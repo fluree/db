@@ -1,7 +1,7 @@
 .PHONY: deps jar install deploy nodejs browser clean
 
 target/fluree-db.jar: pom.xml out src/deps.cljs src/**/* resources/**/*
-	clojure -A:jar
+	clojure -M:jar
 
 jar: target/fluree-db.jar
 
@@ -12,7 +12,7 @@ out/nodejs: out
 	mkdir out/nodejs
 
 out/nodejs/flureenjs.js: package.json package-lock.json build-nodejs.edn deps.edn out/nodejs src/**/* src-nodejs/**/* resources/**/*
-	clojure -A:nodejs
+	clojure -M:nodejs
 
 nodejs: out/nodejs/flureenjs.js
 
@@ -20,7 +20,7 @@ out/browser: out
 	mkdir out/browser
 
 out/browser/flureedb.js: package.json package-lock.json build-browser.edn deps.edn out/browser src/**/* src-cljs/**/* resources/**/*
-	clojure -A:browser
+	clojure -M:browser
 
 browser: out/browser/flureedb.js
 
@@ -31,10 +31,10 @@ deps:
 	clojure -Stree
 
 src/deps.cljs: package.json
-	clojure -A:js-deps
+	clojure -M:js-deps
 
 install: target/fluree-db.jar
-	clojure -A:install
+	clojure -M:install
 
 deploy: target/fluree-db.jar
 	script/deploy-jar.sh
