@@ -1,0 +1,794 @@
+query-specification ::=
+                'SELECT' <space> [set-quantifier <space>] select-list <space> table-expression
+
+set-quantifier ::= 'DISTINCT' | 'ALL'
+
+table-expression ::= from-clause [  <space> where-clause  ]  (*  [  group-by-clause   ] [  having-clause   ] *)
+
+where-clause ::= <'WHERE'> <space> search-condition
+
+from-clause ::=  <'FROM'> <space>  table-reference [ {  <comma>  <space>  table-reference } ]
+
+select-list ::= asterisk |	select-sublist [ {  <comma> <space> select-sublist   } ]
+
+select-sublist ::= column-name (* | derived-column | (qualifier  period    asterisk) *)
+
+ qualifier   ::=  table-name   |  correlation-name
+
+table-name ::= qualified-name |  qualified-local-table-name
+
+<qualified-name> ::= [  schema-name    period   ] qualified-identifier { qualified-identifier }
+
+ as-clause   ::= [ 'AS' ]  column-name
+
+derived-column ::= value-expression [  as-clause   ]
+
+<value-expression> ::= numeric-value-expression |   string-value-expression
+|    datetime-value-expression   |   interval-value-expression
+
+ datetime-value-expression   ::=
+                 datetime-term
+        |	 interval-value-expression    plus-sign    datetime-term
+        |	 datetime-value-expression    plus-sign    interval-term
+        |	 datetime-value-expression    minus-sign    interval-term
+
+ datetime-term   ::=  datetime-factor
+
+ datetime-factor   ::=  datetime-primary   [  time-zone   ]
+
+ datetime-primary   ::=  value-expression-primary   |  datetime-value-function
+
+ datetime-value-function   ::=
+                 current-date-value-function
+        |	 current-time-value-function
+        |	 current-timestamp-value-function
+
+ current-date-value-function   ::= 'CURRENT_DATE'
+
+ current-time-value-function   ::= 'CURRENT_TIME' [  left-paren    time-precision    right-paren   ]
+
+ current-timestamp-value-function   ::= 'CURRENT_TIMESTAMP' [  left-paren    timestamp-precision    right-paren   ]
+
+ time-zone   ::= 'AT'  time-zone-specifier
+
+ time-zone-specifier   ::= 'LOCAL' | 'TIME ZONE'  interval-value-expression
+
+ interval-term   ::=
+                 interval-factor
+        |	 interval-term-2    asterisk    factor
+        |	 interval-term-2    solidus    factor
+        |	 term    asterisk    interval-factor
+
+ interval-factor   ::= [  sign   ]  interval-primary
+
+ interval-primary   ::=  value-expression-primary   [  interval-qualifier   ]
+
+ interval-term-2   ::=  interval-term
+
+ interval-value-expression   ::=
+                 interval-term
+        |	 interval-value-expression-1    plus-sign    interval-term-1
+        |	 interval-value-expression-1    minus-sign    interval-term-1
+        |	 left-paren    datetime-value-expression    minus-sign    datetime-term    right-paren    interval-qualifier
+
+ interval-value-expression-1   ::=  interval-value-expression
+
+ interval-term-1   ::=  interval-term
+
+ <string-value-expression>   ::=  character-value-expression   |  bit-value-expression
+
+ <character-value-expression>   ::=  concatenation   |  character-factor
+
+ concatenation   ::=  character-value-expression    concatenation-operator    character-factor
+
+ <character-factor>   ::=  character-primary   [  collate-clause   ]
+
+ collate-clause   ::= 'COLLATE'  collation-name
+
+ collation-name   ::=  qualified-name
+
+ <character-primary>   ::=  value-expression-primary   |  string-value-function
+
+ string-value-function   ::=  character-value-function   |  bit-value-function
+
+ character-value-function   ::=
+                 character-substring-function
+        |    fold
+        |    form-of-use-conversion
+        |    character-translation
+        |    trim-function
+
+
+ trim-function   ::= 'TRIM'  left-paren    trim-operands    right-paren
+
+ trim-operands   ::= [ [  trim-specification   ] [  trim-character   ] 'FROM' ]  trim-source
+
+ trim-specification   ::= 'LEADING' | 'TRAILING' | 'BOTH'
+
+ trim-character   ::=  character-value-expression
+
+ trim-source   ::=  character-value-expression
+
+ character-translation   ::=
+                'TRANSLATE'  left-paren    character-value-expression   'USING'  translation-name    right-paren
+
+ translation-name   ::=  qualified-name
+
+ form-of-use-conversion   ::=
+                'CONVERT'  left-paren    character-value-expression   'USING'  form-of-use-conversion-name    right-paren
+
+ form-of-use-conversion-name   ::=  qualified-name
+
+ fold   ::= { 'UPPER' | 'LOWER' }  left-paren    character-value-expression    right-paren
+
+ character-substring-function   ::=
+                'SUBSTRING'  left-paren    character-value-expression   'FROM'  start-position   [ 'FOR'  string-length   ]  right-paren
+
+ start-position   ::=  numeric-value-expression
+
+ string-length   ::=  numeric-value-expression
+
+ bit-value-function   ::=  bit-substring-function
+
+ bit-substring-function   ::=
+                'SUBSTRING'  left-paren    bit-value-expression   'FROM'  start-position   [ 'FOR'  string-length   ]  right-paren
+
+ bit-value-expression   ::=  bit-concatenation   |  bit-factor
+
+ bit-concatenation   ::=  bit-value-expression    concatenation-operator    bit-factor
+
+ bit-factor   ::=  bit-primary
+
+ bit-primary   ::=  value-expression-primary   |  string-value-function
+
+numeric-value-expression ::=
+                term
+        |    numeric-value-expression    plus-sign    term
+        |    numeric-value-expression    minus-sign    term
+
+term ::=
+                factor
+        |   term asterisk factor
+        |   term solidus factor
+
+factor::= [  sign   ] numeric-primary
+
+ sign   ::=  plus-sign   |  minus-sign
+
+numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
+
+<value-expression-primary> ::=
+                unsigned-value-specification |    column-reference (*    |   set-function-specification   |    scalar-subquery   |    case-expression    |    left-paren    value-expression    right-paren   |    cast-specification   *)
+
+<column-reference> ::= [ <qualifier> <period> ] column-name
+
+ case-expression   ::=  case-abbreviation   |  case-specification
+
+ case-abbreviation   ::=
+                'NULLIF'  left-paren    value-expression    comma    value-expression    right-paren
+        |	'COALESCE'  left-paren    value-expression   {  comma    value-expression   }   right-paren
+
+ case-specification   ::=  simple-case   |  searched-case
+
+ simple-case   ::=
+                'CASE'  case-operand
+                        { simple-when-clause  }
+                        [  else-clause   ]
+                'END'
+
+ simple-when-clause   ::= 'WHEN'  when-operand   'THEN'  result
+
+ when-operand   ::=  value-expression
+
+ case-operand   ::=  value-expression
+
+ searched-case   ::=
+                'CASE'
+                { searched-when-clause  }
+                [  else-clause   ]
+                'END'
+
+ else-clause   ::= 'ELSE'  result
+
+ searched-when-clause   ::= 'WHEN'  search-condition   'THEN'  result
+
+ search-condition   ::=                  boolean-term
+        |   search-condition  <space> 'OR' <space> boolean-term
+
+ boolean-term   ::=
+            boolean-factor
+        |   boolean-term  <space> 'AND' <space> boolean-factor
+
+ boolean-factor   ::= [ 'NOT' <space>]  boolean-test
+
+ boolean-test   ::=  boolean-primary   [ <space> 'IS' [ <space> 'NOT' ] <space> truth-value   ]
+
+ boolean-primary   ::=  predicate   |  (left-paren    search-condition    right-paren )
+
+ predicate   ::=
+                 comparison-predicate   |    between-predicate   |    in-predicate   |    like-predicate   |    null-predicate   |    quantified-comparison-predicate   |    exists-predicate   |    match-predicate    |    overlaps-predicate
+
+ comparison-predicate   ::=  row-value-constructor  <space>  comp-op  <space>  row-value-constructor
+
+ comp-op   ::=
+             equals-operator
+        |    not-equals-operator
+        |    less-than-operator
+        |    greater-than-operator
+        |    less-than-or-equals-operator
+        |    greater-than-or-equals-operator
+
+ between-predicate ::=
+                row-value-constructor [ 'NOT' ] 'BETWEEN' row-value-constructor 'AND' row-value-constructor
+
+ in-predicate ::= row-value-constructor [ 'NOT' ] 'IN' in-predicate-value
+
+ in-predicate-value ::= table-subquery | left-paren in-value-list right-paren
+
+ in-value-list ::= value-expression { comma value-expression }  +
+
+ like-predicate ::= match-value [ 'NOT' ] 'LIKE' pattern [ 'ESCAPE' escape-character ]
+
+ match-value ::= character-value-expression
+
+ pattern ::= character-value-expression
+
+ escape-character ::= character-value-expression
+
+ null-predicate ::= row-value-constructor 'IS' [ 'NOT' ] 'NULL'
+
+ quantified-comparison-predicate ::= row-value-constructor comp-op quantifier table-subquery
+
+ quantifier ::= all | some
+
+ all ::= 'ALL'
+
+ some ::= 'SOME' | 'ANY'
+
+ exists-predicate ::= 'EXISTS' table-subquery
+
+ unique-predicate ::= 'UNIQUE' table-subquery
+
+ match-predicate ::= row-value-constructor 'MATCH' [ 'UNIQUE' ] [ 'PARTIAL' | 'FULL' ] table-subquery
+
+ overlaps-predicate ::= row-value-constructor-1 'OVERLAPS' row-value-constructor-2
+
+ row-value-constructor-1 ::= row-value-constructor
+
+ row-value-constructor-2 ::= row-value-constructor
+
+ truth-value   ::= 'TRUE' | 'FALSE' | 'UNKNOWN'
+
+ row-value-constructor   ::=
+             row-value-constructor-element
+        |    (left-paren    row-value-constructor-list    right-paren)
+        |    row-subquery
+
+ row-subquery   ::=  subquery
+
+ subquery   ::=  left-paren    query-expression    right-paren
+
+ query-expression   ::=  non-join-query-expression   |  joined-table
+
+ joined-table   ::=
+                cross-join
+        |    qualified-join
+        |    left-paren    joined-table    right-paren
+
+ cross-join   ::=
+                 table-reference   'CROSS JOIN'  table-reference
+
+ qualified-join   ::=
+                 table-reference   [ 'NATURAL' ] [  join-type   ] 'JOIN'  table-reference   [  join-specification   ]
+
+ table-reference   ::=
+            table-name   |    (derived-table    correlation-specification )
+        |    joined-table
+
+ derived-table   ::=  table-subquery
+
+ table-subquery   ::=  subquery
+
+ join-specification   ::=  join-condition   |  named-columns-join
+
+ join-condition   ::= 'ON'  search-condition
+
+ named-columns-join   ::= 'USING'  left-paren    join-column-list    right-paren
+
+ join-column-list   ::=  column-name-list
+
+ correlation-specification   ::=
+                <space> [  'AS' <space>]  correlation-name   [  left-paren    derived-column-list    right-paren   ]
+
+ derived-column-list   ::=  column-name-list
+
+ join-type   ::=
+                'INNER'
+        |    outer-join-type   [ 'OUTER' ]
+        |   'UNION'
+
+ outer-join-type   ::= 'LEFT' | 'RIGHT' | 'FULL'
+
+ non-join-query-expression   ::=
+                 non-join-query-term
+        |	 query-expression   'UNION' [ 'ALL' ] [  corresponding-spec   ]  query-term
+        |	 query-expression   'EXCEPT' [ 'ALL' ] [  corresponding-spec   ]  query-term
+
+ non-join-query-term   ::=
+                 non-join-query-primary
+        |	 query-term   'INTERSECT' [ 'ALL' ] [  corresponding-spec   ]  query-primary
+
+ query-primary   ::=  non-join-query-primary   |  joined-table
+
+ corresponding-spec   ::= 'CORRESPONDING' [ 'BY'  left-paren    corresponding-column-list    right-paren   ]
+
+ corresponding-column-list   ::=  column-name-list
+
+ column-name-list   ::=  column-name   [ {  comma    column-name   }]
+
+ non-join-query-primary   ::=  simple-table   |  left-paren    non-join-query-expression    right-paren
+
+ simple-table   ::=
+                 query-specification
+        |	 table-value-constructor
+        |	 explicit-table
+
+ table-value-constructor   ::= 'VALUES'  table-value-constructor-list
+
+ table-value-constructor-list   ::=  row-value-constructor   [ {  comma    row-value-constructor   } ]
+
+ explicit-table   ::= 'TABLE' table-name
+
+ query-term   ::=  non-join-query-term   |  joined-table
+
+ row-value-constructor-list   ::=  row-value-constructor-element   [ {  comma    row-value-constructor-element   } ]
+
+ row-value-constructor-element   ::=
+                 value-expression
+        |    null-specification
+        |    default-specification
+
+ result   ::=  result-expression   | 'NULL'
+
+ result-expression   ::=  value-expression
+
+ cast-specification   ::= 'CAST'  left-paren    cast-operand   'AS'  cast-target    right-paren
+
+ cast-operand   ::=  value-expression   | 'NULL'
+
+ cast-target   ::=  domain-name   |   data-type
+
+ data-type   ::=
+     character-string-type   [ 'CHARACTER SET'  character-set-specification   ]
+        |	 national-character-string-type
+        |	 bit-string-type
+        |	 numeric-type
+        |	 datetime-type
+        |	 interval-type
+
+ datetime-type   ::=
+                'DATE'
+        |   'TIME' [  left-paren    time-precision    right-paren   ] [ 'WITH TIME ZONE' ]
+        |   'TIMESTAMP' [  left-paren    timestamp-precision    right-paren   ] [ 'WITH TIME ZONE' ]
+
+ time-precision   ::=  time-fractional-seconds-precision
+
+ time-fractional-seconds-precision   ::=  unsigned-integer
+
+ timestamp-precision   ::=  time-fractional-seconds-precision
+
+ interval-type   ::= 'INTERVAL'  interval-qualifier
+
+ numeric-type   ::=
+                 exact-numeric-type
+        |	 approximate-numeric-type
+
+ exact-numeric-type   ::=
+                'NUMERIC' [  left-paren    precision   [  comma    scale   ]  right-paren   ]
+        |       'DECIMAL' [  left-paren    precision   [  comma    scale   ]  right-paren   ]
+        |       'DEC' [  left-paren    precision   [  comma    scale   ]  right-paren   ]
+        |	'INTEGER'
+        |	'INT'
+        |	'SMALLINT'
+
+ scale   ::=  unsigned-integer
+
+ approximate-numeric-type   ::=
+                'FLOAT' [  left-paren    precision    right-paren   ]
+        |	'REAL'
+        |	'DOUBLE PRECISION'
+
+ precision   ::=  unsigned-integer
+
+ character-string-type   ::=
+                'CHARACTER' [  left-paren    length    right-paren   ]
+        |	'CHAR' [  left-paren    length    right-paren   ]
+        |	'CHARACTER VARYING' [  left-paren    length    right-paren   ]
+        |	'CHAR VARYING' [  left-paren    length    right-paren   ]
+        |	'VARCHAR' [  left-paren    length    right-paren   ]
+
+
+ national-character-string-type   ::=
+                'NATIONAL CHARACTER' [  left-paren    length    right-paren   ]
+        |	'NATIONAL CHAR' [  left-paren    length    right-paren   ]
+        |	'NCHAR' [  left-paren    length    right-paren   ]
+        |	'NATIONAL CHARACTER VARYING' [  left-paren    length    right-paren   ]
+        |	'NATIONAL CHAR VARYING' [  left-paren    length    right-paren   ]
+        |	'NCHAR VARYING' [  left-paren    length    right-paren   ]
+
+ bit-string-type   ::=
+                'BIT' [  left-paren    length    right-paren   ]
+        |	'BIT VARYING' [  left-paren    length    right-paren   ]
+
+ length   ::=  unsigned-integer
+
+ domain-name   ::=  qualified-name
+
+unsigned-value-specification ::= unsigned-literal |  general-value-specification
+
+unsigned-literal ::= unsigned-numeric-literal | general-literal
+
+ unsigned-numeric-literal   ::=
+                 exact-numeric-literal
+        |	 approximate-numeric-literal
+
+ approximate-numeric-literal   ::=
+                 mantissa   'E'  exponent
+
+ mantissa   ::=  exact-numeric-literal
+
+ exponent   ::=  signed-integer
+
+ signed-integer   ::= [  sign   ]  unsigned-integer
+
+ exact-numeric-literal   ::=
+                 unsigned-integer   [  period   [  unsigned-integer   ] ]
+        |	 period    unsigned-integer
+
+ general-literal   ::=
+                 character-string-literal
+        |	 national-character-string-literal
+        |	 bit-string-literal
+        |	 hex-string-literal
+        |	 datetime-literal
+        |	 interval-literal
+
+ character-string-literal  ::=
+        [  introducer   character-set-specification   ]  quote   [ { character-representation  } ]  quote   [ { { separator  }  quote   [ { character-representation  } ]  quote   } ]
+
+ national-character-string-literal   ::=
+                'N'  quote   [ { character-representation  } ]  quote   [ { { separator   }  quote   [ { character-representation  } ]  quote   } ]
+
+ character-representation   ::=  nonquote-character   |  quote-symbol
+
+ quote-symbol   ::=  quote    quote
+
+ bit-string-literal   ::=
+                'B'  quote   [ { bit  } ]  quote   [ { { separator  }  quote   [ { bit  } ]  quote   }  ]
+
+ bit   ::= '0' | '1'
+
+ hex-string-literal   ::=
+                'X'  quote   [ { hexit  } ]  quote   [ { { separator  }  quote   [ { hexit  } ]  quote   } ]
+
+ hexit   ::=  digit   | 'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'a' | 'b' | 'c' | 'd' | 'e' | 'f'
+
+ separator   ::= {  comment   |  space   |  newline   }
+
+ comment   ::=  comment-introducer   [ { comment-character  } ]  newline
+
+ comment-introducer   ::=  minus-sign   minus-sign   [{ minus-sign  } ]
+
+ comment-character   ::=  nonquote-character   |  quote
+
+ nonquote-character   ::= '!!'
+
+ newline   ::= '!!'
+
+ datetime-literal   ::=
+                 date-literal
+        |	 time-literal
+        |	 timestamp-literal
+
+ date-literal   ::= 'DATE'  date-string
+
+ time-literal   ::= 'TIME'  time-string
+
+ timestamp-literal   ::= 'TIMESTAMP'  timestamp-string
+
+ time-zone-interval   ::=  sign    hours-value    colon    minutes-value
+
+ timestamp-string   ::=  quote    date-value    space    time-value   [  time-zone-interval   ]  quote
+
+ date-string   ::=  quote    date-value    quote
+
+ date-value   ::=  years-value    minus-sign    months-value    minus-sign    days-value
+
+ time-string   ::=  quote    time-value   [  time-zone-interval   ]  quote
+
+ time-value   ::=  hours-value    colon    minutes-value    colon    seconds-value
+
+ interval-literal   ::= 'INTERVAL' [  sign   ]  interval-string    interval-qualifier
+
+ interval-string   ::=  quote   {  year-month-literal   |  day-time-literal   }  quote
+
+ year-month-literal   ::=
+                 years-value
+        |	[  years-value    minus-sign   ]  months-value
+
+ months-value   ::=  datetime-value
+
+ days-value   ::=  datetime-value
+
+ years-value   ::=  datetime-value
+
+ datetime-value   ::=  unsigned-integer
+
+ day-time-literal   ::=  day-time-interval   |  time-interval
+
+ day-time-interval   ::=
+                 days-value   [  space    hours-value   [  colon    minutes-value   [  colon    seconds-value   ] ] ]
+
+ time-interval   ::=
+                 hours-value   [  colon    minutes-value   [  colon    seconds-value   ] ]
+        |	 minutes-value   [  colon    seconds-value   ]
+        |	 seconds-value
+
+ hours-value   ::=  datetime-value
+
+ minutes-value   ::=  datetime-value
+
+ seconds-value   ::=  seconds-integer-value   [  period   [  seconds-fraction   ] ]
+
+ seconds-integer-value   ::=  unsigned-integer
+
+ seconds-fraction   ::=  unsigned-integer
+
+ interval-qualifier   ::=
+                 start-field   'TO'  end-field
+        |    single-datetime-field
+
+ single-datetime-field   ::=
+                 non-second-datetime-field   [  left-paren    interval-leading-field-precision    right-paren   ]
+        |   'SECOND' [  left-paren    interval-leading-field-precision   [  comma    left-paren    interval-fractional-seconds-precision   ]  right-paren   ]
+
+ start-field   ::=
+                 non-second-datetime-field   [  left-paren    interval-leading-field-precision    right-paren   ]
+
+ non-second-datetime-field   ::= 'YEAR' | 'MONTH' | 'DAY' | 'HOUR' | 'MINUTE'
+
+ interval-leading-field-precision   ::=  unsigned-integer
+
+ end-field   ::=
+                 non-second-datetime-field
+        |   'SECOND' [  left-paren    interval-fractional-seconds-precision    right-paren   ]
+
+ interval-fractional-seconds-precision   ::=  unsigned-integer
+
+ unsigned-integer   ::= digit { digit  }
+
+ general-value-specification   ::=
+                 parameter-specification
+        |    dynamic-parameter-specification
+        |    variable-specification
+        |   'USER'
+        |   'CURRENT_USER'
+        |   'SESSION_USER'
+        |   'SYSTEM_USER'
+        |   'VALUE'
+
+ parameter-specification   ::=  parameter-name   [  indicator-parameter   ]
+
+ parameter-name   ::=  colon    identifier
+
+ indicator-parameter   ::= [ 'INDICATOR' ]  parameter-name
+
+ dynamic-parameter-specification   ::=  question-mark
+
+ variable-specification   ::=  embedded-variable-name   [  indicator-variable   ]
+
+ embedded-variable-name   ::=  colon   host-identifier
+
+ host-identifier   ::=
+                 Ada-host-identifier
+        |	 C-host-identifier
+        |	 Cobol-host-identifier
+        |	 Fortran-host-identifier
+        |	 MUMPS-host-identifier
+        |	 Pascal-host-identifier
+        |	 PL-I-host-identifier
+
+ Ada-host-identifier   ::= '!!'
+
+ C-host-identifier   ::= '!!'
+
+ Cobol-host-identifier   ::= '!!'
+
+ Fortran-host-identifier   ::= '!!'
+
+ MUMPS-host-identifier   ::= '!!'
+
+ Pascal-host-identifier   ::= '!!'
+
+ PL-I-host-identifier   ::= '!!'
+
+ indicator-variable   ::= [ 'INDICATOR' ]  embedded-variable-name
+
+ character-set-specification   ::=
+                 standard-character-repertoire-name
+        |	 implementation-defined-character-repertoire-name
+        |	 user-defined-character-repertoire-name
+        |	 standard-universal-character-form-of-use-name
+        |	 implementation-defined-universal-character-form-of-use-name
+
+ implementation-defined-character-repertoire-name   ::=  character-set-name
+
+ user-defined-character-repertoire-name   ::=  character-set-name
+
+ standard-universal-character-form-of-use-name   ::=  character-set-name
+
+ implementation-defined-universal-character-form-of-use-name   ::=  character-set-name
+
+ standard-character-repertoire-name   ::=  character-set-name
+
+ qualified-local-table-name   ::= 'MODULE'  period    local-table-name
+
+ local-table-name   ::=  qualified-identifier
+
+ character-set-name   ::= [  schema-name    period   ]  SQL-language-identifier
+
+ column-name   ::=  identifier
+
+ correlation-name   ::=  identifier
+
+ <qualified-identifier>   ::= identifier
+
+ <identifier>   ::= [  introducer   character-set-specification   ] actual-identifier
+
+ <actual-identifier>   ::= regular-identifier |  delimited-identifier
+
+ <regular-identifier>   ::= identifier-body
+
+<identifier-body> ::= identifier-start [ {  underscore   | identifier-part } ]
+
+<identifier-part> ::= identifier-start |  digit
+
+
+(* An  identifier start   is any character in the Unicode General Category
+classes "Lu", "Ll", "Lt", "Lm", "Lo", or "Nl".
+
+NOTE 58 — The Unicode General Category classes "Lu", "Ll", "Lt", "Lm", "Lo", and "Nl" are assigned to Unicode characters that are, respectively, upper-case letters, lower-case letters, title-case  letters, modifier letters, other letters, and letter numbers.
+
+I think SQL-language-character is a good approximation for now.
+
+*)
+
+<identifier-start> ::= SQL-language-character
+
+ delimited-identifier   ::=  double-quote    delimited-identifier-body    double-quote
+
+ delimited-identifier-body   ::= { delimited-identifier-part  }
+
+ delimited-identifier-part   ::=  nondoublequote-character   |  doublequote-symbol
+
+ nondoublequote-character   ::= '!!'
+
+ doublequote-symbol   ::=  double-quote   double-quote
+
+ schema-name   ::= [  catalog-name    period   ]  unqualified-schema-name
+
+ unqualified-schema-name   ::=  identifier
+
+ catalog-name   ::=  identifier
+
+ introducer   ::=  underscore
+
+ SQL-language-identifier   ::=
+                 SQL-language-identifier-start   [ {  underscore   |  SQL-language-identifier-part   } ]
+
+ null-specification   ::= 'NULL'
+
+ default-specification   ::= 'DEFAULT'
+
+ not-equals-operator   ::= '<>'
+
+ greater-than-or-equals-operator   ::= '>='
+
+ less-than-or-equals-operator   ::= '<='
+
+ concatenation-operator   ::= '||'
+
+ double-period   ::= '..'
+
+ SQL-language-identifier-start   ::=  simple-Latin-letter
+
+ SQL-language-identifier-part   ::=  simple-Latin-letter   |  digit
+
+<SQL-language-character> ::=
+                simple-Latin-letter
+        |	 digit
+        |	 SQL-special-character
+
+<simple-Latin-letter> ::=
+                simple-Latin-upper-case-letter
+        |	 simple-Latin-lower-case-letter
+
+<simple-Latin-upper-case-letter> ::=
+        'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'H' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'P' | 'Q' | 'R' | 'S' | 'T' | 'U' | 'V' | 'W' | 'X' | 'Y' | 'Z'
+
+ <simple-Latin-lower-case-letter>  ::=
+        'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'h' | 'i' | 'j' | 'k' | 'l' | 'm' | 'n' | 'o' | 'p' | 'q' | 'r' | 's' | 't' | 'u' | 'v' | 'w' | 'x' | 'y' | 'z'
+
+ <digit>   ::=
+        '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
+
+ <SQL-special-character>   ::=
+                 (* space  | asterisk  | *)
+        double-quote
+        |	 percent
+        |	 ampersand
+        |	 quote
+        |	 left-paren
+        |	 right-paren
+        |	 plus-sign
+        |	 comma
+        |	 minus-sign
+        |	 period
+        |	 solidus
+        |	 colon
+        |	 semicolon
+        |	 less-than-operator
+        |	 greater-than-operator
+        |	 equals-operator
+        |	 question-mark
+        |	 underscore
+        |	 vertical-bar
+
+(* space was one of !! See Syntax Rules *)
+ <space>   ::= #"[\x20\x09\x0D\x0A]*\#[^\n]*\n*[\x20\x09\x0D\x0A]*|[\x20\x09\x0D\x0A]" { #"[\x20\x09\x0D\x0A]*\#[^\n]*\n*[\x20\x09\x0D\x0A]*|[\x20\x09\x0D\x0A]"}
+
+ double-quote   ::= '"'
+
+ percent   ::= '%'
+
+ ampersand   ::= '&'
+
+ quote   ::= "'"
+
+ left-paren   ::= '('
+
+ right-paren   ::= ')'
+
+asterisk ::= '*'
+
+ plus-sign   ::= '+'
+
+ <comma>   ::= <','>
+
+ minus-sign   ::= '-'
+
+ period   ::= '.'
+
+ solidus   ::= '/'
+
+ colon   ::= ':'
+
+semicolon   ::= ';'
+
+less-than-operator   ::= '<'
+
+ equals-operator   ::= '='
+
+ greater-than-operator   ::= '>'
+
+ question-mark   ::= '?'
+
+ underscore   ::= '_'
+
+ vertical-bar   ::= '|'
+
+ SQL-embedded-language-character   ::=  left-bracket   |  right-bracket
+
+ left-bracket   ::= '['
+
+ right-bracket   ::= ']'

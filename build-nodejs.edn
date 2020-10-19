@@ -1,0 +1,9 @@
+{:target        :nodejs
+ :output-to     "out/nodejs/flureenjs.js"
+ :output-dir    "out/nodejs/build"
+ :main          flureenjs
+ :optimizations :simple
+ :pretty-print  false
+ :infer-externs true
+ :install-deps  true
+ :npm-deps      {}}
