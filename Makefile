@@ -37,7 +37,7 @@ install: target/fluree-db.jar
 	clojure -M:install
 
 deploy: target/fluree-db.jar
-	script/deploy-jar.sh
+	clojure -M:deploy
 
 clean:
 	rm -rf target

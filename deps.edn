@@ -61,4 +61,9 @@
   :install
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
    :main-opts ["-m" "deps-deploy.deps-deploy" "install"
+               "target/fluree-db.jar"]}
+
+  :deploy
+  {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
+   :main-opts ["-m" "deps-deploy.deps-deploy" "deploy"
                "target/fluree-db.jar"]}}}
