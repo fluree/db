@@ -7,11 +7,11 @@ table-expression ::= from-clause [  <space> where-clause  ]  (*  [  group-by-cla
 
 where-clause ::= <'WHERE'> <space> search-condition
 
-from-clause ::=  <'FROM'> <space>  table-reference [ {  <comma>  <space>  table-reference } ]
+from-clause ::=  <'FROM'> <space>  table-reference [ {  comma  <space>  table-reference } ]
 
-select-list ::= asterisk |	select-sublist [ {  <comma> <space> select-sublist   } ]
+select-list ::= asterisk | select-sublist [ {  comma <space> select-sublist   } ]
 
-select-sublist ::= column-name (* | derived-column | (qualifier  period    asterisk) *)
+select-sublist ::= column-name | (qualifier  period    asterisk) (* | derived-column *)
 
  qualifier   ::=  table-name   |  correlation-name
 
@@ -92,7 +92,7 @@ derived-column ::= value-expression [  as-clause   ]
  string-value-function   ::=  character-value-function   |  bit-value-function
 
  character-value-function   ::=
-                 character-substring-function
+             character-substring-function
         |    fold
         |    form-of-use-conversion
         |    character-translation
@@ -192,12 +192,13 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
 
  searched-when-clause   ::= 'WHEN'  search-condition   'THEN'  result
 
- search-condition   ::=                  boolean-term
-        |   search-condition  <space> 'OR' <space> boolean-term
+ search-condition   ::=
+          boolean-term
+        | search-condition <space> 'OR' <space> boolean-term
 
  boolean-term   ::=
-            boolean-factor
-        |   boolean-term  <space> 'AND' <space> boolean-factor
+          boolean-factor
+        | boolean-term  <space> 'AND' <space> boolean-factor
 
  boolean-factor   ::= [ 'NOT' <space>]  boolean-test
 
@@ -205,8 +206,7 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
 
  boolean-primary   ::=  predicate   |  (left-paren    search-condition    right-paren )
 
- predicate   ::=
-                 comparison-predicate   |    between-predicate   |    in-predicate   |    like-predicate   |    null-predicate   |    quantified-comparison-predicate   |    exists-predicate   |    match-predicate    |    overlaps-predicate
+ predicate   ::= comparison-predicate | between-predicate | in-predicate | like-predicate | null-predicate | quantified-comparison-predicate | exists-predicate | match-predicate | overlaps-predicate
 
  comparison-predicate   ::=  row-value-constructor  <space>  comp-op  <space>  row-value-constructor
 
@@ -219,13 +219,13 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
         |    greater-than-or-equals-operator
 
  between-predicate ::=
-                row-value-constructor [ 'NOT' ] 'BETWEEN' row-value-constructor 'AND' row-value-constructor
+                row-value-constructor <space> [ 'NOT' <space> ] 'BETWEEN' <space> row-value-constructor <space> 'AND' <space> row-value-constructor
 
- in-predicate ::= row-value-constructor [ 'NOT' ] 'IN' in-predicate-value
+ in-predicate ::= row-value-constructor <space> [ 'NOT' <space> ] 'IN' <space> in-predicate-value
 
- in-predicate-value ::= table-subquery | left-paren in-value-list right-paren
+ in-predicate-value ::= table-subquery | left-paren [ <space> ] in-value-list [ <space> ] right-paren
 
- in-value-list ::= value-expression { comma value-expression }  +
+ in-value-list ::= value-expression { comma [ <space> ] value-expression }  +
 
  like-predicate ::= match-value [ 'NOT' ] 'LIKE' pattern [ 'ESCAPE' escape-character ]
 
@@ -235,7 +235,7 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
 
  escape-character ::= character-value-expression
 
- null-predicate ::= row-value-constructor 'IS' [ 'NOT' ] 'NULL'
+ null-predicate ::= row-value-constructor <space> 'IS' <space> [ 'NOT' <space> ] 'NULL'
 
  quantified-comparison-predicate ::= row-value-constructor comp-op quantifier table-subquery
 
@@ -266,9 +266,9 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
 
  row-subquery   ::=  subquery
 
- subquery   ::=  left-paren    query-expression    right-paren
+ subquery   ::=  left-paren query-expression right-paren
 
- query-expression   ::=  non-join-query-expression   |  joined-table
+ query-expression   ::=  non-join-query-expression | joined-table
 
  joined-table   ::=
                 cross-join
@@ -755,9 +755,9 @@ I think SQL-language-character is a good approximation for now.
 
  quote   ::= "'"
 
- left-paren   ::= '('
+ <left-paren>   ::= <'('>
 
- right-paren   ::= ')'
+ <right-paren>   ::= <')'>
 
 asterisk ::= '*'
 
