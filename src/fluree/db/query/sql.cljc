@@ -230,8 +230,7 @@
                                          :select-list
                                          first
                                          (template/fill-in-collection coll))
-          where-clause              (reduce (fn [clause triple]
-                                              ) where select-triples)]
+          where-clause              (reduce conj  where select-triples)]
       (bounce {select-key select-vars
                :where     where-clause}))
     (throw (ex-info "Non-select SQL queries are not currently supported by the transpiler"
