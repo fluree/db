@@ -1,5 +1,7 @@
 # Fluree DB
 
+Usage [documentation](https://docs.flur.ee) is located at https://docs.flur.ee.
+
 ## Overview
 
 Fluree is an immutable, temporal, ledger-backed semantic graph database that has a cloud-native architecture.
