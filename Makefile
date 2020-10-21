@@ -1,7 +1,7 @@
 .PHONY: deps jar install deploy nodejs browser clean
 
 target/fluree-db.jar: pom.xml out src/deps.cljs src/**/* resources/**/*
-	clojure -M:jar
+	clojure -A:jar -M:jar
 
 jar: target/fluree-db.jar
 
@@ -34,7 +34,7 @@ src/deps.cljs: package.json
 	clojure -M:js-deps
 
 install: target/fluree-db.jar
-	clojure -M:install
+	clojure -A:install -M:install
 
 deploy: target/fluree-db.jar
 	clojure -M:deploy
