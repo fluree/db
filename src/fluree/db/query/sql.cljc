@@ -215,26 +215,21 @@
 
 
 (defmethod rule-parser :query-specification
-  [[_ spec & rst]]
-  (if (= spec "SELECT")
-    (let [parse-map                 (parse-into-map rst)
-          select-key                (-> parse-map
-                                        :set-quantifier
-                                        first
-                                        (or :select))
-          {::keys [coll where]}     (-> parse-map :table-expression first)
-          {::keys [select-vars
-                   select-triples]} (->> parse-map
-                                         :select-list
-                                         first
-                                         (template/fill-in-collection coll))
-          where-clause              (reduce conj  where select-triples)]
-      (bounce {select-key select-vars
-               :where     where-clause}))
-    (throw (ex-info "Non-select SQL queries are not currently supported by the transpiler"
-                    {:status 400
-                     :error  :db/invalid-query
-                     :provided-query spec}))))
+  [[_ _ & rst]]
+  (let [parse-map                 (parse-into-map rst)
+        select-key                (-> parse-map
+                                      :set-quantifier
+                                      first
+                                      (or :select))
+        {::keys [coll where]}     (-> parse-map :table-expression first)
+        {::keys [select-vars
+                 select-triples]} (->> parse-map
+                                       :select-list
+                                       first
+                                       (template/fill-in-collection coll))
+        where-clause              (reduce conj  where select-triples)]
+    (bounce {select-key select-vars
+             :where     where-clause})))
 
 
 (defn parse
