@@ -29,16 +29,17 @@ at https://flur.ee/getstarted/.
 ## Development
 
 ### Contributing
-All contributors must complete a Contributor License Agreement. To learn more about
-CLAs, visit https://en.wikipedia.org/wiki/Contributor_License_Agreement.
+
+All contributors must complete a [Contributor License Agreement](https://gist.github.com/bplatz/18bdfab7221fc1b03eb3293c8fe56077).
 
 ### Prerequisites
 
-1. Install clojure tools-deps
+1. Install clojure tools-deps (version 1.10.1.697 or later).
     1. macOS: `brew install clojure/tools/clojure`
     1. Arch Linux: `pacman -S clojure`
 
 ### Building
+
 1. `make deps` - install all local dependencies
 1. `make` or `make jar` - make Java .jar file
 1. `make nodejs` - make JavaScript Fluree DB
