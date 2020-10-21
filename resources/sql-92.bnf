@@ -3,23 +3,32 @@ query-specification ::=
 
 set-quantifier ::= 'DISTINCT' | 'ALL'
 
-table-expression ::= from-clause [  <space> where-clause  ]  (*  [  group-by-clause   ] [  having-clause   ] *)
-
-where-clause ::= <'WHERE'> <space> search-condition
+table-expression ::= from-clause [ <space> where-clause ] [ <space> group-by-clause ] [ <space> having-clause ]
 
 from-clause ::=  <'FROM'> <space>  table-reference [ {  comma  <space>  table-reference } ]
 
+where-clause ::= <'WHERE'> <space> search-condition
+
+group-by-clause ::= 'GROUP BY' grouping-column-reference-list
+
+grouping-column-reference-list ::=
+                grouping-column-reference [ { comma grouping-column-reference } + ]
+
+grouping-column-reference ::= column-reference [ collate-clause ]
+
+having-clause ::= 'HAVING' search-condition
+
 select-list ::= asterisk | select-sublist [ {  comma <space> select-sublist   } ]
 
-select-sublist ::= column-name | (qualifier  period    asterisk) (* | derived-column *)
+select-sublist ::= column-name | (qualifier period asterisk) (* | derived-column *)
 
- qualifier   ::=  table-name   |  correlation-name
+qualifier   ::=  table-name   |  correlation-name
 
 table-name ::= qualified-name |  qualified-local-table-name
 
 <qualified-name> ::= [  schema-name    period   ] qualified-identifier { qualified-identifier }
 
- as-clause   ::= [ 'AS' ]  column-name
+as-clause   ::= [ 'AS' ]  column-name
 
 derived-column ::= value-expression [  as-clause   ]
 
@@ -271,7 +280,7 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
  query-expression   ::=  non-join-query-expression | joined-table
 
  joined-table   ::=
-                cross-join
+             cross-join
         |    qualified-join
         |    left-paren    joined-table    right-paren
 
@@ -344,9 +353,21 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
  row-value-constructor-list   ::=  row-value-constructor-element   [ {  comma    row-value-constructor-element   } ]
 
  row-value-constructor-element   ::=
-                 value-expression
+             value-expression
         |    null-specification
         |    default-specification
+
+ direct-select-statement ::= query-expression [ order-by-clause ]
+
+ order-by-clause ::= 'ORDER BY' sort-specification-list
+
+ sort-specification-list ::= sort-specification [ { comma sort-specification } + ]
+
+ sort-specification ::= sort-key [ collate-clause ] [ ordering-specification ]
+
+ sort-key ::= column-name | unsigned-integer
+
+ ordering-specification ::= 'ASC' | 'DESC'
 
  result   ::=  result-expression   | 'NULL'
 

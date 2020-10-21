@@ -10,7 +10,6 @@
   (-> "sql-92.bnf"
       io/resource
       (insta/parser :input-format :ebnf
-                    :start        :query-specification
                     :string-ci    true)))
 
 
@@ -177,9 +176,8 @@
 (defmethod rule-parser :null-predicate
   [[_ f & rst]]
   (let [field     (-> f parse-element first)
-        field-var (template/build-var field)
-        not?      (some #{"NOT"} rst)]
-    (if not?
+        field-var (template/build-var field)]
+    (if (some #{"NOT"} rst)
       (bounce [[template/collection-var (template/field->predicate-template field) field-var]])
       (bounce [[template/collection-var "rdf:type" template/collection]
                {:optional [[template/collection-var (template/field->predicate-template field) field-var]]}
