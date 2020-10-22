@@ -172,10 +172,10 @@ factor::= [  sign   ] numeric-primary
 
 numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
 
-<value-expression-primary> ::=
-                unsigned-value-specification |    column-reference (*    |   set-function-specification   |    scalar-subquery   |    case-expression    |    left-paren    value-expression    right-paren   |    cast-specification   *)
+value-expression-primary ::=
+                unsigned-value-specification / column-reference (* | set-function-specification | scalar-subquery | case-expression | left-paren value-expression right-paren | cast-specification *)
 
-<column-reference> ::= [ <qualifier> <period> ] column-name
+column-reference ::= [ qualifier <period> ] column-name
 
  case-expression   ::=  case-abbreviation   |  case-specification
 
@@ -586,7 +586,7 @@ unsigned-literal ::= unsigned-numeric-literal | general-literal
 
  interval-fractional-seconds-precision   ::=  unsigned-integer
 
- unsigned-integer   ::= digit { digit  }
+ unsigned-integer   ::= digit { digit }
 
  general-value-specification   ::=
                  parameter-specification
