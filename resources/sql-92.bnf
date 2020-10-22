@@ -1,3 +1,7 @@
+direct-select-statement ::= query-expression [ <space> order-by-clause ]
+
+query-expression   ::=  non-join-query-expression | joined-table
+
 query-specification ::=
                 'SELECT' <space> [set-quantifier <space>] select-list <space> table-expression
 
@@ -7,16 +11,18 @@ table-expression ::= from-clause [ <space> where-clause ] [ <space> group-by-cla
 
 from-clause ::=  <'FROM'> <space>  table-reference [ {  comma  <space>  table-reference } ]
 
+order-by-clause ::= 'ORDER BY' <space> sort-specification-list
+
 where-clause ::= <'WHERE'> <space> search-condition
 
-group-by-clause ::= 'GROUP BY' grouping-column-reference-list
+group-by-clause ::= 'GROUP BY' <space> grouping-column-reference-list
 
 grouping-column-reference-list ::=
-                grouping-column-reference [ { comma grouping-column-reference } + ]
+                grouping-column-reference [ { comma <space> grouping-column-reference } + ]
 
-grouping-column-reference ::= column-reference [ collate-clause ]
+grouping-column-reference ::= column-reference [ <space> collate-clause ]
 
-having-clause ::= 'HAVING' search-condition
+having-clause ::= 'HAVING' <space> search-condition
 
 select-list ::= asterisk | select-sublist [ {  comma <space> select-sublist   } ]
 
@@ -277,8 +283,6 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
 
  subquery   ::=  left-paren query-expression right-paren
 
- query-expression   ::=  non-join-query-expression | joined-table
-
  joined-table   ::=
              cross-join
         |    qualified-join
@@ -350,22 +354,18 @@ numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
 
  query-term   ::=  non-join-query-term   |  joined-table
 
- row-value-constructor-list   ::=  row-value-constructor-element   [ {  comma    row-value-constructor-element   } ]
+ row-value-constructor-list   ::=  row-value-constructor-element   [ {  comma <space> row-value-constructor-element   } ]
 
  row-value-constructor-element   ::=
              value-expression
         |    null-specification
         |    default-specification
 
- direct-select-statement ::= query-expression [ order-by-clause ]
+ sort-specification-list ::= sort-specification [ { comma <space> sort-specification } + ]
 
- order-by-clause ::= 'ORDER BY' sort-specification-list
+ sort-specification ::= sort-key [ <space> collate-clause ] [ <space> ordering-specification ]
 
- sort-specification-list ::= sort-specification [ { comma sort-specification } + ]
-
- sort-specification ::= sort-key [ collate-clause ] [ ordering-specification ]
-
- sort-key ::= column-name | unsigned-integer
+ sort-key ::= column-name (* | unsigned-integer *)
 
  ordering-specification ::= 'ASC' | 'DESC'
 
