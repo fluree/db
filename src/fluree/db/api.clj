@@ -809,6 +809,13 @@
   (query-api/history-query-async sources query-map))
 
 
+(defn history-query
+  [sources query-map]
+  (let [p (promise)]
+    (async/go
+      (deliver p (async/<! (query-api/history-query-async sources query-map))))
+    p))
+
 
 (defn multi-query-async
   "Like query, but takes a map of multiple queries - where map keys are any user-provided aliases
