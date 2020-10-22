@@ -234,4 +234,9 @@
 
 (defn parse
   [q]
-  (->> q sql parse-rule first))
+  (-> q
+      sql
+      parse-rule
+      first
+      (select-keys [:select :selectDistinct :selectOne :where :block :prefixes
+                    :vars :opts])))
