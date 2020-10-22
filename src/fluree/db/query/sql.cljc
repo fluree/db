@@ -201,37 +201,48 @@
     (->> rst parse-all bounce)))
 
 
+(defmethod rule-parser :group-by-clause
+  [[_ _ & rst]]
+  (->> rst
+       parse-all
+       (map template/build-var)
+       bounce))
+
+
 (defmethod rule-parser :table-expression
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
         from      (-> parse-map :from-clause first)
         where     (->> (:where-clause parse-map)
                        (template/fill-in-collection from)
-                       vec)]
+                       vec)
+        grouping  (some-> parse-map :group-by-clause vec)]
     (bounce {::coll  from
              ::where (if (seq where)
                        where
-                       [[(template/build-var from) "rdf:type" from]])})))
+                       [[(template/build-var from) "rdf:type" from]])
+             ::group grouping})))
 
 
 (defmethod rule-parser :query-specification
   [[_ _ & rst]]
-  (let [parse-map                 (parse-into-map rst)
-        select-key                (-> parse-map
-                                      :set-quantifier
-                                      first
-                                      (or :select))
-        {::keys [coll where]}     (-> parse-map :table-expression first)
+  (let [parse-map                   (parse-into-map rst)
+        select-key                  (-> parse-map
+                                        :set-quantifier
+                                        first
+                                        (or :select))
+        {::keys [coll where group]} (-> parse-map :table-expression first)
         {::keys [select-vars
-                 select-triples]} (->> parse-map
-                                       :select-list
-                                       first
-                                       (template/fill-in-collection coll))
-        where-clause              (reduce conj  where select-triples)]
+                 select-triples]}   (->> parse-map
+                                         :select-list
+                                         first
+                                         (template/fill-in-collection coll))
+        where-clause                (reduce conj  where select-triples)]
 
-    (bounce {select-key select-vars
-             :where     where-clause
-             ::coll     coll})))
+    (bounce (cond-> {select-key select-vars
+                     :where     where-clause
+                     ::coll     coll}
+              (seq group) (assoc :opts {:groupBy group})))))
 
 
 (defmethod rule-parser :ordering-specification

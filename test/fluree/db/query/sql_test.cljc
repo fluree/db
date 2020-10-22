@@ -228,4 +228,12 @@
                 subject (parse query)]
             (is (= (-> subject :opts :orderBy)
                    ["DESC" "person/age"])
-                "correctly constructs the orderBy clause")))))))
+                "correctly constructs the orderBy clause"))))
+
+      (testing "grouping"
+        (testing "with multiple fields"
+          (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 GROUP BY age, email"
+                subject (parse query)]
+            (is (= (-> subject :opts :groupBy)
+                   ["?age" "?email"])
+                "correctly constructs the groupBy clause")))))))
