@@ -136,7 +136,7 @@
                   ["?person" "person/foo" "\"bar\""]
                   ["?person" "person/name" "?name"]
                   ["?person" "person/email" "?email"]])
-              "correctly constructs the where clause"))))
+              "correctly constructs the where clause")))
 
       (testing "with OR"
         (let [query   "SELECT name, email FROM person WHERE age > 18 OR team = \"red\""
@@ -201,15 +201,31 @@
                 "correctly constructs the where clause")))
         (testing "with NOT"
           (testing "without NOT"
-          (let [query   "SELECT email FROM person WHERE age NOT IN (18, 19, 20, 21)"
+            (let [query   "SELECT email FROM person WHERE age NOT IN (18, 19, 20, 21)"
+                  subject (parse query)]
+
+              (is (= (:select subject)
+                     ["?email"])
+                  "correctly constructs the select clause")
+
+              (is (= (:where subject)
+                     [["?person" "person/age" "?age"]
+                      {:filter "(and (not= ?age 18) (not= ?age 19) (not= ?age 20) (not= ?age 21))"}
+                      ["?person" "person/email" "?email"]])
+                  "correctly constructs the where clause"))))))
+
+    (testing "with query options"
+      (testing "ordering"
+        (testing "without explicit direction"
+          (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 ORDER BY age"
                 subject (parse query)]
+            (is (= (-> subject :opts :orderBy)
+                   "person/age")
+                "correctly constructs the orderBy clause")))
 
-            (is (= (:select subject)
-                   ["?email"])
-                "correctly constructs the select clause")
-
-            (is (= (:where subject)
-                   [["?person" "person/age" "?age"]
-                    {:filter "(and (not= ?age 18) (not= ?age 19) (not= ?age 20) (not= ?age 21))"}
-                    ["?person" "person/email" "?email"]])
-                "correctly constructs the where clause")))))))
+        (testing "with explicit direction"
+          (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 ORDER BY age DESC"
+                subject (parse query)]
+            (is (= (-> subject :opts :orderBy)
+                   ["DESC" "person/age"])
+                "correctly constructs the orderBy clause")))))))

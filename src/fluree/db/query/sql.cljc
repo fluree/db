@@ -228,8 +228,48 @@
                                        first
                                        (template/fill-in-collection coll))
         where-clause              (reduce conj  where select-triples)]
+
     (bounce {select-key select-vars
-             :where     where-clause})))
+             :where     where-clause
+             ::coll     coll})))
+
+
+(defmethod rule-parser :ordering-specification
+  [[_ order]]
+  (-> order str/upper-case bounce))
+
+
+(defmethod rule-parser :sort-specification
+  [[_ & rst]]
+  (let [parse-map (parse-into-map rst)
+        pred      (-> parse-map
+                      :sort-key
+                      first
+                      template/field->predicate-template)]
+    (if-let [order (-> parse-map :ordering-specification first)]
+      (bounce [[order pred]])
+      (bounce pred))))
+
+
+(defmethod rule-parser :order-by-clause
+  [[_ _ & rst]]
+  (->> rst parse-all bounce))
+
+
+(defmethod rule-parser :direct-select-statement
+  [[_ & rst]]
+  (let [parse-map                 (parse-into-map rst)
+        {::keys [coll] :as query} (->> parse-map :query-expression first)]
+
+    (bounce (if-let [ordering (some->> parse-map
+                                       :order-by-clause
+                                       first
+                                       (template/fill-in-collection coll))]
+              (update query :opts (fn [opts]
+                                    (-> opts
+                                        (or {})
+                                        (assoc :orderBy ordering))))
+              query))))
 
 
 (defn parse
