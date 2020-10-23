@@ -850,13 +850,10 @@
   (go-try (let [{:keys [vars where optional filter]} q-map
                 where-res    (<? (resolve-where-clause db where q-map vars fuel max-fuel opts))
                 optional-res (if optional
-                               (do
-                                 (log/warn (str "The query key: optional should be included in the 'where' array. The top-level 'optional' is being deprecated. Provided: " (pr-str q-map)))
-                                 (<? (optional->left-outer-joins db q-map optional where-res fuel max-fuel opts))) where-res)
+                               (<? (optional->left-outer-joins db q-map optional where-res fuel max-fuel opts))
+                               where-res)
                 filter-res   (if filter
-                               (do
-                                 (log/warn (str "The query key: filter should be included in the 'where' array. The top-level 'filter' is being deprecated. Provided: " (pr-str q-map)))
-                                 (tuples->filtered optional-res filter nil))
+                               (tuples->filtered optional-res filter nil)
                                optional-res)
                 res          filter-res]
             res)))

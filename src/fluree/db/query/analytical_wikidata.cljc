@@ -87,9 +87,7 @@
 
 (defn generateWikiDataQuery
   [q-map clauses select-vars value-clause optional-clauses]
-  (let [_            (when (:wikidataOpts q-map)
-                       (log/warn (str "The Wikidata query option map should be included in the opts map. Top-level options are being deprecated. Provided: " (pr-str q-map))))
-        opts         (merge {:limit 100 :offset 0 :distinct false :language "en"}
+  (let [opts         (merge {:limit 100 :offset 0 :distinct false :language "en"}
                             (:wikidataOpts q-map) (get-in [:opts :wikidataOpts] q-map))
         {:keys [limit offset distinct language prefixes]} opts
         prefixes     (when prefixes (parse-prefixes prefixes))
