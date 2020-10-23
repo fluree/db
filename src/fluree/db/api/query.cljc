@@ -225,13 +225,12 @@
           start #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
           db            (<? (db conn ledger {:auth (when auth-id ["_auth/id" auth-id])}))
           [block-start block-end] (<? (resolve-block-range db query-map))
-          result        (if (= '(:block) (keys (dissoc query-map :pretty-print :opts)))
+          result        (if (= '(:block) (keys (dissoc query-map :pretty-print :opts :prettyPrint)))
                           (<? (block-range db block-start block-end opts))
                           (throw (ex-info (str "Block query not properly formatted. It must only have a block key. Provided "
                                                (pr-str query-map))
                                           {:status 400
                                            :error  :db/invalid-query})))
-          _             (when (:pretty-print query-map) (log/warn (str "The pretty-print key should be rename `prettyPrint`. `pretty-print` is being deprecated. Provided: " (pr-str query-map))))
           result'       (if (or (:prettyPrint query-map) (:pretty-print query-map))
                           (<? (format-blocks-resp-pretty db result))
                           result)]
@@ -332,8 +331,6 @@
   (go-try
     (let [{:keys [block history pretty-print prettyPrint show-auth showAuth auth opts]} query-map
           db     (<? sources)                               ;; only support 1 source currently
-          _      (when pretty-print (log/warn (str "The pretty-print key should be rename `prettyPrint`. `pretty-print` is being deprecated. Provided: " (pr-str query-map))))
-          _      (when show-auth (log/warn (str "The show-auth key should be rename `showAuth`. `pretty-print` is being deprecated. Provided: " (pr-str query-map))))
 
           [block-start block-end] (if block (<? (resolve-block-range db query-map)))
           result (if (= '(:history) (keys (dissoc query-map :block :pretty-print :prettyPrint :auth :show-auth :showAuth :opts)))
