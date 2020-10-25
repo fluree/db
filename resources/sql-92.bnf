@@ -284,19 +284,17 @@ column-reference ::= [ qualifier <period> ] column-name
  subquery   ::=  left-paren query-expression right-paren
 
  joined-table   ::=
-             cross-join
-        |    qualified-join
+             qualified-join
+        |    cross-join
         |    left-paren    joined-table    right-paren
-
- cross-join   ::=
-                 table-reference   'CROSS JOIN'  table-reference
 
  qualified-join   ::=
                  table-reference   [ 'NATURAL' ] [  join-type   ] 'JOIN'  table-reference   [  join-specification   ]
 
- table-reference   ::=
-            table-name   |    (derived-table    correlation-specification )
-        |    joined-table
+ cross-join   ::=
+                 table-reference   'CROSS JOIN'  table-reference
+
+ table-reference ::= table-name | joined-table | ( derived-table correlation-specification )
 
  derived-table   ::=  table-subquery
 

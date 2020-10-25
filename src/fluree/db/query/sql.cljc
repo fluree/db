@@ -98,6 +98,16 @@
        bounce))
 
 
+(defmethod rule-parser :column-reference
+  [[_ & rst]]
+  (let [parse-map (parse-into-map rst)
+        column    (-> parse-map :column-name first)
+        qualifier (-> parse-map :qualifier first)]
+    (cond->> column
+      qualifier (template/build-predicate qualifier)
+      :finally  bounce)))
+
+
 (defmethod rule-parser :set-quantifier
   [[_ quantifier]]
   (let [k  (if (= quantifier "DISTINCT") :selectDistinct :select)]
@@ -239,10 +249,11 @@
                                          (template/fill-in-collection coll))
         where-clause                (reduce conj  where select-triples)]
 
-    (bounce (cond-> {select-key select-vars
-                     :where     where-clause
-                     ::coll     coll}
-              (seq group) (assoc :opts {:groupBy group})))))
+    (cond-> {select-key select-vars
+             :where     where-clause
+             ::coll     coll}
+      (seq group) (assoc :opts {:groupBy group})
+      :finally    bounce)))
 
 
 (defmethod rule-parser :ordering-specification
@@ -270,17 +281,17 @@
 (defmethod rule-parser :direct-select-statement
   [[_ & rst]]
   (let [parse-map                 (parse-into-map rst)
-        {::keys [coll] :as query} (->> parse-map :query-expression first)]
-
-    (bounce (if-let [ordering (some->> parse-map
-                                       :order-by-clause
-                                       first
-                                       (template/fill-in-collection coll))]
-              (update query :opts (fn [opts]
-                                    (-> opts
-                                        (or {})
-                                        (assoc :orderBy ordering))))
-              query))))
+        {::keys [coll] :as query} (->> parse-map :query-expression first)
+        ordering                  (some->> parse-map
+                                           :order-by-clause
+                                           first
+                                           (template/fill-in-collection coll))]
+    (cond-> query
+      ordering (update :opts (fn [opts]
+                               (-> opts
+                                   (or {})
+                                   (assoc :orderBy ordering))))
+      :finally bounce)))
 
 
 (defn parse

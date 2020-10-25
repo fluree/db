@@ -2,10 +2,20 @@
   (:require [clojure.string :as str]
             [clojure.walk :refer [postwalk]]))
 
-(defn build-var
-  "Formats `s` as a var by prepending '?'"
+(defn normalize
+  "Formats `s` by removing any '/' and capitalizing the following character for
+  each '/' removed"
   [s]
-  (str "?" s))
+  (->> (str/split s #"/")
+       (reduce (fn [norm nxt]
+                 (str norm (str/capitalize nxt))))))
+
+(defn build-var
+  "Formats `s` as a var by prepending '?' and filtering out '/'"
+  [s]
+  (->> s
+       normalize
+       (str "?")))
 
 (defn build-predicate
   "Formats the collection string `c` and the field string `f` by joining them
