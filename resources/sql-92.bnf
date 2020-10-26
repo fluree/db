@@ -26,7 +26,7 @@ having-clause ::= 'HAVING' <space> search-condition
 
 select-list ::= asterisk | select-sublist [ {  comma <space> select-sublist   } ]
 
-select-sublist ::= column-name | (qualifier period asterisk) (* | derived-column *)
+select-sublist ::= column-name | (qualifier <period> asterisk) | derived-column
 
 qualifier   ::=  table-name   |  correlation-name
 
@@ -286,35 +286,35 @@ column-reference ::= [ qualifier <period> ] column-name
  joined-table   ::=
              qualified-join
         |    cross-join
-        |    left-paren    joined-table    right-paren
+        |    left-paren joined-table right-paren
 
  qualified-join   ::=
-                 table-reference   [ 'NATURAL' ] [  join-type   ] 'JOIN'  table-reference   [  join-specification   ]
+             table-reference <space> [ 'NATURAL' <space> ] [ join-type <space> ] 'JOIN' <space> table-reference [ <space> join-specification ]
 
  cross-join   ::=
-                 table-reference   'CROSS JOIN'  table-reference
+                 table-reference <space> 'CROSS JOIN' <space> table-reference
 
- table-reference ::= table-name | joined-table | ( derived-table correlation-specification )
+ table-reference ::= table-name | joined-table | ( derived-table <space> correlation-specification )
 
  derived-table   ::=  table-subquery
 
  table-subquery   ::=  subquery
 
- join-specification   ::=  join-condition   |  named-columns-join
+ join-specification ::=  join-condition | named-columns-join
 
- join-condition   ::= 'ON'  search-condition
+ join-condition ::= 'ON' <space> search-condition
 
- named-columns-join   ::= 'USING'  left-paren    join-column-list    right-paren
+ named-columns-join ::= 'USING' <space> left-paren join-column-list right-paren
 
  join-column-list   ::=  column-name-list
 
  correlation-specification   ::=
-                <space> [  'AS' <space>]  correlation-name   [  left-paren    derived-column-list    right-paren   ]
+                [ 'AS' <space>]  correlation-name   [  left-paren    derived-column-list    right-paren   ]
 
  derived-column-list   ::=  column-name-list
 
  join-type   ::=
-                'INNER'
+            'INNER'
         |    outer-join-type   [ 'OUTER' ]
         |   'UNION'
 
@@ -335,11 +335,11 @@ column-reference ::= [ qualifier <period> ] column-name
 
  corresponding-column-list   ::=  column-name-list
 
- column-name-list   ::=  column-name   [ {  comma    column-name   }]
+ column-name-list ::= column-name [ { comma <space> column-name }]
 
- non-join-query-primary   ::=  simple-table   |  left-paren    non-join-query-expression    right-paren
+ non-join-query-primary ::= simple-table |  left-paren non-join-query-expression right-paren
 
- simple-table   ::=
+ simple-table ::=
                  query-specification
         |	 table-value-constructor
         |	 explicit-table
@@ -792,9 +792,9 @@ asterisk ::= '*'
 
  colon   ::= ':'
 
-semicolon   ::= ';'
+ semicolon   ::= ';'
 
-less-than-operator   ::= '<'
+ less-than-operator   ::= '<'
 
  equals-operator   ::= '='
 
