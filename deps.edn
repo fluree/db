@@ -39,7 +39,9 @@
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.66"}
 
         ;; cljs
-        figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}
+        figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
+        ;; docs
+        codox/codox {:mvn/version "0.10.7"}}
  :paths ["src" "resources"]
  :aliases
  {:js-deps
