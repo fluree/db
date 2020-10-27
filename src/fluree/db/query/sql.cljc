@@ -114,20 +114,32 @@
     (bounce k)))
 
 
+(defmethod rule-parser :asterisk
+  [_]
+  (bounce {template/collection-var ["*"]}))
+
+
+(defmethod rule-parser :select-list-element
+  [[_ & rst]]
+  (let [parse-map (parse-into-map rst)
+        column    (->> parse-map :column-name first)]
+    (cond
+      column (let [var    (template/build-var column)
+                   pred   (template/field->predicate-template column)
+                   triple [template/collection-var pred var]]
+               (bounce {::select-vars    [var]
+                        ::select-triples [triple]})))))
+
+
 (defmethod rule-parser :select-list
   [[_ & rst]]
-  (let [{:keys [asterisk select-sublist]} (parse-into-map rst)]
-    (cond
-      asterisk       (bounce {::select-vars    {template/collection-var ["*"]}})
-      select-sublist (let [vars    (->> select-sublist
-                                        (map template/build-var)
-                                        vec)
-                           triples (map (fn [fld var]
-                                          (let [pred (template/field->predicate-template fld)]
-                                            [template/collection-var pred var]))
-                                        select-sublist vars)]
-                       (bounce {::select-vars    vars
-                                ::select-triples triples})))))
+  (let [parse-map (parse-into-map rst)
+        asterisk  (some->> parse-map :asterisk first)
+        sublist   (some->> parse-map
+                           :select-list-element
+                           (apply merge-with into))]
+    (bounce (or sublist
+                {::select-vars asterisk}))))
 
 
 (defmethod rule-parser :between-predicate

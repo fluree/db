@@ -24,9 +24,9 @@ grouping-column-reference ::= column-reference [ <space> collate-clause ]
 
 having-clause ::= 'HAVING' <space> search-condition
 
-select-list ::= asterisk | select-sublist [ {  comma <space> select-sublist   } ]
+select-list ::= asterisk | select-list-element [ { comma <space> select-list-element } ]
 
-select-sublist ::= column-name | (qualifier <period> asterisk) | derived-column
+select-list-element ::= column-name | (qualifier <period> asterisk) | derived-column
 
 qualifier   ::=  table-name   |  correlation-name
 
