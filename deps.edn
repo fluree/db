@@ -47,13 +47,14 @@
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
    :main-opts ["-m" "target-bundle-libs.core"]}
 
+  :nodejs
+  {:extra-paths ["src-nodejs"]
+   :main-opts ["-m" "cljs.main" "--compile-opts" "build-nodejs.edn" "--compile"]}
+
   :browser
   {:extra-paths ["src-cljs"]
    :main-opts ["-m" "cljs.main" "--compile-opts" "build-browser.edn" "--compile"]}
 
-  :nodejs
-  {:extra-paths ["src-nodejs"]
-   :main-opts ["-m" "cljs.main" "--compile-opts" "build-nodejs.edn" "--compile"]}
 
   :jar
   {:extra-deps {seancorfield/depstar {:mvn/version "1.1.117"}}
