@@ -1,8 +1,5 @@
 (ns fluree.db.token-auth
-  (:require [fluree.crypto :as crypto]
-            [fluree.crypto.hmac :refer [hmac-sha256]]
-            [fluree.crypto.scrypt :as scrypt]
-            [fluree.crypto.secp256k1 :as secp256k1]
+  (:require [fluree.crypto.hmac :refer [hmac-sha256]]
             [alphabase.core :as alphabase]
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.json :as json]

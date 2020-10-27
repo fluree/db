@@ -500,7 +500,7 @@
   [?ctx pred-name]
   (go-try
     (let [pred-name (extract pred-name)
-          [res fuel] (<? (fdb/max-pred-val (:db ?ctx) pred-name))
+          [res fuel] (<? (fdb/max-pred-val (:db ?ctx) pred-name nil))
           entry     [{:function "max-pred-val" :arguments pred-name :result res} (clojure.core/+ fuel 10)]]
       (add-stack ?ctx entry)
       res)))

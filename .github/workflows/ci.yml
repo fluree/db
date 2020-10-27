@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: 13 01 * * *
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Build Docker image
+        run: docker build -t fluree/db .
+      - name: Notify Slack fail
+        if: failure()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        uses: voxmedia/github-action-slack-notify-build@v1
+        with:
+          channel_id: CNCH08G14 # development channel
+          status: FAILED
+          color: danger

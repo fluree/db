@@ -1,11 +1,15 @@
-{:output-to     "out/browser/flureedb.js"
- :output-dir    "out/browser/build"
- :main          flureedb
- :optimizations :advanced
- :pretty-print  false
- :infer-externs true
- :install-deps  true
- :npm-deps      {}
- :bundle-cmd {:none ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/main.js" "--mode=development"]
-              :default ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/main.js"]}
- :closure-defines {cljs.core/*global* "window"}}
+{:output-to          "out/browser/index.js"
+ :output-dir         "out/browser"
+ :target             :bundle
+ :main               flureedb
+ :optimizations      :advanced
+ :optimize-constants false
+ :pretty-print       false
+ :pseudo-names       false
+ :infer-externs      true
+ :externs            ["sjcl-externs.js"]
+ :install-deps       true
+ :npm-deps           {}
+ :bundle-cmd         {:none    ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/flureedb.js" "--mode=development"]
+                      :default ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/flureedb.js"]}
+ :closure-defines    {cljs.core/*global* "window"}}

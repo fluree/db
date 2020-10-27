@@ -63,21 +63,24 @@
               result (when (not (nil? funs))
                        (if (boolean? funs)
                          funs
-                         (async/<! (process-functions flake funs db permissions))))]
+                         (async/<! (process-functions flake funs db permissions))))
+              ;; if we ever find a function explicitly assigned, don't check for
+              ;; collection defaults
+              check-defaults?* (if (nil? funs) check-defaults? false)]
           (cond
             ;; exception
             (util/exception? result) result
 
-            ;; any truthy value means flake is allowed
+            ;; any truthy value means flake is allowed, don't check defaults
             result
-            [true check-defaults?]
+            [true false]
 
             ;; nothing left to check, cannot see flake
             (empty? r)
-            [false check-defaults?]
+            [false check-defaults?*]
 
             :else
-            (recur r (if (empty? funs) check-defaults? false))))))))
+            (recur r check-defaults?*)))))))
 
 
 (defn root-permission?
@@ -103,16 +106,12 @@
          (if (util/exception? check)
            check
            (let [[result check-defaults?] check]
-             (if (not (nil? result))
-               result
-               (if check-defaults?
-                 (let [check-defaults (async/<!
-                                        (check-explicit-functions flake db permissions [[:collection cid :default]
-                                                                                        [:collection :default]]))]
-                   (if (util/exception? check-defaults)
-                     check-defaults
-                     (first check-defaults)))
-                 false)))))))))
+             (if check-defaults?
+               (first                                       ;; returns two-tuple
+                 (async/<!
+                   (check-explicit-functions flake db permissions [[:collection cid :default]
+                                                                   [:collection :default]])))
+               result))))))))
 
 
 (defn allow-flakes?

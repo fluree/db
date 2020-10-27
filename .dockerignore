@@ -2,3 +2,4 @@
 .idea/
 db.iml
 target/
+node_modules/
