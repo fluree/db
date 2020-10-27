@@ -9,7 +9,7 @@ set-quantifier ::= 'DISTINCT' | 'ALL'
 
 table-expression ::= from-clause [ <space> where-clause ] [ <space> group-by-clause ] [ <space> having-clause ]
 
-from-clause ::=  <'FROM'> <space>  table-reference [ {  comma  <space>  table-reference } ]
+from-clause ::= 'FROM' <space> table-reference [ { comma <space> table-reference } ]
 
 order-by-clause ::= 'ORDER BY' <space> sort-specification-list
 
@@ -309,13 +309,13 @@ column-reference ::= [ qualifier <period> ] column-name
  join-column-list   ::=  column-name-list
 
  correlation-specification   ::=
-                [ 'AS' <space>]  correlation-name   [  left-paren    derived-column-list    right-paren   ]
+                [ 'AS' <space> ]  correlation-name   [  left-paren    derived-column-list    right-paren   ]
 
  derived-column-list   ::=  column-name-list
 
  join-type   ::=
             'INNER'
-        |    outer-join-type   [ 'OUTER' ]
+        |    outer-join-type [ <space> 'OUTER' ]
         |   'UNION'
 
  outer-join-type   ::= 'LEFT' | 'RIGHT' | 'FULL'

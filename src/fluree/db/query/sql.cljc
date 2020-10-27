@@ -231,10 +231,29 @@
        bounce))
 
 
+(defmethod rule-parser :table-reference
+  [[_ & rst]]
+  (let [parse-map     (parse-into-map rst)
+        table-name    (some->> parse-map :table-name first)
+        joined-table  (some->> parse-map :joined-table first)
+        derived-table (some->> parse-map :derived-table first)]
+    (bounce (cond
+              table-name   {::coll [table-name]}
+              joined-table joined-table))))
+
+
+(defmethod rule-parser :from-clause
+  [[_ _ & rst]]
+  (->> rst
+       parse-all
+       (apply merge-with into)
+       bounce))
+
+
 (defmethod rule-parser :table-expression
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
-        from      (-> parse-map :from-clause first)
+        from      (-> parse-map :from-clause first ::coll first)
         where     (->> (:where-clause parse-map)
                        (template/fill-in-collection from)
                        vec)
