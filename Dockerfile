@@ -1,10 +1,17 @@
-FROM clojure:tools-deps-1.10.1.716-slim-buster
+FROM clojure:tools-deps-1.10.1.727-slim-buster
 
 RUN mkdir -p /usr/src/flureedb
 WORKDIR /usr/src/flureedb
 
+# Add node PPA to get newer versions
+RUN curl -sL https://deb.nodesource.com/setup_14.x | bash -
+RUN apt-get update && apt-get install -y npm
+
 COPY deps.edn Makefile ./
 RUN make deps
+
+COPY package.json ./
+RUN npm install
 
 COPY . ./
 
