@@ -65,8 +65,9 @@
                "target/fluree-db.jar"]}
 
   :docs
-  {:extra-deps {codox/codox {:mvn/version "0.10.7"}}
-   :main-opts ["script/docs.clj"]}
+  {:extra-paths ["src-docs"]
+   :extra-deps {codox/codox {:mvn/version "0.10.7"}}
+   :main-opts ["-m" "fluree.db.docs"]}
 
   :deploy
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
