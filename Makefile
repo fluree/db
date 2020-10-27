@@ -44,4 +44,4 @@ clean:
 	rm -rf out
 
 docs: pom.xml src/fluree/db/api.clj doc/*.md
-	clojure script/docs.clj
+	clojure -M:docs

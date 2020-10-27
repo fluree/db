@@ -39,9 +39,8 @@
         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.66"}
 
         ;; cljs
-        figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-        ;; docs
-        codox/codox {:mvn/version "0.10.7"}}
+        figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}
+
  :paths ["src" "resources"]
  :aliases
  {:js-deps
@@ -64,6 +63,10 @@
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
    :main-opts ["-m" "deps-deploy.deps-deploy" "install"
                "target/fluree-db.jar"]}
+
+  :docs
+  {:extra-deps {codox/codox {:mvn/version "0.10.7"}}
+   :main-opts ["script/docs.clj"]}
 
   :deploy
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
