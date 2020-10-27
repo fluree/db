@@ -40,6 +40,7 @@
 
         ;; cljs
         figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}
+
  :paths ["src" "resources"]
  :aliases
  {:js-deps
@@ -63,6 +64,11 @@
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
    :main-opts ["-m" "deps-deploy.deps-deploy" "install"
                "target/fluree-db.jar"]}
+
+  :docs
+  {:extra-paths ["src-docs"]
+   :extra-deps {codox/codox {:mvn/version "0.10.7"}}
+   :main-opts ["-m" "fluree.db.docs"]}
 
   :deploy
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
