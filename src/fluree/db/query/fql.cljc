@@ -925,10 +925,10 @@
                       opts)
         opts'' (if selectOne (assoc opts' :limit 1) opts')]
     (if #?(:clj (:cache opts'') :cljs false)
-      ;; handle caching
+      ;; handle caching - TODO - if a cache value exists, should max-fuel still be checked and throw if not enough?
       (let [oc (get-in db [:conn :object-cache])]
         ;; object cache takes (a) key and (b) fn to retrieve value if null
-        (oc [:query (:block db) query-map (dissoc opts :fuel) (:auth db)]
+        (oc [:query (:block db) (dissoc query-map :opts) (dissoc opts'' :fuel :max-fuel) (:auth db)]
             (fn [_]
               (let [pc (async/promise-chan)]
                 (async/go
