@@ -920,34 +920,34 @@
   "Returns core async channel with results"
   [db query-map]
   (let [{:keys [select selectOne selectDistinct where from limit offset component orderBy groupBy prettyPrint opts]} query-map
-        opts'  (merge {:limit   limit :offset (or offset 0) :component component
-                       :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
-                      opts)
-        opts'' (if selectOne (assoc opts' :limit 1) opts')]
-    (if #?(:clj (:cache opts'') :cljs false)
-      ;; handle caching
+        opts' (cond-> (merge {:limit   limit :offset (or offset 0) :component component
+                              :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
+                             opts)
+                      selectOne (assoc :limit 1))]
+    (if #?(:clj (:cache opts') :cljs false)
+      ;; handle caching - TODO - if a cache value exists, should max-fuel still be checked and throw if not enough?
       (let [oc (get-in db [:conn :object-cache])]
         ;; object cache takes (a) key and (b) fn to retrieve value if null
-        (oc [:query (:block db) query-map (dissoc opts :fuel) (:auth db)]
+        (oc [:query (:block db) (dissoc query-map :opts) (dissoc opts' :fuel :max-fuel) (:auth db)]
             (fn [_]
               (let [pc (async/promise-chan)]
                 (async/go
                   (let [res (async/<! (query db (assoc-in query-map [:opts :cache] false)))]
                     (async/put! pc res)))
                 pc))))
-      (let [max-fuel (:max-fuel opts'')
+      (let [max-fuel (:max-fuel opts')
             fuel     (or (:fuel opts)                       ;; :fuel volatile! can be provided upstream
                          (when (or max-fuel (:meta opts))
                            (volatile! 0)))]
         (if (sequential? where)
           ;; ad-hoc query
-          (ad-hoc-query db fuel max-fuel query-map opts'')
+          (ad-hoc-query db fuel max-fuel query-map opts')
           ;; all other queries
           (go-try
             (let [select-smt   (or select selectOne selectDistinct
                                    (throw (ex-info "Query missing :select or :selectOne." {:status 400 :error :db/invalid-query})))
-                  {:keys [orderBy limit component offset]} opts''
-                  select-spec  (parse-db db select-smt opts'')
+                  {:keys [orderBy limit component offset]} opts'
+                  select-spec  (parse-db db select-smt opts')
                   select-spec' (if (not (nil? component))
                                  (assoc select-spec :componentFollow? component)
                                  select-spec)
