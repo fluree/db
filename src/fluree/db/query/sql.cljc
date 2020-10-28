@@ -85,6 +85,14 @@
        bounce))
 
 
+(defmethod rule-parser :character-string-literal
+  [[_ & rst]]
+  (->> rst
+       parse-all
+       (apply str)
+       bounce))
+
+
 (defmethod rule-parser :double-quote
   [_]
   (bounce \"))

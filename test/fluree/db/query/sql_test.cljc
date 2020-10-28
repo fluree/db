@@ -124,7 +124,7 @@
 
     (testing "on a complex query"
       (testing "with AND"
-        (let [query   "SELECT name, email FROM person WHERE age = 18 AND team = \"red\" AND foo = \"bar\""
+        (let [query   "SELECT name, email FROM person WHERE age = 18 AND team = 'red' AND foo = 'bar'"
               subject (parse query)]
           (is (= (:select subject)
                  ["?personName" "?personEmail"])
@@ -132,14 +132,14 @@
 
           (is (= (:where subject)
                  [["?person" "person/age" 18]
-                  ["?person" "person/team" "\"red\""]
-                  ["?person" "person/foo" "\"bar\""]
+                  ["?person" "person/team" "'red'"]
+                  ["?person" "person/foo" "'bar'"]
                   ["?person" "person/name" "?personName"]
                   ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
 
       (testing "with OR"
-        (let [query   "SELECT name, email FROM person WHERE age > 18 OR team = \"red\""
+        (let [query   "SELECT name, email FROM person WHERE age > 18 OR team = 'red'"
               subject (parse query)]
 
           (is (= (:select subject)
@@ -150,7 +150,7 @@
                  [{:union
                    [[["?person" "person/age" "?personAge"]
                      {:filter ["(> ?personAge 18)"]}]
-                    [["?person" "person/team" "\"red\""]]]}
+                    [["?person" "person/team" "'red'"]]]}
                   ["?person" "person/name" "?personName"]
                   ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
