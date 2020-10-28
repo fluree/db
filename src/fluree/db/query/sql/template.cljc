@@ -11,7 +11,8 @@
                  (str norm (str/capitalize nxt))))))
 
 (defn build-var
-  "Formats `s` as a var by prepending '?' and filtering out '/'"
+  "Formats `s` as a var by prepending '?', filtering out '/', and lowerCamelCasing
+  the remaining string"
   [s]
   (->> s
        normalize

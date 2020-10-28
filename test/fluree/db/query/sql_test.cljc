@@ -52,13 +52,13 @@
               subject (parse query)]
 
           (is (= (:select subject)
-                 ["?name" "?email"])
+                 ["?personName" "?personEmail"])
               "correctly constructs the select clause")
 
           (is (= (:where subject)
                  [["?person" "person/age" 18]
-                  ["?person" "person/name" "?name"]
-                  ["?person" "person/email" "?email"]])
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
 
       (testing "with 'greater than' predicate"
@@ -66,14 +66,14 @@
               subject (parse query)]
 
           (is (= (:select subject)
-                 ["?name" "?email"])
+                 ["?personName" "?personEmail"])
               "correctly constructs the select clause")
 
           (is (= (:where subject)
-                 [["?person" "person/age" "?age"]
-                  {:filter ["(> ?age 18)"]}
-                  ["?person" "person/name" "?name"]
-                  ["?person" "person/email" "?email"]])
+                 [["?person" "person/age" "?personAge"]
+                  {:filter ["(> ?personAge 18)"]}
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
 
       (testing "with 'less than' predicate"
@@ -81,14 +81,14 @@
               subject (parse query)]
 
           (is (= (:select subject)
-                 ["?name" "?email"])
+                 ["?personName" "?personEmail"])
               "correctly constructs the select clause")
 
           (is (= (:where subject)
-                 [["?person" "person/age" "?age"]
-                  {:filter ["(< ?age 18)"]}
-                  ["?person" "person/name" "?name"]
-                  ["?person" "person/email" "?email"]])
+                 [["?person" "person/age" "?personAge"]
+                  {:filter ["(< ?personAge 18)"]}
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
 
       (testing "with a null predicate"
@@ -97,13 +97,13 @@
                 subject (parse query)]
 
           (is (= (:select subject)
-                 ["?name" "?email"])
+                 ["?personName" "?personEmail"])
               "correctly constructs the select clause")
 
           (is (= (:where subject)
-                 [["?person" "person/email" "?email"]
-                  ["?person" "person/name" "?name"]
-                  ["?person" "person/email" "?email"]])
+                 [["?person" "person/email" "?personEmail"]
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
 
         (testing "not negated"
@@ -111,15 +111,15 @@
                 subject (parse query)]
 
           (is (= (:select subject)
-                 ["?name" "?email"])
+                 ["?personName" "?personEmail"])
               "correctly constructs the select clause")
 
           (is (= (:where subject)
                  [["?person" "rdf:type" "person"]
-                  {:optional [["?person" "person/email" "?email"]]}
-                  {:filter ["(nil? ?email)"]}
-                  ["?person" "person/name" "?name"]
-                  ["?person" "person/email" "?email"]])
+                  {:optional [["?person" "person/email" "?personEmail"]]}
+                  {:filter ["(nil? ?personEmail)"]}
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))))
 
     (testing "on a complex query"
@@ -127,15 +127,15 @@
         (let [query   "SELECT name, email FROM person WHERE age = 18 AND team = \"red\" AND foo = \"bar\""
               subject (parse query)]
           (is (= (:select subject)
-                 ["?name" "?email"])
+                 ["?personName" "?personEmail"])
               "correctly constructs the select clause")
 
           (is (= (:where subject)
                  [["?person" "person/age" 18]
                   ["?person" "person/team" "\"red\""]
                   ["?person" "person/foo" "\"bar\""]
-                  ["?person" "person/name" "?name"]
-                  ["?person" "person/email" "?email"]])
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
 
       (testing "with OR"
@@ -143,16 +143,16 @@
               subject (parse query)]
 
           (is (= (:select subject)
-                 ["?name" "?email"])
+                 ["?personName" "?personEmail"])
               "correctly constructs the select clause")
 
           (is (= (:where subject)
                  [{:union
-                   [[["?person" "person/age" "?age"]
-                     {:filter ["(> ?age 18)"]}]
+                   [[["?person" "person/age" "?personAge"]
+                     {:filter ["(> ?personAge 18)"]}]
                     [["?person" "person/team" "\"red\""]]]}
-                  ["?person" "person/name" "?name"]
-                  ["?person" "person/email" "?email"]])
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]])
               "correctly constructs the where clause")))
 
       (testing "with BETWEEN"
@@ -161,13 +161,13 @@
                 subject (parse query)]
 
             (is (= (:select subject)
-                   ["?email"])
+                   ["?personEmail"])
                 "correctly constructs the select clause")
 
             (is (= (:where subject)
-                   [["?person" "person/age" "?age"]
-                    {:filter ["(>= ?age 18)" "(<= ?age 35)"]}
-                    ["?person" "person/email" "?email"]])
+                   [["?person" "person/age" "?personAge"]
+                    {:filter ["(>= ?personAge 18)" "(<= ?personAge 35)"]}
+                    ["?person" "person/email" "?personEmail"]])
                 "correctly constructs the where clause")))
 
         (testing "with NOT"
@@ -175,14 +175,14 @@
                 subject (parse query)]
 
             (is (= (:select subject)
-                   ["?email"])
+                   ["?personEmail"])
                 "correctly constructs the select clause")
 
             (is (= (:where subject)
-                   [["?person" "person/age" "?age"]
-                    {:union [{:filter ["(< ?age 18)"]}
-                             {:filter ["(> ?age 35)"]}]}
-                    ["?person" "person/email" "?email"]])
+                   [["?person" "person/age" "?personAge"]
+                    {:union [{:filter ["(< ?personAge 18)"]}
+                             {:filter ["(> ?personAge 35)"]}]}
+                    ["?person" "person/email" "?personEmail"]])
                 "correctly constructs the where clause"))))
 
       (testing "with IN"
@@ -191,13 +191,13 @@
                 subject (parse query)]
 
             (is (= (:select subject)
-                   ["?email"])
+                   ["?personEmail"])
                 "correctly constructs the select clause")
 
             (is (= (:where subject)
-                   [["?person" "person/age" "?age"]
-                    {:filter "(or (= ?age 18) (= ?age 19) (= ?age 20) (= ?age 21))"}
-                    ["?person" "person/email" "?email"]])
+                   [["?person" "person/age" "?personAge"]
+                    {:filter "(or (= ?personAge 18) (= ?personAge 19) (= ?personAge 20) (= ?personAge 21))"}
+                    ["?person" "person/email" "?personEmail"]])
                 "correctly constructs the where clause")))
         (testing "with NOT"
           (testing "without NOT"
@@ -205,13 +205,13 @@
                   subject (parse query)]
 
               (is (= (:select subject)
-                     ["?email"])
+                     ["?personEmail"])
                   "correctly constructs the select clause")
 
               (is (= (:where subject)
-                     [["?person" "person/age" "?age"]
-                      {:filter "(and (not= ?age 18) (not= ?age 19) (not= ?age 20) (not= ?age 21))"}
-                      ["?person" "person/email" "?email"]])
+                     [["?person" "person/age" "?personAge"]
+                      {:filter "(and (not= ?personAge 18) (not= ?personAge 19) (not= ?personAge 20) (not= ?personAge 21))"}
+                      ["?person" "person/email" "?personEmail"]])
                   "correctly constructs the where clause"))))))
 
     (testing "with query options"
@@ -235,5 +235,5 @@
           (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 GROUP BY age, email"
                 subject (parse query)]
             (is (= (-> subject :opts :groupBy)
-                   ["?age" "?email"])
+                   ["?personAge" "?personEmail"])
                 "correctly constructs the groupBy clause")))))))

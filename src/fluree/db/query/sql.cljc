@@ -101,11 +101,10 @@
 (defmethod rule-parser :column-reference
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
-        column    (-> parse-map :column-name first)
-        qualifier (-> parse-map :qualifier first)]
-    (cond->> column
-      qualifier (template/build-predicate qualifier)
-      :finally  bounce)))
+        column    (-> parse-map :column-name first)]
+    (bounce (if-let [qualifier (-> parse-map :qualifier first)]
+              (template/build-predicate qualifier column)
+              (template/field->predicate-template column)))))
 
 
 (defmethod rule-parser :set-quantifier
@@ -124,8 +123,8 @@
   (let [parse-map (parse-into-map rst)
         column    (->> parse-map :column-name first)]
     (cond
-      column (let [var    (template/build-var column)
-                   pred   (template/field->predicate-template column)
+      column (let [pred   (template/field->predicate-template column)
+                   var    (template/build-var pred)
                    triple [template/collection-var pred var]]
                (bounce {::select-vars    [var]
                         ::select-triples [triple]})))))
@@ -138,18 +137,18 @@
         sublist   (some->> parse-map
                            :select-list-element
                            (apply merge-with into))]
-    (bounce (or sublist
-                {::select-vars asterisk}))))
+    (-> sublist
+        (or {::select-vars asterisk})
+        bounce)))
 
 
 (defmethod rule-parser :between-predicate
   [[_ & rst]]
-  (let [[field lower upper] (->> rst
+  (let [[pred lower upper] (->> rst
                                 (filter rule?)
                                 parse-all)
-        pred-tmpl           (template/field->predicate-template field)
-        field-var           (template/build-var field)
-        selector            [template/collection-var pred-tmpl field-var]
+        field-var           (template/build-var pred)
+        selector            [template/collection-var pred field-var]
         refinement          (if (some #{"NOT"} rst)
                               {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
                                        {:filter [(template/build-fn-call [">" field-var upper])]}]}
@@ -162,14 +161,13 @@
   [[_ & rst]]
   (let [parse-map  (parse-into-map rst)
         comp       (-> parse-map :comp-op first)
-        [field v]  (:row-value-constructor parse-map)
-        pred-tmpl  (template/field->predicate-template field)]
+        [pred v]  (:row-value-constructor parse-map)]
     (bounce (cond
-              (#{\=} comp)    [[template/collection-var pred-tmpl v]]
+              (#{\=} comp)    [[template/collection-var pred v]]
 
-              (#{\> \<} comp) (let [field-var (template/build-var field)
+              (#{\> \<} comp) (let [field-var (template/build-var pred)
                                     filter-fn (template/build-fn-call [comp field-var v])]
-                                [[template/collection-var pred-tmpl field-var]
+                                [[template/collection-var pred field-var]
                                  {:filter [filter-fn]}])))))
 
 
@@ -179,10 +177,9 @@
                             (filter (fn [e]
                                       (not (contains? #{"IN" "NOT"} e))))
                             parse-into-map)
-        field          (-> parse-map :row-value-constructor first)
-        pred-tmpl      (template/field->predicate-template field)
-        field-var      (template/build-var field)
-        selector       [template/collection-var pred-tmpl field-var]
+        pred           (-> parse-map :row-value-constructor first)
+        field-var      (template/build-var pred)
+        selector       [template/collection-var pred field-var]
         not?           (some #{"NOT"} rst)
         filter-pred    (if not? "not=" "=")
         filter-junc    (if not? "and" "or")
@@ -196,13 +193,13 @@
 
 
 (defmethod rule-parser :null-predicate
-  [[_ f & rst]]
-  (let [field     (-> f parse-element first)
-        field-var (template/build-var field)]
+  [[_ p & rst]]
+  (let [pred      (-> p parse-element first)
+        field-var (template/build-var pred)]
     (if (some #{"NOT"} rst)
-      (bounce [[template/collection-var (template/field->predicate-template field) field-var]])
+      (bounce [[template/collection-var pred field-var]])
       (bounce [[template/collection-var "rdf:type" template/collection]
-               {:optional [[template/collection-var (template/field->predicate-template field) field-var]]}
+               {:optional [[template/collection-var pred field-var]]}
                {:filter [(template/build-fn-call ["nil?" field-var])]}]))))
 
 
@@ -221,14 +218,6 @@
       (bounce {:union [(-> front parse-element vec)
                        (-> back parse-element vec)]}))
     (->> rst parse-all bounce)))
-
-
-(defmethod rule-parser :group-by-clause
-  [[_ _ & rst]]
-  (->> rst
-       parse-all
-       (map template/build-var)
-       bounce))
 
 
 (defmethod rule-parser :table-reference
@@ -250,6 +239,14 @@
        bounce))
 
 
+(defmethod rule-parser :group-by-clause
+  [[_ _ & rst]]
+  (->> rst
+       parse-all
+       (map template/build-var)
+       bounce))
+
+
 (defmethod rule-parser :table-expression
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
@@ -257,7 +254,10 @@
         where     (->> (:where-clause parse-map)
                        (template/fill-in-collection from)
                        vec)
-        grouping  (some-> parse-map :group-by-clause vec)]
+        grouping  (some->> parse-map
+                           :group-by-clause
+                           (template/fill-in-collection from)
+                           vec)]
     (bounce {::coll  from
              ::where (if (seq where)
                        where
@@ -299,7 +299,7 @@
                       :sort-key
                       first
                       template/field->predicate-template)]
-    (if-let [order (-> parse-map :ordering-specification first)]
+    (if-let [order (some->> parse-map :ordering-specification first)]
       (bounce [[order pred]])
       (bounce pred))))
 

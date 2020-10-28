@@ -34,9 +34,9 @@ table-name ::= qualified-name |  qualified-local-table-name
 
 <qualified-name> ::= [  schema-name    period   ] qualified-identifier { qualified-identifier }
 
-as-clause   ::= [ 'AS' ]  column-name
+as-clause   ::= [ 'AS' <space> ]  column-name
 
-derived-column ::= value-expression [  as-clause   ]
+derived-column ::= value-expression [ <space> as-clause ]
 
 <value-expression> ::= numeric-value-expression |   string-value-expression
 |    datetime-value-expression   |   interval-value-expression
