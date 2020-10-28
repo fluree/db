@@ -25,8 +25,9 @@
 (def rules
   "Hierarchy of SQL BNF rule name keywords for parsing equivalence"
   (-> (make-hierarchy)
-      (derive :column-name ::identifier)
-      (derive :table-name ::identifier)))
+      (derive :column-name ::string)
+      (derive :table-name ::string)
+      (derive :character-string-literal ::string)))
 
 (defmulti rule-parser
   "Parse SQL BNF rules depending on their type. Returns a function whose return
@@ -85,20 +86,12 @@
        bounce))
 
 
-(defmethod rule-parser :character-string-literal
-  [[_ & rst]]
-  (->> rst
-       parse-all
-       (apply str)
-       bounce))
-
-
 (defmethod rule-parser :double-quote
   [_]
   (bounce \"))
 
 
-(defmethod rule-parser ::identifier    ; `:column-name`, `:table-name`
+(defmethod rule-parser ::string
   [[_ & rst]]
   (->> rst
        parse-all
