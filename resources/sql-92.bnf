@@ -662,9 +662,9 @@ unsigned-literal ::= unsigned-numeric-literal | general-literal
 
  <qualified-identifier>   ::= identifier
 
- <identifier>   ::= [  introducer   character-set-specification   ] actual-identifier
+ identifier ::= [ introducer character-set-specification ] actual-identifier
 
- <actual-identifier>   ::= regular-identifier |  delimited-identifier
+ <actual-identifier>   ::= regular-identifier | delimited-identifier
 
  <regular-identifier>   ::= identifier-body
 
@@ -676,21 +676,21 @@ unsigned-literal ::= unsigned-numeric-literal | general-literal
 (* An  identifier start   is any character in the Unicode General Category
 classes "Lu", "Ll", "Lt", "Lm", "Lo", or "Nl".
 
-NOTE 58 — The Unicode General Category classes "Lu", "Ll", "Lt", "Lm", "Lo", and "Nl" are assigned to Unicode characters that are, respectively, upper-case letters, lower-case letters, title-case  letters, modifier letters, other letters, and letter numbers.
-
-I think SQL-language-character is a good approximation for now.
-
+NOTE 58 — The Unicode General Category classes "Lu", "Ll", "Lt", "Lm", "Lo", and
+"Nl" are assigned to Unicode characters that are, respectively, upper-case
+letters, lower-case letters, title-case letters, modifier letters, other
+letters, and letter numbers.
 *)
 
-<identifier-start> ::= SQL-language-character
+<identifier-start> ::= SQL-language-identifier
 
- delimited-identifier   ::=  double-quote    delimited-identifier-body    double-quote
+ delimited-identifier ::= double-quote delimited-identifier-body double-quote
 
- delimited-identifier-body   ::= { delimited-identifier-part  }
+ delimited-identifier-body   ::= { delimited-identifier-part }
 
  delimited-identifier-part   ::=  nondoublequote-character   |  doublequote-symbol
 
- nondoublequote-character   ::= '!!'
+ nondoublequote-character   ::= SQL-language-identifier
 
  doublequote-symbol   ::=  double-quote   double-quote
 
