@@ -319,11 +319,8 @@
                                            first
                                            (template/fill-in-collection coll))]
     (cond-> query
-      ordering (update :opts (fn [opts]
-                               (-> opts
-                                   (or {})
-                                   (assoc :orderBy ordering))))
-      :finally bounce)))
+      ordering  (update :opts assoc :orderBy ordering)
+      :finally  bounce)))
 
 
 (defn parse
