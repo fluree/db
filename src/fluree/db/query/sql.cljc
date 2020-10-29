@@ -97,11 +97,20 @@
        bounce))
 
 
+(defmethod rule-parser :qualifier
+  [[_ q]]
+  (-> q
+      parse-element
+      first
+      ::coll
+      bounce))
+
+
 (defmethod rule-parser :column-reference
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
         column    (-> parse-map :column-name first)]
-    (bounce (if-let [qualifier (-> parse-map :qualifier first)]
+    (bounce (if-let [qualifier (some-> parse-map :qualifier first)]
               (template/build-predicate qualifier column)
               (template/field->predicate-template column)))))
 
