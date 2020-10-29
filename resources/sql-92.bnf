@@ -26,7 +26,7 @@ having-clause ::= 'HAVING' <space> search-condition
 
 select-list ::= asterisk | select-list-element [ { comma <space> select-list-element } ]
 
-select-list-element ::= column-name | (qualifier <period> asterisk) | derived-column
+select-list-element ::= derived-column | (qualifier <period> asterisk)
 
 qualifier ::= table-name / correlation-name
 
