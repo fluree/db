@@ -32,9 +32,9 @@ qualifier ::= table-name / correlation-name
 
 table-name ::= qualified-name |  qualified-local-table-name
 
-<qualified-name> ::= [  schema-name    period   ] qualified-identifier { qualified-identifier }
+qualified-name ::= [ schema-name <period> ] qualified-identifier { qualified-identifier }
 
-as-clause   ::= [ 'AS' <space> ]  column-name
+as-clause ::= [ 'AS' <space> ] column-name
 
 derived-column ::= value-expression [ <space> as-clause ]
 
