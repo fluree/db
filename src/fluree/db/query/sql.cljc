@@ -288,6 +288,32 @@
       :finally    bounce)))
 
 
+(defmethod rule-parser :join-condition
+  [[_ _ & rst]]
+  (->> rst parse-all bounce))
+
+
+(defmethod rule-parser :outer-join-type
+  [[_ t]]
+  (bounce (case t
+            "LEFT"  ::left
+            "RIGHT" ::right
+            "FULL"  ::full)))
+
+
+(defmethod rule-parser :join-type
+  [[_ t & rst]]
+  (bounce (case t
+            "INNER" ::inner
+            "UNION" ::union
+            (parse-element t)))) ; `:outer-join-type` case
+
+
+(defmethod rule-parser :named-columns-join
+  [[_ _ & rst]]
+  (->> rst parse-all bounce))
+
+
 (defmethod rule-parser :ordering-specification
   [[_ order]]
   (-> order str/upper-case bounce))
