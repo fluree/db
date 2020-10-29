@@ -115,7 +115,7 @@
 
 (defmethod rule-parser :asterisk
   [_]
-  (bounce {template/collection-var ["*"]}))
+  (bounce {::select-vars {template/collection-var ["*"]}}))
 
 
 (defmethod rule-parser :select-list-element
@@ -131,14 +131,10 @@
 
 (defmethod rule-parser :select-list
   [[_ & rst]]
-  (let [parse-map (parse-into-map rst)
-        asterisk  (some->> parse-map :asterisk first)
-        sublist   (some->> parse-map
-                           :select-list-element
-                           (apply merge-with into))]
-    (-> sublist
-        (or {::select-vars asterisk})
-        bounce)))
+  (->> rst
+       parse-all
+       (apply merge-with into)
+       bounce))
 
 
 (defmethod rule-parser :between-predicate
