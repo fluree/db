@@ -25,7 +25,6 @@
   "Hierarchy of SQL BNF rule name keywords for parsing equivalence"
   (-> (make-hierarchy)
       (derive :column-name ::string)
-      (derive :table-name ::string)
       (derive :character-string-literal ::string)))
 
 (defmulti rule-parser
@@ -215,15 +214,12 @@
     (->> rst parse-all bounce)))
 
 
-(defmethod rule-parser :table-reference
+(defmethod rule-parser :table-name
   [[_ & rst]]
-  (let [parse-map     (parse-into-map rst)
-        table-name    (some->> parse-map :table-name first)
-        joined-table  (some->> parse-map :joined-table first)
-        derived-table (some->> parse-map :derived-table first)]
-    (bounce (cond
-              table-name   {::coll [table-name]}
-              joined-table joined-table))))
+  (let [parsed-name (->> rst
+                         parse-all
+                         (apply str))]
+    (bounce {::coll [parsed-name]})))
 
 
 (defmethod rule-parser :from-clause
