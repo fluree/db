@@ -9,8 +9,7 @@
   "Parses SQL query strings into hiccup-formatted BNF rule trees"
   (-> "sql-92.bnf"
       io/resource
-      (insta/parser :input-format :ebnf
-                    :string-ci    true)))
+      (insta/parser :input-format :ebnf)))
 
 
 (defn rule-tag

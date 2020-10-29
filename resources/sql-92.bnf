@@ -28,7 +28,7 @@ select-list ::= asterisk | select-list-element [ { comma <space> select-list-ele
 
 select-list-element ::= column-name | (qualifier <period> asterisk) | derived-column
 
-qualifier   ::=  table-name   |  correlation-name
+qualifier ::= table-name / correlation-name
 
 table-name ::= qualified-name |  qualified-local-table-name
 
@@ -702,8 +702,8 @@ letters, and letter numbers.
 
  introducer   ::=  underscore
 
- sql-language-identifier   ::=
-                 sql-language-identifier-start   [ {  underscore   |  sql-language-identifier-part   } ]
+ sql-language-identifier ::=
+                 sql-language-identifier-start [ { underscore | sql-language-identifier-part } ]
 
  null-specification   ::= 'NULL'
 
