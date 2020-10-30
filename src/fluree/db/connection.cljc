@@ -431,12 +431,12 @@
 
 (defn listeners
   "Returns list of listeners"
-  [conn-state]
-  (-> @conn-state
+  [conn]
+  (-> @(:state conn)
       (:listeners)))
 
 
-(defn add-listener*
+(defn- add-listener*
   "Internal call to add-listener that uses the state atom directly."
   [conn-state network dbid key fn]
   (when-not (fn? fn)

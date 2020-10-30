@@ -182,7 +182,7 @@
 (defn listeners
   "Return a list of listeners currently registered for each ledger along with their respective keys."
   [conn]
-  (-> (connection/listeners (:state conn))
+  (-> (connection/listeners conn)
       (clj->js)))
 
 
