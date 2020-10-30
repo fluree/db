@@ -96,7 +96,7 @@
     )
 
   (async/<!! (fluree.db.api/query-async my-db my-query))
-  (fluree.db.connection/listeners (:state my-conn))
+  (fluree.db.connection/listeners my-conn)
 
   (async/<!! (fluree.db.api/ledger-info-async my-conn "test/chat"))
   (async/<!! (fluree.db.api/ledger-stats-async my-conn "test/chat"))

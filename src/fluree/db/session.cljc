@@ -13,7 +13,8 @@
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.schema :as schema])
+            [fluree.db.query.schema :as schema]
+            [fluree.db.conn-events :as conn-events])
   #?(:clj
      (:import (fluree.db.flake Flake))))
 
@@ -213,6 +214,11 @@
 ;; note all process-ledger-update operations must return a go-channel
 (defmulti process-ledger-update (fn [_ event-type _] event-type))
 
+(defmethod process-ledger-update :local-ledger-update
+  [_ _ _]
+  ;; no-op, local event to trigger any connection listeners (i.e. syncTo or other user (fdb/listen ...) fns)
+  ;; see :block update/event type below where this event gets originated from
+  true)
 
 (defmethod process-ledger-update :block
   [session event-type {:keys [block t flakes] :as data}]
@@ -232,12 +238,19 @@
           (log/trace (str (:network session) "/$" (:dbid session) ": Received block " block ", DB at that block, update cached db with flakes."))
           (let [flakes* (map #(if (instance? Flake %) % (flake/parts->Flake %)) flakes)
                 new-db  (dbproto/-with current-db block flakes*)]
-            (cas-db! session current-db-ch new-db)))
+            ;; update-local-db, returns true if successful
+            (when (cas-db! session current-db-ch new-db)
+              ;; place a local notification of updated db on *connection* sub-chan, which is what
+              ;; receives all events from ledger server - this allows any (fdb/listen...) listeners to listen
+              ;; for a :local-ledger-update event. :block events from ledger server will trigger listeners
+              ;; but if they rely on the block having updated the local ledger first they will instead want
+              ;; to filter for :local-ledger-update event instead of :block events (i.e. syncTo requires this)
+              (conn-events/process-event (:conn session) :local-ledger-update [(:network session) (:dbid session)] data))))
 
         ;; missing blocks, reload entire db
         :else
         (do
-          (log/info (str "Missing block(s): " (:network session) "/$" (:dbid session) ". Received block " block
+          (log/info (str "Missing block(s): " (:network session) "/" (:dbid session) ". Received block " block
                          ", but latest local block is: " current-block ". Forcing a db reload."))
           (reload-db! session))))))
 
@@ -247,7 +260,7 @@
   (async/go
     ;; reindex, reload at next request
     (clear-db! session)
-    (log/debug (str "Database " (:network session) "/$" (:dbid session) " re-indexed as of block: " block "."))
+    (log/debug (str "Ledger " (:network session) "/" (:dbid session) " re-indexed as of block: " block "."))
     true))
 
 
@@ -390,7 +403,7 @@
   If another process created the session first, will return the other process' session."
   [opts]
   (let [_        (log/trace "Create and cache session. Opt keys: " (keys opts))
-        id       (util/random-uuid)
+        id       (keyword "session" (-> (util/random-uuid) str (subs 0 7)))
         session  (session-factory (assoc opts :id id))
         session* (cache! session)
         new?     (= id (:id session*))]
