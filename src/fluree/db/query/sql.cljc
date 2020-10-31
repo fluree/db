@@ -106,13 +106,30 @@
       bounce))
 
 
+(defmethod rule-parser :subject-placeholder
+  [[_ _ & rst]]
+  (->> rst
+       parse-all
+       (apply str)
+       str/capitalize
+       (str template/collection)
+       bounce))
+
+
 (defmethod rule-parser :column-reference
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
-        column    (-> parse-map :column-name first)]
-    (bounce (if-let [qualifier (some-> parse-map :qualifier first)]
-              (template/build-predicate qualifier column)
-              (template/field->predicate-template column)))))
+        column    (some-> parse-map
+                          :column-name
+                          first
+                          template/field->predicate-template)
+        subject   (some-> parse-map
+                          :subject-placeholder
+                          first)
+        qualifier (some-> parse-map :qualifier first)]
+    (cond->> (or column subject)
+      qualifier (template/fill-in-collection qualifier)
+      :finally  bounce)))
 
 
 (defmethod rule-parser :set-quantifier
