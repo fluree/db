@@ -40,17 +40,17 @@ derived-column ::= value-expression [ <space> as-clause ]
 
 value-expression ::= numeric-value-expression | string-value-expression | datetime-value-expression | interval-value-expression
 
- datetime-value-expression   ::=
+ <datetime-value-expression>   ::=
                  datetime-term
         |	 interval-value-expression    plus-sign    datetime-term
         |	 datetime-value-expression    plus-sign    interval-term
         |	 datetime-value-expression    minus-sign    interval-term
 
- datetime-term   ::=  datetime-factor
+ <datetime-term>   ::=  datetime-factor
 
- datetime-factor   ::=  datetime-primary   [  time-zone   ]
+ <datetime-factor>   ::=  datetime-primary   [  time-zone   ]
 
- datetime-primary   ::=  value-expression-primary   |  datetime-value-function
+ <datetime-primary>   ::=  value-expression-primary   |  datetime-value-function
 
  datetime-value-function   ::=
                  current-date-value-function
@@ -67,33 +67,33 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
 
  time-zone-specifier   ::= 'LOCAL' | 'TIME ZONE'  interval-value-expression
 
- interval-term   ::=
+ <interval-term>   ::=
                  interval-factor
         |	 interval-term-2    asterisk    factor
         |	 interval-term-2    solidus    factor
         |	 term    asterisk    interval-factor
 
- interval-factor   ::= [  sign   ]  interval-primary
+ <interval-factor>   ::= [  sign   ]  interval-primary
 
- interval-primary   ::=  value-expression-primary   [  interval-qualifier   ]
+ <interval-primary>   ::=  value-expression-primary   [  interval-qualifier   ]
 
- interval-term-2   ::=  interval-term
+ <interval-term-2>   ::=  interval-term
 
- interval-value-expression   ::=
+ <interval-value-expression>   ::=
                  interval-term
         |	 interval-value-expression-1    plus-sign    interval-term-1
         |	 interval-value-expression-1    minus-sign    interval-term-1
         |	 left-paren    datetime-value-expression    minus-sign    datetime-term    right-paren    interval-qualifier
 
- interval-value-expression-1   ::=  interval-value-expression
+ <interval-value-expression-1>   ::=  interval-value-expression
 
- interval-term-1   ::=  interval-term
+ <interval-term-1>   ::=  interval-term
 
  <string-value-expression>   ::=  character-value-expression   |  bit-value-expression
 
  <character-value-expression>   ::=  concatenation   |  character-factor
 
- concatenation   ::=  character-value-expression    concatenation-operator    character-factor
+ <concatenation>   ::=  character-value-expression    concatenation-operator    character-factor
 
  <character-factor>   ::=  character-primary   [  collate-clause   ]
 
@@ -155,23 +155,23 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
 
  bit-primary   ::=  value-expression-primary   |  string-value-function
 
-numeric-value-expression ::=
+<numeric-value-expression> ::=
                 term
         |    numeric-value-expression    plus-sign    term
         |    numeric-value-expression    minus-sign    term
 
-term ::=
+<term> ::=
                 factor
         |   term asterisk factor
         |   term solidus factor
 
-factor::= [  sign   ] numeric-primary
+<factor> ::= [  sign   ] numeric-primary
 
- sign   ::=  plus-sign   |  minus-sign
+ <sign>   ::=  plus-sign   |  minus-sign
 
-numeric-primary ::= value-expression-primary (* |  numeric-value-function   *)
+<numeric-primary> ::= value-expression-primary (* |  numeric-value-function   *)
 
-value-expression-primary ::=
+<value-expression-primary> ::=
                 unsigned-value-specification / column-reference (* | set-function-specification | scalar-subquery | case-expression | left-paren value-expression right-paren | cast-specification *)
 
 column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder )
