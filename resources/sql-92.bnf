@@ -40,6 +40,9 @@ derived-column ::= value-expression [ <space> as-clause ]
 
 value-expression ::= numeric-value-expression | string-value-expression | datetime-value-expression | interval-value-expression
 
+<value-expression-primary> ::=
+                unsigned-value-specification / column-reference (* | set-function-specification | scalar-subquery | case-expression | left-paren value-expression right-paren | cast-specification *)
+
  <datetime-value-expression>   ::=
                  datetime-term
         |	 interval-value-expression    plus-sign    datetime-term
@@ -97,9 +100,9 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
 
  <character-factor>   ::=  character-primary   [  collate-clause   ]
 
- collate-clause   ::= 'COLLATE'  collation-name
+ collate-clause ::= 'COLLATE' <space> collation-name
 
- collation-name   ::=  qualified-name
+ collation-name ::=  qualified-name
 
  <character-primary>   ::=  value-expression-primary   |  string-value-function
 
@@ -170,9 +173,6 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
  <sign>   ::=  plus-sign   |  minus-sign
 
 <numeric-primary> ::= value-expression-primary (* |  numeric-value-function   *)
-
-<value-expression-primary> ::=
-                unsigned-value-specification / column-reference (* | set-function-specification | scalar-subquery | case-expression | left-paren value-expression right-paren | cast-specification *)
 
 column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder )
 
