@@ -47,6 +47,18 @@
                    [["?person" "rdf:type" "person"]])
                 "does not include a where clause"))))
 
+      (testing "with subject _id placeholder"
+        (let [query   "SELECT $, name FROM person WHERE age = 18"
+              subject (parse query)]
+
+          (is (= (:select subject)
+                 ["?person" "?personName"])
+              "correctly constructs the select clause")
+
+          (is (= (:where subject)
+                 [["?person" "person/age" 18]
+                  ["?person" "person/name" "?personName"]]))))
+
       (testing "with qualified fields"
         (let [query   "SELECT person.name FROM person WHERE person.age = 18"
               subject (parse query)]
