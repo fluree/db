@@ -140,7 +140,7 @@
 
 (defmethod rule-parser :asterisk
   [_]
-  (bounce {::select-vars {template/collection-var ["*"]}}))
+  (bounce {::select {template/collection-var ["*"]}}))
 
 
 (defmethod rule-parser :select-list-element
@@ -150,8 +150,8 @@
     (cond
       pred (let [var    (template/build-var pred)
                  triple [template/collection-var pred var]]
-             (bounce {::select-vars    [var]
-                      ::select-triples [triple]})))))
+             (bounce {::select [var]
+                      ::where  [triple]})))))
 
 
 (defmethod rule-parser :select-list
@@ -284,21 +284,18 @@
 
 (defmethod rule-parser :query-specification
   [[_ _ & rst]]
-  (let [parse-map                   (parse-into-map rst)
-        select-key                  (-> parse-map
-                                        :set-quantifier
-                                        first
-                                        (or :select))
-        {::keys [coll where group]} (-> parse-map :table-expression first)
-        {::keys [select-vars
-                 select-triples]}   (->> parse-map
-                                         :select-list
-                                         first
-                                         (template/fill-in-collection coll))
-        where-clause                (reduce conj  where select-triples)]
+  (let [parse-map               (parse-into-map rst)
+        select-key              (-> parse-map
+                                    :set-quantifier
+                                    first
+                                    (or :select))
+        table-expr              (-> parse-map :table-expression first)
+        select-list             (-> parse-map :select-list first)
+        {::keys [coll select
+                 where group]}  (merge-with into table-expr select-list)]
 
-    (cond-> {select-key select-vars
-             :where     where-clause
+    (cond-> {select-key (template/fill-in-collection coll select)
+             :where     (template/fill-in-collection coll where)
              ::coll     coll}
       (seq group) (assoc :opts {:groupBy group})
       :finally    bounce)))
