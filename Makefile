@@ -47,7 +47,7 @@ src/deps.cljs: package.json
 	clojure -M:js-deps
 
 test:
-	clojure -M:test
+	./script/test
 
 install: target/fluree-db.jar
 	clojure -M:install
