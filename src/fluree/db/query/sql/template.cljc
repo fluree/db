@@ -24,6 +24,11 @@
   [c f]
   (str c "/" f))
 
+(defn predicate?
+  "Returns true if `s` is a predicate string"
+  [s]
+  (str/includes? s "/"))
+
 (defn build-fn-call
   "Formats `terms` as a function call"
   [terms]

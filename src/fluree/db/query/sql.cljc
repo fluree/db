@@ -146,12 +146,12 @@
 (defmethod rule-parser :select-list-element
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
-        pred      (->> parse-map :derived-column first)]
-    (cond
-      pred (let [var    (template/build-var pred)
-                 triple [template/collection-var pred var]]
-             (bounce {::select [var]
-                      ::where  [triple]})))))
+        pred      (->> parse-map :derived-column first)
+        var       (template/build-var pred)
+        triple    [template/collection-var pred var]]
+    (cond->  {::select [var]}
+      (template/predicate? pred) (assoc ::where [triple])
+      :finally                   bounce)))
 
 
 (defmethod rule-parser :select-list
