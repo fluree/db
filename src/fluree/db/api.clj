@@ -9,6 +9,7 @@
             [fluree.db.permissions :as permissions]
             [fluree.db.auth :as auth]
             [fluree.db.api.query :as query-api]
+            [fluree.db.api.ledger :as ledger-api]
             [fluree.db.query.block :as query-block]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.fql :as fql]
@@ -998,36 +999,7 @@
   ([conn ledger]
    (session/db conn ledger nil))
   ([conn ledger opts]
-   (let [pc (async/promise-chan)]
-     (async/go
-       (try
-         (let [rootdb        (<? (session/db conn ledger nil))
-               {:keys [roles user auth block]} opts
-               auth_id       (when (and auth (not= 0 auth))
-                               (or
-                                 (<? (dbproto/-subid rootdb auth))
-                                 (throw (ex-info (str "Auth id: " auth " unknown.")
-                                                 {:status 401
-                                                  :error  :db/invalid-auth}))))
-               roles         (or roles (if auth_id
-                                         (<? (auth/roles rootdb auth_id)) nil))
-
-               permissions-c (when roles (permissions/permission-map rootdb roles :query))
-               dbt           (if block
-                               (<? (time-travel/as-of-block rootdb (:block opts)))
-                               rootdb)
-               dba           (if auth
-                               (assoc dbt :auth auth)
-                               dbt)
-               permdb        (if roles
-                               (assoc dba :permissions (<? permissions-c))
-                               dba)]
-           (async/put! pc permdb))
-         (catch Exception e
-           (async/put! pc e)
-           (async/close! pc))))
-     ;; return promise chan immediately
-     pc)))
+   (ledger-api/db conn ledger opts)))
 
 (defn get-db-at-block
   [conn ledger block every-n-sec]
@@ -1042,52 +1014,6 @@
                       (recur (inc n)))))))
     db-chan))
 
-(defn sync-to-db
-  "Returns a queryable database from the connection for the specified ledger."
-  ([conn ledger sync-to-block]
-   (sync-to-db conn ledger sync-to-block {}))
-  ([conn ledger sync-to-block opts]
-   (let [pc (async/promise-chan)]
-     (async/go
-       (try
-         (let [{:keys [roles user auth block syncTimeout]} opts
-               sync-timeout (if (or (nil? syncTimeout) (> syncTimeout 120000))
-                              60000 syncTimeout)
-               rootdb       (<? (go-try (let [timeout-ch (async/timeout sync-timeout)
-                                              db-ch      (get-db-at-block conn ledger sync-to-block 1)]
-                                          (async/alt!
-                                            timeout-ch :timeout
-                                            db-ch ([data] data)))))]
-           (if (= :timeout rootdb)
-             (throw (ex-info (str "Sync-to failed. Attempted to sync to block: " sync-to-block ", but timed out.")
-                             {:status 408
-                              :error  :db/timeout}))
-             (let [auth_id       (when (and auth (not= 0 auth))
-                                   (or
-                                     (<? (dbproto/-subid rootdb auth))
-                                     (throw (ex-info (str "Auth id: " auth " unknown.")
-                                                     {:status 401
-                                                      :error  :db/invalid-auth}))))
-                   roles         (or roles (if auth_id
-                                             (<? (auth/roles rootdb auth_id)) nil))
-
-                   permissions-c (when roles (permissions/permission-map rootdb roles :query))
-                   dbt           (if block
-                                   (<? (time-travel/as-of-block rootdb (:block opts)))
-                                   rootdb)
-                   dba           (if auth
-                                   (assoc dbt :auth auth)
-                                   dbt)
-                   permdb        (if roles
-                                   (assoc dba :permissions (<? permissions-c))
-                                   dba)]
-               (async/put! pc permdb))))
-         (catch Exception e
-           (log/error e)
-           (async/put! pc e)
-           (async/close! pc))))
-     ;; return promise chan immediately
-     pc)))
 
 (defn resolve-ledger
   "Resolves a ledger identity in the form of 'network/ledger-or-alias' and returns a
