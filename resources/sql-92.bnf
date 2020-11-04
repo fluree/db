@@ -13,7 +13,7 @@ from-clause ::= 'FROM' <space> table-reference [ { comma <space> table-reference
 
 order-by-clause ::= 'ORDER BY' <space> sort-specification-list
 
-where-clause ::= <'WHERE'> <space> search-condition
+where-clause ::= 'WHERE' <space> search-condition
 
 group-by-clause ::= 'GROUP BY' <space> grouping-column-reference-list
 

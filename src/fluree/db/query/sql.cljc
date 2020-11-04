@@ -255,6 +255,10 @@
        (apply merge-with into)
        bounce))
 
+(defmethod rule-parser :where-clause
+  [[_ _ & rst]]
+  (bounce {::where (->> rst parse-all vec)}))
+
 
 (defmethod rule-parser :group-by-clause
   [[_ _ & rst]]
@@ -266,20 +270,16 @@
 
 (defmethod rule-parser :table-expression
   [[_ & rst]]
-  (let [parse-map (parse-into-map rst)
-        from      (-> parse-map :from-clause first ::coll first)
-        where     (->> (:where-clause parse-map)
-                       (template/fill-in-collection from)
-                       vec)
-        grouping  (some->> parse-map
-                           :group-by-clause
-                           (template/fill-in-collection from)
-                           vec)]
-    (bounce {::coll  from
-             ::where (if (seq where)
-                       where
-                       [[(template/build-var from) "rdf:type" from]])
-             ::group grouping})))
+  (let [parse-map    (parse-into-map rst)
+        from-clause  (->> parse-map :from-clause first)
+        where-clause (or (some->> parse-map :where-clause first)
+                         {::where [[template/collection-var  "rdf:type" template/collection]]})
+        grouping     (->> parse-map :group-by-clause vec)
+        from         (-> from-clause ::coll first)]
+    (-> (merge-with into from-clause where-clause)
+        (assoc ::group grouping)
+        (->> (template/fill-in-collection from))
+        bounce)))
 
 
 (defmethod rule-parser :query-specification
@@ -292,10 +292,11 @@
         table-expr              (-> parse-map :table-expression first)
         select-list             (-> parse-map :select-list first)
         {::keys [coll select
-                 where group]}  (merge-with into table-expr select-list)]
+                 where group]}  (merge-with into table-expr select-list)
+        from                    (first coll)]
 
-    (cond-> {select-key (template/fill-in-collection coll select)
-             :where     (template/fill-in-collection coll where)
+    (cond-> {select-key (template/fill-in-collection from select)
+             :where     (template/fill-in-collection from where)
              ::coll     coll}
       (seq group) (assoc :opts {:groupBy group})
       :finally    bounce)))
@@ -356,7 +357,7 @@
         ordering                  (some->> parse-map
                                            :order-by-clause
                                            first
-                                           (template/fill-in-collection coll))]
+                                           (template/fill-in-collection (first coll)))]
     (cond-> query
       ordering  (update :opts assoc :orderBy ordering)
       :finally  bounce)))

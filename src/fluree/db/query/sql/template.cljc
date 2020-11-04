@@ -6,9 +6,10 @@
   "Formats `s` by removing any '/' and capitalizing the following character for
   each '/' removed"
   [s]
-  (->> (str/split s #"/")
-       (reduce (fn [norm nxt]
-                 (str norm (str/capitalize nxt))))))
+  (reduce (fn [norm nxt]
+            (let [cap (str/capitalize nxt)]
+              (str norm cap)))
+          (str/split s #"/")))
 
 (defn build-var
   "Formats `s` as a var by prepending '?', filtering out '/', and lowerCamelCasing
