@@ -218,7 +218,8 @@
   [_ _ _]
   ;; no-op, local event to trigger any connection listeners (i.e. syncTo or other user (fdb/listen ...) fns)
   ;; see :block update/event type below where this event gets originated from
-  true)
+  (async/go
+    ::no-op))
 
 (defmethod process-ledger-update :block
   [session event-type {:keys [block t flakes] :as data}]
