@@ -205,10 +205,14 @@
                                                     [[(::subj right) (::pred right) v]
                                                      [(::subj left) (::pred left) v]]))
 
-              #_#_(#{\> \<} comp) (let [field-var (template/build-var pred)
-                                    filter-fn (template/build-fn-call [comp field-var v])]
-                                [[template/collection-var pred field-var]
-                                 {:filter [filter-fn]}])))))
+              (#{\> \<} comp) (cond
+                                (and (::pred left)
+                                     (::obj right)) (let [pred      (::pred left)
+                                                          obj       (::obj right)
+                                                          field-var (template/build-var pred)
+                                                          filter-fn (template/build-fn-call [comp field-var obj])]
+                                                      [[template/collection-var pred field-var]
+                                                       {:filter [filter-fn]}]))))))
 
 
 (defmethod rule-parser :in-predicate
