@@ -273,9 +273,9 @@
                (:select subject))
             "correctly constructs the select clause")
 
-        (is (= [["?person" "person/name" "?personName"]
+        (is (= [["?person" "person/job" "?job"]
                 ["?person" "person/age" 18]
-                ["?person" "person/job" "?job"]
+                ["?person" "person/name" "?personName"]
                 ["?job" "job/title" "?jobTitle"]]
                (:where subject))
             "correctly constructs the where clause")))))
