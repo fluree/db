@@ -264,4 +264,18 @@
                 subject (parse query)]
             (is (= ["?personAge" "?personEmail"]
                    (-> subject :opts :groupBy))
-                "correctly constructs the groupBy clause")))))))
+                "correctly constructs the groupBy clause")))))
+
+    (testing "with multiple collections"
+      (let [query   "SELECT person.name, job.title FROM person JOIN job ON person.job = job.$ WHERE person.age = 18"
+            subject (parse query)]
+        (is (= ["?personName" "?jobTitle"]
+               (:select subject))
+            "correctly constructs the select clause")
+
+        (is (= [["?person" "person/name" "?personName"]
+                ["?person" "person/age" 18]
+                ["?person" "person/job" "?job"]
+                ["?job" "job/title" "?jobTitle"]]
+               (:where subject))
+            "correctly constructs the where clause")))))

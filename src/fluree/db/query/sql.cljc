@@ -108,28 +108,37 @@
 
 (defmethod rule-parser :subject-placeholder
   [[_ _ & rst]]
-  (->> rst
-       parse-all
-       (apply str)
-       str/capitalize
-       (str template/collection)
-       bounce))
+  (bounce {::obj (->> rst
+                      parse-all
+                      (apply str)
+                      str/capitalize
+                      (str template/collection-var))}))
+
+
+(defmethod rule-parser :unsigned-value-specification
+  [[_ v]]
+  (bounce {::obj (-> v parse-element first)}))
 
 
 (defmethod rule-parser :column-reference
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
-        column    (some-> parse-map
+        pred      (some-> parse-map
                           :column-name
                           first
                           template/field->predicate-template)
         subject   (some-> parse-map
                           :subject-placeholder
                           first)
-        qualifier (some-> parse-map :qualifier first)]
-    (cond->> (or column subject)
-      qualifier (template/fill-in-collection qualifier)
-      :finally  bounce)))
+        coll      (-> parse-map
+                      :qualifier
+                      first)]
+
+    (cond->> (or subject
+                 {::subj template/collection-var
+                  ::pred pred})
+      coll     (template/fill-in-collection coll)
+      :finally bounce)))
 
 
 (defmethod rule-parser :set-quantifier
@@ -145,10 +154,11 @@
 
 (defmethod rule-parser :select-list-element
   [[_ & rst]]
-  (let [parse-map (parse-into-map rst)
-        pred      (->> parse-map :derived-column first)
-        var       (template/build-var pred)
-        triple    [template/collection-var pred var]]
+  (let [parse-map                (parse-into-map rst)
+        {::keys [subj pred obj]} (->> parse-map :derived-column first)
+        var                      (or (some-> pred template/build-var)
+                                     obj)
+        triple                   [subj pred var]]
     (cond->  {::select [var]}
       (template/predicate? pred) (assoc ::where [triple])
       :finally                   bounce)))
@@ -164,28 +174,38 @@
 
 (defmethod rule-parser :between-predicate
   [[_ & rst]]
-  (let [[pred lower upper] (->> rst
-                                (filter rule?)
-                                parse-all)
-        field-var           (template/build-var pred)
-        selector            [template/collection-var pred field-var]
-        refinement          (if (some #{"NOT"} rst)
-                              {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
-                                       {:filter [(template/build-fn-call [">" field-var upper])]}]}
-                              {:filter [(template/build-fn-call [">=" field-var lower])
-                                        (template/build-fn-call ["<=" field-var upper])]})]
+  (let [[col l u]  (->> rst
+                        (filter rule?)
+                        parse-all)
+        pred       (::pred col)
+        lower      (::obj l)
+        upper      (::obj u)
+        field-var  (template/build-var pred)
+        selector   [template/collection-var pred field-var]
+        refinement (if (some #{"NOT"} rst)
+                            {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
+                                     {:filter [(template/build-fn-call [">" field-var upper])]}]}
+                            {:filter [(template/build-fn-call [">=" field-var lower])
+                                      (template/build-fn-call ["<=" field-var upper])]})]
     (bounce [selector refinement])))
 
 
 (defmethod rule-parser :comparison-predicate
   [[_ & rst]]
-  (let [parse-map  (parse-into-map rst)
-        comp       (-> parse-map :comp-op first)
-        [pred v]  (:row-value-constructor parse-map)]
+  (let [parse-map    (parse-into-map rst)
+        comp         (-> parse-map :comp-op first)
+        [left right] ( :row-value-constructor parse-map)]
     (bounce (cond
-              (#{\=} comp)    [[template/collection-var pred v]]
+              (#{\=} comp) (cond
+                             (or (::obj left)
+                                 (::obj right))   (let [{::keys [subj pred obj]} (merge left right)]
+                                                    [[subj pred obj]])
+                             (and (::pred left)
+                                  (::pred right)) (let [v (template/build-var (::pred right))]
+                                                    [[(::subj right) (::pred right) v]
+                                                     [(::subj left) (::pred left) v]]))
 
-              (#{\> \<} comp) (let [field-var (template/build-var pred)
+              #_#_(#{\> \<} comp) (let [field-var (template/build-var pred)
                                     filter-fn (template/build-fn-call [comp field-var v])]
                                 [[template/collection-var pred field-var]
                                  {:filter [filter-fn]}])))))
@@ -197,7 +217,7 @@
                             (filter (fn [e]
                                       (not (contains? #{"IN" "NOT"} e))))
                             parse-into-map)
-        pred           (-> parse-map :row-value-constructor first)
+        pred           (-> parse-map :row-value-constructor first ::pred)
         field-var      (template/build-var pred)
         selector       [template/collection-var pred field-var]
         not?           (some #{"NOT"} rst)
@@ -205,6 +225,7 @@
         filter-junc    (if not? "and" "or")
         filter-clauses (->> parse-map
                             :in-predicate-value
+                            (map ::obj)
                             (map (fn [v]
                                    (template/build-fn-call [filter-pred field-var v])))
                             (str/join " "))
@@ -214,7 +235,7 @@
 
 (defmethod rule-parser :null-predicate
   [[_ p & rst]]
-  (let [pred      (-> p parse-element first)
+  (let [pred      (-> p parse-element first ::pred)
         field-var (template/build-var pred)]
     (if (some #{"NOT"} rst)
       (bounce [[template/collection-var pred field-var]])
@@ -264,7 +285,7 @@
   [[_ _ & rst]]
   (->> rst
        parse-all
-       (map template/build-var)
+       (map (comp template/build-var ::pred))
        bounce))
 
 
@@ -304,7 +325,7 @@
 
 (defmethod rule-parser :join-condition
   [[_ _ & rst]]
-  (->> rst parse-all bounce))
+  (bounce {::where (->> rst parse-all vec)}))
 
 
 (defmethod rule-parser :outer-join-type
@@ -326,6 +347,25 @@
 (defmethod rule-parser :named-columns-join
   [[_ _ & rst]]
   (->> rst parse-all bounce))
+
+
+(defmethod rule-parser :qualified-join
+  [[_ & rst]]
+  (let [parse-map (->> rst
+                       (filter rule?)
+                       parse-into-map)
+        spec      (->> parse-map
+                       :join-specification
+                       (apply merge-with into))
+        join-ref  (->> parse-map
+                       :table-reference
+                       (apply merge-with into spec))
+        join-type (-> parse-map
+                      :join-type
+                      first
+                      (or ::inner))]
+    (bounce (case join-type
+              ::inner join-ref))))
 
 
 (defmethod rule-parser :ordering-specification
