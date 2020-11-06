@@ -57,6 +57,10 @@
                     (assoc rules tag (parse-all lst)))
                   {})))
 
+(def merge-parsed
+  "Function to merge parsed (sub) query trees"
+  (partial merge-with into))
+
 (defn bounce
   "Returns a function that, when executed, returns the argument supplied to this
   function, `v`, wrapped in a vector if `v` is a rule or scalar, or it returns
@@ -168,7 +172,7 @@
   [[_ & rst]]
   (->> rst
        parse-all
-       (apply merge-with into)
+       (apply merge-parsed)
        bounce))
 
 
@@ -183,10 +187,10 @@
         field-var  (template/build-var pred)
         selector   [template/collection-var pred field-var]
         refinement (if (some #{"NOT"} rst)
-                            {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
-                                     {:filter [(template/build-fn-call [">" field-var upper])]}]}
-                            {:filter [(template/build-fn-call [">=" field-var lower])
-                                      (template/build-fn-call ["<=" field-var upper])]})]
+                     {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
+                              {:filter [(template/build-fn-call [">" field-var upper])]}]}
+                     {:filter [(template/build-fn-call [">=" field-var lower])
+                               (template/build-fn-call ["<=" field-var upper])]})]
     (bounce [selector refinement])))
 
 
@@ -277,7 +281,7 @@
   [[_ _ & rst]]
   (->> rst
        parse-all
-       (apply merge-with into)
+       (apply merge-parsed)
        bounce))
 
 (defmethod rule-parser :where-clause
@@ -301,7 +305,7 @@
                          {::where [[template/collection-var  "rdf:type" template/collection]]})
         grouping     (->> parse-map :group-by-clause vec)
         from         (-> from-clause ::coll first)]
-    (-> (merge-with into from-clause where-clause)
+    (-> (merge-parsed from-clause where-clause)
         (assoc ::group grouping)
         (->> (template/fill-in-collection from))
         bounce)))
@@ -317,7 +321,7 @@
         table-expr              (-> parse-map :table-expression first)
         select-list             (-> parse-map :select-list first)
         {::keys [coll select
-                 where group]}  (merge-with into table-expr select-list)
+                 where group]}  (merge-parsed table-expr select-list)
         from                    (first coll)]
 
     (cond-> {select-key (template/fill-in-collection from select)
@@ -360,10 +364,10 @@
                        parse-into-map)
         spec      (->> parse-map
                        :join-specification
-                       (apply merge-with into))
+                       (apply merge-parsed))
         join-ref  (->> parse-map
                        :table-reference
-                       (apply merge-with into spec))
+                       (apply merge-parsed spec))
         join-type (-> parse-map
                       :join-type
                       first
