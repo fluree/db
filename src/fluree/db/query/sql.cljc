@@ -2,15 +2,12 @@
   (:require [fluree.db.query.sql.template :as template]
             [clojure.string :as str]
             #?(:clj [clojure.java.io :as io])
-            #?(:clj [instaparse.core :as insta]
+            #?(:clj [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
-(def sql
-  "Parses SQL query strings into hiccup-formatted BNF rule trees"
-  (-> "sql-92.bnf"
-      io/resource
-      (insta/parser :input-format :ebnf)))
-
+(defparser sql
+  (io/resource "sql-92.bnf")
+  :input-format :ebnf)
 
 (defn rule-tag
   [r]
