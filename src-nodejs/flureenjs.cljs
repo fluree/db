@@ -744,8 +744,29 @@
              (reject (clj->js e)))))))))
 
 
+(defn ^:export sql
+  "Exceute a sql query against a specified database"
+  ([db sql-str] (sql db sql-str {}))
+  ([db sql-str opts]
+   (js/Promise.
+     (fn [resolve reject]
+       (async/go
+         (try
+           (let [clj-opts (js->clj opts :keywordize-keys true)]
+             (-> sql-str
+                 json/parse
+                 sql/parse
+                 (update :opts merge clj-pts)
+                 (as-> q (fdb-js/query-async db q db-instance))
+                 <?
+                 clj->js
+                 resolve))
+           (catch :default e
+             (log/error e)
+             (reject (clj->js e)))))))))
+
+
 (defn ^:export http-signature
   "Takes an http request and creates an http signature using a private key"
   [req-method url request private-key auth]
   (http-signatures/sign-request req-method url request private-key auth))
-
