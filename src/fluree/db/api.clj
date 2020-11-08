@@ -22,6 +22,7 @@
             [fluree.db.query.graphql-parser :as graphql]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.sparql-parser :as sparql]
+            [fluree.db.query.sql :as sql]
             [fluree.db.util.async :refer [<? <?? go-try channel?]]
             [fluree.db.flake :as flake]
             [fluree.db.util.log :as log])
@@ -890,6 +891,14 @@
           :else
           (<? (multi-query-async db-ch (assoc parsed-gql-query :opts opts))))))))
 
+
+(defn sql-async
+  "Execute an SQL query against a specified database"
+  ([db sql-str]
+   (sql-async db sql-str {}))
+  ([db sql-str opts]
+   (->> (sql/parse sql-str)
+        (#(query-async db (update % :opts merge opts))))))
 
 (defn sparql-async
   "Exceute a sparql query against a specified database"
