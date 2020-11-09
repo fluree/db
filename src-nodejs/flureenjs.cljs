@@ -756,7 +756,7 @@
              (-> sql-str
                  json/parse
                  sql/parse
-                 (update :opts merge clj-pts)
+                 (update :opts merge clj-opts)
                  (as-> q (fdb-js/query-async db q db-instance))
                  <?
                  clj->js
