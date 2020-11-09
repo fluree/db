@@ -897,8 +897,10 @@
   ([db sql-str]
    (sql-async db sql-str {}))
   ([db sql-str opts]
-   (->> (sql/parse sql-str)
-        (#(query-async db (update % :opts merge opts))))))
+   (-> sql-str
+       sql/parse
+       (update :opts merge opts)
+       (as-> q (query-async db q)))))
 
 (defn sparql-async
   "Exceute a sparql query against a specified database"
