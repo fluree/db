@@ -1,6 +1,8 @@
 (ns fluree.db.query.sql-test
-  (:require [clojure.test :refer :all]
-            [fluree.db.query.sql :refer [parse]]))
+  (:require
+    #?@(:clj  [[clojure.test :refer :all]]
+        :cljs [[cljs.test :refer-macros [deftest is testing]]])
+    [fluree.db.query.sql :refer [parse]]))
 
 (deftest sql-query-parser-test
   (testing "parse"
@@ -124,31 +126,31 @@
           (let [query   "SELECT name, email FROM person WHERE email IS NOT NULL"
                 subject (parse query)]
 
-          (is (= ["?personName" "?personEmail"]
-                 (:select subject))
-              "correctly constructs the select clause")
+            (is (= ["?personName" "?personEmail"]
+                   (:select subject))
+                "correctly constructs the select clause")
 
-          (is (= [["?person" "person/email" "?personEmail"]
-                  ["?person" "person/name" "?personName"]
-                  ["?person" "person/email" "?personEmail"]]
-                 (:where subject))
-              "correctly constructs the where clause")))
+            (is (= [["?person" "person/email" "?personEmail"]
+                    ["?person" "person/name" "?personName"]
+                    ["?person" "person/email" "?personEmail"]]
+                   (:where subject))
+                "correctly constructs the where clause")))
 
         (testing "not negated"
           (let [query   "SELECT name, email FROM person WHERE email IS NULL"
                 subject (parse query)]
 
-          (is (= ["?personName" "?personEmail"]
-                 (:select subject))
-              "correctly constructs the select clause")
+            (is (= ["?personName" "?personEmail"]
+                   (:select subject))
+                "correctly constructs the select clause")
 
-          (is (= [["?person" "rdf:type" "person"]
-                  {:optional [["?person" "person/email" "?personEmail"]]}
-                  {:filter ["(nil? ?personEmail)"]}
-                  ["?person" "person/name" "?personName"]
-                  ["?person" "person/email" "?personEmail"]]
-                 (:where subject))
-              "correctly constructs the where clause")))))
+            (is (= [["?person" "rdf:type" "person"]
+                    {:optional [["?person" "person/email" "?personEmail"]]}
+                    {:filter ["(nil? ?personEmail)"]}
+                    ["?person" "person/name" "?personName"]
+                    ["?person" "person/email" "?personEmail"]]
+                   (:where subject))
+                "correctly constructs the where clause")))))
 
     (testing "on a complex query"
       (testing "with AND"
