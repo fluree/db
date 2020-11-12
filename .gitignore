@@ -20,3 +20,4 @@ figwheel_server.log
 package-lock.json
 /out/*
 /resources/public/js/compiled
+/cljs-test-runner-out/*

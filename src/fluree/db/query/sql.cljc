@@ -1,12 +1,11 @@
 (ns fluree.db.query.sql
   (:require [fluree.db.query.sql.template :as template]
             [clojure.string :as str]
-            #?(:clj [clojure.java.io :as io])
-            #?(:clj [instaparse.core :as insta :refer [defparser]]
+            #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
 (defparser sql
-  (io/resource "sql-92.bnf")
+  "resources/sql-92.bnf"
   :input-format :ebnf)
 
 (defn rule-tag
@@ -81,7 +80,8 @@
   (->> rst
        parse-all
        (apply str)
-       Integer/parseInt
+       #?(:clj  Integer/parseInt
+          :cljs Number.parseInt)
        bounce))
 
 
