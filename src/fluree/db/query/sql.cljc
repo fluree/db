@@ -2,16 +2,12 @@
   (:require [fluree.db.query.sql.template :as template]
             [clojure.string :as str]
             #?(:clj [clojure.java.io :as io])
-            #?(:clj [instaparse.core :as insta]
+            #?(:clj [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
-(def sql
-  "Parses SQL query strings into hiccup-formatted BNF rule trees"
-  (-> "sql-92.bnf"
-      io/resource
-      (insta/parser :input-format :ebnf
-                    :start        :query-specification)))
-
+(defparser sql
+  (io/resource "sql-92.bnf")
+  :input-format :ebnf)
 
 (defn rule-tag
   [r]
@@ -25,8 +21,8 @@
 (def rules
   "Hierarchy of SQL BNF rule name keywords for parsing equivalence"
   (-> (make-hierarchy)
-      (derive :column-name ::identifier)
-      (derive :table-name ::identifier)))
+      (derive :column-name ::string)
+      (derive :character-string-literal ::string)))
 
 (defmulti rule-parser
   "Parse SQL BNF rules depending on their type. Returns a function whose return
@@ -54,9 +50,13 @@
   [elts]
   (->> elts
        (group-by rule-tag)
-       (reduce-kv (fn [rules t lst]
-                    (assoc rules t (parse-all lst)))
-               {})))
+       (reduce-kv (fn [rules tag lst]
+                    (assoc rules tag (parse-all lst)))
+                  {})))
+
+(def merge-parsed
+  "Function to merge parsed (sub) query trees"
+  (partial merge-with into))
 
 (defn bounce
   "Returns a function that, when executed, returns the argument supplied to this
@@ -85,22 +85,61 @@
        bounce))
 
 
-(defmethod rule-parser :asterisk
-  [_]
-  (bounce \*))
-
-
 (defmethod rule-parser :double-quote
   [_]
   (bounce \"))
 
 
-(defmethod rule-parser ::identifier    ; `:column-name`, `:table-name`
+(defmethod rule-parser ::string
   [[_ & rst]]
   (->> rst
        parse-all
        (apply str)
        bounce))
+
+
+(defmethod rule-parser :qualifier
+  [[_ q]]
+  (-> q
+      parse-element
+      first
+      ::coll
+      bounce))
+
+
+(defmethod rule-parser :subject-placeholder
+  [[_ _ & rst]]
+  (bounce {::obj (->> rst
+                      parse-all
+                      (apply str)
+                      str/capitalize
+                      (str template/collection-var))}))
+
+
+(defmethod rule-parser :unsigned-value-specification
+  [[_ v]]
+  (bounce {::obj (-> v parse-element first)}))
+
+
+(defmethod rule-parser :column-reference
+  [[_ & rst]]
+  (let [parse-map (parse-into-map rst)
+        pred      (some-> parse-map
+                          :column-name
+                          first
+                          template/field->predicate-template)
+        subject   (some-> parse-map
+                          :subject-placeholder
+                          first)
+        coll      (-> parse-map
+                      :qualifier
+                      first)]
+
+    (cond->> (or subject
+                 {::subj template/collection-var
+                  ::pred pred})
+      coll     (template/fill-in-collection coll)
+      :finally bounce)))
 
 
 (defmethod rule-parser :set-quantifier
@@ -109,58 +148,271 @@
     (bounce k)))
 
 
+(defmethod rule-parser :asterisk
+  [_]
+  (bounce {::select {template/collection-var ["*"]}}))
+
+
+(defmethod rule-parser :select-list-element
+  [[_ & rst]]
+  (let [parse-map                (parse-into-map rst)
+        {::keys [subj pred obj]} (->> parse-map :derived-column first)
+        var                      (or (some-> pred template/build-var)
+                                     obj)
+        triple                   [subj pred var]]
+    (cond->  {::select [var]}
+      (template/predicate? pred) (assoc ::where [triple])
+      :finally                   bounce)))
+
+
+(defmethod rule-parser :select-list
+  [[_ & rst]]
+  (->> rst
+       parse-all
+       (apply merge-parsed)
+       bounce))
+
+
+(defmethod rule-parser :between-predicate
+  [[_ & rst]]
+  (let [[col l u]  (->> rst
+                        (filter rule?)
+                        parse-all)
+        pred       (::pred col)
+        lower      (::obj l)
+        upper      (::obj u)
+        field-var  (template/build-var pred)
+        selector   [template/collection-var pred field-var]
+        refinement (if (some #{"NOT"} rst)
+                     {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
+                              {:filter [(template/build-fn-call [">" field-var upper])]}]}
+                     {:filter [(template/build-fn-call [">=" field-var lower])
+                               (template/build-fn-call ["<=" field-var upper])]})]
+    (bounce [selector refinement])))
+
+
 (defmethod rule-parser :comparison-predicate
   [[_ & rst]]
-  (let [parse-map  (parse-into-map rst)
-        comp       (-> parse-map :comp-op first)
-        [field v]  (:row-value-constructor parse-map)]
-    (bounce (case comp
-              \= (let [pred-tmpl (template/field->predicate-template field)]
-                   [[template/subject-var pred-tmpl v]])))))
+  (let [parse-map    (parse-into-map rst)
+        comp         (-> parse-map :comp-op first)
+        [left right] ( :row-value-constructor parse-map)]
+    (bounce (cond
+              (#{\=} comp) (cond
+                             (or (::obj left)
+                                 (::obj right))   (let [{::keys [subj pred obj]} (merge left right)]
+                                                    [[subj pred obj]])
+                             (and (::pred left)
+                                  (::pred right)) (let [v (template/build-var (::pred right))]
+                                                    [[(::subj right) (::pred right) v]
+                                                     [(::subj left) (::pred left) v]]))
+
+              (#{\> \<} comp) (cond
+                                (and (::pred left)
+                                     (::obj right)) (let [pred      (::pred left)
+                                                          obj       (::obj right)
+                                                          field-var (template/build-var pred)
+                                                          filter-fn (template/build-fn-call [comp field-var obj])]
+                                                      [[template/collection-var pred field-var]
+                                                       {:filter [filter-fn]}]))))))
+
+
+(defmethod rule-parser :in-predicate
+  [[_ & rst]]
+  (let [parse-map      (->> rst
+                            (filter (fn [e]
+                                      (not (contains? #{"IN" "NOT"} e))))
+                            parse-into-map)
+        pred           (-> parse-map :row-value-constructor first ::pred)
+        field-var      (template/build-var pred)
+        selector       [template/collection-var pred field-var]
+        not?           (some #{"NOT"} rst)
+        filter-pred    (if not? "not=" "=")
+        filter-junc    (if not? "and" "or")
+        filter-clauses (->> parse-map
+                            :in-predicate-value
+                            (map ::obj)
+                            (map (fn [v]
+                                   (template/build-fn-call [filter-pred field-var v])))
+                            (str/join " "))
+        filter-func    (str "(" filter-junc " " filter-clauses ")")]
+    (bounce [selector {:filter filter-func}])))
+
+
+(defmethod rule-parser :null-predicate
+  [[_ p & rst]]
+  (let [pred      (-> p parse-element first ::pred)
+        field-var (template/build-var pred)]
+    (if (some #{"NOT"} rst)
+      (bounce [[template/collection-var pred field-var]])
+      (bounce [[template/collection-var "rdf:type" template/collection]
+               {:optional [[template/collection-var pred field-var]]}
+               {:filter [(template/build-fn-call ["nil?" field-var])]}]))))
+
+
+(defmethod rule-parser :boolean-term
+  [[_ & rst]]
+  (->> rst
+       (filter (partial not= "AND"))
+       parse-all
+       bounce))
+
+
+(defmethod rule-parser :search-condition
+  [[_ & rst]]
+  (if (some #{"OR"} rst)
+    (let [[front _ back] rst]
+      (bounce {:union [(-> front parse-element vec)
+                       (-> back parse-element vec)]}))
+    (->> rst parse-all bounce)))
+
+
+(defmethod rule-parser :table-name
+  [[_ & rst]]
+  (let [parsed-name (->> rst
+                         parse-all
+                         (apply str))]
+    (bounce {::coll [parsed-name]})))
+
+
+(defmethod rule-parser :from-clause
+  [[_ _ & rst]]
+  (->> rst
+       parse-all
+       (apply merge-parsed)
+       bounce))
+
+(defmethod rule-parser :where-clause
+  [[_ _ & rst]]
+  (bounce {::where (->> rst parse-all vec)}))
+
+
+(defmethod rule-parser :group-by-clause
+  [[_ _ & rst]]
+  (->> rst
+       parse-all
+       (map (comp template/build-var ::pred))
+       bounce))
 
 
 (defmethod rule-parser :table-expression
   [[_ & rst]]
-  (let [parse-map (parse-into-map rst)
-        from      (-> parse-map :from-clause first)
-        [s r obj] (-> parse-map :where-clause first)
-        subj      (template/fill-in-subject s from)
-        rel       (template/fill-in-collection r from)]
-    (bounce {::coll  from
-             ::where [[subj rel obj]]})))
+  (let [parse-map    (parse-into-map rst)
+        from-clause  (->> parse-map :from-clause first)
+        where-clause (or (some->> parse-map :where-clause first)
+                         {::where [[template/collection-var  "rdf:type" template/collection]]})
+        grouping     (->> parse-map :group-by-clause vec)
+        from         (-> from-clause ::coll first)]
+    (-> (merge-parsed from-clause where-clause)
+        (assoc ::group grouping)
+        (->> (template/fill-in-collection from))
+        bounce)))
 
 
 (defmethod rule-parser :query-specification
-  [[_ spec & rst]]
-  (if (= spec "SELECT")
-    (let [parse-map             (parse-into-map rst)
-          {::keys [coll where]} (-> parse-map :table-expression first)
-          select-key            (-> parse-map
+  [[_ _ & rst]]
+  (let [parse-map               (parse-into-map rst)
+        select-key              (-> parse-map
                                     :set-quantifier
                                     first
                                     (or :select))
-          select-list           (:select-list parse-map)
-          select-val            (->> select-list
-                                     (map (partial str "?"))
-                                     vec)
-          subj                  (-> template/subject-var
-                                    (template/fill-in-subject coll))
-          select-threes         (when-not (= select-list [:*])
-                                  (map (fn [fld var]
-                                         (let [pred (-> fld
-                                                        template/field->predicate-template
-                                                        (template/fill-in-collection coll))]
-                                           [subj pred var]))
-                                       select-list select-val))
-          where-clause          (reduce conj where select-threes)]
-      (bounce {select-key select-val
-               :where     where-clause}))
-    (throw (ex-info "Non-select SQL queries are not currently supported by the transpiler"
-                    {:status 400
-                     :error  :db/invalid-query
-                     :provided-query spec}))))
+        table-expr              (-> parse-map :table-expression first)
+        select-list             (-> parse-map :select-list first)
+        {::keys [coll select
+                 where group]}  (merge-parsed table-expr select-list)
+        from                    (first coll)]
+
+    (cond-> {select-key (template/fill-in-collection from select)
+             :where     (template/fill-in-collection from where)
+             ::coll     coll}
+      (seq group) (assoc :opts {:groupBy group})
+      :finally    bounce)))
+
+
+(defmethod rule-parser :join-condition
+  [[_ _ & rst]]
+  (bounce {::where (->> rst parse-all vec)}))
+
+
+(defmethod rule-parser :outer-join-type
+  [[_ t]]
+  (bounce (case t
+            "LEFT"  ::left
+            "RIGHT" ::right
+            "FULL"  ::full)))
+
+
+(defmethod rule-parser :join-type
+  [[_ t & rst]]
+  (bounce (case t
+            "INNER" ::inner
+            "UNION" ::union
+            (parse-element t)))) ; `:outer-join-type` case
+
+
+(defmethod rule-parser :named-columns-join
+  [[_ _ & rst]]
+  (->> rst parse-all bounce))
+
+
+(defmethod rule-parser :qualified-join
+  [[_ & rst]]
+  (let [parse-map (->> rst
+                       (filter rule?)
+                       parse-into-map)
+        spec      (->> parse-map
+                       :join-specification
+                       (apply merge-parsed))
+        join-ref  (->> parse-map
+                       :table-reference
+                       (apply merge-parsed spec))
+        join-type (-> parse-map
+                      :join-type
+                      first
+                      (or ::inner))]
+    (bounce (case join-type
+              ::inner join-ref))))
+
+
+(defmethod rule-parser :ordering-specification
+  [[_ order]]
+  (-> order str/upper-case bounce))
+
+
+(defmethod rule-parser :sort-specification
+  [[_ & rst]]
+  (let [parse-map (parse-into-map rst)
+        pred      (-> parse-map
+                      :sort-key
+                      first
+                      template/field->predicate-template)]
+    (if-let [order (some->> parse-map :ordering-specification first)]
+      (bounce [[order pred]])
+      (bounce pred))))
+
+
+(defmethod rule-parser :order-by-clause
+  [[_ _ & rst]]
+  (->> rst parse-all bounce))
+
+
+(defmethod rule-parser :direct-select-statement
+  [[_ & rst]]
+  (let [parse-map                 (parse-into-map rst)
+        {::keys [coll] :as query} (->> parse-map :query-expression first)
+        ordering                  (some->> parse-map
+                                           :order-by-clause
+                                           first
+                                           (template/fill-in-collection (first coll)))]
+    (cond-> query
+      ordering  (update :opts assoc :orderBy ordering)
+      :finally  bounce)))
 
 
 (defn parse
   [q]
-  (->> q sql parse-rule first))
+  (-> q
+      sql
+      parse-rule
+      first
+      (select-keys [:select :selectDistinct :selectOne :where :block :prefixes
+                    :vars :opts])))

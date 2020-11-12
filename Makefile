@@ -1,4 +1,4 @@
-.PHONY: deps jar install deploy nodejs browser clean docs
+.PHONY: deps test jar install deploy nodejs browser clean docs
 
 DOCS_MARKDOWN := $(shell find doc -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:doc/%.md=doc/clj/%.html)
@@ -45,6 +45,9 @@ deps:
 
 src/deps.cljs: package.json
 	clojure -M:js-deps
+
+test:
+	./script/test
 
 install: target/fluree-db.jar
 	clojure -M:install

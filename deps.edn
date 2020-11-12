@@ -73,4 +73,9 @@
   :deploy
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
    :main-opts ["-m" "deps-deploy.deps-deploy" "deploy"
-               "target/fluree-db.jar"]}}}
+               "target/fluree-db.jar"]}
+
+  :test
+  {:extra-paths ["test"]
+   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.0.700"}
+                 org.clojure/test.check {:mvn/version "1.1.0"}}}}}

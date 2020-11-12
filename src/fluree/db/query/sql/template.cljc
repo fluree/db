@@ -1,5 +1,40 @@
 (ns fluree.db.query.sql.template
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [clojure.walk :refer [postwalk]]))
+
+(defn normalize
+  "Formats `s` by removing any '/' and capitalizing the following character for
+  each '/' removed"
+  [s]
+  (reduce (fn [norm nxt]
+            (let [cap (str/capitalize nxt)]
+              (str norm cap)))
+          (str/split s #"/")))
+
+(defn build-var
+  "Formats `s` as a var by prepending '?', filtering out '/', and lowerCamelCasing
+  the remaining string"
+  [s]
+  (->> s
+       normalize
+       (str "?")))
+
+(defn build-predicate
+  "Formats the collection string `c` and the field string `f` by joining them
+  with a '/'"
+  [c f]
+  (str c "/" f))
+
+(defn predicate?
+  "Returns true if `s` is a predicate string"
+  [s]
+  (and s
+       (str/includes? s "/")))
+
+(defn build-fn-call
+  "Formats `terms` as a function call"
+  [terms]
+  (str "(" (str/join " " terms) ")"))
 
 (defn template-for
   [kw]
@@ -10,33 +45,39 @@
   (str/replace tmpl-str tmpl v))
 
 
-(def subject
-  "Template for representing flake subjects"
-  (template-for :subject))
-
-(def subject-var
-  "Template for storing flake subjects as variables"
-  (str "?" subject))
-
-(defn fill-in-subject
-  "Fills in the flake subject value `subj` wherever the subject template appears
-  in `tmpl-str`"
-  [tmpl-str subj]
-  (fill-in tmpl-str subject subj))
-
-
 (def collection
   "Template for representing flake collections"
   (template-for :collection))
 
-(defn field->predicate-template
-  "Build a flake predicate template string from the collection template and the
-  known field value `field`"
-  [field]
-  (str collection "/" field))
+(def collection-var
+  "Template for storing flake subjects as variables"
+  (build-var collection))
 
 (defn fill-in-collection
-  "Fills in the known collection value `coll` wherever the collection template
+  "Fills in the known collection name `coll-name` wherever the collection template
   appears in `tmpl-str`"
-  [tmpl-str coll]
-  (fill-in tmpl-str collection coll))
+  [coll-name tmpl-data]
+  (postwalk (fn [c]
+              (if (string? c)
+                (fill-in c collection coll-name)
+                c))
+            tmpl-data))
+
+(def field
+  "Template for represent collection fields"
+  (template-for :field))
+
+(def field-var
+  "Template for storing flake fields as variables"
+  (build-var field))
+
+(defn field->predicate-template
+  "Build a flake predicate template string from the collection template and the
+  known field value `f`"
+  [f]
+  (build-predicate collection f))
+
+(def predicate
+  "Template for representing flake predicates with both collection and field
+  missing"
+  (build-predicate collection field))
