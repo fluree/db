@@ -1,12 +1,24 @@
 (ns fluree.db.query.sql
   (:require [fluree.db.query.sql.template :as template]
             [clojure.string :as str]
+            #?(:clj  [clojure.java.io :as io])
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
-(defparser sql
-  "resources/sql-92.bnf"
-  :input-format :ebnf)
+#?(:cljs
+   (def inline-grammar
+     "SQL grammar in instaparse compatible BNF format loaded at compile time so it's
+     available to cljs and js artifacts."
+     (inline-resource "sql-92.bnf")))
+
+#?(:clj
+   (def sql
+     (-> "sql-92.bnf"
+         io/resource
+         (insta/parser :input-format :ebnf)))
+
+   :cljs
+   (defparser sql inline-grammar :input-format :ebnf))
 
 (defn rule-tag
   [r]
