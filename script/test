@@ -29,4 +29,4 @@
 
 # See: https://cljdoc.org/d/lambdaisland/kaocha/1.0.700/doc/readme
 
-clojure -M:test -m kaocha.runner "$@"
+clojure -M:cljtest "$@"
