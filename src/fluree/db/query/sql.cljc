@@ -423,6 +423,7 @@
 (defn parse
   [q]
   (-> q
+      str/trim
       sql
       parse-rule
       first
