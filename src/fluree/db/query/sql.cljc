@@ -273,10 +273,11 @@
 
 
 (defmethod rule-parser :null-predicate
-  [[_ p & rst]]
-  (let [pred      (-> p parse-element first ::pred)
+  [[_ & rst]]
+  (let [parsed    (parse-all rst)
+        pred      (-> parsed first ::pred)
         field-var (template/build-var pred)]
-    (if (some #{"NOT"} rst)
+    (if (some #{"NOT"} parsed)
       (bounce [[template/collection-var pred field-var]])
       (bounce [[template/collection-var "rdf:type" template/collection]
                {:optional [[template/collection-var pred field-var]]}
