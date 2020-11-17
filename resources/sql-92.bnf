@@ -2,27 +2,36 @@ direct-select-statement ::= query-expression [ <space> order-by-clause ]
 
 query-expression   ::=  non-join-query-expression | joined-table
 
-query-specification ::=
-                'SELECT' <space> [set-quantifier <space>] select-list <space> table-expression
+select ::= 'select' | 'SELECT'
 
-set-quantifier ::= 'DISTINCT' | 'ALL'
+query-specification ::=
+                select <space> [set-quantifier <space>] select-list <space> table-expression
+
+distinct = 'distinct' | 'DISTINCT'
+all = 'all' | 'ALL'
+set-quantifier ::= distinct | all
 
 table-expression ::= from-clause [ <space> where-clause ] [ <space> group-by-clause ] [ <space> having-clause ]
 
-from-clause ::= 'FROM' <space> table-reference [ { comma <space> table-reference } ]
+from ::= 'from' | 'FROM'
+from-clause ::= from <space> table-reference [ { comma <space> table-reference } ]
 
-order-by-clause ::= 'ORDER BY' <space> sort-specification-list
+order-by ::= 'order by' | 'ORDER BY'
+order-by-clause ::= order-by <space> sort-specification-list
 
-where-clause ::= 'WHERE' <space> search-condition
+where ::= 'where' | 'WHERE'
+where-clause ::=  where <space> search-condition
 
-group-by-clause ::= 'GROUP BY' <space> grouping-column-reference-list
+group-by ::= 'group by' | 'GROUP BY'
+group-by-clause ::=  group-by <space> grouping-column-reference-list
 
 grouping-column-reference-list ::=
                 grouping-column-reference [ { comma <space> grouping-column-reference } + ]
 
 grouping-column-reference ::= column-reference [ <space> collate-clause ]
 
-having-clause ::= 'HAVING' <space> search-condition
+having ::= 'having' | 'HAVING'
+having-clause ::= having <space> search-condition
 
 select-list ::= asterisk | select-list-element [ { comma <space> select-list-element } ]
 
@@ -34,7 +43,8 @@ table-name ::= qualified-name |  qualified-local-table-name
 
 qualified-name ::= [ schema-name <period> ] qualified-identifier { qualified-identifier }
 
-as-clause ::= [ 'AS' <space> ] column-name
+as ::= 'as' | 'AS'
+as-clause ::= [ as <space> ] column-name
 
 derived-column ::= value-expression [ <space> as-clause ]
 
@@ -60,15 +70,21 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
         |	 current-time-value-function
         |	 current-timestamp-value-function
 
- current-date-value-function   ::= 'CURRENT_DATE'
+current-date ::= 'current_date' | 'CURRENT_DATE'
+current-date-value-function   ::= current-date
 
- current-time-value-function   ::= 'CURRENT_TIME' [  left-paren    time-precision    right-paren   ]
+current-time ::= 'current_time' | 'CURRENT_TIME'
+current-time-value-function   ::=  current-time [  left-paren    time-precision    right-paren   ]
 
- current-timestamp-value-function   ::= 'CURRENT_TIMESTAMP' [  left-paren    timestamp-precision    right-paren   ]
+current-timestamp ::= 'current_timestamp' | 'CURRENT_TIMESTAMP'
+current-timestamp-value-function   ::=  current-timestamp [  left-paren    timestamp-precision    right-paren   ]
 
- time-zone   ::= 'AT'  time-zone-specifier
+at ::= 'at' | 'AT'
+time-zone   ::= at time-zone-specifier
 
- time-zone-specifier   ::= 'LOCAL' | 'TIME ZONE'  interval-value-expression
+local ::= 'local' | 'LOCAL'
+time-zone ::= 'time zone' | 'TIME ZONE'
+time-zone-specifier   ::= local | time-zone interval-value-expression
 
  <interval-term>   ::=
                  interval-factor
@@ -100,7 +116,8 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
 
  <character-factor>   ::=  character-primary   [  collate-clause   ]
 
- collate-clause ::= 'COLLATE' <space> collation-name
+collate ::= 'collate' | 'COLLATE'
+collate-clause ::= collate <space> collation-name
 
  collation-name ::=  qualified-name
 
@@ -116,9 +133,11 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
         |    trim-function
 
 
- trim-function   ::= 'TRIM'  left-paren    trim-operands    right-paren
+trim ::= 'trim' | 'TRIM'
+trim-function   ::= trim left-paren    trim-operands    right-paren
 
  trim-operands   ::= [ [  trim-specification   ] [  trim-character   ] 'FROM' ]  trim-source
+
 
  trim-specification   ::= 'LEADING' | 'TRAILING' | 'BOTH'
 
@@ -176,55 +195,67 @@ value-expression ::= numeric-value-expression | string-value-expression | dateti
 
 column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder )
 
- case-expression   ::=  case-abbreviation   |  case-specification
+case-expression   ::=  case-abbreviation   |  case-specification
 
- case-abbreviation   ::=
-                'NULLIF'  left-paren    value-expression    comma    value-expression    right-paren
-        |	'COALESCE'  left-paren    value-expression   {  comma    value-expression   }   right-paren
+nullif ::= 'nullif' | 'NULLIF'
+coalesce ::= 'coalesce' | 'COALESCE'
+case-abbreviation   ::=  nullif <space> left-paren value-expression comma <space> value-expression right-paren
+                    | coalesce <space> left-paren value-expression { comma <space> value-expression } right-paren
 
- case-specification   ::=  simple-case   |  searched-case
+case-specification   ::=  simple-case   |  searched-case
 
- simple-case   ::=
-                'CASE'  case-operand
+case ::= 'case' | 'CASE'
+end ::= 'end' | 'END'
+simple-case ::= case <space> case-operand
                         { simple-when-clause  }
                         [  else-clause   ]
-                'END'
+                        end
 
- simple-when-clause   ::= 'WHEN'  when-operand   'THEN'  result
+when ::= 'when' | 'WHEN'
+then ::= 'then' | 'THEN'
+simple-when-clause   ::= when <space> when-operand <space> then <space> result
 
  when-operand   ::=  value-expression
 
  case-operand   ::=  value-expression
 
+case ::= 'case' | 'CASE'
  searched-case   ::=
-                'CASE'
-                { searched-when-clause  }
-                [  else-clause   ]
-                'END'
+                case <space>
+                { searched-when-clause <space> }
+                [ else-clause <space> ]
+                end
 
- else-clause   ::= 'ELSE'  result
+else ::= 'else' | 'ELSE'
+else-clause   ::= else <space> result
 
- searched-when-clause   ::= 'WHEN'  search-condition   'THEN'  result
+when ::= 'when' | 'WHEN'
+then ::= 'then' | 'THEN'
+searched-when-clause   ::= when <space> search-condition <space> then <space>  result
 
- search-condition   ::=
+or ::= 'or' | 'OR'
+search-condition   ::=
           boolean-term
-        | search-condition <space> 'OR' <space> boolean-term
+          | search-condition <space> or <space> boolean-term
 
- boolean-term   ::=
+and ::= 'and' | 'AND'
+boolean-term   ::=
           boolean-factor
-        | boolean-term  <space> 'AND' <space> boolean-factor
+          | boolean-term  <space> and <space> boolean-factor
 
- boolean-factor   ::= [ 'NOT' <space>]  boolean-test
+not ::= 'not' | 'NOT'
+boolean-factor   ::= [ not <space>]  boolean-test
 
- boolean-test   ::=  boolean-primary   [ <space> 'IS' [ <space> 'NOT' ] <space> truth-value   ]
+is ::= 'is' | 'IS'
+boolean-test   ::=  boolean-primary   [ <space> is [ <space> not ] <space> truth-value   ]
 
- boolean-primary   ::=  predicate   |  (left-paren    search-condition    right-paren )
+boolean-primary   ::=  predicate   |  (left-paren    search-condition    right-paren )
 
- predicate   ::= comparison-predicate | between-predicate | in-predicate | like-predicate | null-predicate | quantified-comparison-predicate | exists-predicate | match-predicate | overlaps-predicate
+predicate   ::= comparison-predicate | between-predicate | in-predicate | like-predicate | null-predicate | quantified-comparison-predicate | exists-predicate | match-predicate | overlaps-predicate
 
- comparison-predicate   ::=  row-value-constructor  <space>  comp-op  <space>  row-value-constructor
+comparison-predicate   ::=  row-value-constructor  <space>  comp-op  <space>  row-value-constructor
 
- comp-op   ::=
+comp-op   ::=
              equals-operator
         |    not-equals-operator
         |    less-than-operator
@@ -232,16 +263,17 @@ column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder 
         |    less-than-or-equals-operator
         |    greater-than-or-equals-operator
 
- between-predicate ::=
-                row-value-constructor <space> [ 'NOT' <space> ] 'BETWEEN' <space> row-value-constructor <space> 'AND' <space> row-value-constructor
+between ::= 'between' | 'BETWEEN'
+between-predicate ::= row-value-constructor <space> [ not <space> ] between <space> row-value-constructor <space> and <space> row-value-constructor
 
- in-predicate ::= row-value-constructor <space> [ 'NOT' <space> ] 'IN' <space> in-predicate-value
+in ::= 'in' | 'IN'
+in-predicate ::= row-value-constructor <space> [ not <space> ] in <space> in-predicate-value
 
  in-predicate-value ::= table-subquery | left-paren [ <space> ] in-value-list [ <space> ] right-paren
 
  in-value-list ::= value-expression { comma [ <space> ] value-expression }  +
 
- like-predicate ::= match-value [ 'NOT' ] 'LIKE' pattern [ 'ESCAPE' escape-character ]
+ like-predicate ::= match-value [ not ] 'LIKE' pattern [ 'ESCAPE' escape-character ]
 
  match-value ::= character-value-expression
 
@@ -249,19 +281,20 @@ column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder 
 
  escape-character ::= character-value-expression
 
- null-predicate ::= row-value-constructor <space> 'IS' <space> [ 'NOT' <space> ] 'NULL'
+null ::= 'null' | 'NULL'
+null-predicate ::= row-value-constructor <space> 'IS' <space> [ not <space> ] null
 
  quantified-comparison-predicate ::= row-value-constructor comp-op quantifier table-subquery
 
  quantifier ::= all | some
 
- all ::= 'ALL'
+ some ::= 'some' | 'SOME' | 'any' | 'ANY'
 
- some ::= 'SOME' | 'ANY'
+exists ::= 'exists' | 'EXISTS'
+exists-predicate ::= exists <space> table-subquery
 
- exists-predicate ::= 'EXISTS' table-subquery
-
- unique-predicate ::= 'UNIQUE' table-subquery
+unique ::= 'unique' | 'UNIQUE'
+unique-predicate ::= unique <space> table-subquery
 
  match-predicate ::= row-value-constructor 'MATCH' [ 'UNIQUE' ] [ 'PARTIAL' | 'FULL' ] table-subquery
 
@@ -271,7 +304,10 @@ column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder 
 
  row-value-constructor-2 ::= row-value-constructor
 
- truth-value   ::= 'TRUE' | 'FALSE' | 'UNKNOWN'
+true ::= 'true' | 'TRUE'
+false ::= 'false' | 'FALSE'
+unknown ::= 'unknown' | 'UNKNOWN'
+truth-value   ::= true | false | unknown
 
  row-value-constructor   ::=
              row-value-constructor-element
@@ -287,11 +323,12 @@ column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder 
         |    cross-join
         |    left-paren joined-table right-paren
 
- qualified-join   ::=
-             table-reference <space> [ 'NATURAL' <space> ] [ join-type <space> ] 'JOIN' <space> table-reference [ <space> join-specification ]
+join ::= 'join' | 'JOIN'
+natural ::= 'natural' | 'NATURAL'
+qualified-join   ::= table-reference <space> [ natural <space> ] [ join-type <space> ] join <space> table-reference [ <space> join-specification ]
 
- cross-join   ::=
-                 table-reference <space> 'CROSS JOIN' <space> table-reference
+cross ::= 'cross' | 'CROSS'
+cross-join ::= table-reference <space> cross <space> join <space> table-reference
 
  table-reference ::= table-name | joined-table | ( derived-table <space> correlation-specification )
 
@@ -301,36 +338,45 @@ column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder 
 
  join-specification ::=  join-condition | named-columns-join
 
- join-condition ::= 'ON' <space> search-condition
+on ::= 'on' | 'ON'
+join-condition ::= on <space> search-condition
 
- named-columns-join ::= 'USING' <space> left-paren join-column-list right-paren
+using ::= 'using' | 'USING'
+named-columns-join ::= using <space> left-paren join-column-list right-paren
 
- join-column-list   ::=  column-name-list
+join-column-list   ::=  column-name-list
 
- correlation-specification   ::=
-                [ 'AS' <space> ]  correlation-name   [  left-paren    derived-column-list    right-paren   ]
+correlation-specification   ::= [ as <space> ]  correlation-name [ <space> left-paren derived-column-list right-paren ]
 
- derived-column-list   ::=  column-name-list
+derived-column-list   ::=  column-name-list
 
- join-type   ::=
-            'INNER'
-        |    outer-join-type [ <space> 'OUTER' ]
-        |   'UNION'
+inner ::= 'inner' | 'INNER'
+union ::= 'union' | 'UNION'
+join-type   ::=
+          inner
+        | outer-join-type [ <space> 'OUTER' ]
+        | union
 
- outer-join-type   ::= 'LEFT' | 'RIGHT' | 'FULL'
+left ::= 'left' | 'LEFT'
+right ::= 'right' | 'RIGHT'
+full ::= 'full' | 'FULL'
+outer-join-type ::= left | right | full
 
- non-join-query-expression   ::=
+except ::= 'except' | 'EXCEPT'
+non-join-query-expression   ::=
                  non-join-query-term
-        |	 query-expression   'UNION' [ 'ALL' ] [  corresponding-spec   ]  query-term
-        |	 query-expression   'EXCEPT' [ 'ALL' ] [  corresponding-spec   ]  query-term
+                 | query-expression union [ <space> all ] [ <space> corresponding-spec ] <space> query-term
+                 | query-expression except [ <space> all ] [ <space> corresponding-spec ] <space> query-term
 
- non-join-query-term   ::=
+intersect ::= 'intersect' | 'INTERSECT'
+non-join-query-term   ::=
                  non-join-query-primary
-        |	 query-term   'INTERSECT' [ 'ALL' ] [  corresponding-spec   ]  query-primary
+                 | query-term <space> intersect [ <space> all ] [ <space> corresponding-spec ]  <space> query-primary
 
- query-primary   ::=  non-join-query-primary   |  joined-table
+query-primary   ::=  non-join-query-primary   |  joined-table
 
- corresponding-spec   ::= 'CORRESPONDING' [ 'BY'  left-paren    corresponding-column-list    right-paren   ]
+corresponding ::= 'corresponding' | 'CORRESPONDING'
+corresponding-spec ::= corresponding <space> [ 'BY'  left-paren    corresponding-column-list    right-paren   ]
 
  corresponding-column-list   ::=  column-name-list
 
@@ -343,17 +389,19 @@ column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder 
         |	 table-value-constructor
         |	 explicit-table
 
- table-value-constructor   ::= 'VALUES'  table-value-constructor-list
+values ::= 'values' | 'VALUES'
+table-value-constructor ::= values <space> table-value-constructor-list
 
- table-value-constructor-list   ::=  row-value-constructor   [ {  comma    row-value-constructor   } ]
+table-value-constructor-list ::=  row-value-constructor [ { comma <space> row-value-constructor } ]
 
- explicit-table   ::= 'TABLE' table-name
+table ::= 'table' | 'TABLE'
+explicit-table ::= table <space> table-name
 
- query-term   ::=  non-join-query-term   |  joined-table
+query-term ::= non-join-query-term | joined-table
 
- row-value-constructor-list   ::=  row-value-constructor-element   [ {  comma <space> row-value-constructor-element   } ]
+row-value-constructor-list   ::=  row-value-constructor-element   [ {  comma <space> row-value-constructor-element   } ]
 
- row-value-constructor-element   ::=
+row-value-constructor-element   ::=
              value-expression
         |    null-specification
         |    default-specification
@@ -364,15 +412,17 @@ column-reference ::= [ qualifier <period> ] ( column-name | subject-placeholder 
 
  sort-key ::= column-name (* | unsigned-integer *)
 
- ordering-specification ::= 'ASC' | 'DESC'
+asc ::= 'asc' | 'ASC'
+desc ::= 'desc' | 'DESC'
+ordering-specification ::= asc | desc
 
- result   ::=  result-expression   | 'NULL'
+ result   ::=  result-expression   | null
 
  result-expression   ::=  value-expression
 
  cast-specification   ::= 'CAST'  left-paren    cast-operand   'AS'  cast-target    right-paren
 
- cast-operand   ::=  value-expression   | 'NULL'
+ cast-operand   ::=  value-expression   | null
 
  cast-target   ::=  domain-name   |   data-type
 
@@ -704,7 +754,7 @@ letters, and letter numbers.
  sql-language-identifier ::=
                  sql-language-identifier-start [ { underscore | sql-language-identifier-part } ]
 
- null-specification   ::= 'NULL'
+ null-specification   ::= null
 
  default-specification   ::= 'DEFAULT'
 
