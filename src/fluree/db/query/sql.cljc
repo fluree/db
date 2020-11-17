@@ -30,11 +30,25 @@
   (and (sequential? elt)
        (keyword? (rule-tag elt))))
 
+(def reserved-words
+  #{:all :and :as :asc :at :between :case :coalesce :collate :corresponding
+    :cross :current-date :current-time :current-timestamp :desc :distinct :else
+    :end :except :exists :false :from :full :group-by :having :in :inner
+    :intersect :is :join :left :local :natural :not :null :nullif :on :or
+    :order-by :right :select :some :table :then :trim :true :unique :unknown
+    :using :values :when :where})
+
+(defn derive-all [hier coll kw]
+  (reduce (fn [h elt]
+            (derive h elt kw))
+          hier coll))
+
 (def rules
   "Hierarchy of SQL BNF rule name keywords for parsing equivalence"
   (-> (make-hierarchy)
       (derive :column-name ::string)
-      (derive :character-string-literal ::string)))
+      (derive :character-string-literal ::string)
+      (derive-all reserved-words ::reserved)))
 
 (defmulti rule-parser
   "Parse SQL BNF rules depending on their type. Returns a function whose return
@@ -86,6 +100,16 @@
 (defmethod rule-parser :default
   [[_ & rst]]
   (->> rst parse-all bounce))
+
+
+(defmethod rule-parser ::reserved
+  [[_ & words]]
+  (->> words
+       (map parse-element)
+       flatten
+       (str/join " ")
+       str/upper-case
+       bounce))
 
 
 (defmethod rule-parser :unsigned-integer
