@@ -180,8 +180,9 @@
 
 
 (defmethod rule-parser :set-quantifier
-  [[_ quantifier]]
-  (let [k  (if (= quantifier "DISTINCT") :selectDistinct :select)]
+  [[_ q]]
+  (let [quantifier (-> q parse-element first)
+        k          (if (= quantifier "DISTINCT") :selectDistinct :select)]
     (bounce k)))
 
 
