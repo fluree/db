@@ -255,14 +255,11 @@
 
 (defmethod rule-parser :in-predicate
   [[_ & rst]]
-  (let [parse-map      (->> rst
-                            (filter (fn [e]
-                                      (not (contains? #{"IN" "NOT"} e))))
-                            parse-into-map)
+  (let [parse-map      (parse-into-map rst)
         pred           (-> parse-map :row-value-constructor first ::pred)
         field-var      (template/build-var pred)
         selector       [template/collection-var pred field-var]
-        not?           (some #{"NOT"} rst)
+        not?           (contains? parse-map :not)
         filter-pred    (if not? "not=" "=")
         filter-junc    (if not? "and" "or")
         filter-clauses (->> parse-map
