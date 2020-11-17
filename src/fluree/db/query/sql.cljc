@@ -407,11 +407,6 @@
               ::inner join-ref))))
 
 
-(defmethod rule-parser :ordering-specification
-  [[_ order]]
-  (-> order str/upper-case bounce))
-
-
 (defmethod rule-parser :sort-specification
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
