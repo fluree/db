@@ -131,6 +131,7 @@
   [[_ & rst]]
   (->> rst
        parse-all
+       (remove #{\'})
        (apply str)
        bounce))
 
