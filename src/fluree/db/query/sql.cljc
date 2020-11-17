@@ -31,6 +31,7 @@
        (keyword? (rule-tag elt))))
 
 (def reserved-words
+  "Keyword rule tags representing the SQL reserved words"
   #{:all :and :as :asc :at :between :case :coalesce :collate :corresponding
     :cross :current-date :current-time :current-timestamp :desc :distinct :else
     :end :except :exists :false :from :full :group-by :having :in :inner
@@ -38,13 +39,13 @@
     :order-by :right :select :some :table :then :trim :true :unique :unknown
     :using :values :when :where})
 
-(defn derive-all [hier coll kw]
-  (reduce (fn [h elt]
-            (derive h elt kw))
-          hier coll))
 
 (def rules
   "Hierarchy of SQL BNF rule name keywords for parsing equivalence"
+  (let [derive-all (fn [hier coll kw]
+                     (reduce (fn [h elt]
+                               (derive h elt kw))
+                             hier coll))])
   (-> (make-hierarchy)
       (derive :column-name ::string)
       (derive :character-string-literal ::string)
