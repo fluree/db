@@ -213,15 +213,15 @@
 
 (defmethod rule-parser :between-predicate
   [[_ & rst]]
-  (let [[col l u]  (->> rst
-                        (filter rule?)
-                        parse-all)
+  (let [parsed     (parse-all rst)
+        [col l u]  (filter (complement #{"AND" "BETWEEN" "NOT"})
+                           parsed)
         pred       (::pred col)
         lower      (::obj l)
         upper      (::obj u)
         field-var  (template/build-var pred)
         selector   [template/collection-var pred field-var]
-        refinement (if (some #{"NOT"} rst)
+        refinement (if (some #{"NOT"} parsed)
                      {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
                               {:filter [(template/build-fn-call [">" field-var upper])]}]}
                      {:filter [(template/build-fn-call [">=" field-var lower])
