@@ -45,11 +45,11 @@
   (let [derive-all (fn [hier coll kw]
                      (reduce (fn [h elt]
                                (derive h elt kw))
-                             hier coll))])
-  (-> (make-hierarchy)
-      (derive :column-name ::string)
-      (derive :character-string-literal ::string)
-      (derive-all reserved-words ::reserved)))
+                             hier coll))]
+    (-> (make-hierarchy)
+        (derive :column-name ::string)
+        (derive :character-string-literal ::string)
+        (derive-all reserved-words ::reserved))))
 
 (defmulti rule-parser
   "Parse SQL BNF rules depending on their type. Returns a function whose return
