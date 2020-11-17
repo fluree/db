@@ -286,7 +286,8 @@
 (defmethod rule-parser :boolean-term
   [[_ & rst]]
   (->> rst
-       (filter (partial not= "AND"))
+       (filter (fn [r]
+                 (not= :and (rule-tag r))))
        parse-all
        bounce))
 
