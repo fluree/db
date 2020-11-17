@@ -294,11 +294,13 @@
 
 (defmethod rule-parser :search-condition
   [[_ & rst]]
-  (if (some #{"OR"} rst)
-    (let [[front _ back] rst]
-      (bounce {:union [(-> front parse-element vec)
-                       (-> back parse-element vec)]}))
-    (->> rst parse-all bounce)))
+  (let [parsed (parse-all rst)]
+    (if (some #{"OR"} parsed)
+      (let [[front back] (split-with (complement #{"OR"})
+                                     parsed)]
+        (bounce {:union [(vec front)
+                         (->> back rest vec)]}))
+      (bounce parsed))))
 
 
 (defmethod rule-parser :table-name
