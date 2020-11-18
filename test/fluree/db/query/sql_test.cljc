@@ -161,8 +161,8 @@
               "correctly constructs the select clause")
 
           (is (= [["?person" "person/age" 18]
-                  ["?person" "person/team" "'red'"]
-                  ["?person" "person/foo" "'bar'"]
+                  ["?person" "person/team" "red"]
+                  ["?person" "person/foo" "bar"]
                   ["?person" "person/name" "?personName"]
                   ["?person" "person/email" "?personEmail"]]
                  (:where subject))
@@ -179,7 +179,7 @@
           (is (= [{:union
                    [[["?person" "person/age" "?personAge"]
                      {:filter ["(> ?personAge 18)"]}]
-                    [["?person" "person/team" "'red'"]]]}
+                    [["?person" "person/team" "red"]]]}
                   ["?person" "person/name" "?personName"]
                   ["?person" "person/email" "?personEmail"]]
                  (:where subject))

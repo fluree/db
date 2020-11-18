@@ -1,12 +1,25 @@
 (ns fluree.db.query.sql
   (:require [fluree.db.query.sql.template :as template]
             [clojure.string :as str]
+            #?(:clj  [clojure.java.io :as io]
+               :cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
-(defparser sql
-  "resources/sql-92.bnf"
-  :input-format :ebnf)
+#?(:cljs
+   (def inline-grammar
+     "SQL grammar in instaparse compatible BNF format loaded at compile time so it's
+     available to cljs and js artifacts."
+     (inline-resource "sql-92.bnf")))
+
+#?(:clj
+   (def sql
+     (-> "sql-92.bnf"
+         io/resource
+         (insta/parser :input-format :ebnf)))
+
+   :cljs
+   (defparser sql inline-grammar :input-format :ebnf))
 
 (defn rule-tag
   [r]
@@ -17,11 +30,26 @@
   (and (sequential? elt)
        (keyword? (rule-tag elt))))
 
+(def reserved-words
+  "Keyword rule tags representing the SQL reserved words"
+  #{:all :and :as :asc :at :between :case :coalesce :collate :corresponding
+    :cross :current-date :current-time :current-timestamp :desc :distinct :else
+    :end :except :exists :false :from :full :group-by :having :in :inner
+    :intersect :is :join :left :local :natural :not :null :nullif :on :or
+    :order-by :right :select :some :table :then :trim :true :unique :unknown
+    :using :values :when :where})
+
+
 (def rules
   "Hierarchy of SQL BNF rule name keywords for parsing equivalence"
-  (-> (make-hierarchy)
-      (derive :column-name ::string)
-      (derive :character-string-literal ::string)))
+  (let [derive-all (fn [hier coll kw]
+                     (reduce (fn [h elt]
+                               (derive h elt kw))
+                             hier coll))]
+    (-> (make-hierarchy)
+        (derive :column-name ::string)
+        (derive :character-string-literal ::string)
+        (derive-all reserved-words ::reserved))))
 
 (defmulti rule-parser
   "Parse SQL BNF rules depending on their type. Returns a function whose return
@@ -75,6 +103,16 @@
   (->> rst parse-all bounce))
 
 
+(defmethod rule-parser ::reserved
+  [[_ & words]]
+  (->> words
+       (map parse-element)
+       flatten
+       (str/join " ")
+       str/upper-case
+       bounce))
+
+
 (defmethod rule-parser :unsigned-integer
   [[_ & rst]]
   (->> rst
@@ -94,6 +132,7 @@
   [[_ & rst]]
   (->> rst
        parse-all
+       (remove #{\'})
        (apply str)
        bounce))
 
@@ -143,8 +182,9 @@
 
 
 (defmethod rule-parser :set-quantifier
-  [[_ quantifier]]
-  (let [k  (if (= quantifier "DISTINCT") :selectDistinct :select)]
+  [[_ q]]
+  (let [quantifier (-> q parse-element first)
+        k          (if (= quantifier "DISTINCT") :selectDistinct :select)]
     (bounce k)))
 
 
@@ -175,15 +215,15 @@
 
 (defmethod rule-parser :between-predicate
   [[_ & rst]]
-  (let [[col l u]  (->> rst
-                        (filter rule?)
-                        parse-all)
+  (let [parsed     (parse-all rst)
+        [col l u]  (filter (complement #{"AND" "BETWEEN" "NOT"})
+                           parsed)
         pred       (::pred col)
         lower      (::obj l)
         upper      (::obj u)
         field-var  (template/build-var pred)
         selector   [template/collection-var pred field-var]
-        refinement (if (some #{"NOT"} rst)
+        refinement (if (some #{"NOT"} parsed)
                      {:union [{:filter [(template/build-fn-call ["<" field-var lower])]}
                               {:filter [(template/build-fn-call [">" field-var upper])]}]}
                      {:filter [(template/build-fn-call [">=" field-var lower])
@@ -218,14 +258,11 @@
 
 (defmethod rule-parser :in-predicate
   [[_ & rst]]
-  (let [parse-map      (->> rst
-                            (filter (fn [e]
-                                      (not (contains? #{"IN" "NOT"} e))))
-                            parse-into-map)
+  (let [parse-map      (parse-into-map rst)
         pred           (-> parse-map :row-value-constructor first ::pred)
         field-var      (template/build-var pred)
         selector       [template/collection-var pred field-var]
-        not?           (some #{"NOT"} rst)
+        not?           (contains? parse-map :not)
         filter-pred    (if not? "not=" "=")
         filter-junc    (if not? "and" "or")
         filter-clauses (->> parse-map
@@ -239,10 +276,11 @@
 
 
 (defmethod rule-parser :null-predicate
-  [[_ p & rst]]
-  (let [pred      (-> p parse-element first ::pred)
+  [[_ & rst]]
+  (let [parsed    (parse-all rst)
+        pred      (-> parsed first ::pred)
         field-var (template/build-var pred)]
-    (if (some #{"NOT"} rst)
+    (if (some #{"NOT"} parsed)
       (bounce [[template/collection-var pred field-var]])
       (bounce [[template/collection-var "rdf:type" template/collection]
                {:optional [[template/collection-var pred field-var]]}
@@ -252,18 +290,21 @@
 (defmethod rule-parser :boolean-term
   [[_ & rst]]
   (->> rst
-       (filter (partial not= "AND"))
+       (filter (fn [r]
+                 (not= :and (rule-tag r))))
        parse-all
        bounce))
 
 
 (defmethod rule-parser :search-condition
   [[_ & rst]]
-  (if (some #{"OR"} rst)
-    (let [[front _ back] rst]
-      (bounce {:union [(-> front parse-element vec)
-                       (-> back parse-element vec)]}))
-    (->> rst parse-all bounce)))
+  (let [parsed (parse-all rst)]
+    (if (some #{"OR"} parsed)
+      (let [[front back] (split-with (complement #{"OR"})
+                                     parsed)]
+        (bounce {:union [(vec front)
+                         (->> back rest vec)]}))
+      (bounce parsed))))
 
 
 (defmethod rule-parser :table-name
@@ -373,11 +414,6 @@
               ::inner join-ref))))
 
 
-(defmethod rule-parser :ordering-specification
-  [[_ order]]
-  (-> order str/upper-case bounce))
-
-
 (defmethod rule-parser :sort-specification
   [[_ & rst]]
   (let [parse-map (parse-into-map rst)
@@ -411,6 +447,7 @@
 (defn parse
   [q]
   (-> q
+      str/trim
       sql
       parse-rule
       first
