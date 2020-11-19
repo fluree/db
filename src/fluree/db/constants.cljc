@@ -18,8 +18,9 @@
 (def ^:const $_role 7)
 (def ^:const $_rule 8)
 (def ^:const $_setting 9)
+(def ^:const $_prefix 10)
 
-(def ^:const $numSystemCollections 9)
+(def ^:const $numSystemCollections 10)
 (def ^:const $maxSystemPredicates 999)
 
 ;; predicate id constants
@@ -120,6 +121,9 @@
 (def ^:const $_shard:name 120)
 (def ^:const $_shard:miners 121)
 (def ^:const $_shard:mutable 122)
+
+(def ^:const $_prefix:prefix 130)
+(def ^:const $_prefix:uri 131)
 
 ;; tags
 ;; _predicate/type tags
