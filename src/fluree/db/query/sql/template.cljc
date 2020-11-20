@@ -2,12 +2,21 @@
   (:require [clojure.string :as str]
             [clojure.walk :refer [postwalk]]))
 
+(defn capitalize-first
+  "Capitalizes the first letter (and only the first letter) of `s`"
+  [s]
+  (if (<= (count s) 1)
+    (str/upper-case s)
+    (-> (subs s 0 1)
+        str/upper-case
+        (str (subs s 1)))))
+
 (defn normalize
   "Formats `s` by removing any '/' and capitalizing the following character for
   each '/' removed"
   [s]
   (reduce (fn [norm nxt]
-            (let [cap (str/capitalize nxt)]
+            (let [cap (capitalize-first nxt)]
               (str norm cap)))
           (str/split s #"/")))
 
