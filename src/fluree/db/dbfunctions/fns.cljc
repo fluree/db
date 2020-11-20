@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.fns
   (:refer-clojure :exclude [max min get inc dec + - * / quot mod == rem contains? get-in < <= > >=
-                            boolean re-find and or count str nth rand nil? hash-set empty? not uuid])
+                            boolean re-find and or count str nth rand nil? hash-set empty? not uuid subs not=])
   (:require [fluree.db.dbfunctions.internal :as fdb]
             [fluree.db.util.log :as log]
             [fluree.db.util.json :as json]
@@ -127,6 +127,18 @@
     (let [args  (<? (coerce-args args))
           res   (apply fdb/str args)
           entry [{:function "str" :arguments [args] :result res} 10]]
+      (add-stack ?ctx entry)
+      res)))
+
+(defn subs
+  {:doc      "Returns substring of a string with a start and optional end integer. Returned string is inclusive of start integer and exclusive of end integer."
+   :fdb/spec nil
+   :fdb/cost 30}
+  [?ctx args]
+  (go-try
+    (let [args  (<? (coerce-args args))
+          res   (apply fdb/subs args)
+          entry [{:function "subs" :arguments [args] :result res} 30]]
       (add-stack ?ctx entry)
       res)))
 
@@ -422,6 +434,19 @@
           res   (apply fdb/>= args)
           cost  (clojure.core/+ 9 (clojure.core/count [args]))
           entry [{:function ">=" :arguments [args] :result res} cost]]
+      (add-stack ?ctx entry)
+      res)))
+
+(defn not=
+  {:doc      "Returns true if two (or more) values are not equal."
+   :fdb/spec nil
+   :fdb/cost "9 + count of numbers in <="}
+  [?ctx & args]
+  (go-try
+    (let [args  (<? (coerce-args args))
+          res   (apply fdb/not= args)
+          cost  (clojure.core/+ 9 (clojure.core/count [args]))
+          entry [{:function "not=" :arguments [args] :result res} cost]]
       (add-stack ?ctx entry)
       res)))
 
