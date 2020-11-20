@@ -13,11 +13,18 @@
     (if (= 0 auth_id)                                       ;; root user, special case
       []
       ;; Lookup both auth roles and user roles in parallel
-      (let [auth-roles-ch (dbproto/-query db {:select "?roles"
-                                              :where  [[auth_id "_auth/roles" "?roles"]]})
-            user-roles-ch (dbproto/-query db {:select "?roles"
-                                              :where  [["?user" "_user/auth" auth_id]
-                                                       ["?user" "_user/roles" "?roles"]]})]
+      (let [auth-roles-ch (if (number? auth_id)
+                            (dbproto/-query db {:select "?roles"
+                                                :where  [[auth_id "_auth/roles" "?roles"]]})
+                            (dbproto/-query db {:select "?roles"
+                                                :where  [[["_auth/id" auth_id] "_auth/roles" "?roles"]]}))
+            user-roles-ch (if (number? auth_id)
+                            (dbproto/-query db {:select "?roles"
+                                                :where  [["?user" "_user/auth" auth_id]
+                                                         ["?user" "_user/roles" "?roles"]]})
+                            (dbproto/-query db {:select "?roles"
+                                                :where  [["?user" "_user/auth" ["_auth/id" auth_id]]
+                                                         ["?user" "_user/roles" "?roles"]]}))]
         (if-let [auth-roles (not-empty (<? auth-roles-ch))]
           auth-roles
           (<? user-roles-ch))))))
