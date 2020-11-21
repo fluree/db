@@ -375,7 +375,7 @@
 (defn ==
   {:doc      "Return true if arguments in sequence equal each other."
    :fdb/spec nil
-   :fdb/cost "9 + count of objects in =="}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
@@ -388,7 +388,7 @@
 (defn >
   {:doc      "Returns non-nil if nums are in monotonically decreasing order, otherwise false."
    :fdb/spec nil
-   :fdb/cost "9 + count of numbers in >"}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
@@ -401,7 +401,7 @@
 (defn <
   {:doc      "Returns non-nil if nums are in monotonically increasing order, otherwise false."
    :fdb/spec nil
-   :fdb/cost "9 + count of numbers in <"}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
@@ -414,7 +414,7 @@
 (defn <=
   {:doc      "Returns non-nil if nums are in monotonically non-decreasing order,\notherwise false."
    :fdb/spec nil
-   :fdb/cost "9 + count of numbers in <="}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
@@ -427,7 +427,7 @@
 (defn >=
   {:doc      "Returns non-nil if nums are in monotonically non-increasing order,\notherwise false."
    :fdb/spec nil
-   :fdb/cost "9 + count of numbers in <="}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
@@ -440,7 +440,7 @@
 (defn not=
   {:doc      "Returns true if two (or more) values are not equal."
    :fdb/spec nil
-   :fdb/cost "9 + count of numbers in not="}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
@@ -453,7 +453,7 @@
 (defn max
   {:doc      "Gets max value from a sequence."
    :fdb/spec nil
-   :fdb/cost "9 + count of numbers in max"}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
@@ -466,12 +466,12 @@
 (defn min
   {:doc      "Gets min value from a sequence."
    :fdb/spec nil
-   :fdb/cost "Count of numbers in min"}
+   :fdb/cost "9 + number of arguments."}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
           res   (apply fdb/min args)
-          cost  (clojure.core/count [args])
+          cost  (clojure.core/+ 9 (clojure.core/count [args]))
           entry [{:function "min" :arguments [args] :result res} cost]]
       (add-stack ?ctx entry)
       res)))
