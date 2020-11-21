@@ -440,7 +440,7 @@
 (defn not=
   {:doc      "Returns true if two (or more) values are not equal."
    :fdb/spec nil
-   :fdb/cost "9 + count of numbers in <="}
+   :fdb/cost "9 + count of numbers in not="}
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
