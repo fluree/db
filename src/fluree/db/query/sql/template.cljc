@@ -11,14 +11,19 @@
         str/upper-case
         (str (subs s 1)))))
 
+(defn combine-str
+  "Combines `s1` and `s2` by concatenating `s1` with the result of capitalizing
+  the first character of `s2`"
+  [s1 s2]
+  (->> s2
+       capitalize-first
+       (str s1)))
+
 (defn normalize
   "Formats `s` by removing any '/' and capitalizing the following character for
   each '/' removed"
   [s]
-  (reduce (fn [norm nxt]
-            (let [cap (capitalize-first nxt)]
-              (str norm cap)))
-          (str/split s #"/")))
+  (reduce combine-str (str/split s #"/")))
 
 (defn build-var
   "Formats `s` as a var by prepending '?', filtering out '/', and lowerCamelCasing

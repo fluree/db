@@ -151,8 +151,7 @@
   (bounce {::obj (->> rst
                       parse-all
                       (apply str)
-                      str/capitalize
-                      (str template/collection-var))}))
+                      (template/combine-str template/collection-var))}))
 
 
 (defmethod rule-parser :unsigned-value-specification
@@ -175,8 +174,7 @@
                       first)]
 
     (cond->> (or subject
-                 {::subj template/collection-var
-                  ::pred pred})
+                 {::subj template/collection-var, ::pred pred})
       coll     (template/fill-in-collection coll)
       :finally bounce)))
 
