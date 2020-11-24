@@ -451,7 +451,7 @@
                                   ;; map of listener functions registered. key is two-tuple of [network dbid],
                                   ;; value is vector of single-argument callback functions that will receive [header data]
                                   :listeners    {}})
-        {:keys [storage-read storage-exists storage-write storage-rename
+        {:keys [storage-read storage-exists storage-write storage-rename storage-list
                 parallelism req-chan sub-chan pub-chan default-network
                 object-cache close-fn serializer
                 tx-private-key private-key-file memory
@@ -509,6 +509,7 @@
                             :sub-chan         sub-chan
                             :pub-chan         pub-chan
                             :close            close
+                            :storage-list     storage-list
                             :storage-read     storage-read*
                             :storage-exists   storage-exists*
                             :storage-write    storage-write
