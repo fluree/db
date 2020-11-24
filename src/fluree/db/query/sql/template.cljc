@@ -47,8 +47,10 @@
 
 (defn build-fn-call
   "Formats `terms` as a function call"
-  [terms]
-  (str "(" (str/join " " terms) ")"))
+  ([fst sec]
+   (build-fn-call [fst sec]))
+  ([terms]
+   (str "(" (str/join " " terms) ")")))
 
 (defn template-for
   [kw]
