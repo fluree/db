@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.internal
   (:refer-clojure :exclude [max min get inc dec + - * / == quot mod rem contains? get-in < <= > >=
-                            boolean re-find and or count str nth rand nil? empty? hash-set not])
+                            boolean re-find and or count str nth rand nil? empty? hash-set not subs not=])
   (:require [clojure.tools.reader.edn :as edn]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -115,6 +115,12 @@
   (try* (apply clojure.core/str args)
         (catch* e (function-error e "str" args))))
 
+(defn subs
+  "Like clojure.core/subs"
+  [& args]
+  (try* (apply clojure.core/subs args)
+        (catch* e (function-error e "subs" args))))
+
 (defn lower-case
   "Like clojure.core/lower-case"
   [str]
@@ -163,6 +169,11 @@
   [& args]
   (try* (apply clojure.core/<= args)
         (catch* e (function-error e "<=" args))))
+
+(defn not=
+  [& args]
+  (try* (apply clojure.core/not= args)
+        (catch* e (function-error e "not=" args))))
 
 (defn query
   "Executes a database query, but returns the :results directly."
@@ -213,10 +224,9 @@
                      :error  :db/invalid-predicate}))))
 
 (defn unreverse-var
-  [var]
-  (let [[coll pred] (str/split var #"/")
-        pred (subs pred 1)]
-    (str coll "/" pred)))
+  "A reverse-reference predicate gets transformed to the actual predicate name."
+  [pred]
+  (str/replace pred "/_" "/"))
 
 (defn build-where-single-path
   [startSubject var endSubject]
