@@ -1228,3 +1228,15 @@
             t         (:t latest-db)]
         (deliver p t)))
     p))
+
+
+(defn to-t
+  "Given a db and any time value (block, ISO-8601 time/duration, or t)
+  will return the underlying ledger's t value as of that time value."
+  [db block-or-t-or-time]
+  (let [p (promise)]
+    (async/go
+      (->> (ledger-api/to-t db block-or-t-or-time)
+           async/<!
+           (deliver p)))
+    p))

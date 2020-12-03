@@ -31,6 +31,12 @@
      ;; session/db returns a promise channel
      (session/db conn ledger nil))))
 
+(defn to-t
+  "Given a db and any time value (block, ISO-8601 time/duration, or t)
+  will return the underlying ledger's t value as of that time value."
+  [db block-or-t-or-time]
+  (time-travel/to-t db block-or-t-or-time))
+
 (defn- add-db-auth-sid
   "Resolves auth subject id from any identity value. Will
   throw an exception if it is unable to resolve to an established identity.

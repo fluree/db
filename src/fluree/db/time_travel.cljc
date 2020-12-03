@@ -61,6 +61,7 @@
         block 1))))
 
 (defn non-border-t-to-block
+  "Returns the block that any given 't' is contained within."
   [db t]
   (go-try (let [border-t (some-> (dbproto/-rootdb db)
                                  (query-range/index-range :opst = [t "_block/transactions"])
@@ -73,30 +74,34 @@
 
 
 (defn block-to-int-format
-  [db block]
+  "Returns the block for a given time as a string (ISO-8601 formatted time or a duration).
+  If a block (positive integer) is provided, returns it unmodified."
+  [db time-str]
   (go-try
     (let [block (cond
-                  (pos-int? block)
-                  block
+                  (pos-int? time-str)                       ;; assume a block number, don't modify
+                  time-str
 
                   ; If string start with P - it's a duration
-                  (and (string? block) (= "P" (str (get block 0))))
-                  (let [parsed-time-str (duration-parse block)
+                  (and (string? time-str) (= "P" (str (get time-str 0))))
+                  (let [parsed-time-str (duration-parse time-str)
                         t               (<? (time-to-t db parsed-time-str))]
                     (<? (t-to-block db t)))
 
-                  (string? block)
-                  (let [t (<? (time-to-t db block))]
+                  (string? time-str)
+                  (let [t (<? (time-to-t db time-str))]
                     (<? (t-to-block db t)))
 
                   :else
-                  (throw (ex-info (str "Invalid block key provided: " (pr-str block))
+                  (throw (ex-info (str "Invalid block key provided: " (pr-str time-str))
                                   {:status 400
                                    :error  :db/invalid-time})))]
       block)))
 
 
 (defn block-to-t
+  "Given a positive integer block, returns the t (negative integer) associated.
+  If block does not exist, throws."
   [db block]
   (go-try
     (let [block-t (some->
@@ -111,6 +116,32 @@
                          :error  :db/invalid-time})))
       block-t)))
 
+(defn to-t
+  "Takes any time value: block, ISO-8601 time or duration string, or t
+  and returns the exact 't' as of that value into a core async channel."
+  [db block-or-t-or-time]
+  (go-try
+    (let [latest-db (<? (dbproto/-latest-db db))]
+      (cond
+        (pos-int? block-or-t-or-time)     ;; specified block
+        (try*
+          (<? (block-to-t latest-db block-or-t-or-time))
+          ;; exception if block doesn't exist... use latest 't'
+          (catch* _ (:t latest-db)))
+
+        (neg-int? block-or-t-or-time)     ;; specified tx identifier
+        block-or-t-or-time
+
+        (string? block-or-t-or-time)      ;; ISO 8601-string
+        (if (= "P" (str (get block-or-t-or-time 0))) ; If string start with P - it's a duration
+          (<? (time-to-t latest-db (duration-parse block-or-t-or-time)))
+          (<? (time-to-t latest-db block-or-t-or-time)))
+
+        :else
+        (throw (ex-info (str "Invalid time value provided: " (pr-str block-or-t-or-time))
+                        {:status 400
+                         :error  :db/invalid-time}))))))
+
 
 (defn as-of-block
   "Gets the database as-of a specified block. Either block number or a time string in ISO-8601 format.
@@ -120,25 +151,7 @@
     (try*
       (async/go
         (let [latest-db (<? (dbproto/-latest-db db))
-              t         (cond
-                          (pos-int? block-or-t-or-time)     ;; specified block
-                          (try*
-                            (<? (block-to-t latest-db block-or-t-or-time))
-                            ;; exception if block doesn't exist... use latest 't'
-                            (catch* _ (:t latest-db)))
-
-                          (neg-int? block-or-t-or-time)     ;; specified tx identifier
-                          block-or-t-or-time
-
-                          (string? block-or-t-or-time)      ;; ISO 8601-string
-                          (if (= "P" (str (get block-or-t-or-time 0))) ; If string start with P - it's a duration
-                            (<? (time-to-t latest-db (duration-parse block-or-t-or-time)))
-                            (<? (time-to-t latest-db block-or-t-or-time)))
-
-                          :else
-                          (throw (ex-info (str "Invalid block key provided: " (pr-str block-or-t-or-time))
-                                          {:status 400
-                                           :error  :db/invalid-time})))
+              t         (<? (to-t latest-db block-or-t-or-time))
               block     (<? (t-to-block latest-db t))]
           (async/put! pc (assoc db :t t
                                    :block block))))
