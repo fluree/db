@@ -13,14 +13,17 @@
     (if (= 0 auth_id)                                       ;; root user, special case
       []
       ;; Lookup both auth roles and user roles in parallel
-      (let [auth-roles-ch (dbproto/-query db {:select "?roles"
-                                              :where  [[auth_id "_auth/roles" "?roles"]]})
-            user-roles-ch (dbproto/-query db {:select "?roles"
-                                              :where  [["?user" "_user/auth" auth_id]
-                                                       ["?user" "_user/roles" "?roles"]]})]
-        (if-let [auth-roles (not-empty (<? auth-roles-ch))]
-          auth-roles
-          (<? user-roles-ch))))))
+      (let [auth-ident    (if (string? auth_id)
+                            ["_auth/id" auth_id]            ;; if a string, assume it is an improperly formed identity for _auth/id
+                            auth_id)
+            auth-roles-ch (<? (dbproto/-query db {:select "?roles"
+                                                  :where  [[auth-ident "_auth/roles" "?roles"]]
+                                                  :opts   {:cache true}}))]
+        (or (not-empty auth-roles-ch)
+            (<? (dbproto/-query db {:select "?roles"        ;; user roles, if exist, act as defaults if no auth roles
+                                    :where  [["?user" "_user/auth" auth-ident]
+                                             ["?user" "_user/roles" "?roles"]]
+                                    :opts   {:cache true}})))))))
 
 
 (defn root-role?
@@ -32,22 +35,17 @@
     ;; Lookup auth roles
     (if (nil? auth_id)
       false
-      (let [auth-roles-ch (if (number? auth_id)
-                            (dbproto/-query db {:select "?role"
-                                                :where  [["?role", "_role/id", "root"]
-                                                         [auth_id "_auth/roles" "?role"]]})
-                            (dbproto/-query db {:select "?role"
-                                                :where  [["?role", "_role/id", "root"]
-                                                         [["_auth/id" auth_id] "_auth/roles" "?role"]]}))
-            user-roles-ch (if (number? auth_id)
-                            (dbproto/-query db {:select "?role"
-                                                :where  [["?role", "_role/id", "root"]
-                                                         ["?user" "_user/auth" auth_id]
-                                                         ["?user" "_user/roles" "?roles"]]})
-                            (dbproto/-query db {:select "?role"
-                                                :where  [["?role", "_role/id", "root"]
-                                                         ["?user" "_user/auth" ["_auth/id" auth_id]]
-                                                         ["?user" "_user/roles" "?roles"]]}))]
-        (or (not-empty (<? auth-roles-ch))
-            (not-empty (<? user-roles-ch)))))))
+      (let [auth-ident    (if (string? auth_id)
+                            ["_auth/id" auth_id]            ;; if a string, assume it is an improperly formed identity for _auth/id
+                            auth_id)
+            auth-roles-ch (<? (dbproto/-query db {:select "?role"
+                                                  :where  [["?role", "_role/id", "root"]
+                                                           [auth-ident "_auth/roles" "?role"]]
+                                                  :opts   {:cache true}}))]
+        (or (not-empty auth-roles-ch)
+            (not-empty (<? (dbproto/-query db {:select "?role"
+                                               :where  [["?role", "_role/id", "root"]
+                                                        ["?user" "_user/auth" auth-ident]
+                                                        ["?user" "_user/roles" "?roles"]]
+                                               :opts   {:cache true}}))))))))
 

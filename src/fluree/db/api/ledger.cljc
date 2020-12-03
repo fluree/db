@@ -149,7 +149,7 @@
   ([conn ledger {:keys [roles auth block syncTo syncTimeout] :as opts}]
    (let [pc (async/promise-chan)]
      (async/go
-       (try
+       (try*
          (let [dbx (cond-> (<? (session/db conn ledger nil))
                            syncTo (-> (syncTo-db syncTo syncTimeout) <?)
                            block (-> (time-travel/as-of-block block) <?)
@@ -157,7 +157,7 @@
                            auth (-> (add-db-permissions auth roles) <?) ;; if both, auth overrides roles
                            )]
            (async/put! pc dbx))
-         (catch Exception e
+         (catch* e
            (async/put! pc e)
            (async/close! pc))))
      ;; return promise chan immediately
