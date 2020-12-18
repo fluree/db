@@ -587,22 +587,22 @@
     (let [{:keys [sid pid db]} ?ctx
           p-name      (dbproto/-p-prop db :name pid)
           _           (when-not sid
-                        (throw (ex-info (str "Unable to execute cas as no subject id could be determined. Cas values: " compare-val new-val)
+                        (throw (ex-info (str "Unable to execute cas - subject id could be determined. Cas values: " compare-val new-val)
                                         {:status 400
                                          :error  :db/validation-error})))
           _           (when-not p-name
-                        (throw (ex-info (str "Unable to execute cas as no predicate id could be determined. Cas values: " compare-val new-val)
+                        (throw (ex-info (str "Unable to execute cas - predicate could be determined. Cas values: " compare-val new-val)
                                         {:status 400
                                          :error  :db/validation-error})))
           _           (when (dbproto/-p-prop db :multi pid)
-                        (throw (ex-info (str "Unable to execute cas on a multi-predicate: " p-name)
+                        (throw (ex-info (str "Unable to execute cas on a multi-cardinality predicate: " p-name)
                                         {:status 400
                                          :error  :db/validation-error})))
 
           query'      {:select "?current-val"
                        :where  [[sid p-name "?current-val"]]
                        :opts   {}}
-          [res fuel] (<? (query db query'))
+          [res _] (<? (query db query'))
           current-val (first res)]
       (if (= current-val compare-val)
         new-val
