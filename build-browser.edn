@@ -10,6 +10,6 @@
  :externs            ["sjcl-externs.js"]
  :install-deps       true
  :npm-deps           {}
- :bundle-cmd         {:none    ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/flureedb.js" "--mode=development"]
-                      :default ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/flureedb.js"]}
+ :bundle-cmd         {:none    ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/main.js" "--mode=development"]
+                      :default ["npx" "webpack" "out/browser/index.js" "-o" "out/browser/main.js"]}
  :closure-defines    {cljs.core/*global* "window"}}
