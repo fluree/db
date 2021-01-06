@@ -72,8 +72,7 @@
   :jar
   {:extra-deps {seancorfield/depstar {:mvn/version "2.0.165"}}
    :exec-fn hf.depstar/jar
-   :exec-args {:jar "target/fluree-db.standalone.jar"
-               :aot true}}
+   :exec-args {:jar "target/fluree-db.jar"}}
 
   :install
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "RELEASE"}}
