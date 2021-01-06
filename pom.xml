@@ -4,7 +4,7 @@
   <packaging>jar</packaging>
   <groupId>com.fluree</groupId>
   <artifactId>db</artifactId>
-  <version>1.0.0-rc1</version>
+  <version>1.0.0-rc2</version>
   <name>db</name>
   <dependencies>
     <dependency>
