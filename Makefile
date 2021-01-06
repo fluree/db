@@ -11,7 +11,7 @@ NODEJS_SOURCES := $(shell find src-nodejs)
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
 
 target/fluree-db.jar: pom.xml out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
-	clojure -M:jar
+	clojure -X:jar
 
 jar: target/fluree-db.jar
 
@@ -30,7 +30,6 @@ out/flureedb.js: out package.json package-lock.json node_modules build-browser.e
 	clojure -M:browser && cp out/browser/main.js out/flureedb.js
 
 browser: out/flureedb.js
-
 
 pom.xml: deps.edn
 	clojure -Spom
