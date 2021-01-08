@@ -598,11 +598,9 @@
                         (throw (ex-info (str "Unable to execute cas on a multi-cardinality predicate: " p-name)
                                         {:status 400
                                          :error  :db/validation-error})))
-
-          query'      {:select "?current-val"
-                       :where  [[sid p-name "?current-val"]]
-                       :opts   {}}
-          [res _] (<? (query db query'))
+          [res _] (<? (query db {:select "?current-val"
+                                 :where  [[sid p-name "?current-val"]]
+                                 :opts   {}}))
           current-val (first res)]
       (if (= current-val compare-val)
         new-val
