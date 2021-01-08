@@ -17,13 +17,11 @@
                             ["_auth/id" auth_id]            ;; if a string, assume it is an improperly formed identity for _auth/id
                             auth_id)
             auth-roles-ch (<? (dbproto/-query db {:select "?roles"
-                                                  :where  [[auth-ident "_auth/roles" "?roles"]]
-                                                  :opts   {:cache true}}))]
+                                                  :where  [[auth-ident "_auth/roles" "?roles"]]}))]
         (or (not-empty auth-roles-ch)
             (<? (dbproto/-query db {:select "?roles"        ;; user roles, if exist, act as defaults if no auth roles
                                     :where  [["?user" "_user/auth" auth-ident]
-                                             ["?user" "_user/roles" "?roles"]]
-                                    :opts   {:cache true}})))))))
+                                             ["?user" "_user/roles" "?roles"]]})))))))
 
 
 (defn root-role?
