@@ -93,7 +93,8 @@
                      'floor         (resolve 'fluree.db.dbfunctions.fns/floor)
                      'upper-case    (resolve 'fluree.db.dbfunctions.fns/upper-case)
                      'lower-case    (resolve 'fluree.db.dbfunctions.fns/lower-case)
-                     'uuid          (resolve 'fluree.db.dbfunctions.fns/uuid)})
+                     'uuid          (resolve 'fluree.db.dbfunctions.fns/uuid)
+                     'cas           (resolve 'fluree.db.dbfunctions.fns/cas)})
 
 (defn resolve-local-fn
   [f]
