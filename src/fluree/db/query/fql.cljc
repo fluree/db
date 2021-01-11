@@ -253,199 +253,54 @@
               (assoc acc key-spec val-spec)))
           {} (get-in select-spec [:select :reverse])))
 
-;; For a multi variable, the recursion map needs to track all the paths to the parent
-;; The structure of the recursion map looks like
-;; {:category/child { :124 [[124]]
-;;                    :125 [[124 125]]
-;;                    :126 [[124 126]]
-;;                    :depth 2}}
-;; where each vectors holds can hold multiple vectors, which are all the paths to the parent.
-;; Lets say we get a new flake:     126 category/child 124
 
-;; When adding a flake to the recursion map, we first get the path to the parent (126).
-;; In this case, the parent is 126, and the only path to the parent is [124 126].
-;; We append 124 to every path to the parent, resulting in [[124 126 124]]
-;; Then we retrieve existing path to the child. The child is 124, and the existing path to the
-;; child is [[124]]
-;; We combine the existing and the new paths to the child, giving us [[124 126 124] [124]]
-
-;; Then we look at the longest path in the child. The longest path is length 3. If this is longer
-;; than the current depth of :category/child (it is, in this case), then we update :depth.
-;; This results in:
-;; {:category/child {:124 [[124 126 124] [124]]
-;;                  :125 [[124 125]]
-;;                  :126 [[124 126]]
-;;                  :depth 3}}
+(defn- conjv
+  "Like conj, but if collection is nil creates a new vector instead of list.
+  Not built to handle variable arity values"
+  [coll x]
+  (if (nil? coll)
+    (vector x)
+    (conj coll x)))
 
 
-(defn get-recursion-map-multi
-  [recursion-map k f full-select-spec seen?]
-  [[[(o f)]] (-> (assoc-in recursion-map [k (o f)] [[(o f)]])
-                 (assoc-in [k :depth] 0)
-                 (assoc-in [:pred-ids k] (.-p f))
-                 (assoc-in [:select-specs (.-p f)] full-select-spec)) true])
-;(let [parent-path (get-in recursion-map [k (s f)])
-;      new-child-paths (mapv #(conj % (o f)) parent-path)
-;      existing-child-paths (or (get-in recursion-map [k (o f)]) [])
-;
-;      ;; TODO - I redo the work of getting the min-existing-depth. Revisit
-;      ;; To determine if we should retrieve the children of this flake's
-;      ;; object, we need to check if the min length of the existing child paths
-;      ;; are shorter than the min length of the additional child paths.
-;      ;; If the existing paths are shorter, then we will see more descendants of
-;      ;; the object by following the shorter path.
-;      existing-path-shorter? (if (not-empty existing-child-paths)
-;                               (let [min-existing-depth (apply min (map count existing-child-paths))
-;                                     min-new-depth (apply min (map count new-child-paths))]
-;                                 (< min-existing-depth min-new-depth))
-;                               false)
-;
-;
-;      ;; If the shortest existing path is longer, BUT if all the new paths
-;      ;; that are shorter than the shortest existing path repeat themselves,
-;      ;; then we can also stop getting the descendants of the current path
-;      retrieve-children? (if existing-path-shorter?
-;                           false
-;                           (let [empty-existing? (empty? existing-child-paths)
-;                                 new-paths-short (if empty-existing?
-;                                                   new-child-paths
-;                                                   (let [min-existing-depth (apply min (map count existing-child-paths))]
-;                                                     (filter #(< (count %) min-existing-depth)
-;                                                             new-child-paths)))]
-;                             (some (fn [path]
-;                                     (let [last-item (last path)
-;                                           index (.indexOf path last-item)]
-;                                       (not= index (count path)))) new-paths-short)))
-;
-;      max-depth (apply max (map count new-child-paths))
-;      complete-child-path (into existing-child-paths new-child-paths)
-;      recursion-map (if (> max-depth (get-in recursion-map [k :depth]))
-;                      (assoc-in recursion-map [k :depth] max-depth)
-;                      recursion-map)]
-;  [new-child-paths (assoc-in recursion-map [k (o f)] complete-child-path) retrieve-children?])
+(defn- recur-select-spec
+  "For recursion, takes current select-spec and nests the recur predicate as a child, updating
+  recur-depth and recur-seen values. Uses flake as the recursion flake being operated on."
+  [select-spec ^Flake flake]
+  (let [recur-subject (.-o flake)
+        recur-pred    (.-p flake)
+        {:keys [recur-seen recur-depth]} select-spec]
+    (-> select-spec
+        (assoc-in [:select :pred-id recur-pred] select-spec) ;; move current pred-spec to child in :select key for next recursion round
+        (assoc-in [:select :pred-id recur-pred :recur-depth] (inc recur-depth))
+        (assoc-in [:select :pred-id recur-pred :recur-seen] (conj recur-seen recur-subject))
+        ;; only need inherited keys
+        (select-keys [:select :componentFollow? :compact?]))))
 
 
 
-(defn add-in-multi-flakes
-  [acc new-child-paths k f db cache fuel max-fuel pred-spec component-follow? parent-exists]
-  (go-try
-    (loop [[child-path & r] new-child-paths
-           acc acc]
-      (if-not child-path
-        acc
-        (let [child-path  (if parent-exists
-                            child-path
-                            (drop-last child-path))
-              keys'       [k]
-              get-in-keys (if (and (not= (:_id acc) (s f)) (not (empty? child-path)))
-                            (loop [child-path child-path
-                                   keys'      keys']
-                              (let [value    (get-in acc keys')
-                                    elem     (-> (filter #(= (:_id %) (first child-path)) value)
-                                                 first)
-                                    index    (.indexOf value elem)
-                                    new-keys (conj (conj keys' index) k)]
-                                (if (> (count (rest child-path)) 0)
-                                  (recur (rest child-path) new-keys)
-                                  new-keys))) keys')
-              get-in-keys (if (> (count get-in-keys) 1)
-                            (drop-last get-in-keys)
-                            get-in-keys)
-              existing    (get-in acc get-in-keys)
-              updated     (let [[updated _] (if (= (:_id acc) (s f))
-                                              (<? (add-pred db cache fuel max-fuel acc pred-spec f component-follow? true))
-                                              (<? (add-pred db cache fuel max-fuel existing pred-spec f component-follow? true)))]
-                            (if (or (= (:_id acc) (s f)) (empty? get-in-keys))
-                              updated
-                              (assoc-in acc get-in-keys updated)))]
-          (recur r (conj acc updated)))))))
-
-
-(defn flake->recur-multi
-  [db f pred-spec recursion-map flakes acc fuel max-fuel select-spec cache component-follow?]
-  (go-try
-    (let [acc           (assoc acc :_id (s f))
-          recur-subject (o f)
-          k             (or (:as pred-spec) (:name pred-spec) (:p pred-spec))
-          seen?         (or (get-in recursion-map [k recur-subject]) false)
-          [new-child-paths recursion-map retrieve-children?] (get-recursion-map-multi recursion-map k f select-spec seen?)
-          max-depth?    (< (:recur pred-spec) (get-in recursion-map [k :depth]))
-          ;; TODO - figure out how to add reverse refs here....
-          reverse-refs  (when-not (or max-depth? (not retrieve-children?))
-                          (when-let [reverse-pred-specs (select-spec->reverse-pred-specs (get-in recursion-map [:select-specs (.-p f)]))]
-                            (<? (resolve-reverse-refs db cache fuel max-fuel (.-o f) reverse-pred-specs))))]
-      (let [acc     (<? (add-in-multi-flakes acc new-child-paths k f db cache fuel max-fuel pred-spec component-follow? false))
-            flakes' (cond (or max-depth? (not retrieve-children?))
-                          (rest flakes)
-
-                          reverse-refs
-                          (concat (rest flakes) reverse-refs)
-
-                          :else
-                          (concat (rest flakes)
-                                  (cond->> (<? (query-range/index-range db :spot = [recur-subject]))
-                                           fuel (sequence (fuel-flake-transducer fuel max-fuel)))))]
-        [acc flakes' recursion-map]))))
-
-
-(defn get-recursion-map
-  [db recursion-map select-spec cache k f]
-  (let [select-spec      (get-in select-spec [:select :pred-id (.-p f)])
-        full-select-spec (if (has-ns-lookups? select-spec)
-                           (full-select-spec db cache select-spec (s f))
-                           select-spec)]
-    (-> (assoc-in recursion-map [k (s f)] 0)
-        (assoc-in [:pred-ids k] (.-p f))
-        (assoc-in [:select-specs (.-p f)] full-select-spec))))
-
-
+;; TODO - reverse refs
 (defn flake->recur
-  [db f pred-spec recursion-map flakes acc fuel max-fuel select-spec cache]
-  (go-try
-    (let [recur-subject  (.-o f)
-          multi?         (:multi? pred-spec)
-          k              (or (:as pred-spec) (:name pred-spec) (:p pred-spec))
-          depth          0
-          e-map          (get-in acc
-                                 (into [] (repeat depth k)))
-          seen?          (or (get-in recursion-map [k recur-subject]) false)
-          recursion-map  (if (not seen?)
-                           (get-recursion-map db recursion-map select-spec cache k f) recursion-map)
-          recursion-map' (if seen?
-                           recursion-map
-                           (assoc-in recursion-map [k recur-subject] (inc depth)))
-          max-depth?     (->> (get recursion-map' k)
-                              vals
-                              (apply max)
-                              (< (:recur pred-spec)))
-          reverse-refs   (when-not (or max-depth? seen?)
-                           (when-let [reverse-pred-specs (select-spec->reverse-pred-specs (get-in recursion-map' [:select-specs (.-p f)]))]
-                             (<? (resolve-reverse-refs db cache fuel max-fuel (.-o f) reverse-pred-specs))))]
-      (if (and multi? (> (count (get e-map k)) (:limit pred-spec)))
-        [acc (rest flakes) recursion-map']
-        (let [e-map   (if multi?
-                        (assoc e-map k (into [] (conj (get e-map k) {:_id recur-subject})))
-                        (assoc-in e-map [k :_id] recur-subject))
-              e-map   (if reverse-refs
-                        (assoc e-map k (merge (get e-map k) reverse-refs))
-                        e-map)
-              acc     (cond
-                        (not seen?)
-                        e-map
+  ([db ^Flake flake select-spec acc fuel max-fuel cache]
+   (go-try
+     (let [recur-subject (.-o flake)                        ;; ref, so recur subject is the object of the incoming flake
+           {:keys [multi? as recur recur-seen recur-depth limit]} select-spec ;; recur contains # with requested recursion depth
+           seen?         (contains? recur-seen recur-subject) ;; subject has been seen before, stop recursion
+           max-depth?    (> recur-depth recur)              ;; reached max depth
+           sub-flakes    (cond->> (<? (query-range/index-range db :spot = [recur-subject]))
+                                  fuel (sequence (fuel-flake-transducer fuel max-fuel)))
+           stop?         (or seen? max-depth? (empty? sub-flakes))
+           add-result    (if multi?
+                           (fn [results as new-result]
+                             (update results as conjv new-result))
+                           (fn [results as new-result]
+                             (assoc results as new-result)))]
+       (if stop?
+         acc
+         (let [select-spec* (recur-select-spec select-spec flake)
 
-                        seen?
-                        acc
-
-                        :else
-                        (assoc-in acc (into [] (repeat depth k))
-                                  e-map))
-
-              flakes' (if (or max-depth? seen?)
-                        (rest flakes)
-                        (concat (rest flakes)
-                                (cond->> (<? (query-range/index-range db :spot = [recur-subject]))
-                                         fuel (sequence (fuel-flake-transducer fuel max-fuel)))))]
-          [acc flakes' recursion-map'])))))
+               res          (<? (flakes->res db cache fuel max-fuel select-spec* sub-flakes))]
+           (add-result acc as res)))))))
 
 
 (defn flakes->res
@@ -472,39 +327,36 @@
                                      (<?)
                                      (merge base-acc))
                                 base-acc)
-            result            (loop [flakes        flakes
-                                     acc           acc+refs
-                                     recursion-map {}
-                                     offset-map    {}]
+            result            (loop [flakes     flakes
+                                     acc        acc+refs
+                                     offset-map {}]
                                 (if (empty? flakes)
                                   acc
                                   (let [f                (first flakes)
                                         pred-spec        (get-in select-spec [:select :pred-id (.-p f)])
                                         componentFollow? (component-follow? pred-spec select-spec)
-                                        [acc flakes' recursion-map offset-map'] (cond
-                                                                                  (and (:multi? pred-spec) (:recur pred-spec))
-                                                                                  (<? (flake->recur-multi db f pred-spec recursion-map flakes acc fuel max-fuel select-spec cache component-follow?))
+                                        [acc flakes' offset-map'] (cond
+                                                                    (:recur pred-spec)
+                                                                    [(<? (flake->recur db f pred-spec acc fuel max-fuel cache))
+                                                                     (rest flakes) offset-map]
 
-                                                                                  (:recur pred-spec)
-                                                                                  (<? (flake->recur db f pred-spec recursion-map flakes acc fuel max-fuel select-spec cache))
+                                                                    pred-spec
+                                                                    (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec f componentFollow? false offset-map))]
+                                                                      [acc (rest flakes) offset-map])
 
-                                                                                  pred-spec
-                                                                                  (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec f componentFollow? false offset-map))]
-                                                                                    [acc (rest flakes) recursion-map offset-map])
+                                                                    (:wildcard? select-spec)
+                                                                    [(first (<? (add-pred db cache fuel max-fuel acc
+                                                                                          select-spec f componentFollow? false)))
+                                                                     (rest flakes)
+                                                                     offset-map]
 
-                                                                                  (:wildcard? select-spec)
-                                                                                  [(first (<? (add-pred db cache fuel max-fuel acc
-                                                                                                        select-spec f componentFollow? false)))
-                                                                                   (rest flakes)
-                                                                                   recursion-map offset-map]
+                                                                    (and (empty? (:select select-spec)) (:id? select-spec))
+                                                                    [{"_id" (.-s f)} (rest flakes) offset-map]
 
-                                                                                  (and (empty? (:select select-spec)) (:id? select-spec))
-                                                                                  [{"_id" (.-s f)} (rest flakes) recursion-map offset-map]
-
-                                                                                  :else
-                                                                                  [acc (rest flakes) recursion-map offset-map])
+                                                                    :else
+                                                                    [acc (rest flakes) offset-map])
                                         acc              (assoc acc :_id (.-s f))]
-                                    (recur flakes' acc recursion-map offset-map'))))
+                                    (recur flakes' acc offset-map'))))
             sort-preds        (reduce (fn [acc spec]
                                         (if (or (and (:multi? spec) (:orderBy spec))
                                                 (and (:reverse? spec) (:orderBy spec)))
