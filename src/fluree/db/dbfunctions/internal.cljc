@@ -579,3 +579,32 @@
     (let [base (.nextDouble (java.util.Random. instant))
           num  (int (Math/floor (* base max')))] num)
     (catch* e (function-error e "rand" instant max'))))
+
+(defn cas
+  "Returns new-val if existing-val is equal to compare-val, else throws exception"
+  [?ctx compare-val new-val]
+  (go-try
+    (let [{:keys [sid pid db]} ?ctx
+          p-name      (dbproto/-p-prop db :name pid)
+          _           (when-not sid
+                        (throw (ex-info (str "Unable to execute cas - subject id could be determined. Cas values: " compare-val new-val)
+                                        {:status 400
+                                         :error  :db/validation-error})))
+          _           (when-not p-name
+                        (throw (ex-info (str "Unable to execute cas - predicate could be determined. Cas values: " compare-val new-val)
+                                        {:status 400
+                                         :error  :db/validation-error})))
+          _           (when (dbproto/-p-prop db :multi pid)
+                        (throw (ex-info (str "Unable to execute cas on a multi-cardinality predicate: " p-name)
+                                        {:status 400
+                                         :error  :db/validation-error})))
+          [res _] (<? (query db {:select "?current-val"
+                                 :where  [[sid p-name "?current-val"]]
+                                 :opts   {}}))
+          current-val (first res)]
+      (if (= current-val compare-val)
+        new-val
+        (throw (ex-info (clojure.core/str "The current value: " current-val " does not match the comparison value: " compare-val ".")
+                        {:status 400
+                         :error  :db/validation-error}))))))
+

@@ -770,7 +770,7 @@
      (let [seed' (extract seed)
            max'  (clojure.core/or (extract max) 10)
            res   (fdb/rand seed' max')
-           entry [{:function "rand" :arguments [seed max] :result res} 10]]
+           entry [{:function "rand" :arguments [max seed] :result res} 10]]
        (add-stack ?ctx entry)
        res))))
 
@@ -805,5 +805,16 @@
     (let [num   (extract num)
           res   (fdb/floor num)
           entry [{:function "" :arguments [floor] :result res} 10]]
+      (add-stack ?ctx entry)
+      res)))
+
+(defn cas
+  {:doc      "Does a compare and set/swap operation as a transaction function."
+   :fdb/spec nil
+   :fdb/cost 20}
+  [?ctx compare-val new-val]
+  (go-try
+    (let [res   (<? (fdb/cas ?ctx compare-val new-val))
+          entry [{:function "" :arguments [compare-val new-val] :result res} 10]]
       (add-stack ?ctx entry)
       res)))
