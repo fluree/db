@@ -150,7 +150,35 @@
                     ["?person" "person/name" "?personName"]
                     ["?person" "person/email" "?personEmail"]]
                    (:where subject))
-                "correctly constructs the where clause")))))
+                "correctly constructs the where clause"))))
+
+      (testing "with aggregate functions"
+        (testing "count"
+          (testing "explicit fields"
+            (let [query   "SELECT COUNT(middleName) FROM person"
+                  subject (parse query)]
+
+              (is (= ["(count ?personMiddleName)"]
+                     (:select subject))
+                  "correctly constructs the select clause")
+
+              (is (= [["?person" "rdf:type" "person"]
+                      ["?person" "person/middleName" "?personMiddleName"]]
+                     (:where subject))
+                  "correctly constructs the where clause"))
+
+            (testing "with distinct"
+              (let [query   "SELECT COUNT(DISTINCT middleName) FROM person"
+                    subject (parse query)]
+
+                (is (= ["(count (distinct ?personMiddleName))"]
+                     (:select subject))
+                  "correctly constructs the select clause")
+
+              (is (= [["?person" "rdf:type" "person"]
+                      ["?person" "person/middleName" "?personMiddleName"]]
+                     (:where subject))
+                  "correctly constructs the where clause")))))))
 
     (testing "on a complex query"
       (testing "with AND"

@@ -151,8 +151,7 @@
   (bounce {::obj (->> rst
                       parse-all
                       (apply str)
-                      str/capitalize
-                      (str template/collection-var))}))
+                      (template/combine-str template/collection-var))}))
 
 
 (defmethod rule-parser :unsigned-value-specification
@@ -175,8 +174,7 @@
                       first)]
 
     (cond->> (or subject
-                 {::subj template/collection-var
-                  ::pred pred})
+                 {::subj template/collection-var, ::pred pred})
       coll     (template/fill-in-collection coll)
       :finally bounce)))
 
@@ -193,14 +191,41 @@
   (bounce {::select {template/collection-var ["*"]}}))
 
 
+(defmethod rule-parser :set-function-type
+  [[_ t]]
+  (-> t rule-tag name bounce))
+
+
+(defmethod rule-parser :general-set-function
+  [[_ & rst]]
+  (let [parse-map (parse-into-map rst)
+        func      (-> parse-map :set-function-type first)
+        val-exp   (-> parse-map
+                      :value-expression
+                      first)
+        subj      (-> val-exp
+                      ::subj
+                      (or template/collection-var))
+        pred      (::pred val-exp)
+        val       (template/build-var pred)
+        distinct? (-> parse-map
+                      :set-quantifier
+                      first
+                      (= :selectDistinct))]
+    (cond-> {::subj subj, ::pred pred, ::obj val}
+      distinct? (update ::obj (partial template/build-fn-call "distinct"))
+      :finally  (-> (update ::obj (partial template/build-fn-call func))
+                    bounce))))
+
+
 (defmethod rule-parser :select-list-element
   [[_ & rst]]
   (let [parse-map                (parse-into-map rst)
         {::keys [subj pred obj]} (->> parse-map :derived-column first)
-        var                      (or (some-> pred template/build-var)
-                                     obj)
-        triple                   [subj pred var]]
-    (cond->  {::select [var]}
+        pred-var                 (some-> pred template/build-var)
+        selected                 (or obj pred-var)
+        triple                   [subj pred pred-var]]
+    (cond->  {::select [selected]}
       (template/predicate? pred) (assoc ::where [triple])
       :finally                   bounce)))
 

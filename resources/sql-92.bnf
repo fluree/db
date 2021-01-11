@@ -51,9 +51,23 @@ derived-column ::= value-expression [ <space> as-clause ]
 value-expression ::= numeric-value-expression | string-value-expression | datetime-value-expression | interval-value-expression
 
 <value-expression-primary> ::=
-                unsigned-value-specification / column-reference (* | set-function-specification | scalar-subquery | case-expression | left-paren value-expression right-paren | cast-specification *)
+                unsigned-value-specification / column-reference / set-function-specification (* | scalar-subquery | case-expression | left-paren value-expression right-paren | cast-specification *)
 
- <datetime-value-expression>   ::=
+count ::= 'count' | 'COUNT'
+avg ::= 'avg' | 'AVG'
+max ::= 'max' | 'MAX'
+min ::= 'min' | 'MIN'
+sum ::= 'sum' | 'SUM'
+
+set-function-specification ::=
+                           count [ <space> ] <left-paren> asterisk <right-paren>
+                           | general-set-function
+
+general-set-function ::= set-function-type [ <space> ] <left-paren> [ set-quantifier <space> ] value-expression <right-paren>
+
+set-function-type ::= avg | max | min | sum | count
+
+<datetime-value-expression>   ::=
                  datetime-term
         |	 interval-value-expression    plus-sign    datetime-term
         |	 datetime-value-expression    plus-sign    interval-term
