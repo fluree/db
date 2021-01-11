@@ -2,6 +2,63 @@
 # Changelog
 All notable changes to FlureeDB will be documented in this file.
 
+## 1.0.0
+- Add support for cas (compare and set) SmartFunction (FC-956)
+- Fix issues for nodejs permissions (FC-786)
+- Update ledger/db to use try*/catch* macro (FC-918)
+- Add subs, not= SmartFunctions and stream-line unreversed-var (FC-920)
+- Include :storage-list in connection for raft (FC-914)
+- Fix local ledger update to return go-channel 
+- Improve syncTo by registering a listener w/callback to return results (FC-849, FC-847 , FC-846)
+- Fix query cache issue (FC-887)
+- Add docs for Clojure API (FC-111)
+- Fix issue where collection-default SmartFunctions not always triggering properly (FC-879)
+- Fix permission validation to support multi-cardinality roles (FC-879)
+- Remove deprecation syntax warnings as both syntax formats will be supported (FC-837)
+- Fix validation issues for block query and history query (FC-861)
+- Add promise version of history query (FC-878)
+- Add support for SQL queries in Clojure and Node.js APIs (FC-501, FC-815, FC-816, FC-817, FC-883)
+- Fix sync-to-db API (FC-849)
+- Add block-event->map API function (FC-832)
+- Add tx-hash generation utility function (FC-809)
+- Fix Clojure API connection to pass options (FC-808)
+- Standardize try/catch blocks for Clojure/ClojureScript to use macro (FC-636, FC-768)
+- Fix GraphQL history query so it works (FC-754, FC-548)
+- Fix omit :opts when validating block query format (FC-717)
+- Replace read-string macro with reference to read-string (FC-703)
+- Update root-role? check to validate against both auth-roles and user-roles (FC-705)
+- Remove separate 'opts' parameter for queries in favor of :opts key in query map (FC-626)
+- Node.js: override default cljs behavior to support permissions, smart-function code (FC-915)
+- Add "predicate-name" Clojure API function (FC-831)
+- Fix issue where adding a listener doesn't trigger events if ledger/db was not previously loaded (FC-829)
+- Move generate-merkle-root fn to db library for reuse (FC-824)
+- Update shared Clojure code to support ClojureScript (FC-784)
+- nodejs: Fix issue where run-time cannot find dbfunctions in bindings (FC-785)
+
+
+## 0.16.0-rc2
+- Collection default smartfunctions not always triggering properly (FC-879)
+
+## 0.16.0-rc1
+- Production release-candidate
+
+## 0.15.7
+- fix issue with combination of string? where, :orderBy and :offset (FC-743)
+
+## 0.15.6
+- fix issue where :offset excluded ref data (FC-736)
+
+## 0.15.5
+- wire-up auth to subscription (cljs & web-socket) (FC-693)
+
+## 0.15.4
+- fix for clj->js to preserve namespaces (FC-672)
+- Permissioned DB will fail with empty blocks (FC-688)
+- Fix for root permissions to skip filtering (FC-689)
+
+## 0.15.3
+- upd root-role? to handle nil or string auth (FC-659)
+
 ## 0.15.2
 - Modifications for On-Demand access thru JavaScript apis (FC-607)
 
