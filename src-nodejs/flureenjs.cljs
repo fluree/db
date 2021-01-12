@@ -1,12 +1,15 @@
 (ns flureenjs
-  (:require-macros [cljs.tools.reader.reader-types])
+  (:require-macros [cljs.tools.reader.reader-types]
+                   [flureenjs :refer [analyzer-state]])
 
   (:require [clojure.string :as str]
             [cljs.core.async :refer [go <!] :as async]
             [alphabase.core :as alphabase]
             [fluree.crypto :as crypto]
+            [fluree.db.api.ledger :as ledger]
             [fluree.db.auth :as db-auth]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.dbfunctions.fns :as fns]
             [fluree.db.graphdb :as graphdb]
             [fluree.db.query.http-signatures :as http-signatures]
             [fluree.db.operations :as ops]
@@ -15,9 +18,10 @@
             [fluree.db.query.graphql-parser :as graphql]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql-parser :as sparql-parser]
+            [fluree.db.query.sql :as sql]
             [fluree.db.session :as session]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [go-try <? into?]]
+            [fluree.db.util.async :refer [go-try <? into? channel?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
@@ -42,7 +46,13 @@
 ;; -- Implement *eval*       --
 ;; ----------------------------
 ;; https://stackoverflow.com/questions/47177243/clojure-dynamic-binding-read-string-and-eval-unable-to-resolve-symbol
-(let [st (cljs.js/empty-state)]
+(defn init-state [state]
+  (assoc-in state [:cljs.analyzer/namespaces 'fluree.db.dbfunctions.fns]
+            (analyzer-state 'fluree.db.dbfunctions.fns)))
+
+(def nj-state (cljs.js/empty-state init-state))
+
+(let [st nj-state]
   (set! *eval*
         (fn [form]
           (let [result   (atom {:result nil})
@@ -54,9 +64,8 @@
                 opts     {:context :expr
                           :eval    cljs.js/js-eval
                           :ns      (cljs.core/find-ns cljs.analyzer/*cljs-ns*)
+                          ;:verbose true
                           :target  :nodejs}
-                ;:verbose true
-
                 cb       (fn [res]
                            (if (:error res)
                              (swap! result assoc :result (:error res))
@@ -73,10 +82,6 @@
                           :version "v0.17.0"}))
 
 (println (:product @app-state) (:version @app-state))
-
-
-;var isBrowser=new Function("try {return this===window;}catch(e){ return false;}");
-;var isNode=new Function("try {return this===global;}catch(e){return false;}");
 
 
 (declare db-instance)
@@ -98,6 +103,7 @@
         {:keys [level]} opts']
     (log/set-level! (keyword level))))
 
+
 ;; ======================================
 ;;
 ;; Network Operations
@@ -107,21 +113,20 @@
 (defn ^:export connect
   "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
    supplied, separated by commas."
-  ([servers-string] (connect servers-string nil))
-  ([servers-string opts]
-   (let [opts' (js->clj opts :keywordize-keys true)]
-     (conn-handler/connect servers-string opts'))))
+  [servers-string & [opts]]
+  (-> opts
+      (js->clj :keywordize-keys true)
+      (as-> clj-opts (conn-handler/connect servers-string clj-opts))))
 
 
 (defn ^:export connect-p
   "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
    supplied, separated by commas.
-
    Returns a promise that eventually contains the connection object."
-  ([servers-string] (connect-p servers-string nil))
-  ([servers-string opts]
-   (let [opts' (js->clj opts :keywordize-keys true)]
-     (conn-handler/connect-p servers-string opts'))))
+  [servers-string & [opts]]
+  (-> opts
+      (js->clj :keywordize-keys true)
+      (as-> clj-opts (conn-handler/connect-p servers-string clj-opts))))
 
 
 (defn ^:export close
@@ -139,10 +144,10 @@
   "Attempts to generate a new user auth record account."
   ([conn ledger password user] (password-generate conn ledger password user nil))
   ([conn ledger password user opts]
-   (let [opts' (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-         data  (assoc opts' :user user)]
-     (conn-handler/password-generate conn ledger password data))))
-
+   (-> opts
+       (js->clj :keywordize-keys true)
+       (assoc :user user)
+       (as-> data (conn-handler/password-generate conn ledger password data)))))
 
 
 (defn ^:export password-login
@@ -175,10 +180,8 @@
 (defn ^:export listen
   "Listens to all events of a given ledger. Supply a ledger identity,
   any key, and a two-argument function that will be called with each event.
-
   The key is any arbitrary key, and is only used to close the listener via close-listener,
   otherwise it is opaque to the listener.
-
   The callback function's first argument is the event header/metadata and the second argument
   is the event data itself."
   [conn ledger key callback]
@@ -203,56 +206,52 @@
 ;;
 ;; ======================================
 
-;(defn ^:export collection-id
-;  "Returns promise containing id of a collection, given a collection name.
-;  Returns nil if collection doesn't exist."
-;  [db-source collection]
-;  (js/Promise.
-;    (fn [resolve reject]
-;      (async/go
-;        (try
-;          (let [result (dbproto/-c-prop (<? db-source) :id collection)]
-;            (resolve (clj->js result)))
-;          (catch :default e
-;            (log/error e)
-;            (reject e)))))))
-
 
 (defn ^:export db
   "Returns a queryable database from the connection."
   [conn ledger & [opts]]
-  (let [opts (when-not (nil? opts) (js->clj opts :keywordize-keys true))]
-    (db-instance conn ledger opts)))
+  (-> opts
+      (js->clj :keywordize-keys true)
+      (as-> clj-opts (db-instance conn ledger clj-opts))))
 
 
 (defn ^:private db-instance
   "Returns a queryable database from the connection."
-  [conn ledger & [opts]]
-  (let [pc (async/promise-chan)]
-    (async/go
-      (try
-        (let [{:keys [roles user auth block]} opts
-              _             (conn-handler/check-connection conn opts)
-              [network ledger-id] (session/resolve-ledger conn ledger)
-              root-db       (-> (<? (session/db conn ledger opts))
-                                (assoc :conn conn :network network :dbid ledger-id))
-              roles         (or roles (if auth
-                                        (<? (db-auth/roles root-db auth)) nil))
-              permissions-c (when roles (permissions/permission-map root-db roles :query))
-              dbt           (if block
-                              (<? (time-travel/as-of-block root-db (:block opts)))
-                              root-db)
-              perm-db       (if roles
-                              (assoc dbt :permissions (<? permissions-c))
-                              dbt)]
-          (async/put! pc perm-db))
-        (catch :default e
-          (log/error e)
-          (async/put! pc e)
-          (async/close! pc))))
-    ;; return promise chan immediately
-    pc))
+  ([conn ledger] (db-instance conn ledger {}))
+  ([conn ledger opts]
+   (let [pc (async/promise-chan)]
+     (async/go
+       (try
+         (let [{:keys [auth jwt]} opts
+               _             (conn-handler/check-connection conn opts)
+               [network ledger-id] (session/resolve-ledger conn ledger)
+               auth'        (or auth (if jwt
+                                       ["_auth/id" (-> (conn-handler/validate-token conn jwt)
+                                                       :sub)]))
+               perm-db       (-> (<? (ledger/db conn ledger (assoc opts :auth auth')))
+                                 (assoc :conn conn :network network :dbid ledger-id))]
+           (async/put! pc perm-db))
+         (catch :default e
+           (log/error e)
+           (async/put! pc e)
+           (async/close! pc))))
+     pc)))
 
+
+(defn ^:export db-p
+  "Returns a queryable database from the connection."
+  [conn ledger & [opts]]
+  (js/Promise.
+    (fn [resolve reject]
+      (async/go
+        (try
+          (-> opts
+              (js->clj :keywordize-keys true)
+              (as-> clj-opts (db-instance conn ledger clj-opts))
+              resolve)
+          (catch :default e
+            (log/error e)
+            (reject e)))))))
 
 (defn ^:export db-schema
   "Returns db's schema map."
@@ -400,39 +399,6 @@
              (log/error e)
              (reject (clj->js (assoc (ex-data e) :message (ex-message e)))))))))))
 
-
-;(defn ^:export predicate-id
-;  "Returns promise containing predicate id given a predicate name, or predicate id.
-;  If predicate doesn't exist, returns nil."
-;  [db-source predicate]
-;  (js/Promise.
-;    (fn [resolve reject]
-;      (async/go
-;        (try
-;          (let [result (dbproto/-p-prop (<? db-source) :id predicate)]
-;            (resolve (clj->js result)))
-;          (catch :default e
-;            (log/error e)
-;            (reject e)))))))
-
-
-;(defn ^:export subject-id
-;  "Returns promise containing subject id given a subject identity, or subject id.
-;  If subject doesn't exist, returns nil."
-;  [db-source ident]
-;  (js/Promise.
-;    (fn [resolve reject]
-;      (async/go
-;        (try
-;          (let [ident*  (json/parse ident)
-;                ident** (js->clj ident* :keywordize-keys true)
-;                result  (<? (dbproto/-subid (<? db-source) ident** false))]
-;            (resolve (clj->js result)))
-;          (catch :default e
-;            (log/error e)
-;            (reject e)))))))
-
-
 ;; ======================================
 ;;
 ;; Transactions
@@ -504,27 +470,6 @@
 ;; Queries
 ;;
 ;; ======================================
-(defn ^:export block-range
-  "Returns a Promise that will eventually contain blocks from start block (inclusive)
-  to end if provided (inclusive). Each block is a separate map, containing keys :block,
-  :t and :flakes."
-  ([conn ledger start] (block-range conn ledger start start nil))
-  ([conn ledger start end] (block-range conn ledger start end nil))
-  ([conn ledger start end opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [opts    (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 ;_       (conn-handler/check-connection conn opts)  ;fdb-db-instance/db performs this check
-                 db-chan (async/<! (db-instance conn ledger opts))
-                 result  (<? (query-block/block-range db-chan start end opts))]
-             (resolve (clj->js result)))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
-
 (defn ^:export block-range-with-txn
   "Returns a Promise that will eventually contain transaction information for blocks from
    start block (inclusive) to end if provided (exclusive). Each block is a separate map,
@@ -535,12 +480,12 @@
      (fn [resolve reject]
        (async/go
          (try
-           (let [opts      (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 ;_         (conn-handler/check-connection conn opts) ;db-instance performs this check
-                 block-map (when-not (nil? block-map) (js->clj block-map :keywordize-keys true))
+           (let [clj-opts  (-> opts
+                               (js->clj :keywordize-keys true))
+                 block-map (js->clj block-map :keywordize-keys true)
                  {:keys [start end]} block-map
-                 db-chan   (async/<! (db-instance conn ledger opts))
-                 db-blocks (<? (query-block/block-range db-chan start end opts))
+                 db-chan   (async/<! (db-instance conn ledger clj-opts))
+                 db-blocks (<? (query-block/block-range db-chan start end clj-opts))
                  result    (query-range/block-with-tx-data db-blocks)]
              (resolve (clj->js result)))
            (catch :default e
@@ -555,61 +500,22 @@
        (async/go
          (try
            (let [query-map*  (js->clj query-map :keywordize-keys true)
-                 opts        (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 _           (conn-handler/check-connection conn opts)
-                 auth-id     (or (:auth opts) (:auth-id opts))
-                 jwt         (:jwt opts)
-                 private-key (:private-key opts)
+                 clj-opts    (-> opts
+                                 (js->clj :keywordize-keys true))
+                 _           (conn-handler/check-connection conn clj-opts)
+                 auth-id     (or (:auth clj-opts) (:auth-id clj-opts))
+                 jwt         (:jwt clj-opts)
+                 private-key (:private-key clj-opts)
                  db          (when (nil? private-key)
-                               (<? (db-instance conn ledger {:auth (when auth-id ["_auth/id" auth-id])
-                                                             :jwt  jwt})))
+                               (<? (db-instance conn ledger {:auth   (when auth-id ["_auth/id" auth-id])
+                                                             :jwt    jwt})))
                  result*     (if (nil? private-key)
-                               (<? (fdb-js/block-query-async db query-map* opts))
-                               (<? (fdb-js/signed-query-async conn ledger query-map* (assoc-in opts [:action] :block))))]
+                               (<? (fdb-js/block-query-async db query-map* clj-opts))
+                               (<? (fdb-js/signed-query-async conn ledger query-map* (assoc-in clj-opts [:action] :block))))]
              (resolve (clj->js result*)))
            (catch :default e
              (log/error e)
              (reject e))))))))
-
-
-(defn ^:private forward-time-travel
-  "Returns a core async chan with a new db based on the provided db, including the provided flakes.
-  Flakes can contain one or more 't's, but should be sequential and start after the current
-  't' of the provided db. (i.e. if db-t is -14, flakes 't' should be -15, -16, etc.).
-  Remember 't' is negative and thus should be in descending order.
-
-  A forward-time-travel db can be further forward-time-traveled.
-
-  A forward-time travel DB is held in memory, and is not shared across servers. Ensure you
-  have adequate memory to hold the flakes you generate and add. If access is provided via
-  an external API, do any desired size restrictions or controls within your API endpoint.
-
-  Remember schema operations done via forward-time-travel should be done in a 't' prior to
-  the flakes that end up requiring the schema change."
-  [db flakes]
-  (js/Promise.
-    (fn [resolve reject]
-      (async/go
-        (try
-          (let [result (graphdb/forward-time-travel db nil flakes)]
-            (resolve (clj->js result)))
-          (catch :default e
-            (log/error e)
-            (reject e)))))))
-
-
-(defn ^:private forward-time-travel-db?
-  "Returns true if provided db is a forward-time-travel db."
-  [db]
-  (js/Promise.
-    (fn [resolve reject]
-      (async/go
-        (try
-          (let [result (graphdb/forward-time-travel-db? db)]
-            (resolve (clj->js result)))
-          (catch :default e
-            (log/error e)
-            (reject e)))))))
 
 
 (defn ^:export graphql
@@ -623,32 +529,33 @@
            (let [param*       (-> param
                                   (json/parse)
                                   (js->clj :keywordize-keys true))
-                 opts         (js->clj opts :keywordize-keys true)
-                 auth-id      (:auth-id opts)
+                 clj-opts     (-> opts
+                                  (js->clj :keywordize-keys true))
+                 auth-id      (:auth-id clj-opts)
                  {gql-query :query vars :variables} param*
                  db-ch        (db-instance conn db-name {:auth (when auth-id ["_auth/id" auth-id])})
                  db           (<? db-ch)
-                 parsed-query (<? (graphql/parse-graphql-to-flureeql db gql-query vars opts))
+                 parsed-query (<? (graphql/parse-graphql-to-flureeql db gql-query vars clj-opts))
                  result       (if (util/exception? parsed-query)
                                 parsed-query
                                 (cond
                                   ;; __schema and __type queries are fully resolved in the graphql ns, can return from there
                                   (#{:__schema :__type} (:type parsed-query))
-                                  (if (:meta opts)
+                                  (if (:meta clj-opts)
                                     (dissoc parsed-query :type)
                                     (:result parsed-query))
 
                                   (= :history (:type parsed-query))
-                                  (<? (fdb-js/history-query-async db (dissoc parsed-query :type) opts))
+                                  (<? (fdb-js/history-query-async db (dissoc parsed-query :type) clj-opts))
 
                                   (= :block (:type parsed-query))
-                                  (<? (fdb-js/block-query-async db (dissoc parsed-query :type) opts))
+                                  (<? (fdb-js/block-query-async db (dissoc parsed-query :type) clj-opts))
 
                                   (:tx parsed-query)
-                                  (<? (fdb-js/transact-async conn db-name (:tx parsed-query) opts))
+                                  (<? (fdb-js/transact-async conn db-name (:tx parsed-query) clj-opts))
 
                                   :else
-                                  (<? (fdb-js/multi-query-async db-ch parsed-query opts))))]
+                                  (<? (fdb-js/multi-query-async db-ch parsed-query clj-opts))))]
              (resolve (clj->js result)))
            (catch :default e
              (log/error e)
@@ -663,9 +570,9 @@
        (async/go
          (try
            (let [query-map* (js->clj query-map :keywordize-keys true)
-                 opts       (when-not (or (nil? opts) (empty? opts))
-                              (js->clj opts :keywordize-keys true))
-                 result     (<? (fdb-js/history-query-async sources query-map* opts))]
+                 clj-opts   (-> opts
+                                (js->clj :keywordize-keys true))
+                 result     (<? (fdb-js/history-query-async sources query-map* clj-opts))]
              (resolve (clj->js result)))
            (catch :default e
              (log/error e)
@@ -680,8 +587,9 @@
        (async/go
          (try
            (let [query-map* (js->clj multi-query-map :keywordize-keys true)
-                 opts       (js->clj opts :keywordize-keys true)
-                 result*    (<? (fdb-js/multi-query-async sources query-map* opts db-instance))]
+                 clj-opts   (-> opts
+                                (js->clj :keywordize-keys true))
+                 result*    (<? (fdb-js/multi-query-async sources query-map* clj-opts db-instance))]
              (resolve (clj->js result*)))
            (catch :default e
              (log/error e)
@@ -706,25 +614,6 @@
             (reject (clj->js e))))))))
 
 
-(defn ^:export signed-query
-  "Execute a query against a ledger, or optionally
-  additional sources if the query spans multiple data sets.
-
-  Returns promise containing results."
-  ([conn ledger query-map] (signed-query conn ledger query-map nil))
-  ([conn ledger query-map opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [query-map (js->clj query-map :keywordize-keys true)
-                 opts      (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 result    (<? (fdb-js/signed-query-async conn ledger query-map opts))]
-             (resolve (clj->js result)))
-           (catch :default e
-             (log/error e)
-             (reject (clj->js e)))))))))
-
 
 (defn ^:export sparql
   "Exceute a sparql query against a specified database"
@@ -736,12 +625,14 @@
          (try
            (let [sparql-str   (json/parse sparql-str)
                  query-parsed (sparql-parser/sparql-to-ad-hoc sparql-str)
-                 opts*        (merge (:opts query-parsed) (when opts (js->clj opts :keywordize-keys true)))
+                 opts*        (merge (:opts query-parsed)
+                                     (when opts (js->clj opts :keywordize-keys true)))
                  result       (<? (fdb-js/query-async db (assoc query-parsed :opts opts*) db-instance))]
              (resolve (clj->js result)))
            (catch :default e
              (log/error e)
              (reject (clj->js e)))))))))
+
 
 
 (defn ^:export sql
