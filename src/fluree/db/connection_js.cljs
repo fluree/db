@@ -26,16 +26,13 @@
 ;;
 ;; ======================================
 
-(defn- validate-token
+(defn validate-token
   "Verifies that the jwt token has not expired.
-
   Only returns when token is valid.  Otherwise, an exception is thrown."
   [conn jwt]
   (let [secret (-> (:flureedb-settings conn) deref :jwt-secret
                    (alphabase/base-to-byte-array :hex))]
-    (if (dbaas? conn)
-      true                                                  ;; assume that dbaas will validate the token for now
-      (token-auth/verify-jwt secret jwt))))
+    (token-auth/verify-jwt secret jwt)))
 
 
 ;; ======================================
@@ -83,7 +80,7 @@
   ([servers-string opts]
    (let [conn (-> (connection/connect servers-string opts)
                   (assoc-in [:flureedb-settings] (atom {}))
-                  (assoc-in [:token] (atom {})))            ; need token for dbaas auth
+                  (assoc-in [:token] (atom {})))
          pc   (async/promise-chan)
          _    (async/go
                 (async/put! (:req-chan conn) [:settings nil pc nil])
@@ -108,7 +105,7 @@
          (try
            (let [conn (-> (connection/connect servers-string opts)
                           (assoc-in [:flureedb-settings] (atom {}))
-                          (assoc-in [:jwt] (atom {})))      ; need token for dbaas auth
+                          (assoc-in [:token] (atom {})))
                  pc   (async/promise-chan)]
              (do
                (async/put! (:req-chan conn) [:settings nil pc nil])
@@ -308,7 +305,9 @@
                                   (reject (clj->js err-resp)))
 
                                 :else
-                                (resolve (clj->js result)))))))
+                                (do
+                                  (connection/add-token conn result)
+                                  (resolve (clj->js result))))))))
            (catch :default e
              (reject (clj->js e)))))))))
 
@@ -344,7 +343,8 @@
                                   (reject (clj->js result)))
 
                                 :else
-                                (resolve (clj->js result)))))))
+                                (do
+                                  (connection/add-token conn result)
+                                  (resolve (clj->js result))))))))
            (catch :default e
              (reject (clj->js e)))))))))
-
