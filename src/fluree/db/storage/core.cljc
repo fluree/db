@@ -21,7 +21,7 @@
    (defn block-storage-path
      "For a ledger server, will return the storage path it is using for blocks for a given ledger."
      [conn network dbid]
-     (let [storage-path (-> conn :meta :storage-directory)]
+     (let [storage-path (-> conn :meta :file-storage-path)]
        (when storage-path
          (io/file storage-path network dbid "block")))))
 
