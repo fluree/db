@@ -385,7 +385,7 @@
              (let [language    (-> db :settings :language)
                    [var search search-param] clause
                    var         (variable? var)
-                   storage-dir (-> db :conn :meta :storage-directory)
+                   storage-dir (-> db :conn :meta :file-storage-path)
                    store       (full-text/index-store storage-dir (:network db)
                                                       (:dbid db))]
                (full-text/search db store [var search search-param] language)))))
