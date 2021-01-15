@@ -16,6 +16,11 @@
            org.apache.lucene.analysis.fr.FrenchAnalyzer
            org.apache.lucene.index.IndexWriter))
 
+(defn predicate?
+  [^Flake f]
+  (= const/$_predicate:fullText
+     (.-p f)))
+
 (defn storage-path
   [base-path [network dbid]]
   (str/join "/" [base-path network dbid "lucene"]))
