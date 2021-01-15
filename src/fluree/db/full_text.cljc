@@ -1,10 +1,12 @@
 (ns fluree.db.full-text
-  (:require [fluree.db.flake :as flake]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
             [clojure.string :as str]
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
             [clucie.store :as lucene-store])
-  (:import org.apache.lucene.analysis.en.EnglishAnalyzer
+  (:import fluree.db.flake.Flake
+           org.apache.lucene.analysis.en.EnglishAnalyzer
            org.apache.lucene.analysis.cn.smart.SmartChineseAnalyzer
            org.apache.lucene.analysis.hi.HindiAnalyzer
            org.apache.lucene.analysis.es.SpanishAnalyzer
