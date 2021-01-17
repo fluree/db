@@ -115,16 +115,16 @@
       (-> registry-file slurp edn/read-string))))
 
 (defn register-block
-  [writer]
+  [writer status]
   (let [registry-file (block-registry-file writer)
-        registry      (-> block (select-keys [:block :t]) prn-str)]
+        registry      (prn-str status)]
     (spit registry-file registry)))
 
 (defn forget-block-registry
   [writer]
   (let [registry-file (block-registry-file writer)]
     (when (.exists registry-file)
-      (io/delete-file registry-file true))))
+      (io/delete-file registry-file))))
 
 (defn forget
   [^IndexWriter w]
