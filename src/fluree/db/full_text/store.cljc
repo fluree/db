@@ -7,7 +7,9 @@
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
             [clucie.store :as lucene-store])
-  (:import fluree.db.flake.Flake))
+  (:import fluree.db.flake.Flake
+           java.io.File
+           org.apache.lucene.index.IndexWriter))
 
 (defn storage-path
   [base-path [network dbid]]
@@ -50,6 +52,10 @@
 (defn writer->reader
   [^IndexWriter w]
   (-> w .getDirectory reader))
+
+(defn writer->storage-path
+  [^IndexWriter w]
+  (-> w .getDirectory .toFile .getPath))
 
 (defn add-subject
   [idx-writer subj pred-vals]
@@ -96,22 +102,31 @@
               map-keys  (keys purge-map)]
           (lucene/update! idx-writer purge-map map-keys :_id id))))))
 
-(defn block-registry-path
-  [base-path [network db-id]]
-  (let [parent (storage-path base-path [network dbid])]
-    (str/join "/" [store "block_registry.edn"])))
+(defn block-registry-file ^File
+  [writer]
+  (let [parent (writer->storage-path writer)
+        path   (str/join "/" [parent "block_registry.edn"])]
+    (io/as-file path)))
 
 (defn read-block-registry
   [base-path [network db-id]]
-  (let [registry-file (-> base-path
-                          (block-registry-path [network db-id])
-                          io/as-file)]
-    (if (.exists registry-file)
+  (let [registry-file (block-registry-file base-path [network db-id])]
+    (when (.exists registry-file)
       (-> registry-file slurp edn/read-string))))
 
 (defn register-block
-  [base-path [network dbid] block]
-  (let [registry (-> block :block prn-str)]
-    (-> base-path
-        (block-registry-path [network dbid])
-        (spit registry))))
+  [writer]
+  (let [registry-file (block-registry-file writer)
+        registry      (-> block (select-keys [:block :t]) prn-str)]
+    (spit registry-file registry)))
+
+(defn forget-block-registry
+  [writer]
+  (let [registry-file (block-registry-file writer)]
+    (when (.exists registry-file)
+      (io/delete-file registry-file true))))
+
+(defn forget
+  [^IndexWriter w]
+  (doto w .deleteAll .commit)
+  (forget-block-registry w))
