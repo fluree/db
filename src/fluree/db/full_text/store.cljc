@@ -1,6 +1,8 @@
 (ns fluree.db.full-text
   (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
@@ -38,8 +40,8 @@
 
 (defn writer
   [idx-store lang]
-  (let [anyz (analyzer lang)]
-    (lucene-store/store-writer idx-store anyz)))
+  (let [anlz (analyzer lang)]
+    (lucene-store/store-writer idx-store anlz)))
 
 (defn reader
   [idx-store]
@@ -59,10 +61,10 @@
     (lucene/add! idx-writer [subj-map] map-keys)))
 
 (defn get-subject
-  [idx-reader anyz subj]
+  [idx-reader anlz subj]
   (let [subj-id  (str subj)]
     (-> idx-reader
-        (lucene/search {:_id subj-id} 1 anyz 0 1)
+        (lucene/search {:_id subj-id} 1 anlz 0 1)
         first)))
 
 (defn update-subject
@@ -75,16 +77,16 @@
 (defn put-subject
   [^IndexWriter idx-writer subj pred-vals]
   (with-open [idx-reader (writer->reader idx-writer)]
-    (let [anyz (.getAnalyzer idx-writer)]
-      (if-let [subj-map (get-subject idx-reader anyz subj)]
+    (let [anlz (.getAnalyzer idx-writer)]
+      (if-let [subj-map (get-subject idx-reader anlz subj)]
         (update-subject idx-writer subj-map pred-vals)
         (add-subject idx-writer subj pred-vals)))))
 
 (defn purge-subject
   [idx-writer subj pred-vals]
   (with-open [idx-reader (writer->reader idx-writer)]
-    (let [anyz (.getAnalyzer idx-writer)]
-      (when-let [{id :_id, :as subj-map} (get-subject idx-reader anyz subj)]
+    (let [anlz (.getAnalyzer idx-writer)]
+      (when-let [{id :_id, :as subj-map} (get-subject idx-reader anlz subj)]
         (let [purge-map (->> subj-map
                              (filter (fn [[k v]]
                                       (or (#{:_id :_collection} k)
@@ -94,10 +96,22 @@
               map-keys  (keys purge-map)]
           (lucene/update! idx-writer purge-map map-keys :_id id))))))
 
+(defn block-registry-path
+  [base-path [network db-id]]
+  (let [parent (storage-path base-path [network dbid])]
+    (str/join "/" [store "block_registry.edn"])))
 
-#_(track-full-text storage-dir (str network "/" dbid) (:block block))
+(defn read-block-registry
+  [base-path [network db-id]]
+  (let [registry-file (-> base-path
+                          (block-registry-path [network db-id])
+                          io/as-file)]
+    (if (.exists registry-file)
+      (-> registry-file slurp edn/read-string))))
 
-(defn track-full-text
-  [dir ledger block]
-  (with-open [w (clojure.java.io/writer (str dir ledger "/lucene/block.txt") :append false)]
-    (.write w (str block))))
+(defn register-block
+  [base-path [network dbid] block]
+  (let [registry (-> block :block prn-str)]
+    (-> base-path
+        (block-registry-path [network dbid])
+        (spit registry))))
