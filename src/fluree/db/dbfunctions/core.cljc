@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.core
   (:require #?(:clj  [clojure.tools.reader.edn :as edn])
-            #?(:cljs [cljs.reader] :refer [read-string])
+            #?(:cljs [cljs.reader :refer [read-string]])
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :refer [try* catch*]]
