@@ -125,6 +125,19 @@
 (def ^:const $_prefix:prefix 130)
 (def ^:const $_prefix:uri 131)
 
+
+;; TODO reorder - look at _prefix:uri above and see if we can replace with $rdf:uri
+(def ^:const $rdf:iri 132)
+(def ^:const $rdf:type 133)
+
+(def ^:const $rdfs:Class 134)
+(def ^:const $rdfs:subClassOf 135)
+(def ^:const $rdfs:subPropertyOf 136)
+
+(def ^:const $fluree:partition 137)
+
+
+
 ;; tags
 ;; _predicate/type tags
 (def ^:const _predicate$type:string 1)
