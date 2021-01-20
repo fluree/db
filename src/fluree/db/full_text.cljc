@@ -88,20 +88,11 @@
         (lucene/search {:_id subj-id} 1 anlz 0 1)
         first)))
 
-(defn update-subject
-  [idx-writer subj-map pred-vals]
-  (when-let [{id :_id} subj-map]
-    (let [new-map  (merge subj-map pred-vals)
-          map-keys (keys new-map)]
-      (lucene/update! idx-writer new-map map-keys :_id id))))
-
 (defn put-subject
-  [^IndexWriter idx-writer subj pred-vals]
-  (with-open [idx-reader (writer->reader idx-writer)]
-    (let [anlz (.getAnalyzer idx-writer)]
-      (if-let [subj-map (get-subject idx-reader anlz subj)]
-        (update-subject idx-writer subj-map pred-vals)
-        (add-subject idx-writer subj pred-vals)))))
+  [idx-writer subj pred-vals]
+  (let [subj-map (assoc pred-vals :_id subj)
+        map-keys (keys subj-map)]
+    (lucene/update! idx-writer subj-map map-keys :_id subj)))
 
 (defn purge-subject
   [idx-writer subj pred-vals]
