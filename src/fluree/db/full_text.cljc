@@ -70,7 +70,7 @@
 
 (defn writer->storage-path
   [^IndexWriter w]
-  (-> w .getDirectory .toFile .getPath))
+  (-> w .getDirectory .getDirectory .toString))
 
 (defn add-subject
   [idx-writer subj pred-vals]
