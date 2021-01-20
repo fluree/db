@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.core
-  (:require #?(:clj  [clojure.tools.reader.edn :as edn])
-            #?(:cljs [cljs.reader :refer [read-string]])
+  (:refer-clojure :exclude [read-string])
+  (:require [#?(:cljs cljs.reader :clj clojure.tools.reader.edn) :refer [read-string]]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :refer [try* catch*]]
@@ -31,11 +31,6 @@
   #?(:clj  (reset! db-fn-cache (cache/fifo-cache-factory {} :threshold 500))
      :cljs (reset! db-fn-cache (cache/lru-cache-factory {} :threshold 500))))
 
-(defn- read-str
-  "Like read-string but abstracts CLJ / CLJS differences"
-  [s]
-  #?(:clj  (edn/read-string s)
-     :cljs (read-string s)))
 
 (defn tx-fn?
   "Returns true if this value is a transaction function."
@@ -141,12 +136,14 @@
                                                       (throw (ex-info (str "Unknown function: " (pr-str fn-name))
                                                                       {:status 400
                                                                        :error  :db/invalid-fn})))
-                                        params      (read-str (get res* "_fn/params"))
-                                        code        (<? (resolve-fn db (read-str (get res* "_fn/code")) funType params))
+                                        params      (read-string (get res* "_fn/params"))
+                                        code        (<? (resolve-fn db (read-string (get res* "_fn/code")) funType params))
                                         spec        (get res* "_fn/spec")
-                                        params'     (mapv (fn [x] (symbol x)) params)
-                                        params''    (into [] (cons '?ctx params'))
-                                        custom-func (build-fn params'' code)]
+                                        params'     (->> params
+                                                         (mapv (fn [x] (symbol x)))
+                                                         (cons '?ctx)
+                                                         (into []))
+                                        custom-func (build-fn params' code)]
                                     {:f      custom-func
                                      :params params
                                      :arity  (hash-set (count params))
@@ -169,8 +166,8 @@
                                                     (throw (ex-info (str "Unknown function: " (pr-str fn-name))
                                                                     {:status 400
                                                                      :error  :db/invalid-fn})))
-                                      params      (read-str (get res "_fn/params"))
-                                      code        (<? (resolve-fn db (read-str (get res "_fn/code")) funType params))
+                                      params      (read-string (get res "_fn/params"))
+                                      code        (<? (resolve-fn db (read-string (get res "_fn/code")) funType params))
                                       spec        (get res "_fn/spec")
                                       params'     (mapv (fn [x] (symbol x)) params)
                                       params''    (into [] (cons '?ctx params'))
@@ -270,7 +267,7 @@
    (go-try
      (if
        (or (= fn-str "true") (= fn-str "false"))
-       (defn true-or-false [n] (read-str fn-str))
+       (defn true-or-false [n] (read-string fn-str))
 
        (try*
          (when-not (re-matches #"(^\(.+\)$)" fn-str)
@@ -278,7 +275,7 @@
                            {:status 400
                             :error  :db/invalid-fn})))
 
-         (let [form      (read-str fn-str)
+         (let [form      (read-string fn-str)
                resolved  (<? (resolve-fn db form type params))
                f-wrapped `(fn [~'?ctx] ~resolved)
                f         (if (and params (= type "functionDec"))
