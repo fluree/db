@@ -27,12 +27,13 @@
      (.-p f)))
 
 (defn storage-path
-  [base-path [network dbid]]
-  (str/join "/" [base-path network dbid "lucene"]))
+  [{:keys [conn network dbid] :as db}]
+  (let [base-path (-> db :conn :meta :file-storage-path)]
+    (str/join "/" [base-path network dbid "lucene"])))
 
 (defn storage
-  [base-path [network dbid]]
-  (let [path (storage-path base-path [network dbid])]
+  [db]
+  (let [path (storage-path db)]
     (lucene-store/disk-store path)))
 
 ;; TODO: determine size impact of these analyzers - can we package them
