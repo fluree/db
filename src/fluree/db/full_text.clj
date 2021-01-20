@@ -1,5 +1,6 @@
 (ns fluree.db.full-text
   (:require [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -25,6 +26,18 @@
   [^Flake f]
   (= const/$_predicate:fullText
      (.-p f)))
+
+(defn full-text-predicates
+  [db collection]
+  (->> db
+       :schema
+       :pred
+       vals
+       (filter (fn [pred]
+                 (and (:fullText pred)
+                      (str/starts-with? (:name pred)
+                                        collection))))
+       (map :id)))
 
 (defn storage-path
   [{:keys [conn network dbid] :as db}]
