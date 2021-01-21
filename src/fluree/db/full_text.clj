@@ -150,3 +150,28 @@
   [^IndexWriter w]
   (doto w .deleteAll .commit)
   (forget-block-registry w))
+
+(defn search
+  [db store [var search search-param]]
+  (let [lang   (-> db :settings :language)
+        limit  Integer/MAX_VALUE
+        search (-> search
+                   (str/split #"^fullText:")
+                   second)
+        query  (if (str/includes? search "/")
+                 ;; This is a predicate-specific query, i.e. fullText:_user/username
+                 (let [pid (dbproto/-p-prop db :id search)]
+                   {pid search-param})
+
+                 ;; This is a collection-based query, i.e. fullText:_user
+                 (let [cid           (dbproto/-c-prop db :id search)
+                       predicates    (full-text-predicates db search)
+                       search-params (->> predicates
+                                          (map (fn [p]
+                                                 {p search-param}))
+                                          (into #{}))]
+                   [{:_collection cid} search-params]))
+        res    (lucene/search store query limit (analyzer lang) 0 limit)]
+    {:headers [var]
+     :tuples  (map #(->> % :_id read-string (conj [])) res)
+     :vars    {}}))

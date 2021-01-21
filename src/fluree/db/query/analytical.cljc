@@ -382,11 +382,10 @@
              (throw (ex-info "Full text search is not supported in when running in-memory"
                              {:status 400
                               :error  :db/invalid-query}))
-             (let [language    (-> db :settings :language)
-                   [var search search-param] clause
+             (let [[var search search-param] clause
                    var         (variable? var)
                    store       (full-text/storage db)]
-               (full-text/search db store [var search search-param] language)))))
+               (full-text/search db store [var search search-param])))))
 
 
 ;; Can be: ["?item" "rdf:type" "person"]
