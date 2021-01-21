@@ -89,7 +89,7 @@
 (defn add-subject
   [idx-writer subj pred-vals]
   (let [subj-id  (str subj)
-        cid      (flake/sid->cid subj)
+        cid      (-> subj flake/sid->cid str)
         subj-map (merge {:_id subj-id, :_collection cid}
                         pred-vals)
         map-keys (keys subj-map)]
@@ -164,7 +164,7 @@
                    {pid search-param})
 
                  ;; This is a collection-based query, i.e. fullText:_user
-                 (let [cid           (dbproto/-c-prop db :id search)
+                 (let [cid           (str (dbproto/-c-prop db :id search))
                        predicates    (full-text-predicates db search)
                        search-params (->> predicates
                                           (map (fn [p]
