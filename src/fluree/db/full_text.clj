@@ -86,15 +86,6 @@
   [^IndexWriter w]
   (-> w .getDirectory .getDirectory .toString))
 
-(defn add-subject
-  [idx-writer subj pred-vals]
-  (let [subj-id  (str subj)
-        cid      (-> subj flake/sid->cid str)
-        subj-map (merge {:_id subj-id, :_collection cid}
-                        pred-vals)
-        map-keys (keys subj-map)]
-    (lucene/add! idx-writer [subj-map] map-keys)))
-
 (defn get-subject
   [idx-reader anlz subj]
   (let [subj-id  (str subj)]
@@ -104,7 +95,10 @@
 
 (defn put-subject
   [idx-writer subj pred-vals]
-  (let [subj-map (assoc pred-vals :_id subj)
+  (let [subj-id  (str subj)
+        cid      (-> subj flake/sid->cid str)
+        subj-map (merge {:_id subj-id, :_collection cid}
+                        pred-vals)
         map-keys (keys subj-map)]
     (lucene/update! idx-writer subj-map map-keys :_id subj)))
 
@@ -160,7 +154,7 @@
                    second)
         query  (if (str/includes? search "/")
                  ;; This is a predicate-specific query, i.e. fullText:_user/username
-                 (let [pid (dbproto/-p-prop db :id search)]
+                 (let [pid  (dbproto/-p-prop db :id search)]
                    {pid search-param})
 
                  ;; This is a collection-based query, i.e. fullText:_user
