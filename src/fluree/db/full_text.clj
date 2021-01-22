@@ -123,8 +123,8 @@
     (io/as-file path)))
 
 (defn read-block-registry
-  [base-path [network db-id]]
-  (let [^File registry-file (block-registry-file base-path [network db-id])]
+  [writer]
+  (let [^File registry-file (block-registry-file writer)]
     (when (.exists registry-file)
       (-> registry-file slurp edn/read-string))))
 
