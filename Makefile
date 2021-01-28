@@ -35,7 +35,7 @@ pom.xml: deps.edn
 	clojure -Spom
 
 deps:
-	clojure -P
+	clojure -A:cljtest:cljstest -P
 
 src/deps.cljs: package.json
 	clojure -M:js-deps
@@ -54,7 +54,7 @@ doc/clj/%.html: doc/%.md
 
 docs: doc/clj/fluree.db.api.html doc/clj/index.html $(DOCS_TARGETS)
 
-cljstest: node_modules
+cljstest: node_modules package-lock.json
 	clojure -M:cljstest
 
 cljtest:
