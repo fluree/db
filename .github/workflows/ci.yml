@@ -7,10 +7,12 @@ on:
 
 jobs:
   test:
-    name: Run Tests
-    runs-on: ubuntu-latest
+    name: Run tests & build Docker image
+    runs-on: [self-hosted, docker]
     steps:
       - uses: actions/checkout@v2
+      - name: Run tests
+        run: script/run-in-docker.sh make test
       - name: Build Docker image
         run: docker build -t fluree/db .
       - name: Notify Slack fail
