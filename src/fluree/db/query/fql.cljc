@@ -623,10 +623,6 @@
                    {:keys [headers tuples]} (if orderBy
                                               (order-offset-and-limit-results orderBy res+agg offset group-limit)
                                               res+agg)
-                   ;tuples  (if (and (not orderBy) (or limit offset))
-                   ;          (->> (drop offset tuples)
-                   ;               (take limit))
-                   ;          tuples)
                    res     (<? (format-filter-tuples db tuples select-spec headers vars (dissoc opts :limit :offset :orderBy :groupBy)))]
                ;; TODO - drop unused columns, and calculate distinct before resolving all vals
                (if selectDistinct?
@@ -654,28 +650,31 @@
           (assoc res k' (conj (get res k' []) v))))
       {} tuples)))
 
+(defn- build-order-fn
+  [orderBy groupBy]
+  (let [[sortDirection sortCriteria]  (if orderBy orderBy ["ASC" groupBy])]
+    (cond
+      (= sortCriteria groupBy)
+      (if (= sortDirection "DESC")
+        (fn [x y] (* -1 (compare-fn x y)))
+        compare-fn)
+
+      (and (coll? groupBy) (string? sortCriteria))
+      (let [orderByIdx     (util/index-of groupBy sortCriteria)]
+        (if (= "DESC" sortDirection)
+          (fn [x y] (* -1 (compare-fn (nth x orderByIdx) (nth y orderByIdx))))
+          (fn [x y] (compare-fn (nth x orderByIdx) (nth y orderByIdx)))))
+
+      :else nil)))
+
 (defn process-ad-hoc-res
   [db
    {:keys [headers vars] :as res}
    {:keys [groupBy orderBy limit selectOne? selectDistinct? inVector? offset] :as select-spec}
    opts]
   (go-try (if groupBy
-            (let [orderBy'  (if orderBy orderBy ["ASC" groupBy])
-                  order-fn  (cond (and orderBy' (= (second orderBy') groupBy))
-                                  (if (= (first orderBy') "DESC")
-                                    (fn [x y] (* -1 (compare-fn x y)))
-                                    compare-fn)
-
-                                  (and (coll? groupBy) (string? (second orderBy')))
-                                  (let [orderByIdx     (util/index-of groupBy (second orderBy))
-                                        orderDirection (first orderBy)]
-                                    (if (= "DESC" orderDirection)
-                                      (fn [x y] (* -1 (compare-fn (nth x orderByIdx) (nth y orderByIdx))))
-                                      (fn [x y] (compare-fn (nth x orderByIdx) (nth y orderByIdx)))))
-
-                                  :else nil)
+            (let [order-fn  (build-order-fn orderBy groupBy)
                   group-map (cond->> (ad-hoc-group-by res groupBy)
-                                     ;?sort for selectOne?
                                      order-fn (into (sorted-map-by order-fn)))]
               (if selectOne?
                 (let [k (first (keys group-map))
@@ -684,8 +683,8 @@
                                                       :tuples  (first (vals group-map))} select-spec limit opts))]
                   {k v})
                 ; loop through map of groups
-                (loop [[group-key & r-k] (keys group-map)
-                       [group & r] (vals group-map)
+                (loop [[group-key & rest-keys] (keys group-map)
+                       [group & rest-groups] (vals group-map)
                        limit      (if (= 0 limit) nil limit) ; limit of 0 is ALL
                        offset     (or offset 0)
                        acc        {}]
@@ -700,7 +699,11 @@
 
                       ;? last item in this group is BEFORE offset - skip
                       (>= offset group-count)
-                      (recur r-k r limit (- offset group-count) acc)
+                      (recur rest-keys
+                             rest-groups
+                             limit
+                             (if selectDistinct? (- offset 1) (- offset group-count))
+                             acc)
 
                       :else
                       ; 1) set orderBy to nil so order-offset-and-limit-results is not executed
@@ -709,14 +712,17 @@
                       (-> (cond->> (<? (process-ad-hoc-group
                                          db
                                          group-as-res
-                                         (assoc select-spec :orderBy nil :offset 0 :limit limit)
-                                         (assoc opts :offset 0 :limit limit)))
+                                         (assoc select-spec :orderBy nil :offset 0 :limit 0)
+                                         (assoc opts :offset 0 :limit 0)))
                                    (< 0 offset) (drop offset)
                                    (and limit (< 0 limit)) (take limit))
-                          (as-> res' (recur r-k
-                                            r
+                          (as-> res' (recur rest-keys
+                                            rest-groups
                                             (when-not (nil? limit) (- limit (count res')))
-                                            (if (<= 0 offset) 0 (- offset (- group-count (count res'))))
+                                            (cond
+                                              (<= offset 0) 0
+                                              selectDistinct? (- offset 1)
+                                              :else (- offset (- group-count (count res'))))
                                             (if (or (nil? res') (empty? res')) acc (assoc acc group-key res'))) )))))))
             ; no group by
             (let [limit (if selectOne? 1 limit)
