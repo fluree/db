@@ -36,10 +36,7 @@
          com.fluree/alphabase              {:mvn/version "3.2.1"}
 
          com.fluree/crypto                 {:mvn/version "0.3.5"}
-         org.bouncycastle/bcprov-jdk15on   {:mvn/version "1.68"}
-
-         ;; cljs
-         figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}
+         org.bouncycastle/bcprov-jdk15on   {:mvn/version "1.68"}}
 
  :paths ["src" "resources"]
  :aliases
