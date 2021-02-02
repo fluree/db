@@ -1,0 +1,15 @@
+{:output-to          "out/webworker/index.js"
+ :output-dir         "out/webworker"
+ :target             :bundle
+ :main               flureeworker
+ :optimizations      :advanced
+ :pretty-print       false
+ :pseudo-names       false
+ :infer-externs      true
+ :optimize-constants false
+ :externs            ["sjcl-externs.js"]
+ :install-deps       true
+ :npm-deps           {}
+ :bundle-cmd         {:none    ["npx" "webpack" "out/webworker/index.js" "-o" "out/webworker/main.js" "--mode=development" "--target=webworker"]
+                      :default ["npx" "webpack" "out/webworker/index.js" "-o" "out/webworker/main.js" "--target=webworker"]}
+ :closure-defines {cljs.core/*global* "self"}}

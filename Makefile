@@ -1,4 +1,4 @@
-.PHONY: deps jar install deploy nodejs browser cljtest cljstest test clean docs
+.PHONY: deps jar install deploy nodejs browser webworker cljtest cljstest test clean docs
 
 DOCS_MARKDOWN := $(shell find doc -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:doc/%.md=doc/clj/%.html)
@@ -30,6 +30,11 @@ out/flureedb.js: out package.json package-lock.json node_modules build-browser.e
 	clojure -M:browser && cp out/browser/main.js out/flureedb.js
 
 browser: out/flureedb.js
+
+out/flureeworker.js: out package.json package-lock.json node_modules build-webworker.edn deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
+	clojure -M:webworker && cp out/webworker/main.js out/flureeworker.js
+
+webworker: out/flureeworker.js
 
 pom.xml: deps.edn
 	clojure -Spom

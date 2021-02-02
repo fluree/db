@@ -66,6 +66,10 @@
   {:extra-paths ["src-cljs"]
    :main-opts   ["-m" "cljs.main" "--compile-opts" "build-browser.edn" "--compile"]}
 
+  :webworker
+  {:extra-paths ["src-cljs"]
+   :main-opts ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
+
   :jar
   {:extra-deps {seancorfield/depstar {:mvn/version "2.0.165"}}
    :exec-fn hf.depstar/jar
