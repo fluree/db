@@ -48,7 +48,7 @@
    :extra-deps {olical/cljs-test-runner {:mvn/version "3.8.0"}}
    :main-opts ["-m" "cljs-test-runner.main"
                "-D" "doo.edn"
-               "-c" "test-build.edn"
+               "-c" "build-test.edn"
                "-x" "chrome-headless"]}
 
   :cljtest
