@@ -18,9 +18,9 @@
    :_fn/doc      "Returns the maximum number based on a list of numbers"
    :_fn/spec     {"?numbers" [:numbers]}
    :_fn/source   "Source code for the function"
-   :_fn/language nil                                        ;; only clojure for now
-   }
-  )
+   :_fn/language nil})                                        ;; only clojure for now
+
+
 
 
 (def db-fn-cache (atom #?(:clj  (cache/fifo-cache-factory {} :threshold 500)
@@ -335,13 +335,13 @@
   db
 
   (->> (parse-code-str test-fn)
-       #_(parse-form db)
-       )
+       #_(parse-form db))
 
 
-  (fn? (get default-fn-map 'max))
 
-  )
+  (fn? (get default-fn-map 'max)))
+
+
 
 
 

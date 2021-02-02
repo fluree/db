@@ -32,8 +32,8 @@
           (let [v (goog.object/get obj key)]
             (if (= "function" (goog/typeOf v))
               result
-              (assoc result (keyword key) (obj->clj v))
-              )))
+              (assoc result (keyword key) (obj->clj v)))))
+
         (reduce {} (.getKeys goog/object obj)))
     obj))
 
@@ -328,8 +328,8 @@
                             (worker-action conn-id :login ref {:status status :message message :error error}))
 
                           :else
-                          (worker-action conn-id :login ref {:status 401 :message (str "Authentication failed: " resp)})))
-                      )))
+                          (worker-action conn-id :login ref {:status 401 :message (str "Authentication failed: " resp)}))))))
+
         (catch :default e
           (worker-action conn-id :login ref {:status 400 :message (str e)}))))
     true))
@@ -372,8 +372,8 @@
                             (worker-action conn-id :pwGenerate ref {:status status :message message :error error}))
 
                           :else
-                          (worker-action conn-id :pwGenerate ref {:status 401 :message (str "Password Generation failed: " resp)})))
-                      )))
+                          (worker-action conn-id :pwGenerate ref {:status 401 :message (str "Password Generation failed: " resp)}))))))
+
         (catch :default e
           (worker-action conn-id :pwGenerate ref {:status 400 :message (str e)}))))
     true))
