@@ -1,14 +1,15 @@
 (ns fluree.db.index
   (:require [clojure.data.avl :as avl]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
 (def types
-  "The five possible index orderings based on the subject, predicate, object, and
-  transaction flake attributes"
+  "The five possible index orderings based on the subject, predicate, object,
+  and transaction flake attributes"
   #{:spot :psot :post :opst :tspo})
 
 (defrecord IndexConfig [index-type comparator historyComparator])
@@ -18,6 +19,24 @@
      (.write w (str "#FdbIndexConfig "))
      (binding [*out* w]
        (pr {:idx-type (:index-type config)}))))
+
+(def default-configs
+  "Map of default index configuration objects for the five index types"
+  {:spot (map->IndexConfig {:index-type        :spot
+                            :comparator        flake/cmp-flakes-spot
+                            :historyComparator flake/cmp-flakes-spot-novelty})
+   :psot (map->IndexConfig {:index-type        :psot
+                            :comparator        flake/cmp-flakes-psot
+                            :historyComparator flake/cmp-flakes-psot-novelty})
+   :post (map->IndexConfig {:index-type        :post
+                            :comparator        flake/cmp-flakes-post
+                            :historyComparator flake/cmp-flakes-post-novelty})
+   :opst (map->IndexConfig {:index-type        :opst
+                            :comparator        flake/cmp-flakes-opst
+                            :historyComparator flake/cmp-flakes-opst-novelty})
+   :tspo (map->IndexConfig {:index-type        :tspo
+                            :comparator        flake/cmp-flakes-block
+                            :historyComparator flake/cmp-flakes-block})})
 
 
 (defrecord IndexNode [block t rhs children config leftmost?]

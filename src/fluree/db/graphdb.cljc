@@ -345,36 +345,20 @@
     ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
     idx-node))
 
-(def default-index-configs {:spot (index/map->IndexConfig {:index-type        :spot
-                                                           :comparator        flake/cmp-flakes-spot
-                                                           :historyComparator flake/cmp-flakes-spot-novelty})
-                            :psot (index/map->IndexConfig {:index-type        :psot
-                                                           :comparator        flake/cmp-flakes-psot
-                                                           :historyComparator flake/cmp-flakes-psot-novelty})
-                            :post (index/map->IndexConfig {:index-type        :post
-                                                           :comparator        flake/cmp-flakes-post
-                                                           :historyComparator flake/cmp-flakes-post-novelty})
-                            :opst (index/map->IndexConfig {:index-type        :opst
-                                                           :comparator        flake/cmp-flakes-opst
-                                                           :historyComparator flake/cmp-flakes-opst-novelty})
-                            :tspo (index/map->IndexConfig {:index-type        :tspo
-                                                           :comparator        flake/cmp-flakes-block
-                                                           :historyComparator flake/cmp-flakes-block})})
-
 (defn blank-db
   [conn network dbid schema-cache current-db-fn]
   (assert conn "No conn provided when creating new db.")
   (assert network "No network provided when creating new db.")
   (assert dbid "No dbid provided when creating new db.")
-  (let [novelty     (new-novelty-map default-index-configs)
+  (let [novelty     (new-novelty-map index/default-configs)
         permissions {:collection {:all? false}
                      :predicate  {:all? true}
                      :root?      true}
-        spot        (new-empty-index conn default-index-configs network dbid :spot)
-        psot        (new-empty-index conn default-index-configs network dbid :psot)
-        post        (new-empty-index conn default-index-configs network dbid :post)
-        opst        (new-empty-index conn default-index-configs network dbid :opst)
-        tspo        (new-empty-index conn default-index-configs network dbid :tspo)
+        spot        (new-empty-index conn index/default-configs network dbid :spot)
+        psot        (new-empty-index conn index/default-configs network dbid :psot)
+        post        (new-empty-index conn index/default-configs network dbid :post)
+        opst        (new-empty-index conn index/default-configs network dbid :opst)
+        tspo        (new-empty-index conn index/default-configs network dbid :tspo)
         stats       {:flakes  0
                      :size    0
                      :indexed 0}
@@ -382,7 +366,7 @@
         fork-block  nil
         schema      nil
         settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst schema settings default-index-configs schema-cache novelty permissions fork fork-block current-db-fn)))
+    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst schema settings index/default-configs schema-cache novelty permissions fork fork-block current-db-fn)))
 
 (defn graphdb?
   [db]
