@@ -468,7 +468,7 @@
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
-  [conn index-configs network dbid index index-data block t]
+  [conn {:keys [network dbid index-configs block t]} index index-data]
   (let [cfg (or (get index-configs index)
                 (throw (ex-info (str "Internal error reifying db root index: " (pr-str index))
                                 {:status 500
@@ -491,9 +491,10 @@
                             :ecount ecount
                             :stats (assoc stats :indexed block))]
     (reduce
-      (fn [db idx]
-        (assoc db idx (reify-index-root conn index-configs network dbid idx (get root-data idx) block t)))
-      db* [:spot :psot :post :opst])))
+     (fn [db idx]
+       (let [idx-root (reify-index-root conn db idx (get root-data idx))]
+         (assoc db idx idx-root)))
+     db* [:spot :psot :post :opst])))
 
 
 (defn read-garbage
