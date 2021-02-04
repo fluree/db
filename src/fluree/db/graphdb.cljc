@@ -187,7 +187,7 @@
                                 (assoc db* idx (-> (get db* idx)
                                                    (assoc :tt-id tt-id'))))
                               (assoc db :tt-id tt-id')
-                              [:spot :psot :post :opst])
+                              index/types)
           flakes-by-t (->> flakes
                            (sort-by :t)
                            reverse
@@ -323,12 +323,12 @@
 
 (defn new-novelty-map
   [index-configs]
-  (->> [:spot :psot :post :opst]
-       (reduce
-         (fn [m idx]
-           (let [ss (avl/sorted-set-by (get-in index-configs [idx :historyComparator]))]
-             (assoc m idx ss)))
-         {:size 0})))
+  (reduce
+   (fn [m idx]
+     (assoc m idx (-> index-configs
+                      (get-in [idx :historyComparator])
+                      avl/sorted-set-by)))
+   {:size 0} index/types))
 
 (defn new-empty-index
   [conn index-configs network dbid idx]
@@ -356,7 +356,8 @@
                                                            :historyComparator flake/cmp-flakes-post-novelty})
                             :opst (index/map->IndexConfig {:index-type        :opst
                                                            :comparator        flake/cmp-flakes-opst
-                                                           :historyComparator flake/cmp-flakes-opst-novelty})})
+                                                           :historyComparator flake/cmp-flakes-opst-novelty})
+                            :tspo (index/map->IndexConfig {})})
 
 (defn blank-db
   [conn network dbid schema-cache current-db-fn]
@@ -383,4 +384,3 @@
 (defn graphdb?
   [db]
   (instance? GraphDb db))
-

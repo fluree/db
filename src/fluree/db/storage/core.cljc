@@ -494,7 +494,7 @@
      (fn [db idx]
        (let [idx-root (reify-index-root conn db idx (get root-data idx))]
          (assoc db idx idx-root)))
-     db* [:spot :psot :post :opst])))
+     db* index/types)))
 
 
 (defn read-garbage
