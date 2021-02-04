@@ -357,7 +357,9 @@
                             :opst (index/map->IndexConfig {:index-type        :opst
                                                            :comparator        flake/cmp-flakes-opst
                                                            :historyComparator flake/cmp-flakes-opst-novelty})
-                            :tspo (index/map->IndexConfig {})})
+                            :tspo (index/map->IndexConfig {:index-type        :tspo
+                                                           :comparator        flake/cmp-flakes-block
+                                                           :historyComparator flake/cmp-flakes-block})})
 
 (defn blank-db
   [conn network dbid schema-cache current-db-fn]
@@ -372,6 +374,7 @@
         psot        (new-empty-index conn default-index-configs network dbid :psot)
         post        (new-empty-index conn default-index-configs network dbid :post)
         opst        (new-empty-index conn default-index-configs network dbid :opst)
+        tspo        (new-empty-index conn default-index-configs network dbid :tspo)
         stats       {:flakes  0
                      :size    0
                      :indexed 0}

@@ -362,16 +362,17 @@
     (cmp-meta (.-m f1) (.-m f2))))
 
 
-(defn cmp-flakes-block [^Flake f1, ^Flake f2]
-  "Comparison for flakes in blocks.
-  Like cmp-flakes-spot-novelty, but 't' is moved up front."
+(defn cmp-flakes-block
+  "Comparison for flakes in blocks. Like cmp-flakes-spot-novelty, but with 't'
+  moved up front."
+  [^Flake f1, ^Flake f2]
   (combine-cmp
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val-xtype (.-o f1) (.-o f2))
-    (cmp-bool (.-op f1) (.-op f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+   (cmp-long (.-t f2) (.-t f1))                            ;; reversed
+   (cmp-long (.-s f2) (.-s f1))                            ;; reversed
+   (cmp-pred (.-p f1) (.-p f2))
+   (cmp-val-xtype (.-o f1) (.-o f2))
+   (cmp-bool (.-op f1) (.-op f2))
+   (cmp-meta (.-m f1) (.-m f2))))
 
 
 (defn cmp-flakes-history
@@ -512,4 +513,3 @@
     flake-set
     (let [k (nth flake-set n)]
       (first (avl/split-key k flake-set)))))
-
