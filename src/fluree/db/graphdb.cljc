@@ -39,8 +39,10 @@
       (throw (ex-info (str "Invalid ledger identity: " ledger)
                       {:status 400 :error :db/invalid-ledger-name})))))
 
-;; exclude these predicates from the database
-(def ^:const exclude-predicates #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
+
+(def ^:const exclude-predicates
+  "Predicates to exclude from the database"
+  #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
 
 (defn add-predicate-to-idx
   [db pred-id]
@@ -331,19 +333,21 @@
    {:size 0} index/types))
 
 (defn new-empty-index
-  [conn index-configs network dbid idx]
-  (let [index-config (get index-configs idx)
-        _            (assert index-config (str "No index config found for index: " idx))
-        comparator   (:historyComparator index-config)
-        _            (assert comparator (str "No index comparator found for index: " idx))
-        first-flake  (flake/->Flake util/max-long 0 util/max-long 0 true nil) ;; left hand side is the largest flake possible
-        child-node   (storage/map->UnresolvedNode
+  ([conn network dbid idx-type]
+   (new-empty-index conn index/default-configs network dbid idx-type))
+  ([conn index-configs network dbid idx-type]
+   (let [index-config (get index-configs idx-type)
+         _            (assert index-config (str "No index config found for index: " idx-type))
+         comparator   (:historyComparator index-config)
+         _            (assert comparator (str "No index comparator found for index: " idx-type))
+         first-flake  (flake/->Flake util/max-long 0 util/max-long 0 true nil) ;; left hand side is the largest flake possible
+         child-node   (storage/map->UnresolvedNode
                        {:conn  conn :config index-config :network network :dbid dbid :id :empty :leaf true
                         :first first-flake :rhs nil :size 0 :block 0 :t 0 :tt-id nil :leftmost? true})
-        children     (avl/sorted-map-by comparator first-flake child-node)
-        idx-node     (index/->IndexNode 0 0 nil children index-config true)]
-    ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
-    idx-node))
+         children     (avl/sorted-map-by comparator first-flake child-node)
+         idx-node     (index/->IndexNode 0 0 nil children index-config true)]
+     ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
+     idx-node)))
 
 (defn blank-db
   [conn network dbid schema-cache current-db-fn]
@@ -354,14 +358,12 @@
         permissions {:collection {:all? false}
                      :predicate  {:all? true}
                      :root?      true}
-        spot        (new-empty-index conn index/default-configs network dbid :spot)
-        psot        (new-empty-index conn index/default-configs network dbid :psot)
-        post        (new-empty-index conn index/default-configs network dbid :post)
-        opst        (new-empty-index conn index/default-configs network dbid :opst)
-        tspo        (new-empty-index conn index/default-configs network dbid :tspo)
-        stats       {:flakes  0
-                     :size    0
-                     :indexed 0}
+        spot        (new-empty-index conn network dbid :spot)
+        psot        (new-empty-index conn network dbid :psot)
+        post        (new-empty-index conn network dbid :post)
+        opst        (new-empty-index conn network dbid :opst)
+        tspo        (new-empty-index conn network dbid :tspo)
+        stats       {:flakes 0, :size 0, :indexed 0}
         fork        nil
         fork-block  nil
         schema      nil
