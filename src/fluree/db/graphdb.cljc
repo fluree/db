@@ -96,18 +96,20 @@
              psot   (get-in db* [:novelty :psot])
              post   (get-in db* [:novelty :post])
              opst   (get-in db* [:novelty :opst])
+             tspo   (get-in db* [:novelty :tspo])
              ecount (:ecount db)]
         (if-not f
-          (let [db*  (assoc db* :ecount ecount
-                                :novelty {:spot spot :psot psot :post post :opst opst
-                                          :size (+ flakes-bytes (get-in db* [:novelty :size]))})
-                db** (if (or schema-change? (nil? (:schema db*)))
-                       (assoc db* :schema (<? (schema/schema-map db*)))
-                       db*)]
-            (cond-> db**
-
-                    root-setting-change?
-                    (assoc :settings (<? (schema/setting-map db**)))))
+          (let [flake-size (-> db*
+                               (get-in [:novelty :size])
+                               (+ flakes-bytes))
+                db*  (assoc db*
+                            :ecount ecount
+                            :novelty {:spot spot, :psot psot, :post post,
+                                      :opst opst, :size flake-size})]
+            (cond-> db*
+              (or schema-change?
+                  (nil? (:schema db*))) (assoc :schema (<? (schema/schema-map db*)))
+              root-setting-change?      (assoc :settings (<? (schema/setting-map db*)))))
           (let [cid     (flake/sid->cid (.-s f))
                 ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
             (recur r
@@ -119,6 +121,7 @@
                    (if (get ref?-map (.-p f))
                      (conj opst f)
                      opst)
+                   (conj tspo f)
                    ecount*)))))))
 
 (defn with
@@ -246,7 +249,7 @@
                                      e)))))
     return-chan))
 
-(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst schema settings index-configs schema-cache novelty permissions fork fork-block current-db-fn]
+(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst tspo schema settings index-configs schema-cache novelty permissions fork fork-block current-db-fn]
   dbproto/IFlureeDb
   (-latest-db [this]
     (go-try
@@ -368,7 +371,7 @@
         fork-block  nil
         schema      nil
         settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst schema settings index/default-configs schema-cache novelty permissions fork fork-block current-db-fn)))
+    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst tspo schema settings index/default-configs schema-cache novelty permissions fork fork-block current-db-fn)))
 
 (defn graphdb?
   [db]

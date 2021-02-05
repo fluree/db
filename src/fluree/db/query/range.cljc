@@ -39,7 +39,8 @@
       :spot [p1 (dbproto/-p-prop db :id p2) p3 t op m]
       :psot [p2 (dbproto/-p-prop db :id p1) p3 t op m]
       :post [p3 (dbproto/-p-prop db :id p1) p2 t op m]
-      :opst [p3 (dbproto/-p-prop db :id p2) p1 t op m])))
+      :opst [p3 (dbproto/-p-prop db :id p2) p1 t op m]
+      :tspo [t (dbproto/-p-prop db :id p1) p2 p3 op m])))
 
 
 
@@ -482,4 +483,3 @@
                                 :sigs      sigs
                                 :flakes    flakes
                                 :txn       txn-flakes'}))))))
-

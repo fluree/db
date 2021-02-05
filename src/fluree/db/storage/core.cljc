@@ -188,24 +188,28 @@
    (write-db-root db nil))
   ([db custom-ecount]
    (go-try
-     (let [{:keys [conn network dbid block t ecount stats spot psot post opst fork fork-block]} db
-           db-root-key (ledger-root-key network dbid block)
-           data        {:dbid      dbid
-                        :block     block
-                        :t         t
-                        :ecount    (or custom-ecount ecount)
-                        :stats     (select-keys stats [:flakes :size])
-                        :spot      (child-data spot)
-                        :psot      (child-data psot)
-                        :post      (child-data post)
-                        :opst      (child-data opst)
-                        :timestamp (util/current-time-millis)
-                        :prevIndex (or (:indexed stats) 0)
-                        :fork      fork
-                        :forkBlock fork-block}
-           ser         (serdeproto/-serialize-db-root (serde conn) data)]
-       (<? (storage-write conn db-root-key ser))
-       db-root-key))))
+    (let [{:keys [conn network dbid block t ecount stats spot psot post opst
+                  tspo fork fork-block]}
+          db
+
+          db-root-key (ledger-root-key network dbid block)
+          data        {:dbid      dbid
+                       :block     block
+                       :t         t
+                       :ecount    (or custom-ecount ecount)
+                       :stats     (select-keys stats [:flakes :size])
+                       :spot      (child-data spot)
+                       :psot      (child-data psot)
+                       :post      (child-data post)
+                       :opst      (child-data opst)
+                       :tspo      (child-data tspo)
+                       :timestamp (util/current-time-millis)
+                       :prevIndex (or (:indexed stats) 0)
+                       :fork      fork
+                       :forkBlock fork-block}
+          ser         (serdeproto/-serialize-db-root (serde conn) data)]
+      (<? (storage-write conn db-root-key ser))
+      db-root-key))))
 
 ;; TODO - sorting is temporary... place into node in correct order
 (defn reify-history
@@ -301,7 +305,7 @@
   "Gets a history slice of a node with the oldest 't' from-t, to the
   most recent 't', to-t.
 
-  Returns sorted set in novelty's sort order (spot, psot, post, or opst)"
+  Returns sorted set in novelty's sort order (spot, psot, post, opst, or tspo)"
   [node from-t to-t idx-novelty leftmost?]
   (go
     (try*
