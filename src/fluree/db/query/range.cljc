@@ -34,14 +34,13 @@
   returns flake-ordered components of [s p o t op m].
   Coerces idents and string predicate names."
   [db idx match]
-  (let [[p1 p2 p3 t op m] match]
+  (let [[p1 p2 p3 p4 op m] match]
     (case idx
-      :spot [p1 (dbproto/-p-prop db :id p2) p3 t op m]
-      :psot [p2 (dbproto/-p-prop db :id p1) p3 t op m]
-      :post [p3 (dbproto/-p-prop db :id p1) p2 t op m]
-      :opst [p3 (dbproto/-p-prop db :id p2) p1 t op m]
-      :tspo [t (dbproto/-p-prop db :id p1) p2 p3 op m])))
-
+      :spot [p1 (dbproto/-p-prop db :id p2) p3 p4 op m]
+      :psot [p2 (dbproto/-p-prop db :id p1) p3 p4 op m]
+      :post [p3 (dbproto/-p-prop db :id p1) p2 p4 op m]
+      :opst [p3 (dbproto/-p-prop db :id p2) p1 p4 op m]
+      :tspo [p2 (dbproto/-p-prop db :id p3) p4 p1 op m])))
 
 
 (def ^{:private true :const true} subject-min-match [util/max-long])
