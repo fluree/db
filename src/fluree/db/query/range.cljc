@@ -12,7 +12,8 @@
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
 (defn value-with-nil-pred
-  "Checks whether an index range is :spot, starts with [s1 -1 o1] and ends with [s1 int/max p1]"
+  "Checks whether an index range is :spot, starts with [s1 -1 o1] and ends
+  with [s1 int/max p1]"
   [idx ^Flake start-flake ^Flake end-flake]
   (and (= :spot idx)
        (not (nil? (.-o start-flake)))
@@ -26,7 +27,8 @@
   [db p]
   (when p
     (or (dbproto/-p-prop db :id p)
-        (throw (ex-info (str "Invalid predicate, does not exist: " p) {:status 400 :error :db/invalid-predicate})))))
+        (throw (ex-info (str "Invalid predicate, does not exist: " p)
+                        {:status 400, :error :db/invalid-predicate})))))
 
 
 (defn- match->flake-parts
@@ -47,6 +49,8 @@
 (def ^{:private true :const true} subject-max-match [util/min-long])
 (def ^{:private true :const true} pred-min-match [0])
 (def ^{:private true :const true} pred-max-match [flake/MAX-PREDICATE-ID])
+(def ^{:private true :const true} txn-max-match [util/min-long])
+(def ^{:private true :const true} txn-min-match [0])
 
 
 (defn- min-match
@@ -56,7 +60,8 @@
     :spot subject-min-match
     :psot pred-min-match
     :post pred-min-match
-    :opst subject-min-match))
+    :opst subject-min-match
+    :tspo txn-min-match))
 
 
 (defn- max-match
@@ -66,23 +71,27 @@
     :spot subject-max-match
     :psot pred-max-match
     :post pred-max-match
-    :opst subject-max-match))
+    :opst subject-max-match
+    :tspo txn-max-match))
 
 
 (defn time-range
   "Range query across an index.
 
-  Uses a DB, but in the future support supplying a connection and db name, as we don't need a 't'
+  Uses a DB, but in the future support supplying a connection and db name, as we
+  don't need a 't'
 
-  Ranges take the natural numeric sort orders, but all results will
-  return in reverse order (newest subjects and predicates first).
+  Ranges take the natural numeric sort orders, but all results will return in
+  reverse order (newest subjects and predicates first).
 
   Returns core async channel.
 
   opts:
-  :from-t - start transaction (transaction 't' is negative, so smallest number is most recent). Defaults to db's t
+  :from-t - start transaction (transaction 't' is negative, so smallest number
+            is most recent). Defaults to db's t
   :to-t - stop transaction - can be null, which pulls full history
-  :xform - xform applied to each result individually. This is not used when :chan is supplied.
+  :xform - xform applied to each result individually. This is not used
+           when :chan is supplied.
   :limit - max number of flakes to return"
   ([db idx] (time-range db idx {}))
   ([db idx opts] (time-range db idx >= (min-match idx) <= (max-match idx) opts))
