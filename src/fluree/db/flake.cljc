@@ -459,6 +459,10 @@
   (apply avl/sorted-set-by comparator flakes))
 
 (defn disj-all
+  "Removes all flakes in the `to-remove` collection from the AVL-backed sorted
+  flake set `sorted-set`. This function uses transients for intermediate set
+  values for better performance because of the slower batched update performance
+  of AVL-backed sorted sets."
   [sorted-set to-remove]
   (as-> (transient sorted-set) tset
     (reduce disj! tset to-remove)
