@@ -458,6 +458,11 @@
   [comparator & flakes]
   (apply avl/sorted-set-by comparator flakes))
 
+(defn disj-all
+  [sorted-set to-remove]
+  (as-> (transient sorted-set) tset
+    (reduce disj! tset to-remove)
+    (persistent! tset)))
 
 (defn size-flake
   "Base size of a flake is 38 bytes... then add size for 'o' and 'm'.
