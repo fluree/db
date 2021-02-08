@@ -65,7 +65,7 @@
 
 
 (defn- max-match
-  "Smallest index flake part match by index"
+  "Biggest index flake part match by index"
   [idx]
   (case idx
     :spot subject-max-match
