@@ -11,17 +11,6 @@
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
-(defn value-with-nil-pred
-  "Checks whether an index range is :spot, starts with [s1 -1 o1] and ends
-  with [s1 int/max p1]"
-  [idx ^Flake start-flake ^Flake end-flake]
-  (and (= :spot idx)
-       (not (nil? (.-o start-flake)))
-       (= (.-o start-flake) (.-o end-flake))
-       (= -1 (.-p start-flake))
-       (= flake/MAX-PREDICATE-ID (.-p end-flake))))
-
-
 (defn- pred-id-strict
   "Will throw if predicate doesn't exist."
   [db p]
@@ -100,23 +89,13 @@
           m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
       [s' p' o' t op m'])))
 
-(defn filter-flakes
-  [sorted-flakes ^Flake start-flake ^Flake end-flake idx]
-  (if (value-with-nil-pred idx start-flake end-flake)
-    (->> sorted-flakes
-         (filter (fn [^Flake f]
-                   (not= (.-o f) (.-o start-flake))))
-         (flake/disj-all sorted-flakes))
-    sorted-flakes))
-
 (defn base-subrange
   [next-node idx from-t to-t novelty start-test start-flake end-test end-flake]
   (go-try
    (-> next-node
        (dbproto/-resolve-history-range from-t to-t novelty)
        <?
-       (flake/subrange start-test start-flake end-test end-flake)
-       (filter-flakes start-flake end-flake idx))))
+       (flake/subrange start-test start-flake end-test end-flake))))
 
 (defn take-flakes
   [base-result acc limit db i no-filter?]
@@ -321,7 +300,6 @@
                              acc       []]                  ;; acc is all of the flakes we have accumulated thus far
                         (let [base-result  (flake/subrange (:flakes next-node) start-test start-flake end-test end-flake)
                               base-result' (cond->> base-result
-                                                    (value-with-nil-pred idx start-flake end-flake) (filter #(= (.-o %) (.-o start-flake)))
                                                     subject-fn (filter #(subject-fn (.-s %)))
                                                     predicate-fn (filter #(predicate-fn (.-p %)))
                                                     object-fn (filter #(object-fn (.-o %))))
