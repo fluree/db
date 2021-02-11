@@ -76,25 +76,23 @@
         (async/put! out id)))
     out))
 
-(defn resolve-flake-parts
+(defn resolve-flake
   [db idx test match]
   (go-try
-    (let [[s p o t op m]
-          (match->flake-parts db idx match)
-
+    (let [[s p o t op m] (match->flake-parts db idx match)
           s' (<? (resolve-subid db s))
           o' (<? (resolve-subid db o))
           ;; for >=, start at the beginning of the possible range for exp and for > start at the end
           p' (if (and (nil? p) o) -1 p)
           m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
-      [s' p' o' t op m'])))
+      (flake/->Flake s' p' o' t op m'))))
 
 (defn node-stream
   [root-node flake-compare start-flake end-flake]
   (let [out (chan)]
     (go-loop [next-flake start-flake]
       (if-not (and next-flake
-                   #_(neg? (flake-compare next-flake end-flake)))
+                   (neg? (flake-compare next-flake end-flake)))
         (async/close! out)
         (let [next-node (<! (dbproto/-lookup-leaf root-node next-flake))]
           (when (>! out next-node)
@@ -112,7 +110,7 @@
         (dbproto/-resolve-history-range from-t to-t novelty)
         (async/pipe subrange-ch))))
 
-(defn flake-range-ch
+(defn flake-range-stream
   [node-stream-ch from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
@@ -128,11 +126,16 @@
     out))
 
 (defn filter-flakes
-  [flake-range-ch db]
-  #?(:cljs flake-range-ch ; Note this bypasses all permissions in CLJS for now!
-     :clj (let [out (chan)]
+  [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
+  #?(:cljs flake-range-stream ; Note this bypasses all permissions in CLJS for now!
+     :clj (let [out        (chan)
+                s1         (.-s start)
+                p1         (.-p start)
+                s2         (.-s end)
+                p2         (.-p end)
+                no-filter? (perm-validate/no-filter? permissions s1 s2 p1 p2)]
             (go-loop []
-              (if-let [flake (<! flake-range-ch)]
+              (if-let [flake (<! flake-range-stream)]
                 (do (when (<? (perm-validate/allow-flake? db flake))
                       (>! out flake))
                     (recur))
@@ -144,52 +147,28 @@
   (let [out (async/chan 1 (take limit))]
     (async/pipe flake-chan out)))
 
-(defn take-flakes
-  [base-result acc limit db i no-filter?]
-  (go-try
-   (if no-filter?
-     (into (flake/take (- limit i) base-result) acc)
-     (loop [[f & r] base-result   ;; we must filter, check each flake
-            i'   i
-            acci base-result]
-       (if (or (nil? f) (> i' limit))
-         (into acci acc)
-         (recur r
-                (inc i')
-                ;; Note this bypasses all permissions in CLJS for now!
-                #?(:cljs acci      ;; always allow for now
-                   :clj  (if (<? (perm-validate/allow-flake? db f))
-                           acci
-                           (disj acci f)))))))))
+(defn time-range-stream
+  [{t :t :as db} idx start-test start-match end-test end-match opts]
+  (let [{:keys [limit from-t to-t]
+         :or   {limit util/max-long, from-t t}}
+        opts
 
-(defn time-range-chan
-  [{:keys [permissions t] :as db} idx start-test start-match end-test end-match
-   {:keys [limit from-t to-t]
-    :or   {limit util/max-long, from-t t}
-    :as   opts}]
-  (let [out-chan (chan)]
+        novelty     (get-in db [:novelty idx])
+        idx-compare (get-in db [:index-configs idx :comparator])
+        out-chan    (chan)]
+
     (go
-      (let [[s1 p1 o1 t1 op1 m1] (<? (resolve-flake-parts db idx start-test start-match))
-            [s2 p2 o2 t2 op2 m2] (<? (resolve-flake-parts db idx end-test end-match))
-            root-node            (<? (-> db
-                                         (get idx)
-                                         dbproto/-resolve))
-
-            ;; flip values, because they do have a lexicographical sort order
-            start-flake (flake/->Flake s1 p1 o1 t1 op1 m1)
-            end-flake   (flake/->Flake s2 p2 o2 t2 op2 m2)
-            idx-compare (get-in db [:index-configs idx :comparator])
-            novelty     (get-in db [:novelty idx])
-
-            ;; Note this bypasses all permissions in CLJS for now!
-            no-filter? #?(:cljs true                         ;; always allow for now
-                          :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
+      (let [root-node   (<? (-> db
+                                (get idx)
+                                dbproto/-resolve))
+            start-flake (<? (resolve-flake db idx start-test start-match))
+            end-flake   (<? (resolve-flake db idx end-test end-match))]
         (-> root-node
-            (node-stream compare start-flake end-flake)
-            (flake-range-ch from-t to-t novelty start-test start-flake end-test end-flake)
-            (filter-flakes db)
+            (node-stream idx-compare start-flake end-flake)
+            (flake-range-stream from-t to-t novelty
+                                start-test start-flake end-test end-flake)
+            (filter-flakes db start-flake end-flake)
             (take-only limit)
-            (->> (async/reduce conj (flake/sorted-set-by idx-compare)))
             (async/pipe out-chan))))
 
     out-chan))
@@ -229,8 +208,11 @@
    (time-range db idx start-test start-match end-test end-match {}))
   ([db idx start-test start-match end-test end-match opts]
    ;; formulate a comparison flake based on conditions
-   (time-range-chan db idx start-test start-match end-test end-match opts)))
-
+   (let [idx-compare (get-in db [:index-configs idx :comparator])
+         time-stream (time-range-stream db idx start-test start-match end-test end-match opts)
+         out         (chan 1 (map (partial apply flake/sorted-set-by idx-compare)))]
+     (-> (async/reduce conj [] time-stream)
+         (async/pipe out)))))
 
 (defn subject-groups->allow-flakes
   "Starting with flakes grouped by subject id, filters the flakes until
