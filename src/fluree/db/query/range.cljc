@@ -285,26 +285,27 @@
   ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
    ;; formulate a comparison flake based on conditions
    (go-try
-    (let [[s1 p1 o1 t1 op1 m1] (match->flake-parts db idx start-match)
-          [s2 p2 o2 t2 op2 m2] (match->flake-parts db idx end-match)
-          {:keys [flake-limit limit offset subject-fn predicate-fn object-fn]
-           :or   {flake-limit util/max-long
-                  offset      0}}
+    (let [{:keys [flake-limit limit offset subject-fn predicate-fn object-fn]
+           :or   {flake-limit util/max-long, offset 0}}
           opts
 
           limit            (or limit util/max-long)
           max-limit?       (= limit util/max-long)
+          fast-forward-db? (:tt-id db)
           idx-compare      (get-in db [:index-configs idx :comparator])
           novelty          (get-in db [:novelty idx])
-          fast-forward-db? (:tt-id db)
 
+          [s1 p1 o1 t1 op1 m1] (match->flake-parts db idx start-match)
+          [s2 p2 o2 t2 op2 m2] (match->flake-parts db idx end-match)
           s1                 (if (util/pred-ident? s1)
                                (<? (dbproto/-subid db s1))
                                s1)
           s2                 (if (util/pred-ident? s2)
                                (<? (dbproto/-subid db s2))
                                s2)
-          [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
+          [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1
+                                                  (boolean? o2) o2
+                                                  :else nil)]
                                 [[nil nil] (fn [o] (= o bool))]
                                 [[o1 o2] object-fn])
           o1                 (if (util/pred-ident? o1)
