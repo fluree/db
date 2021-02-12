@@ -151,6 +151,11 @@
   (let [limit-chan (async/chan 1 (take limit))]
     (async/pipe flake-chan limit-chan)))
 
+(defn skip-first
+  [flake-chan offset]
+  (let [offset-chan (async/chan 1 (drop offset))]
+    (async/pipe flake-chan offset-chan)))
+
 (defn time-range-stream
   [{t :t :as db} idx start-test start-match end-test end-match opts]
   (let [{:keys [limit from-t to-t]
