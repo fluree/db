@@ -99,13 +99,13 @@
             (recur (dbproto/-rhs next-node))))))
     out))
 
-(defn node-subrange-ch
+(defn flake-subrange-stream
   [next-node from-t to-t novelty start-test start-flake end-test end-flake]
-  (let [node-subrange (fn [node]
+  (let [flake-subrange (fn [node]
                         (flake/subrange node
                                         start-test start-flake
                                         end-test end-flake))
-        subrange-ch   (chan 1 (mapcat node-subrange))]
+        subrange-ch   (chan 1 (mapcat flake-subrange))]
     (-> next-node
         (dbproto/-resolve-history-range from-t to-t novelty)
         (async/pipe subrange-ch))))
@@ -114,8 +114,8 @@
   [node-stream-ch from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
-      (if-let [next-node   (<! node-stream-ch)]
-        (let [subrange-ch (node-subrange-ch next-node from-t to-t novelty start-test start-flake end-test end-flake)]
+      (if-let [next-node (<! node-stream-ch)]
+        (let [subrange-ch (flake-subrange-stream next-node from-t to-t novelty start-test start-flake end-test end-flake)]
           (loop []
             (when-let [next-flake (<! subrange-ch)]
               (if-not (>! out next-flake)
@@ -240,16 +240,16 @@
                  (into acc subject-filtered)))))))
 
 (defn find-next-valid-node
-  [root-node rhs t novelty fast-forward-db?]
+  [root-node start-flake t novelty fast-forward-db?]
   (go-try
-    (loop [lookup-leaf (<? (dbproto/-lookup-leaf root-node rhs))]
+    (loop [lookup-leaf (<? (dbproto/-lookup-leaf root-node start-flake))]
       (let [node (try*
                    (<? (dbproto/-resolve-to-t lookup-leaf t novelty fast-forward-db?))
                    (catch* e nil))]
-        (if node node
-                 (if-let [rhs (:rhs lookup-leaf)]
-                   (recur (<? (dbproto/-lookup-leaf root-node rhs)))
-                   nil))))))
+        (if node
+          node
+          (when-let [rhs (:rhs lookup-leaf)]
+            (recur (<? (dbproto/-lookup-leaf root-node rhs)))))))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
