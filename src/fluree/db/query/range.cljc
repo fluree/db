@@ -150,9 +150,10 @@
 (defn time-range-stream
   [{t :t :as db} idx start-test start-match end-test end-match opts]
   (let [{:keys [limit from-t to-t]
-         :or   {limit util/max-long, from-t t}}
+         :or   {from-t t}}
         opts
 
+        limit       (or limit util/max-long)
         novelty     (get-in db [:novelty idx])
         idx-compare (get-in db [:index-configs idx :comparator])
         out-chan    (chan)]
@@ -271,108 +272,108 @@
      (index-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
-  ([db idx start-test start-match end-test end-match opts]
+  ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
    ;; formulate a comparison flake based on conditions
    (go-try
-     (let [[s1 p1 o1 t1 op1 m1] (match->flake-parts db idx start-match)
-           [s2 p2 o2 t2 op2 m2] (match->flake-parts db idx end-match)
-           {:keys [subject-fn predicate-fn object-fn]} opts
-           s1                 (if (util/pred-ident? s1)
-                                (<? (dbproto/-subid db s1))
-                                s1)
-           s2                 (if (util/pred-ident? s2)
-                                (<? (dbproto/-subid db s2))
-                                s2)
-           [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
-                                 [[nil nil] (fn [o] (= o bool))]
-                                 [[o1 o2] object-fn])
-           o1                 (if (util/pred-ident? o1)
-                                (<? (dbproto/-subid db o1))
-                                o1)
-           o2                 (if (util/pred-ident? o2)
-                                (<? (dbproto/-subid db o2))
-                                o2)
-           ;; for >=, start at the beginning of the possible range for exp and for > start at the end
-           p1                 (if (and (nil? p1) o1) -1 p1)
-           p2                 (if (and (nil? p2) o2) flake/MAX-PREDICATE-ID p2)
-           m1                 (or m1 (if (identical? >= start-test) util/min-integer util/max-integer))
-           m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
-           ;; flip values, because they do have a lexicographical sort order
-           start-flake        (flake/->Flake s1 p1 o1 t1 op1 m1)
-           end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
-           {:keys [flake-limit limit offset]
-            :or   {flake-limit util/max-long
-                   offset      0}} opts
-           limit              (or limit util/max-long)
-           max-limit?         (= limit util/max-long)
-           permissions        (:permissions db)
-           idx-compare        (get-in db [:index-configs idx :comparator])
-           t                  (:t db)
-           novelty            (get-in db [:novelty idx])
-           fast-forward-db?   (:tt-id db)
-           root-node          (-> (get db idx)
-                                  (dbproto/-resolve)
-                                  (<?))
-           node-start         (<? (find-next-valid-node root-node start-flake t novelty fast-forward-db?))
-           no-filter? #?(:cljs true
-                         :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
-       (if node-start (loop [next-node node-start
-                             offset    offset               ;; offset counts down from the offset
-                             i         0                    ;; i is count of flakes
-                             s         0                    ;; s is the count of subjects
-                             acc       []]                  ;; acc is all of the flakes we have accumulated thus far
-                        (let [base-result  (flake/subrange (:flakes next-node) start-test start-flake end-test end-flake)
-                              base-result' (cond->> base-result
-                                                    subject-fn (filter #(subject-fn (.-s %)))
-                                                    predicate-fn (filter #(predicate-fn (.-p %)))
-                                                    object-fn (filter #(object-fn (.-o %))))
-                              rhs          (dbproto/-rhs next-node) ;; can be nil if at farthest right point
-                              [offset* i* s* acc*] (if (and max-limit? (= 0 offset) no-filter?)
-                                                     (let [i+   (count base-result')
-                                                           acc* (into acc (take (- flake-limit i) base-result'))]
-                                                       ;; we don't care about s if max-limit
-                                                       [0 (+ i i+) s acc*])
+    (let [[s1 p1 o1 t1 op1 m1] (match->flake-parts db idx start-match)
+          [s2 p2 o2 t2 op2 m2] (match->flake-parts db idx end-match)
+          {:keys [flake-limit limit offset subject-fn predicate-fn object-fn]
+           :or   {flake-limit util/max-long
+                  offset      0}}
+          opts
 
-                                                     (let [partitioned              (partition-by #(.-s %) base-result')
-                                                           count-partitioned-result (count partitioned)]
-                                                       (if (> offset count-partitioned-result)
-                                                         [(- offset count-partitioned-result) i s acc]
-                                                         (let [offset-res (drop offset partitioned)
-                                                               offset*    0
-                                                               [i* s* res-flakes] (if no-filter?
-                                                                                    (let [offset-res-count (count offset-res)
-                                                                                          subject-count    (+ s offset-res-count)
-                                                                                          limit-drop       (- subject-count limit)
-                                                                                          [s* limit-take*] (if (pos-int? limit-drop)
-                                                                                                             [limit (- offset-res-count limit-drop)]
-                                                                                                             [subject-count subject-count])
-                                                                                          res-flakes       (->> (take limit-take* offset-res)
-                                                                                                                (apply concat))
-                                                                                          res-i-count      (count res-flakes)
-                                                                                          i*               (+ i res-i-count)
-                                                                                          [i* res-flakes] (if (> i* flake-limit)
-                                                                                                            [flake-limit (take (- res-i-count (- i* flake-limit))
-                                                                                                                               res-flakes)]
+          limit            (or limit util/max-long)
+          max-limit?       (= limit util/max-long)
+          idx-compare      (get-in db [:index-configs idx :comparator])
+          novelty          (get-in db [:novelty idx])
+          fast-forward-db? (:tt-id db)
 
-                                                                                                            [i* res-flakes])]
-                                                                                      [i* s* res-flakes])
+          s1                 (if (util/pred-ident? s1)
+                               (<? (dbproto/-subid db s1))
+                               s1)
+          s2                 (if (util/pred-ident? s2)
+                               (<? (dbproto/-subid db s2))
+                               s2)
+          [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
+                                [[nil nil] (fn [o] (= o bool))]
+                                [[o1 o2] object-fn])
+          o1                 (if (util/pred-ident? o1)
+                               (<? (dbproto/-subid db o1))
+                               o1)
+          o2                 (if (util/pred-ident? o2)
+                               (<? (dbproto/-subid db o2))
+                               o2)
+          ;; for >=, start at the beginning of the possible range for exp and for > start at the end
+          p1                 (if (and (nil? p1) o1) -1 p1)
+          p2                 (if (and (nil? p2) o2) flake/MAX-PREDICATE-ID p2)
+          m1                 (or m1 (if (identical? >= start-test) util/min-integer util/max-integer))
+          m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
+          ;; flip values, because they do have a lexicographical sort order
+          start-flake        (flake/->Flake s1 p1 o1 t1 op1 m1)
+          end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
+          root-node          (-> (get db idx)
+                                 (dbproto/-resolve)
+                                 (<?))
+          node-start         (<? (find-next-valid-node root-node start-flake t novelty fast-forward-db?))
+          no-filter? #?(:cljs true
+                        :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
+      (when node-start
+        (loop [next-node node-start
+               offset    offset               ;; offset counts down from the offset
+               i         0                    ;; i is count of flakes
+               s         0                    ;; s is the count of subjects
+               acc       []]                  ;; acc is all of the flakes we have accumulated thus far
+          (let [base-result  (flake/subrange (:flakes next-node) start-test start-flake end-test end-flake)
+                base-result' (cond->> base-result
+                               subject-fn (filter #(subject-fn (.-s %)))
+                               predicate-fn (filter #(predicate-fn (.-p %)))
+                               object-fn (filter #(object-fn (.-o %))))
+                rhs          (dbproto/-rhs next-node) ;; can be nil if at farthest right point
+                [offset* i* s* acc*] (if (and max-limit? (= 0 offset) no-filter?)
+                                       (let [i+   (count base-result')
+                                             acc* (into acc (take (- flake-limit i) base-result'))]
+                                         ;; we don't care about s if max-limit
+                                         [0 (+ i i+) s acc*])
 
-                                                                                    ;; if there is a filter, we want to handle limit and filtering
-                                                                                    ;; at the same time
-                                                                                    (<? (subject-groups->allow-flakes db offset-res i s flake-limit limit)))]
-                                                           [offset* i* s* (into acc res-flakes)]))))
-                              ;; TODO - handle situation where subject is across multiple nodes...
-                              more?        (and rhs
-                                                (neg? (idx-compare rhs end-flake))
-                                                (< i* flake-limit)
-                                                (< s* limit))
-                              next-node    (when more?
-                                             (<? (find-next-valid-node root-node rhs t novelty fast-forward-db?)))
-                              more?        (and more? next-node)]
-                          (if-not more?
-                            acc*
-                            (recur next-node offset* i* s* acc*))))
-                      nil)))))
+                                       (let [partitioned              (partition-by #(.-s %) base-result')
+                                             count-partitioned-result (count partitioned)]
+                                         (if (> offset count-partitioned-result)
+                                           [(- offset count-partitioned-result) i s acc]
+                                           (let [offset-res (drop offset partitioned)
+                                                 offset*    0
+                                                 [i* s* res-flakes] (if no-filter?
+                                                                      (let [offset-res-count (count offset-res)
+                                                                            subject-count    (+ s offset-res-count)
+                                                                            limit-drop       (- subject-count limit)
+                                                                            [s* limit-take*] (if (pos-int? limit-drop)
+                                                                                               [limit (- offset-res-count limit-drop)]
+                                                                                               [subject-count subject-count])
+                                                                            res-flakes       (->> (take limit-take* offset-res)
+                                                                                                  (apply concat))
+                                                                            res-i-count      (count res-flakes)
+                                                                            i*               (+ i res-i-count)
+                                                                            [i* res-flakes] (if (> i* flake-limit)
+                                                                                              [flake-limit (take (- res-i-count (- i* flake-limit))
+                                                                                                                 res-flakes)]
+
+                                                                                              [i* res-flakes])]
+                                                                        [i* s* res-flakes])
+
+                                                                      ;; if there is a filter, we want to handle limit and filtering
+                                                                      ;; at the same time
+                                                                      (<? (subject-groups->allow-flakes db offset-res i s flake-limit limit)))]
+                                             [offset* i* s* (into acc res-flakes)]))))
+                ;; TODO - handle situation where subject is across multiple nodes...
+                more?        (and rhs
+                                  (neg? (idx-compare rhs end-flake))
+                                  (< i* flake-limit)
+                                  (< s* limit))
+                next-node    (when more?
+                               (<? (find-next-valid-node root-node rhs t novelty fast-forward-db?)))
+                more?        (and more? next-node)]
+            (if-not more?
+              acc*
+              (recur next-node offset* i* s* acc*)))))))))
 
 (defn non-nil-non-boolean?
   [o]
