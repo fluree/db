@@ -156,6 +156,7 @@
         (apply assoc acc kv)))
     {} select))
 
+;; TODO - check :limit below and default setting
 (defn parse
   "Parses select statement into our own select format.
   Has no dependency on a database, or a given schema
@@ -201,7 +202,8 @@
                                                {:status 400
                                                 :db     :db/invalid-query})))
 
-                  sub-select (some-> (not-empty (dissoc v' "_limit" "_offset" "_as" "_recur" "_component" "_orderBy" "_compact"))
+                  sub-select (some-> (dissoc v' "_limit" "_offset" "_as" "_recur" "_component" "_orderBy" "_compact")
+                                     (not-empty)
                                      (parse opts))
                   namespace? (str/includes? pred "/")
                   reverse?   (str/includes? pred "/_")
@@ -228,7 +230,9 @@
                               :limit            (get v' "_limit" 100)
                               :offset           (get v' "_offset" 0)
                               :as               as
-                              :recur            (get v' "_recur")
+                              :recur            (get v' "_recur") ;; holds max depth of recursion
+                              :recur-depth      0           ;; updated with recursion depth while processing
+                              :recur-seen       #{}
                               :orderBy          (get v' "_orderBy")
                               :select           (:select sub-select)}]
               (cond

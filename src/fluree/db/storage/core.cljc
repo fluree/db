@@ -19,11 +19,9 @@
 
 #?(:clj
    (defn block-storage-path
-     "For a ledger server, will return the storage path it is using for blocks for a given ledger."
-     [conn network dbid]
-     (let [storage-path (-> conn :meta :storage-directory)]
-       (when storage-path
-         (io/file storage-path network dbid "block")))))
+     "For a ledger server, will return the relative storage path it is using for blocks for a given ledger."
+     [network dbid]
+     (io/file network dbid "block")))
 
 (defn storage-exists?
   "Returns truthy if the provided key exists in storage."

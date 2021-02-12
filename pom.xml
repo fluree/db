@@ -4,7 +4,7 @@
   <packaging>jar</packaging>
   <groupId>com.fluree</groupId>
   <artifactId>db</artifactId>
-  <version>1.0.0-rc3</version>
+  <version>1.0.0-rc8</version>
   <name>db</name>
   <dependencies>
     <dependency>
@@ -15,7 +15,7 @@
     <dependency>
       <groupId>org.clojure</groupId>
       <artifactId>clojure</artifactId>
-      <version>1.10.1</version>
+      <version>1.10.2</version>
     </dependency>
     <dependency>
       <groupId>criterium</groupId>
@@ -26,11 +26,6 @@
       <groupId>org.clojure</groupId>
       <artifactId>tools.logging</artifactId>
       <version>1.1.0</version>
-    </dependency>
-    <dependency>
-      <groupId>figwheel-sidecar</groupId>
-      <artifactId>figwheel-sidecar</artifactId>
-      <version>0.5.20</version>
     </dependency>
     <dependency>
       <groupId>cc.qbits</groupId>
@@ -70,7 +65,7 @@
     <dependency>
       <groupId>com.fluree</groupId>
       <artifactId>crypto</artifactId>
-      <version>0.3.4</version>
+      <version>0.3.5</version>
     </dependency>
     <dependency>
       <groupId>instaparse</groupId>

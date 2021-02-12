@@ -3,7 +3,6 @@
  :target             :bundle
  :main               flureedb
  :optimizations      :advanced
- :optimize-constants false
  :pretty-print       false
  :pseudo-names       false
  :infer-externs      true

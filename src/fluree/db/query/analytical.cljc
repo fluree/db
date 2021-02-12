@@ -3,7 +3,7 @@
             [fluree.db.query.range :as query-range]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
-            #?(:clj [fluree.db.query.analytical-full-text :as full-text])
+            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.util.core :as util]
@@ -374,21 +374,18 @@
 
 
 (defn full-text->tuples
-  [db res clause]
+  [{:keys [conn network dbid] :as db} res clause]
   #?(:cljs (throw (ex-info "Full text search is not supported in JS"
                            {:status 400
                             :error  :db/invalid-query}))
-     :clj  (if (-> db :conn :memory)
+     :clj  (if (:memory conn)
              (throw (ex-info "Full text search is not supported in when running in-memory"
                              {:status 400
                               :error  :db/invalid-query}))
-             (let [language    (-> db :settings :language)
-                   [var search search-param] clause
+             (let [[var search search-param] clause
                    var         (variable? var)
-                   storage-dir (-> db :conn :meta :storage-directory)
-                   store       (full-text/index-store storage-dir (:network db)
-                                                      (:dbid db))]
-               (full-text/search db store [var search search-param] language)))))
+                   store       (full-text/storage db)]
+               (full-text/search db store [var search search-param])))))
 
 
 ;; Can be: ["?item" "rdf:type" "person"]

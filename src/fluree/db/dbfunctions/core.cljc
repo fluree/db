@@ -1,5 +1,6 @@
 (ns fluree.db.dbfunctions.core
-  (:require [clojure.tools.reader.edn :as edn]
+  (:refer-clojure :exclude [read-string])
+  (:require [#?(:cljs cljs.reader :clj clojure.tools.reader.edn) :refer [read-string]]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :refer [try* catch*]]
@@ -17,9 +18,9 @@
    :_fn/doc      "Returns the maximum number based on a list of numbers"
    :_fn/spec     {"?numbers" [:numbers]}
    :_fn/source   "Source code for the function"
-   :_fn/language nil                                        ;; only clojure for now
-   }
-  )
+   :_fn/language nil})                                        ;; only clojure for now
+
+
 
 
 (def db-fn-cache (atom #?(:clj  (cache/fifo-cache-factory {} :threshold 500)
@@ -111,12 +112,48 @@
      :spec   spec
      :code   nil}))
 
+#?(:cljs
+   (defn- build-fn
+     [var fun]
+     (eval `(fn [~var]
+              ~fun))))
 
 (defn find-fn
   ([db fn-name]
    (find-fn db fn-name nil))
   ([db fn-name funType]
-   #?(:cljs (throw (ex-info "DB functions not yet supported in javascript!" {}))
+   #?(:cljs (cond
+              (identical? "nodejs" cljs.core/*target*)
+              (go-try
+                (let [forward-time-travel-db? (:tt-id db)]
+                  (or (if-not forward-time-travel-db? (get @db-fn-cache [(:network db) (:dbid db) fn-name]))
+                      (let [res (if-let [local-fn (get default-fn-map (symbol fn-name))]
+                                  (resolve-local-fn local-fn)
+                                  (let [query       {:selectOne ["_fn/params" "_fn/code" "_fn/spec"]
+                                                     :from      ["_fn/name" (name fn-name)]}
+                                        res*        (<? (dbproto/-query db query))
+                                        _           (if (empty? res*)
+                                                      (throw (ex-info (str "Unknown function: " (pr-str fn-name))
+                                                                      {:status 400
+                                                                       :error  :db/invalid-fn})))
+                                        params      (read-string (get res* "_fn/params"))
+                                        code        (<? (resolve-fn db (read-string (get res* "_fn/code")) funType params))
+                                        spec        (get res* "_fn/spec")
+                                        params'     (->> params
+                                                         (mapv (fn [x] (symbol x)))
+                                                         (cons '?ctx)
+                                                         (into []))
+                                        custom-func (build-fn params' code)]
+                                    {:f      custom-func
+                                     :params params
+                                     :arity  (hash-set (count params))
+                                     :&args? false
+                                     :spec   spec
+                                     :code   nil}))]
+                        (if-not forward-time-travel-db? (swap! db-fn-cache assoc [(:network db) (:dbid db) fn-name] res))
+                        res))))
+              :else
+              (throw (ex-info "DB functions not yet supported in javascript!" {})))
       :clj  (go-try
               (let [forward-time-travel-db? (:tt-id db)]
                 (or (if-not forward-time-travel-db? (get @db-fn-cache [(:network db) (:dbid db) fn-name]))
@@ -129,8 +166,8 @@
                                                     (throw (ex-info (str "Unknown function: " (pr-str fn-name))
                                                                     {:status 400
                                                                      :error  :db/invalid-fn})))
-                                      params      (edn/read-string (get res "_fn/params"))
-                                      code        (<? (resolve-fn db (edn/read-string (get res "_fn/code")) funType params))
+                                      params      (read-string (get res "_fn/params"))
+                                      code        (<? (resolve-fn db (read-string (get res "_fn/code")) funType params))
                                       spec        (get res "_fn/spec")
                                       params'     (mapv (fn [x] (symbol x)) params)
                                       params''    (into [] (cons '?ctx params'))
@@ -230,7 +267,7 @@
    (go-try
      (if
        (or (= fn-str "true") (= fn-str "false"))
-       (defn true-or-false [n] (edn/read-string fn-str))
+       (defn true-or-false [n] (read-string fn-str))
 
        (try*
          (when-not (re-matches #"(^\(.+\)$)" fn-str)
@@ -238,7 +275,7 @@
                            {:status 400
                             :error  :db/invalid-fn})))
 
-         (let [form      (edn/read-string fn-str)
+         (let [form      (read-string fn-str)
                resolved  (<? (resolve-fn db form type params))
                f-wrapped `(fn [~'?ctx] ~resolved)
                f         (if (and params (= type "functionDec"))
@@ -298,13 +335,13 @@
   db
 
   (->> (parse-code-str test-fn)
-       #_(parse-form db)
-       )
+       #_(parse-form db))
 
 
-  (fn? (get default-fn-map 'max))
 
-  )
+  (fn? (get default-fn-map 'max)))
+
+
 
 
 

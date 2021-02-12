@@ -2,14 +2,28 @@
   (:require [clojure.string :as str]
             [clojure.walk :refer [postwalk]]))
 
+(defn capitalize-first
+  "Capitalizes the first letter (and only the first letter) of `s`"
+  [s]
+  (if (<= (count s) 1)
+    (str/upper-case s)
+    (-> (subs s 0 1)
+        str/upper-case
+        (str (subs s 1)))))
+
+(defn combine-str
+  "Combines `s1` and `s2` by concatenating `s1` with the result of capitalizing
+  the first character of `s2`"
+  [s1 s2]
+  (->> s2
+       capitalize-first
+       (str s1)))
+
 (defn normalize
   "Formats `s` by removing any '/' and capitalizing the following character for
   each '/' removed"
   [s]
-  (reduce (fn [norm nxt]
-            (let [cap (str/capitalize nxt)]
-              (str norm cap)))
-          (str/split s #"/")))
+  (reduce combine-str (str/split s #"/")))
 
 (defn build-var
   "Formats `s` as a var by prepending '?', filtering out '/', and lowerCamelCasing
@@ -33,8 +47,10 @@
 
 (defn build-fn-call
   "Formats `terms` as a function call"
-  [terms]
-  (str "(" (str/join " " terms) ")"))
+  ([fst sec]
+   (build-fn-call [fst sec]))
+  ([terms]
+   (str "(" (str/join " " terms) ")")))
 
 (defn template-for
   [kw]
