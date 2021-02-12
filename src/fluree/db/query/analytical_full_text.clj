@@ -71,11 +71,11 @@
                    {pid search-param})
 
                  ;; This is a collection-based query, i.e. fullText:_user
-                 (let [cid           (dbproto/-c-prop db :id (first search))
+                 (let [partition     (dbproto/-c-prop db :partition (first search))
                        fullTextPreds (collection-predicates-full-text db (first search))
                        search-params (->> (map #(assoc {} (-> % str keyword) search-param)
                                                fullTextPreds) (into #{}))]
-                   [{:collection (str cid)} search-params]))
+                   [{:collection (str partition)} search-params]))
         res    (clucie/search store query limit (analyzer language) 0 limit)]
     {:headers [var]
      :tuples  (map #(->> % :_id read-string (conj [])) res)

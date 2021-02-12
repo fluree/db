@@ -413,9 +413,9 @@
                        :tuples  (map #(conj [] %) (range min-sid max-sid))
                        :vars    {}})
 
-                    (let [cid     (dbproto/-c-prop db :id (last clause))
-                          max-sid (-> db :ecount (get cid))
-                          min-sid (flake/min-subject-id cid)]
+                    (let [partition (dbproto/-c-prop db :partition (last clause))
+                          max-sid   (-> db :ecount (get partition))
+                          min-sid   (flake/min-subject-id partition)]
                       {:headers [subject-var]
                        :tuples  (map #(conj [] %) (range min-sid (inc max-sid)))
                        :vars    {}}))
