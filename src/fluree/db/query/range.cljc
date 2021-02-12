@@ -100,22 +100,22 @@
     out))
 
 (defn flake-subrange-stream
-  [next-node from-t to-t novelty start-test start-flake end-test end-flake]
+  [start-test start-flake end-test end-flake]
   (let [flake-subrange (fn [node]
                         (flake/subrange node
                                         start-test start-flake
-                                        end-test end-flake))
-        subrange-ch   (chan 1 (mapcat flake-subrange))]
-    (-> next-node
-        (dbproto/-resolve-history-range from-t to-t novelty)
-        (async/pipe subrange-ch))))
+                                        end-test end-flake))]
+    (chan 1 (mapcat flake-subrange))))
 
-(defn flake-range-stream
+(defn flake-history-range-stream
   [node-stream-ch from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
       (if-let [next-node (<! node-stream-ch)]
-        (let [subrange-ch (flake-subrange-stream next-node from-t to-t novelty start-test start-flake end-test end-flake)]
+        (let [subrange-ch (-> next-node
+                              (dbproto/-resolve-history-range from-t to-t novelty)
+                              (async/pipe (flake-subrange-stream start-test start-flake
+                                                                 end-test end-flake)))]
           (loop []
             (when-let [next-flake (<! subrange-ch)]
               (if-not (>! out next-flake)
@@ -176,8 +176,8 @@
 
         (-> root-node
             (node-stream idx-compare start-flake end-flake)
-            (flake-range-stream from-t to-t novelty
-                                start-test start-flake end-test end-flake)
+            (flake-history-range-stream from-t to-t novelty
+                                        start-test start-flake end-test end-flake)
             (filter-flakes db start-flake end-flake)
             (take-only limit)
             (async/pipe out-chan))))
