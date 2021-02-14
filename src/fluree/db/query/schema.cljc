@@ -287,9 +287,11 @@
 
 (defn schema-map
   "Returns a map of the schema for a db to allow quick lookups of schema properties.
-  Schema is a map with two keys:
+  Schema is a map with keys:
+  - :t - the 't' value when schema built, allows schema equality checks
   - :coll - collection info, mapping cid->name and name->cid all within the same map
   - :pred - predicate info, mapping pid->properties and name->properties for quick lookup based on id or name respectively
+  - :fullText - contains predicate ids that need fulltext search
   "
   [db]
   (go-try
@@ -341,6 +343,7 @@
                                                           :component          (boolean (get p->v const/$_predicate:component))
                                                           :noHistory          (boolean (get p->v const/$_predicate:noHistory))
                                                           :restrictCollection (get p->v const/$_predicate:restrictCollection)
+                                                          :retractDuplicates  (boolean (get p->v const/$_predicate:retractDuplicates))
                                                           :spec               (get p->v const/$_predicate:spec)
                                                           :specDoc            (get p->v const/$_predicate:specDoc)
                                                           :txSpec             (get p->v const/$_predicate:txSpec)
