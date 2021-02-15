@@ -99,25 +99,20 @@
             (recur (dbproto/-rhs next-node))))))
     out))
 
-(defn flake-subrange-stream
-  [start-test start-flake end-test end-flake]
-  (let [flake-subrange (fn [node]
-                        (flake/subrange node
-                                        start-test start-flake
-                                        end-test end-flake))]
-    (chan 1 (mapcat flake-subrange))))
-
 (defn extract-history-range
   [node-stream from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
       (if-let [next-node (<! node-stream)]
-        (let [subrange-ch (-> next-node
-                              (dbproto/-resolve-history-range from-t to-t novelty)
-                              (async/pipe (flake-subrange-stream start-test start-flake
-                                                                 end-test end-flake)))]
+        (let [subrange-ch   (chan 1 (mapcat (fn [node]
+                                              (flake/subrange node
+                                                              start-test start-flake
+                                                              end-test end-flake))))
+              history-range (-> next-node
+                                (dbproto/-resolve-history-range from-t to-t novelty)
+                                (async/pipe subrange-ch))]
           (loop []
-            (when-let [next-flake (<! subrange-ch)]
+            (when-let [next-flake (<! history-range)]
               (if-not (>! out next-flake)
                 (async/close! node-stream)
                 (recur))))
@@ -217,7 +212,7 @@
              (filter-flakes db start-flake end-flake)
              (take-only limit)
              (as-> flake-chan
-               (async/reduce conj [] flake-chan))
+                 (async/reduce conj [] flake-chan))
              (async/pipe out-chan))))
      out-chan)))
 
