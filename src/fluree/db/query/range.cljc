@@ -79,15 +79,15 @@
 (defn resolve-flake
   [db idx test match]
   (go-try
-    (let [[s p o t op m] (match->flake-parts db idx match)
-          s' (<? (resolve-subid db s))
-          o' (<? (resolve-subid db o))
-          ;; for >=, start at the beginning of the possible range for exp and for > start at the end
-          p' (if (and (nil? p) o) -1 p)
-          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
-      (flake/->Flake s' p' o' t op m'))))
+   (let [[s p o t op m] (match->flake-parts db idx match)
+         s' (<? (resolve-subid db s))
+         o' (<? (resolve-subid db o))
+         ;; for >=, start at the beginning of the possible range for exp and for > start at the end
+         p' (if (and (nil? p) o) -1 p)
+         m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
+     (flake/->Flake s' p' o' t op m'))))
 
-(defn node-stream
+(defn index-node-stream
   [root-node flake-compare start-flake end-flake]
   (let [out (chan)]
     (go-loop [next-flake start-flake]
@@ -107,11 +107,11 @@
                                         end-test end-flake))]
     (chan 1 (mapcat flake-subrange))))
 
-(defn flake-history-range-stream
-  [node-stream-ch from-t to-t novelty start-test start-flake end-test end-flake]
+(defn extract-history-range
+  [node-stream from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
-      (if-let [next-node (<! node-stream-ch)]
+      (if-let [next-node (<! node-stream)]
         (let [subrange-ch (-> next-node
                               (dbproto/-resolve-history-range from-t to-t novelty)
                               (async/pipe (flake-subrange-stream start-test start-flake
@@ -119,7 +119,7 @@
           (loop []
             (when-let [next-flake (<! subrange-ch)]
               (if-not (>! out next-flake)
-                (async/close! node-stream-ch)
+                (async/close! node-stream)
                 (recur))))
           (recur))
         (async/close! out)))
@@ -148,41 +148,17 @@
 
 (defn take-only
   [flake-chan limit]
-  (let [limit-chan (async/chan 1 (take limit))]
-    (async/pipe flake-chan limit-chan)))
+  (if limit
+    (let [limit-chan (async/chan 1 (take limit))]
+      (async/pipe flake-chan limit-chan))
+    flake-chan))
 
 (defn skip-first
   [flake-chan offset]
-  (let [offset-chan (async/chan 1 (drop offset))]
-    (async/pipe flake-chan offset-chan)))
-
-(defn time-range-stream
-  [{t :t :as db} idx start-test start-match end-test end-match opts]
-  (let [{:keys [limit from-t to-t]
-         :or   {from-t t}}
-        opts
-
-        limit       (or limit util/max-long)
-        novelty     (get-in db [:novelty idx])
-        idx-compare (get-in db [:index-configs idx :comparator])
-        out-chan    (chan)]
-
-    (go
-      (let [root-node   (<? (-> db
-                                (get idx)
-                                dbproto/-resolve))
-            start-flake (<? (resolve-flake db idx start-test start-match))
-            end-flake   (<? (resolve-flake db idx end-test end-match))]
-
-        (-> root-node
-            (node-stream idx-compare start-flake end-flake)
-            (flake-history-range-stream from-t to-t novelty
-                                        start-test start-flake end-test end-flake)
-            (filter-flakes db start-flake end-flake)
-            (take-only limit)
-            (async/pipe out-chan))))
-
-    out-chan))
+  (if offset
+    (let [offset-chan (async/chan 1 (drop offset))]
+      (async/pipe flake-chan offset-chan))
+    flake-chan))
 
 (defn time-range
   "Range query across an index.
@@ -217,13 +193,33 @@
      (time-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (time-range db idx start-test start-match end-test end-match {}))
-  ([db idx start-test start-match end-test end-match opts]
-   ;; formulate a comparison flake based on conditions
-   (let [idx-compare (get-in db [:index-configs idx :comparator])
-         time-stream (time-range-stream db idx start-test start-match end-test end-match opts)
-         out         (chan 1 (map (partial apply flake/sorted-set-by idx-compare)))]
-     (-> (async/reduce conj [] time-stream)
-         (async/pipe out)))))
+  ([{t :t :as db} idx start-test start-match end-test end-match opts]
+   (let [{:keys [limit from-t to-t]
+          :or   {from-t t}}
+         opts
+
+         limit       (or limit util/max-long)
+         novelty     (get-in db [:novelty idx])
+         idx-compare (get-in db [:index-configs idx :comparator])
+         out-chan    (chan 1 (map (fn [flakes]
+                                    (apply flake/sorted-set-by idx-compare flakes))))]
+     (go
+       (let [root-node   (<? (-> db
+                                 (get idx)
+                                 dbproto/-resolve))
+             start-flake (<? (resolve-flake db idx start-test start-match))
+             end-flake   (<? (resolve-flake db idx end-test end-match))]
+         (-> root-node
+             (index-node-stream idx-compare start-flake end-flake)
+             (extract-history-range from-t to-t novelty
+                                    start-test start-flake
+                                    end-test end-flake)
+             (filter-flakes db start-flake end-flake)
+             (take-only limit)
+             (as-> flake-chan
+               (async/reduce conj [] flake-chan))
+             (async/pipe out-chan))))
+     out-chan)))
 
 (defn subject-groups->allow-flakes
   "Starting with flakes grouped by subject id, filters the flakes until
