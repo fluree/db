@@ -104,8 +104,8 @@
   (let [out (chan)]
     (go-loop []
       (if-let [next-node (<! node-stream)]
-        (let [subrange-ch   (chan 1 (mapcat (fn [node]
-                                              (flake/subrange node
+        (let [subrange-ch   (chan 1 (mapcat (fn [flakes]
+                                              (flake/subrange flakes
                                                               start-test start-flake
                                                               end-test end-flake))))
               history-range (-> next-node
