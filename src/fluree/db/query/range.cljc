@@ -121,8 +121,7 @@
         (async/close! out)))
     out))
 
-
-(defn authorize-flakes
+(defn filter-authorized
   [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
   #?(:cljs
      flake-range-stream ; Note this bypasses all permissions in CLJS for now!
@@ -143,7 +142,7 @@
                (async/close! out)))
            out)))))
 
-(defn take-only
+(defn take-flakes
   [flake-chan limit]
   (if limit
     (let [limit-chan (async/chan 1 (take limit))]
@@ -188,7 +187,6 @@
           :or   {from-t t}}
          opts
 
-         limit       (or limit util/max-long)
          novelty     (get-in db [:novelty idx])
          idx-compare (get-in db [:index-configs idx :comparator])
          out-chan    (chan 1 (map (fn [flakes]
@@ -204,8 +202,8 @@
              (expand-history-range from-t to-t novelty
                                    start-test start-flake
                                    end-test end-flake)
-             (authorize-flakes db start-flake end-flake)
-             (take-only limit)
+             (filter-authorized db start-flake end-flake)
+             (take-flakes limit)
              (as-> flake-chan
                  (async/reduce conj [] flake-chan))
              (async/pipe out-chan))))
