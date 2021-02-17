@@ -456,16 +456,15 @@
   ([db name opts]
    (go
      (try*
-       (let [id (dbproto/-c-prop db :id name)]
-         (if id
-           (<? (index-range db :spot
-                            >= [(flake/max-subject-id id)]
-                            <= [(flake/min-subject-id id)]
-                            opts))
-           (throw (ex-info (str "Invalid collection name: " (pr-str name))
-                           {:status 400
-                            :error  :db/invalid-collection}))))
-       (catch* e e)))))
+      (if-let [id (dbproto/-c-prop db :id name)]
+        (<? (index-range db :spot
+                         >= [(flake/max-subject-id id)]
+                         <= [(flake/min-subject-id id)]
+                         opts))
+        (throw (ex-info (str "Invalid collection name: " (pr-str name))
+                        {:status 400
+                         :error  :db/invalid-collection})))
+      (catch* e e)))))
 
 (defn _block-or_tx-collection
   "Returns spot index range for only the requested collection."
@@ -486,8 +485,8 @@
       result*
       (let [obj     (.-o flake')
             cmd-map (try*
-                      (json/parse obj)
-                      (catch* e nil))                       ; log an error if transaction is not parsable?
+                     (json/parse obj)
+                     (catch* e nil))                       ; log an error if transaction is not parsable?
             {:keys [type db tx nonce auth expire]} cmd-map]
         (recur r
                (if (= type "tx")
