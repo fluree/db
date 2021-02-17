@@ -121,6 +121,19 @@
         (async/close! out)))
     out))
 
+(defn resolve-nodes-to-t
+  [nodes novelty fast-forward-db? t]
+  (let [out (chan)]
+    (go-loop []
+      (if-let [node (<! nodes)]
+        (when-let [resolved (try*
+                             (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
+                             (catch* e nil))]
+          (if (>! out resolved)
+            (recur)
+            (async/close! nodes)))
+        (async/close! out)))))
+
 (defn filter-authorized
   [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
   #?(:cljs
@@ -239,6 +252,41 @@
           node
           (when-let [rhs (:rhs lookup-leaf)]
             (recur (<? (dbproto/-lookup-leaf root-node rhs)))))))))
+
+(defn indexed-flakes-xf
+  [{:keys [start-test start-flake end-test end-flake subject-fn predicate-fn
+           object-fn]}]
+  (let [subrange-fn (fn [flakes]
+                       (flake/subrange flakes
+                                       start-test start-flake
+                                       end-test end-flake))
+        xforms      (cond-> [(map :flakes)
+                             (mapcat subrange-fn)]
+                       subject-fn   (conj (filter (fn [^Flake f]
+                                                    (subject-fn (.-s f)))))
+                       predicate-fn (conj (filter (fn [^Flake f]
+                                                    (predicate-fn (.-p f)))))
+                       object-fn    (conj (filter (fn [^Flake f]
+                                                    (object-fn (.-o f))))))]
+    (apply comp xforms)))
+
+(defn extract-index-flakes
+  [node-stream opts]
+  (let [extract-chan (chan 1 (indexed-flakes-xf opts))]
+    (async/pipe node-stream extract-chan)))
+
+(defn select-flakes-xf
+  [{:keys [subject-limit flake-limit offset]}]
+  (comp (partition-by (fn [^Flake f]
+                        (.-s f)))
+        (mapcat (partial take subject-limit))
+        (drop offset)
+        (take flake-limit)))
+
+(defn select-flake-window
+  [flake-stream opts]
+  (let [select-chan (chan 1 (select-flakes-xf opts))]
+    (async/pipe flake-stream select-chan)))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
