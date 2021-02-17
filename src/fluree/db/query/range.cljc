@@ -154,13 +154,6 @@
       (async/pipe flake-chan limit-chan))
     flake-chan))
 
-(defn skip-first
-  [flake-chan offset]
-  (if offset
-    (let [offset-chan (async/chan 1 (drop offset))]
-      (async/pipe flake-chan offset-chan))
-    flake-chan))
-
 (defn time-range
   "Range query across an index.
 
