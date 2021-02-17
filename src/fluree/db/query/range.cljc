@@ -99,15 +99,20 @@
             (recur (dbproto/-rhs next-node))))))
     out))
 
-(defn extract-history-range
+(defn flake-subrange-chan
+  [start-test start-flake end-test end-flake]
+  (chan 1 (mapcat (fn [flakes]
+                    (flake/subrange flakes
+                                    start-test start-flake
+                                    end-test end-flake)))))
+
+(defn expand-history-range
   [node-stream from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
       (if-let [next-node (<! node-stream)]
-        (let [subrange-ch   (chan 1 (mapcat (fn [flakes]
-                                              (flake/subrange flakes
-                                                              start-test start-flake
-                                                              end-test end-flake))))
+        (let [subrange-ch   (flake-subrange-chan start-test start-flake
+                                                 end-test end-flake)
               history-range (-> next-node
                                 (dbproto/-resolve-history-range from-t to-t novelty)
                                 (async/pipe subrange-ch))]
@@ -120,7 +125,8 @@
         (async/close! out)))
     out))
 
-(defn filter-flakes
+
+(defn authorize-flakes
   [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
   #?(:cljs
      flake-range-stream ; Note this bypasses all permissions in CLJS for now!
@@ -206,10 +212,10 @@
              end-flake   (<? (resolve-flake db idx end-test end-match))]
          (-> root-node
              (index-node-stream idx-compare start-flake end-flake)
-             (extract-history-range from-t to-t novelty
-                                    start-test start-flake
-                                    end-test end-flake)
-             (filter-flakes db start-flake end-flake)
+             (expand-history-range from-t to-t novelty
+                                   start-test start-flake
+                                   end-test end-flake)
+             (authorize-flakes db start-flake end-flake)
              (take-only limit)
              (as-> flake-chan
                  (async/reduce conj [] flake-chan))
