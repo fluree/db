@@ -158,8 +158,7 @@
 (defn take-flakes
   [flake-chan limit]
   (if limit
-    (let [limit-chan (async/chan 1 (take limit))]
-      (async/pipe flake-chan limit-chan))
+    (async/take limit flake-chan)
     flake-chan))
 
 (defn time-range
@@ -244,18 +243,14 @@
   (let [extract-chan (chan 1 (indexed-flakes-xf opts))]
     (async/pipe node-stream extract-chan)))
 
-(defn select-flakes-xf
-  [{:keys [subject-limit flake-limit offset]}]
-  (comp (partition-by (fn [^Flake f]
-                        (.-s f)))
-        (mapcat (partial take subject-limit))
-        (drop offset)
-        (take flake-limit)))
-
 (defn select-flake-window
-  [flake-stream opts]
-  (let [select-chan (chan 1 (select-flakes-xf opts))]
-    (async/pipe flake-stream select-chan)))
+  [flake-stream {:keys [subject-limit flake-limit offset]}]
+  (let [select-chan (chan 1 (comp (partition-by (fn [^Flake f]
+                                                  (.-s f)))
+                                  (mapcat (partial take subject-limit))
+                                  (drop offset)))]
+    (->> (async/pipe flake-stream select-chan)
+         (async/take flake-limit))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
