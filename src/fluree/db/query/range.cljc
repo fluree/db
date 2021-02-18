@@ -82,10 +82,8 @@
    (let [[s p o t op m] (match->flake-parts db idx match)
          s' (<? (resolve-subid db s))
          o' (<? (resolve-subid db o))
-         ;; for >=, start at the beginning of the possible range for exp and for > start at the end
-         p' (if (and (nil? p) o) -1 p)
          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
-     (flake/->Flake s' p' o' t op m'))))
+     (flake/->Flake s' p o' t op m'))))
 
 (defn index-node-stream
   [root-node flake-compare start-flake end-flake]
@@ -132,7 +130,8 @@
           (if (>! out resolved)
             (recur)
             (async/close! nodes)))
-        (async/close! out)))))
+        (async/close! out)))
+    out))
 
 (defn filter-authorized
   [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
@@ -310,9 +309,6 @@
             o2                 (if (util/pred-ident? o2)
                                  (<? (dbproto/-subid db o2))
                                  o2)
-            ;; for >=, start at the beginning of the possible range for exp and for > start at the end
-            p1                 (if (and (nil? p1) o1) -1 p1)
-            p2                 (if (and (nil? p2) o2) flake/MAX-PREDICATE-ID p2)
             m1                 (or m1 (if (identical? >= start-test) util/min-integer util/max-integer))
             m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
             ;; flip values, because they do have a lexicographical sort order
