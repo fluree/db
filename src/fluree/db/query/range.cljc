@@ -224,17 +224,17 @@
   [{:keys [start-test start-flake end-test end-flake subject-fn predicate-fn
            object-fn]}]
   (let [subrange-fn (fn [flakes]
-                       (flake/subrange flakes
-                                       start-test start-flake
-                                       end-test end-flake))
+                      (flake/subrange flakes
+                                      start-test start-flake
+                                      end-test end-flake))
         xforms      (cond-> [(map :flakes)
                              (mapcat subrange-fn)]
-                       subject-fn   (conj (filter (fn [^Flake f]
-                                                    (subject-fn (.-s f)))))
-                       predicate-fn (conj (filter (fn [^Flake f]
-                                                    (predicate-fn (.-p f)))))
-                       object-fn    (conj (filter (fn [^Flake f]
-                                                    (object-fn (.-o f))))))]
+                      subject-fn   (conj (filter (fn [^Flake f]
+                                                   (subject-fn (.-s f)))))
+                      predicate-fn (conj (filter (fn [^Flake f]
+                                                   (predicate-fn (.-p f)))))
+                      object-fn    (conj (filter (fn [^Flake f]
+                                                   (object-fn (.-o f))))))]
     (apply comp xforms)))
 
 (defn extract-index-flakes
@@ -242,14 +242,20 @@
   (let [extract-chan (chan 1 (indexed-flakes-xf opts))]
     (async/pipe node-stream extract-chan)))
 
+(defn select-flakes-xf
+  [{:keys [subject-limit offset]}]
+  (let [xforms (cond-> []
+                 subject-limit (conj (partition-by (fn [^Flake f]
+                                                     (.-s f)))
+                                     (mapcat (partial take subject-limit)))
+                 :finally      (conj (drop offset)))]
+    (apply comp xforms)))
+
 (defn select-flake-window
-  [flake-stream {:keys [subject-limit flake-limit offset]}]
-  (let [select-chan (chan 1 (comp (partition-by (fn [^Flake f]
-                                                  (.-s f)))
-                                  (mapcat (partial take subject-limit))
-                                  (drop offset)))]
-    (->> (async/pipe flake-stream select-chan)
-         (async/take flake-limit))))
+  [flake-stream {:keys [flake-limit] :as opts}]
+  (let [select-chan (->> (chan 1 (select-flakes-xf opts))
+                         (async/pipe flake-stream))]
+    (take-flakes select-chan flake-limit)))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
