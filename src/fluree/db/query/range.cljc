@@ -343,7 +343,7 @@
             (select-flake-window {:subject-limit subject-limit
                                   :flake-limit flake-limit
                                   :offset offset})
-            (as-> flake-chan (async/reduce conj [] flake-chan))
+            (->> (async/into #{}))
             (async/pipe out-chan))))
 
     out-chan)))
