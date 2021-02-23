@@ -1,6 +1,7 @@
 (ns fluree.db.query.range
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
+            [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
@@ -148,7 +149,8 @@
          (let [out (chan)]
            (go-loop []
              (if-let [flake (<! flake-range-stream)]
-               (do (when (<? (perm-validate/allow-flake? db flake))
+               (do (when (or (schema-util/is-schema-flake? flake)
+                             (<? (perm-validate/allow-flake? db flake)))
                      (>! out flake))
                    (recur))
                (async/close! out)))
