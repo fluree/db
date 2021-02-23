@@ -249,15 +249,17 @@
   (let [xforms (cond-> []
                  subject-limit (conj (partition-by (fn [^Flake f]
                                                      (.-s f)))
-                                     (mapcat (partial take subject-limit)))
+                                     (take subject-limit)
+                                     cat)
                  :finally      (conj (drop offset)))]
     (apply comp xforms)))
 
 (defn select-flake-window
   [flake-stream {:keys [flake-limit] :as opts}]
-  (let [select-chan (->> (chan 1 (select-flakes-xf opts))
-                         (async/pipe flake-stream))]
-    (take-flakes select-chan flake-limit)))
+  (let [select-chan (chan 1 (select-flakes-xf opts))]
+    (-> flake-stream
+        (async/pipe select-chan)
+        (take-flakes flake-limit))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
