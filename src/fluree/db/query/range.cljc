@@ -87,15 +87,18 @@
      (flake/->Flake s' p o' t op m'))))
 
 (defn index-node-stream
-  [root-node flake-compare start-flake end-flake]
+  [root-ch flake-compare start-flake end-flake]
   (let [out (chan)]
-    (go-loop [next-flake start-flake]
-      (if-not (and next-flake
-                   (neg? (flake-compare next-flake end-flake)))
-        (async/close! out)
-        (let [next-node (<! (dbproto/-lookup-leaf root-node next-flake))]
-          (when (>! out next-node)
-            (recur (dbproto/-rhs next-node))))))
+    (go-loop []
+      (if-let [root-node (<? root-ch)]
+        (loop [next-flake start-flake]
+          (if-not (and next-flake
+                       (neg? (flake-compare next-flake end-flake)))
+            (async/close! out)
+            (let [next-node (<! (dbproto/-lookup-leaf root-node next-flake))]
+              (when (>! out next-node)
+                (recur (dbproto/-rhs next-node))))))
+        (async/close! out)))
     out))
 
 (defn expand-history-range
@@ -205,12 +208,11 @@
          out-chan    (chan 1 (map (fn [flakes]
                                     (apply flake/sorted-set-by idx-compare flakes))))]
      (go
-       (let [root-node   (<? (-> db
-                                 (get idx)
-                                 dbproto/-resolve))
-             start-flake (<? (resolve-flake db idx start-test start-match))
+       (let [start-flake (<? (resolve-flake db idx start-test start-match))
              end-flake   (<? (resolve-flake db idx end-test end-match))]
-         (-> root-node
+         (-> db
+             (get idx)
+             dbproto/-resolve
              (index-node-stream idx-compare start-flake end-flake)
              (expand-history-range from-t to-t novelty
                                    start-test start-flake
@@ -323,27 +325,24 @@
             m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
             ;; flip values, because they do have a lexicographical sort order
             start-flake        (flake/->Flake s1 p1 o1 t1 op1 m1)
-            end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
-            idx-opts           {:subject-fn subject-fn
-                                :predicate-fn predicate-fn
-                                :object-fn object-fn
-                                :start-test start-test
-                                :start-flake start-flake
-                                :end-test end-test
-                                :end-flake end-flake}
-            window-opts        {:subject-limit subject-limit
-                                :flake-limit flake-limit
-                                :offset offset}
-            root-node          (-> (get db idx)
-                                   (dbproto/-resolve)
-                                   (<?))]
+            end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)]
 
-        (-> root-node
+        (-> db
+            (get idx)
+            dbproto/-resolve
             (index-node-stream idx-compare start-flake end-flake)
             (resolve-nodes-to-t novelty fast-forward-db? t)
-            (extract-index-flakes idx-opts)
+            (extract-index-flakes {:subject-fn subject-fn
+                                   :predicate-fn predicate-fn
+                                   :object-fn object-fn
+                                   :start-test start-test
+                                   :start-flake start-flake
+                                   :end-test end-test
+                                   :end-flake end-flake})
             (filter-authorized db start-flake end-flake)
-            (select-flake-window window-opts)
+            (select-flake-window {:subject-limit subject-limit
+                                  :flake-limit flake-limit
+                                  :offset offset})
             (as-> flake-chan (async/reduce conj [] flake-chan))
             (async/pipe out-chan))))
 
