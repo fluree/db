@@ -324,6 +324,16 @@
             ;; flip values, because they do have a lexicographical sort order
             start-flake        (flake/->Flake s1 p1 o1 t1 op1 m1)
             end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
+            idx-opts           {:subject-fn subject-fn
+                                :predicate-fn predicate-fn
+                                :object-fn object-fn
+                                :start-test start-test
+                                :start-flake start-flake
+                                :end-test end-test
+                                :end-flake end-flake}
+            window-opts        {:subject-limit subject-limit
+                                :flake-limit flake-limit
+                                :offset offset}
             root-node          (-> (get db idx)
                                    (dbproto/-resolve)
                                    (<?))]
@@ -331,17 +341,9 @@
         (-> root-node
             (index-node-stream idx-compare start-flake end-flake)
             (resolve-nodes-to-t novelty fast-forward-db? t)
-            (extract-index-flakes (-> opts
-                                      (select-keys [:subject-fn :predicate-fn
-                                                    :object-fn])
-                                      (assoc :start-test start-test
-                                             :start-flake start-flake
-                                             :end-test end-test
-                                             :end-flake end-flake)))
+            (extract-index-flakes idx-opts)
             (filter-authorized db start-flake end-flake)
-            (select-flake-window {:subject-limit subject-limit
-                                  :flake-limit flake-limit
-                                  :offset offset})
+            (select-flake-window window-opts)
             (as-> flake-chan (async/reduce conj [] flake-chan))
             (async/pipe out-chan))))
 
