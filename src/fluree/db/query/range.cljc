@@ -93,7 +93,7 @@
       (if-let [root-node (<? root-ch)]
         (loop [next-flake start-flake]
           (if-not (and next-flake
-                       (neg? (flake-compare next-flake end-flake)))
+                       (not (pos? (flake-compare next-flake end-flake))))
             (async/close! out)
             (let [next-node (<! (dbproto/-lookup-leaf root-node next-flake))]
               (when (>! out next-node)
