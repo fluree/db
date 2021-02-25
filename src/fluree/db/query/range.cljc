@@ -165,6 +165,17 @@
     (async/take limit flake-chan)
     flake-chan))
 
+(defn expand-range-interval
+  "Finds the full index or time range interval including the maximum and minimum
+  tests when only one test is provided"
+  [idx test match]
+  (condp identical? test
+    =  [>= match <= match]
+    <  [> (min-match idx) < match]
+    <= [> (min-match idx) <= match]
+    >  [> match <= (max-match idx)]
+    >= [>= match < (max-match idx)]))
+
 (defn time-range
   "Range query across an index.
 
@@ -187,14 +198,8 @@
   ([db idx opts] (time-range db idx >= (min-match idx) <= (max-match idx) opts))
   ([db idx test match] (time-range db idx test match {}))
   ([db idx test match opts]
-   ;; only one test provided, we need to figure out the other test.
    (let [[start-test start-match end-test end-match]
-         (condp identical? test
-           = [>= match <= match]
-           < [> (min-match idx) < match]
-           <= [> (min-match idx) <= match]
-           > [> match <= (max-match idx)]
-           >= [>= match < (max-match idx)])]
+         (expand-range-interval idx test match)]
      (time-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (time-range db idx start-test start-match end-test end-match {}))
@@ -278,14 +283,8 @@
   ([db idx opts] (index-range db idx >= (min-match idx) <= (max-match idx) opts))
   ([db idx test match] (index-range db idx test match {}))
   ([db idx test match opts]
-   ;; only one test provided, we need to figure out the other test.
    (let [[start-test start-match end-test end-match]
-         (condp identical? test
-           = [>= match <= match]
-           < [> (min-match idx) < match]
-           <= [> (min-match idx) <= match]
-           > [> match <= (max-match idx)]
-           >= [>= match < (max-match idx)])]
+         (expand-range-interval idx test match)]
      (index-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
@@ -333,7 +332,6 @@
                                     :offset offset})
             (->> (async/into #{}))
             (async/pipe out-chan))))
-
     out-chan)))
 
 (defn non-nil-non-boolean?
