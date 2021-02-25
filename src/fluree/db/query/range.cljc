@@ -248,12 +248,11 @@
 
 (defn select-flakes-xf
   [{:keys [subject-limit offset]}]
-  (let [xforms (cond-> []
-                 subject-limit (conj (partition-by (fn [^Flake f]
-                                                     (.-s f)))
-                                     (take subject-limit)
-                                     cat)
-                 :finally      (conj (drop offset)))]
+  (let [xforms (cond-> [(partition-by (fn [^Flake f]
+                                        (.-s f)))
+                        (drop offset)]
+                 subject-limit (conj (take subject-limit))
+                 :finally      (conj cat))]
     (apply comp xforms)))
 
 (defn select-flake-window
