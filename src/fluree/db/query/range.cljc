@@ -76,7 +76,7 @@
         (async/put! out id)))
     out))
 
-(defn resolve-flake
+(defn resolve-match-flake
   [db test parts]
   (go-try
    (let [[s p o t op m] parts
@@ -216,9 +216,9 @@
                                     (apply flake/sorted-set-by idx-compare flakes))))]
      (go
        (let [start-parts (match->flake-parts db idx start-match)
-             start-flake (<? (resolve-flake db start-test start-parts))
+             start-flake (<? (resolve-match-flake db start-test start-parts))
              end-parts   (match->flake-parts db idx end-match)
-             end-flake   (<? (resolve-flake db end-test end-parts))]
+             end-flake   (<? (resolve-match-flake db end-test end-parts))]
          (-> db
              (get idx)
              dbproto/-resolve
@@ -311,8 +311,8 @@
          out-chan (chan 1 (map (fn [flakes]
                                  (apply flake/sorted-set-by idx-compare flakes))))]
     (go
-      (let [start-flake (<? (resolve-flake db start-test [s1 p1 o1 t1 op1 m1]))
-            end-flake   (<? (resolve-flake db end-test [s2 p2 o2 t2 op2 m2]))]
+      (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
+            end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))]
         (-> db
             (get idx)
             dbproto/-resolve
