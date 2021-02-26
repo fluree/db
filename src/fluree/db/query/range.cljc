@@ -64,7 +64,6 @@
     :opst subject-max-match
     :tspo txn-max-match))
 
-
 (defn resolve-subid
   [db id]
   (let [out (chan)]
@@ -89,7 +88,7 @@
 (defn index-node-stream
   [root-ch flake-compare start-flake end-flake]
   (let [out (chan)]
-    (go-loop []
+    (go
       (if-let [root-node (<? root-ch)]
         (loop [next-flake start-flake]
           (if-not (and next-flake
@@ -101,23 +100,27 @@
         (async/close! out)))
     out))
 
+(defn history-range-ch
+  [node from-t to-t novelty start-test start-flake end-test end-flake]
+  (let [subrange-ch (chan 1 (mapcat (fn [flakes]
+                                      (flake/subrange flakes
+                                                      start-test start-flake
+                                                      end-test end-flake))))]
+    (-> node
+        (dbproto/-resolve-history-range from-t to-t novelty)
+        (async/pipe subrange-ch))))
+
 (defn expand-history-range
   [node-stream from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
       (if-let [next-node (<! node-stream)]
-        (let [subrange-ch   (chan 1 (mapcat (fn [flakes]
-                                              (flake/subrange flakes
-                                                              start-test start-flake
-                                                              end-test end-flake))))
-              history-range (-> next-node
-                                (dbproto/-resolve-history-range from-t to-t
-                                                                novelty)
-                                (async/pipe subrange-ch))]
+        (let [range-ch (history-range-ch next-node from-t to-t novelty
+                                         start-test start-flake
+                                         end-test end-flake)]
           (loop []
-            (when-let [next-flake (<! history-range)]
-              (if-not (>! out next-flake)
-                (async/close! node-stream)
+            (when-let [next-flake (<! range-ch)]
+              (when (>! out next-flake)
                 (recur))))
           (recur))
         (async/close! out)))
@@ -131,9 +134,8 @@
         (when-let [resolved (try*
                              (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
                              (catch* e nil))]
-          (if (>! out resolved)
-            (recur)
-            (async/close! nodes)))
+          (when (>! out resolved)
+            (recur)))
         (async/close! out)))
     out))
 
@@ -297,29 +299,29 @@
          idx-compare      (get-in db [:index-configs idx :comparator])
          novelty          (get-in db [:novelty idx])
 
+         [s1 p1 o1 t1 op1 m1]
+         (match->flake-parts db idx start-match)
+
+         [s2 p2 o2 t2 op2 m2]
+         (match->flake-parts db idx end-match)
+
+         [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1
+                                                 (boolean? o2) o2
+                                                 :else nil)]
+                               [[nil nil] (fn [o] (= o bool))]
+                               [[o1 o2] object-fn])
+
          out-chan (chan 1 (map (fn [flakes]
                                  (apply flake/sorted-set-by idx-compare flakes))))]
     (go
-      (let [[s1 p1 o1 t1 op1 m1]
-            (match->flake-parts db idx start-match)
-
-            [s2 p2 o2 t2 op2 m2]
-            (match->flake-parts db idx end-match)
-
-            [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1
-                                                    (boolean? o2) o2
-                                                    :else nil)]
-                                  [[nil nil] (fn [o] (= o bool))]
-                                  [[o1 o2] object-fn])
-
-            start-flake (<? (resolve-flake db start-test [s1 p1 o1 t1 op1 m1]))
+      (let [start-flake (<? (resolve-flake db start-test [s1 p1 o1 t1 op1 m1]))
             end-flake   (<? (resolve-flake db end-test [s2 p2 o2 t2 op2 m2]))]
         (-> db
             (get idx)
             dbproto/-resolve
             (index-node-stream idx-compare start-flake end-flake)
             (resolve-nodes-to-t novelty fast-forward-db? t)
-            (extract-index-flakes {:subject-fn subject-fn,
+            (extract-index-flakes {:subject-fn subject-fn
                                    :predicate-fn predicate-fn
                                    :object-fn object-fn
                                    :start-test start-test
