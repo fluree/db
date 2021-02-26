@@ -161,7 +161,7 @@
                (async/close! out)))
            out)))))
 
-(defn take-flakes
+(defn take-only
   [flake-chan limit]
   (if limit
     (async/take limit flake-chan)
@@ -227,7 +227,7 @@
                                    start-test start-flake
                                    end-test end-flake)
              (filter-authorized db start-flake end-flake)
-             (take-flakes limit)
+             (take-only limit)
              (->> (async/into #{}))
              (async/pipe out-chan))))
      out-chan)))
@@ -254,21 +254,18 @@
   (let [extract-chan (chan 1 (indexed-flakes-xf opts))]
     (async/pipe node-stream extract-chan)))
 
-(defn select-flakes-xf
-  [{:keys [subject-limit offset]}]
-  (let [xforms (cond-> [(partition-by (fn [^Flake f]
-                                        (.-s f)))
-                        (drop offset)]
-                 subject-limit (conj (take subject-limit))
-                 :finally      (conj cat))]
-    (apply comp xforms)))
-
 (defn select-subject-window
-  [flake-stream {:keys [flake-limit] :as opts}]
-  (let [select-chan (chan 1 (select-flakes-xf opts))]
+  [flake-stream {:keys [subject-limit flake-limit offset]}]
+  (let [offset-subject-xf (comp (partition-by (fn [^Flake f]
+                                                (.-s f)))
+                                (drop offset))
+        subject-ch        (chan 1 offset-subject-xf)
+        concat-flake-ch   (chan 1 cat)]
     (-> flake-stream
-        (async/pipe select-chan)
-        (take-flakes flake-limit))))
+        (async/pipe subject-ch)
+        (take-only subject-limit)
+        (async/pipe concat-flake-ch)
+        (take-only flake-limit))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
