@@ -86,15 +86,23 @@
      (flake/->Flake s' p o' t op m'))))
 
 (defn index-node-stream
-  [root-node flake-compare start-flake end-flake]
-  (let [out (chan)]
-    (go-loop [next-flake start-flake]
-      (if-not (and next-flake
-                   (not (pos? (flake-compare next-flake end-flake))))
-        (async/close! out)
-        (let [next-node (<! (dbproto/-lookup-leaf root-node next-flake))]
-          (when (>! out next-node)
-            (recur (dbproto/-rhs next-node))))))
+  "Returns a channel that will eventually contain a stream of index nodes from
+  index `idx` within the database `db` between `start-flake` and `end-flake`,
+  inclusive and one-by-one"
+  [db idx start-flake end-flake]
+  (let [idx-compare (get-in db [:index-configs idx :comparator])
+        out         (chan)]
+    (go
+      (let [root-node (<? (-> db
+                              (get idx)
+                              dbproto/-resolve))]
+        (loop [next-flake start-flake]
+          (if-not (and next-flake
+                       (not (pos? (idx-compare next-flake end-flake))))
+            (async/close! out)
+            (let [next-node (<? (dbproto/-lookup-leaf root-node next-flake))]
+              (when (>! out next-node)
+                (recur (dbproto/-rhs next-node))))))))
     out))
 
 (defn history-range-ch
@@ -108,6 +116,7 @@
         (async/pipe subrange-ch))))
 
 (defn expand-history-range
+
   [node-stream from-t to-t novelty start-test start-flake end-test end-flake]
   (let [out (chan)]
     (go-loop []
@@ -216,12 +225,9 @@
                                     (apply flake/sorted-set-by idx-compare flakes))))]
      (go
        (let [start-flake (<? (resolve-match-flake db start-test start-parts))
-             end-flake   (<? (resolve-match-flake db end-test end-parts))
-             root-node   (<? (-> db
-                                 (get idx)
-                                 dbproto/-resolve))]
-         (-> root-node
-             (index-node-stream idx-compare start-flake end-flake)
+             end-flake   (<? (resolve-match-flake db end-test end-parts))]
+         (-> db
+             (index-node-stream idx start-flake end-flake)
              (expand-history-range from-t to-t novelty start-test start-flake
                                    end-test end-flake)
              (filter-authorized db start-flake end-flake)
@@ -309,12 +315,9 @@
                                  (apply flake/sorted-set-by idx-compare flakes))))]
     (go
       (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
-            end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))
-            root-node   (<? (-> db
-                                (get idx)
-                                dbproto/-resolve))]
-        (-> root-node
-            (index-node-stream idx-compare start-flake end-flake)
+            end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))]
+        (-> db
+            (index-node-stream idx start-flake end-flake)
             (resolve-nodes-to-t novelty fast-forward-db? t)
             (extract-index-flakes {:subject-fn subject-fn
                                    :predicate-fn predicate-fn
