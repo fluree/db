@@ -105,32 +105,28 @@
                 (recur (dbproto/-rhs next-node))))))))
     out))
 
-(defn history-range-ch
-  [node from-t to-t novelty start-test start-flake end-test end-flake]
-  (let [subrange-ch (chan 1 (mapcat (fn [flakes]
-                                      (flake/subrange flakes
-                                                      start-test start-flake
-                                                      end-test end-flake))))]
-    (-> node
-        (dbproto/-resolve-history-range from-t to-t novelty)
-        (async/pipe subrange-ch))))
+(defn flake-subrange-xf
+  [start-test start-flake end-test end-flake]
+  (mapcat (fn [flake-range]
+            (flake/subrange flake-range start-test start-flake
+                            end-test end-flake))))
 
 (defn expand-history-range
-
+  "Returns a channel that will eventually contain a stream of flakes between
+  `start-flake` and `end-flake`, according to `start-test` and `end-test`,
+  respectively, and also contained within the history range between `from-t` and
+  `to-t` for some index data node in the `node-stream` channel."
   [node-stream from-t to-t novelty start-test start-flake end-test end-flake]
-  (let [out (chan)]
+  (let [subrange-ch (chan 1 (flake-subrange-xf start-test start-flake
+                                               end-test end-flake))]
     (go-loop []
       (if-let [next-node (<! node-stream)]
-        (let [range-ch (history-range-ch next-node from-t to-t novelty
-                                         start-test start-flake
-                                         end-test end-flake)]
-          (loop []
-            (when-let [next-flake (<! range-ch)]
-              (when (>! out next-flake)
-                (recur))))
+        (let [range (<? (dbproto/-resolve-history-range next-node from-t to-t novelty))]
+          (when (seq range)
+            (>! subrange-ch range))
           (recur))
-        (async/close! out)))
-    out))
+        (async/close! subrange-ch)))
+    subrange-ch))
 
 (defn resolve-nodes-to-t
   [nodes novelty fast-forward-db? t]
@@ -254,8 +250,8 @@
 
 (defn extract-index-flakes
   [node-stream opts]
-  (let [extract-chan (chan 1 (indexed-flakes-xf opts))]
-    (async/pipe node-stream extract-chan)))
+  (let [index-chan (chan 1 (indexed-flakes-xf opts))]
+    (async/pipe node-stream index-chan)))
 
 (defn select-subject-window
   [flake-stream {:keys [subject-limit flake-limit offset]}]
