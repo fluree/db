@@ -105,7 +105,7 @@
                 db*  (assoc db*
                             :ecount ecount
                             :novelty {:spot spot, :psot psot, :post post,
-                                      :opst opst, :size flake-size})]
+                                      :opst opst, :tspo tspo, :size flake-size})]
             (cond-> db*
               (or schema-change?
                   (nil? (:schema db*))) (assoc :schema (<? (schema/schema-map db*)))
