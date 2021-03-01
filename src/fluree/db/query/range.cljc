@@ -218,7 +218,7 @@
                                    end-test end-flake)
              (filter-authorized db start-flake end-flake)
              (take-only limit)
-             (->> (async/into #{}))
+             (->> (async/into []))
              (async/pipe out-chan))))
      out-chan)))
 
@@ -339,7 +339,7 @@
             (select-subject-window {:subject-limit subject-limit
                                     :flake-limit flake-limit
                                     :offset offset})
-            (->> (async/into #{}))
+            (->> (async/into []))
             (async/pipe out-chan))))
     out-chan)))
 
