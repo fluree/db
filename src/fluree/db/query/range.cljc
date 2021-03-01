@@ -247,9 +247,9 @@
   options if they are present."
   [{:keys [start-test start-flake end-test end-flake subject-fn predicate-fn
            object-fn]}]
-  (let [flakes-sf   (map :flakes)
+  (let [flakes-xf   (map :flakes)
         subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
-        xforms      (cond-> [flakes-sf subrange-xf]
+        xforms      (cond-> [flakes-xf subrange-xf]
                       subject-fn   (conj (filter (fn [^Flake f]
                                                    (subject-fn (.-s f)))))
                       predicate-fn (conj (filter (fn [^Flake f]
@@ -264,6 +264,9 @@
     (async/pipe node-stream index-chan)))
 
 (defn select-subject-window
+  "Returns a channel that contains the flakes from `flake-stream`, skipping the
+  flakes from the first `offset` subjects encountered, including a maximum of
+  `flake-limit` flakes from a maximum of `subject-limit` subjects."
   [flake-stream {:keys [subject-limit flake-limit offset]}]
   (let [offset-subject-xf (comp (partition-by (fn [^Flake f]
                                                 (.-s f)))
