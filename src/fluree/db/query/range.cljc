@@ -129,6 +129,9 @@
     subrange-ch))
 
 (defn filter-authorized
+  "Returns a channel that will eventually contain only the schema flakes and the
+  flakes validated by fluree.db.permissions-validate/allow-flake? function for
+  the database `db` from the `flake-range-stream` channel"
   [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
   #?(:cljs
      flake-range-stream ; Note this bypasses all permissions in CLJS for now!
