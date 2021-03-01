@@ -128,19 +128,6 @@
         (async/close! subrange-ch)))
     subrange-ch))
 
-(defn resolve-nodes-to-t
-  [nodes novelty fast-forward-db? t]
-  (let [out (chan)]
-    (go-loop []
-      (if-let [node (<! nodes)]
-        (when-let [resolved (try*
-                             (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
-                             (catch* e))]
-          (when (>! out resolved)
-            (recur)))
-        (async/close! out)))
-    out))
-
 (defn filter-authorized
   [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
   #?(:cljs
@@ -231,6 +218,22 @@
              (->> (async/into #{}))
              (async/pipe out-chan))))
      out-chan)))
+
+(defn resolve-nodes-to-t
+  "Returns a channel that will eventually contain a stream of index nodes where
+  each node in the output stream is the result of resolving a node in the input
+  `node-stream` at specified transaction `t` and index novelty `novelty`"
+  [nodes novelty fast-forward-db? t]
+  (let [out (chan)]
+    (go-loop []
+      (if-let [node (<! nodes)]
+        (when-let [resolved (try*
+                             (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
+                             (catch* e))]
+          (when (>! out resolved)
+            (recur)))
+        (async/close! out)))
+    out))
 
 (defn indexed-flakes-xf
   [{:keys [start-test start-flake end-test end-flake subject-fn predicate-fn
