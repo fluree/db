@@ -131,10 +131,10 @@
 (defn filter-authorized
   "Returns a channel that will eventually contain only the schema flakes and the
   flakes validated by fluree.db.permissions-validate/allow-flake? function for
-  the database `db` from the `flake-range-stream` channel"
-  [flake-range-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
+  the database `db` from the `flake-stream` channel"
+  [flake-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
   #?(:cljs
-     flake-range-stream ; Note this bypasses all permissions in CLJS for now!
+     flake-stream ; Note this bypasses all permissions in CLJS for now!
 
      :clj
      (let [s1 (.-s start)
@@ -142,10 +142,10 @@
            s2 (.-s end)
            p2 (.-p end)]
        (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
-         flake-range-stream
+         flake-stream
          (let [out (chan)]
            (go-loop []
-             (if-let [flake (<! flake-range-stream)]
+             (if-let [flake (<! flake-stream)]
                (do (when (or (schema-util/is-schema-flake? flake)
                              (<? (perm-validate/allow-flake? db flake)))
                      (>! out flake))
