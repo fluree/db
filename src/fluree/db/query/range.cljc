@@ -236,13 +236,17 @@
     out))
 
 (defn indexed-flakes-xf
+  "Returns a transducer that first extracts a flake set under the `:flakes` keys
+  from it's input stream of index nodes, filters those flakes down to those
+  between the `start-flake` and `end-flake` options according to the
+  `start-test` and `end-test` options, respectively, and further filters the
+  flake stream according to the `subject-fn`, `predicate-fn`, and `object-fn`
+  options if they are present."
   [{:keys [start-test start-flake end-test end-flake subject-fn predicate-fn
            object-fn]}]
-  (let [subrange-fn (fn [flakes]
-                      (flake/subrange flakes
-                                      start-test start-flake
-                                      end-test end-flake))
-        xforms      (cond-> [(map :flakes), (mapcat subrange-fn)]
+  (let [flakes-sf   (map :flakes)
+        subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
+        xforms      (cond-> [flakes-sf subrange-xf]
                       subject-fn   (conj (filter (fn [^Flake f]
                                                    (subject-fn (.-s f)))))
                       predicate-fn (conj (filter (fn [^Flake f]
