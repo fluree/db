@@ -247,7 +247,7 @@
            s2                 (if (util/pred-ident? s2)
                                 (<? (dbproto/-subid db s2))
                                 s2)
-           [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
+           [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
                                  [[nil nil] (fn [o] (= o bool))]
                                  [[o1 o2] object-fn])
            o1                 (if (util/pred-ident? o1)
