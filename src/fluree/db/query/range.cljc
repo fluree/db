@@ -11,6 +11,7 @@
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
+
 (defn value-with-nil-pred
   "Checks whether an index range is :spot, starts with [s1 -1 o1] and ends with [s1 int/max p1]"
   [idx ^Flake start-flake ^Flake end-flake]
@@ -130,12 +131,13 @@
            from-t             (or (:from-t opts) (:t db))
            to-t               (:to-t opts)
            ;; Note this bypasses all permissions in CLJS for now!
-           no-filter? #?(:cljs true                         ;; always allow for now
-                         :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))
+           no-filter?         #?(:cljs true                         ;; always allow for now
+                                 :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))
            novelty            (get-in db [:novelty idx])
-           root-node          (-> (get db idx)
-                                  (dbproto/-resolve)
-                                  (<?))]
+           root-node          (-> db
+                                  (get idx)
+                                  dbproto/-resolve
+                                  <?)]
        (loop [next-node (<? (dbproto/-lookup-leaf root-node start-flake))
               i         0
               acc       nil]
@@ -193,6 +195,7 @@
                  (+ subject-count subject-new-count)
                  (into acc subject-filtered)))))))
 
+
 (defn find-next-valid-node
   [root-node rhs t novelty fast-forward-db?]
   (go-try
@@ -204,6 +207,7 @@
                  (if-let [rhs (:rhs lookup-leaf)]
                    (recur (<? (dbproto/-lookup-leaf root-node rhs)))
                    nil))))))
+
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
@@ -243,7 +247,7 @@
            s2                 (if (util/pred-ident? s2)
                                 (<? (dbproto/-subid db s2))
                                 s2)
-           [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
+           [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
                                  [[nil nil] (fn [o] (= o bool))]
                                  [[o1 o2] object-fn])
            o1                 (if (util/pred-ident? o1)
@@ -274,8 +278,8 @@
                                   (dbproto/-resolve)
                                   (<?))
            node-start         (<? (find-next-valid-node root-node start-flake t novelty fast-forward-db?))
-           no-filter? #?(:cljs true
-                         :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
+           no-filter?         #?(:cljs true
+                                 :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
        (if node-start (loop [next-node node-start
                              offset    offset               ;; offset counts down from the offset
                              i         0                    ;; i is count of flakes
@@ -335,17 +339,21 @@
                             (recur next-node offset* i* s* acc*))))
                       nil)))))
 
+
 (defn non-nil-non-boolean?
   [o]
   (and (not (nil? o))
        (not (boolean? o))))
 
+
 (defn tag-string?
   [possible-tag]
   (re-find #"^[a-zA-Z0-9-_]*/[a-zA-Z0-9-_]*:[a-zA-Z0-9-]*$" possible-tag))
 
+
 (def ^:const tag-sid-start (flake/min-subject-id const/$_tag))
 (def ^:const tag-sid-end (flake/max-subject-id const/$_tag))
+
 
 (defn is-tag-flake?
   "Returns true if flake is a root setting flake."
@@ -363,6 +371,7 @@
               o (<? (dbproto/-tag db o p))]
           (recur r (conj acc (flake/parts->Flake [s p o t op m]))))
         (recur r (conj acc flake))) acc)))
+
 
 (defn search
   ([db fparts]
@@ -408,6 +417,7 @@
                                   res)]
              res*))))
 
+
 (defn collection
   "Returns spot index range for only the requested collection."
   ([db name] (collection db name nil))
@@ -425,10 +435,12 @@
                             :error  :db/invalid-collection}))))
        (catch* e e)))))
 
+
 (defn _block-or_tx-collection
   "Returns spot index range for only the requested collection."
   [db opts]
   (index-range db :spot > [0] <= [util/min-long] opts))
+
 
 (defn txn-from-flakes
   "Returns vector of transactions from a set of flakes.
@@ -451,6 +463,7 @@
                (if (= type "tx")
                  (conj result* {:db db :tx tx :nonce nonce :auth auth :expire expire})
                  result*))))))
+
 
 (defn block-with-tx-data
   "Returns block data as a map, with the following keys:

@@ -173,12 +173,12 @@
 
                 (is (= ["(count (distinct ?personMiddleName))"]
                      (:select subject))
-                  "correctly constructs the select clause")
+                    "correctly constructs the select clause")
 
-              (is (= [["?person" "rdf:type" "person"]
-                      ["?person" "person/middleName" "?personMiddleName"]]
-                     (:where subject))
-                  "correctly constructs the where clause")))))))
+                (is (= [["?person" "rdf:type" "person"]
+                        ["?person" "person/middleName" "?personMiddleName"]]
+                       (:where subject))
+                    "correctly constructs the where clause")))))))
 
     (testing "on a complex query"
       (testing "with AND"
