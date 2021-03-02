@@ -314,9 +314,9 @@
          [s2 p2 o2 t2 op2 m2]
          (match->flake-parts db idx end-match)
 
-         [[o1 o2] object-fn] (if-let [bool (cond (boolean? o1) o1
-                                                 (boolean? o2) o2
-                                                 :else nil)]
+         [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1
+                                                  (boolean? o2) o2
+                                                  :else nil)]
                                [[nil nil] (fn [o] (= o bool))]
                                [[o1 o2] object-fn])
 
