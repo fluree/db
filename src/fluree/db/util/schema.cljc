@@ -32,6 +32,10 @@
 (def ^:const tag-sid-start (flake/min-subject-id const/$_tag))
 (def ^:const tag-sid-end (flake/max-subject-id const/$_tag))
 
+(defn is-tx-meta-flake?
+  "Returns true if this flake is for tx-meta"
+  [^Flake f]
+  (< (.-s f) 0))
 
 (defn is-schema-flake?
   "Returns true if flake is a schema flake."
@@ -73,6 +77,8 @@
                   (>= pred-ecount (.-s %))) (.-s %)) flakes))
 
 (defn remove-from-post-preds
+  "Returns any predicate subject flakes that are removing
+  an existing index, either via index: true or unique: true."
   [flakes]
   (keep #(when (and (true? (.-op %))
                     (or (= (.-p %) const/$_predicate:index)
