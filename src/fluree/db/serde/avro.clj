@@ -160,9 +160,10 @@
                  {:name "fork", :type [:null :string]}
                  {:name "forkBlock", :type [:null :long]}
                  {:name "spot", :type "fluree.FdbChildNode"} ;; spot
-                 {:name "psot" :type "fluree.FdbChildNode"} ;; psot
-                 {:name "post" :type "fluree.FdbChildNode"} ;; post
-                 {:name "opst" :type "fluree.FdbChildNode"} ;; opst
+                 {:name "psot", :type "fluree.FdbChildNode"} ;; psot
+                 {:name "post", :type "fluree.FdbChildNode"} ;; post
+                 {:name "opst", :type "fluree.FdbChildNode"} ;; opst
+                 {:name "tspo", :type "fluree.FdbChildNode"} ;; tspo
                  {:name "timestamp" :type [:null :long]}
                  {:name "prevIndex" :type [:null :long]}]}))
 
