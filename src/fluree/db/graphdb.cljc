@@ -254,8 +254,8 @@
   (-forward-time-travel [db flakes] (forward-time-travel db nil flakes))
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
   (-c-prop [this property collection]
-    ;; collection properties
-    (assert (#{:name :id :sid} property) (str "Invalid collection property: " (pr-str property)))
+    ;; collection properties TODO-deprecate :id property below in favor of :partition
+    (assert (#{:name :id :sid :partition :spec :specDoc} property) (str "Invalid collection property: " (pr-str property)))
     (if (neg-int? collection)
       (get-in schema [:coll "_tx" property])
       (get-in schema [:coll collection property])))
@@ -264,7 +264,7 @@
     (assert (#{:name :id :type :ref? :idx? :unique :multi :index :upsert :component :noHistory :restrictCollection
                :spec :specDoc :txSpec :txSpecDoc :restrictTag} property) (str "Invalid predicate property: " (pr-str property)))
     (cond->> (get-in schema [:pred predicate property])
-             (= :restrictCollection property) (dbproto/-c-prop this :id)))
+             (= :restrictCollection property) (dbproto/-c-prop this :partition)))
   (-tag [this tag-id]
     ;; resolves a tags's value given a tag subject id
     (go-try

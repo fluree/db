@@ -12,3 +12,18 @@
 ;;    this will allow us to provide sample data using that URI and everything will work without namespacing
 ;;
 
+(defn from-name
+  "Returns two-tuple of [prefix name] from an IRI capable string (i.e. _predicate/name).
+  Note a prefix can be an empty string, i.e. ':mypred' will return ['' 'mypred],
+  whereas 'mypred' would return [nil 'mypred'], and 'my:pred' would return ['my' 'pred']"
+  [pred-name]
+  (if-let [[_ prefix rest] (re-find #"^([^:]*):(.+$)" pred-name)]
+    [prefix rest]
+    [nil pred-name]))
+
+(comment
+
+
+  (predicate-prefix ":me")
+
+  )
