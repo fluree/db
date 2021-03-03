@@ -46,9 +46,11 @@
 
   When an old value does not exist, old-val is nil.
   If they subject being created is completely new, :new? true "
-  [db tempids flakes]
+  [db tempids flakes filter?]
   (go-try
-    (let [pred-flakes (filter schema-util/is-pred-flake? flakes)
+    (let [pred-flakes (if filter?
+                        (filter schema-util/is-pred-flake? flakes)
+                        flakes)
           is-new?     (into #{} (vals tempids))             ;; a set of all the new tempid subids, to be used as a fn
           new-map     (reduce #(assoc-in %1 [(.-s %2) :new?] (boolean (is-new? (.-s %2)))) {} pred-flakes)]
       (loop [[f & r] pred-flakes
