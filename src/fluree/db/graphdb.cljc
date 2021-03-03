@@ -284,7 +284,7 @@
             tag)))))
   (-tag-id [this tag-name]
     (go-try
-      (let [tag-pred-id 30]
+      (let [tag-pred-id const/$_tag:id]
         (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
                 ^Flake (first)
                 (.-s)))))
