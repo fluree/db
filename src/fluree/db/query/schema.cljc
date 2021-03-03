@@ -198,12 +198,13 @@
 
 
 (defn validate-schema-change
-  [db tempids flakes]
-  (go-try
-    (let [changes (<? (new-pred-changes db tempids flakes))]
-      (if (empty? changes)
-        db
-        (<? (predicate-change-error changes db true))))))
+  ([db tempids flakes] (validate-schema-change db tempids flakes true))
+  ([db tempids flakes filter?]
+   (go-try
+     (let [changes (<? (new-pred-changes db tempids flakes filter?))]
+       (if (empty? changes)
+         db
+         (<? (predicate-change-error changes db true)))))))
 
 
 (def predicate-re #"(?:([^/]+)/)([^/]+)")
@@ -301,19 +302,21 @@
           coll          (->> collection-flakes
                              (partition-by #(.-s %))
                              (reduce (fn [acc coll-flakes]
-                                       (let [sid     (.-s (first coll-flakes))
-                                             id      (flake/sid->i sid)
-                                             p->v    (->> coll-flakes ;; quick lookup map of collection's predicate ids
-                                                          (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
-                                             c-name  (get p->v const/$_collection:name)
-                                             spec    (get p->v const/$_collection:spec)
-                                             specDoc (get p->v const/$_collection:specDoc)
-                                             c-props {:name    c-name
-                                                      :sid     sid
-                                                      :spec    spec
-                                                      :specDoc specDoc
-                                                      :id      id}]
-                                         (assoc acc id c-props
+                                       (let [sid       (.-s (first coll-flakes))
+                                             p->v      (->> coll-flakes ;; quick lookup map of collection's predicate ids
+                                                            (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
+                                             partition (or (get p->v const/$_collection:partition)
+                                                           (flake/sid->i sid))
+                                             c-name    (get p->v const/$_collection:name)
+                                             spec      (get p->v const/$_collection:spec)
+                                             specDoc   (get p->v const/$_collection:specDoc)
+                                             c-props   {:name      c-name
+                                                        :sid       sid
+                                                        :spec      spec
+                                                        :specDoc   specDoc
+                                                        :id        partition ;; TODO - deprecate! (use partition instead)
+                                                        :partition partition}]
+                                         (assoc acc partition c-props
                                                     c-name c-props)))
                                      ;; put in defaults for _tx
                                      {-1    {:name "_tx" :id -1 :sid -1}
