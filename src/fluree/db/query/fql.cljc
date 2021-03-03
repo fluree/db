@@ -488,7 +488,7 @@
   "Order By can be:
     - Single variable, ?favNums
     - Two-tuple,  [ASC, ?favNums]"
-  [orderBy {:keys [headers tuples] :as res} offset limit]
+  [tuples headers orderBy offset limit]
   (let [[order var] orderBy
         indexOfFind (or (util/index-of headers (symbol var)) -1)
         tuples      (if (<= 0 indexOfFind)
@@ -496,7 +496,7 @@
                                (= "DESC" order) reverse
                                offset (drop offset)
                                limit (take limit)) tuples)]
-    {:headers headers :tuples tuples}))
+    tuples))
 
 (defn parse-map [x valid-var]
   (let [_             (when-not (= 1 (count (keys x)))
@@ -618,16 +618,21 @@
                           res)]
                (if inVector? [res'] res'))
 
-             (let [res+agg (if aggregates (analytical/add-aggregate-cols res aggregates) res)
-                   offset  (if groupBy 0 offset)
-                   {:keys [headers tuples]} (if orderBy
-                                              (order-offset-and-limit-results orderBy res+agg offset group-limit)
-                                              res+agg)
-                   res     (<? (format-filter-tuples db tuples select-spec headers vars (dissoc opts :limit :offset :orderBy :groupBy)))]
+             (let [{:keys [headers tuples]} (if aggregates (analytical/add-aggregate-cols res aggregates) res)
+                   offset' (if (or selectDistinct? groupBy) 0 offset)
+                   limit'  (if selectDistinct? nil group-limit)
+                   tuples' (if orderBy
+                             (order-offset-and-limit-results tuples headers orderBy offset' limit')
+                             tuples)
+                   res'    (->> (dissoc opts :limit :offset :orderBy :groupBy)
+                                (format-filter-tuples db tuples' select-spec headers vars)
+                               <?)]
                ;; TODO - drop unused columns, and calculate distinct before resolving all vals
                (if selectDistinct?
-                 (->> (into #{} res) (into []))
-                 res))))))
+                 (cond->> (distinct res')
+                          (and offset (< 0 offset)) (drop offset)
+                          (and group-limit (< 0 group-limit)) (take group-limit))
+                 res'))))))
 
 
 (defn ad-hoc-group-by
@@ -712,8 +717,8 @@
                       (-> (cond->> (<? (process-ad-hoc-group
                                          db
                                          group-as-res
-                                         (assoc select-spec :orderBy nil :offset 0 :limit 0)
-                                         (assoc opts :offset 0 :limit 0)))
+                                         (assoc select-spec :orderBy nil :offset 0 :limit nil)
+                                         (assoc opts :offset 0 :limit nil)))
                                    (< 0 offset) (drop offset)
                                    (and limit (< 0 limit)) (take limit))
                           (as-> res' (recur rest-keys
@@ -745,7 +750,7 @@
         orderBy       (when-let [orderBy (:orderBy opts)]
                         (if (or (string? orderBy) (and (vector? orderBy) (#{"DESC" "ASC"} (first orderBy))))
                           (if (vector? orderBy) orderBy ["ASC" orderBy])
-                          (throw (ex-info (str "Invalid orderBy clause, must by variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
+                          (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
                                           {:status 400
                                            :error  :db/invalid-query}))))]
     {:select          parsed-select
