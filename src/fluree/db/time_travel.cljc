@@ -117,8 +117,8 @@
   Returns db as a promise channel"
   [db block-or-t-or-time]
   (let [pc (async/promise-chan)]
-    (try*
-      (async/go
+    (async/go
+      (try*
         (let [latest-db (<? (dbproto/-latest-db db))
               t         (cond
                           (pos-int? block-or-t-or-time)     ;; specified block
@@ -141,8 +141,8 @@
                                            :error  :db/invalid-time})))
               block     (<? (t-to-block latest-db t))]
           (async/put! pc (assoc db :t t
-                                   :block block))))
-      (catch* e
-              ;; return exception into promise-chan
-              (async/put! pc e)))
+                                   :block block)))
+        (catch* e
+                ;; return exception into promise-chan
+                (async/put! pc e))))
     pc))
