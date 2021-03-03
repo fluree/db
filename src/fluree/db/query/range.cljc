@@ -422,15 +422,16 @@
   ([db name opts]
    (go
      (try*
-      (if-let [id (dbproto/-c-prop db :id name)]
-        (<? (index-range db :spot
-                         >= [(flake/max-subject-id id)]
-                         <= [(flake/min-subject-id id)]
-                         opts))
-        (throw (ex-info (str "Invalid collection name: " (pr-str name))
-                        {:status 400
-                         :error  :db/invalid-collection})))
-      (catch* e e)))))
+       (if-let [partition (dbproto/-c-prop db :partition name)]
+         (<? (index-range db :spot
+                          >= [(flake/max-subject-id partition)]
+                          <= [(flake/min-subject-id partition)]
+                          opts))
+
+         (throw (ex-info (str "Invalid collection name: " (pr-str name))
+                         {:status 400
+                          :error  :db/invalid-collection})))
+       (catch* e e)))))
 
 (defn _block-or_tx-collection
   "Returns spot index range for only the requested collection."

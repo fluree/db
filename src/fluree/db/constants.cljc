@@ -51,6 +51,8 @@
 (def ^:const $_predicate:txSpecDoc 25)
 (def ^:const $_predicate:restrictTag 26)
 (def ^:const $_predicate:fullText 27)
+(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
+(def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
 
 (def ^:const $_tag:id 30)
 (def ^:const $_tag:doc 31)
@@ -61,6 +63,8 @@
 (def ^:const $_collection:spec 43)
 (def ^:const $_collection:specDoc 44)
 (def ^:const $_collection:shard 45)
+(def ^:const $_collection:equivalentClass 46)
+(def ^:const $_collection:partition 47)
 
 (def ^:const $_user:username 50)
 (def ^:const $_user:auth 51)
@@ -123,7 +127,7 @@
 (def ^:const $_shard:mutable 122)
 
 (def ^:const $_prefix:prefix 130)
-(def ^:const $_prefix:uri 131)
+(def ^:const $_prefix:iri 131)
 
 
 ;; TODO reorder - look at _prefix:uri above and see if we can replace with $rdf:uri
@@ -136,7 +140,12 @@
 
 (def ^:const $fluree:partition 137)
 
-
+(def ^:const $sh:path 138)
+(def ^:const $sh:datatype 139)
+(def ^:const $sh:pattern 140)
+(def ^:const $sh:minCount 141)
+(def ^:const $sh:maxCount 142)
+(def ^:const $sh:property 143)
 
 ;; tags
 ;; _predicate/type tags

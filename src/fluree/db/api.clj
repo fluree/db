@@ -481,7 +481,7 @@
   (let [p (promise)]
     (async/go
       (try
-        (deliver p (dbproto/-c-prop (<? db) :id collection))
+        (deliver p (dbproto/-c-prop (<? db) :partition collection))
         (catch Exception e
           (deliver p e))))
     p))
