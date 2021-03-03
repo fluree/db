@@ -168,21 +168,6 @@
   [session block]
   (swap! (:state session) assoc :db/indexing nil :db/indexed block))
 
-
-(def alias->id-cache (atom #?(:clj  (cache/fifo-cache-factory {:threshold 100})
-                              :cljs (cache/lru-cache-factory {:threshold 100}))))
-
-(defn ledger-alias->id
-  "Returns ledger id from alias."
-  [conn network alias]
-  (or (get-in @alias->id-cache [network alias])
-      (let [
-            ;; TODO - temporarily turned off alias
-            dbid alias]
-        (swap! alias->id-cache assoc-in [network alias] dbid)
-        dbid)))
-
-
 (defn resolve-ledger
   "Resolves a ledger identity in the form of 'network/alias' and returns a
   two-tuple of [network ledger-id].
@@ -197,18 +182,18 @@
   - testnet/testledger - Look for ledger with an alias testledger on network testnet.
   - testnet/$testledger - look for a ledger with id testledger on network testnet (skip alias lookup).
   - [testnet testledger] - already in form of [network ledger-id]"
-  [conn ledger]
+  [_conn ledger]
   (if (sequential? ledger)
     ledger
     (let [ledger      (keyword ledger)
           network     (namespace ledger)
-          maybe-alias (name ledger)
-
-          _           (when-not (and network maybe-alias) (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
-                                                                          {:status 400 :error :db/invalid-db})))]
-      (if (str/starts-with? maybe-alias "$")
-        [network (subs maybe-alias 1)]
-        [network (ledger-alias->id conn network maybe-alias) maybe-alias]))))
+          maybe-alias (name ledger)]
+      (if (and network maybe-alias)
+        (if (str/starts-with? maybe-alias "$")
+          [network (subs maybe-alias 1)]
+          [network maybe-alias])
+        (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
+                        {:status 400, :error :db/invalid-db}))))))
 
 
 ;; note all process-ledger-update operations must return a go-channel
