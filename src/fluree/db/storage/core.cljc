@@ -188,28 +188,24 @@
    (write-db-root db nil))
   ([db custom-ecount]
    (go-try
-    (let [{:keys [conn network dbid block t ecount stats spot psot post opst
-                  tspo fork fork-block]}
-          db
-
-          db-root-key (ledger-root-key network dbid block)
-          data        {:dbid      dbid
-                       :block     block
-                       :t         t
-                       :ecount    (or custom-ecount ecount)
-                       :stats     (select-keys stats [:flakes :size])
-                       :spot      (child-data spot)
-                       :psot      (child-data psot)
-                       :post      (child-data post)
-                       :opst      (child-data opst)
-                       :tspo      (child-data tspo)
-                       :timestamp (util/current-time-millis)
-                       :prevIndex (or (:indexed stats) 0)
-                       :fork      fork
-                       :forkBlock fork-block}
-          ser         (serdeproto/-serialize-db-root (serde conn) data)]
-      (<? (storage-write conn db-root-key ser))
-      db-root-key))))
+     (let [{:keys [conn network dbid block t ecount stats spot psot post opst fork fork-block]} db
+           db-root-key (ledger-root-key network dbid block)
+           data        {:dbid      dbid
+                        :block     block
+                        :t         t
+                        :ecount    (or custom-ecount ecount)
+                        :stats     (select-keys stats [:flakes :size])
+                        :spot      (child-data spot)
+                        :psot      (child-data psot)
+                        :post      (child-data post)
+                        :opst      (child-data opst)
+                        :timestamp (util/current-time-millis)
+                        :prevIndex (or (:indexed stats) 0)
+                        :fork      fork
+                        :forkBlock fork-block}
+           ser         (serdeproto/-serialize-db-root (serde conn) data)]
+       (<? (storage-write conn db-root-key ser))
+       db-root-key))))
 
 ;; TODO - sorting is temporary... place into node in correct order
 (defn reify-history
@@ -305,7 +301,7 @@
   "Gets a history slice of a node with the oldest 't' from-t, to the
   most recent 't', to-t.
 
-  Returns sorted set in novelty's sort order (spot, psot, post, opst, or tspo)"
+  Returns sorted set in novelty's sort order (spot, psot, post, or opst)"
   [node from-t to-t idx-novelty leftmost?]
   (go
     (try*
@@ -472,7 +468,7 @@
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
-  [conn {:keys [network dbid index-configs block t]} index index-data]
+  [conn index-configs network dbid index index-data block t]
   (let [cfg (or (get index-configs index)
                 (throw (ex-info (str "Internal error reifying db root index: " (pr-str index))
                                 {:status 500
@@ -495,10 +491,9 @@
                             :ecount ecount
                             :stats (assoc stats :indexed block))]
     (reduce
-     (fn [db idx]
-       (let [idx-root (reify-index-root conn db idx (get root-data idx))]
-         (assoc db idx idx-root)))
-     db* index/types)))
+      (fn [db idx]
+        (assoc db idx (reify-index-root conn index-configs network dbid idx (get root-data idx) block t)))
+      db* [:spot :psot :post :opst])))
 
 
 (defn read-garbage

@@ -5,7 +5,7 @@
   "All nodes must implement this protocol. It's includes the minimal functionality
    necessary to avoid resolving nodes unless strictly necessary."
   (-first-flake [node] "Returns the first flake in this node")
-  (-rhs [node] "Returns the node's first flake")
+  (-rhs [node] "Returns the next node's first flake")
   (-history-count [node] "Returns how many history nodes are present for this node (if a leaf)")
   (-resolve [node] "Returns node resolved with data as async channel")
   (-resolve-to-t [node t idx-novelty] [node t idx-novelty fast-forward-db?] [node t idx-novelty fast-forward-db? remove-flakes]
