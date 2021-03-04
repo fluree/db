@@ -21,11 +21,12 @@
 
 (defn- deserialize-db-root
   [db-root]
-  (let [{:keys [spot psot post opst]} db-root]
+  (let [{:keys [spot psot post opst tspo]} db-root]
     (assoc db-root :spot (deserialize-child-node spot)
                    :psot (deserialize-child-node psot)
                    :post (deserialize-child-node post)
-                   :opst (deserialize-child-node opst))))
+                   :opst (deserialize-child-node opst)
+                   :tspo (deserialize-child-node tspo))))
 
 
 (defn- deserialize-branch-node
