@@ -117,6 +117,7 @@
 
 (comment
 
+
   (def sample-flakes
     [(flake/->Flake :person const/$rdf:iri "ex:Person" -1 true nil) ;; class id 1
      (flake/->Flake :person const/$fluree:partition :part-person -1 true nil)
@@ -162,5 +163,57 @@
   (-collection classes "ex:Resident")
   (-collection classes "ex:Doctor")
 
-  )
+  (def conn (-> user/system
+                :conn))
+
+  @(fluree.db.api/ledger-list conn)
+  (def ledger :bp/t3)
+  (def db (fluree.db.api/db conn ledger))
+
+  (time (async/<!! (sub-classes (async/<!! db) "Person")))
+  (time (async/<!! (parent-classes (async/<!! db) "FullTimeEmployee")))
+  (time (async/<!! (classes->collections (async/<!! db))))
+  (time (async/<!! (collection-for-class conn ledger "TestSub1")))
+
+
+  @(fluree.db.api/query db {:select ["?child"]
+                            :where  [["?child" "_class/subclassOf" ["_class/name" "Person"]]]
+                            :union  [["?sub-child" "_class/subclassOf" ["_class/name" "Person"]]
+                                     ["?child" "_class/subclassOf" "?sub-child"]]})
+
+  @(fluree.db.api/query db {:select ["?child"]
+                            :where  [["?child" "_class/subclassOf" ["_class/name" "Person"]]]
+                            :union  [
+                                     [["?sub-child" "_class/subclassOf" ["_class/name" "Person"]]]
+                                     [["?child" "_class/subclassOf" "?sub-child"]]]})
+
+
+
+  @(fluree.db.api/query db {:select ["?child"]
+                            :where  [["?child" "_class/subclassOf+5" ["_class/name" "Person"]]]})
+
+
+
+  @(fluree.db.api/query db {:select ["_class/name" {"_class/_subclassOf" ["_class/name" {"_class/_subclassOf" ["*"]}]}]
+                            :from   ["_class/name" "Person"]})
+
+
+  @(fluree.db.api/query db {:select ["_class/name" {"_class/_subclassOf" {"_class/name" nil
+                                                                          "_recur"      100}}]
+                            :from   ["_class/name" "Person"]})
+
+
+
+  @(fluree.db.api/query db {:select ["?x"]
+                            :where  [["?x" "_collection/name" "?y"]]
+                            :union  [
+                                     ["?x" "_predicate/name" "?y"]]})
+
+
+
+
+  (async/<!! (find-sub-classes (async/<!! db) "Person")))
+
+
+
 
