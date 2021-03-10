@@ -491,12 +491,14 @@
   [tuples headers orderBy offset limit]
   (let [[order var] orderBy
         indexOfFind (or (util/index-of headers (symbol var)) -1)
-        tuples      (if (<= 0 indexOfFind)
+        tuples'     (if (<= 0 indexOfFind)
                       (cond->> (sort-by #(nth % indexOfFind) compare-fn tuples)
-                               (= "DESC" order) reverse
-                               offset (drop offset)
-                               limit (take limit)) tuples)]
-    tuples))
+                               (= "DESC" order) reverse)
+                      tuples)]
+    (cond->> tuples'
+             offset (drop offset)
+             limit (take limit)
+             (vector? tuples) (into []))))
 
 (defn parse-map [x valid-var]
   (let [_             (when-not (= 1 (count (keys x)))
@@ -626,12 +628,14 @@
                              tuples)
                    res'    (->> (dissoc opts :limit :offset :orderBy :groupBy)
                                 (format-filter-tuples db tuples' select-spec headers vars)
-                               <?)]
+                                <?)]
                ;; TODO - drop unused columns, and calculate distinct before resolving all vals
-               (if selectDistinct?
-                 (cond->> (distinct res')
+               (if (or selectDistinct? (and (not orderBy) (or group-limit offset)))
+                 (cond->> res'
+                          selectDistinct? distinct
                           (and offset (< 0 offset)) (drop offset)
-                          (and group-limit (< 0 group-limit)) (take group-limit))
+                          (and group-limit (< 0 group-limit)) (take group-limit)
+                          (or inVector? (vector? res')) (into []))
                  res'))))))
 
 
