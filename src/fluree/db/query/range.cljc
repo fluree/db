@@ -97,12 +97,12 @@
                               (get idx)
                               dbproto/-resolve))]
         (loop [next-flake start-flake]
-          (if-not (and next-flake
-                       (not (pos? (idx-compare next-flake end-flake))))
-            (async/close! out)
-            (let [next-node (<? (dbproto/-lookup-leaf root-node next-flake))]
-              (when (>! out next-node)
-                (recur (dbproto/-rhs next-node))))))))
+          (if-let [next-node (and next-flake
+                                  (not (pos? (idx-compare next-flake end-flake)))
+                                  (<? (dbproto/-lookup-leaf root-node next-flake)))]
+            (when (>! out next-node)
+              (recur (dbproto/-rhs next-node)))
+            (async/close! out)))))
     out))
 
 (defn flake-subrange-xf
