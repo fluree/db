@@ -262,7 +262,7 @@
   (-p-prop [this property predicate]
     ;; predicate properties
     (assert (#{:name :id :type :ref? :idx? :unique :multi :index :upsert :component :noHistory :restrictCollection
-               :spec :specDoc :txSpec :txSpecDoc :restrictTag} property) (str "Invalid predicate property: " (pr-str property)))
+               :spec :specDoc :txSpec :txSpecDoc :restrictTag :retractDuplicates} property) (str "Invalid predicate property: " (pr-str property)))
     (cond->> (get-in schema [:pred predicate property])
              (= :restrictCollection property) (dbproto/-c-prop this :partition)))
   (-tag [this tag-id]
