@@ -533,32 +533,3 @@
       (let [db  (reify-db-root conn blank-db (<? db-root))
             db* (assoc db :schema (<? (schema/schema-map db)))]
         (assoc db* :settings (<? (schema/setting-map db*)))))))
-
-
-;; TODO - should look to add some parallelism to block fetches
-(defn block-range
-  "Returns a channel that will contains blocks in specified range."
-  ([conn network dbid start] (block-range conn network dbid start nil))
-  ([conn network dbid start end]
-   (log/trace "Block-range request: " network dbid start end)
-   (go-try
-     (assert (>= end start) "Block range should be in ascending order, from earliest (smallest) block to most recent (largest) block.")
-     (let [parallelism (:parallelism conn)]
-       (loop [block  start
-              result []]
-         (let [res (<! (read-block conn network dbid block))]
-           (cond (or (nil? res) (instance? #?(:clj Throwable :cljs js/Error) res))
-                 result
-
-                 (= block end)
-                 (conj result res)
-
-                 :else
-                 (recur (inc block) (conj result res)))))))))
-
-(defn block
-  "Reads a single block from storage"
-  [conn network dbid block]
-  (go-try
-    (-> (<? (block-range conn network dbid block block))
-        (first))))
