@@ -24,7 +24,7 @@
          clucie/clucie                     {:mvn/version "0.4.2"}
 
          ;; messaging
-         aleph/aleph                       {:mvn/version "0.4.6"}
+         aleph/aleph                       {:mvn/version "0.4.7-alpha5"}
 
          ;; benchmarking
          criterium/criterium               {:mvn/version "0.4.6"}
