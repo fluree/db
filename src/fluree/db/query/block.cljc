@@ -23,7 +23,7 @@
         const/$_block:sigs         :sigs}
        pred))
 
-(defn include-block-meta
+(defn reduce-meta-flake
   [m ^Flake f]
   (let [p (.-p f)
         o (.-o f)]
@@ -40,7 +40,7 @@
       (let [block-t (<! (lookup-block-t db block-num))]
         (-> db
             (index-flake-stream :spot = [block-t])
-            (->> (async/reduce include-block-meta {:t block-t}))
+            (->> (async/reduce reduce-meta-flake {:t block-t}))
             (async/pipe out))))
     out))
 
@@ -66,8 +66,8 @@
              blocks []]
         (if (> current-block last-block)
           blocks
-          (let [res (<? (lookup-block db current-block))
-                blocks* (conj blocks res)
+          (let [block   (<? (lookup-block db current-block))
+                blocks* (conj blocks block)
                 next-block (if reverse?
                              (dec current-block)
                              (inc current-block))]
