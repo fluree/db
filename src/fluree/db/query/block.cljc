@@ -1,16 +1,18 @@
 (ns fluree.db.query.block
-  (:require [clojure.set :as set]
-            [fluree.db.constants :as const]
+  (:require [fluree.db.constants :as const]
             [fluree.db.query.range :refer [index-range index-flake-stream]]
-            [fluree.db.query.fql :as fql]
-            #?(:clj [fluree.db.util.async :refer [<? go-try]])
-            #?(:clj [fluree.db.permissions-validate :as perm-validate])
-            #?(:clj  [clojure.core.async :refer [>! <! >!! <!! go chan buffer close! thread
-                                                 alts! alts!! timeout] :as async]
-               :cljs [cljs.core.async :refer [go chan <!] :as async])
-            [fluree.db.util.core :as util]
+            #?(:clj  [clojure.core.async :refer [>! <! go chan] :as async]
+               :cljs [cljs.core.async :refer [>! <! go chan] :as async])
             [fluree.db.util.async :refer [<?]])
   (:import fluree.db.flake.Flake))
+
+(defn lookup-block-t
+  [db block-num]
+  (let [out (chan 1 (map #(.-s ^Flake %)))]
+    (-> db
+        (index-flake-stream :post = [const/$_block:number block-num]
+                            {:limit 1, :flake-limit 1})
+        (async/pipe out))))
 
 (defn block-pred->meta-key
   [pred]
@@ -20,15 +22,6 @@
         const/$_block:number       :block
         const/$_block:sigs         :sigs}
        pred))
-
-(defn lookup-block-t
-  [db block-num]
-  (let [out (chan 1 (map (fn [^Flake f]
-                           (.-s f))))]
-    (-> db
-        (index-flake-stream :post = [const/$_block:number block-num]
-                            {:limit 1, :flake-limit 1})
-        (async/pipe out))))
 
 (defn include-block-meta
   [m ^Flake f]
@@ -55,12 +48,13 @@
   [db min-t max-t]
   (index-range db :tspo >= [min-t] <= [max-t]))
 
-(defn query-block
+(defn lookup-block
   [db block]
   (go
-    (let [meta (<! (lookup-block-meta db block))
-          [min-t max-t] (apply (juxt max min) (:txns meta)) ; reverse max and min because t decrements)
-          flakes (<! (block-flakes db min-t max-t))]
+    (let [meta          (<! (lookup-block-meta db block))
+          ;; reverse max and min here because t decrements)
+          [min-t max-t] (apply (juxt max min) (:txns meta))
+          flakes        (<! (block-flakes db min-t max-t))]
       (assoc meta :flakes flakes))))
 
 (defn block-range
@@ -72,7 +66,7 @@
              blocks []]
         (if (> current-block last-block)
           blocks
-          (let [res (<? (query-block db current-block))
+          (let [res (<? (lookup-block db current-block))
                 blocks* (conj blocks res)
                 next-block (if reverse?
                              (dec current-block)
