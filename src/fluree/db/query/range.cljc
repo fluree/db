@@ -279,6 +279,56 @@
         (async/pipe flake-ch)
         (take-only flake-limit))))
 
+(defn index-flake-stream
+  ([db idx] (index-flake-stream db idx {}))
+  ([db idx opts] (index-flake-stream db idx >= (min-match idx) <= (max-match idx) opts))
+  ([db idx test match] (index-flake-stream db idx test match {}))
+  ([db idx test match opts]
+   (let [[start-test start-match end-test end-match]
+         (expand-range-interval idx test match)]
+     (index-flake-stream db idx start-test start-match end-test end-match opts)))
+  ([db idx start-test start-match end-test end-match]
+   (index-flake-stream db idx start-test start-match end-test end-match {}))
+  ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
+   (let [{:keys [flake-limit offset subject-fn predicate-fn object-fn]
+          subject-limit :limit, :or {offset 0}}
+         opts
+
+         fast-forward-db? (:tt-id db)
+         novelty          (get-in db [:novelty idx])
+
+         [s1 p1 o1 t1 op1 m1]
+         (match->flake-parts db idx start-match)
+
+         [s2 p2 o2 t2 op2 m2]
+         (match->flake-parts db idx end-match)
+
+         [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1
+                                                  (boolean? o2) o2
+                                                  :else nil)]
+                               [[nil nil] (fn [o] (= o bool))]
+                               [[o1 o2] object-fn])
+         out-chan (chan)]
+     (go
+       (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
+             end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))]
+         (-> db
+             (index-node-stream idx start-flake end-flake)
+             (resolve-nodes-to-t novelty fast-forward-db? t)
+             (extract-index-flakes {:subject-fn subject-fn
+                                    :predicate-fn predicate-fn
+                                    :object-fn object-fn
+                                    :start-test start-test
+                                    :start-flake start-flake
+                                    :end-test end-test
+                                    :end-flake end-flake})
+             (filter-authorized db start-flake end-flake)
+             (select-subject-window {:subject-limit subject-limit
+                                     :flake-limit flake-limit
+                                     :offset offset})
+             (async/pipe out-chan))))
+     out-chan)))
+
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
 
@@ -300,48 +350,13 @@
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
   ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
-   (let [{:keys [flake-limit offset subject-fn predicate-fn object-fn]
-          subject-limit :limit, :or {offset 0}}
-         opts
-
-         fast-forward-db? (:tt-id db)
-         idx-compare      (get-in db [:index-configs idx :comparator])
-         novelty          (get-in db [:novelty idx])
-
-         [s1 p1 o1 t1 op1 m1]
-         (match->flake-parts db idx start-match)
-
-         [s2 p2 o2 t2 op2 m2]
-         (match->flake-parts db idx end-match)
-
-         [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1
-                                                  (boolean? o2) o2
-                                                  :else nil)]
-                               [[nil nil] (fn [o] (= o bool))]
-                               [[o1 o2] object-fn])
-
-         out-chan (chan 1 (map (fn [flakes]
-                                 (apply flake/sorted-set-by idx-compare flakes))))]
-    (go
-      (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
-            end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))]
-        (-> db
-            (index-node-stream idx start-flake end-flake)
-            (resolve-nodes-to-t novelty fast-forward-db? t)
-            (extract-index-flakes {:subject-fn subject-fn
-                                   :predicate-fn predicate-fn
-                                   :object-fn object-fn
-                                   :start-test start-test
-                                   :start-flake start-flake
-                                   :end-test end-test
-                                   :end-flake end-flake})
-            (filter-authorized db start-flake end-flake)
-            (select-subject-window {:subject-limit subject-limit
-                                    :flake-limit flake-limit
-                                    :offset offset})
-            (->> (async/into []))
-            (async/pipe out-chan))))
-    out-chan)))
+   (let [idx-compare (get-in db [:index-configs idx :comparator])
+         out-chan    (chan 1 (map (fn [flakes]
+                                    (apply flake/sorted-set-by idx-compare flakes))))]
+     (-> db
+         (index-flake-stream idx start-test start-match end-test end-match opts)
+         (->> (async/into []))
+         (async/pipe out-chan)))))
 
 (defn non-nil-non-boolean?
   [o]
