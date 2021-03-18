@@ -14,35 +14,28 @@
                             {:limit 1, :flake-limit 1})
         (async/pipe out))))
 
-(defn block-pred->meta-key
-  [pred]
-  (get {const/$_block:hash         :hash
-        const/$_block:transactions :txns
-        const/$_block:instant      :instant
-        const/$_block:number       :block
-        const/$_block:sigs         :sigs}
-       pred))
+(def block-meta-mapping
+  {const/$_block:hash         :hash
+   const/$_block:transactions :txns
+   const/$_block:instant      :instant
+   const/$_block:number       :block
+   const/$_block:sigs         :sigs})
 
 (defn reduce-meta-flake
   [m ^Flake f]
   (let [p (.-p f)
         o (.-o f)]
-    (if-let [meta-key (block-pred->meta-key p)]
+    (if-let [meta-key (get block-meta-mapping p)]
       (if (= meta-key :txns)
         (update m meta-key conj o)
         (assoc m meta-key o))
       m)))
 
 (defn lookup-block-meta
-  [db block-num]
-  (let [out (chan)]
-    (go
-      (let [block-t (<! (lookup-block-t db block-num))]
-        (-> db
-            (index-flake-stream :spot = [block-t])
-            (->> (async/reduce reduce-meta-flake {:t block-t}))
-            (async/pipe out))))
-    out))
+  [db block-t]
+  (-> db
+      (index-flake-stream :spot = [block-t])
+      (->> (async/reduce reduce-meta-flake {:t block-t}))))
 
 (defn block-flakes
   [db min-t max-t]
@@ -51,7 +44,8 @@
 (defn lookup-block
   [db block]
   (go
-    (let [meta          (<! (lookup-block-meta db block))
+    (let [block-t       (<! (lookup-block-t db block))
+          meta          (<! (lookup-block-meta db block-t))
           ;; reverse max and min here because t decrements)
           [min-t max-t] (apply (juxt max min) (:txns meta))
           flakes        (<! (block-flakes db min-t max-t))]
