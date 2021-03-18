@@ -1,5 +1,6 @@
 (ns fluree.db.query.block
   (:require [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
             [fluree.db.query.range :refer [index-range index-flake-stream]]
             #?(:clj  [clojure.core.async :refer [>! <! go chan] :as async]
                :cljs [cljs.core.async :refer [>! <! go chan] :as async])
@@ -8,7 +9,7 @@
 
 (defn lookup-block-t
   [db block-num]
-  (let [out (chan 1 (map #(.-s ^Flake %)))]
+  (let [out (chan 1 (map #(flake/s %)))]
     (-> db
         (index-flake-stream :post = [const/$_block:number block-num]
                             {:limit 1, :flake-limit 1})
@@ -23,8 +24,8 @@
 
 (defn reduce-meta-flake
   [m ^Flake f]
-  (let [p (.-p f)
-        o (.-o f)]
+  (let [p (flake/p f)
+        o (flake/o f)]
     (if-let [meta-key (get block-meta-mapping p)]
       (if (= meta-key :txns)
         (update m meta-key conj o)

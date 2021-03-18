@@ -160,6 +160,29 @@
           (binding [*out* w]
             (pr [(.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f)]))))
 
+(defn s
+  [^Flake f]
+  (.-s f))
+
+(defn p
+  [^Flake f]
+  (.-p f))
+
+(defn o
+  [^Flake f]
+  (.-o f))
+
+(defn t
+  [^Flake f]
+  (.-t f))
+
+(defn op
+  [^Flake f]
+  (.-op f))
+
+(defn m
+  [^Flake f]
+  (.-m f))
 
 (defn- equiv-flake
   [^Flake f ^Flake o]
