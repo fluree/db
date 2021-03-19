@@ -456,7 +456,6 @@
 
 (defn lookup
   [ss start-flake end-flake]
-  ;(log/warn "index-range-flakes" {:start-test >= :start-flake start-flake :end-test <= :end-flake end-flake})
   (avl/subrange ss >= start-flake <= end-flake))
 
 (defn subrange
