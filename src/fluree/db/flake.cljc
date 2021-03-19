@@ -1,5 +1,5 @@
 (ns fluree.db.flake
-  (:refer-clojure :exclude [split-at sorted-set-by take])
+  (:refer-clojure :exclude [split-at sorted-set-by take last])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             #?(:clj [abracad.avro :as avro]))
@@ -489,6 +489,12 @@
   (as-> (transient sorted-set) tset
     (reduce disj! tset to-remove)
     (persistent! tset)))
+
+(defn last
+  "Returns the last item in `ss` in constant time as long as `ss` is a sorted
+  set."
+  [ss]
+  (first (rseq ss)))
 
 (defn size-flake
   "Base size of a flake is 38 bytes... then add size for 'o' and 'm'.
