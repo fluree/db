@@ -15,6 +15,14 @@
 
 (declare equiv-flake assoc-flake get-flake-val nth-flake)
 
+(def inc-t
+  "Increments a transaction value"
+  dec)
+
+(def dec-t
+  "Decrements a transaction value"
+  inc)
+
 (defn lshift
   [n bits]
   #?(:clj  (bit-shift-left n bits)
@@ -494,7 +502,7 @@
   "Returns the last item in `ss` in constant time as long as `ss` is a sorted
   set."
   [ss]
-  (first (rseq ss)))
+  (->> ss rseq first))
 
 (defn size-flake
   "Base size of a flake is 38 bytes... then add size for 'o' and 'm'.

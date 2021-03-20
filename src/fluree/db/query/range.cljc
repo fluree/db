@@ -99,7 +99,7 @@
         (loop [next-flake start-flake]
           (if-let [next-node (and next-flake
                                   (not (pos? (idx-compare next-flake end-flake)))
-                                  (<? (dbproto/-lookup-leaf root-node next-flake)))]
+                                  (<! (dbproto/-lookup-leaf root-node next-flake)))]
             (when (>! out next-node)
               (recur (dbproto/-rhs next-node)))
             (async/close! out)))))
@@ -230,11 +230,11 @@
   (let [out (chan)]
     (go-loop []
       (if-let [node (<! nodes)]
-        (when-let [resolved (try*
-                             (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
-                             (catch* e))]
-          (when (>! out resolved)
-            (recur)))
+        (do (when-let [resolved (try*
+                                 (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
+                                 (catch* e))]
+              (>! out resolved))
+            (recur))
         (async/close! out)))
     out))
 
