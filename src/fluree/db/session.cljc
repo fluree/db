@@ -174,7 +174,7 @@
 
 (defn ledger-alias->id
   "Returns ledger id from alias."
-  [conn network alias]
+  [network alias]
   (or (get-in @alias->id-cache [network alias])
       (let [
             ;; TODO - temporarily turned off alias
@@ -208,7 +208,7 @@
                                                                           {:status 400 :error :db/invalid-db})))]
       (if (str/starts-with? maybe-alias "$")
         [network (subs maybe-alias 1)]
-        [network (ledger-alias->id conn network maybe-alias) maybe-alias]))))
+        [network (ledger-alias->id network maybe-alias) maybe-alias]))))
 
 
 ;; note all process-ledger-update operations must return a go-channel

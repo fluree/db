@@ -64,60 +64,64 @@
   "Processes a single transaction, adding it to the DB.
   Assumes flakes are already properly sorted."
   [db flakes]
-  (go-try
-    (let [t                    (.-t ^Flake (first flakes))
-          _                    (when (not= t (dec (:t db)))
-                                 (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
-                                                 {:status 500
-                                                  :error  :db/unexpected-error})))
-          add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
-          add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
-          idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
-          ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
-          flakes-bytes         (flake/size-bytes add-flakes)
-          schema-change?       (schema-util/schema-change? add-flakes)
-          root-setting-change? (schema-util/setting-change? add-flakes)
-          pred-ecount          (-> db :ecount (get const/$_predicate))
-          add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
-          db*                  (loop [[add-pred & r] add-pred-to-idx?
-                                      db db]
-                                 (if add-pred
-                                   (recur r (<? (add-predicate-to-idx db add-pred)))
-                                   db))
-          ;; this could require reindexing, so we handle remove predicates later
-          db*                  (-> db*
-                                   (assoc :t t)
-                                   (update-in [:stats :size] + flakes-bytes) ;; total db ~size
-                                   (update-in [:stats :flakes] + (count add-flakes)))]
-      (loop [[^Flake f & r] add-flakes
-             spot   (get-in db* [:novelty :spot])
-             psot   (get-in db* [:novelty :psot])
-             post   (get-in db* [:novelty :post])
-             opst   (get-in db* [:novelty :opst])
-             ecount (:ecount db)]
-        (if-not f
-          (let [db*  (assoc db* :ecount ecount
-                                :novelty {:spot spot :psot psot :post post :opst opst
-                                          :size (+ flakes-bytes (get-in db* [:novelty :size]))})
-                db** (if (or schema-change? (nil? (:schema db*)))
-                       (assoc db* :schema (<? (schema/schema-map db*)))
-                       db*)]
-            (cond-> db**
+  (go
+    (try*
+      (let [t                    (.-t ^Flake (first flakes))
+            _                    (when (not= t (dec (:t db)))
+                                   (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
+                                                   {:status 500
+                                                    :error  :db/unexpected-error})))
+            add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
+            add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
+            idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
+            ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
+            flakes-bytes         (flake/size-bytes add-flakes)
+            schema-change?       (schema-util/schema-change? add-flakes)
+            root-setting-change? (schema-util/setting-change? add-flakes)
+            pred-ecount          (-> db :ecount (get const/$_predicate))
+            add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
+            db*                  (loop [[add-pred & r] add-pred-to-idx?
+                                        db db]
+                                   (if add-pred
+                                     (recur r (<? (add-predicate-to-idx db add-pred)))
+                                     db))
+            ;; this could require reindexing, so we handle remove predicates later
+            db*                  (-> db*
+                                     (assoc :t t)
+                                     (update-in [:stats :size] + flakes-bytes) ;; total db ~size
+                                     (update-in [:stats :flakes] + (count add-flakes)))]
+        (loop [[^Flake f & r] add-flakes
+               spot   (get-in db* [:novelty :spot])
+               psot   (get-in db* [:novelty :psot])
+               post   (get-in db* [:novelty :post])
+               opst   (get-in db* [:novelty :opst])
+               ecount (:ecount db)]
+          (if-not f
+            (let [db*  (assoc db* :ecount ecount
+                                  :novelty {:spot spot :psot psot :post post :opst opst
+                                            :size (+ flakes-bytes (get-in db* [:novelty :size]))})
+                  db** (if (or schema-change? (nil? (:schema db*)))
+                         (assoc db* :schema (<? (schema/schema-map db*)))
+                         db*)]
+              (cond-> db**
 
-                    root-setting-change?
-                    (assoc :settings (<? (schema/setting-map db**)))))
-          (let [cid     (flake/sid->cid (.-s f))
-                ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
-            (recur r
-                   (conj spot f)
-                   (conj psot f)
-                   (if (get idx?-map (.-p f))
-                     (conj post f)
-                     post)
-                   (if (get ref?-map (.-p f))
-                     (conj opst f)
-                     opst)
-                   ecount*)))))))
+                      root-setting-change?
+                      (assoc :settings (<? (schema/setting-map db**)))))
+            (let [cid     (flake/sid->cid (.-s f))
+                  ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
+              (recur r
+                     (conj spot f)
+                     (conj psot f)
+                     (if (get idx?-map (.-p f))
+                       (conj post f)
+                       post)
+                     (if (get ref?-map (.-p f))
+                       (conj opst f)
+                       opst)
+                     ecount*)))))
+      (catch* e (log/error e "Could not process with-t on the following data, returning error upstream."
+                           {:db db :flakes flakes})
+              e))))
 
 (defn with
   "Returns db 'with' flakes added as a core async promise channel.
