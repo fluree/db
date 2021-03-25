@@ -2,7 +2,10 @@
 # Changelog
 All notable changes to FlureeDB will be documented in this file.
 
-## 1.0.0
+## 1.0.0-rc15
+- Fix issue where selectDistinct executed twice for analytical queries (FC-1076)
+
+## 1.0.0-rc1
 - Add support for cas (compare and set) SmartFunction (FC-956)
 - Fix issues for nodejs permissions (FC-786)
 - Update ledger/db to use try*/catch* macro (FC-918)
