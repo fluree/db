@@ -738,7 +738,6 @@
                   res   (<? (process-ad-hoc-group db res select-spec limit opts))]
               (cond (not (coll? res)) (if inVector? [res] res)
                     selectOne? (first res)
-                    selectDistinct? (distinct res)
                     :else res)))))
 
 
