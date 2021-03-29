@@ -81,9 +81,17 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce app-state (atom {:product "Fluree NodeJs Library"
-                          :version "v1.0.0-rc5"}))
+                          :version "v1.0.0-rc15"}))
 
 (println (:product @app-state) (:version @app-state))
+
+(defonce njs-crypto (atom {:crypto nil}))
+(try
+  (let [cm (js/require "crypto")]
+    (swap! njs-crypto assoc :crypto cm))
+  (catch :default ex
+    (log/warn (str "Error: Unable to access Node.js crypto module:" ex))
+    (log/warn "Private key generation is not available.")))
 
 
 (declare db-instance)
@@ -136,14 +144,32 @@
   [message signature] (crypto/pub-key-from-message message signature))
 
 
-;(defn ^:export new-private-key
-;  "Generates a new private key, returned in a map along with
-;  the public key and account id. Return keys are :public,
-;  :private, and :id."
-;  []
-;  (let [kp      (crypto/generate-key-pair)
-;        account (crypto/account-id-from-private (:private kp))]
-;    (assoc kp :id account)))
+(defn- generate-key-pair
+  "Generates a private-public key pair using the Node.js
+  crypto module. The JavaScript code looks like:
+
+     const ecdh = crypto.createECDH('secp256k1');
+     ecdh.generateKeys()
+     return { privateKey: ecdh.getPrivateKey('hex'),
+              publicKey:  ecdh.getPublicKey('hex','compressed')};
+  "
+  []
+  (let [njsCrypto (-> njs-crypto deref :crypto)
+        ecdh      (js-invoke njsCrypto "createECDH" "secp256k1")
+        _         (js-invoke ecdh "generateKeys")]
+    {:private (js-invoke ecdh "getPrivateKey" "hex")
+     :public (js-invoke ecdh "getPublicKey" "hex" "compressed")}))
+
+
+(defn ^:export new-private-key
+  "Generates a new private key, returned in a map along with
+  the public key and account id. Return keys are :public,
+  :private, and :id.
+  "
+  []
+  (let [kp      (generate-key-pair)
+        account (crypto/account-id-from-private (:private kp))]
+    (assoc kp :id account)))
 
 
 (defn ^:export sign
