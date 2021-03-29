@@ -582,11 +582,11 @@
                                                                             (get vars select-val) (fn [tuple] (get vars select-val)))]
                                                        (if (:selection select)
                                                          (fn [tuple]
-                                                           (go-try (when (select-fn tuple)
+                                                           (go-try (when-let [_id (select-fn tuple)]
                                                                      (or (<? (query db {:selectOne (:selection select)
-                                                                                        :from      (select-fn tuple)
+                                                                                        :from      _id
                                                                                         :opts      opts}))
-                                                                         {:_id (select-fn tuple)}))))
+                                                                         {:_id _id}))))
                                                          (fn [tuple]
                                                            (go-try (select-fn tuple)))))) select)
                                               (map (fn [select]
@@ -621,14 +621,18 @@
                (if inVector? [res'] res'))
 
              (let [{:keys [headers tuples]} (if aggregates (analytical/add-aggregate-cols res aggregates) res)
-                   offset' (if (or selectDistinct? groupBy) 0 offset)
-                   limit'  (if selectDistinct? nil group-limit)
-                   tuples' (if orderBy
-                             (order-offset-and-limit-results tuples headers orderBy offset' limit')
-                             tuples)
-                   res'    (->> (dissoc opts :limit :offset :orderBy :groupBy)
-                                (format-filter-tuples db tuples' select-spec headers vars)
-                                <?)]
+                   offset'  (if groupBy 0 offset)
+                   tuples'  (if selectDistinct?
+                              (into #{} tuples)
+                              tuples)
+                   tuples'' (cond
+                              orderBy (order-offset-and-limit-results tuples' headers orderBy offset' group-limit)
+                              groupBy tuples'               ;; TODO - needed to pass tests, but no optimizations for groupBy (Revisit!)
+                              (or offset' group-limit) (->> tuples' (drop offset') (take group-limit))
+                              :else tuples')
+                   res'     (->> (dissoc opts :limit :offset :orderBy :groupBy)
+                                 (format-filter-tuples db tuples'' select-spec headers vars)
+                                 <?)]
                ;; TODO - drop unused columns, and calculate distinct before resolving all vals
                (if (or selectDistinct? (and (not orderBy) (or group-limit offset)))
                  (cond->> res'
