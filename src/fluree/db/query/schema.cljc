@@ -289,6 +289,12 @@
                     (assoc acc p o))))
           {} flakes))
 
+(defn- extract-spec-ids
+  [spec-pid schema-flakes]
+  (->> schema-flakes
+       (keep #(when (= spec-pid (.-p %)) (.-o %)))
+       vec))
+
 (defn schema-map
   "Returns a map of the schema for a db to allow quick lookups of schema properties.
   Schema is a map with keys:
@@ -311,11 +317,12 @@
                                              partition (or (get p->v const/$_collection:partition)
                                                            (flake/sid->i sid))
                                              c-name    (get p->v const/$_collection:name)
-                                             spec      (get p->v const/$_collection:spec)
+                                             specs     (when (get p->v const/$_collection:spec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                         (extract-spec-ids const/$_collection:spec coll-flakes))
                                              specDoc   (get p->v const/$_collection:specDoc)
                                              c-props   {:name      c-name
                                                         :sid       sid
-                                                        :spec      spec
+                                                        :spec      specs
                                                         :specDoc   specDoc
                                                         :id        partition ;; TODO - deprecate! (use partition instead)
                                                         :partition partition}]
@@ -354,9 +361,11 @@
                                                           :noHistory          (boolean (get p->v const/$_predicate:noHistory))
                                                           :restrictCollection (get p->v const/$_predicate:restrictCollection)
                                                           :retractDuplicates  (boolean (get p->v const/$_predicate:retractDuplicates))
-                                                          :spec               (get p->v const/$_predicate:spec)
+                                                          :spec               (when (get p->v const/$_predicate:spec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                                                (extract-spec-ids const/$_predicate:spec pred-flakes))
                                                           :specDoc            (get p->v const/$_predicate:specDoc)
-                                                          :txSpec             (get p->v const/$_predicate:txSpec)
+                                                          :txSpec             (when (get p->v const/$_predicate:txSpec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                                                (extract-spec-ids const/$_predicate:txSpec pred-flakes))
                                                           :txSpecDoc          (get p->v const/$_predicate:txSpecDoc)
                                                           :restrictTag        (get p->v const/$_predicate:restrictTag)
                                                           :fullText           fullText?}]
