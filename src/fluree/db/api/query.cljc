@@ -271,7 +271,6 @@
 
                         (and (nil? s) (not (nil? p)) (not (nil? o)))
                         [[p o s t] :post]
-
                         :else
                         (throw (ex-info (str "History query not properly formatted. Must include at least an subject or predicate to query. Provided: " history)
                                         {:status 400

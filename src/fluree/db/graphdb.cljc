@@ -39,10 +39,8 @@
       (throw (ex-info (str "Invalid ledger identity: " ledger)
                       {:status 400 :error :db/invalid-ledger-name})))))
 
-
-(def ^:const exclude-predicates
-  "Predicates to exclude from the database"
-  #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
+;; exclude these predicates from the database
+(def ^:const exclude-predicates #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
 
 (defn add-predicate-to-idx
   [db pred-id]
@@ -66,63 +64,64 @@
   "Processes a single transaction, adding it to the DB.
   Assumes flakes are already properly sorted."
   [db flakes]
-  (go-try
-    (let [t                    (.-t ^Flake (first flakes))
-          _                    (when (not= t (dec (:t db)))
-                                 (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
-                                                 {:status 500
-                                                  :error  :db/unexpected-error})))
-          add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
-          add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
-          idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
-          ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
-          flakes-bytes         (flake/size-bytes add-flakes)
-          schema-change?       (schema-util/schema-change? add-flakes)
-          root-setting-change? (schema-util/setting-change? add-flakes)
-          pred-ecount          (-> db :ecount (get const/$_predicate))
-          add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
-          db*                  (loop [[add-pred & r] add-pred-to-idx?
-                                      db db]
-                                 (if add-pred
-                                   (recur r (<? (add-predicate-to-idx db add-pred)))
-                                   db))
-          ;; this could require reindexing, so we handle remove predicates later
-          db*                  (-> db*
-                                   (assoc :t t)
-                                   (update-in [:stats :size] + flakes-bytes) ;; total db ~size
-                                   (update-in [:stats :flakes] + (count add-flakes)))]
-      (loop [[^Flake f & r] add-flakes
-             spot   (get-in db* [:novelty :spot])
-             psot   (get-in db* [:novelty :psot])
-             post   (get-in db* [:novelty :post])
-             opst   (get-in db* [:novelty :opst])
-             tspo   (get-in db* [:novelty :tspo])
-             ecount (:ecount db)]
-        (if-not f
-          (let [flake-size (-> db*
-                               (get-in [:novelty :size])
-                               (+ flakes-bytes))
-                db*  (assoc db*
-                            :ecount ecount
-                            :novelty {:spot spot, :psot psot, :post post,
-                                      :opst opst, :tspo tspo, :size flake-size})]
-            (cond-> db*
-              (or schema-change?
-                  (nil? (:schema db*))) (assoc :schema (<? (schema/schema-map db*)))
-              root-setting-change?      (assoc :settings (<? (schema/setting-map db*)))))
-          (let [cid     (flake/sid->cid (.-s f))
-                ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
-            (recur r
-                   (conj spot f)
-                   (conj psot f)
-                   (if (get idx?-map (.-p f))
-                     (conj post f)
-                     post)
-                   (if (get ref?-map (.-p f))
-                     (conj opst f)
-                     opst)
-                   (conj tspo f)
-                   ecount*)))))))
+  (go
+    (try*
+      (let [t                    (.-t ^Flake (first flakes))
+            _                    (when (not= t (dec (:t db)))
+                                   (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
+                                                   {:status 500
+                                                    :error  :db/unexpected-error})))
+            add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
+            add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
+            idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
+            ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
+            flakes-bytes         (flake/size-bytes add-flakes)
+            schema-change?       (schema-util/schema-change? add-flakes)
+            root-setting-change? (schema-util/setting-change? add-flakes)
+            pred-ecount          (-> db :ecount (get const/$_predicate))
+            add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
+            db*                  (loop [[add-pred & r] add-pred-to-idx?
+                                        db db]
+                                   (if add-pred
+                                     (recur r (<? (add-predicate-to-idx db add-pred)))
+                                     db))
+            ;; this could require reindexing, so we handle remove predicates later
+            db*                  (-> db*
+                                     (assoc :t t)
+                                     (update-in [:stats :size] + flakes-bytes) ;; total db ~size
+                                     (update-in [:stats :flakes] + (count add-flakes)))]
+        (loop [[^Flake f & r] add-flakes
+               spot   (get-in db* [:novelty :spot])
+               psot   (get-in db* [:novelty :psot])
+               post   (get-in db* [:novelty :post])
+               opst   (get-in db* [:novelty :opst])
+               ecount (:ecount db)]
+          (if-not f
+            (let [db*  (assoc db* :ecount ecount
+                                  :novelty {:spot spot :psot psot :post post :opst opst
+                                            :size (+ flakes-bytes (get-in db* [:novelty :size]))})
+                  db** (if (or schema-change? (nil? (:schema db*)))
+                         (assoc db* :schema (<? (schema/schema-map db*)))
+                         db*)]
+              (cond-> db**
+
+                      root-setting-change?
+                      (assoc :settings (<? (schema/setting-map db**)))))
+            (let [cid     (flake/sid->cid (.-s f))
+                  ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
+              (recur r
+                     (conj spot f)
+                     (conj psot f)
+                     (if (get idx?-map (.-p f))
+                       (conj post f)
+                       post)
+                     (if (get ref?-map (.-p f))
+                       (conj opst f)
+                       opst)
+                     ecount*)))))
+      (catch* e (log/error e "Could not process with-t on the following data, returning error upstream."
+                           {:db db :flakes flakes})
+              e))))
 
 (defn with
   "Returns db 'with' flakes added as a core async promise channel.
@@ -192,7 +191,7 @@
                                 (assoc db* idx (-> (get db* idx)
                                                    (assoc :tt-id tt-id'))))
                               (assoc db :tt-id tt-id')
-                              index/types)
+                              [:spot :psot :post :opst])
           flakes-by-t (->> flakes
                            (sort-by :t)
                            reverse
@@ -249,7 +248,7 @@
                                      e)))))
     return-chan))
 
-(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst tspo schema settings index-configs schema-cache novelty permissions fork fork-block current-db-fn]
+(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst schema settings index-configs schema-cache novelty permissions fork fork-block current-db-fn]
   dbproto/IFlureeDb
   (-latest-db [this]
     (go-try
@@ -267,7 +266,7 @@
   (-p-prop [this property predicate]
     ;; predicate properties
     (assert (#{:name :id :type :ref? :idx? :unique :multi :index :upsert :component :noHistory :restrictCollection
-               :spec :specDoc :txSpec :txSpecDoc :restrictTag} property) (str "Invalid predicate property: " (pr-str property)))
+               :spec :specDoc :txSpec :txSpecDoc :restrictTag :retractDuplicates} property) (str "Invalid predicate property: " (pr-str property)))
     (cond->> (get-in schema [:pred predicate property])
              (= :restrictCollection property) (dbproto/-c-prop this :partition)))
   (-tag [this tag-id]
@@ -328,51 +327,64 @@
 
 (defn new-novelty-map
   [index-configs]
-  (reduce
-   (fn [m idx]
-     (assoc m idx (-> index-configs
-                      (get-in [idx :historyComparator])
-                      avl/sorted-set-by)))
-   {:size 0} index/types))
+  (->> [:spot :psot :post :opst]
+       (reduce
+         (fn [m idx]
+           (let [ss (avl/sorted-set-by (get-in index-configs [idx :historyComparator]))]
+             (assoc m idx ss)))
+         {:size 0})))
 
 (defn new-empty-index
-  ([conn network dbid idx-type]
-   (new-empty-index conn index/default-configs network dbid idx-type))
-  ([conn index-configs network dbid idx-type]
-   (let [index-config (get index-configs idx-type)
-         _            (assert index-config (str "No index config found for index: " idx-type))
-         comparator   (:historyComparator index-config)
-         _            (assert comparator (str "No index comparator found for index: " idx-type))
-         first-flake  (flake/->Flake util/max-long 0 util/max-long 0 true nil) ;; left hand side is the largest flake possible
-         child-node   (storage/map->UnresolvedNode
+  [conn index-configs network dbid idx]
+  (let [index-config (get index-configs idx)
+        _            (assert index-config (str "No index config found for index: " idx))
+        comparator   (:historyComparator index-config)
+        _            (assert comparator (str "No index comparator found for index: " idx))
+        first-flake  (flake/->Flake util/max-long 0 util/max-long 0 true nil) ;; left hand side is the largest flake possible
+        child-node   (storage/map->UnresolvedNode
                        {:conn  conn :config index-config :network network :dbid dbid :id :empty :leaf true
                         :first first-flake :rhs nil :size 0 :block 0 :t 0 :tt-id nil :leftmost? true})
-         children     (avl/sorted-map-by comparator first-flake child-node)
-         idx-node     (index/->IndexNode 0 0 nil children index-config true)]
-     ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
-     idx-node)))
+        children     (avl/sorted-map-by comparator first-flake child-node)
+        idx-node     (index/->IndexNode 0 0 nil children index-config true)]
+    ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
+    idx-node))
+
+(def default-index-configs {:spot (index/map->IndexConfig {:index-type        :spot
+                                                           :comparator        flake/cmp-flakes-spot
+                                                           :historyComparator flake/cmp-flakes-spot-novelty})
+                            :psot (index/map->IndexConfig {:index-type        :psot
+                                                           :comparator        flake/cmp-flakes-psot
+                                                           :historyComparator flake/cmp-flakes-psot-novelty})
+                            :post (index/map->IndexConfig {:index-type        :post
+                                                           :comparator        flake/cmp-flakes-post
+                                                           :historyComparator flake/cmp-flakes-post-novelty})
+                            :opst (index/map->IndexConfig {:index-type        :opst
+                                                           :comparator        flake/cmp-flakes-opst
+                                                           :historyComparator flake/cmp-flakes-opst-novelty})})
 
 (defn blank-db
   [conn network dbid schema-cache current-db-fn]
   (assert conn "No conn provided when creating new db.")
   (assert network "No network provided when creating new db.")
   (assert dbid "No dbid provided when creating new db.")
-  (let [novelty     (new-novelty-map index/default-configs)
+  (let [novelty     (new-novelty-map default-index-configs)
         permissions {:collection {:all? false}
                      :predicate  {:all? true}
                      :root?      true}
-        spot        (new-empty-index conn network dbid :spot)
-        psot        (new-empty-index conn network dbid :psot)
-        post        (new-empty-index conn network dbid :post)
-        opst        (new-empty-index conn network dbid :opst)
-        tspo        (new-empty-index conn network dbid :tspo)
-        stats       {:flakes 0, :size 0, :indexed 0}
+        spot        (new-empty-index conn default-index-configs network dbid :spot)
+        psot        (new-empty-index conn default-index-configs network dbid :psot)
+        post        (new-empty-index conn default-index-configs network dbid :post)
+        opst        (new-empty-index conn default-index-configs network dbid :opst)
+        stats       {:flakes  0
+                     :size    0
+                     :indexed 0}
         fork        nil
         fork-block  nil
         schema      nil
         settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst tspo schema settings index/default-configs schema-cache novelty permissions fork fork-block current-db-fn)))
+    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst schema settings default-index-configs schema-cache novelty permissions fork fork-block current-db-fn)))
 
 (defn graphdb?
   [db]
   (instance? GraphDb db))
+

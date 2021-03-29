@@ -36,8 +36,12 @@ out/flureeworker.js: out package.json package-lock.json node_modules build-webwo
 
 webworker: out/flureeworker.js
 
-pom.xml: deps.edn
+# force this to always run b/c it's way too easy for pom.xml to be newer than deps.edn
+# but still be out of date w/r/t dep versions
+pom.xml: FORCE
 	clojure -Spom
+
+FORCE:
 
 deps:
 	clojure -A:cljtest:cljstest -P
