@@ -4,14 +4,7 @@
             [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.api :as fdb]
-            [fluree.db.util.core :as util]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.dbfunctions.core :as dbfunctions]
-            [fluree.db.util.async :as async-util]
-            [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.constants :as const])
-  (:import (fluree.db.flake Flake)))
+            [fluree.db.util.core :as util]))
 
 ;; transaction utilities
 
