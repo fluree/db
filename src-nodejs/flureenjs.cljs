@@ -81,9 +81,16 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce app-state (atom {:product "Fluree NodeJs Library"
-                          :version "v1.0.0-rc15"}))
+                          :version "v1.0.0-rc16"}))
 
 (println (:product @app-state) (:version @app-state))
+
+
+;; ======================================
+;;
+;; Get handle to Node.js crypto module
+;;
+;; ======================================
 
 (defonce njs-crypto (atom {:crypto nil}))
 (try
@@ -150,8 +157,8 @@
 
      const ecdh = crypto.createECDH('secp256k1');
      ecdh.generateKeys()
-     return { privateKey: ecdh.getPrivateKey('hex'),
-              publicKey:  ecdh.getPublicKey('hex','compressed')};
+     return { private: ecdh.getPrivateKey('hex'),
+              public:  ecdh.getPublicKey('hex','compressed')};
   "
   []
   (let [njsCrypto (-> njs-crypto deref :crypto)
@@ -167,9 +174,13 @@
   :private, and :id.
   "
   []
-  (let [kp      (generate-key-pair)
-        account (crypto/account-id-from-private (:private kp))]
-    (assoc kp :id account)))
+  (try
+    (let [kp      (generate-key-pair)
+          account (crypto/account-id-from-private (:private kp))]
+      (assoc kp :id account))
+    (catch :default e
+      (log/error (str "Unable to generate private key. Error: " e))
+      (throw e))))
 
 
 (defn ^:export sign
