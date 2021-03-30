@@ -91,14 +91,14 @@
 ;; Get handle to Node.js crypto module
 ;;
 ;; ======================================
-
-(defonce njs-crypto (atom {:crypto nil}))
-(try
-  (let [cm (js/require "crypto")]
-    (swap! njs-crypto assoc :crypto cm))
-  (catch :default ex
-    (log/warn (str "Error: Unable to access Node.js crypto module:" ex))
-    (log/warn "Private key generation is not available.")))
+(def ^:const njs-crypto
+  (try
+    (js/require "crypto")
+    (catch :default ex
+      (do
+        (log/warn (str "Error: Unable to access Node.js crypto module:" ex))
+        (log/warn "Private key generation is not available.")
+        nil))))
 
 
 (declare db-instance)
@@ -161,11 +161,12 @@
               public:  ecdh.getPublicKey('hex','compressed')};
   "
   []
-  (let [njsCrypto (-> njs-crypto deref :crypto)
-        ecdh      (js-invoke njsCrypto "createECDH" "secp256k1")
-        _         (js-invoke ecdh "generateKeys")]
-    {:private (js-invoke ecdh "getPrivateKey" "hex")
-     :public (js-invoke ecdh "getPublicKey" "hex" "compressed")}))
+  (if njs-crypto
+    (let [ecdh      (js-invoke njs-crypto "createECDH" "secp256k1")
+          _         (js-invoke ecdh "generateKeys")]
+      {:private (js-invoke ecdh "getPrivateKey" "hex")
+       :public (js-invoke ecdh "getPublicKey" "hex" "compressed")})
+    (throw "Node.js crypto module not accessible")))
 
 
 (defn ^:export new-private-key
