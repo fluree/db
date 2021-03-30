@@ -121,6 +121,36 @@
                  (:where subject))
               "correctly constructs the where clause")))
 
+      (testing "with 'greater than or equal' predicate"
+        (let [query   "SELECT name, email FROM person WHERE age >= 18"
+              subject (parse query)]
+
+          (is (= ["?personName" "?personEmail"]
+                 (:select subject))
+              "correctly constructs the select clause")
+
+          (is (= [["?person" "person/age" "?personAge"]
+                  {:filter ["(>= ?personAge 18)"]}
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]]
+                 (:where subject))
+              "correctly constructs the where clause")))
+
+      (testing "with 'less than or equal' predicate"
+        (let [query   "SELECT name, email FROM person WHERE age <= 18"
+              subject (parse query)]
+
+          (is (= ["?personName" "?personEmail"]
+                 (:select subject))
+              "correctly constructs the select clause")
+
+          (is (= [["?person" "person/age" "?personAge"]
+                  {:filter ["(<= ?personAge 18)"]}
+                  ["?person" "person/name" "?personName"]
+                  ["?person" "person/email" "?personEmail"]]
+                 (:where subject))
+              "correctly constructs the where clause")))
+
       (testing "with a null predicate"
         (testing "negated"
           (let [query   "SELECT name, email FROM person WHERE email IS NOT NULL"
