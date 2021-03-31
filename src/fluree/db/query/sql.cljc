@@ -271,12 +271,14 @@
                                                     [[(::subj right) (::pred right) v]
                                                      [(::subj left) (::pred left) v]]))
 
+              ; this condition handles the <, <=, >, >= operations
               (#{\> \<} comp) (cond
                                 (and (::pred left)
                                      (::obj right)) (let [pred      (::pred left)
                                                           obj       (::obj right)
+                                                          comp'     (->> parse-map :comp-op (apply str))
                                                           field-var (template/build-var pred)
-                                                          filter-fn (template/build-fn-call [comp field-var obj])]
+                                                          filter-fn (template/build-fn-call [comp' field-var obj])]
                                                       [[template/collection-var pred field-var]
                                                        {:filter [filter-fn]}]))))))
 
