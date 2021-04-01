@@ -8,6 +8,7 @@
 ;; system constants
 
 ;; system collection ids
+(def ^:const $_tx -1)                                       ;; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
 (def ^:const $_predicate 0)
 (def ^:const $_collection 1)
 (def ^:const $_shard 2)
