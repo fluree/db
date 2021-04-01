@@ -570,6 +570,53 @@
         (:variable select)
         (util/index-of headers (:variable select))))
 
+
+(defn pipeline-expandmaps-result
+  "For each tuple in the results that requires a query map expanded, fetches the
+  results in parallel with `parallelism` supplied.
+
+  i.e. if a simple one-tuple result set were columns [?person], where ?person is just
+  the subject id of persons... then the tuples would look like
+  [[1234567] [1234566] [1234565] ...]
+
+  The select clause might be {?person [person/fullName, person/age, {person/children [*]}]}
+
+  This will produce the results of each of the select clauses based on the source tuples.
+
+  TODO - this uses a 'functionArray' of pre-defined functions that take a single tuple argument
+       - I think this could be done more cleanly and possibly efficiently, so refactor another day."
+  [tuples functionArray inVector? pretty-print parallelism]
+  (go-try
+    (let [queue-ch (async/chan)
+          res-ch   (async/chan)
+          af       (fn [tuple port]
+                     (async/go
+                       (let [tuple-res (async/<! (format-tuple functionArray tuple))
+                             res       (cond (util/exception? tuple-res) tuple-res
+                                             pretty-print (zipmap pretty-print tuple-res)
+                                             inVector? tuple-res
+                                             :else (first tuple-res))]
+                         (async/put! port res)
+                         (async/close! port))))]
+      (async/onto-chan! queue-ch tuples)
+      (async/pipeline-async parallelism res-ch af queue-ch)
+
+      (loop [acc []]
+        (let [next-res (async/<! res-ch)]
+          (cond
+            (nil? next-res)
+            acc
+
+            (util/exception? next-res)
+            (do
+              (async/close! queue-ch)
+              (async/close! res-ch)
+              (throw next-res))
+
+            :else
+            (recur (conj acc next-res))))))))
+
+
 (defn format-filter-tuples
   [db tuples {:keys [prettyPrint select inVector? expandMaps?] :as select-spec} headers vars opts]
   (go-try (let [pp            (when prettyPrint
@@ -595,13 +642,7 @@
                                                        (let [idx (get-header-idx headers select)]
                                                          (fn [tuple]
                                                            (nth tuple idx))))) select))]
-            (if expandMaps? (<? (async/go-loop [[tuple & r] tuples
-                                                res []]
-                                  (if tuple (let [tuple-res  (<? (format-tuple functionArray tuple))
-                                                  tuple-res' (cond pp (zipmap pp tuple-res)
-                                                                   inVector? tuple-res
-                                                                   :else (first tuple-res))]
-                                              (recur r (conj res tuple-res'))) res)))
+            (if expandMaps? (<? (pipeline-expandmaps-result tuples functionArray inVector? pp 8))
                             (map (fn [tuple]
                                    (let [tuple-res (map #(% tuple) functionArray)]
                                      (cond pp (zipmap pp tuple-res)
