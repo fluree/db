@@ -586,14 +586,45 @@
         vals (vals q-map)]
     (zipmap keys vals)))
 
-(defn find-match
-  "Given a single tuple from A, a-idxs, b-idxs, b-not-idxs, and b-tuples, return any tuples in b that match."
-  [a-tuple a-idxs b-tuples b-idxs b-not-idxs]
-  (let [a-tuple-part (map #(nth a-tuple %) a-idxs)]
-    (reduce (fn [acc b-tuple]
-              (if (= a-tuple-part (map #(nth b-tuple %) b-idxs))
-                (conj (or acc []) (concat a-tuple (map #(nth b-tuple %) b-not-idxs))) acc))
-            nil b-tuples)))
+
+(defn match-tuples-lists
+  "Combines two lists of tuples, a-tuples and b-tuples, into a single aggregated
+  tuples list based on matching criteria.
+
+  Matching criteria is a-idxs and b-idxs - which represent the multiple index (columns)
+  of each tuples set that must be compared. i.e. if column 1 in a-tuples is to be compared
+  to column 3 in b-tuples, then a-idxs will be [0] and b-idxs will be [2]. Indexes start at 0.
+  Multiple indexes can be compared, i.e. a-idxs of [1 2] means compare both 1 and 2 columns.
+  Order matters. The count of a-idxs and b-idxs should always be identical, else there would never
+  be any matches.
+
+  When there is a match, all non-matching columns from matching b-tuples are appended to the
+  respective matched a-tuple. i.e. if b-tuples had 4 columns (indexes 0 -> 3),
+  and was matching on [2], then columns [0 1 3] would be appended to the respective matched a-tuple.
+
+  If left-outer-join? is true, instead of discarding any non-matches,
+  we retain all the a-tuples, but pad the extra b-columns (b-not-idxs) with 'nil'"
+  [a-idxs a-tuples b-idxs b-tuples b-not-idxs left-outer-join?]
+  ;; make a comparison map of b-tuples for quick lookups, with the key
+  ;; being the b-ixs values to be compared, and value being the b-tuples (can be many)
+  ;; that match that comparison
+  (let [b-map (reduce (fn [acc tuple]
+                        (let [b-compare (map #(nth tuple %) b-idxs)]
+                          (update acc b-compare conj tuple)))
+                      {} b-tuples)]
+    ;; iterate over a-tuples, and their respective match criteria, to see if matching b-tuple(s) exist
+    (seq (reduce
+           (fn [acc a-tuple]
+             (let [a-compare (map #(nth a-tuple %) a-idxs)]
+               (if-let [b-matched (get b-map a-compare)]
+                 ;; found match, appends all b-tuples columns (b-not-idxs) to the matching a-tuple
+                 (reduce #(conj %1 (concat a-tuple (map (fn [idx] (nth %2 idx)) b-not-idxs))) acc b-matched)
+                 ;; no match, but if left-outer-join retain a-tuple and pad with nil values
+                 (if left-outer-join?
+                   (conj acc (concat a-tuple (repeat (count b-not-idxs) nil)))
+                   acc))))
+           [] a-tuples))))
+
 
 (defn find-match+row-nums
   "Given a single tuple from A, a-idxs, b-idxs, b-not-idxs, and b-tuples, return any tuples in b that match.
@@ -613,9 +644,7 @@
         b-idxs      (map #(util/index-of (:headers b-res) %) common-keys)
         b-not-idxs  (-> b-res :headers count (#(range 0 %))
                         set (set/difference (set b-idxs)) (#(apply vector %)))
-        c-tuples    (apply concat (map (fn [a-tuple]
-                                         (find-match a-tuple a-idxs (:tuples b-res)
-                                                     b-idxs b-not-idxs)) (:tuples a-res)))
+        c-tuples    (match-tuples-lists a-idxs (:tuples a-res) b-idxs (:tuples b-res) b-not-idxs false)
         c-headers   (concat (:headers a-res) (map #(nth (:headers b-res) %) b-not-idxs))]
     {:headers c-headers
      :vars    (merge (:vars a-res) (:vars b-res))
@@ -630,11 +659,7 @@
         b-idxs      (map #(util/index-of (:headers b-tuples) %) common-keys)
         b-not-idxs  (-> b-tuples :headers count (#(range 0 %))
                         set (set/difference (set b-idxs)) (#(apply vector %)))
-        c-tuples    (apply concat (map (fn [a-tuple]
-                                         (let [matches (find-match a-tuple a-idxs (:tuples b-tuples)
-                                                                   b-idxs b-not-idxs)]
-                                           (or matches [(concat a-tuple (repeat (count b-not-idxs) nil))])))
-                                       (:tuples a-tuples)))
+        c-tuples    (match-tuples-lists a-idxs (:tuples a-tuples) b-idxs (:tuples b-tuples) b-not-idxs true)
         c-headers   (concat (:headers a-tuples) (map #(nth (:headers b-tuples) %) b-not-idxs))]
     {:headers c-headers
      :vars    (merge (:vars a-tuples) (:vars b-tuples))
@@ -655,7 +680,8 @@
                                     (fn [[c-tuples b-matched-rows] a-tuple]
                                       (let [[matches matched-rows] (find-match+row-nums a-tuple a-idxs (:tuples b-tuples) b-idxs b-not-idxs)
                                             matches (or matches [(concat a-tuple (repeat (count b-not-idxs) nil))])]
-                                        [(concat c-tuples matches)
+                                        ;; TODO - revise this fn - below was susceptible to stack overflows, quick fix to retain original ordering in case important
+                                        [(into (vec c-tuples) matches) #_(concat c-tuples matches)
                                          (set/union b-matched-rows matched-rows)]))
                                     [[] #{}] (:tuples a-tuples))
         b-unmatched-rows          (remove b-matched-rows (range 0 (count (:tuples b-tuples))))
