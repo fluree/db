@@ -4,6 +4,7 @@
          org.clojure/core.cache            {:mvn/version "1.0.207"}
          org.clojars.mmb90/cljs-cache      {:mvn/version "0.1.4"}
          org.clojure/data.avl              {:mvn/version "0.1.0"}
+         org.clojure/data.xml              {:mvn/version "0.2.0-alpha6"}
          org.clojure/tools.reader          {:mvn/version "1.3.5"}
          environ/environ                   {:mvn/version "1.2.0"}
          byte-streams/byte-streams         {:mvn/version "0.2.4"}
@@ -96,4 +97,7 @@
   :deploy
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
    :main-opts ["-m" "deps-deploy.deps-deploy" "deploy"
-               "target/fluree-db.jar"]}}}
+               "target/fluree-db.jar"]}
+
+  :meta
+  {:main-opts ["-m" "fluree.db.meta"]}}}
