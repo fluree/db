@@ -76,18 +76,18 @@
    :main-opts ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
 
   :jar
-  {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.0.211"}}
-   :exec-fn hf.depstar/jar
-   :exec-args {:jar "target/fluree-db.jar"
-               :group-id :mvn/group-id
-               :artifact-id :mvn/artifact-id
-               :version :mvn/version
-               :sync-pom true}}
+  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.0.211"}}
+   :exec-fn      hf.depstar/jar
+   :exec-args    {:jar "target/fluree-db.jar"
+                  :group-id :mvn/group-id
+                  :artifact-id :mvn/artifact-id
+                  :version :mvn/version
+                  :sync-pom true}}
 
   :install
-  {:extra-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
-   :main-opts  ["-m" "deps-deploy.deps-deploy" "install"
-                "target/fluree-db.jar"]}
+  {:replace-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
+   :main-opts    ["-m" "deps-deploy.deps-deploy" "install"
+                  "target/fluree-db.jar"]}
 
   :docs
   {:extra-paths ["src-docs"]
@@ -95,9 +95,9 @@
    :main-opts   ["-m" "fluree.db.docs"]}
 
   :deploy
-  {:extra-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
-   :main-opts ["-m" "deps-deploy.deps-deploy" "deploy"
-               "target/fluree-db.jar"]}
+  {:replace-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
+   :main-opts    ["-m" "deps-deploy.deps-deploy" "deploy"
+                  "target/fluree-db.jar"]}
 
   :meta
   {:main-opts ["-m" "fluree.db.meta"]}}}
