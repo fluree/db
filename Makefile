@@ -65,6 +65,8 @@ doc/clj/%.html: doc/%.md
 
 docs: doc/clj/fluree.db.api.html doc/clj/index.html $(DOCS_TARGETS)
 
+doc: docs
+
 cljstest: node_modules package-lock.json
 	clojure -M:cljstest
 
