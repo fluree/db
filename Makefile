@@ -1,4 +1,4 @@
-.PHONY: deps jar install deploy nodejs browser webworker cljtest cljstest test clean docs
+.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljstest test clean docs
 
 DOCS_MARKDOWN := $(shell find doc -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:doc/%.md=doc/clj/%.html)
@@ -9,6 +9,8 @@ BROWSER_SOURCES := src-cljs/flureedb.cljs
 WEBWORKER_SOURCES := src-cljs/flureeworker.cljs
 NODEJS_SOURCES := $(shell find src-nodejs)
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
+
+all: jar browser nodejs webworker docs
 
 target/fluree-db.jar: pom.xml out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
 	clojure -X:jar
