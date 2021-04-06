@@ -12,7 +12,7 @@ ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURC
 
 all: jar browser nodejs webworker docs
 
-target/fluree-db.jar: pom.xml out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
+target/fluree-db.jar: out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
 	clojure -X:jar
 
 jar: target/fluree-db.jar
@@ -38,13 +38,6 @@ out/flureeworker.js: out package.json package-lock.json node_modules build-webwo
 
 webworker: out/flureeworker.js
 
-# force this to always run b/c it's way too easy for pom.xml to be newer than deps.edn
-# but still be out of date w/r/t dep versions
-pom.xml: FORCE
-	clojure -Spom
-
-FORCE:
-
 deps:
 	clojure -A:cljtest:cljstest -P
 
@@ -57,7 +50,7 @@ install: target/fluree-db.jar
 deploy: target/fluree-db.jar
 	clojure -M:deploy
 
-doc/clj/fluree.db.api.html doc/clj/index.html: pom.xml src/fluree/db/api.clj
+doc/clj/fluree.db.api.html doc/clj/index.html: src/fluree/db/api.clj
 	clojure -M:docs
 
 doc/clj/%.html: doc/%.md

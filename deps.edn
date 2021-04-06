@@ -40,7 +40,11 @@
 
  :paths ["src" "resources"]
  :aliases
- {:cljstest
+ {:mvn/group-id com.fluree
+  :mvn/artifact-id db
+  :mvn/version "1.0.0-rc15"
+
+  :cljstest
   {:extra-paths ["test"]
    :extra-deps {olical/cljs-test-runner {:mvn/version "3.8.0"}}
    :main-opts ["-m" "cljs-test-runner.main"
@@ -73,7 +77,11 @@
   :jar
   {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.0.211"}}
    :exec-fn hf.depstar/jar
-   :exec-args {:jar "target/fluree-db.jar"}}
+   :exec-args {:jar "target/fluree-db.jar"
+               :group-id :mvn/group-id
+               :artifact-id :mvn/artifact-id
+               :version :mvn/version
+               :sync-pom true}}
 
   :install
   {:extra-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
