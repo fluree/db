@@ -43,14 +43,18 @@
 (def ^:const exclude-predicates #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
 
 (defn add-predicate-to-idx
-  [db pred-id]
+  "Adds a predicate to post index when :index true is turned on.
+  Ensures adding the predicate into novelty won't blow past novelty-max.
+  When reindex? is true, we are doing a full reindex and allow the novelty
+  to grow beyond novelty-max."
+  [db pred-id {:keys [reindex?] :as opts}]
   (go-try
     (let [flakes-to-idx (<? (query-range/index-range db :psot = [pred-id]))
           {:keys [post size]} (:novelty db)
           with-size     (flake/size-bytes flakes-to-idx)
           total-size    (+ size with-size)
           {:keys [novelty-min novelty-max]} (get-in db [:conn :meta])
-          _             (if (> total-size novelty-max)
+          _             (if (and (> total-size novelty-max) (not reindex?))
                           (throw (ex-info (str "You cannot add " pred-id " to the index at this point. There are too many affected flakes.")
                                           {:error  :db/max-novelty-size
                                            :status 400})))
@@ -63,96 +67,98 @@
 (defn with-t
   "Processes a single transaction, adding it to the DB.
   Assumes flakes are already properly sorted."
-  [db flakes]
-  (go-try
-    (let [t                    (.-t ^Flake (first flakes))
-          _                    (when (not= t (dec (:t db)))
-                                 (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
-                                                 {:status 500
-                                                  :error  :db/unexpected-error})))
-          add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
-          add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
-          idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
-          ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
-          flakes-bytes         (flake/size-bytes add-flakes)
-          schema-change?       (schema-util/schema-change? add-flakes)
-          root-setting-change? (schema-util/setting-change? add-flakes)
-          pred-ecount          (-> db :ecount (get const/$_predicate))
-          add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
-          db*                  (loop [[add-pred & r] add-pred-to-idx?
-                                      db db]
-                                 (if add-pred
-                                   (recur r (<? (add-predicate-to-idx db add-pred)))
-                                   db))
-          ;; this could require reindexing, so we handle remove predicates later
-          db*                  (-> db*
-                                   (assoc :t t)
-                                   (update-in [:stats :size] + flakes-bytes) ;; total db ~size
-                                   (update-in [:stats :flakes] + (count add-flakes)))]
-      (loop [[^Flake f & r] add-flakes
-             spot   (get-in db* [:novelty :spot])
-             psot   (get-in db* [:novelty :psot])
-             post   (get-in db* [:novelty :post])
-             opst   (get-in db* [:novelty :opst])
-             ecount (:ecount db)]
-        (if-not f
-          (let [db*  (assoc db* :ecount ecount
-                                :novelty {:spot spot :psot psot :post post :opst opst
-                                          :size (+ flakes-bytes (get-in db* [:novelty :size]))})
-                db** (if (or schema-change? (nil? (:schema db*)))
-                       (assoc db* :schema (<? (schema/schema-map db*)))
-                       db*)]
-            (cond-> db**
+  ([db flakes] (with-t db flakes nil))
+  ([db flakes opts]
+   (go-try
+     (let [t                    (.-t ^Flake (first flakes))
+           _                    (when (not= t (dec (:t db)))
+                                  (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
+                                                  {:status 500
+                                                   :error  :db/unexpected-error})))
+           add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
+           add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
+           idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
+           ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
+           flakes-bytes         (flake/size-bytes add-flakes)
+           schema-change?       (schema-util/schema-change? add-flakes)
+           root-setting-change? (schema-util/setting-change? add-flakes)
+           pred-ecount          (-> db :ecount (get const/$_predicate))
+           add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
+           db*                  (loop [[add-pred & r] add-pred-to-idx?
+                                       db db]
+                                  (if add-pred
+                                    (recur r (<? (add-predicate-to-idx db add-pred opts)))
+                                    db))
+           ;; this could require reindexing, so we handle remove predicates later
+           db*                  (-> db*
+                                    (assoc :t t)
+                                    (update-in [:stats :size] + flakes-bytes) ;; total db ~size
+                                    (update-in [:stats :flakes] + (count add-flakes)))]
+       (loop [[^Flake f & r] add-flakes
+              spot   (get-in db* [:novelty :spot])
+              psot   (get-in db* [:novelty :psot])
+              post   (get-in db* [:novelty :post])
+              opst   (get-in db* [:novelty :opst])
+              ecount (:ecount db)]
+         (if-not f
+           (let [db*  (assoc db* :ecount ecount
+                                 :novelty {:spot spot :psot psot :post post :opst opst
+                                           :size (+ flakes-bytes (get-in db* [:novelty :size]))})
+                 db** (if (or schema-change? (nil? (:schema db*)))
+                        (assoc db* :schema (<? (schema/schema-map db*)))
+                        db*)]
+             (cond-> db**
 
-                    root-setting-change?
-                    (assoc :settings (<? (schema/setting-map db**)))))
-          (let [cid     (flake/sid->cid (.-s f))
-                ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
-            (recur r
-                   (conj spot f)
-                   (conj psot f)
-                   (if (get idx?-map (.-p f))
-                     (conj post f)
-                     post)
-                   (if (get ref?-map (.-p f))
-                     (conj opst f)
-                     opst)
-                   ecount*)))))))
+                     root-setting-change?
+                     (assoc :settings (<? (schema/setting-map db**)))))
+           (let [cid     (flake/sid->cid (.-s f))
+                 ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
+             (recur r
+                    (conj spot f)
+                    (conj psot f)
+                    (if (get idx?-map (.-p f))
+                      (conj post f)
+                      post)
+                    (if (get ref?-map (.-p f))
+                      (conj opst f)
+                      opst)
+                    ecount*))))))))
 
 (defn with
   "Returns db 'with' flakes added as a core async promise channel.
   Note this always does a re-sort."
-  [db block flakes]
-  (let [resp-ch (async/promise-chan)]
-    (async/go
-      (try*
-        (when (and (not= block (inc (:block db))))
-          (throw (ex-info (str "Invalid 'with' called for db " (:dbid db) " because current db 'block', " (:block db) " must be one less than supplied block " block ".")
-                          {:status 500
-                           :error  :db/unexpected-error})))
-        (if (empty? flakes)
-          (async/put! resp-ch (assoc db :block block))
-          (let [flakes (sort flake/cmp-flakes-block flakes)
-                db*    (loop [[^Flake f & r] flakes
-                              t        (.-t (first flakes)) ;; current 't' value
-                              t-flakes []                   ;; all flakes for current 't'
-                              db       db]
-                         (cond (and f (= t (.-t f)))
-                               (recur r t (conj t-flakes f) db)
+  ([db block flakes] (with db block flakes nil))
+  ([db block flakes opts]
+   (let [resp-ch (async/promise-chan)]
+     (async/go
+       (try*
+         (when (and (not= block (inc (:block db))))
+           (throw (ex-info (str "Invalid 'with' called for db " (:dbid db) " because current db 'block', " (:block db) " must be one less than supplied block " block ".")
+                           {:status 500
+                            :error  :db/unexpected-error})))
+         (if (empty? flakes)
+           (async/put! resp-ch (assoc db :block block))
+           (let [flakes (sort flake/cmp-flakes-block flakes)
+                 db*    (loop [[^Flake f & r] flakes
+                               t        (.-t (first flakes)) ;; current 't' value
+                               t-flakes []                  ;; all flakes for current 't'
+                               db       db]
+                          (cond (and f (= t (.-t f)))
+                                (recur r t (conj t-flakes f) db)
 
-                               :else
-                               (let [db' (-> db
-                                             (assoc :t (inc t)) ;; due to permissions, an entire 't' may be filtered out, set to 't' prior to the new flakes
-                                             (with-t t-flakes)
-                                             (<?))]
-                                 (if (nil? f)
-                                   (assoc db' :block block)
-                                   (recur r (.-t f) [f] db')))))]
+                                :else
+                                (let [db' (-> db
+                                              (assoc :t (inc t)) ;; due to permissions, an entire 't' may be filtered out, set to 't' prior to the new flakes
+                                              (with-t t-flakes opts)
+                                              (<?))]
+                                  (if (nil? f)
+                                    (assoc db' :block block)
+                                    (recur r (.-t f) [f] db')))))]
 
-            (async/put! resp-ch db*)))
-        (catch* e
-                (async/put! resp-ch e))))
-    resp-ch))
+             (async/put! resp-ch db*)))
+         (catch* e
+                 (async/put! resp-ch e))))
+     resp-ch)))
 
 (defn forward-time-travel-db?
   "Returns true if db is a forward time travel db."
@@ -299,9 +305,11 @@
   (-subid [this ident strict?] (subid this ident strict?))
   (-search [this fparts] (query-range/search this fparts))
   (-query [this query-map] (fql/query this query-map))
-  (-with [this block flakes] (with this block flakes))
-  (-with-t [this flakes] (with-t this flakes))
-  (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id)))
+  (-with [this block flakes] (with this block flakes nil))
+  (-with [this block flakes opts] (with this block flakes opts))
+  (-with-t [this flakes] (with-t this flakes nil))
+  (-with-t [this flakes opts] (with-t this flakes opts))
+  (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil)))
 ;#?@(:cljs
 ;    [IPrintWithWriter
 ;     (-pr-writer [db w opts]
