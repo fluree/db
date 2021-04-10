@@ -4,9 +4,10 @@
   #?(:cljs (:import goog.debug.Console)))
 
 
+; Added deprecated parameter since compiling in strict mode
 #?(:cljs
    (def logger
-     (glog/getLogger "app")))
+     (glog/getLogger "app" goog.log.Level.INFO)))
 
 #?(:cljs
    (def levels {:severe  goog.debug.Logger.Level.SEVERE
@@ -23,7 +24,7 @@
 
 #?(:cljs
    (defn set-level! [level]
-     (.setLevel logger (get levels level (:info levels)))))
+     (goog.log.setLevel logger (get levels level (:info levels)))))
 
 (defn fmt [msgs]
   (apply str (interpose " " (map pr-str msgs))))
@@ -32,24 +33,24 @@
   #?(:clj  (if (instance? Exception (first s))
              (log/error (first s) (fmt (rest s)))
              (log/error (fmt (rest s))))
-     :cljs (glog/error logger (fmt s))))
+     :cljs (glog/error logger (fmt s) nil)))
 
 (defn warn [& s]
   #?(:clj  (log/warn (fmt s))
-     :cljs (glog/warning logger (fmt s))))
+     :cljs (glog/warning logger (fmt s) nil)))
 
 (defn info [& s]
   #?(:clj  (log/info (fmt s))
-     :cljs (glog/info logger (fmt s))))
+     :cljs (glog/info logger (fmt s) nil)))
 
 (defn debug [& s]
   #?(:clj  (log/debug (fmt s))
-     :cljs (glog/fine logger (fmt s))))
+     :cljs (glog/fine logger (fmt s) nil)))
 
 
 (defn trace [& s]
   #?(:clj  (log/trace (fmt s))
-     :cljs (glog/fine logger (fmt s))))
+     :cljs (glog/fine logger (fmt s) nil)))
 
 
 #?(:cljs

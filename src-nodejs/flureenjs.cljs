@@ -185,7 +185,7 @@
 
 
 (defn ^:export sign
-  "Returns a signature for a message given provided private key."
+  "Returns a signature for a message given a private key."
   [message private-key]
   (crypto/sign-message message private-key))
 
@@ -570,7 +570,7 @@
             (reject e)))))))
 
 (defn ^:export ledger-stats
-  "Returns promise with ledger's  with ledger's stats, including db size and # of flakes.
+  "Returns promise with ledger stats, including db size and # of flakes.
   If ledger doesn't exist, will return an empty map."
   [conn ledger]
   (js/Promise.
