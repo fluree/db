@@ -570,48 +570,167 @@
         (:variable select)
         (util/index-of headers (:variable select))))
 
-(defn format-filter-tuples
-  [db tuples {:keys [prettyPrint select inVector? expandMaps?] :as select-spec} headers vars opts]
-  (go-try (let [pp            (when prettyPrint
-                                (get-pretty-print-keys select))
-                functionArray (if expandMaps? (map (fn [select]
-                                                     (let [select-val (or (:as select) (:variable select))
-                                                           idx        (when select-val (util/index-of headers select-val))
-                                                           select-fn  (cond idx (fn [tuple] (nth tuple idx))
-                                                                            (:value select) (fn [tuple] (:value select))
-                                                                            (get vars select-val) (fn [tuple] (get vars select-val)))]
-                                                       (if (:selection select)
-                                                         (fn [tuple]
-                                                           (go-try (when (select-fn tuple)
-                                                                     (or (<? (query db {:selectOne (:selection select)
-                                                                                        :from      (select-fn tuple)
-                                                                                        :opts      opts}))
-                                                                         {:_id (select-fn tuple)}))))
-                                                         (fn [tuple]
-                                                           (go-try (select-fn tuple)))))) select)
-                                              (map (fn [select]
-                                                     (if-let [val (:value select)]
-                                                       (fn [x] val)
-                                                       (let [idx (get-header-idx headers select)]
-                                                         (fn [tuple]
-                                                           (nth tuple idx))))) select))]
-            (if expandMaps? (<? (async/go-loop [[tuple & r] tuples
-                                                res []]
-                                  (if tuple (let [tuple-res  (<? (format-tuple functionArray tuple))
-                                                  tuple-res' (cond pp (zipmap pp tuple-res)
-                                                                   inVector? tuple-res
-                                                                   :else (first tuple-res))]
-                                              (recur r (conj res tuple-res'))) res)))
-                            (map (fn [tuple]
-                                   (let [tuple-res (map #(% tuple) functionArray)]
-                                     (cond pp (zipmap pp tuple-res)
-                                           inVector? tuple-res
-                                           :else (first tuple-res)))) tuples)))))
+
+(defn- build-expand-map
+  "Builds list of two-tuples: ([tuple-index query-map] ...)
+  for :select tuple positions that define a graph crawling query map.
+
+  Used by 'expand-map' and 'replace-expand-map' functions for executing
+  the query map and inserting the query map results into the final response
+  respectively.
+
+  i.e. if the initial query was {:select [?x {?person ['*']} ?y] .... }, then in the
+  three-tuple :select clause is [?x ?person ?y], where ?person must be expanded with additional query results.
+
+  Given this example, this function would output:
+  ([1 ['*']]) - which means position 1 in the select clause tuple (0-indexed) needs to be expanded with a
+  query: {:select ['*'] :from ?person}, for each instance of ?person returned from the query."
+  [select pretty-print-keys]
+  (keep-indexed (fn [idx select-item]
+                  (when-let [query-map (:selection select-item)]
+                    ;; if pretty print is used, the result is a map,
+                    ;; and in the index should be the respective pretty-print key, else just the numerical index
+                    (let [tuple-index (if pretty-print-keys
+                                        (nth pretty-print-keys idx)
+                                        idx)]
+                      [tuple-index query-map])))
+                select))
+
+
+(defn- expand-map
+  "Updates a two-tuple as defined by 'build-expand-map` function by executing the query-map query for
+  the tuple-result using supplied db and options. Up
+  [tuple-index query-map] -> [tuple-index query-map-result]
+
+  Returns async channel with the transformed two-tuple, or a query exception if one occurs."
+  [db query-opts tuple-result [tuple-index query-map]]
+  ;; ignore any nil values in tuple-result at idx position (i.e. can happen with optional/left outer joins)
+  (when-let [_id (get tuple-result tuple-index)]
+    (async/go
+      [tuple-index (<? (query db {:selectOne query-map
+                                  :from      _id
+                                  :opts      query-opts}))])))
+
+(defn- replace-expand-maps
+  "Follow-on step for 'expand-map' function above, replaces the final query map
+  results into the tuple position specified. Designed to be used in a reducing function.
+
+  tuple-result is a single tuple result, like [42 12345 'usa']
+  expand-map-tuple is a two-tuple of index position to replace in the tuple result
+  along with the value to replace it with, i.e. [1 {12345 {:firstName 'Jane', :lastName 'Doe'}}]
+  After replacing position/index 1 in the initial tuple result in this example, the final output
+  will be the modified tuple result of:
+  [42 {12345 {:firstName 'Jane', :lastName 'Doe'}} 'usa']"
+  [tuple-result expand-map-tuple]
+  (when (util/exception? expand-map-tuple)
+    (throw expand-map-tuple))
+  (let [[tuple-index query-map-result] expand-map-tuple]
+    (assoc tuple-result tuple-index query-map-result)))
+
+
+(defn pipeline-expandmaps-result
+  "For each tuple in the results that requires a query map expanded, fetches the
+  results in parallel with `parallelism` supplied.
+
+  Inputs are:
+  - select - select specification map
+  - pp-keys - if prettyPrint was done on the query, the results will be a map instead of a tuple. This lists the map keys
+  - single-result? - if the query's :select was not wrapped in a vector, we return a single result instead of a tuple
+  - db - the db to execute the query-map expansion with
+  - opts - opts to use for the query-map expansion query
+  - parallelism - how many queries to run in parallel
+  - tuples-res - final response tuples that need one or more query expansions on them
+
+  i.e. if a simple one-tuple result set were columns [?person], where ?person is just
+  the subject id of persons... then the tuples would look like
+  [[1234567] [1234566] [1234565] ...]
+
+  The select clause might be {?person [person/fullName, person/age, {person/children [*]}]}
+
+  This will produce the results of each of the select clauses based on the source tuples."
+  [select pp-keys single-result? db opts parallelism tuples-res]
+  (go-try
+    (let [expandMaps (build-expand-map select pp-keys)
+          queue-ch   (async/chan)
+          res-ch     (async/chan)
+          opts*      (dissoc opts :limit :offset :orderBy :groupBy)
+          af         (fn [tuple-res port]
+                       (async/go
+                         (try*
+                           (let [tuple-res' (if single-result? [tuple-res] tuple-res)]
+                             (->> expandMaps
+                                  (keep #(expand-map db opts* tuple-res' %)) ;; returns async channels, executes expandmap query
+                                  (async/merge)
+                                  (async/into [])
+                                  (async/<!)                ;; all expandmaps with final results now in single vector
+                                  (reduce replace-expand-maps tuple-res') ;; update original tuple with expandmaps result(s)
+                                  (#(if single-result? (first %) %))
+                                  (async/put! port)))
+                           (async/close! port)
+                           (catch* e (async/put! port e) (async/close! port)))))]
+
+      (async/onto-chan! queue-ch tuples-res)
+      (async/pipeline-async parallelism res-ch af queue-ch)
+
+      (loop [acc []]
+        (let [next-res (async/<! res-ch)]
+          (cond
+            (nil? next-res)
+            acc
+
+            (util/exception? next-res)
+            (do
+              (async/close! queue-ch)
+              (async/close! res-ch)
+              (throw next-res))
+
+            :else
+            (recur (conj acc next-res))))))))
+
+
+(defn select-fn
+  "Builds function that returns tuple result based on the :select portion of the original query
+  when provided the list of tuples that result from the :where portion of the original query."
+  [headers vars select]
+  (let [{:keys [as variable value]} select
+        select-val   (or as variable)
+        idx          (get-header-idx headers select)
+        tuple-select (cond
+                       value (constantly value)
+                       idx (fn [tuple] (nth tuple idx))
+                       (get vars select-val) (constantly (get vars select-val)))]
+    tuple-select))
+
+
+(defn- select-tuples-fn
+  "Returns a single function, that when applied against a full result tuple from
+  the query's :where clause, preps the :select clause response with just the values
+  in the specified order.
+
+  The :where result tuples will contain a column/tuple index for every variable
+  that appears in the where clause, but the :select clause specifies which of those
+  variables to return in the result - which is often a subset.
+
+  Here, the 'headers' will contain the where clause variables and what column/index
+  they are in, and the 'select' will specify the select variables desired, and order."
+  [headers vars select]
+  (->> select
+       (map (partial select-fn headers vars))
+       (apply juxt)))
+
+
+(defn order-result-tuples
+  [headers orderBy tuples]
+  (let [[order var] orderBy
+        comparator (if (= "DESC" order) (fn [a b] (compare b a)) compare)]
+    (if-let [compare-idx (util/index-of headers (symbol var))]
+      (sort-by #(nth % compare-idx) comparator tuples)
+      tuples)))
 
 (defn- process-ad-hoc-group
   ([db res select-spec opts]
    (process-ad-hoc-group db res select-spec nil opts))
-  ([db {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select limit selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
+  ([db {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select limit expandMaps? selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
    (go-try (if
              (and aggregates (= 1 (count select)))          ;; only aggregate
              (let [res  (second (analytical/calculate-aggregate res (first aggregates)))
@@ -621,22 +740,21 @@
                (if inVector? [res'] res'))
 
              (let [{:keys [headers tuples]} (if aggregates (analytical/add-aggregate-cols res aggregates) res)
-                   offset' (if (or selectDistinct? groupBy) 0 offset)
-                   limit'  (if selectDistinct? nil group-limit)
-                   tuples' (if orderBy
-                             (order-offset-and-limit-results tuples headers orderBy offset' limit')
-                             tuples)
-                   res'    (->> (dissoc opts :limit :offset :orderBy :groupBy)
-                                (format-filter-tuples db tuples' select-spec headers vars)
-                                <?)]
-               ;; TODO - drop unused columns, and calculate distinct before resolving all vals
-               (if (or selectDistinct? (and (not orderBy) (or group-limit offset)))
-                 (cond->> res'
-                          selectDistinct? distinct
-                          (and offset (< 0 offset)) (drop offset)
-                          (and group-limit (< 0 group-limit)) (take group-limit)
-                          (or inVector? (vector? res')) (into []))
-                 res'))))))
+                   offset'        (when (and offset (not groupBy)) ;; groupBy results cannot be offset (not sure why! was there)
+                                    offset)
+                   single-result? (and (not prettyPrint) (not inVector?))
+                   pp-keys        (when prettyPrint (get-pretty-print-keys select))
+                   xf             (apply comp
+                                         (cond-> [(map (select-tuples-fn headers vars select))] ;; a function that formats a :where result tuple to specified :select clause
+                                                 single-result? (conj (map first))
+                                                 selectDistinct? (conj (distinct))
+                                                 offset' (conj (drop offset'))
+                                                 group-limit (conj (take group-limit))
+                                                 prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
+                   result         (into [] xf tuples)]
+               (if expandMaps?
+                 (<? (pipeline-expandmaps-result select pp-keys single-result? db opts 8 result))
+                 result))))))
 
 
 (defn ad-hoc-group-by
@@ -661,7 +779,7 @@
 
 (defn- build-order-fn
   [orderBy groupBy]
-  (let [[sortDirection sortCriteria]  (if orderBy orderBy ["ASC" groupBy])]
+  (let [[sortDirection sortCriteria] (if orderBy orderBy ["ASC" groupBy])]
     (cond
       (= sortCriteria groupBy)
       (if (= sortDirection "DESC")
@@ -669,7 +787,7 @@
         compare-fn)
 
       (and (coll? groupBy) (string? sortCriteria))
-      (let [orderByIdx     (util/index-of groupBy sortCriteria)]
+      (let [orderByIdx (util/index-of groupBy sortCriteria)]
         (if (= "DESC" sortDirection)
           (fn [x y] (* -1 (compare-fn (nth x orderByIdx) (nth y orderByIdx))))
           (fn [x y] (compare-fn (nth x orderByIdx) (nth y orderByIdx)))))
@@ -694,10 +812,10 @@
                 ; loop through map of groups
                 (loop [[group-key & rest-keys] (keys group-map)
                        [group & rest-groups] (vals group-map)
-                       limit      (if (= 0 limit) nil limit) ; limit of 0 is ALL
-                       offset     (or offset 0)
-                       acc        {}]
-                  (let [group-count (count group)
+                       limit  (if (= 0 limit) nil limit)    ; limit of 0 is ALL
+                       offset (or offset 0)
+                       acc    {}]
+                  (let [group-count  (count group)
                         group-as-res {:headers headers :vars vars :tuples group}]
                     (cond
                       ;? process all groups
@@ -732,7 +850,7 @@
                                               (<= offset 0) 0
                                               selectDistinct? (- offset 1)
                                               :else (- offset (- group-count (count res'))))
-                                            (if (or (nil? res') (empty? res')) acc (assoc acc group-key res'))) )))))))
+                                            (if (or (nil? res') (empty? res')) acc (assoc acc group-key res'))))))))))
             ; no group by
             (let [limit (if selectOne? 1 limit)
                   res   (<? (process-ad-hoc-group db res select-spec limit opts))]

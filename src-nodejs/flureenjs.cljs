@@ -81,9 +81,24 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce app-state (atom {:product "Fluree NodeJs Library"
-                          :version "v1.0.0-rc5"}))
+                          :version "v1.0.0-rc16"}))
 
 (println (:product @app-state) (:version @app-state))
+
+
+;; ======================================
+;;
+;; Get handle to Node.js crypto module
+;;
+;; ======================================
+(def ^:const njs-crypto
+  (try
+    (js/require "crypto")
+    (catch :default ex
+      (do
+        (log/warn (str "Error: Unable to access Node.js crypto module:" ex))
+        (log/warn "Private key generation is not available.")
+        nil))))
 
 
 (declare db-instance)
@@ -136,18 +151,41 @@
   [message signature] (crypto/pub-key-from-message message signature))
 
 
-;(defn ^:export new-private-key
-;  "Generates a new private key, returned in a map along with
-;  the public key and account id. Return keys are :public,
-;  :private, and :id."
-;  []
-;  (let [kp      (crypto/generate-key-pair)
-;        account (crypto/account-id-from-private (:private kp))]
-;    (assoc kp :id account)))
+(defn- generate-key-pair
+  "Generates a private-public key pair using the Node.js
+  crypto module. The JavaScript code looks like:
+
+     const ecdh = crypto.createECDH('secp256k1');
+     ecdh.generateKeys()
+     return { private: ecdh.getPrivateKey('hex'),
+              public:  ecdh.getPublicKey('hex','compressed')};
+  "
+  []
+  (if njs-crypto
+    (let [ecdh      (js-invoke njs-crypto "createECDH" "secp256k1")
+          _         (js-invoke ecdh "generateKeys")]
+      {:private (js-invoke ecdh "getPrivateKey" "hex")
+       :public (js-invoke ecdh "getPublicKey" "hex" "compressed")})
+    (throw "Node.js crypto module not accessible")))
+
+
+(defn ^:export new-private-key
+  "Generates a new private key, returned in a map along with
+  the public key and account id. Return keys are :public,
+  :private, and :id.
+  "
+  []
+  (try
+    (let [kp      (generate-key-pair)
+          account (crypto/account-id-from-private (:private kp))]
+      (assoc kp :id account))
+    (catch :default e
+      (log/error (str "Unable to generate private key. Error: " e))
+      (throw e))))
 
 
 (defn ^:export sign
-  "Returns a signature for a message given provided private key."
+  "Returns a signature for a message given a private key."
   [message private-key]
   (crypto/sign-message message private-key))
 
@@ -532,7 +570,7 @@
             (reject e)))))))
 
 (defn ^:export ledger-stats
-  "Returns promise with ledger's  with ledger's stats, including db size and # of flakes.
+  "Returns promise with ledger stats, including db size and # of flakes.
   If ledger doesn't exist, will return an empty map."
   [conn ledger]
   (js/Promise.

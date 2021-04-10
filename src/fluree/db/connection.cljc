@@ -141,10 +141,10 @@
 
                           ;; default to http
                           :else (str "http://" server))
-              ;; add port 8080 as a default
+              ;; add port 8090 as a default
               server*   (if (re-matches #".+:[0-9]+" server*)
                           server*
-                          (str server* ":8080"))
+                          (str server* ":8090"))
               is-https? (str/starts-with? server "https://")
               result*   (conj result server*)]
           (when-not (re-matches #"^https?://(((?!-))(xn--|_{1,1})?[a-z0-9-]{0,61}[a-z0-9]{1,1}\.)*(xn--)?([a-z0-9\-]{1,61}|[a-z0-9-]{1,30}\.[a-z]{2,})(?:\:\d+)$" server*)
