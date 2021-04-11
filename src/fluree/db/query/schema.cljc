@@ -8,8 +8,7 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.schema :as schema-util]
-            [fluree.db.class.prefix :as prefix])
+            [fluree.db.util.schema :as schema-util])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 (defn pred-name->keyword
@@ -343,16 +342,12 @@
                                                idx?      (boolean (or ref?
                                                                       (get p->v const/$_predicate:index)
                                                                       (get p->v const/$_predicate:unique)))
-                                               [prefix prefix-name] (prefix/from-name p-name)
-                                               prefixed? (boolean prefix)
                                                fullText? (get p->v const/$_predicate:fullText)
                                                p-props   {:name               p-name
                                                           :id                 id
                                                           :type               p-type
                                                           :ref?               ref?
                                                           :idx?               idx?
-                                                          :prefix             prefix ;; nil unless prefixed, i.e. 'my:pred' would have 'my' in prefix
-                                                          :iri                nil
                                                           :unique             (boolean (get p->v const/$_predicate:unique))
                                                           :multi              (boolean (get p->v const/$_predicate:multi))
                                                           :index              (boolean (get p->v const/$_predicate:index))

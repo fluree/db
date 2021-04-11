@@ -7,7 +7,6 @@
  :pretty-print       false
  :pseudo-names       false
  :infer-externs      true
- :optimize-constants false
  :externs            ["sjcl-externs.js"]
  :install-deps       true
  :npm-deps           {}
