@@ -440,7 +440,7 @@
 
          :else
          (recur r (inc n)
-                (conj acc (->> (<? (query-range/index-range db :spot = [s] {:limit limit}))
+                (conj acc (->> (<? (query-range/index-range db :spot = [s]))
                                ((fn [n] (flakes->res db cache fuel max-fuel select-spec n)))
                                (<?)))))))))
 
