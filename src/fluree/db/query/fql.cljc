@@ -751,7 +751,9 @@
                                                  offset' (conj (drop offset'))
                                                  group-limit (conj (take group-limit))
                                                  prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
-                   result         (into [] xf tuples)]
+                   result         (cond->> tuples
+                                           orderBy (order-result-tuples fuel max-fuel headers orderBy)
+                                           true (into [] xf))]
                (if expandMaps?
                  (<? (pipeline-expandmaps-result select pp-keys single-result? db opts 8 result))
                  result))))))
