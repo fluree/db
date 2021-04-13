@@ -720,11 +720,19 @@
 
 
 (defn order-result-tuples
+  "Order By can be:
+    - Single variable, ?favNums
+    - Two-tuple,  [ASC, ?favNums]
+    - Three-tuple, [ASC, ?favNums, 'NOCASE'] - ignore case when sorting strings"
   [headers orderBy tuples]
-  (let [[order var] orderBy
-        comparator (if (= "DESC" order) (fn [a b] (compare b a)) compare)]
-    (if-let [compare-idx (util/index-of headers (symbol var))]
-      (sort-by #(nth % compare-idx) comparator tuples)
+  (let [[order var option] orderBy
+        comparator  (if (= "DESC" order) (fn [a b] (compare b a)) compare)
+        compare-idx (util/index-of headers (symbol var))
+        keyfn       (if (and (string? option) (= "NOCASE" (str/upper-case option)))
+                      #(str/upper-case (nth % compare-idx))
+                      #(nth % compare-idx))]
+    (if compare-idx
+      (sort-by keyfn comparator tuples)
       tuples)))
 
 (defn- process-ad-hoc-group
