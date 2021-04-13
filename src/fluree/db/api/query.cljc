@@ -326,6 +326,16 @@
                         acc))]
       (vals res))))
 
+#?(:cljs
+   (defn block-Flakes->vector
+     "Convert flakes into vectors.
+     Notes:
+     Cannot use IPrintWithWriter override since calls to storage-handler
+     download blocks using the #Flake format to support internal query
+     handling."
+    [blocks]
+     (mapv (fn [block] (assoc block :flakes (mapv vec (:flakes block)))) blocks)))
+
 (defn history-query-async
   [sources query-map]
   (go-try
@@ -349,7 +359,8 @@
                          resp     (<? (format-history-resp db flakes auth-set (or showAuth show-auth)))
                          resp'    (if (or prettyPrint pretty-print)
                                     (<? (format-blocks-resp-pretty db resp))
-                                    resp)]
+                                    #?(:clj  resp
+                                       :cljs (block-Flakes->vector resp)))]
                      (if meta? {:result resp'
                                 :fuel   (count flakes)
                                 :status 200}
