@@ -334,12 +334,7 @@
      download blocks using the #Flake format to support internal query
      handling."
     [blocks]
-    (loop [[block & r] blocks
-           acc []]
-      (if block
-        (let [flakes (map flake/Flake->parts (:flakes block))]
-          (recur r (into acc [(assoc block :flakes flakes)])))
-        acc))))
+     (mapv (fn [block] (assoc block :flakes (mapv vec (:flakes block)))) blocks)))
 
 (defn history-query-async
   [sources query-map]
