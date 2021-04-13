@@ -38,19 +38,20 @@
           (thisfn x))))))
 
 (defn parse
-  [x]
-  #?(:clj  (-> (cond (string? x) x
-                     (bytes? x) (butil/UTF8->string x)
-                     (instance? ByteArrayInputStream x) (slurp x)
-                     (instance? InputStream x) (slurp x)
-                     :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
-                                           {:status 500 :error :db/unexpected-error})))
-               (cjson/decode true))
-     :cljs (-> (if (string? x)
-                 x
-                 (butil/UTF8->string x))
-               (js/JSON.parse)
-               (js->clj :keywordize-keys true))))
+  ([x] (parse x true))
+  ([x keywordize-keys?]
+   #?(:clj  (-> (cond (string? x) x
+                      (bytes? x) (butil/UTF8->string x)
+                      (instance? ByteArrayInputStream x) (slurp x)
+                      (instance? InputStream x) (slurp x)
+                      :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
+                                            {:status 500 :error :db/unexpected-error})))
+                (cjson/parse-string keywordize-keys?))
+      :cljs (-> (if (string? x)
+                  x
+                  (butil/UTF8->string x))
+                (js/JSON.parse)
+                (js->clj :keywordize-keys keywordize-keys?)))))
 
 #?(:cljs
    (defn stringify-preserve-namespace
