@@ -15,11 +15,20 @@
   Puts original :cmd string and :sig string into this one map for use downstream."
   [{:keys [sig cmd]}]
   ;; TODO - here again we calc the sha3 id, I think redundant at this point
-  (let [cmd-map       (-> (json/parse cmd)
-                          (assoc :txid (crypto/sha3-256 cmd) ;; don't trust their id if provided
-                                 :cmd cmd
-                                 :sig sig))
-
+  (let [decoded       (json/parse cmd false)
+        cmd-map       {:tx             (get decoded "tx")
+                       :auth           (get decoded "auth")
+                       :auth-sid       nil                  ;; filled in later
+                       :tx-permissions nil                  ;; filled in later
+                       :authority      (get decoded "authority")
+                       :authority-sid  nil                  ;; filled in later
+                       :expire         (get decoded "expire")
+                       :type           (keyword (get decoded "type"))
+                       :deps           (get decoded "deps")
+                       :nonce          (get decoded "nonce")
+                       :txid           (crypto/sha3-256 cmd) ;; don't trust their id if provided
+                       :cmd            cmd
+                       :sig            sig}
         sig-authority (crypto/account-id-from-message cmd sig) ;; throws if invalid signature
         ;; merge everything together into one map for transaction.
         current-time  (System/currentTimeMillis)
