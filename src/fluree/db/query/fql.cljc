@@ -442,7 +442,7 @@
 
          :else
          (recur r (inc n)
-                (conj acc (->> (<? (query-range/index-range db :spot = [s] {:limit limit}))
+                (conj acc (->> (<? (query-range/index-range db :spot = [s]))
                                ((fn [n] (flakes->res db cache fuel max-fuel select-spec n)))
                                (<?)))))))))
 
@@ -716,19 +716,30 @@
 
 (defn order-result-tuples
   "Sorts result tuples when orderBy is specified.
+   Order By can be:
+   - Single variable, ?favNums
+   - Two-tuple,  [ASC, ?favNums]
+   - Three-tuple, [ASC, ?favNums, 'NOCASE'] - ignore case when sorting strings
 
   Operation should happen before tuples get filtered, as the orderBy variable might
   not be present in the :select clause.
 
-  Order operation = 2 fuel per tuple ordered."
+  2 fuel per tuple ordered + 2 additional fuel for 'NOCASE'."
   ;; TODO - check/throw max fuel
   [fuel max-fuel headers orderBy tuples]
-  (let [[order var] orderBy
-        comparator (if (= "DESC" order) (fn [a b] (compare b a)) compare)]
-    (if-let [compare-idx (util/index-of headers (symbol var))]
-      (do
-        (vswap! fuel + (* 2 (count tuples)))
-        (sort-by #(nth % compare-idx) comparator tuples))
+  (let [[order var option] orderBy
+        comparator  (if (= "DESC" order) (fn [a b] (compare b a)) compare)
+        compare-idx (util/index-of headers (symbol var))
+        no-case?    (and (string? option) (= "NOCASE" (str/upper-case option)))
+        keyfn       (if no-case?
+                      #(str/upper-case (nth % compare-idx))
+                      #(nth % compare-idx))]
+    (if compare-idx
+      (let [fuel-total (vswap! fuel + (* (if no-case? 4 2) (count tuples)))]
+        (when (> fuel-total max-fuel)
+          (throw (ex-info (str "Maximum query cost of " max-fuel " exceeded.")
+                          {:status 400 :error :db/exceeded-cost})))
+        (sort-by keyfn comparator tuples))
       tuples)))
 
 (defn- process-ad-hoc-group
