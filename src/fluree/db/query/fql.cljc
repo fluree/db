@@ -18,24 +18,26 @@
 (declare flakes->res query)
 
 (defn fuel-flake-transducer
-  "Can sit in a flake pipeline and accumulate a count of 1 for every flake pulled.
+  "Can sit in a flake pipeline and accumulate a count of 'fuel-per' for every flake pulled
+  or item touched. 'fuel-per' defaults to 1 fuel per item.
 
   Inputs are:
   - fuel - volatile! that holds fuel counter
   - max-fuel - throw exception if @fuel ever exceeds this number
 
   To get final count, just deref fuel volatile when when where is complete."
-  [fuel max-fuel]
-  (fn [xf]
-    (fn
-      ([] (xf))                                             ;; transducer start
-      ([result] (xf result))                                ;; transducer stop
-      ([result flake]
-       (vswap! fuel inc)
-       (when (and max-fuel (> @fuel max-fuel))
-         (throw (ex-info (str "Maximum query cost of " max-fuel " exceeded.")
-                         {:status 400 :error :db/exceeded-cost})))
-       (xf result flake)))))
+  ([fuel max-fuel] (fuel-flake-transducer fuel max-fuel 1))
+  ([fuel max-fuel fuel-per]
+   (fn [xf]
+     (fn
+       ([] (xf))                                            ;; transducer start
+       ([result] (xf result))                               ;; transducer stop
+       ([result flake]
+        (vswap! fuel + fuel-per)
+        (when (and max-fuel (> @fuel max-fuel))
+          (throw (ex-info (str "Maximum query cost of " max-fuel " exceeded.")
+                          {:status 400 :error :db/exceeded-cost})))
+        (xf result flake))))))
 
 
 (defn fuel-flakes-transducer
@@ -484,21 +486,6 @@
                  acc*
                  (recur r acc*))))))))))
 
-(defn order-offset-and-limit-results
-  "Order By can be:
-    - Single variable, ?favNums
-    - Two-tuple,  [ASC, ?favNums]"
-  [tuples headers orderBy offset limit]
-  (let [[order var] orderBy
-        indexOfFind (or (util/index-of headers (symbol var)) -1)
-        tuples'     (if (<= 0 indexOfFind)
-                      (cond->> (sort-by #(nth % indexOfFind) compare-fn tuples)
-                               (= "DESC" order) reverse)
-                      tuples)]
-    (cond->> tuples'
-             offset (drop offset)
-             limit (take limit)
-             (vector? tuples) (into []))))
 
 (defn parse-map [x valid-var]
   (let [_             (when-not (= 1 (count (keys x)))
@@ -648,23 +635,26 @@
   The select clause might be {?person [person/fullName, person/age, {person/children [*]}]}
 
   This will produce the results of each of the select clauses based on the source tuples."
-  [select pp-keys single-result? db opts parallelism tuples-res]
+  [select pp-keys single-result? db fuel max-fuel opts parallelism tuples-res]
   (go-try
     (let [expandMaps (build-expand-map select pp-keys)
           queue-ch   (async/chan)
           res-ch     (async/chan)
-          opts*      (dissoc opts :limit :offset :orderBy :groupBy)
+          stop!      (fn [] (async/close! queue-ch) (async/close! res-ch))
+          opts*      (-> (dissoc opts :limit :offset :orderBy :groupBy)
+                         (assoc :fuel (volatile! 0)))
           af         (fn [tuple-res port]
                        (async/go
                          (try*
-                           (let [tuple-res' (if single-result? [tuple-res] tuple-res)]
+                           (let [tuple-res' (if single-result? [tuple-res] tuple-res)
+                                 query-fuel (volatile! 0)]
                              (->> expandMaps
-                                  (keep #(expand-map db opts* tuple-res' %)) ;; returns async channels, executes expandmap query
+                                  (keep #(expand-map db (assoc opts* :fuel fuel) tuple-res' %)) ;; returns async channels, executes expandmap query
                                   (async/merge)
                                   (async/into [])
                                   (async/<!)                ;; all expandmaps with final results now in single vector
                                   (reduce replace-expand-maps tuple-res') ;; update original tuple with expandmaps result(s)
-                                  (#(if single-result? (first %) %))
+                                  (#(if single-result? [(first %) @query-fuel] [% @query-fuel])) ;; return two-tuple with second element being fuel consumed
                                   (async/put! port)))
                            (async/close! port)
                            (catch* e (async/put! port e) (async/close! port)))))]
@@ -680,12 +670,17 @@
 
             (util/exception? next-res)
             (do
-              (async/close! queue-ch)
-              (async/close! res-ch)
-              (throw next-res))
+              (stop!)
+              next-res)
 
             :else
-            (recur (conj acc next-res))))))))
+            (let [total-fuel (vswap! fuel + (second next-res))]
+              (if (> total-fuel max-fuel)
+                (do (stop!)
+                    (ex-info (str "Query exceeded max fuel while processing: " max-fuel
+                                  ". If you have permission, you can set the max fuel for a query with: 'opts': {'fuel' 10000000}")
+                             {:error :db/insufficient-fuel :status 400}))
+                (recur (conj acc (first next-res)))))))))))
 
 
 (defn select-fn
@@ -720,25 +715,37 @@
 
 
 (defn order-result-tuples
-  "Order By can be:
-    - Single variable, ?favNums
-    - Two-tuple,  [ASC, ?favNums]
-    - Three-tuple, [ASC, ?favNums, 'NOCASE'] - ignore case when sorting strings"
-  [headers orderBy tuples]
+  "Sorts result tuples when orderBy is specified.
+   Order By can be:
+   - Single variable, ?favNums
+   - Two-tuple,  [ASC, ?favNums]
+   - Three-tuple, [ASC, ?favNums, 'NOCASE'] - ignore case when sorting strings
+
+  Operation should happen before tuples get filtered, as the orderBy variable might
+  not be present in the :select clause.
+
+  2 fuel per tuple ordered + 2 additional fuel for 'NOCASE'."
+  ;; TODO - check/throw max fuel
+  [fuel max-fuel headers orderBy tuples]
   (let [[order var option] orderBy
         comparator  (if (= "DESC" order) (fn [a b] (compare b a)) compare)
         compare-idx (util/index-of headers (symbol var))
-        keyfn       (if (and (string? option) (= "NOCASE" (str/upper-case option)))
+        no-case?    (and (string? option) (= "NOCASE" (str/upper-case option)))
+        keyfn       (if no-case?
                       #(str/upper-case (nth % compare-idx))
                       #(nth % compare-idx))]
     (if compare-idx
-      (sort-by keyfn comparator tuples)
+      (let [fuel-total (vswap! fuel + (* (if no-case? 4 2) (count tuples)))]
+        (when (> fuel-total max-fuel)
+          (throw (ex-info (str "Maximum query cost of " max-fuel " exceeded.")
+                          {:status 400 :error :db/exceeded-cost})))
+        (sort-by keyfn comparator tuples))
       tuples)))
 
 (defn- process-ad-hoc-group
-  ([db res select-spec opts]
-   (process-ad-hoc-group db res select-spec nil opts))
-  ([db {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select limit expandMaps? selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
+  ([db fuel max-fuel res select-spec opts]
+   (process-ad-hoc-group db fuel max-fuel res select-spec nil opts))
+  ([db fuel max-fuel {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select limit expandMaps? selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
    (go-try (if
              (and aggregates (= 1 (count select)))          ;; only aggregate
              (let [res  (second (analytical/calculate-aggregate res (first aggregates)))
@@ -755,15 +762,16 @@
                    xf             (apply comp
                                          (cond-> [(map (select-tuples-fn headers vars select))] ;; a function that formats a :where result tuple to specified :select clause
                                                  single-result? (conj (map first))
+                                                 selectDistinct? (conj (fuel-flake-transducer fuel max-fuel 5)) ;; distinct charges 5 per item touched
                                                  selectDistinct? (conj (distinct))
                                                  offset' (conj (drop offset'))
                                                  group-limit (conj (take group-limit))
                                                  prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
                    result         (cond->> tuples
-                                           orderBy (order-result-tuples headers orderBy)
+                                           orderBy (order-result-tuples fuel max-fuel headers orderBy)
                                            true (into [] xf))]
                (if expandMaps?
-                 (<? (pipeline-expandmaps-result select pp-keys single-result? db opts 8 result))
+                 (<? (pipeline-expandmaps-result select pp-keys single-result? db fuel max-fuel opts 8 result))
                  result))))))
 
 
@@ -805,7 +813,7 @@
       :else nil)))
 
 (defn process-ad-hoc-res
-  [db
+  [db fuel max-fuel
    {:keys [headers vars] :as res}
    {:keys [groupBy orderBy limit selectOne? selectDistinct? inVector? offset] :as select-spec}
    opts]
@@ -815,9 +823,10 @@
                                      order-fn (into (sorted-map-by order-fn)))]
               (if selectOne?
                 (let [k (first (keys group-map))
-                      v (<? (process-ad-hoc-group db {:headers headers
-                                                      :vars    vars
-                                                      :tuples  (first (vals group-map))} select-spec limit opts))]
+                      v (<? (process-ad-hoc-group db fuel max-fuel
+                                                  {:headers headers
+                                                   :vars    vars
+                                                   :tuples  (first (vals group-map))} select-spec limit opts))]
                   {k v})
                 ; loop through map of groups
                 (loop [[group-key & rest-keys] (keys group-map)
@@ -847,7 +856,7 @@
                       ; 2) set offset to 0 so a drop is not performed
                       ; 3) then call process-ad-hoc-group
                       (-> (cond->> (<? (process-ad-hoc-group
-                                         db
+                                         db fuel max-fuel
                                          group-as-res
                                          (assoc select-spec :orderBy nil :offset 0 :limit nil)
                                          (assoc opts :offset 0 :limit nil)))
@@ -863,7 +872,7 @@
                                             (if (or (nil? res') (empty? res')) acc (assoc acc group-key res'))))))))))
             ; no group by
             (let [limit (if selectOne? 1 limit)
-                  res   (<? (process-ad-hoc-group db res select-spec limit opts))]
+                  res   (<? (process-ad-hoc-group db fuel max-fuel res select-spec limit opts))]
               (cond (not (coll? res)) (if inVector? [res] res)
                     selectOne? (first res)
                     :else res)))))
@@ -920,10 +929,10 @@
             :else
             (let [select-spec (get-ad-hoc-select-spec (:headers where-result) (:vars where-result)
                                                       query-map opts)]
-              (<? (process-ad-hoc-res db where-result select-spec opts)))))))
+              (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))))
 
 (defn query
-  "Returns core async channel with results"
+  "Returns core async channel with results or exception"
   [db query-map]
   (let [{:keys [select selectOne selectDistinct where from limit offset component orderBy groupBy prettyPrint opts]} query-map
         opts' (cond-> (merge {:limit   limit :offset (or offset 0) :component component
