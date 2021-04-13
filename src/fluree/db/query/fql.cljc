@@ -440,7 +440,7 @@
 
          :else
          (recur r (inc n)
-                (conj acc (->> (<? (query-range/index-range db :spot = [s] {:limit limit}))
+                (conj acc (->> (<? (query-range/index-range db :spot = [s]))
                                ((fn [n] (flakes->res db cache fuel max-fuel select-spec n)))
                                (<?)))))))))
 
@@ -751,7 +751,9 @@
                                                  offset' (conj (drop offset'))
                                                  group-limit (conj (take group-limit))
                                                  prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
-                   result         (into [] xf tuples)]
+                   result         (cond->> tuples
+                                           orderBy (order-result-tuples headers orderBy)
+                                           true (into [] xf))]
                (if expandMaps?
                  (<? (pipeline-expandmaps-result select pp-keys single-result? db opts 8 result))
                  result))))))
