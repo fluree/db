@@ -34,6 +34,15 @@
                  res)
                res)))
 
+(defn get-all-wd-optional-clauses
+  [coll]
+  (reduce (fn [res clause]
+            (if-let [optional (-> clause :optional)]
+              (into res optional)
+              res)) 
+          []
+          coll))
+
 (defn get-all-wd-clauses
   [coll]
   (loop [[clause & r] coll
@@ -68,10 +77,12 @@
 
 (defn ad-hoc-clause-to-wikidata
   [clause optional?]
-  (let [clause-str (str (str/join " " (map wikiDataVar? clause)) ".")]
-    (if optional?
-      (str "OPTIONAL {" clause-str "}")
-      clause-str)))
+  (cond->> clause
+           (= "$wd" (first clause))  (drop 1)
+           true                     (map fluree.db.query.analytical-wikidata/wikiDataVar?)
+           true                     (clojure.string/join " ")
+           true                     (format "%s .")
+           optional?                (format "OPTIONAL {%s}")))
 
 (defn parse-prefixes
   [prefixes]
