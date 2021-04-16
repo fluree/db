@@ -11,7 +11,8 @@
   (-resolve-to-t [node t idx-novelty] [node t idx-novelty fast-forward-db?] [node t idx-novelty fast-forward-db? remove-flakes]
     "Resolves this node at specified transaction 't'. Novelty included for the specified index.")
   (-resolve-history [node] "Returns the history for data nodes.")
-  (-resolve-history-range [node from-t to-t] [node from-t to-t idx-novelty] "Returns the history within specified range of 't' values. From is most recent time."))
+  (-resolve-history-range [node from-t to-t] [node from-t to-t idx-novelty]
+    "Returns the history within specified range of 't' values. From is most recent time."))
 
 
 (defprotocol INode

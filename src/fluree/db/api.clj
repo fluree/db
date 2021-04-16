@@ -742,32 +742,7 @@
 
 (defn resolve-block-range
   [db query-map]
-  (go-try
-    (let [range     (if (sequential? (:block query-map))
-                      (:block query-map)
-                      [(:block query-map) (:block query-map)])
-          [block-start block-end]
-          (if (some string? range)                          ;; do we need to convert any times to block integers?
-            [(<? (time-travel/block-to-int-format db (first range)))
-             (when-let [end (second range)]
-               (<? (time-travel/block-to-int-format db end)))] range)
-          db-block  (:block db)
-          _         (when (> block-start db-block)
-                      (throw (ex-info (str "Start block is out of range for this ledger. Start block provided: " (pr-str block-start) ". Database block: " (pr-str db-block)) {:status 400 :error :db/invalid-query})))
-          [block-start block-end]
-          (cond
-            (and block-start block-end) [block-start block-end]
-            block-start [block-start (:block db)]
-            :else (throw (ex-info (str "Invalid block range provided: " (pr-str range)) {:status 400 :error :db/invalid-query})))
-          _         (when (not (and (pos-int? block-start) (pos-int? block-end)))
-                      (throw (ex-info (str "Invalid block range provided: " (pr-str range)) {:status 400 :error :db/invalid-query})))
-          [block-start block-end]
-          (if (< block-end block-start)
-            [block-end block-start]                         ;; make sure smallest number comes first
-            [block-start block-end])
-          block-end (if (> block-end db-block)
-                      db-block block-end)]
-      [block-start block-end])))
+  (query-api/resolve-block-range db query-map))
 
 (defn block-query-async
   [conn ledger query-map]

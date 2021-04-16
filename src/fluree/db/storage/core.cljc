@@ -310,10 +310,11 @@
   (go
     (try*
       (let [node-t      (:t node)
-            history     (when (or (nil? from-t) (<= node-t from-t)) ;; don't pull history if requested 't' range is entirely in novelty
+            history     (when (or (nil? from-t)
+                                  (<= node-t from-t)) ;; don't pull history if requested 't' range is entirely in novelty
                           (cond->> (<? (dbproto/-resolve-history node))
-                                   (> to-t node-t) (drop-while #(< (.-t ^Flake %) to-t))
-                                   from-t (take-while #(<= (.-t ^Flake %) from-t))))
+                            (> to-t node-t) (drop-while #(< (.-t ^Flake %) to-t))
+                            from-t          (take-while #(<= (.-t ^Flake %) from-t))))
             first-flake (dbproto/-first-flake node)
             rhs         (dbproto/-rhs node)
             _           (when-not (:leaf node)
