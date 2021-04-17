@@ -46,11 +46,3 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 1. `make browser` - make JavaScript WebWorker Fluree DB
 1. `make clean` - clean all build directories/files
 1. `make install` - install jar file into local .m2/maven
-
-### Deploying
-
-1. Make sure you've setup everything in the [Prerequisites](#Prerequisites) section above.
-1. Install maven
-    1. macOS: `brew install maven`
-1. Set the version number in `pom.xml`
-1. Run `make deploy`

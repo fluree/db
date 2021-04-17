@@ -43,7 +43,7 @@
  :aliases
  {:mvn/group-id com.fluree
   :mvn/artifact-id db
-  :mvn/version "1.0.0-rc15"
+  :mvn/version "1.0.0-rc17"
 
   :cljstest
   {:extra-paths ["test"]
@@ -85,7 +85,7 @@
                   :sync-pom true}}
 
   :install
-  {:replace-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "install"
                   "target/fluree-db.jar"]}
 
@@ -95,7 +95,7 @@
    :main-opts   ["-m" "fluree.db.docs"]}
 
   :deploy
-  {:replace-deps {deps-deploy/deps-deploy {:mvn/version "2021.03.31"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "deploy"
                   "target/fluree-db.jar"]}
 

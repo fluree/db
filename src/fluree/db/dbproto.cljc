@@ -35,8 +35,8 @@
   (-subid [db ident] [db ident strict?] "Returns subject ID if exists, else nil")
   (-search [db fparts] "Performs a slice, but determines best index to use.")
   (-query [db query] [db query opts] "Performs a query.")
-  (-with [db block flakes] "Applies flakes to this db as a new block with possibly multiple 't' transactions.")
-  (-with-t [db flakes] "Applies flakes to this db as a new 't', but retains current block.")
+  (-with [db block flakes] [db block flakes opts] "Applies flakes to this db as a new block with possibly multiple 't' transactions.")
+  (-with-t [db flakes] [db flakes opts] "Applies flakes to this db as a new 't', but retains current block.")
   (-add-predicate-to-idx [db pred-id] "Adds predicate to idx, return updated db."))
 
 

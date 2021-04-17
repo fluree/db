@@ -705,16 +705,6 @@
 ;; Search/Time-travel
 ;;
 ;; ======================================
-(defn- ^:private block-Flakes->vector
-  [blocks]
-  (loop [[block & r] blocks
-         acc []]
-    (if block
-      (let [flakes (map flake/Flake->parts (:flakes block))]
-        (recur r (into acc [(assoc block :flakes flakes)])))
-      acc)))
-
-
 (defn ^:export search
   "Returns a promise containing search results of flake parts (flake-parts)."
   [db flake-parts]
@@ -989,7 +979,7 @@
                (js->clj :keywordize-keys true)
                (as-> clj-opts (query-block/block-range (<? db) start end clj-opts))
                <?
-               block-Flakes->vector
+               (query/block-Flakes->vector)
                clj->js
                (resolve))
            (catch :default e
