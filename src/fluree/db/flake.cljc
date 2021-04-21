@@ -350,8 +350,9 @@
 
 
 
-;; when we look up an item in history, we can quickly find the relevant items, then apply changes in reverse
-;; the alternative would be to reverse an entire node, which might work better for generic caching purposes.
+;; When we look up an item in history, we can quickly find the relevant items,
+;; then apply changes in reverse. The alternative would be to reverse an entire
+;; node, which might work better for generic caching purposes.
 
 (defn cmp-flakes-spot-novelty [^Flake f1, ^Flake f2]
   (combine-cmp

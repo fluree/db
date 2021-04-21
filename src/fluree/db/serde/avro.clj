@@ -248,7 +248,8 @@
                                        {:status 500 :error :db/unexpected-error})))))
 
 (defn decode-key
-  "Given a key, figures out what type of data it is and decodes it with the appropriate schema."
+  "Given a key, figures out what type of data it is and decodes it with the
+  appropriate schema."
   [k data]
   (log/warn "AVRO decode key:" k)
   (cond

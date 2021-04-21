@@ -280,18 +280,15 @@
                             :none [])
               ;; either conjoin flakes or disjoin them depending on if source if from history of novelty
               conj?       (case source
-                            :novelty (fn [^Flake f] (true? (.-op f)))
-                            :history (fn [^Flake f] (false? (.-op f)))
+                            :novelty (fn [^Flake f] (true? (flake/op f)))
+                            :history (fn [^Flake f] (false? (flake/op f)))
                             :none nil)
-              flakes      (doall (reduce
-                                   (fn [acc ^Flake f]
-                                     (cond ((or remove-preds #{}) (.-p f))
-                                           (disj acc f)
-
-                                           (conj? f) (conj acc f)
-
-                                           :else (disj acc f)))
-                                   (:flakes base-node) coll))
+              flakes      (reduce (fn [acc ^Flake f]
+                                    (if (and (conj? f)
+                                             (not (contains? remove-preds (flake/p f))))
+                                      (conj acc f)
+                                      (disj acc f)))
+                                  (:flakes base-node) coll)
               resolved-t  (assoc base-node :flakes flakes)]
           (async/put! result-ch resolved-t))
         (catch* e
