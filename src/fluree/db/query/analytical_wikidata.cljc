@@ -78,9 +78,9 @@
 (defn ad-hoc-clause-to-wikidata
   [clause optional?]
   (cond->> clause
-           (= "$wd" (first clause))  (drop 1)
-           true                     (map fluree.db.query.analytical-wikidata/wikiDataVar?)
-           true                     (clojure.string/join " ")
+           (= "$wd" (first clause)) (drop 1)
+           true                     (map wikiDataVar?)
+           true                     (str/join " ")
            true                     (format "%s .")
            optional?                (format "OPTIONAL {%s}")))
 
