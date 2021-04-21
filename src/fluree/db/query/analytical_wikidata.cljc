@@ -36,8 +36,8 @@
 
 (defn get-all-wd-optional-clauses
   [coll]
-  (reduce (fn [res clause]
-            (if-let [optional (-> clause :optional)]
+  (reduce (fn [res {:keys [optional]}]
+            (if optional
               (into res optional)
               res)) 
           []
