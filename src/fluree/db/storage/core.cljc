@@ -292,7 +292,9 @@
               resolved-t  (assoc base-node :flakes flakes)]
           (async/put! result-ch resolved-t))
         (catch* e
-                (error-fn)
+                (log/error e "Exception when resolving node t")
+                (when error-fn
+                  (error-fn))
                 (async/put! result-ch e)
                 (async/close! result-ch))))
     ;; return promise chan immediately
