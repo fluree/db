@@ -489,15 +489,27 @@
   [comparator & flakes]
   (apply avl/sorted-set-by comparator flakes))
 
+(defn transient-reduce
+  [reducer ss coll]
+  (->> coll
+       (reduce reducer (transient ss))
+       persistent!))
+
+(defn conj-all
+  "Adds all flakes in the `to-add` collection from the AVL-backed sorted flake set
+  `sorted-set`. This function uses transients for intermediate set values for
+  better performance because of the slower batched update performance of
+  AVL-backed sorted sets."
+  [ss to-add]
+  (transient-reduce conj! ss to-add))
+
 (defn disj-all
   "Removes all flakes in the `to-remove` collection from the AVL-backed sorted
   flake set `sorted-set`. This function uses transients for intermediate set
   values for better performance because of the slower batched update performance
   of AVL-backed sorted sets."
-  [sorted-set to-remove]
-  (as-> (transient sorted-set) tset
-    (reduce disj! tset to-remove)
-    (persistent! tset)))
+  [ss to-remove]
+  (transient-reduce disj! ss to-remove))
 
 (defn last
   "Returns the last item in `ss` in constant time as long as `ss` is a sorted
