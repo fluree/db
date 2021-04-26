@@ -331,7 +331,6 @@
                url          (str address "/fdb/storage/" path)
                headers      (cond-> {"Accept" #?(:clj  "avro/binary"
                                                  :cljs "application/json")}
-                                    private (assoc "X-fdb-pri" private)
                                     jwt' (assoc "X-fdb-jwt" jwt')
                                     jwt' (assoc "Authorization" (str "Bearer " jwt')))
                headers*     (if private
