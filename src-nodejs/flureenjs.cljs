@@ -380,6 +380,27 @@
       (js->clj :keywordize-keys true)
       (as-> clj-opts (db-instance conn ledger clj-opts))))
 
+(defn ^:private ledger-db
+  "Returns a queryable database from the connection for the specified ledger."
+  ([conn ledger]
+   (ledger/root-db conn ledger nil))
+  ([conn ledger {:keys [roles auth block syncTo syncTimeout] :as opts}]
+   (let [pc (async/promise-chan)]
+     (async/go
+       (try
+         (let [dbx (cond-> (<? (session/db conn ledger opts))
+                           syncTo (-> (ledger/syncTo-db syncTo syncTimeout) <?)
+                           block (-> (time-travel/as-of-block block) <?)
+                           ;; should only ever have roles -or- auth
+                           ;; if both, auth overrides roles
+                           (or auth roles) (-> (ledger/add-db-permissions auth roles) <?))]
+           (async/put! pc dbx))
+         (catch :default e
+                 (async/put! pc e)
+                 (async/close! pc))))
+     ;; return promise chan immediately
+     pc)))
+
 
 (defn ^:private db-instance
   "Returns a queryable database from the connection."
