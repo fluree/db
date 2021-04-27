@@ -415,7 +415,7 @@
                auth'        (or auth (if jwt
                                        ["_auth/id" (-> (conn-handler/validate-token conn jwt)
                                                        :sub)]))
-               perm-db       (-> (<? (ledger/db conn ledger (assoc opts :auth auth')))
+               perm-db       (-> (<? (ledger-db conn ledger (assoc opts :auth auth')))
                                  (assoc :conn conn :network network :dbid ledger-id))]
            (async/put! pc perm-db))
          (catch :default e
