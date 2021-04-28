@@ -370,7 +370,8 @@
               {:keys [comparator]} config
               child-nodes (map-indexed (fn [idx {:keys [id leaf first rhs size] :as child}]
                                          (let [at-leftmost? (and leftmost? (zero? idx))]
-                                           (->UnresolvedNode conn config network dbid id leaf first rhs size block t tt-id at-leftmost? tempid))) children)
+                                           (->UnresolvedNode conn config network dbid id leaf first rhs size block t tt-id at-leftmost? tempid)))
+                                       children)
               idx-node    (index/->IndexNode block t
                                              rhs
                                              ;; child nodes are in a sorted map with {<lastFlake> <UnresolvedNode>} as k/v
