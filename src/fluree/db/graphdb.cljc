@@ -204,8 +204,7 @@
                              (assoc db :tt-id tt-id)
                              index/types)
          flakes-by-t (->> flakes
-                          (sort-by :t)
-                          reverse
+                          (sort-by :t flake/cmp-t)
                           (partition-by :t))]
      (loop [db tt-db
             [flakes & rest] flakes-by-t]

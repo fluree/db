@@ -274,7 +274,6 @@
     (compare o1 o2)
     0))
 
-
 (defn cc-cmp-class [x]
   (if (string? x)
     "string"
@@ -316,6 +315,11 @@
     #?(:clj (Long/compare l1 l2) :cljs (- l1 l2))
     0))
 
+(defn cmp-t
+  "Comparator for transaction values. The supplied values are reversed before the
+  comparison to account for transaction's decreasing sort order"
+  [t1 t2]
+  (cmp-long t2 t1))
 
 (defn cmp-flakes-spot [^Flake f1, ^Flake f2]
   (combine-cmp
@@ -359,7 +363,7 @@
     (cmp-long (.-s f2) (.-s f1))                            ;; reversed
     (cmp-pred (.-p f1) (.-p f2))
     (cmp-val-xtype (.-o f1) (.-o f2))
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
+    (cmp-t (t f1) (t f2))
     (cmp-bool (.-op f1) (.-op f2))
     (cmp-meta (.-m f1) (.-m f2))))
 
@@ -369,7 +373,7 @@
     (cmp-pred (.-p f1) (.-p f2))
     (cmp-long (.-s f2) (.-s f1))                            ;; reversed
     (cmp-val-xtype (.-o f1) (.-o f2))
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
+    (cmp-t (t f1) (t f2))
     (cmp-bool (.-op f1) (.-op f2))
     (cmp-meta (.-m f1) (.-m f2))))
 
@@ -379,7 +383,7 @@
     (cmp-pred (.-p f1) (.-p f2))
     (cmp-val-xtype (.-o f1) (.-o f2))
     (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
+    (cmp-t (t f1) (t f2))
     (cmp-bool (.-op f1) (.-op f2))
     (cmp-meta (.-m f1) (.-m f2))))
 
@@ -389,7 +393,7 @@
     (cmp-long (.-o f2) (.-o f1))                            ;; reversed
     (cmp-pred (.-p f1) (.-p f2))
     (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
+    (cmp-t (t f1) (t f2))
     (cmp-bool (.-op f1) (.-op f2))
     (cmp-meta (.-m f1) (.-m f2))))
 
@@ -399,7 +403,7 @@
   moved up front."
   [^Flake f1, ^Flake f2]
   (combine-cmp
-   (cmp-long (.-t f2) (.-t f1))                            ;; reversed
+   (cmp-t (t f1) (t f2))
    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
    (cmp-pred (.-p f1) (.-p f2))
    (cmp-val-xtype (.-o f1) (.-o f2))
@@ -411,7 +415,7 @@
   "Note this is not suitable for a set, only a vector/list."
   [^Flake f1, ^Flake f2]
   (combine-cmp
-    (cmp-long (.-t f1) (.-t f2))
+    (cmp-long (t f1) (t f2))
     #?(:clj  (Boolean/compare (.-op f2) (.-op f1))
        :cljs (compare (.-op f2) (.-op f1)))))
 
