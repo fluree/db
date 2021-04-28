@@ -192,24 +192,26 @@
   the flakes that end up requiring the schema change."
   [db tt-id flakes]
   (go-try
-    (let [tt-id'      (if (nil? tt-id) (util/random-uuid) tt-id)
-          ;; update each root index with the provided tt-id
-          ;; As the root indexes are resolved, the tt-id will carry through the b-tree and ensure
-          ;; query caching is specific to this tt-id
-          db'         (reduce (fn [db* idx]
-                                (assoc db* idx (-> (get db* idx)
-                                                   (assoc :tt-id tt-id'))))
-                              (assoc db :tt-id tt-id')
-                              index/types)
-          flakes-by-t (->> flakes
-                           (sort-by :t)
-                           reverse
-                           (partition-by :t))]
-      (loop [db db'
-             [flakes & rest] flakes-by-t]
-        (if flakes
-          (recur (<? (with-t db flakes)) rest)
-          db)))))
+   (let [tt-id       (if (nil? tt-id)
+                       (util/random-uuid)
+                       tt-id)
+
+         ;; update each root index with the provided tt-id
+         ;; As the root indexes are resolved, the tt-id will carry through the b-tree and ensure
+         ;; query caching is specific to this tt-id
+         tt-db       (reduce (fn [db* idx]
+                               (update db* idx assoc :tt-id tt-id))
+                             (assoc db :tt-id tt-id)
+                             index/types)
+         flakes-by-t (->> flakes
+                          (sort-by :t)
+                          reverse
+                          (partition-by :t))]
+     (loop [db tt-db
+            [flakes & rest] flakes-by-t]
+       (if flakes
+         (recur (<? (with-t db flakes)) rest)
+         db)))))
 
 (defn subid
   "Returns subject ID of ident as async promise channel.
