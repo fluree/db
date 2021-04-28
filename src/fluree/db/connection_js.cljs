@@ -40,6 +40,7 @@
 ;; Connection
 ;;
 ;; ======================================
+;; TODO: deprecated
 (defn authenticate
   "Authenticate with Fluree On-Demand"
   ([conn account user password] (authenticate conn account user password nil))
