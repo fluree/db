@@ -7,6 +7,9 @@
 
 ;; system constants
 
+;; @id (unique subject identifier) in the form of IRI
+(def ^:const $iri 0)
+
 ;; system collection ids
 (def ^:const $_tx -1)                                       ;; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
 (def ^:const $_predicate 0)
@@ -20,6 +23,7 @@
 (def ^:const $_rule 8)
 (def ^:const $_setting 9)
 (def ^:const $_prefix 10)
+(def ^:const $_default 11)
 
 (def ^:const $numSystemCollections 10)
 (def ^:const $maxSystemPredicates 999)
@@ -66,6 +70,7 @@
 (def ^:const $_collection:shard 45)
 (def ^:const $_collection:equivalentClass 46)
 (def ^:const $_collection:partition 47)
+(def ^:const $_collection:baseIRI 48)
 
 (def ^:const $_user:username 50)
 (def ^:const $_user:auth 51)

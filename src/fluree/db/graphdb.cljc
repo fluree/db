@@ -215,6 +215,12 @@
                         (when (not-empty (<? (query-range/index-range db :spot = [ident])))
                           ident)
 
+                        ;; predicate subject id was supplied
+                        (pos-int? (first ident))
+                        (some-> (<? (query-range/index-range db :post = [(first ident) (second ident)]))
+                                ^Flake (first)
+                                (.-s))
+
                         ; If it's an pred-ident, but the first part of the identity doesn't resolve to an existing predicate, throws an error
                         (and (util/pred-ident? ident) (nil? (dbproto/-p-prop db :id (first ident))))
                         (throw (ex-info (str "Subject ID lookup failed. The predicate " (pr-str (first ident)) " does not exist.")
@@ -261,7 +267,7 @@
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
   (-c-prop [this property collection]
     ;; collection properties TODO-deprecate :id property below in favor of :partition
-    (assert (#{:name :id :sid :partition :spec :specDoc} property) (str "Invalid collection property: " (pr-str property)))
+    (assert (#{:name :id :sid :partition :spec :specDoc :base-iri} property) (str "Invalid collection property: " (pr-str property)))
     (if (neg-int? collection)
       (get-in schema [:coll "_tx" property])
       (get-in schema [:coll collection property])))
@@ -344,7 +350,7 @@
         _            (assert index-config (str "No index config found for index: " idx))
         comparator   (:historyComparator index-config)
         _            (assert comparator (str "No index comparator found for index: " idx))
-        first-flake  (flake/->Flake util/max-long 0 util/max-long 0 true nil) ;; left hand side is the largest flake possible
+        first-flake  (flake/->Flake util/max-long -1 util/max-long 0 true nil) ;; left hand side is the largest flake possible
         child-node   (storage/map->UnresolvedNode
                        {:conn  conn :config index-config :network network :dbid dbid :id :empty :leaf true
                         :first first-flake :rhs nil :size 0 :block 0 :t 0 :tt-id nil :leftmost? true})

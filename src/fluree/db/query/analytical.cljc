@@ -67,7 +67,7 @@
                            (update :search #(conj % nil))
                            (assoc-in [:rel key-as-var] idx))
 
-                       (and (internal-filter? key) (= idx 2))
+                       (and (= idx 2) (internal-filter? key))
                        (let [filter-code (#?(:clj read-string :cljs cljs.reader/read-string) (subs key 1))
                              var         (or (get-vars filter-code)
                                              (throw (ex-info (str "Filter function must contain a valid variable. Provided: " key) {:status 400 :error :db/invalid-query})))
@@ -91,7 +91,8 @@
                        (update acc :search #(conj % (safe-read-string key)))
 
                        :else
-                       (update acc :search #(conj % key))))) {:search [] :rel {} :opts {}} clause))
+                       (update acc :search #(conj % key)))))
+             {:search [] :rel {} :opts {}} clause))
 
 (defn get-ns-arrays [ns arrays]
   (map (fn [array] (map #(nth array %) ns)) arrays))
@@ -328,7 +329,8 @@
                                                            v)]
                                            (if single-v?
                                              [acc (assoc clause' idx-of (first v))]
-                                             [(assoc acc k v) clause']))) [{} search] common-keys)
+                                             [(assoc acc k v) clause'])))
+                                       [{} search] common-keys)
                 ;; Currently, only pass in object-fn to search opts. Seems to be faster to filter
                 ;; subject after. I'm sure this depends on a number of variables
                 ;; TODO - determine what, when, and how to filter - in index range? after index-range?

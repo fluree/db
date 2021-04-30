@@ -325,7 +325,8 @@
                                                         :spec      specs
                                                         :specDoc   specDoc
                                                         :id        partition ;; TODO - deprecate! (use partition instead)
-                                                        :partition partition}]
+                                                        :partition partition
+                                                        :base-iri  (get p->v const/$_collection:baseIRI)}]
                                          (assoc acc partition c-props
                                                     c-name c-props)))
                                      ;; put in defaults for _tx

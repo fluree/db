@@ -131,8 +131,8 @@
            from-t             (or (:from-t opts) (:t db))
            to-t               (:to-t opts)
            ;; Note this bypasses all permissions in CLJS for now!
-           no-filter?         #?(:cljs true                         ;; always allow for now
-                                 :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))
+           no-filter? #?(:cljs true                         ;; always allow for now
+                         :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))
            novelty            (get-in db [:novelty idx])
            root-node          (-> db
                                   (get idx)
@@ -278,8 +278,8 @@
                                   (dbproto/-resolve)
                                   (<?))
            node-start         (<? (find-next-valid-node root-node start-flake t novelty fast-forward-db?))
-           no-filter?         #?(:cljs true
-                                 :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
+           no-filter? #?(:cljs true
+                         :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
        (if node-start (loop [next-node node-start
                              offset    offset               ;; offset counts down from the offset
                              i         0                    ;; i is count of flakes
@@ -372,6 +372,20 @@
           (recur r (conj acc (flake/parts->Flake [s p o t op m]))))
         (recur r (conj acc flake))) acc)))
 
+(defn coerce-tag-object
+  "When a predicate is type :tag and the query object (o) is a string,
+  resolves the tag string to a tag subject id (sid)."
+  [db p o-string]
+  (go-try
+    (if (tag-string? o-string)
+      ;; Returns tag-id
+      (<? (dbproto/-tag-id db o-string))
+      ;; if string, but not tag string, we have a string
+      ;; like "query" with no namespace, we need to ns.
+      (let [tag-name (str (dbproto/-p-prop db :name p) ":" o-string)]
+        (<? (dbproto/-tag-id db tag-name))))))
+
+
 
 (defn search
   ([db fparts]
@@ -379,20 +393,24 @@
   ([db fparts opts]
    (go-try (let [[s p o t] fparts
                  idx-predicate? (dbproto/-p-prop db :idx? p)
-                 tag-predicate? (if p (= :tag (dbproto/-p-prop db :type p)) false)
-                 o-coerce?      (and tag-predicate? (string? o))
+                 ref?           (if p (dbproto/-p-prop db :ref? p) false) ;; ref? is either a type :tag or :ref
+                 o-coerce?      (and ref? (string? o))
                  o              (cond (not o-coerce?)
                                       o
 
-                                      (tag-string? o)
-                                      (<? (dbproto/-tag-id db o))
-                                      ;; Returns tag-id
+                                      (= :tag (dbproto/-p-prop db :type p))
+                                      (<? (coerce-tag-object db p o))
 
-                                      ;; if string, but not tag string, we have a string
-                                      ;; like "query" with no namespace, we need to ns.
-                                      (string? o)
-                                      (let [tag-name (str (dbproto/-p-prop db :name p) ":" o)]
-                                        (<? (dbproto/-tag-id db tag-name))))
+                                      :else                 ;; type is :ref, supplied iri
+                                      (<? (dbproto/-subid db [const/$iri o])))
+
+                 s              (cond (string? s)
+                                      (<? (dbproto/-subid db [const/$iri s]))
+
+                                      (util/pred-ident? s)
+                                      (<? (dbproto/-subid db s))
+
+                                      :else s)
 
                  res            (cond
                                   s
@@ -412,7 +430,7 @@
 
                                   o
                                   (<? (index-range db :opst = [o p s t] opts)))
-                 res*           (if tag-predicate?
+                 res*           (if (and ref? (= :tag (dbproto/-p-prop db :type p)))
                                   (<? (coerce-tag-flakes db res))
                                   res)]
              res*))))

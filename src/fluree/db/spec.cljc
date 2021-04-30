@@ -1,7 +1,9 @@
 (ns fluree.db.spec
   (:require [fluree.db.util.json :as json]
             [alphabase.core :as alphabase]
-            [fluree.db.util.core :as util :refer [try* catch*]]))
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [clojure.string :as str]))
 
 (def ^:private EMAIL #"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
@@ -12,171 +14,113 @@
     (catch* e
             (str x))))
 
+
+(defn type-check-error
+  ([message] (throw (ex-info message {:status 400 :error :db/invalid-type})))
+  ([x p-type] (type-check-error (str "Could not coerce value to " (util/keyword->str p-type) ": " x "."))))
+
 (defn type-check
   "(type-check type object) transforms a object to match the type. If it cannot be transformed, it throws an ex-info with a map from paths into the object to errors encountered at those paths."
-  ([object spec]
-   (let [errors    (atom {})
-         conformed (type-check object spec [] errors)
-         error-seq (reduce-kv (fn [e k v] (conj e (assoc v :path k))) [] @errors)]
-     (if (empty? error-seq)
-       conformed
-       (throw
-         (ex-info (str "Could not conform object: " (pr-str object) " to type " (pr-str spec))
-                  {:status 400
-                   :body   {:message (apply print-str "Validation error."
-                                            (mapv
-                                              #(str (:message %) " at " (mapv safe-name (:path %))
-                                                    ". Expected " (safe-name (:spec %))
-                                                    " but got \"" (:object %) "\".")
-                                              error-seq))
-                            :errors  error-seq}})))))
-  ([object spec path errors-atom]
-   (try*
-     (let [error (fn [& [message]] (throw (ex-info (or message "Invalid object") {})))
-           spec  (if (keyword? spec) (name spec) spec)]
-       (cond
-         (nil? spec)
-         (if (nil? object) object (error))
+  [x p-type]
+  (try*
+    (if (nil? x)
+      nil
+      (case p-type
+        :string (if (keyword? x)
+                  (subs (str x) 1)
+                  (str x))
 
-         (string? spec)
-         (let [optional  (.endsWith spec "?")
-               base-spec (if optional (subs spec 0 (dec (.length spec))) spec)]
-           (cond
-             (and optional (nil? object))
-             nil
+        :boolean (cond
+                   (true? x) true
+                   (false? x) false
+                   (and (string? x) (= "true" (str/lower-case x))) true
+                   (and (string? x) (= "false" (str/lower-case x))) false
+                   :else (type-check-error x p-type))
 
-             (= base-spec "any")
-             object
+        :instant (try*
+                   (util/date->millis x)
+                   (catch* _ (type-check-error x p-type)))
 
-             (= base-spec "boolean")
-             (if (boolean? object) object (error))
+        :uuid (cond
+                (string? x) x
+                (uuid? x) (str x)
+                :else (type-check-error x p-type))
 
-             (= base-spec "int")
-             (int object)
+        :uri (str x)
 
-             ;; longs can exceed what JavaScript/JSON supports, so we allow them to come over as a string.
-             (= base-spec "long")
-             (cond
-               (number? object)
-               (long object)
+        :bytes (cond
+                 (string? x) (let [uc (str/lower-case x)]
+                               (if (re-matches #"^[0-9a-f]+$" uc)
+                                 uc
+                                 (type-check-error "Bytes type must be in hex string form, provided: " x)))
+                 #?@(:clj  [(bytes? x) (alphabase/bytes->hex x)]
+                     :cljs [(sequential? (js->clj x)) (alphabase/bytes->hex x)])
 
-               (string? object)
-               #?(:clj  (Long/parseLong object)
-                  :cljs (let [i (js/parseInt object)]
-                          (if (<= util/min-long i util/max-long)
-                            i
-                            (error (str "Long " object " is outside of javascript max integer size of 2^53 - 1.")))))
+                 :else (type-check-error x p-type))
 
-               :else
-               (error))
+        :int (cond
+               (int? x) x
+               (string? x) #?(:clj  (Integer/parseInt x)
+                              :cljs (js/parseInt x))
+               :else (type-check-error x p-type))
 
-             ; Is this what we want?
-             (= base-spec "bigint")
-             #?(:clj  (bigint object)
-                :cljs (let [i (if (string? object)
-                                (js/parseInt object)
-                                object)]
-                        (if (<= util/min-long i util/max-long)
-                          i
-                          (error (str "Bigintegers are not supported in javascript. max integer size of 2^53 - 1, provided: " object)))))
+        :long (cond
+                (number? x) (long x)
+                (string? x) #?(:clj  (Long/parseLong x)
+                               :cljs (let [i (js/parseInt x)]
+                                       (if (<= util/min-long i util/max-long)
+                                         i
+                                         (type-check-error (str "Long value is outside of javascript max integer size of 2^53 - 1, provided: " x ".")))))
+                :else (type-check-error x p-type))
 
+        :bigint #?(:clj  (bigint x)
+                   :cljs (let [i (if (string? x)
+                                   (js/parseInt x)
+                                   x)]
+                           (if (<= util/min-long i util/max-long)
+                             i
+                             (type-check-error (str "Bigintegers are not supported in javascript. max integer size of 2^53 - 1, provided: " x ".")))))
 
-             (= base-spec "float")
-             (if (number? object) (float object) (error))
+        :float (cond
+                 (number? x) (float x)
+                 (string? x) #?(:clj  (Float/parseFloat x)
+                                :cljs (js/parseFloat x))
+                 :else (type-check-error x p-type))
 
-             ;; Doubles can exceed what JavaScript/JSON supports, so we allow them to come over as a string.
-             (= base-spec "double")
-             (cond
-               (number? object)
-               (double object)
+        ;; TODO - double in JS should have a check for a valid value, see: https://stackoverflow.com/questions/45929493/node-js-maximum-safe-floating-point-number
+        :double (cond
+                  (number? x) (double x)
+                  (string? x) #?(:clj  (Double/parseDouble x)
+                                 :cljs (js/parseFloat x))
+                  :else (type-check-error x p-type))
 
-               (string? object)
-               #?(:clj  (Double/parseDouble object)
-                  :cljs (js/parseFloat object))
+        :bigdec #?(:clj  (bigdec x)
+                   :cljs (type-check-error (str "Javascript does not support big decimals. Provided: " x ".")))
 
-               :else
-               (error))
+        :json (try*
+                (if (string? x)                             ;;confirm parsable
+                  (do (json/parse x)
+                      x)
+                  ;; try to convert to json
+                  (json/stringify x))
+                (catch* _ (type-check-error x p-type)))
 
-             ; bigDec to string
-             (= base-spec "bigdec")
-             #?(:clj  (bigdec object)
-                :cljs (error (str "Javascript does not support big decimals. Provided: " object)))
+        :geojson (try*
+                   (let [parsed (if (string? x)
+                                  (json/parse x)
+                                  x)]
+                     (if (json/valid-geojson? parsed)
+                       (if (string? x)
+                         x
+                         (json/stringify x))
+                       (type-check-error x p-type)))
+                   (catch* _ (type-check-error x p-type)))
 
-             (= base-spec "string")
-             (cond
-               (keyword? object) (subs (str object) 1)
-               :else (str object))
+        :tag (long x)
 
-             (= base-spec "bytes")
-             (cond
-               (string? object) (let [uc (.toLowerCase object)]
-                                  (if (re-matches #"^[0-9a-f]+$" uc)
-                                    uc
-                                    (error "Bytes type must be in hex string form.")))
-               #?@(:clj  [(bytes? object) (alphabase/bytes->hex object)]
-                   :cljs [(sequential? (js->clj object)) (alphabase/bytes->hex object)])
+        :ref (long x)
 
-               :else (error))
+        ;; else
+        (type-check-error (str "Unknown type: " p-type "."))))
 
-             (= base-spec "instant")
-             (try*
-               (util/date->millis object)
-               (catch* e
-                       (error)))
-
-             ; URI to string
-             (= base-spec "uri")
-             (str object)
-
-             (= base-spec "email")
-             (if (and (string? object) (re-find EMAIL object)) object (error))
-
-             (or (= base-spec "tag") (= base-spec "ref"))
-             (long object)
-
-             ;UUID to string
-             (= base-spec "uuid")
-             (cond
-               (string? object)
-               object
-
-               (uuid? object)
-               (str object)
-
-               :else
-               (error))
-
-             (= base-spec "json")
-             (try*
-               (if (string? object)                         ;;confirm parsable
-                 (do (json/parse object)
-                     object)
-                 ;; try to convert to json
-                 (json/stringify object))
-               (catch* _ (error)))
-
-             (= base-spec "geojson")
-             (try*
-               (let [parsed (if (string? object)
-                              (json/parse object)
-                              object)]
-                 (if (json/valid-geojson? parsed)
-                   (if (string? object)
-                     object
-                     (json/stringify object))
-                   (error)))
-               (catch* _ (error)))
-
-             :else
-             (error (str "Unknown base spec " base-spec))))
-
-         :else
-         (error (str "Unknown type " spec))))
-
-     (catch* e
-             (swap! errors-atom assoc path
-                    {:message #?(:clj (.getMessage e) :cljs (str e))
-                     :spec    spec
-                     :object  object})
-             object))))
-
+    (catch* _ (type-check-error (str "Unexpected error attempting to conform to: " p-type " with value: " x ".")))))
