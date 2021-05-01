@@ -8,6 +8,9 @@
 (def ^:const schema-sid-start (flake/min-subject-id const/$_predicate))
 (def ^:const schema-sid-end (flake/max-subject-id const/$_collection))
 
+(def ^:const prefix-sid-start (flake/min-subject-id const/$_prefix))
+(def ^:const prefix-sid-end (flake/max-subject-id const/$_prefix))
+
 (def ^:const collection-sid-start (flake/min-subject-id const/$_collection))
 (def ^:const collection-sid-end (flake/max-subject-id const/$_collection))
 
@@ -40,7 +43,9 @@
 (defn is-schema-flake?
   "Returns true if flake is a schema flake."
   [^Flake f]
-  (<= schema-sid-start (.-s f) schema-sid-end))
+  (or
+    (<= schema-sid-start (.-s f) schema-sid-end)
+    (<= prefix-sid-start (.-s f) prefix-sid-end)))
 
 (defn is-setting-flake?
   "Returns true if flake is a root setting flake."

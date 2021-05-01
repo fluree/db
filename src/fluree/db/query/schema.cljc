@@ -9,7 +9,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.schema :as schema-util]
-            [fluree.db.class.prefix :as prefix])
+            [fluree.db.class.prefix :as prefix]
+            [fluree.db.util.iri :as iri-util])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 (defn pred-name->keyword
@@ -305,33 +306,38 @@
   "
   [db]
   (go-try
-    (let [schema-flakes (->> (query-range/index-range db :spot >= [(flake/max-subject-id const/$_collection)] <= [0])
-                             (<?))
+    (let [schema-flakes    (<? (query-range/index-range db :spot
+                                                        >= [(flake/max-subject-id const/$_collection)]
+                                                        <= [0]))
+          ;; retrieve prefix flakes in background, process last
+          prefix-flakes-ch (query-range/index-range db :spot
+                                                    >= [(flake/max-subject-id const/$_prefix)]
+                                                    <= [(flake/min-subject-id const/$_prefix)])
           [collection-flakes predicate-flakes] (partition-by #(<= (.-s %) flake/MAX-COLL-SUBJECTS) schema-flakes)
-          coll          (->> collection-flakes
-                             (partition-by #(.-s %))
-                             (reduce (fn [acc coll-flakes]
-                                       (let [sid       (.-s (first coll-flakes))
-                                             p->v      (->> coll-flakes ;; quick lookup map of collection's predicate ids
-                                                            (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
-                                             partition (or (get p->v const/$_collection:partition)
-                                                           (flake/sid->i sid))
-                                             c-name    (get p->v const/$_collection:name)
-                                             specs     (when (get p->v const/$_collection:spec) ;; specs are multi-cardinality - if one exists filter through to get all
-                                                         (extract-spec-ids const/$_collection:spec coll-flakes))
-                                             specDoc   (get p->v const/$_collection:specDoc)
-                                             c-props   {:name      c-name
-                                                        :sid       sid
-                                                        :spec      specs
-                                                        :specDoc   specDoc
-                                                        :id        partition ;; TODO - deprecate! (use partition instead)
-                                                        :partition partition
-                                                        :base-iri  (get p->v const/$_collection:baseIRI)}]
-                                         (assoc acc partition c-props
-                                                    c-name c-props)))
-                                     ;; put in defaults for _tx
-                                     {-1    {:name "_tx" :id -1 :sid -1}
-                                      "_tx" {:name "_tx" :id -1 :sid -1}}))
+          coll             (->> collection-flakes
+                                (partition-by #(.-s %))
+                                (reduce (fn [acc coll-flakes]
+                                          (let [sid       (.-s (first coll-flakes))
+                                                p->v      (->> coll-flakes ;; quick lookup map of collection's predicate ids
+                                                               (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
+                                                partition (or (get p->v const/$_collection:partition)
+                                                              (flake/sid->i sid))
+                                                c-name    (get p->v const/$_collection:name)
+                                                specs     (when (get p->v const/$_collection:spec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                            (extract-spec-ids const/$_collection:spec coll-flakes))
+                                                specDoc   (get p->v const/$_collection:specDoc)
+                                                c-props   {:name      c-name
+                                                           :sid       sid
+                                                           :spec      specs
+                                                           :specDoc   specDoc
+                                                           :id        partition ;; TODO - deprecate! (use partition instead)
+                                                           :partition partition
+                                                           :base-iri  (get p->v const/$_collection:baseIRI)}]
+                                            (assoc acc partition c-props
+                                                       c-name c-props)))
+                                        ;; put in defaults for _tx
+                                        {-1    {:name "_tx" :id -1 :sid -1}
+                                         "_tx" {:name "_tx" :id -1 :sid -1}}))
           [pred fullText] (->> predicate-flakes
                                (partition-by #(.-s %))
                                (reduce (fn [[pred fullText] pred-flakes]
@@ -376,6 +382,7 @@
       {:t        (:t db)                                    ;; record time of spec generation, can use to determine cache validity
        :coll     coll
        :pred     pred
+       :prefix   (iri-util/system-context (<? prefix-flakes-ch))
        :fullText fullText})))
 
 (defn setting-map
