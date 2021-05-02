@@ -53,6 +53,12 @@
     compact-iri))
 
 
+(defn expand-db
+  "Expands an iri, if compact, with the db's default context"
+  [compact-iri db]
+  (expand compact-iri (get-in db [:schema :prefix])))
+
+
 (defn reverse-context
   "Flips context map from prefix -> iri, to iri -> prefix"
   [context]

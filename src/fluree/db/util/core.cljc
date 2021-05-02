@@ -116,7 +116,8 @@
   [x]
   (and (sequential? x)
        (= 2 (count x))
-       (string? (first x))))
+       (or (string? (first x))
+           (int? (first x)))))
 
 
 (defn temp-ident?

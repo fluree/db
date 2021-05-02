@@ -14,7 +14,8 @@
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.log :as log]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [fluree.db.util.iri :as iri-util])
   #?(:clj
      (:import (fluree.db.flake Flake))))
 
@@ -215,23 +216,22 @@
                         (when (not-empty (<? (query-range/index-range db :spot = [ident])))
                           ident)
 
-                        ;; predicate subject id was supplied
-                        (pos-int? (first ident))
-                        (some-> (<? (query-range/index-range db :post = [(first ident) (second ident)]))
-                                ^Flake (first)
-                                (.-s))
-
-                        ; If it's an pred-ident, but the first part of the identity doesn't resolve to an existing predicate, throws an error
-                        (and (util/pred-ident? ident) (nil? (dbproto/-p-prop db :id (first ident))))
-                        (throw (ex-info (str "Subject ID lookup failed. The predicate " (pr-str (first ident)) " does not exist.")
-                                        {:status 400
-                                         :error  :db/invalid-ident}))
+                        ;; assume iri
+                        (string? ident)
+                        (let [iri (iri-util/expand-db ident db)]
+                          (some-> (<? (query-range/index-range db :post = [const/$iri iri]))
+                                  ^Flake (first)
+                                  (.-s)))
 
                         ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
                         (util/pred-ident? ident)
-                        (some-> (<? (query-range/index-range db :post = [(dbproto/-p-prop db :id (first ident)) (second ident)]))
-                                ^Flake (first)
-                                (.-s))
+                        (if-let [pid (dbproto/-p-prop db :id (first ident))]
+                          (some-> (<? (query-range/index-range db :post = [pid (second ident)]))
+                                  ^Flake (first)
+                                  (.-s))
+                          (throw (ex-info (str "Subject ID lookup failed. The predicate " (pr-str (first ident)) " does not exist.")
+                                          {:status 400
+                                           :error  :db/invalid-ident})))
 
                         :else
                         (throw (ex-info (str "Entid lookup must be a number or valid two-tuple identity: " (pr-str ident))

@@ -404,8 +404,8 @@
                                       :else                 ;; type is :ref, supplied iri
                                       (<? (dbproto/-subid db [const/$iri o])))
 
-                 s              (cond (string? s)
-                                      (<? (dbproto/-subid db [const/$iri s]))
+                 s*             (cond (string? s)
+                                      (<? (dbproto/-subid db s))
 
                                       (util/pred-ident? s)
                                       (<? (dbproto/-subid db s))
@@ -414,22 +414,24 @@
 
                  res            (cond
                                   s
-                                  (<? (index-range db :spot = [s p o t] opts))
+                                  (if (nil? s*)             ;; subject could not be resolved, no results
+                                    nil
+                                    (<? (index-range db :spot = [s* p o t] opts)))
 
                                   (and p (non-nil-non-boolean? o) idx-predicate? (not (fn? o)))
-                                  (<? (index-range db :post = [p o s t] opts))
+                                  (<? (index-range db :post = [p o s* t] opts))
 
                                   (and p (not idx-predicate?) o)
                                   (let [obj-fn (if-let [obj-fn (:object-fn opts)]
                                                  (fn [x] (and (obj-fn x) (= x o)))
                                                  (fn [x] (= x o)))]
-                                    (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn))))
+                                    (<? (index-range db :psot = [p s* nil t] (assoc opts :object-fn obj-fn))))
 
                                   p
-                                  (<? (index-range db :psot = [p s o t] opts))
+                                  (<? (index-range db :psot = [p s* o t] opts))
 
                                   o
-                                  (<? (index-range db :opst = [o p s t] opts)))
+                                  (<? (index-range db :opst = [o p s* t] opts)))
                  res*           (if (and ref? (= :tag (dbproto/-p-prop db :type p)))
                                   (<? (coerce-tag-flakes db res))
                                   res)]
