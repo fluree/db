@@ -453,8 +453,8 @@
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
   ([^Flake flake]
    (->Flake (s flake) (p flake) (o flake) (t flake) (not (op flake)) (m flake)))
-  ([^Flake flake t]
-   (->Flake (s flake) (p flake) (o flake) t (not (op flake)) (m flake))))
+  ([^Flake flake tx]
+   (->Flake (s flake) (p flake) (o flake) tx (not (op flake)) (m flake))))
 
 (defn change-t
   "Takes a flake and returns one with the provided block and op flipped from true/false.
