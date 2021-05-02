@@ -346,26 +346,28 @@
 
 
 (defn read-branch
-  "Reads and deserializes branch node."
-  [conn key]
-  (go-try (let [data (storage-read conn key)]
-            (when data
-              (serdeproto/-deserialize-branch (serde conn) (<? data))))))
+  [{:keys [serializer] :as conn} key]
+  (go-try
+   (let [data  (<? (storage-read conn key))]
+     (when data
+       (serdeproto/-deserialize-branch serializer data)))))
 
+(defn read-leaf
+  [{:keys [serializer] :as conn} key]
+  (go-try
+   (let [data (<? (storage-read conn key))]
+     (when data
+       (serdeproto/-deserialize-leaf serializer data)))))
 
 (defn reify-branch
-  "Should throw if no result... should never be the case."
   [conn config network dbid key block t tt-id leftmost? tempid error-fn]
   (let [return-ch (async/promise-chan)]
-    ;; kick of retrieval/reification process
     (async/go
       (try*
         (let [data        (<? (read-branch conn key))
               _           (when (nil? data)
                             (throw (ex-info (str "Unable to retrieve key from storage: " key)
                                             {:status 500 :error :db/storage-error})))
-              _           (when (util/exception? data)
-                            (throw data))
               {:keys [children rhs]} data
               {:keys [comparator]} config
               child-nodes (map-indexed (fn [idx {:keys [id leaf first rhs size] :as child}]
@@ -385,16 +387,6 @@
                 (async/close! return-ch))))
     ;; return promise-chan immediately
     return-ch))
-
-
-(defn read-leaf
-  "Reads and deserializes a leaf node"
-  [conn key]
-  (go-try
-    (let [data (storage-read conn key)]
-      (when data
-        (serdeproto/-deserialize-leaf (serde conn) (<? data))))))
-
 
 (defn reify-leaf
   "Should throw if no result... should never be the case."

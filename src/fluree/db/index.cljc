@@ -38,7 +38,6 @@
                             :comparator        flake/cmp-flakes-block
                             :historyComparator flake/cmp-flakes-block})})
 
-
 (defrecord IndexNode [block t rhs children config leftmost?]
   dbproto/IResolve
   (-resolve [this] (async/go this))

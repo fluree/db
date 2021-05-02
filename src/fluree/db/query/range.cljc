@@ -111,6 +111,22 @@
             (flake/subrange flake-range start-test start-flake
                             end-test end-flake))))
 
+(defn resolve-nodes-to-t
+  "Returns a channel that will eventually contain a stream of index nodes where
+  each node in the output stream is the result of resolving a node in the input
+  `node-stream` at specified transaction `t` and index novelty `novelty`"
+  [nodes novelty fast-forward-db? t]
+  (let [out (chan)]
+    (go-loop []
+      (if-let [node (<! nodes)]
+        (do (when-let [resolved (try*
+                                 (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
+                                 (catch* e))]
+              (>! out resolved))
+            (recur))
+        (async/close! out)))
+    out))
+
 (defn expand-history-range
   "Returns a channel that will eventually contain a stream of flakes between
   `start-flake` and `end-flake`, according to `start-test` and `end-test`,
@@ -132,15 +148,15 @@
   "Returns a channel that will eventually contain only the schema flakes and the
   flakes validated by fluree.db.permissions-validate/allow-flake? function for
   the database `db` from the `flake-stream` channel"
-  [flake-stream {:keys [permissions] :as db} ^Flake start ^Flake end]
+  [flake-stream {:keys [permissions] :as db} start end]
   #?(:cljs
      flake-stream ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (let [s1 (.-s start)
-           p1 (.-p start)
-           s2 (.-s end)
-           p2 (.-p end)]
+     (let [s1 (flake/s start)
+           p1 (flake/p start)
+           s2 (flake/s end)
+           p2 (flake/p end)]
        (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
          flake-stream
          (let [out (chan)]
@@ -222,22 +238,6 @@
              (async/pipe out-chan))))
      out-chan)))
 
-(defn resolve-nodes-to-t
-  "Returns a channel that will eventually contain a stream of index nodes where
-  each node in the output stream is the result of resolving a node in the input
-  `node-stream` at specified transaction `t` and index novelty `novelty`"
-  [nodes novelty fast-forward-db? t]
-  (let [out (chan)]
-    (go-loop []
-      (if-let [node (<! nodes)]
-        (do (when-let [resolved (try*
-                                 (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
-                                 (catch* e))]
-              (>! out resolved))
-            (recur))
-        (async/close! out)))
-    out))
-
 (defn indexed-flakes-xf
   "Returns a transducer that first extracts a flake set under the `:flakes` keys
   from it's input stream of index nodes, filters those flakes down to those
@@ -250,12 +250,12 @@
   (let [flakes-xf   (map :flakes)
         subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
         xforms      (cond-> [flakes-xf subrange-xf]
-                      subject-fn   (conj (filter (fn [^Flake f]
-                                                   (subject-fn (.-s f)))))
-                      predicate-fn (conj (filter (fn [^Flake f]
-                                                   (predicate-fn (.-p f)))))
-                      object-fn    (conj (filter (fn [^Flake f]
-                                                   (object-fn (.-o f))))))]
+                      subject-fn   (conj (filter (fn [f]
+                                                   (subject-fn (flake/s f)))))
+                      predicate-fn (conj (filter (fn [f]
+                                                   (predicate-fn (flake/p f)))))
+                      object-fn    (conj (filter (fn [f]
+                                                   (object-fn (flake/o f))))))]
     (apply comp xforms)))
 
 (defn extract-index-flakes
@@ -269,7 +269,7 @@
   `flake-limit` flakes from a maximum of `subject-limit` subjects."
   [flake-stream {:keys [subject-limit flake-limit offset]}]
   (let [offset-subject-xf (comp (partition-by (fn [^Flake f]
-                                                (.-s f)))
+                                                (flake/s f)))
                                 (drop offset))
         subject-ch        (chan 1 offset-subject-xf)
         flake-ch          (chan 1 cat)]
@@ -373,7 +373,7 @@
 (defn is-tag-flake?
   "Returns true if flake is a root setting flake."
   [^Flake f]
-  (<= tag-sid-start (.-o f) tag-sid-end))
+  (<= tag-sid-start (flake/o f) tag-sid-end))
 
 
 (defn coerce-tag-flakes
@@ -464,7 +464,7 @@
   (loop [[flake' & r] flakes result* []]
     (if (nil? flake')
       result*
-      (let [obj     (.-o flake')
+      (let [obj     (flake/o flake')
             cmd-map (try*
                      (json/parse obj)
                      (catch* e nil))                       ; log an error if transaction is not parsable?
@@ -490,11 +490,11 @@
     (if (nil? block')
       result*
       (let [{:keys [block t flakes]} block'
-            prev-hash   (some #(when (= (.-p %) const/$_block:prevHash) (.-o %)) flakes)
-            hash        (some #(when (= (.-p %) const/$_block:hash) (.-o %)) flakes)
-            instant     (some #(when (= (.-p %) const/$_block:instant) (.-o %)) flakes)
-            sigs        (some #(when (= (.-p %) const/$_block:sigs) (.-o %)) flakes)
-            txn-flakes  (filter #(= (.-p %) const/$_tx:tx) flakes)
+            prev-hash   (some #(when (= (flake/p %) const/$_block:prevHash) (flake/o %)) flakes)
+            hash        (some #(when (= (flake/p %) const/$_block:hash) (flake/o %)) flakes)
+            instant     (some #(when (= (flake/p %) const/$_block:instant) (flake/o %)) flakes)
+            sigs        (some #(when (= (flake/p %) const/$_block:sigs) (flake/o %)) flakes)
+            txn-flakes  (filter #(= (flake/p %) const/$_tx:tx) flakes)
             txn-flakes' (txn-from-flakes txn-flakes)]
         (recur r (conj result* {:block     block
                                 :t         t
