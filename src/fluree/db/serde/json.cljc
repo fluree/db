@@ -12,10 +12,10 @@
 
 
 (defn- deserialize-child-node
-  "Turns :first and :rhs into flakes"
+  "Turns :first-flake and :rhs into flakes"
   [child-node]
-  (assoc child-node :first (some-> (:first child-node)
-                                   (flake/parts->Flake))
+  (assoc child-node :first-flake (some-> (:first child-node)
+                                         (flake/parts->Flake))
                     :rhs (some-> (:rhs child-node)
                                  (flake/parts->Flake))))
 

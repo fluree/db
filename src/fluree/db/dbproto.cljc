@@ -1,5 +1,5 @@
 (ns fluree.db.dbproto
-  (:refer-clojure :exclude [-lookup]))
+  (:refer-clojure :exclude [-lookup resolve]))
 
 (defprotocol IResolve
   "All nodes must implement this protocol. It's includes the minimal functionality
@@ -39,6 +39,8 @@
   (-with-t [db flakes] [db flakes opts] "Applies flakes to this db as a new 't', but retains current block.")
   (-add-predicate-to-idx [db pred-id] "Adds predicate to idx, return updated db."))
 
+(defprotocol IndexResolver
+  (resolve [r node] "Populate index branch and leaf node maps with either their child node attributes or the flakes the store, respectively."))
 
 (defn db?
   [db]

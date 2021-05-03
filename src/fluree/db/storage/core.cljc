@@ -12,8 +12,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.schema :as schema])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
-     :clj
-           (:import (fluree.db.flake Flake))))
+     :clj (:import (fluree.db.flake Flake))))
 
 (declare ->UnresolvedNode)
 
@@ -122,7 +121,7 @@
 (defn child-data
   "Given a child, unresolved node, extracts just the data that will go into storage."
   [child]
-  (select-keys child [:id :leaf :first :rhs :size]))
+  (select-keys child [:id :leaf :first-flake :rhs :size]))
 
 (defn write-history
   [conn history his-key next-his-key]
@@ -359,110 +358,6 @@
      (when data
        (serdeproto/-deserialize-leaf serializer data)))))
 
-(defn reify-branch
-  [conn config network dbid key block t tt-id leftmost? tempid error-fn]
-  (let [return-ch (async/promise-chan)]
-    (async/go
-      (try*
-        (let [data        (<? (read-branch conn key))
-              _           (when (nil? data)
-                            (throw (ex-info (str "Unable to retrieve key from storage: " key)
-                                            {:status 500 :error :db/storage-error})))
-              {:keys [children rhs]} data
-              {:keys [comparator]} config
-              child-nodes (map-indexed (fn [idx {:keys [id leaf first rhs size] :as child}]
-                                         (let [at-leftmost? (and leftmost? (zero? idx))]
-                                           (->UnresolvedNode conn config network dbid id leaf first rhs size block t tt-id at-leftmost? tempid)))
-                                       children)
-              idx-node    (index/->IndexNode block t
-                                             rhs
-                                             ;; child nodes are in a sorted map with {<lastFlake> <UnresolvedNode>} as k/v
-                                             (apply avl/sorted-map-by comparator (interleave (map :first child-nodes) child-nodes))
-                                             config
-                                             leftmost?)]
-          (async/put! return-ch idx-node))
-        (catch* e
-                (error-fn)
-                (async/put! return-ch e)
-                (async/close! return-ch))))
-    ;; return promise-chan immediately
-    return-ch))
-
-(defn reify-leaf
-  "Should throw if no result... should never be the case."
-  [conn config key block t rhs error-fn]
-  (assert (:comparator config) (str "Cannot reify leaf, config does not have a comparator. Config: " (pr-str config)))
-  (let [return-ch (async/promise-chan)]
-    ;; kick of retrieval/reification process
-    (async/go
-      (try*
-        (let [leaf (async/<! (read-leaf conn key))
-              _    (when (nil? leaf)
-                     (throw (ex-info (str "Unable to retrieve key from storage: " key)
-                                     {:status 500 :error :db/storage-error})))
-              _    (when (util/exception? leaf)
-                     (throw leaf))
-              {:keys [flakes his]} leaf
-              {:keys [comparator]} config
-              node (index/data-node block t (apply flake/sorted-set-by comparator flakes) rhs config)]
-          (async/put! return-ch node))
-        (catch* e
-                (error-fn)
-                (async/put! return-ch e)
-                (async/close! return-ch))))
-    ;; return promise-chan immediately
-    return-ch))
-
-
-;; TODO - create an EmptyNode type so don't need to check for :empty in .-id
-;; block needs to be passed down from the parent
-(defrecord UnresolvedNode [conn config network dbid id leaf first rhs size block t tt-id leftmost? tempid]
-  dbproto/IResolve
-  (-first-flake [_] first)
-  (-rhs [_] rhs)
-  (-resolve [_]
-    ;; returns async promise chan
-    (if (= :empty id)
-      (let [pc (async/promise-chan)]
-        (async/put! pc (index/data-node 0 0 (flake/sorted-set-by (:comparator config)) nil config))
-        pc)
-      (let [object-cache (:object-cache conn)]
-        (object-cache
-          [id tempid]
-          (fn [_]
-            (if leaf
-              (reify-leaf conn config id block t rhs (fn [] (object-cache [id tempid] nil)))
-              (reify-branch conn config network dbid id block t tt-id leftmost? tempid (fn [] (object-cache [id tempid] nil)))))))))
-  (-resolve-history [_]
-    ;; will return a core-async promise channel
-    (let [history-id   (str id "-his")
-          object-cache (:object-cache conn)
-          ;; clear cache if an error occurs
-          error-fn     (fn [] (object-cache history-id nil))]
-      (object-cache
-        history-id
-        (fn [_] (reify-history conn history-id error-fn)))))
-  (-resolve-to-t [this to-t idx-novelty]
-    (resolve-to-t this id tempid rhs leftmost? to-t tt-id idx-novelty conn false #{}))
-  (-resolve-to-t [this to-t idx-novelty fast-foward-db?]
-    (resolve-to-t this id tempid rhs leftmost? to-t tt-id idx-novelty conn fast-foward-db? #{}))
-  (-resolve-to-t [this to-t idx-novelty fast-foward-db? remove-preds]
-    (resolve-to-t this id tempid rhs leftmost? to-t tt-id idx-novelty conn fast-foward-db? remove-preds))
-  (-resolve-history-range [node from-t to-t]
-    ;; returns core async channel
-    (resolve-history-range node from-t to-t nil leftmost?))
-  (-resolve-history-range [node from-t to-t idx-novelty]
-    (resolve-history-range node from-t to-t idx-novelty leftmost?)))
-
-
-#?(:clj
-   (defmethod print-method UnresolvedNode [^UnresolvedNode node, ^java.io.Writer w]
-     (.write w (str "#FlureeUnresolvedNode "))
-     (binding [*out* w]
-       (pr {:network (:network node) :dbid (:dbid node) :id (:id node) :leaf (:leaf node) :first (:first node) :rhs (:rhs node) :size (:size node)
-            :block   (:block node) :t (:t node) :leftmost? (:leftmost? node) :tempid (:tempid node) :config (:config node)}))))
-
-
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
   [conn {:keys [network dbid index-configs block t]} index index-data]
@@ -470,12 +365,13 @@
                 (throw (ex-info (str "Internal error reifying db root index: " (pr-str index))
                                 {:status 500
                                  :error  :db/unexpected-error})))]
-    (map->UnresolvedNode (assoc index-data :conn conn
-                                           :config cfg
-                                           :network network
-                                           :dbid dbid
-                                           :block block :t t
-                                           :leftmost? true))))
+    (assoc index-data
+           :config cfg
+           :network network
+           :dbid dbid
+           :block block
+           :t t
+           :leftmost? true)))
 
 
 (defn reify-db-root
@@ -526,3 +422,59 @@
       (let [db  (reify-db-root conn blank-db (<? db-root))
             db* (assoc db :schema (<? (schema/schema-map db)))]
         (assoc db* :settings (<? (schema/setting-map db*)))))))
+
+(defn fetch-child-attributes
+  [conn {:keys [id config leftmost?] :as branch}]
+  (go-try
+   (if-let [{:keys [children]} (<? (read-branch conn id))]
+     (let [branch-metadata (select-keys branch [:config :network :dbid :block
+                                                :t :tt-id :tempid])
+           child-attrs     (map-indexed (fn [i child]
+                                          (-> branch-metadata
+                                              (assoc :leftmost? (and leftmost?
+                                                                     (zero? i)))
+                                              (merge child)))
+                                        children)
+           child-entries   (mapcat (juxt :first-flake identity)
+                                   child-attrs)
+           idx-compare     (:comparator config)]
+       (apply avl/sorted-map-by idx-compare child-entries))
+     (throw (ex-info (str "Unable to retrieve index branch with id " id " from storage.")
+                     {:status 500 :error :db/storage-error})))))
+
+(defn fetch-leaf-flakes
+  [conn {:keys [id config]}]
+  (go-try
+   (if-let [{:keys [flakes] :as leaf} (<? (read-leaf conn id))]
+     (let [idx-compare (:comparator config)]
+       (apply flake/sorted-set-by idx-compare flakes))
+     (throw (ex-info (str "Unable to retrieve leaf node with id: "
+                          id " from storage")
+                     {:status 500, :error :db/storage-error})))))
+
+(defn resolve-index-node
+  [conn {:keys [config leaf] :as node} error-fn]
+  (assert (:comparator config)
+          (str "Cannot resolve index node; configuration does not have a comparator. "
+               " Configuration: " (pr-str config)))
+  (let [return-ch (async/promise-chan)]
+    (go
+      (try*
+       (let [[k data] (if leaf
+                        [:flakes   (<? (fetch-leaf-flakes conn node))]
+                        [:children (<? (fetch-child-attributes conn node))])]
+         (async/put! return-ch
+                     (assoc node k data)))
+       (catch* e
+               (error-fn)
+               (async/put! return-ch e)
+               (async/close! return-ch))))
+    return-ch))
+
+(defn resolve-empty-leaf
+  [{{:keys [comparator]} :config, :as node}]
+  (let [pc         (async/promise-chan)
+        empty-set  (flake/sorted-set-by comparator)
+        empty-node (assoc node :flakes empty-set)]
+    (async/put! pc empty-node)
+    pc))

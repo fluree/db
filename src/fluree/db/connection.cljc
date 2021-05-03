@@ -15,7 +15,9 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.query.http-signatures :as http-signatures]
             #?(:clj [fluree.db.serde.avro :refer [avro-serde]])
-            [fluree.db.conn-events :as conn-events]))
+            [fluree.db.conn-events :as conn-events]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.storage.core :as storage]))
 
 ;; socket connections are keyed by connection-id and contain :socket - ws, :id - socket-id :health - status of health checks.
 (def server-connections-atom (atom {}))
@@ -107,7 +109,20 @@
                        tx-private-key tx-key-id
                        meta
                        add-listener remove-listener
-                       close])
+                       close]
+
+  dbproto/IndexResolver
+  (resolve
+  [conn {:keys [config id leaf tempid] :as node}]
+  (if (= :empty id)
+    (storage/resolve-empty-leaf node)
+    (let [object-cache (:object-cache conn)]
+      (object-cache
+       [id tempid]
+       (fn [_]
+         (storage/resolve-index-node conn node
+                                     (fn []
+                                       (object-cache [id tempid] nil)))))))))
 
 
 (defn- normalize-servers

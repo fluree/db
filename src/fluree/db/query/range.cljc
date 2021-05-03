@@ -1,6 +1,7 @@
 (ns fluree.db.query.range
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
+            [fluree.db.index :as index]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
@@ -111,16 +112,55 @@
             (flake/subrange flake-range start-test start-flake
                             end-test end-flake))))
 
+(defn resolve-t
+  [node t idx-novelty rhs leftmost? remove-preds error-fn]
+  (let [result-ch (async/promise-chan)]
+    (go
+      (try*
+        (let [base-node   (<? (dbproto/-resolve node))
+              first-flake (dbproto/-first-flake base-node)
+              node-t      (:t base-node)
+              source      (cond
+                            (> node-t t) :novelty
+                            (< node-t t) :history
+                            (= node-t t) :none)
+              coll        (case source
+                            :novelty (index-node/source-novelty-t idx-novelty first-flake rhs leftmost? t)
+                            :history (->> (<? (dbproto/-resolve-history node))
+                                          (take-while #(<= (.-t ^Flake %) t)))
+                            :none [])
+              ;; either conjoin flakes or disjoin them depending on if source if from history of novelty
+              conj?       (case source
+                            :novelty (fn [^Flake f] (true? (flake/op f)))
+                            :history (fn [^Flake f] (false? (flake/op f)))
+                            :none nil)
+              flakes      (reduce (fn [acc ^Flake f]
+                                    (if (and (conj? f)
+                                             (not (contains? remove-preds (flake/p f))))
+                                      (conj acc f)
+                                      (disj acc f)))
+                                  (:flakes base-node) coll)
+              resolved-t  (assoc base-node :flakes flakes)]
+          (async/put! result-ch resolved-t))
+        (catch* e
+                (when error-fn
+                  (error-fn))
+                (async/put! result-ch e)
+                (async/close! result-ch))))
+    ;; return promise chan immediately
+    result-ch))
+
 (defn resolve-nodes-to-t
   "Returns a channel that will eventually contain a stream of index nodes where
   each node in the output stream is the result of resolving a node in the input
   `node-stream` at specified transaction `t` and index novelty `novelty`"
-  [nodes novelty fast-forward-db? t]
-  (let [out (chan)]
+  [nodes novelty fast-forward-db? to-t]
+  (let [out (chan 1 (map :flakes))]
     (go-loop []
-      (if-let [node (<! nodes)]
+      (if-let [{:keys [conn config network dbid id leaf first rhs size block t tt-id leftmost? tempid] :as node}
+               (<! nodes)]
         (do (when-let [resolved (try*
-                                 (<? (dbproto/-resolve-to-t node t novelty fast-forward-db?))
+                                 (<? (resolve-t node to-t novelty rhs leftmost? #{} nil))
                                  (catch* e))]
               (>! out resolved))
             (recur))
@@ -247,9 +287,8 @@
   options if they are present."
   [{:keys [start-test start-flake end-test end-flake subject-fn predicate-fn
            object-fn]}]
-  (let [flakes-xf   (map :flakes)
-        subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
-        xforms      (cond-> [flakes-xf subrange-xf]
+  (let [subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
+        xforms      (cond-> [subrange-xf]
                       subject-fn   (conj (filter (fn [f]
                                                    (subject-fn (flake/s f)))))
                       predicate-fn (conj (filter (fn [f]

@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [split-at sorted-set-by take last])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
+            [fluree.db.util.core :as util]
             #?(:clj [abracad.avro :as avro]))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
@@ -213,6 +214,9 @@
   [^Flake flake]
   [(s flake) (p flake) (o flake) (t flake) (op flake) (m flake)])
 
+(def maximum
+  "The largest flake possible"
+  (->Flake util/max-long 0 util/max-long 0 true nil))
 
 (defn- assoc-flake
   "Assoc for Flakes"
