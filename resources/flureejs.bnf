@@ -1,0 +1,56 @@
+
+exports ::= <WS?> <'exports.'> symbol <WS?> arrow-fn <WS?>
+block ::=  <'{'> <WS?> (var-define | var-set | object-get | if-else | return | throw | <WS>)+ <WS?> <'}'>
+arrow-fn ::= <'='> <WS?> ('async')? <WS?> arguments <WS?> <'=>'> <WS?> block <';'?>
+
+var-define ::= (<'var'> | <'let'> | <'const'>) <WS> symbol <WS> <'='> <WS> (literal | symbol | object-get) <WS?> <';'?>
+var-set ::= (symbol | object-get) <WS> <'='> <WS> (literal | symbol | object-get) <WS?> <';'?>
+object-get ::= (symbol | literal) <'.'> (symbol | method) (<'.'> (symbol | method))* <WS?> <';'?> (* i.e. Math.floor(myNumber) or 'hi'.toUpperCase() *)
+
+if-else ::= if (else-if)* (else)*
+if ::= <'if'> <WS?> expression <WS?> block <WS?>
+else-if ::= <'else if'> <WS?> expression <WS?> block <WS?>
+else ::= <'else'> <WS?> block <WS?>
+expression ::= <'('> (symbol | object-get | literal) <WS> operator <WS> (symbol | object-get | literal) <')'>
+operator ::= (equals | not-equal | lt | gt | gte | lte)
+throw ::= <'throw'> <WS> (symbol | object-get | literal) <WS?> <';'?>
+
+
+return ::= <'return'> <WS> (symbol | literal) <WS?> <';'?>
+
+(* literals *)
+literal	::=	decimal | integer | string | string-single-quot | boolean | null
+string  ::= #"\".*\""
+string-single-quot  ::= #"'.*'"
+boolean ::= 'true' | 'false'
+null    ::= "null"
+integer         ::= #"[0-9]+"
+decimal         ::= #"[0-9]*\.[0-9]*"
+
+(* TODO - look into more complex types like below
+double          ::= #"[0-9]+\.[0-9]*|(\.[0-9]+)|([0-9]+)" exponent
+exponent        ::= #"[eE][+-]?[0-9]+"
+ *)
+
+(* TODO: add hex and regex STRING_LITERAL_LONG1 *)
+HEX	  ::=  	#"[0-9]" | #"[A-F]" | #"[a-f]"
+WS	  ::=  	<#"[\x{20}\x{9}\x{D}\x{A}]*\#[^\n]*\n*[\x{20}\x{9}\x{D}\x{A}]*|[\x{20}\x{9}\x{D}\x{A}]*">
+
+equals ::= (<'=='> | <'==='>)
+not-equal ::= (<'!='> | <'!=='>)
+gt ::= <'>'>
+lt ::= <'<'>
+gte ::= <'>='>
+lte ::= <'<='>
+
+
+symbol ::= #"[_$a-zA-Z][_$a-zA-Z0-9]*"
+method ::= symbol arguments
+
+arguments ::= <'('> argument* <')'>
+argument ::= <WS?> (symbol | literal) <WS?> <','?>
+empty-argument ::= <''>
+
+(*
+identifierName ::= #"^[_$a-zA-Z\xA0-\uFFFF][_$a-zA-Z0-9\xA0-\uFFFF]*$"
+*)

@@ -154,7 +154,7 @@
         ;; therefore, when it comes time to evaluate an optional WD clause, we ignore it.
         (if (and optional? (not (empty? all-wd)))
           [nil r]
-          (let [optional          (wikidata/get-all-wd-clauses (:optional q-map))
+          (let [optional          (wikidata/get-all-wd-optional-clauses (:where q-map))
                 all-wd-vars       (-> (apply concat (map clause->keys all-wd)) set)
                 all-vars          (into all-wd-vars
                                         (apply concat (map clause->keys optional)))
