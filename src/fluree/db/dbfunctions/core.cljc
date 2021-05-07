@@ -7,7 +7,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.dbfunctions.fns]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.dbfunctions.js :as js]))
 
 (declare resolve-fn)
 
@@ -18,8 +19,7 @@
    :_fn/doc      "Returns the maximum number based on a list of numbers"
    :_fn/spec     {"?numbers" [:numbers]}
    :_fn/source   "Source code for the function"
-   :_fn/language nil})                                        ;; only clojure for now
-
+   :_fn/language nil})                                      ;; only clojure for now
 
 
 
@@ -122,64 +122,51 @@
   ([db fn-name]
    (find-fn db fn-name nil))
   ([db fn-name funType]
-   #?(:cljs (cond
-              (identical? "nodejs" cljs.core/*target*)
-              (go-try
-                (let [forward-time-travel-db? (:tt-id db)]
-                  (or (if-not forward-time-travel-db? (get @db-fn-cache [(:network db) (:dbid db) fn-name]))
-                      (let [res (if-let [local-fn (get default-fn-map (symbol fn-name))]
-                                  (resolve-local-fn local-fn)
-                                  (let [query       {:selectOne ["_fn/params" "_fn/code" "_fn/spec"]
-                                                     :from      ["_fn/name" (name fn-name)]}
-                                        res*        (<? (dbproto/-query db query))
-                                        _           (if (empty? res*)
-                                                      (throw (ex-info (str "Unknown function: " (pr-str fn-name))
-                                                                      {:status 400
-                                                                       :error  :db/invalid-fn})))
-                                        params      (read-string (get res* "_fn/params"))
-                                        code        (<? (resolve-fn db (read-string (get res* "_fn/code")) funType params))
-                                        spec        (get res* "_fn/spec")
-                                        params'     (->> params
-                                                         (mapv (fn [x] (symbol x)))
-                                                         (cons '?ctx)
-                                                         (into []))
-                                        custom-func (build-fn params' code)]
-                                    {:f      custom-func
-                                     :params params
-                                     :arity  (hash-set (count params))
-                                     :&args? false
-                                     :spec   spec
-                                     :code   nil}))]
-                        (if-not forward-time-travel-db? (swap! db-fn-cache assoc [(:network db) (:dbid db) fn-name] res))
-                        res))))
-              :else
-              (throw (ex-info "DB functions not yet supported in javascript!" {})))
-      :clj  (go-try
-              (let [forward-time-travel-db? (:tt-id db)]
-                (or (if-not forward-time-travel-db? (get @db-fn-cache [(:network db) (:dbid db) fn-name]))
-                    (let [res (if-let [local-fn (get default-fn-map (symbol fn-name))]
-                                (resolve-local-fn local-fn)
-                                (let [query       {:selectOne ["_fn/params" "_fn/code" "_fn/spec"]
-                                                   :from      ["_fn/name" (name fn-name)]}
-                                      res         (<? (dbproto/-query db query))
-                                      _           (if (empty? res)
-                                                    (throw (ex-info (str "Unknown function: " (pr-str fn-name))
-                                                                    {:status 400
-                                                                     :error  :db/invalid-fn})))
-                                      params      (read-string (get res "_fn/params"))
-                                      code        (<? (resolve-fn db (read-string (get res "_fn/code")) funType params))
-                                      spec        (get res "_fn/spec")
-                                      params'     (mapv (fn [x] (symbol x)) params)
-                                      params''    (into [] (cons '?ctx params'))
-                                      custom-func (list #'clojure.core/fn params'' code)]
-                                  {:f      custom-func
-                                   :params params
-                                   :arity  (hash-set (count params))
-                                   :&args? false
-                                   :spec   spec
-                                   :code   nil}))]
-                      (if-not forward-time-travel-db? (swap! db-fn-cache assoc [(:network db) (:dbid db) fn-name] res))
-                      res)))))))
+   (go-try
+     #?(:cljs (when-not (identical? "nodejs" cljs.core/*target*)
+                (throw (ex-info "DB functions not yet supported in javascript!" {}))))
+     (let [forward-time-travel-db? (:tt-id db)]
+       (or (if-not forward-time-travel-db? (get @db-fn-cache [(:network db) (:dbid db) fn-name]))
+           (let [res (if-let [local-fn (get default-fn-map (symbol fn-name))]
+                       (resolve-local-fn local-fn)
+                       (let [query               {:selectOne ["_fn/params" "_fn/code" "_fn/language" "_fn/spec"]
+                                                  :from      ["_fn/name" (name fn-name)]}
+                             res                 (<? (dbproto/-query db query))
+                             _                   (if (empty? res)
+                                                   (throw (ex-info (str "Unknown function: " (pr-str fn-name))
+                                                                   {:status 400
+                                                                    :error  :db/invalid-fn})))
+                             language            (if-let [lang (get res "_fn/language")]
+                                                   (keyword lang) ;; should only be :javascript today
+                                                   :lisp)
+                             params              (when-let [p (get res "_fn/params")]
+                                                   (read-string p))
+                             code                (case language
+                                                   :lisp (<? (resolve-fn db (read-string (get res "_fn/code")) funType params))
+                                                   :javascript (js/parse (get res "_fn/code"))
+                                                   ;; else
+                                                   (throw (ex-info (str "Unknown SmartFunction language: " (get res "_fn/params")
+                                                                        " specified for function: " fn-name ".")
+                                                                   {:status 400 :error :db/invalid-function})))
+                             spec                (get res "_fn/spec")
+                             params'             (->> params
+                                                      (map symbol)
+                                                      (cons '?ctx)
+                                                      (into []))
+                             custom-func         (case language
+                                                   :lisp #?(:clj  (list #'clojure.core/fn params' code) ;; TODO - either should work the same for both clj/cljs, need to test before consolidating
+                                                            :cljs (build-fn params' code))
+                                                   :javascript (eval code))]
+                         {:f      custom-func
+                          :lang   language
+                          :params params
+                          :arity  (hash-set (count params))
+                          :&args? false
+                          :spec   spec
+                          :code   nil}))]
+             (when-not forward-time-travel-db?
+               (swap! db-fn-cache assoc [(:network db) (:dbid db) fn-name] res))
+             res))))))
 
 (defn combine-fns
   "Given a collection of function strings, returns a combined function using the and function"
@@ -208,7 +195,9 @@
                       (cond
                         (string? x) x
                         (number? x) x
-                        (symbol? x) (or (symbol-whitelist x) (some #{x} (mapv #(symbol %) params)) (= funType "functionDec")
+                        (symbol? x) (or (symbol-whitelist x)
+                                        (some #{x} (mapv #(symbol %) params))
+                                        (= funType "functionDec")
                                         (throw (ex-info (str "Invalid symbol: " x " used in function." (pr-str vec))
                                                         {:status 400
                                                          :error  :db/invalid-fn})))
@@ -231,7 +220,7 @@
            args    (rest form)
            args-n  (count args)
            fn-map  (<? (find-fn db fn-name type))
-           {:keys [f arity arglist &args?]} fn-map
+           {:keys [f arity &args?]} fn-map
            _       (when (not (or &args? (arity args-n)))
                      (throw (ex-info (str "Incorrect arity for function " fn-name ". Expected " arity ", provided: " args-n ".") {})))
            args*   (loop [[arg & r] args
