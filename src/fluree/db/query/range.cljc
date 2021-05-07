@@ -90,19 +90,18 @@
   "Returns a channel that will eventually contain a stream of index nodes from
   index `idx` within the database `db` between `start-flake` and `end-flake`,
   inclusive and one-by-one"
-  [db idx start-flake end-flake]
+  [{:keys [conn] :as db} idx start-flake end-flake]
   (let [idx-compare (get-in db [:index-configs idx :comparator])
         out         (chan)]
     (go
-      (let [root-node (<? (-> db
-                              (get idx)
-                              dbproto/-resolve))]
+      (let [root-node (<? (dbproto/resolve conn
+                                           (get db idx)))]
         (loop [next-flake start-flake]
           (if-let [next-node (and next-flake
                                   (not (pos? (idx-compare next-flake end-flake)))
-                                  (<! (dbproto/-lookup-leaf root-node next-flake)))]
+                                  (<! (index/lookup-leaf root-node next-flake)))]
             (when (>! out next-node)
-              (recur (dbproto/-rhs next-node)))
+              (recur (index/rhs next-node)))
             (async/close! out)))))
     out))
 

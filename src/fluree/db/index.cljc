@@ -134,6 +134,16 @@
      :tt-id nil,
      :leftmost? true}))
 
+(defn child-entry
+  [{:keys [first-flake] :as node}]
+  [first-flake node])
+
+(defn child-map
+  [cmp & child-nodes]
+  (->> child-nodes
+       (mapcat child-entry)
+       (apply avl/sorted-map-by cmp)))
+
 (defn empty-branch
   ([conn network dbid idx-type]
    (empty-branch conn default-configs network dbid idx-type))
@@ -143,10 +153,8 @@
          comparator (:historyComparator idx-config)
          _          (assert comparator (str "No index comparator found for index: " idx-type))
 
-         {:keys [first-flake] :as child-node}
-         (empty-leaf network dbid idx-config)
-
-         children (avl/sorted-map-by comparator first-flake child-node) ]
+         child-node (empty-leaf network dbid idx-config)
+         children   (child-map comparator child-node)]
      {:config idx-config
       :network network
       :dbid dbid
@@ -226,6 +234,10 @@
                             novelty)]
      (cond-> novelty-subrange
        through-t (flake/disj-all (flakes-after through-t novelty-subrange))))))
+
+(defn flakes-within
+  [{:keys [first-flake rhs leftmost? t] :as node} flakes]
+  (source-novelty-t flakes first-flake rhs leftmost? t))
 
 (defn novelty-flakes-before
   [{:keys [rhs leftmost? flakes], node-t :t, :as node} t idx-novelty remove-preds]
