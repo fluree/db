@@ -6,7 +6,7 @@
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.permissions-validate :as perm-validate]
+            #?(:clj [fluree.db.permissions-validate :as perm-validate])
             [fluree.db.util.async :refer [<? go-try]])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
@@ -131,9 +131,9 @@
            from-t             (or (:from-t opts) (:t db))
            to-t               (:to-t opts)
            ;; Note this bypasses all permissions in CLJS for now!
-           no-filter?         #?(:cljs (if (identical? "nodejs" cljs.core/*target*)
-                                         (perm-validate/no-filter? permissions s1 s2 p1 p2)
-                                         true)  ;; browser: always allow for now
+           ;; Node.js: filtering is performed server-side based
+           ;; on the provided auth when blocks/updates are downloaded.
+           no-filter?         #?(:cljs true                         ;; always allow for now
                                  :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))
            novelty            (get-in db [:novelty idx])
            root-node          (-> db
@@ -164,12 +164,10 @@
                                   (into acci acc)
                                   (recur r
                                          (inc i')
-                                         ;; browser: bypasses all permissions in CLJS for now!
-                                         #?(:cljs (if (identical? "nodejs" cljs.core/*target*)
-                                                    (if (<? (perm-validate/allow-flake? db f))
-                                                      acci
-                                                      (disj acci f))
-                                                    acci)
+                                         ;; Note this bypasses all permissions in CLJS for now!
+                                         ;; Node.js: filtering is performed server-side based
+                                         ;; on the provided auth when blocks/updates are downloaded.
+                                         #?(:cljs acci      ;; always allow for now
                                             :clj  (if (<? (perm-validate/allow-flake? db f))
                                                     acci
                                                     (disj acci f)))))))
@@ -194,9 +192,7 @@
       (if (or (nil? subject-flakes) (>= flake-count flake-limit) (>= subject-count subject-limit))
         [flake-count subject-count acc]
         (let [subject-filtered #?(:clj (<? (perm-validate/allow-flakes? db subject-flakes))
-                                  :cljs (if (identical? "nodejs" cljs.core/*target*)
-                                          (<? (perm-validate/allow-flakes? db subject-flakes))
-                                          subject-flakes))
+                                  :cljs subject-flakes)
               flakes-new-count         (count subject-filtered)
               subject-new-count        (if (= 0 flakes-new-count) 0 1)]
           (recur r (+ flake-count flakes-new-count)
@@ -286,9 +282,7 @@
                                   (dbproto/-resolve)
                                   (<?))
            node-start         (<? (find-next-valid-node root-node start-flake t novelty fast-forward-db?))
-           no-filter?         #?(:cljs (if (identical? "nodejs" cljs.core/*target*)
-                                         (perm-validate/no-filter? permissions s1 s2 p1 p2)
-                                         true)
+           no-filter?         #?(:cljs true
                                  :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
        (if node-start (loop [next-node node-start
                              offset    offset               ;; offset counts down from the offset
