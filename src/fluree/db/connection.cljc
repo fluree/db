@@ -433,6 +433,25 @@
   (remove-listener* (:state conn) network dbid key))
 
 
+
+(defn add-token
+  "Adds token to connection information so it is available to submit storage read requests.
+
+  Returns true if successful, false otherwise."
+  [conn token]
+  (let [conn-id (:id conn)
+        _ (log/info "add-token" {:conn-id conn-id :token token})
+        ]
+    (try
+      (swap! server-connections-atom update-in [conn-id :token]
+             (fn [x]
+               (if x
+                 x
+                 token)))
+      true
+      (catch #?(:clj Exception :cljs :default) _
+        false))))
+
 (defn- generate-connection
   "Generates connection object."
   [servers opts]
@@ -480,7 +499,7 @@
                              (async/close! pub-chan)
                              (close-websocket conn-id)
                              (swap! state-atom assoc :close? true)
-                             ;; NOTE - when we allow permissions back in CLJS browser, remove conditional below
+                             ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
                              #?(:clj (dbfunctions/clear-db-fn-cache)
                                 :cljs (if (identical? "nodejs" cljs.core/*target*)
                                         (dbfunctions/clear-db-fn-cache)))
@@ -531,24 +550,12 @@
                                                 #?(:clj  nil
                                                    :cljs keep-alive-fn))
                             :add-listener     (partial add-listener* state-atom)
-                            :remove-listener  (partial remove-listener* state-atom)}]
+                            :remove-listener  (partial remove-listener* state-atom)
+                            :add-token        #?(:clj nil
+                                                 :cljs (if (identical? *target* "nodejs")
+                                                         (partial add-token)
+                                                         nil))}]
     (map->Connection settings)))
-
-(defn add-token
-  "Adds token to connection information so it is available to submit storage read requests.
-
-  Returns true if successful, false otherwise."
-  [conn token]
-  (let [conn-id (:id conn)]
-    (try
-      (swap! server-connections-atom update-in [conn-id :token]
-             (fn [x]
-               (if x
-                 x
-                 token)))
-      true
-      (catch #?(:clj Exception :cljs :default) _
-        false))))
 
 (defn close!
   "Closes connection, returns true if close successful, false if already closed."
