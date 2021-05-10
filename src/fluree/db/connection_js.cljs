@@ -8,7 +8,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.token-auth :as token-auth]))
 
-
+;; TODO: deprecated
 (defn dbaas?
   "Returns open-api? setting from connection object"
   [conn]
