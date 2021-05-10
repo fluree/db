@@ -5,7 +5,7 @@
                :cljs [cljs.core.async :as async])
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            #?(:clj [fluree.db.dbfunctions.core :as dbfunctions])
+            [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
             #?(:clj [fluree.crypto :as crypto])
@@ -21,7 +21,7 @@
 (def server-connections-atom (atom {}))
 
 (defn- acquire-healthy-server
-  "Tries all servers in parralel, the first healthy response will be used for the connection
+  "Tries all servers in parallel, the first healthy response will be used for the connection
   (additional server healthy writes will be no-ops after first)."
   [conn-id servers promise-chan]
   ;; kick off server comms in parallel
@@ -480,8 +480,10 @@
                              (async/close! pub-chan)
                              (close-websocket conn-id)
                              (swap! state-atom assoc :close? true)
-                             ;; NOTE - when we allow permissions back in CLJS, remove conditional below
-                             #?(:clj (dbfunctions/clear-db-fn-cache))
+                             ;; NOTE - when we allow permissions back in CLJS browser, remove conditional below
+                             #?(:clj (dbfunctions/clear-db-fn-cache)
+                                :cljs (if (identical? "nodejs" cljs.core/*target*)
+                                        (dbfunctions/clear-db-fn-cache)))
                              (session/close-all-sessions conn-id)
                              (reset! default-cache-atom (default-object-cache-factory memory-object-size))
                              ;; user-supplied close function
