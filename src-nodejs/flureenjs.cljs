@@ -371,15 +371,6 @@
 ;; Ledger/DB Operations
 ;;
 ;; ======================================
-
-
-(defn ^:export db
-  "Returns a queryable database from the connection."
-  [conn ledger & [opts]]
-  (-> opts
-      (js->clj :keywordize-keys true)
-      (as-> clj-opts (db-instance conn ledger clj-opts))))
-
 (defn ^:private ledger-db
   "Returns a queryable database from the connection for the specified ledger."
   ([conn ledger]
@@ -424,6 +415,12 @@
            (async/close! pc))))
      pc)))
 
+(defn ^:export db
+  "Returns a queryable database from the connection."
+  [conn ledger & [opts]]
+  (-> opts
+      (js->clj :keywordize-keys true)
+      (as-> clj-opts (db-instance conn ledger clj-opts))))
 
 (defn ^:export db-p
   "Returns a queryable database from the connection."
