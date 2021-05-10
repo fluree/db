@@ -412,6 +412,18 @@
       (assoc session* :new? true)
       session*)))
 
+#?(:cljs (if (identical? *target* "nodejs")
+           (defn nodejs-access-token
+             [{:keys [conn dbid network]} {:keys [auth jwt]}]
+             (if-let [add-token-fn (:add-token conn)]
+               (if (and (nil? jwt) auth)
+                 ;; if closed-api mode without jwt, auth is required.
+                 ;; if any auth provided without jwt, request access
+                 ;; token for storage reads
+                 (go-try
+                   (->> (ops/send-operation conn :issue-access-token [[network dbid] auth])
+                        <?
+                        (add-token-fn conn))))))))
 
 ;; TO-DO check for expired jwt when specified
 (defn session
@@ -449,6 +461,11 @@
                ;; send a subscription request to this database. This is idempotent in the
                ;; unlikely case of multiple sessions simultaneously being created (of which only one will 'win').
                (ops/subscribe session opts)
+
+               ;; get an access token for Node.js library
+               ;; to download blocks in closed-api mode
+               #?(:cljs (if (identical? *target* "nodejs")
+                          (nodejs-access-token session opts)))
 
                ;; register a callback fn for this session to listen for updates and push onto update chan
                ((:add-listener conn) network ledger-id (:id session)
