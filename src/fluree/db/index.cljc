@@ -22,21 +22,16 @@
 
 (def default-configs
   "Map of default index configuration objects for the five index types"
-  {:spot (map->IndexConfig {:index-type        :spot
-                            :comparator        flake/cmp-flakes-spot-novelty
-                            :historyComparator flake/cmp-flakes-spot-novelty})
-   :psot (map->IndexConfig {:index-type        :psot
-                            :comparator        flake/cmp-flakes-psot-novelty
-                            :historyComparator flake/cmp-flakes-psot-novelty})
-   :post (map->IndexConfig {:index-type        :post
-                            :comparator        flake/cmp-flakes-post-novelty
-                            :historyComparator flake/cmp-flakes-post-novelty})
-   :opst (map->IndexConfig {:index-type        :opst
-                            :comparator        flake/cmp-flakes-opst-novelty
-                            :historyComparator flake/cmp-flakes-opst-novelty})
-   :tspo (map->IndexConfig {:index-type        :tspo
-                            :comparator        flake/cmp-flakes-block
-                            :historyComparator flake/cmp-flakes-block})})
+  {:spot (map->IndexConfig {:index-type :spot
+                            :comparator flake/cmp-flakes-spot-novelty})
+   :psot (map->IndexConfig {:index-type :psot
+                            :comparator flake/cmp-flakes-psot-novelty})
+   :post (map->IndexConfig {:index-type :post
+                            :comparator flake/cmp-flakes-post-novelty})
+   :opst (map->IndexConfig {:index-type :opst
+                            :comparator flake/cmp-flakes-opst-novelty})
+   :tspo (map->IndexConfig {:index-type :tspo
+                            :comparator flake/cmp-flakes-block})})
 
 (defn node?
   [x]
@@ -173,10 +168,15 @@
   [t flake]
   (-> flake flake/t (< t)))
 
-(defn flakes-after
+(defn filter-after
   [t flakes]
-  (filter (partial after-t? t)
-          flakes))
+  (filter (partial after-t? t) flakes))
+
+(defn flakes-through
+  [t flakes]
+  (->> flakes
+       (filter-after t)
+       (flake/disj-all flakes)))
 
 (defn remove-latest
   [[first-flake & other-flakes]]
@@ -199,13 +199,32 @@
 
 (defn flake-tx-range
   [from-t to-t flakes]
-  (flake/disj-all flakes
-                  (concat (flakes-before from-t flakes)
-                          (flakes-after to-t flakes))))
+  (let [out-of-range (concat (flakes-before from-t flakes)
+                             (filter-after to-t flakes))]
+    (flake/disj-all flakes out-of-range)))
 
-(defn flakes-at
+(defn as-of
   [t flakes]
   (flake-tx-range t t flakes))
+
+(defn novelty-subrange
+  [novelty first-flake rhs leftmost?]
+  (cond
+    ;; standard case.. both left and right boundaries
+    (and rhs (not leftmost?))
+    (avl/subrange novelty > first-flake <= rhs)
+
+    ;; right only boundary
+    (and rhs leftmost?)
+    (avl/subrange novelty <= rhs)
+
+    ;; left only boundary
+    (and (nil? rhs) (not leftmost?))
+    (avl/subrange novelty > first-flake)
+
+    ;; no boundary
+    (and (nil? rhs) leftmost?)
+    novelty))
 
 (defn source-novelty-t
   "Given a novelty set, a first-flake and rhs flake boundary,
@@ -216,27 +235,12 @@
   ([novelty first-flake rhs leftmost?]
    (source-novelty-t novelty first-flake rhs leftmost? nil))
   ([novelty first-flake rhs leftmost? through-t]
-   (let [novelty-subrange (cond
-                            ;; standard case.. both left and right boundaries
-                            (and rhs (not leftmost?))
-                            (avl/subrange novelty > first-flake <= rhs)
+   (let [subrange (novelty-subrange novelty first-flake rhs leftmost?)]
+     (cond-> subrange
+       through-t (flake/disj-all (filter-after through-t subrange))))))
 
-                            ;; right only boundary
-                            (and rhs leftmost?)
-                            (avl/subrange novelty <= rhs)
-
-                            ;; left only boundary
-                            (and (nil? rhs) (not leftmost?))
-                            (avl/subrange novelty > first-flake)
-
-                            ;; no boundary
-                            (and (nil? rhs) leftmost?)
-                            novelty)]
-     (cond-> novelty-subrange
-       through-t (flake/disj-all (flakes-after through-t novelty-subrange))))))
-
-(defn flakes-within
-  [{:keys [first-flake rhs leftmost? t] :as node} flakes]
+(defn node-subrange
+  [{:keys [first-flake rhs leftmost?] :as node} t flakes]
   (source-novelty-t flakes first-flake rhs leftmost? t))
 
 (defn novelty-flakes-before
@@ -260,7 +264,7 @@
       (update :flakes flake/conj-all (novelty-flakes-before node t idx-novelty remove-preds))
 
       (< node-t t)
-      (update :flakes flake/disj-all (flakes-after t flakes))
+      (update :flakes flake/disj-all (filter-after t flakes))
 
       :finally
       (assoc :t t))))
@@ -275,4 +279,4 @@
     (flake/conj-all (novelty-flakes-before t node idx-novelty remove-preds))
 
     (< node-t t)
-    (flake/disj-all (flakes-after t flakes))))
+    (flake/disj-all (filter-after t flakes))))

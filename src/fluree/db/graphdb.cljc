@@ -342,7 +342,7 @@
   (reduce
    (fn [m idx]
      (assoc m idx (-> index-configs
-                      (get-in [idx :historyComparator])
+                      (get-in [idx :comparator])
                       avl/sorted-set-by)))
    {:size 0} index/types))
 

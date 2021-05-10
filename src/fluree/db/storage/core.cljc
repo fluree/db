@@ -119,59 +119,49 @@
       (<? (storage-write conn key ser)))))
 
 (defn child-data
-  "Given a child, unresolved node, extracts just the data that will go into storage."
-  [child]
-  (select-keys child [:id :leaf :first-flake :rhs :size]))
-
-(defn write-history
-  [conn history his-key next-his-key]
-  (go-try
-    (let [data {:flakes history
-                :his    next-his-key}
-          ser  (serdeproto/-serialize-leaf (serde conn) data)]
-      (<? (storage-write conn his-key ser)))))
+  "Given a child, unresolved node, extracts just the data that will go into
+  storage."
+  [[fflake child]]
+  [fflake (select-keys child [:id :leaf :first-flake :rhs :size])])
 
 (defn write-leaf
-  "Writes a leaf plus its history.
-
-  Writes history first, and only on successful history write then writes leaf.
-
-  Returns leaf's key"
-  [conn network dbid idx-type id flakes history]
+  "Computes a new unique id for `leaf` and writes it to storage under that id.
+  Returns the leaf map with the new id attached uner the `:id` key"
+  [conn network dbid idx-type {:keys [flakes] :as leaf}]
   (go-try
-    (let [leaf-key      (ledger-node-key network dbid idx-type id "l")
-          his-key       (str leaf-key "-his")
-          data          {:flakes flakes
-                         :his    his-key}
-          ser           (serdeproto/-serialize-leaf (serde conn) data)
-          write-his-ch  (write-history conn history his-key nil)
-          write-leaf-ch (storage-write conn leaf-key ser)]
-      ;; write history and leaf node in parallel
-      (<? write-his-ch)
-      (<? write-leaf-ch)
-      leaf-key)))
+   (let [id-base (str (util/random-uuid))
+         leaf-id (ledger-node-key network dbid idx-type id-base "l")
+         data    {:flakes flakes}
+         ser     (serdeproto/-serialize-leaf (serde conn) data)]
+     (<? (storage-write conn leaf-id ser))
+     (assoc leaf :id leaf-id))))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key"
   [conn key data]
   (go-try
-    (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-      (<? (storage-write conn key ser))
-      key)))
+   (let [ser (serdeproto/-serialize-branch (serde conn) data)]
+     (<? (storage-write conn key ser))
+     key)))
 
 (defn write-branch
-  "Returns core async channel with index key"
-  [conn network dbid idx-type id children]
-  (let [branch-key (ledger-node-key network dbid idx-type id "b")
-        child-vals (mapv #(child-data (val %)) children)
-        rhs        (:rhs (last child-vals))
-        data       {:children child-vals
-                    :rhs      rhs}]
-    (write-branch-data conn branch-key data)))
+  "Computes a new unique id for `branch` and writes it to storage under that id.
+  Returns the branch map with the new id attached uner the `:id` key"
+  [conn network dbid idx-type {:keys [children] :as branch}]
+  (go-try
+   (let [id-base       (str (util/random-uuid))
+         branch-id     (ledger-node-key network dbid idx-type id-base "b")
+         child-entries (mapv child-data children)
+         child-vals    (mapv val child-entries)
+         rhs           (->> child-vals last :rhs)
+         data          {:children child-vals
+                        :rhs      rhs}]
+     (<? (write-branch-data conn branch-id data))
+     (assoc branch :id branch-id, :children child-entries))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [db {:keys [garbage] :as progress}]
+  [db garbage]
   (go-try
     (let [{:keys [conn network dbid block]} db
           garbage-key (ledger-garbage-key network dbid block)
@@ -209,26 +199,6 @@
           ser         (serdeproto/-serialize-db-root (serde conn) data)]
       (<? (storage-write conn db-root-key ser))
       db-root-key))))
-
-;; TODO - sorting is temporary... place into node in correct order
-(defn reify-history
-  [conn key error-fn]
-  (let [return-ch (async/promise-chan)]
-    (go
-      (try*
-        (let [data (<! (storage-read conn key))]
-          (if (or (nil? data) (instance? #?(:clj Throwable :cljs js/Error) data))
-            (async/close! return-ch)
-            (->> (serdeproto/-deserialize-leaf (serde conn) data)
-                 :flakes
-                 (sort flake/cmp-flakes-history)
-                 (async/put! return-ch))))
-        (catch* e
-                (error-fn)
-                (async/put! return-ch e)
-                (async/close! return-ch))))
-    ;; return promise chan immediately
-    return-ch))
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
