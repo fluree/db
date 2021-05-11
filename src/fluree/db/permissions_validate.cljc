@@ -26,6 +26,7 @@
           sid     (.-s flake)
           ctx     {:sid     sid
                    :auth_id (or (:auth db) (:auth permissions))
+                   :instant (util/current-time-millis)
                    :db      root-db
                    :state   (atom {:stack   []
                                    :credits 10000000
