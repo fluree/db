@@ -20,6 +20,22 @@
 ;; socket connections are keyed by connection-id and contain :socket - ws, :id - socket-id :health - status of health checks.
 (def server-connections-atom (atom {}))
 
+;; regex to parse URI
+;; Returns an array of strings in order of:
+;; 0 - href  e.g., "https://my-fluree-server.ee:8090/fdb/test/chat/query"
+;; 1 - protocol  e.g., "https:"
+;; 2 - hostname  e.g., "my-fluree-server.ee"
+;; 3 - port  e.g., "8090"
+;; 4 - pathname  e.g. "fdb/test/chat/query"
+;; 5 - search  e.g., "?example=notsupported" if "https://my-fluree-server.ee:8090/fdb/test/chat/query?example=notsupported"
+;; 6 - hash  e.g., "#authority" if https://docs.flur.ee/guides/identity/auth-records#authority
+(def uri-regex #?(:clj #"^(?:((?:https?|s?ftp):)\/\/)([^:\/\s]+)(?::(\d*))?(?:\/([^\s?#]+)?([?][^?#]*)?(#.*)?)?"
+                  :cljs #"^(?:((?:https?|s?ftp):)//)([^:/\s]+)(?::(\d*))?(?:/([^\s?#]+)?([?][^?#]*)?(#.*)?)?"))
+(def server-regex #?(:clj #"^(?:((?:https?):)\/\/)([^:\/\s#]+)(?::(\d*))?"
+                     :cljs #"^(?:((?:https?):)//)([^:/\s#]+)(?::(\d*))?"))
+
+
+
 (defn- acquire-healthy-server
   "Tries all servers in parralel, the first healthy response will be used for the connection
   (additional server healthy writes will be no-ops after first)."
@@ -147,7 +163,7 @@
                           (str server* ":8090"))
               is-https? (str/starts-with? server "https://")
               result*   (conj result server*)]
-          (when-not (re-matches #"^https?://(((?!-))(xn--|_{1,1})?[a-z0-9-]{0,61}[a-z0-9]{1,1}\.)*(xn--)?([a-z0-9\-]{1,61}|[a-z0-9-]{1,30}\.[a-z]{2,})(?:\:\d+)$" server*)
+          (when-not (re-matches server-regex server*)
             (throw (ex-info (str "Invalid connection server, provide url and port only. Optionally specify http:// or https://. Provided: " server)
                             {:status 400 :error :db/invalid-connection})))
           (when (and https? (not= is-https? https?))
