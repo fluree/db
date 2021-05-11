@@ -6,6 +6,8 @@
     [fluree.db.util.log :as log]
     #?(:clj  [clojure.core.async :as async]
        :cljs [cljs.core.async :as async])
+    #?(:cljs [goog.string :as gstring])
+    #?(:cljs [goog.string.format])
     [fluree.db.util.async :refer [<? go-try merge-into?]]))
 
 (defn variable? [form]
@@ -33,6 +35,15 @@
                  (recur r (conj res clause))
                  res)
                res)))
+
+(defn get-all-wd-optional-clauses
+  [coll]
+  (reduce (fn [res {:keys [optional]}]
+            (if optional
+              (into res optional)
+              res)) 
+          []
+          coll))
 
 (defn get-all-wd-clauses
   [coll]
@@ -68,10 +79,12 @@
 
 (defn ad-hoc-clause-to-wikidata
   [clause optional?]
-  (let [clause-str (str (str/join " " (map wikiDataVar? clause)) ".")]
-    (if optional?
-      (str "OPTIONAL {" clause-str "}")
-      clause-str)))
+  (cond->> clause
+           (= "$wd" (first clause)) (drop 1)
+           true                     (map wikiDataVar?)
+           true                     (str/join " ")
+           true                     (#?(:clj format :cljs gstring/format) "%s .")
+           optional?                (#?(:clj format :cljs gstring/format) "OPTIONAL {%s}")))
 
 (defn parse-prefixes
   [prefixes]
