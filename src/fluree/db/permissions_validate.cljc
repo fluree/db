@@ -7,7 +7,8 @@
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.schema :as schema-util])
-  #?(:clj (:import (fluree.db.flake Flake))))
+  #?(:clj (:import (fluree.db.flake Flake)
+                   (java.time Instant))))
 
 ;; goal is a quick check if we can not check every result. Many queries are small,
 ;; so an extended effort in here is not worth the time, we can just check each result
@@ -27,7 +28,7 @@
           ctx     {:sid     sid
                    :auth_id (or (:auth db) (:auth permissions))
                    :db      root-db
-                   :instant (util/current-time-millis)
+                   :instant (Instant/now)
                    :state   (atom {:stack   []
                                    :credits 10000000
                                    :spent   0})}]
