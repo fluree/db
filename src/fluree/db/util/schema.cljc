@@ -35,6 +35,19 @@
 (def ^:const tag-sid-start (flake/min-subject-id const/$_tag))
 (def ^:const tag-sid-end (flake/max-subject-id const/$_tag))
 
+(def ^:const pred-reverse-ref-re #"(?:([^/]+)/)_([^/]+)")
+
+(defn reverse-ref?
+  "Reverse refs must be strings that include a '/_' in them, which characters before and after."
+  [predicate-name throw?]
+  (if (string? predicate-name)
+    (boolean (re-matches pred-reverse-ref-re predicate-name))
+    (if throw?
+      (throw (ex-info (str "Bad predicate name, should be string: " (pr-str predicate-name))
+                      {:status 400
+                       :error  :db/invalid-predicate}))
+      false)))
+
 (defn is-tx-meta-flake?
   "Returns true if this flake is for tx-meta"
   [^Flake f]
@@ -117,3 +130,8 @@
   "Returns true if there are any predicate changes present in set of flakes."
   [flakes]
   (some is-pred-flake? flakes))
+
+(defn version
+  "Returns schema version from a db, which is the :t when the schema was last updated."
+  [db]
+  (get-in db [:schema :t]))

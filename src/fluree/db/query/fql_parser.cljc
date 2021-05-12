@@ -4,7 +4,8 @@
             [clojure.string :as str]
             [fluree.db.spec :as spec]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.schema :as schema]))
+            [fluree.db.query.schema :as schema]
+            [fluree.db.util.schema :as schema-util]))
 
 (defn where-clause-valid?
   "Checks to see if the where clause has ' = ', ' > ', ' < ', ' <= ', or ' >= ', and returns true if yes"
@@ -43,7 +44,7 @@
                         (let [arg       (str/trim arg)
                               [_ ^String pred-name ^String op ^String match] (re-find #"^([^\s=><].+)[\s]+:?(=|>|<|>=|<=|not=)[\s]+:?(.+)$" arg)
                               pred-name (cond
-                                          (schema/reverse-ref? pred-name false)
+                                          (schema-util/reverse-ref? pred-name false)
                                           (throw (ex-info (str "Reverse references cannot be used in a where clause. Provided: " pred-name)
                                                           {:status 400 :error :db/invalid-query}))
 
@@ -333,7 +334,7 @@
 
    Caches results based on database version."
   [db select opts]
-  (let [schema-version (schema/version db)]
+  (let [schema-version (schema-util/version db)]
     ;; when schema is at a newer version, reset cache (version is 't' and negative, so decreases with newer)
     (when (< schema-version (:version @select-cache))
       (reset! select-cache {:version schema-version}))
