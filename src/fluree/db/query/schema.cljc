@@ -8,7 +8,8 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.schema :as schema-util])
+            [fluree.db.util.schema :as schema-util]
+            [fluree.db.util.iri :as iri-util])
 
   #?(:clj (:import (fluree.db.flake Flake))))
 
