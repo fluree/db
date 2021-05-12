@@ -258,7 +258,7 @@
                                      e)))))
     return-chan))
 
-(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst tspo schema settings index-configs schema-cache novelty permissions fork fork-block current-db-fn]
+(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst tspo schema settings comparators schema-cache novelty permissions fork fork-block current-db-fn]
   dbproto/IFlureeDb
   (-latest-db [this]
     (go-try
@@ -338,11 +338,11 @@
        (pr {:network (:network db) :dbid (:dbid db) :block (:block db) :t (:t db) :stats (:stats db) :permissions (:permissions db)}))))
 
 (defn new-novelty-map
-  [index-configs]
+  [comparators]
   (reduce
    (fn [m idx]
-     (assoc m idx (-> index-configs
-                      (get-in [idx :comparator])
+     (assoc m idx (-> comparators
+                      (get idx)
                       avl/sorted-set-by)))
    {:size 0} index/types))
 
@@ -351,21 +351,29 @@
   (assert conn "No conn provided when creating new db.")
   (assert network "No network provided when creating new db.")
   (assert dbid "No dbid provided when creating new db.")
-  (let [novelty     (new-novelty-map index/default-configs)
+  (let [novelty     (new-novelty-map index/default-comparators)
         permissions {:collection {:all? false}
                      :predicate  {:all? true}
                      :root?      true}
-        spot        (index/empty-branch conn network dbid :spot)
-        psot        (index/empty-branch conn network dbid :psot)
-        post        (index/empty-branch conn network dbid :post)
-        opst        (index/empty-branch conn network dbid :opst)
-        tspo        (index/empty-branch conn network dbid :tspo)
+
+        {spot-cmp :spot
+         psot-cmp :psot
+         post-cmp :post
+         opst-cmp :opst
+         tspo-cmp :tspo} index/default-comparators
+
+        spot (index/empty-branch conn network dbid spot-cmp)
+        psot (index/empty-branch conn network dbid psot-cmp)
+        post (index/empty-branch conn network dbid post-cmp)
+        opst (index/empty-branch conn network dbid opst-cmp)
+        tspo (index/empty-branch conn network dbid tspo-cmp)
+
         stats       {:flakes 0, :size 0, :indexed 0}
         fork        nil
         fork-block  nil
         schema      nil
         settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst tspo schema settings index/default-configs schema-cache novelty permissions fork fork-block current-db-fn)))
+    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst tspo schema settings index/default-comparators schema-cache novelty permissions fork fork-block current-db-fn)))
 
 (defn graphdb?
   [db]

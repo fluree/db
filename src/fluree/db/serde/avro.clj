@@ -113,8 +113,8 @@
      :namespace "fluree"
      :fields    [{:name "id", :type :string}
                  {:name "leaf" :type :boolean}              ;; is this a leaf (data) node?
-                 {:name "first", :type "fluree.Flake"}
-                 {:name "rhs", :type [:null "fluree.Flake"]}
+                 {:name "floor", :type "fluree.Flake"}
+                 {:name "ciel", :type [:null "fluree.Flake"]}
                  {:name "size", :type :int}]}))
 
 

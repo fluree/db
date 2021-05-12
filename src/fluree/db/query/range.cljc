@@ -91,7 +91,7 @@
   index `idx` within the database `db` between `start-flake` and `end-flake`,
   inclusive and one-by-one"
   [{:keys [conn] :as db} idx start-flake end-flake]
-  (let [idx-compare (get-in db [:index-configs idx :comparator])
+  (let [idx-compare (get-in db [:comparators idx])
         out         (chan)]
     (go
       (let [idx-root  (get db idx)
@@ -102,7 +102,7 @@
             (let [next-node     (<! (index/lookup-leaf root-node next-flake))
                   resolved-node (<! (dbproto/resolve conn next-node))]
               (when (>! out resolved-node)
-                (recur (:rhs resolved-node))))
+                (recur (:ciel resolved-node))))
             (async/close! out)))))
     out))
 
@@ -115,7 +115,7 @@
 (defn flake-history-xf
   [{:keys [from-t to-t start-test start-flake end-test end-flake]}]
   (let [tx-range-xf (map (fn [{:keys [flakes]}]
-                           (index/flake-tx-range from-t to-t flakes)))
+                           (index/tx-range from-t to-t flakes)))
         subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)]))
 
 (defn expand-history-range
@@ -125,7 +125,7 @@
   `to-t` for some index data node in the `node-stream` channel."
   [node-stream {:keys [from-t to-t novelty start-test start-flake end-test end-flake]}]
   (let [tx-range-xf    (map (fn [{:keys [flakes]}]
-                              (index/flake-tx-range from-t to-t flakes)))
+                              (index/tx-range from-t to-t flakes)))
         flake-range-xf (flake-subrange-xf start-test start-flake end-test end-flake)
         history-xf     (comp tx-range-xf flake-range-xf)
         history-chan   (async/chan 1 history-xf)]
@@ -206,7 +206,7 @@
          opts
 
          novelty     (get-in db [:novelty idx])
-         idx-compare (get-in db [:index-configs idx :comparator])
+         idx-compare (get-in db [:comparators idx])
          start-parts (match->flake-parts db idx start-match)
          end-parts   (match->flake-parts db idx end-match)
 
@@ -343,7 +343,7 @@
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
   ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
-   (let [idx-compare (get-in db [:index-configs idx :comparator])
+   (let [idx-compare (get-in db [:comparators idx])
          out-chan    (chan 1 (map (fn [flakes]
                                     (apply flake/sorted-set-by idx-compare flakes))))]
      (-> db

@@ -1,27 +1,6 @@
 (ns fluree.db.dbproto
   (:refer-clojure :exclude [-lookup resolve]))
 
-(defprotocol IResolve
-  "All nodes must implement this protocol. It's includes the minimal functionality
-   necessary to avoid resolving nodes unless strictly necessary."
-  (-first-flake [node] "Returns the first flake in this node")
-  (-rhs [node] "Returns the node's first flake")
-  (-history-count [node] "Returns how many history nodes are present for this node (if a leaf)")
-  (-resolve [node] "Returns node resolved with data as async channel")
-  (-resolve-to-t [node t idx-novelty] [node t idx-novelty fast-forward-db?] [node t idx-novelty fast-forward-db? remove-flakes]
-    "Resolves this node at specified transaction 't'. Novelty included for the specified index.")
-  (-resolve-history [node] "Returns the history for data nodes.")
-  (-resolve-history-range [node from-t to-t] [node from-t to-t idx-novelty]
-    "Returns the history within specified range of 't' values. From is most recent time."))
-
-
-(defprotocol INode
-  (-lookup [node flake] "Returns the child node which contains the given key")
-  (-lookup-after [node flake] "Returns the child node which comes after the given key")
-  (-lookup-leaf [node flake] "Returns the leaf node which contains the given key")
-  (-lookup-leaf-after [node flake] "Returns the leaf node which comes after the given key"))
-
-
 (defprotocol IFlureeDb
   (-latest-db [db] "Updates a db to the most current version of the db known to this server. Maintains existing permissions")
   (-rootdb [db] "Returns root db version of this db.")
@@ -39,9 +18,9 @@
   (-with-t [db flakes] [db flakes opts] "Applies flakes to this db as a new 't', but retains current block.")
   (-add-predicate-to-idx [db pred-id] "Adds predicate to idx, return updated db."))
 
-(defprotocol IndexResolver
-  (resolve [r node] "Populate index branch and leaf node maps with either their child node attributes or the flakes the store, respectively."))
-
 (defn db?
   [db]
   (satisfies? IFlureeDb db))
+
+(defprotocol IndexResolver
+  (resolve [r node] "Populate index branch and leaf node maps with either their child node attributes or the flakes the store, respectively."))

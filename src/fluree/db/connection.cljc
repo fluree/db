@@ -113,7 +113,7 @@
 
   dbproto/IndexResolver
   (resolve
-  [conn {:keys [config id leaf tempid] :as node}]
+  [conn {:keys [id leaf tempid] :as node}]
   (if (= :empty id)
     (storage/resolve-empty-leaf node)
     (let [object-cache (:object-cache conn)]

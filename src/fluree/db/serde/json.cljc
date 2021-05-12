@@ -9,31 +9,29 @@
   [block]
   (assoc block :flakes (mapv flake/parts->Flake (:flakes block))))
 
-
-
 (defn- deserialize-child-node
-  "Turns :first-flake and :rhs into flakes"
+  "Turns :floor and :ciel into flakes"
   [child-node]
-  (assoc child-node :first-flake (some-> (:first child-node)
-                                         (flake/parts->Flake))
-                    :rhs (some-> (:rhs child-node)
-                                 (flake/parts->Flake))))
+  (assoc child-node
+         :floor (some-> child-node :floor flake/parts->Flake)
+         :ciel  (some-> child-node :ciel flake/parts->Flake)))
 
 (defn- deserialize-db-root
   [db-root]
   (let [{:keys [spot psot post opst tspo]} db-root]
-    (assoc db-root :spot (deserialize-child-node spot)
-                   :psot (deserialize-child-node psot)
-                   :post (deserialize-child-node post)
-                   :opst (deserialize-child-node opst)
-                   :tspo (deserialize-child-node tspo))))
+    (assoc db-root
+           :spot (deserialize-child-node spot)
+           :psot (deserialize-child-node psot)
+           :post (deserialize-child-node post)
+           :opst (deserialize-child-node opst)
+           :tspo (deserialize-child-node tspo))))
 
 
 (defn- deserialize-branch-node
   [branch]
   (assoc branch :children (mapv deserialize-child-node (:children branch))
-                :rhs (some-> (:rhs branch)
-                             (flake/parts->Flake))))
+         :ciel (some-> (:ciel branch)
+                       (flake/parts->Flake))))
 
 
 (defn- deserialize-leaf-node

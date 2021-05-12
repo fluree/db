@@ -14,8 +14,6 @@
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
      :clj (:import (fluree.db.flake Flake))))
 
-(declare ->UnresolvedNode)
-
 #?(:clj
    (defn block-storage-path
      "For a ledger server, will return the relative storage path it is using for blocks for a given ledger."
@@ -121,8 +119,8 @@
 (defn child-data
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
-  [[fflake child]]
-  [fflake (select-keys child [:id :leaf :first-flake :rhs :size])])
+  [[floor child]]
+  [floor (select-keys child [:id :leaf :floor :ciel :size])])
 
 (defn write-leaf
   "Computes a new unique id for `leaf` and writes it to storage under that id.
@@ -153,11 +151,17 @@
          branch-id     (ledger-node-key network dbid idx-type id-base "b")
          child-entries (mapv child-data children)
          child-vals    (mapv val child-entries)
-         rhs           (->> child-vals last :rhs)
+         floor         (->> child-vals first :floor)
+         ciel          (->> child-vals rseq first :ciel)
          data          {:children child-vals
-                        :rhs      rhs}]
+                        :floor    floor
+                        :ciel     ciel}]
      (<? (write-branch-data conn branch-id data))
-     (assoc branch :id branch-id, :children child-entries))))
+     (assoc branch
+            :id branch-id
+            :floor floor
+            :ciel ciel
+            :children child-entries))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
@@ -216,13 +220,13 @@
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
-  [conn {:keys [network dbid index-configs block t]} index index-data]
-  (let [cfg (or (get index-configs index)
-                (throw (ex-info (str "Internal error reifying db root index: " (pr-str index))
+  [conn {:keys [network dbid comparators block t]} index index-data]
+  (let [cmp (or (get comparators index)
+                (throw (ex-info (str "Internal error reifying db index root: " (pr-str index))
                                 {:status 500
                                  :error  :db/unexpected-error})))]
     (assoc index-data
-           :config cfg
+           :comparator cmp
            :network network
            :dbid dbid
            :block block
@@ -233,8 +237,7 @@
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
-  (let [{:keys [network dbid index-configs]} blank-db
-        {:keys [block t ecount stats]} root-data
+  (let [{:keys [block t ecount stats]} root-data
         db* (assoc blank-db :block block
                             :t t
                             :ecount ecount
@@ -291,7 +294,7 @@
                                                                      (zero? i)))
                                               (merge child)))
                                         children)
-           child-entries   (mapcat (juxt :first-flake identity)
+           child-entries   (mapcat (juxt :floor identity)
                                    child-attrs)
            idx-compare     (:comparator config)]
        (apply avl/sorted-map-by idx-compare child-entries))
@@ -328,7 +331,7 @@
     return-ch))
 
 (defn resolve-empty-leaf
-  [{{:keys [comparator]} :config, :as node}]
+  [{:keys [comparator] :as node}]
   (let [pc         (async/promise-chan)
         empty-set  (flake/sorted-set-by comparator)
         empty-node (assoc node :flakes empty-set)]

@@ -7,7 +7,7 @@
 
 (defn pprint-root
   [index count-atom depth pos-idx]
-  (let [indent-first-flake 18
+  (let [indent-floor 18
         str-vec            (-> (repeat depth "-") vec (conj ">"))
         str-vec            (if (index/branch? index)
                              (conj str-vec " I")
@@ -20,13 +20,13 @@
                                (swap! count-atom + node-count)
                                (conj str-vec (str ":" (.-block index) "-" node-count)))
                              str-vec)
-        first-flake        ^Flake (index/first-flake index)
+        floor        ^Flake (:floor index)
         main-str           (apply str str-vec)
-        addl-indent        (if (neg? (- indent-first-flake (count main-str)))
+        addl-indent        (if (neg? (- indent-floor (count main-str)))
                              " "
-                             (apply str (repeat (- indent-first-flake (count main-str)) " ")))
+                             (apply str (repeat (- indent-floor (count main-str)) " ")))
         str-vec            [main-str addl-indent]
-        str-vec            (conj str-vec (str (.-s first-flake) "-" (.-p first-flake) " "))
+        str-vec            (conj str-vec (str (.-s floor) "-" (.-p floor) " "))
         str-vec            (conj str-vec (pr-str pos-idx))]
     (println (apply str str-vec))
     (when (index/index-node? index)
