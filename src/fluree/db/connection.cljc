@@ -20,19 +20,7 @@
 ;; socket connections are keyed by connection-id and contain :socket - ws, :id - socket-id :health - status of health checks.
 (def server-connections-atom (atom {}))
 
-;; regex to parse URI
-;; Returns an array of strings in order of:
-;; 0 - href  e.g., "https://my-fluree-server.ee:8090/fdb/test/chat/query"
-;; 1 - protocol  e.g., "https:"
-;; 2 - hostname  e.g., "my-fluree-server.ee"
-;; 3 - port  e.g., "8090"
-;; 4 - pathname  e.g. "fdb/test/chat/query"
-;; 5 - search  e.g., "?example=notsupported" if "https://my-fluree-server.ee:8090/fdb/test/chat/query?example=notsupported"
-;; 6 - hash  e.g., "#authority" if https://docs.flur.ee/guides/identity/auth-records#authority
-(def uri-regex #?(:clj #"^(?:((?:https?|s?ftp):)\/\/)([^:\/\s]+)(?::(\d*))?(?:\/([^\s?#]+)?([?][^?#]*)?(#.*)?)?"
-                  :cljs #"^(?:((?:https?|s?ftp):)//)([^:/\s]+)(?::(\d*))?(?:/([^\s?#]+)?([?][^?#]*)?(#.*)?)?"))
-(def server-regex #?(:clj #"^(?:((?:https?):)\/\/)([^:\/\s#]+)(?::(\d*))?"
-                     :cljs #"^(?:((?:https?):)//)([^:/\s#]+)(?::(\d*))?"))
+(def server-regex #"^(?:((?:https?):)//)([^:/\s#]+)(?::(\d*))?")
 
 
 
