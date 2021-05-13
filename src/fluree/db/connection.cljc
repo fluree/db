@@ -331,7 +331,6 @@
                url          (str address "/fdb/storage/" path)
                headers      (cond-> {"Accept" #?(:clj  "avro/binary"
                                                  :cljs "application/json")}
-                                    jwt' (assoc "X-fdb-jwt" jwt')
                                     jwt' (assoc "Authorization" (str "Bearer " jwt')))
                headers*     (if private
                               (-> (http-signatures/sign-request "get" url {:headers headers} private)
@@ -550,11 +549,7 @@
                                                 #?(:clj  nil
                                                    :cljs keep-alive-fn))
                             :add-listener     (partial add-listener* state-atom)
-                            :remove-listener  (partial remove-listener* state-atom)
-                            :add-token        #?(:clj nil
-                                                 :cljs (if (identical? *target* "nodejs")
-                                                         (partial add-token)
-                                                         nil))}]
+                            :remove-listener  (partial remove-listener* state-atom)}]
     (map->Connection settings)))
 
 (defn close!
