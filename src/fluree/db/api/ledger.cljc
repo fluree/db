@@ -141,10 +141,14 @@
   ([conn ledger]
    (root-db conn ledger nil))
   ([conn ledger {:keys [roles auth block syncTo syncTimeout] :as opts}]
-   (let [pc (async/promise-chan)]
+   (let [pc (async/promise-chan)
+         opts' #?(:clj nil
+                  :cljs (if (identical? *target* "nodejs")
+                          opts ; need to pass auth/jwt for nodejs in closed-api
+                          nil))]
      (async/go
        (try*
-         (let [dbx (cond-> (<? (session/db conn ledger nil))
+         (let [dbx (cond-> (<? (session/db conn ledger opts'))
                            syncTo (-> (syncTo-db syncTo syncTimeout) <?)
                            block (-> (time-travel/as-of-block block) <?)
                            roles (-> (add-db-permissions auth roles) <?) ;; should only ever have roles -or- auth
