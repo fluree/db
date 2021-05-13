@@ -222,7 +222,8 @@
   "Turns each index root node into an unresolved node."
   [conn {:keys [network dbid comparators block t]} index index-data]
   (let [cmp (or (get comparators index)
-                (throw (ex-info (str "Internal error reifying db index root: " (pr-str index))
+                (throw (ex-info (str "Internal error reifying db index root: "
+                                     (pr-str index))
                                 {:status 500
                                  :error  :db/unexpected-error})))]
     (assoc index-data
@@ -270,12 +271,15 @@
 
 
 (defn reify-db
-  "Reifies db at specified index point. If unable to read db-root at index, throws."
+  "Reifies db at specified index point. If unable to read db-root at index,
+  throws."
   [conn network dbid blank-db index]
   (go-try
     (let [db-root (read-db-root conn network dbid index)]
       (when-not db-root
-        (throw (ex-info (str "Database " network "/" dbid " could not be loaded at index point: " index ".")
+        (throw (ex-info (str "Database " network "/" dbid
+                             " could not be loaded at index point: "
+                             index ".")
                         {:status 400
                          :error  :db/unavailable})))
       (let [db  (reify-db-root conn blank-db (<? db-root))
@@ -283,10 +287,10 @@
         (assoc db* :settings (<? (schema/setting-map db*)))))))
 
 (defn fetch-child-attributes
-  [conn {:keys [id config leftmost?] :as branch}]
+  [conn {:keys [id comparator leftmost?] :as branch}]
   (go-try
    (if-let [{:keys [children]} (<? (read-branch conn id))]
-     (let [branch-metadata (select-keys branch [:config :network :dbid :block
+     (let [branch-metadata (select-keys branch [:comparator :network :dbid :block
                                                 :t :tt-id :tempid])
            child-attrs     (map-indexed (fn [i child]
                                           (-> branch-metadata
@@ -295,27 +299,25 @@
                                               (merge child)))
                                         children)
            child-entries   (mapcat (juxt :floor identity)
-                                   child-attrs)
-           idx-compare     (:comparator config)]
-       (apply avl/sorted-map-by idx-compare child-entries))
-     (throw (ex-info (str "Unable to retrieve index branch with id " id " from storage.")
-                     {:status 500 :error :db/storage-error})))))
+                                   child-attrs)]
+       (apply avl/sorted-map-by comparator child-entries))
+     (throw (ex-info (str "Unable to retrieve index branch with id "
+                          id " from storage.")
+                     {:status 500, :error :db/storage-error})))))
 
 (defn fetch-leaf-flakes
-  [conn {:keys [id config]}]
+  [conn {:keys [id comparator]}]
   (go-try
    (if-let [{:keys [flakes] :as leaf} (<? (read-leaf conn id))]
-     (let [idx-compare (:comparator config)]
-       (apply flake/sorted-set-by idx-compare flakes))
+     (apply flake/sorted-set-by comparator flakes)
      (throw (ex-info (str "Unable to retrieve leaf node with id: "
                           id " from storage")
                      {:status 500, :error :db/storage-error})))))
 
 (defn resolve-index-node
-  [conn {:keys [config leaf] :as node} error-fn]
-  (assert (:comparator config)
-          (str "Cannot resolve index node; configuration does not have a comparator. "
-               " Configuration: " (pr-str config)))
+  [conn {:keys [comparator leaf] :as node} error-fn]
+  (assert comparator
+          "Cannot resolve index node; configuration does not have a comparator.")
   (let [return-ch (async/promise-chan)]
     (go
       (try*
