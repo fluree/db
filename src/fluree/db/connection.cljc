@@ -438,17 +438,11 @@
 
   Returns true if successful, false otherwise."
   [conn token]
-  (let [conn-id (:id conn)
-        _ (log/info "add-token" {:conn-id conn-id :token token})
-        ]
-    (try
-      (swap! server-connections-atom update-in [conn-id :token]
-             (fn [x]
-               (if x
-                 x
-                 token)))
+  (let [conn-id (:id conn)]
+    (try*
+      (swap! server-connections-atom update-in [conn-id :token] #(or % token))
       true
-      (catch #?(:clj Exception :cljs :default) _
+      (catch* e
         false))))
 
 (defn- generate-connection
@@ -500,7 +494,7 @@
                              (swap! state-atom assoc :close? true)
                              ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
                              #?(:clj (dbfunctions/clear-db-fn-cache)
-                                :cljs (if (identical? "nodejs" cljs.core/*target*)
+                                :cljs (when (identical? "nodejs" cljs.core/*target*)
                                         (dbfunctions/clear-db-fn-cache)))
                              (session/close-all-sessions conn-id)
                              (reset! default-cache-atom (default-object-cache-factory memory-object-size))
