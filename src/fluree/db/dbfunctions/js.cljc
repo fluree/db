@@ -1,13 +1,25 @@
 (ns fluree.db.dbfunctions.js
   (:require [clojure.string :as str]
-            [clojure.java.io :as io]
+            [clojure.tools.reader.edn :as edn]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [<? go-try merge-into? channel?]]
-            #?(:clj  [instaparse.core :as insta :refer [defparser]]
-               :cljs [instaparse.core :as insta :refer-macros [defparser]])
-            [clojure.edn :as edn]))
+            #?(:clj  [clojure.java.io :as io]
+               :cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
+            #?(:clj  [instaparse.core :as insta]
+               :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
-(def ^:const flureejs (insta/parser (io/resource "flureejs.bnf")))
+#?(:cljs
+   (def inline-grammar
+     "FlureeJS grammer in instaparse compatible BNF format loaded at compile time so it's
+     available to cljs and js artifacts."
+     (inline-resource "flureejs.bnf")))
+
+#?(:clj
+   (def ^:const flureejs (insta/parser (io/resource "flureejs.bnf")))
+
+   :cljs
+   (defparser flureejs inline-grammar :input-format :ebnf))
+
 
 (def ^:const operators {:lt         `<
                         :gt         `>
@@ -198,32 +210,9 @@
 
   (insta/parse flureejs "exports.myFn = (myarg) => { var myvar = 'there'.toUpperCase(); \n return myvar; };")
 
-  (insta/parse flureejs "exports.myFn = (myarg) => { blah.ctx.res(false); };")
-
   flureejs
-
-  (insta/parse flureejs "var hi = 'there'.toUpperCase(); return hi")
 
   (->> (slurp (io/resource "smartFunctions/nonNegative-sf.js"))
        (insta/parse flureejs))
 
-  (->> (slurp (io/resource "smartFunctions/sample-sf.js"))
-       (insta/parse flureejs))
-
-  ((-> '()
-       (conj '(let [hi "blah"] hi))
-       (conj [])
-       (conj 'clojure.core/fn)
-       (eval)))
-
   )
-
-;; var str = "Hello World!";
-;; var res = str.toUpperCase();
-
-; [{
-;    "_id": "_fn",
-;    "name": "nonNegative?",
-;    "doc": "Checks that a value is non-negative",
-;    "code": "(<= 0 (?o))"
-;}]

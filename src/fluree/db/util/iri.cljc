@@ -1,6 +1,7 @@
 (ns fluree.db.util.iri
-  (:require [fluree.db.constants :as const])
-  (:import [fluree.db.flake Flake]))
+  (:require [fluree.db.constants :as const]
+            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])])
+  #?(:clj (:import (fluree.db.flake Flake))))
 
 ;; utilities related to iris, prefixes, expansion and compaction
 
