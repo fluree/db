@@ -81,7 +81,7 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce app-state (atom {:product "Fluree NodeJs Library"
-                          :version "v1.0.0-rc16"}))
+                          :version "v1.0.0-rc18"}))
 
 (println (:product @app-state) (:version @app-state))
 
@@ -371,28 +371,6 @@
 ;; Ledger/DB Operations
 ;;
 ;; ======================================
-(defn ^:private ledger-db
-  "Returns a queryable database from the connection for the specified ledger."
-  ([conn ledger]
-   (ledger/root-db conn ledger nil))
-  ([conn ledger {:keys [roles auth block syncTo syncTimeout] :as opts}]
-   (let [pc (async/promise-chan)]
-     (async/go
-       (try
-         (let [dbx (cond-> (<? (session/db conn ledger opts))
-                           syncTo (-> (ledger/syncTo-db syncTo syncTimeout) <?)
-                           block (-> (time-travel/as-of-block block) <?)
-                           ;; should only ever have roles -or- auth
-                           ;; if both, auth overrides roles
-                           (or auth roles) (-> (ledger/add-db-permissions auth roles) <?))]
-           (async/put! pc dbx))
-         (catch :default e
-                 (async/put! pc e)
-                 (async/close! pc))))
-     ;; return promise chan immediately
-     pc)))
-
-
 (defn ^:private db-instance
   "Returns a queryable database from the connection."
   ([conn ledger] (db-instance conn ledger {}))
@@ -406,7 +384,7 @@
                auth'        (or auth (if jwt
                                        ["_auth/id" (-> (conn-handler/validate-token conn jwt)
                                                        :sub)]))
-               perm-db       (-> (<? (ledger-db conn ledger (assoc opts :auth auth')))
+               perm-db       (-> (<? (ledger/db conn ledger (assoc opts :auth auth')))
                                  (assoc :conn conn :network network :dbid ledger-id))]
            (async/put! pc perm-db))
          (catch :default e
