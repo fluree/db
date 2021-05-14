@@ -119,8 +119,8 @@
 (defn child-data
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
-  [[floor child]]
-  [floor (select-keys child [:id :leaf :floor :ciel :size])])
+  [[_ child]]
+  (select-keys child [:id :leaf :floor :ciel :size]))
 
 (defn write-leaf
   "Computes a new unique id for `leaf` and writes it to storage under that id.
@@ -149,19 +149,14 @@
   (go-try
    (let [id-base       (str (util/random-uuid))
          branch-id     (ledger-node-key network dbid idx-type id-base "b")
-         child-entries (mapv child-data children)
-         child-vals    (mapv val child-entries)
+         child-vals    (mapv child-data children)
          floor         (->> child-vals first :floor)
          ciel          (->> child-vals rseq first :ciel)
          data          {:children child-vals
                         :floor    floor
                         :ciel     ciel}]
      (<? (write-branch-data conn branch-id data))
-     (assoc branch
-            :id branch-id
-            :floor floor
-            :ciel ciel
-            :children child-entries))))
+     (assoc branch :id branch-id))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
