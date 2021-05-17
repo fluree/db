@@ -573,6 +573,7 @@
       sum)
     (catch* e (function-error e "objF" flakes))))
 
+;; TODO - below is java-specific, need a javascript version
 (defn rand
   [instant max']
   (try*

@@ -560,7 +560,7 @@
    :fdb/spec nil
    :fdb/cost 10}
   [?ctx]
-  (let [res   (.toEpochMilli (:instant ?ctx))
+  (let [res   (:instant ?ctx)
         entry [{:function "now" :arguments [] :result res} 10]]
     (add-stack ?ctx entry)
     res))
@@ -764,7 +764,7 @@
    :fdb/spec nil
    :fdb/cost 10}
   ([?ctx max]
-   (rand ?ctx max (.toEpochMilli (:instant ?ctx))))
+   (rand ?ctx max (:instant ?ctx)))
   ([?ctx max seed]
    (go-try
      (let [seed' (extract seed)
@@ -774,6 +774,7 @@
        (add-stack ?ctx entry)
        res))))
 
+;; TODO - this is not deterministic... should look at deterministic generation of UUID5 (Sha1)
 (defn uuid
   {:doc      "Returns a random number, seed is either provided or a we use the txn instant"
    :fdb/spec nil

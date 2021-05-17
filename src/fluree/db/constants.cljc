@@ -8,6 +8,7 @@
 ;; system constants
 
 ;; system collection ids
+(def ^:const $_tx -1)                                       ;; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
 (def ^:const $_predicate 0)
 (def ^:const $_collection 1)
 (def ^:const $_shard 2)
@@ -50,6 +51,8 @@
 (def ^:const $_predicate:txSpecDoc 25)
 (def ^:const $_predicate:restrictTag 26)
 (def ^:const $_predicate:fullText 27)
+;(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
+(def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
 
 (def ^:const $_tag:id 30)
 (def ^:const $_tag:doc 31)
@@ -60,6 +63,8 @@
 (def ^:const $_collection:spec 43)
 (def ^:const $_collection:specDoc 44)
 (def ^:const $_collection:shard 45)
+;(def ^:const $_collection:equivalentClass 46)
+(def ^:const $_collection:partition 47)
 
 (def ^:const $_user:username 50)
 (def ^:const $_user:auth 51)

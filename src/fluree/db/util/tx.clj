@@ -3,10 +3,10 @@
             [fluree.crypto :as crypto]
             [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.util.core :as util]))
 
 ;; transaction utilities
-
 
 (defn validate-command
   "Takes a command (map) and validates signature, adds in auth or authority and does
@@ -48,33 +48,6 @@
                           (assoc cmd-map :authority sig-authority)))]
     cmd-map*))
 
-
-(defn get-tx-meta-from-tx
-  "Separates tx-meta from the rest of the transaction.
-  If by chance tx-meta was included twice, will throw an exception."
-  [txn]
-  (let [grouped (group-by #(if (str/starts-with? (:_id %) "_tx")
-                             :tx-meta
-                             :rest-tx) txn)
-        tx-meta (when-let [tx-meta+ (not-empty (:tx-meta grouped))]
-                  (when (not= 1 (count tx-meta+))
-                    (throw (ex-info "You have multiple _tx metadata records in a single transaction, only one is allowed."
-                                    {:status 400 :error :db/invalid-transaction})))
-                  (->> tx-meta+
-                       first
-                       (reduce-kv (fn [acc k v]
-                                    (cond
-                                      (or (= :_id k) (= :_action k) (= :_meta k))
-                                      (assoc acc k v)
-
-                                      (nil? (namespace k))
-                                      (assoc acc (keyword "_tx" (name k)) v)
-
-                                      :else
-                                      (assoc acc k v)))
-                                  {})))]
-    {:tx-meta tx-meta
-     :rest-tx (:rest-tx grouped)}))
 
 (defn gen-tx-hash
   "From a list of transaction flakes, returns the sha3 hash.
@@ -131,3 +104,36 @@
       (if (> 1 (count merkle-results))
         (recur (apply generate-hashes merkle-results))
         (first merkle-results)))))
+
+
+;; TODO - moved this from the original transact namespace. Need to look at how this special treatment is handled
+;; and verify it is being done in a reasonable way.
+(defn create-new-db-tx
+  [tx-map]
+  (let [{:keys [db alias auth doc fork forkBlock]} tx-map
+        db-name (if (sequential? db)
+                  (str (first db) "/" (second db))
+                  (str/replace db "/$" "/"))
+        tx      (util/without-nils
+                  {:_id       "db$newdb"
+                   :_action   :insert
+                   :id        db-name
+                   :alias     (or alias db-name)
+                   :root      auth
+                   :doc       doc
+                   :fork      fork
+                   :forkBlock forkBlock})]
+    [tx]))
+
+
+(defn make-candidate-db
+  "Assigns a tempid to all index roots, which ensures caching for this candidate db
+  is independent from any 'official' db with the same block."
+  [db]
+  (let [tempid  (util/random-uuid)
+        indexes [:spot :psot :post :opst]]
+    (reduce
+      (fn [db idx]
+        (let [index (assoc (get db idx) :tempid tempid)]
+          (assoc db idx index)))
+      db indexes)))

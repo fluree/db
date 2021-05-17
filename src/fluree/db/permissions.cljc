@@ -73,8 +73,8 @@
           wild-collection? (or (nil? collection) (= "*" collection))
           wild-predicate?  (or (empty? predicates) (some #(= "*" %) predicates))
 
-          collection-id    (when-not wild-collection?
-                             (dbproto/-c-prop db :id collection))
+          partition        (when-not wild-collection?
+                             (dbproto/-c-prop db :partition collection))
           predicate-ids    (when-not wild-predicate?
                              (map #(dbproto/-p-prop db :id %) predicates))]
       (cond
@@ -94,12 +94,12 @@
         ;; first check collection + predicate rule(s) and if none are true, check this.
         (and (not wild-collection?) wild-predicate?)
         (if default?
-          [[[:collection collection-id :default] fun]]
-          [[[:collection collection-id :all] fun]])
+          [[[:collection partition :default] fun]]
+          [[[:collection partition :all] fun]])
 
         ;; collection + predicate predicate
         :else
-        (mapv (fn [pred-id] [[:collection collection-id pred-id] fun]) predicate-ids)))))
+        (mapv (fn [pred-id] [[:collection partition pred-id] fun]) predicate-ids)))))
 
 
 (defn rules-from-role

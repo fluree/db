@@ -46,9 +46,11 @@
 
   When an old value does not exist, old-val is nil.
   If they subject being created is completely new, :new? true "
-  [db tempids flakes]
+  [db tempids flakes filter?]
   (go-try
-    (let [pred-flakes (filter schema-util/is-pred-flake? flakes)
+    (let [pred-flakes (if filter?
+                        (filter schema-util/is-pred-flake? flakes)
+                        flakes)
           is-new?     (into #{} (vals tempids))             ;; a set of all the new tempid subids, to be used as a fn
           new-map     (reduce #(assoc-in %1 [(.-s %2) :new?] (boolean (is-new? (.-s %2)))) {} pred-flakes)]
       (loop [[f & r] pred-flakes
@@ -198,12 +200,13 @@
 
 
 (defn validate-schema-change
-  [db tempids flakes]
-  (go-try
-    (let [changes (<? (new-pred-changes db tempids flakes))]
-      (if (empty? changes)
-        db
-        (<? (predicate-change-error changes db true))))))
+  ([db tempids flakes] (validate-schema-change db tempids flakes true))
+  ([db tempids flakes filter?]
+   (go-try
+     (let [changes (<? (new-pred-changes db tempids flakes filter?))]
+       (if (empty? changes)
+         db
+         (<? (predicate-change-error changes db true)))))))
 
 
 (def predicate-re #"(?:([^/]+)/)([^/]+)")
@@ -285,11 +288,19 @@
                     (assoc acc p o))))
           {} flakes))
 
+(defn- extract-spec-ids
+  [spec-pid schema-flakes]
+  (->> schema-flakes
+       (keep #(when (= spec-pid (.-p %)) (.-o %)))
+       vec))
+
 (defn schema-map
   "Returns a map of the schema for a db to allow quick lookups of schema properties.
-  Schema is a map with two keys:
+  Schema is a map with keys:
+  - :t - the 't' value when schema built, allows schema equality checks
   - :coll - collection info, mapping cid->name and name->cid all within the same map
   - :pred - predicate info, mapping pid->properties and name->properties for quick lookup based on id or name respectively
+  - :fullText - contains predicate ids that need fulltext search
   "
   [db]
   (go-try
@@ -299,19 +310,22 @@
           coll          (->> collection-flakes
                              (partition-by #(.-s %))
                              (reduce (fn [acc coll-flakes]
-                                       (let [sid     (.-s (first coll-flakes))
-                                             id      (flake/sid->i sid)
-                                             p->v    (->> coll-flakes ;; quick lookup map of collection's predicate ids
-                                                          (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
-                                             c-name  (get p->v const/$_collection:name)
-                                             spec    (get p->v const/$_collection:spec)
-                                             specDoc (get p->v const/$_collection:specDoc)
-                                             c-props {:name    c-name
-                                                      :sid     sid
-                                                      :spec    spec
-                                                      :specDoc specDoc
-                                                      :id      id}]
-                                         (assoc acc id c-props
+                                       (let [sid       (.-s (first coll-flakes))
+                                             p->v      (->> coll-flakes ;; quick lookup map of collection's predicate ids
+                                                            (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
+                                             partition (or (get p->v const/$_collection:partition)
+                                                           (flake/sid->i sid))
+                                             c-name    (get p->v const/$_collection:name)
+                                             specs     (when (get p->v const/$_collection:spec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                         (extract-spec-ids const/$_collection:spec coll-flakes))
+                                             specDoc   (get p->v const/$_collection:specDoc)
+                                             c-props   {:name      c-name
+                                                        :sid       sid
+                                                        :spec      specs
+                                                        :specDoc   specDoc
+                                                        :id        partition ;; TODO - deprecate! (use partition instead)
+                                                        :partition partition}]
+                                         (assoc acc partition c-props
                                                     c-name c-props)))
                                      ;; put in defaults for _tx
                                      {-1    {:name "_tx" :id -1 :sid -1}
@@ -341,9 +355,12 @@
                                                           :component          (boolean (get p->v const/$_predicate:component))
                                                           :noHistory          (boolean (get p->v const/$_predicate:noHistory))
                                                           :restrictCollection (get p->v const/$_predicate:restrictCollection)
-                                                          :spec               (get p->v const/$_predicate:spec)
+                                                          :retractDuplicates  (boolean (get p->v const/$_predicate:retractDuplicates))
+                                                          :spec               (when (get p->v const/$_predicate:spec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                                                (extract-spec-ids const/$_predicate:spec pred-flakes))
                                                           :specDoc            (get p->v const/$_predicate:specDoc)
-                                                          :txSpec             (get p->v const/$_predicate:txSpec)
+                                                          :txSpec             (when (get p->v const/$_predicate:txSpec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                                                (extract-spec-ids const/$_predicate:txSpec pred-flakes))
                                                           :txSpecDoc          (get p->v const/$_predicate:txSpecDoc)
                                                           :restrictTag        (get p->v const/$_predicate:restrictTag)
                                                           :fullText           fullText?}]
