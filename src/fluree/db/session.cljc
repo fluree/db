@@ -412,7 +412,6 @@
       (assoc session* :new? true)
       session*)))
 
-
 ;; TO-DO check for expired jwt when specified
 (defn session
   "Returns connection to the given ledger, and ensures it is cached.
