@@ -6,7 +6,7 @@
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            #?(:clj [fluree.db.permissions-validate :as perm-validate])
+            [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.util.async :refer [<? go-try]])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
@@ -131,8 +131,11 @@
            from-t             (or (:from-t opts) (:t db))
            to-t               (:to-t opts)
            ;; Note this bypasses all permissions in CLJS for now!
-           no-filter? #?(:cljs true                         ;; always allow for now
-                         :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))
+           no-filter?         #?(:clj (perm-validate/no-filter? permissions s1 s2 p1 p2)
+                                 :cljs (if (identical? *target* "nodejs")
+                                         (perm-validate/no-filter? permissions s1 s2 p1 p2)
+                                         ;; always allow for browser-mode
+                                         true))
            novelty            (get-in db [:novelty idx])
            root-node          (-> db
                                   (get idx)
@@ -162,11 +165,17 @@
                                   (into acci acc)
                                   (recur r
                                          (inc i')
-                                         ;; Note this bypasses all permissions in CLJS for now!
-                                         #?(:cljs acci      ;; always allow for now
-                                            :clj  (if (<? (perm-validate/allow-flake? db f))
+                                         ;; Note this bypasses all permissions in CLJS (browser) for now!
+                                         #?(:clj  (if (<? (perm-validate/allow-flake? db f))
                                                     acci
-                                                    (disj acci f)))))))
+                                                    (disj acci f))
+                                            :cljs (if (identical? *target* "nodejs")
+                                                    ; check permissions for nodejs
+                                                    (if (<? (perm-validate/allow-flake? db f))
+                                                      acci
+                                                      (disj acci f))
+                                                    ; always include for browser
+                                                    acci))))))
                i*           (count acc*)
                more?        (and rhs
                                  (neg? (idx-compare rhs end-flake))
@@ -180,7 +189,7 @@
   "Starting with flakes grouped by subject id, filters the flakes until
   either flake-limit or subject-limit reached."
   [db subject-groups flake-start subject-start flake-limit subject-limit]
-  (async/go
+  (go-try
     (loop [[subject-flakes & r] subject-groups
            flake-count   flake-start
            subject-count subject-start
@@ -188,7 +197,9 @@
       (if (or (nil? subject-flakes) (>= flake-count flake-limit) (>= subject-count subject-limit))
         [flake-count subject-count acc]
         (let [subject-filtered #?(:clj (<? (perm-validate/allow-flakes? db subject-flakes))
-                                  :cljs subject-flakes)
+                                  :cljs (if (identical? *target* "nodejs")
+                                          (<? (perm-validate/allow-flakes? db subject-flakes))
+                                          subject-flakes))
               flakes-new-count         (count subject-filtered)
               subject-new-count        (if (= 0 flakes-new-count) 0 1)]
           (recur r (+ flake-count flakes-new-count)
@@ -278,8 +289,10 @@
                                   (dbproto/-resolve)
                                   (<?))
            node-start         (<? (find-next-valid-node root-node start-flake t novelty fast-forward-db?))
-           no-filter? #?(:cljs true
-                         :clj (perm-validate/no-filter? permissions s1 s2 p1 p2))]
+           no-filter?         #?(:clj (perm-validate/no-filter? permissions s1 s2 p1 p2)
+                                 :cljs (if (identical? *target* "nodejs")
+                                         (perm-validate/no-filter? permissions s1 s2 p1 p2)
+                                         true))]
        (if node-start (loop [next-node node-start
                              offset    offset               ;; offset counts down from the offset
                              i         0                    ;; i is count of flakes

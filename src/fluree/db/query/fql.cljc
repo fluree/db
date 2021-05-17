@@ -143,7 +143,7 @@
                                 (and componentFollow? (:component? pred-spec'))
                                 (let [children (<? (query-range/index-range db :spot = [(.-o flake)] {:limit (:limit pred-spec')}))]
                                   (if (empty? children)
-                                    [{"_id" (.-o flake)} offset-map] ;; no permission (empty results), so just return _id
+                                    [{:_id (.-o flake)} offset-map] ;; no permission (empty results), so just return _id
                                     [(<? (cond->> children
                                                   fuel (sequence (fuel-flake-transducer fuel max-fuel))
                                                   true ((fn [n] (flakes->res db cache fuel max-fuel {:wildcard? true} n)))))
@@ -151,7 +151,7 @@
 
                                 ;; if a ref, put out an {:_id ...}
                                 ref?
-                                [{"_id" (.-o flake)} offset-map]
+                                [{:_id (.-o flake)} offset-map]
 
                                 ;; else just output value
                                 :else
@@ -321,7 +321,7 @@
                                 (full-select-spec db cache base-select-spec top-level-subject)
                                 base-select-spec)
             base-acc          (if (or (:wildcard? select-spec) (:id? select-spec))
-                                {"_id" top-level-subject}
+                                {:_id top-level-subject}
                                 {})
             acc+refs          (if (get-in select-spec [:select :reverse])
                                 (->> (select-spec->reverse-pred-specs select-spec)
@@ -353,7 +353,7 @@
                                                                      offset-map]
 
                                                                     (and (empty? (:select select-spec)) (:id? select-spec))
-                                                                    [{"_id" (.-s f)} (rest flakes) offset-map]
+                                                                    [{:_id (.-s f)} (rest flakes) offset-map]
 
                                                                     :else
                                                                     [acc (rest flakes) offset-map])

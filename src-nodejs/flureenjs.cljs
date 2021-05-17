@@ -81,7 +81,7 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce app-state (atom {:product "Fluree NodeJs Library"
-                          :version "v1.0.0-rc16"}))
+                          :version "v1.0.0-rc18"}))
 
 (println (:product @app-state) (:version @app-state))
 
@@ -371,16 +371,6 @@
 ;; Ledger/DB Operations
 ;;
 ;; ======================================
-
-
-(defn ^:export db
-  "Returns a queryable database from the connection."
-  [conn ledger & [opts]]
-  (-> opts
-      (js->clj :keywordize-keys true)
-      (as-> clj-opts (db-instance conn ledger clj-opts))))
-
-
 (defn ^:private db-instance
   "Returns a queryable database from the connection."
   ([conn ledger] (db-instance conn ledger {}))
@@ -403,6 +393,12 @@
            (async/close! pc))))
      pc)))
 
+(defn ^:export db
+  "Returns a queryable database from the connection."
+  [conn ledger & [opts]]
+  (-> opts
+      (js->clj :keywordize-keys true)
+      (as-> clj-opts (db-instance conn ledger clj-opts))))
 
 (defn ^:export db-p
   "Returns a queryable database from the connection."

@@ -5,7 +5,7 @@
                :cljs [cljs.core.async :as async])
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            #?(:clj [fluree.db.dbfunctions.core :as dbfunctions])
+            [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
             #?(:clj [fluree.crypto :as crypto])
@@ -20,8 +20,12 @@
 ;; socket connections are keyed by connection-id and contain :socket - ws, :id - socket-id :health - status of health checks.
 (def server-connections-atom (atom {}))
 
+(def server-regex #"^(?:((?:https?):)//)([^:/\s#]+)(?::(\d*))?")
+
+
+
 (defn- acquire-healthy-server
-  "Tries all servers in parralel, the first healthy response will be used for the connection
+  "Tries all servers in parallel, the first healthy response will be used for the connection
   (additional server healthy writes will be no-ops after first)."
   [conn-id servers promise-chan]
   ;; kick off server comms in parallel
@@ -147,7 +151,7 @@
                           (str server* ":8090"))
               is-https? (str/starts-with? server "https://")
               result*   (conj result server*)]
-          (when-not (re-matches #"^https?://(((?!-))(xn--|_{1,1})?[a-z0-9-]{0,61}[a-z0-9]{1,1}\.)*(xn--)?([a-z0-9\-]{1,61}|[a-z0-9-]{1,30}\.[a-z]{2,})(?:\:\d+)$" server*)
+          (when-not (re-matches server-regex server*)
             (throw (ex-info (str "Invalid connection server, provide url and port only. Optionally specify http:// or https://. Provided: " server)
                             {:status 400 :error :db/invalid-connection})))
           (when (and https? (not= is-https? https?))
@@ -331,8 +335,6 @@
                url          (str address "/fdb/storage/" path)
                headers      (cond-> {"Accept" #?(:clj  "avro/binary"
                                                  :cljs "application/json")}
-                                    private (assoc "X-fdb-pri" private)
-                                    jwt' (assoc "X-fdb-jwt" jwt')
                                     jwt' (assoc "Authorization" (str "Bearer " jwt')))
                headers*     (if private
                               (-> (http-signatures/sign-request "get" url {:headers headers} private)
@@ -434,6 +436,19 @@
   (remove-listener* (:state conn) network dbid key))
 
 
+
+(defn add-token
+  "Adds token to connection information so it is available to submit storage read requests.
+
+  Returns true if successful, false otherwise."
+  [conn token]
+  (let [conn-id (:id conn)]
+    (try*
+      (swap! server-connections-atom update-in [conn-id :token] #(or % token))
+      true
+      (catch* e
+        false))))
+
 (defn- generate-connection
   "Generates connection object."
   [servers opts]
@@ -481,8 +496,10 @@
                              (async/close! pub-chan)
                              (close-websocket conn-id)
                              (swap! state-atom assoc :close? true)
-                             ;; NOTE - when we allow permissions back in CLJS, remove conditional below
-                             #?(:clj (dbfunctions/clear-db-fn-cache))
+                             ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
+                             #?(:clj (dbfunctions/clear-db-fn-cache)
+                                :cljs (when (identical? "nodejs" cljs.core/*target*)
+                                        (dbfunctions/clear-db-fn-cache)))
                              (session/close-all-sessions conn-id)
                              (reset! default-cache-atom (default-object-cache-factory memory-object-size))
                              ;; user-supplied close function
@@ -532,22 +549,6 @@
                             :add-listener     (partial add-listener* state-atom)
                             :remove-listener  (partial remove-listener* state-atom)}]
     (map->Connection settings)))
-
-(defn add-token
-  "Adds token to connection information so it is available to submit storage read requests.
-
-  Returns true if successful, false otherwise."
-  [conn token]
-  (let [conn-id (:id conn)]
-    (try
-      (swap! server-connections-atom update-in [conn-id :token]
-             (fn [x]
-               (if x
-                 x
-                 token)))
-      true
-      (catch #?(:clj Exception :cljs :default) _
-        false))))
 
 (defn close!
   "Closes connection, returns true if close successful, false if already closed."
