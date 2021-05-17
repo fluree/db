@@ -119,7 +119,7 @@
 (defn child-data
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
-  [[_ child]]
+  [child]
   (select-keys child [:id :leaf :floor :ciel :size]))
 
 (defn write-leaf
@@ -149,7 +149,9 @@
   (go-try
    (let [id-base       (str (util/random-uuid))
          branch-id     (ledger-node-key network dbid idx-type id-base "b")
-         child-vals    (mapv child-data children)
+         child-vals    (->> children
+                            (map val)
+                            (mapv child-data))
          floor         (->> child-vals first :floor)
          ciel          (->> child-vals rseq first :ciel)
          data          {:children child-vals
