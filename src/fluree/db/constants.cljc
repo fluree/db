@@ -29,6 +29,7 @@
 (def ^:const $maxSystemPredicates 999)
 
 ;; predicate id constants
+(def ^:const $id 0)
 
 (def ^:const $_block:hash 1)
 (def ^:const $_block:prevHash 2)
@@ -136,7 +137,7 @@
 (def ^:const $_prefix:iri 131)
 
 
-;; TODO reorder - look at _prefix:uri above and see if we can replace with $rdf:uri
+;; TODO reorder - look at _prefix:iri above and see if we can replace with $rdf:iri
 (def ^:const $rdf:iri 132)
 (def ^:const $rdf:type 133)
 
