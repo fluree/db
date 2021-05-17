@@ -46,9 +46,15 @@
                                      (:fnstr (meta f)) ": " #?(:clj (.getMessage e) :cljs (str e)))
                                 {:status 400
                                  :error  :db/db-function-error})))]
-            (if res
-              true
-              (recur r)))
+            (cond
+              (util/exception? res)
+              res
+
+              (not res)                                     ;; not yet a true response, try next
+              (recur r)
+
+              :else                                         ;; first true response will allow
+              true))
           false)))))
 
 
