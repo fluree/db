@@ -189,7 +189,7 @@
   "Starting with flakes grouped by subject id, filters the flakes until
   either flake-limit or subject-limit reached."
   [db subject-groups flake-start subject-start flake-limit subject-limit]
-  (async/go
+  (go-try
     (loop [[subject-flakes & r] subject-groups
            flake-count   flake-start
            subject-count subject-start
