@@ -99,13 +99,14 @@
    (add-pred db cache fuel max-fuel acc pred-spec ^Flake flake componentFollow? recur? {}))
   ([db cache fuel max-fuel acc pred-spec ^Flake flake componentFollow? recur? offset-map]
    (go-try
-     (let [pred-spec  (if (and (:wildcard? pred-spec) (nil? (:as pred-spec)))
+     (let [compact?   (:compact? pred-spec) ;retain original value
+           pred-spec  (if (and (:wildcard? pred-spec) (nil? (:as pred-spec)))
                         ;; nested 'refs' can be wildcard, but also have a pred-spec... so only get a default wildcard spec if we have no other spec
                         (wildcard-pred-spec db cache (.-p flake) (:compact? pred-spec))
                         pred-spec)
-           pred-spec' (if (contains? pred-spec :componentFollow?)
-                        pred-spec
-                        (assoc pred-spec :componentFollow? componentFollow?))
+           pred-spec' (cond-> pred-spec
+                              (not (contains? pred-spec :componentFollow?)) (assoc :componentFollow? componentFollow?)
+                              (not (contains? pred-spec :compact?)) (assoc :compact? compact?))
            ;; TODO - I think we can eliminate the check below for fallbacks and ensure we always have an 'as' in every spec
            k          (or (:as pred-spec') (:name pred-spec') (:p pred-spec')) ;; use :as, then full pred name, then just p-id as backup
            {:keys [multi? ref? limit orderBy offset p]} pred-spec'
@@ -146,7 +147,7 @@
                                     [{:_id (.-o flake)} offset-map] ;; no permission (empty results), so just return _id
                                     [(<? (cond->> children
                                                   fuel (sequence (fuel-flake-transducer fuel max-fuel))
-                                                  true ((fn [n] (flakes->res db cache fuel max-fuel {:wildcard? true} n)))))
+                                                  true ((fn [n] (flakes->res db cache fuel max-fuel {:wildcard? true :compact? compact?} n)))))
                                      offset-map]))
 
                                 ;; if a ref, put out an {:_id ...}
