@@ -78,41 +78,39 @@
   (reset! session-cache (cache-factory)))
 
 (defn- full-load-existing-db
-  [session]
+  [{:keys [conn network dbid blank-db] :as session}]
   (let [pc (async/promise-chan)]
     (async/go
       (try*
-        (let [blank-db        (:blank-db session)
-              {:keys [conn network dbid]} session
-              db-info         (<? (ops/ledger-info-async conn [network dbid]))
-              _               (when (not= :ready (keyword (:status db-info)))
-                                (throw (ex-info (if (empty? db-info)
-                                                  (str "Ledger " network "/" dbid
-                                                       " is not found on this ledger group.")
-                                                  (str "Ledger " network "/" dbid
-                                                       " is not currently available. Status is: "
-                                                       (:status db-info) "."))
-                                                {:status 400
-                                                 :error  :db/unavailable})))
-              last-indexed-db (<? (storage/reify-db conn network dbid blank-db (:index db-info)))
-              latest-block    (:block db-info)
-              db              (when last-indexed-db
-                                (loop [db         last-indexed-db
-                                       next-block (-> last-indexed-db :block inc)]
-                                  (if (> next-block latest-block)
-                                    db
-                                    (let [block-data (<? (storage/read-block conn network dbid next-block))]
-                                      (if block-data
-                                        (let [{:keys [flakes block t]} block-data
-                                              db* (<? (dbproto/-with db block flakes))]
-                                          (recur db* (inc next-block)))
-                                        (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
-                                                        {:status 500 :error :db/unexpected-error})))))))
-              db*             (assoc db :schema (<? (schema/schema-map db)))
-              db**            (assoc db* :settings (<? (schema/setting-map db*)))]
-          (async/put! pc db**))
-        (catch* e
-                (async/put! pc e))))
+       (let [db-info         (<? (ops/ledger-info-async conn [network dbid]))
+             _               (when (not= :ready (keyword (:status db-info)))
+                               (throw (ex-info (if (empty? db-info)
+                                                 (str "Ledger " network "/" dbid
+                                                      " is not found on this ledger group.")
+                                                 (str "Ledger " network "/" dbid
+                                                      " is not currently available. Status is: "
+                                                      (:status db-info) "."))
+                                               {:status 400
+                                                :error  :db/unavailable})))
+             last-indexed-db (<? (storage/reify-db conn network dbid blank-db (:index db-info)))
+             latest-block    (:block db-info)
+             db              (when last-indexed-db
+                               (loop [db         last-indexed-db
+                                      next-block (-> last-indexed-db :block inc)]
+                                 (if (> next-block latest-block)
+                                   db
+                                   (let [block-data (<? (storage/read-block conn network dbid next-block))]
+                                     (if block-data
+                                       (let [{:keys [flakes block t]} block-data
+                                             db* (<? (dbproto/-with db block flakes))]
+                                         (recur db* (inc next-block)))
+                                       (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
+                                                       {:status 500 :error :db/unexpected-error})))))))
+             db*             (assoc db :schema (<? (schema/schema-map db)))
+             db**            (assoc db* :settings (<? (schema/setting-map db*)))]
+         (async/put! pc db**))
+       (catch* e
+               (async/put! pc e))))
     pc))
 
 (defn cas-db!
@@ -476,13 +474,14 @@
   "Gets the latest db from the central DB atom if available, or loads it from scratch.
   DB is returned as a core async promise channel."
   [session]
-  (swap! (:state session) #(assoc % :req/last (util/current-time-millis)
-                                    :req/count (inc (:req/count %))))
+  (swap! (:state session) #(-> %
+                               (assoc :req/last (util/current-time-millis))
+                               (update :req/count inc)))
   (let [db (:db/db @(:state session))]
     (if (nil? db)
       (do
         (swap! (:schema-cache session) empty)               ;; always clear schema cache on new load
-        (swap! (:state session) #(assoc % :db/db (full-load-existing-db session)))
+        (swap! (:state session) assoc :db/db (full-load-existing-db session))
         (:db/db @(:state session)))
       db)))
 

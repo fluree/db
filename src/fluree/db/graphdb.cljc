@@ -14,9 +14,7 @@
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.log :as log]
-            [clojure.string :as str])
-  #?(:clj
-     (:import (fluree.db.flake Flake))))
+            [clojure.string :as str]))
 
 (defn validate-ledger-name
   "Returns when ledger name is valid.
@@ -77,8 +75,8 @@
                                  (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
                                                  {:status 500
                                                   :error  :db/unexpected-error})))
-          add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
-          add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
+          add-flakes           (filter #(not (exclude-predicates (flake/p %))) flakes)
+          add-preds            (into #{} (map #(flake/p %) add-flakes))
           idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
           ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
           flakes-bytes         (flake/size-bytes add-flakes)
@@ -96,7 +94,7 @@
                                    (assoc :t t)
                                    (update-in [:stats :size] + flakes-bytes) ;; total db ~size
                                    (update-in [:stats :flakes] + (count add-flakes)))]
-      (loop [[^Flake f & r] add-flakes
+      (loop [[f & r] add-flakes
              spot   (get-in db* [:novelty :spot])
              psot   (get-in db* [:novelty :psot])
              post   (get-in db* [:novelty :post])
@@ -117,15 +115,15 @@
 
               root-setting-change?
               (assoc :settings (<? (schema/setting-map db*)))))
-          (let [cid     (flake/sid->cid (.-s f))
-                ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
+          (let [cid     (flake/sid->cid (flake/s f))
+                ecount* (update ecount cid #(if % (max % (flake/s f)) (flake/s f)))]
             (recur r
                    (conj spot f)
                    (conj psot f)
-                   (if (get idx?-map (.-p f))
+                   (if (get idx?-map (flake/p f))
                      (conj post f)
                      post)
-                   (if (get ref?-map (.-p f))
+                   (if (get ref?-map (flake/p f))
                      (conj opst f)
                      opst)
                    (conj tspo f)
@@ -146,11 +144,11 @@
          (if (empty? flakes)
            (async/put! resp-ch (assoc db :block block))
            (let [flakes (sort flake/cmp-flakes-block flakes)
-                 db*    (loop [[^Flake f & r] flakes
-                               t        (.-t (first flakes)) ;; current 't' value
+                 db*    (loop [[f & r]  flakes
+                               t        (->> flakes first flake/t) ;; current 't' value
                                t-flakes []                  ;; all flakes for current 't'
                                db       db]
-                          (cond (and f (= t (.-t f)))
+                          (cond (and f (= t (flake/t f)))
                                 (recur r t (conj t-flakes f) db)
 
                                 :else
@@ -160,7 +158,7 @@
                                               (<?))]
                                   (if (nil? f)
                                     (assoc db' :block block)
-                                    (recur r (.-t f) [f] db')))))]
+                                    (recur r (flake/t f) [f] db')))))]
 
              (async/put! resp-ch db*)))
          (catch* e
@@ -232,8 +230,8 @@
                         ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
                         (util/pred-ident? ident)
                         (some-> (<? (query-range/index-range db :post = [(dbproto/-p-prop db :id (first ident)) (second ident)]))
-                                ^Flake (first)
-                                (.-s))
+                                first
+                                flake/s)
 
                         :else
                         (throw (ex-info (str "Entid lookup must be a number or valid two-tuple identity: " (pr-str ident))
@@ -284,8 +282,8 @@
     (go-try
       (let [tag-pred-id 30]
         (some-> (<? (query-range/index-range (dbproto/-rootdb this) :spot = [tag-id tag-pred-id]))
-                ^Flake (first)
-                (.-o)))))
+                first
+                flake/o))))
   (-tag [this tag-id pred]
     ;; resolves a tag's value given a tag subject id, and shortens the return value if it
     ;; starts with the predicate name.
@@ -300,8 +298,8 @@
     (go-try
       (let [tag-pred-id 30]
         (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
-                ^Flake (first)
-                (.-s)))))
+                first
+                flake/s))))
   (-tag-id [this tag-name pred]
     (go-try
       (if (str/includes? tag-name "/")
