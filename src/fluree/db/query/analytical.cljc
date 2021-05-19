@@ -55,7 +55,9 @@
                (let [key-as-var   (variable? key)
                      static-value (get interm-vars key-as-var)]
                  (when (and (= idx 1) (not key-as-var)
-                            (not (try (dbproto/-p-prop db :name (re-find #"[_a-zA-Z0-9/]*" key)))))
+                            (not (dbproto/-p-prop db :name (if (string? key)
+                                                             (re-find #"[_a-zA-Z0-9/]*" key)
+                                                             key))))
                    (throw (ex-info (str "Invalid predicate provided: " key)
                                    {:status 400
                                     :error  :db/invalid-query})))
@@ -78,7 +80,7 @@
                              (assoc-in [:opts :object-fn] filter-fn)
                              (assoc-in [:rel var] idx)))
 
-                       (and (= idx 1) (re-find #"\+" key))
+                       (and (= idx 1) (string? key) (re-find #"\+" key))
                        (let [[pred recur-amt] (str/split key #"\+")
                              recur-amt (if recur-amt
                                          (or (safe-read-string recur-amt) 100)
