@@ -139,7 +139,7 @@
 (defn remove-latest
   [[floor & other-flakes]]
   (last (reduce (fn [[latest rest] flake]
-                  (if (pos? (flake/cmp-tx latest flake))
+                  (if (pos? (flake/cmp-tx (flake/t latest) (flake/t flake)))
                     [latest (conj rest flake)]
                     [flake (conj rest latest)]))
                 [floor #{}]
