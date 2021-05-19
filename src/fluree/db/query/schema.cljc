@@ -293,81 +293,80 @@
   "
   [db]
   (go-try
-    (let [schema-flakes (->> (query-range/index-range db :spot >= [(flake/max-subject-id const/$_collection)] <= [0])
-                             (<?))
-          [collection-flakes predicate-flakes] (partition-by #(<= (.-s %) flake/MAX-COLL-SUBJECTS) schema-flakes)
-          coll          (->> collection-flakes
-                             (partition-by #(.-s %))
-                             (reduce (fn [acc coll-flakes]
-                                       (let [sid     (.-s (first coll-flakes))
-                                             id      (flake/sid->i sid)
-                                             p->v    (->> coll-flakes ;; quick lookup map of collection's predicate ids
-                                                          (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
-                                             c-name  (get p->v const/$_collection:name)
-                                             spec    (get p->v const/$_collection:spec)
-                                             specDoc (get p->v const/$_collection:specDoc)
-                                             c-props {:name    c-name
-                                                      :sid     sid
-                                                      :spec    spec
-                                                      :specDoc specDoc
-                                                      :id      id}]
-                                         (assoc acc id c-props
-                                                    c-name c-props)))
-                                     ;; put in defaults for _tx
-                                     {-1    {:name "_tx" :id -1 :sid -1}
-                                      "_tx" {:name "_tx" :id -1 :sid -1}}))
-          [pred fullText] (->> predicate-flakes
-                               (partition-by #(.-s %))
-                               (reduce (fn [[pred fullText] pred-flakes]
-                                         (let [id        (.-s (first pred-flakes))
-                                               p->v      (flake->pred-map pred-flakes)
-                                               p-name    (get p->v const/$_predicate:name)
-                                               p-type    (->> (get p->v const/$_predicate:type)
-                                                              (get type-sid->type))
-                                               ref?      (boolean (#{:ref :tag} p-type))
-                                               idx?      (boolean (or ref?
-                                                                      (get p->v const/$_predicate:index)
-                                                                      (get p->v const/$_predicate:unique)))
-                                               fullText? (get p->v const/$_predicate:fullText)
-                                               p-props   {:name               p-name
-                                                          :id                 id
-                                                          :type               p-type
-                                                          :ref?               ref?
-                                                          :idx?               idx?
-                                                          :unique             (boolean (get p->v const/$_predicate:unique))
-                                                          :multi              (boolean (get p->v const/$_predicate:multi))
-                                                          :index              (boolean (get p->v const/$_predicate:index))
-                                                          :upsert             (boolean (get p->v const/$_predicate:upsert))
-                                                          :component          (boolean (get p->v const/$_predicate:component))
-                                                          :noHistory          (boolean (get p->v const/$_predicate:noHistory))
-                                                          :restrictCollection (get p->v const/$_predicate:restrictCollection)
-                                                          :spec               (get p->v const/$_predicate:spec)
-                                                          :specDoc            (get p->v const/$_predicate:specDoc)
-                                                          :txSpec             (get p->v const/$_predicate:txSpec)
-                                                          :txSpecDoc          (get p->v const/$_predicate:txSpecDoc)
-                                                          :restrictTag        (get p->v const/$_predicate:restrictTag)
-                                                          :fullText           fullText?}]
-                                           [(assoc pred id p-props
-                                                        p-name p-props)
-                                            (if fullText? (conj fullText id) fullText)])) [{} #{}]))]
-      {:t        (:t db)                                    ;; record time of spec generation, can use to determine cache validity
-       :coll     coll
-       :pred     pred
-       :fullText fullText})))
+   (let [schema-flakes (<? (query-range/index-range db :spot >= [(flake/max-subject-id const/$_collection)] <= [0]))
+         [collection-flakes predicate-flakes] (partition-by #(<= (flake/s %) flake/MAX-COLL-SUBJECTS) schema-flakes)
+         coll          (->> collection-flakes
+                            (partition-by flake/s)
+                            (reduce (fn [acc coll-flakes]
+                                      (let [sid     (.-s (first coll-flakes))
+                                            id      (flake/sid->i sid)
+                                            p->v    (->> coll-flakes ;; quick lookup map of collection's predicate ids
+                                                         (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
+                                            c-name  (get p->v const/$_collection:name)
+                                            spec    (get p->v const/$_collection:spec)
+                                            specDoc (get p->v const/$_collection:specDoc)
+                                            c-props {:name    c-name
+                                                     :sid     sid
+                                                     :spec    spec
+                                                     :specDoc specDoc
+                                                     :id      id}]
+                                        (assoc acc id c-props
+                                               c-name c-props)))
+                                    ;; put in defaults for _tx
+                                    {-1    {:name "_tx" :id -1 :sid -1}
+                                     "_tx" {:name "_tx" :id -1 :sid -1}}))
+         [pred fullText] (->> predicate-flakes
+                              (partition-by #(.-s %))
+                              (reduce (fn [[pred fullText] pred-flakes]
+                                        (let [id        (.-s (first pred-flakes))
+                                              p->v      (flake->pred-map pred-flakes)
+                                              p-name    (get p->v const/$_predicate:name)
+                                              p-type    (->> (get p->v const/$_predicate:type)
+                                                             (get type-sid->type))
+                                              ref?      (boolean (#{:ref :tag} p-type))
+                                              idx?      (boolean (or ref?
+                                                                     (get p->v const/$_predicate:index)
+                                                                     (get p->v const/$_predicate:unique)))
+                                              fullText? (get p->v const/$_predicate:fullText)
+                                              p-props   {:name               p-name
+                                                         :id                 id
+                                                         :type               p-type
+                                                         :ref?               ref?
+                                                         :idx?               idx?
+                                                         :unique             (boolean (get p->v const/$_predicate:unique))
+                                                         :multi              (boolean (get p->v const/$_predicate:multi))
+                                                         :index              (boolean (get p->v const/$_predicate:index))
+                                                         :upsert             (boolean (get p->v const/$_predicate:upsert))
+                                                         :component          (boolean (get p->v const/$_predicate:component))
+                                                         :noHistory          (boolean (get p->v const/$_predicate:noHistory))
+                                                         :restrictCollection (get p->v const/$_predicate:restrictCollection)
+                                                         :spec               (get p->v const/$_predicate:spec)
+                                                         :specDoc            (get p->v const/$_predicate:specDoc)
+                                                         :txSpec             (get p->v const/$_predicate:txSpec)
+                                                         :txSpecDoc          (get p->v const/$_predicate:txSpecDoc)
+                                                         :restrictTag        (get p->v const/$_predicate:restrictTag)
+                                                         :fullText           fullText?}]
+                                          [(assoc pred id p-props
+                                                  p-name p-props)
+                                           (if fullText? (conj fullText id) fullText)])) [{} #{}]))]
+     {:t        (:t db)                                    ;; record time of spec generation, can use to determine cache validity
+      :coll     coll
+      :pred     pred
+      :fullText fullText})))
 
 (defn setting-map
   [db]
   (go-try
-    (let [setting-flakes (try*
-                           (<? (query-range/index-range db :spot = [["_setting/id" "root"]]))
-                           (catch* e nil))
-          setting-flakes (flake->pred-map setting-flakes)
-          settings       {:passwords (boolean (get setting-flakes const/$_setting:passwords))
-                          :anonymous (get setting-flakes const/$_setting:anonymous)
-                          :language  (get lang-sid->lang (get setting-flakes const/$_setting:language))
-                          :ledgers   (get setting-flakes const/$_setting:ledgers)
-                          :txMax     (get setting-flakes const/$_setting:txMax)
-                          :consensus (get setting-flakes const/$_setting:consensus)}]
+   (let [setting-flakes (try*
+                         (<? (query-range/index-range db :spot = [["_setting/id" "root"]]))
+                         (catch* e nil))
+         setting-flakes (flake->pred-map setting-flakes)
+         settings       {:passwords (boolean (get setting-flakes const/$_setting:passwords))
+                         :anonymous (get setting-flakes const/$_setting:anonymous)
+                         :language  (get lang-sid->lang (get setting-flakes const/$_setting:language))
+                         :ledgers   (get setting-flakes const/$_setting:ledgers)
+                         :txMax     (get setting-flakes const/$_setting:txMax)
+                         :consensus (get setting-flakes const/$_setting:consensus)}]
       settings)))
 
 (defn version

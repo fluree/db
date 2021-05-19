@@ -239,10 +239,11 @@
   options if they are present."
   [{:keys [t start-test start-flake end-test end-flake subject-fn predicate-fn
            object-fn]}]
-  (let [as-of-xf    (map (fn [{:keys [flakes]}]
+  (let [flakes-xf   (map :flakes)
+        as-of-xf    (map (fn [flakes]
                            (index/as-of t flakes)))
         subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
-        xforms      (cond-> [as-of-xf subrange-xf]
+        xforms      (cond-> [flakes-xf as-of-xf subrange-xf]
                       subject-fn   (conj (filter (fn [f]
                                                    (subject-fn (flake/s f)))))
                       predicate-fn (conj (filter (fn [f]

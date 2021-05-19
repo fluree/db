@@ -272,17 +272,18 @@
   throws."
   [conn network dbid blank-db index]
   (go-try
-    (let [db-root (read-db-root conn network dbid index)]
-      (if-not db-root
-        (throw (ex-info (str "Database " network "/" dbid
-                             " could not be loaded at index point: "
-                             index ".")
-                        {:status 400
-                         :error  :db/unavailable}))
-        (let [db           (reify-db-root conn blank-db (<? db-root))
-              schema-map   (<? (schema/schema-map db))
-              settings-map (<? (schema/setting-map db))]
-          (assoc db :schema schema-map, :settings settings-map))))))
+   (let [db-root (read-db-root conn network dbid index)]
+     (if-not db-root
+       (throw (ex-info (str "Database " network "/" dbid
+                            " could not be loaded at index point: "
+                            index ".")
+                       {:status 400
+                        :error  :db/unavailable}))
+       (let [db           (reify-db-root conn blank-db (<? db-root))
+             schema-map   (<? (schema/schema-map db))
+             db*          (assoc db :schema  schema-map)
+             settings-map (<? (schema/setting-map db*))]
+         (assoc db* :settings settings-map))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]

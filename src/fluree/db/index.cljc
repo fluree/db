@@ -149,7 +149,7 @@
   [t flakes]
   (->> flakes
        (group-by (fn [f]
-                   [flake/s flake/p flake/o]))
+                   (juxt flake/s flake/p flake/o)))
        vals
        (mapcat #(->> %
                      (filter (complement (partial after-t? t)))
@@ -157,8 +157,9 @@
 
 (defn tx-range
   [from-t to-t flakes]
-  (let [out-of-range (concat (flakes-before from-t flakes)
-                             (filter-after to-t flakes))]
+  (let [previous     (flakes-before from-t flakes)
+        subsequent   (filter-after to-t flakes)
+        out-of-range (concat previous subsequent)]
     (flake/disj-all flakes out-of-range)))
 
 (defn as-of
