@@ -155,16 +155,16 @@
                      (filter (complement (partial after-t? t)))
                      remove-latest))))
 
-(defn tx-range
+(defn t-range
   [from-t to-t flakes]
   (let [previous     (flakes-before from-t flakes)
         subsequent   (filter-after to-t flakes)
         out-of-range (concat previous subsequent)]
     (flake/disj-all flakes out-of-range)))
 
-(defn as-of
-  [t flakes]
-  (tx-range t t flakes))
+(defn current-flakes
+  [{:keys [t flakes]}]
+  (t-range t t flakes))
 
 (defn novelty-subrange
   [{:keys [floor ciel leftmost?] :as node} through-t novelty]
@@ -195,19 +195,21 @@
                    (not (contains? remove-preds (flake/p f)))))
             subrange-through-t)))
 
-(defn value-at-t
+(defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
   `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later
   than `t` from `leaf` if `t` is older than `leaf`."
-  [{:keys [ciel leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty remove-preds]
-  (if (= leaf-t t)
-    leaf
-    (cond-> leaf
-      (> leaf-t t)
-      (update :flakes flake/conj-all (novelty-flakes-before leaf t idx-novelty remove-preds))
+  ([leaf t idx-novelty]
+   (at-t leaf t idx-novelty #{}))
+  ([{:keys [ciel leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty remove-preds]
+   (if (= leaf-t t)
+     leaf
+     (cond-> leaf
+       (> leaf-t t)
+       (update :flakes flake/conj-all (novelty-flakes-before leaf t idx-novelty remove-preds))
 
-      (< leaf-t t)
-      (update :flakes flake/disj-all (filter-after t flakes))
+       (< leaf-t t)
+       (update :flakes flake/disj-all (filter-after t flakes))
 
-      :finally
-      (assoc :t t))))
+       :finally
+       (assoc :t t)))))

@@ -124,10 +124,12 @@
   respectively, and also contained within the history range between `from-t` and
   `to-t` for some index data node in the `node-stream` channel."
   [node-stream {:keys [from-t to-t novelty start-test start-flake end-test end-flake]}]
-  (let [tx-range-xf    (map (fn [{:keys [flakes]}]
-                              (index/tx-range from-t to-t flakes)))
+  (let [at-t-xf        (map (fn [leaf]
+                              (index/at-t leaf to-t novelty)))
+        tx-range-xf    (map (fn [{:keys [flakes]}]
+                              (index/t-range from-t to-t flakes)))
         flake-range-xf (flake-subrange-xf start-test start-flake end-test end-flake)
-        history-xf     (comp tx-range-xf flake-range-xf)
+        history-xf     (comp at-t-xf tx-range-xf flake-range-xf)
         history-chan   (async/chan 1 history-xf)]
     (async/pipe node-stream history-chan)))
 
@@ -237,13 +239,13 @@
   `start-test` and `end-test` options, respectively, and further filters the
   flake stream according to the `subject-fn`, `predicate-fn`, and `object-fn`
   options if they are present."
-  [{:keys [t start-test start-flake end-test end-flake subject-fn predicate-fn
-           object-fn]}]
-  (let [flakes-xf   (map :flakes)
-        as-of-xf    (map (fn [flakes]
-                           (index/as-of t flakes)))
+  [{:keys [t novelty start-test start-flake end-test end-flake
+           subject-fn predicate-fn object-fn]}]
+  (let [at-t-xf     (map (fn [leaf]
+                           (index/at-t leaf t novelty)))
+        current-xf  (map index/current-flakes)
         subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
-        xforms      (cond-> [flakes-xf as-of-xf subrange-xf]
+        xforms      (cond-> [at-t-xf current-xf subrange-xf]
                       subject-fn   (conj (filter (fn [f]
                                                    (subject-fn (flake/s f)))))
                       predicate-fn (conj (filter (fn [f]
@@ -315,6 +317,7 @@
                                     :start-flake start-flake
                                     :end-test end-test
                                     :end-flake end-flake
+                                    :novelty novelty
                                     :t t})
              (filter-authorized db start-flake end-flake)
              (select-subject-window {:subject-limit subject-limit
