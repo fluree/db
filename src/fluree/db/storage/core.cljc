@@ -315,8 +315,7 @@
 
 (defn resolve-index-node
   [conn {:keys [comparator leaf] :as node} error-fn]
-  (assert comparator
-          "Cannot resolve index node; configuration does not have a comparator.")
+  (assert comparator "Cannot resolve index node; configuration does not have a comparator.")
   (let [return-ch (async/promise-chan)]
     (go
       (try*

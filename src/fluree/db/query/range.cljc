@@ -112,12 +112,6 @@
             (flake/subrange flake-range start-test start-flake
                             end-test end-flake))))
 
-(defn flake-history-xf
-  [{:keys [from-t to-t start-test start-flake end-test end-flake]}]
-  (let [tx-range-xf (map (fn [{:keys [flakes]}]
-                           (index/tx-range from-t to-t flakes)))
-        subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)]))
-
 (defn expand-history-range
   "Returns a channel that will eventually contain a stream of flakes between
   `start-flake` and `end-flake`, according to `start-test` and `end-test`,
