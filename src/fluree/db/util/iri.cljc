@@ -60,6 +60,15 @@
   (expand compact-iri (get-in db [:schema :prefix])))
 
 
+(defn class-sid
+  "Returns the class subject id (or nil).
+  First attempts to expand the class-iri to a full iri.
+  If a match exists, returns the subject id for the class."
+  [class-iri db]
+  (let [expanded-iri (expand-db class-iri db)]
+    (get-in db [:schema :pred expanded-iri :id])))
+
+
 (defn reverse-context
   "Flips context map from prefix -> iri, to iri -> prefix"
   [context]
@@ -72,7 +81,7 @@
   If a prefix can be resolved, returns a 3-tuple of:
   [compacted-iri prefix base-iri]"
   [context]
-  (let [flipped    (reverse-context context)            ;; flips context map
+  (let [flipped    (reverse-context context)                ;; flips context map
         match-iris (->> flipped
                         keys
                         (sort-by #(* -1 (count %))))        ;; want longest iris checked first

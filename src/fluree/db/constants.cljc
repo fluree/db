@@ -59,6 +59,11 @@
 (def ^:const $_predicate:fullText 27)
 (def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
 (def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
+;; TODO - jumping predicate ids - rethink ordering a bit
+(def ^:const $rdf:type 200)
+(def ^:const $rdfs:subClassOf 201)
+(def ^:const $rdfs:subPropertyOf 202)
+(def ^:const $rdfs:Class 203)
 
 (def ^:const $_tag:id 30)
 (def ^:const $_tag:doc 31)
@@ -135,15 +140,6 @@
 
 (def ^:const $_prefix:prefix 130)
 (def ^:const $_prefix:iri 131)
-
-
-;; TODO reorder - look at _prefix:iri above and see if we can replace with $rdf:iri
-(def ^:const $rdf:iri 132)
-(def ^:const $rdf:type 133)
-
-(def ^:const $rdfs:Class 134)
-(def ^:const $rdfs:subClassOf 135)
-(def ^:const $rdfs:subPropertyOf 136)
 
 (def ^:const $fluree:partition 137)
 

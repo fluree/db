@@ -271,10 +271,14 @@
     (if (neg-int? collection)
       (get-in schema [:coll "_tx" property])
       (get-in schema [:coll collection property])))
+  (-class-prop [this property class]
+    (if (= :subclass property)
+      (get @(:subclasses schema) class)
+      (get-in schema [:pred class property])))
   (-p-prop [this property predicate]
     ;; predicate properties
     (assert (#{:name :id :type :ref? :idx? :unique :multi :index :upsert :component :noHistory :restrictCollection
-               :spec :specDoc :txSpec :txSpecDoc :restrictTag :retractDuplicates} property) (str "Invalid predicate property: " (pr-str property)))
+               :spec :specDoc :txSpec :txSpecDoc :restrictTag :retractDuplicates :subclass} property) (str "Invalid predicate property: " (pr-str property)))
     (cond->> (get-in schema [:pred predicate property])
              (= :restrictCollection property) (dbproto/-c-prop this :partition)))
   (-tag [this tag-id]

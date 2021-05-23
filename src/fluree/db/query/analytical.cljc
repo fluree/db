@@ -13,7 +13,9 @@
             [clojure.string :as str]
             [fluree.db.util.log :as log]
             #?(:cljs [cljs.reader])
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.constants :as const]
+            [fluree.db.util.iri :as iri-util]))
 
 (defn variable? [form]
   (when (and (or (string? form) (keyword? form) (symbol? form)) (= (first (name form)) \?))
@@ -397,6 +399,22 @@
                              full-text/storage)]
                (full-text/search db store [var search search-param])))))
 
+(defn class+subclasses
+  "Returns a channel containing "
+  ([db class] (class+subclasses db class (async/chan)))
+  ([db class out-ch]
+   (async/go
+     (let [classes (into [class] (dbproto/-class-prop db :subclass class))]
+       (loop [[class* & r] classes
+              res []]
+         (if (nil? class*)
+           (do
+             (async/put! out-ch res)
+             (async/close! out-ch))
+           (let [class-res (async/<! (query-range/index-range db :post = [const/$rdf:type class*]))]
+             (recur r (into res class-res)))))))
+   out-ch))
+
 
 ;; Can be: ["?item" "rdf:type" "person"]
 ;; Can be: [234 "rdf:type" "?collection"]
@@ -405,36 +423,48 @@
 (defn collection->tuples
   [db res clause]
   (go-try (let [subject-var (variable? (first clause))
-                object-var  (variable? (last clause))]
-            (cond (and subject-var object-var)
-                  (throw (ex-info "When using rdf:type, either a subject or a type (collection) must be specified."
-                                  {:status 400
-                                   :error  :db/invalid-query}))
+                object-var  (variable? (last clause))
+                class-sid   (when subject-var
+                              (iri-util/class-sid (last clause) db))]
+            (when (or (and subject-var object-var)
+                      (and (nil? subject-var) (nil? object-var)))
+              (throw (ex-info "When using rdf:type, either a subject or a type (collection) must be specified."
+                              {:status 400
+                               :error  :db/invalid-query})))
 
-                  subject-var
-                  ;; _tx and _block return the same things
-                  (if (#{"_tx" "_block"} (last clause))
-                    (let [min-sid (-> db :t)
-                          max-sid 0]
-                      {:headers [subject-var]
-                       :tuples  (map #(conj [] %) (range min-sid max-sid))
-                       :vars    {}})
+            (cond
+              object-var
+              (let [s       (first clause)
+                    subject (if (number? s) s (<? (dbproto/-subid db s)))
+                    cid     (flake/sid->cid subject)
+                    cname   (dbproto/-c-prop db :name cid)]
+                {:headers [object-var]
+                 :tuples  [[cname]]
+                 :vars    {}})
 
-                    (let [partition (dbproto/-c-prop db :partition (last clause))
-                          max-sid   (-> db :ecount (get partition))
-                          min-sid   (flake/min-subject-id partition)]
-                      {:headers [subject-var]
-                       :tuples  (map #(conj [] %) (range min-sid (inc max-sid)))
-                       :vars    {}}))
+              ;; everything below has a subject-var, no need to check for that
+              (#{"_tx" "_block"} (last clause))
+              (let [min-sid (-> db :t)
+                    max-sid 0]
+                {:headers [subject-var]
+                 :tuples  (map #(conj [] %) (range min-sid max-sid))
+                 :vars    {}})
 
-                  object-var
-                  (let [s       (first clause)
-                        subject (if (number? s) s (<? (dbproto/-subid db s)))
-                        cid     (flake/sid->cid subject)
-                        cname   (dbproto/-c-prop db :name cid)]
-                    {:headers [object-var]
-                     :tuples  [[cname]]
-                     :vars    {}})))))
+              class-sid
+              (let [res-ch  (async/chan)
+                    results (<? (class+subclasses db class-sid res-ch))]
+                {:headers [subject-var]
+                 :tuples  (map #(vector (.-s %)) results)
+                 :vars    {}})
+
+              ;; not a class, try a collection if matches
+              :else
+              (if-let [collection (dbproto/-c-prop db :partition (last clause))]
+                {:headers [subject-var]
+                 :tuples  (map #(conj [] %) (range (flake/min-subject-id collection) (-> db :ecount (get collection) inc)))
+                 :vars    {}}
+                (throw (ex-info (str "No matching classes or collections for: " (last clause))
+                                {:status 400 :error :db/invalid-query})))))))
 
 
 
@@ -837,7 +867,8 @@
           (and (= 3 (count clause)) (str/starts-with? (second clause) "fullText:"))
           [(full-text->tuples db res clause) r]
 
-          (and (= 3 (count clause)) (= (second clause) "rdf:type"))
+          (and (= 3 (count clause)) (or (= (second clause) "rdf:type")
+                                        (= (second clause) "a")))
           [(<? (collection->tuples db res clause)) r]
 
           (= 3 (count clause))

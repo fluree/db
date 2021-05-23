@@ -38,7 +38,7 @@
 
 (defn flake->pred-map
   [flakes]
-  (reduce (fn [acc ^Flake flake]                                   ;; quick lookup map of predicate's predicate ids
+  (reduce (fn [acc ^Flake flake]                            ;; quick lookup map of predicate's predicate ids
             (let [p         (.-p flake)
                   o         (.-o flake)
                   existing? (get acc p)]
@@ -57,6 +57,64 @@
   (->> schema-flakes
        (keep #(when (= spec-pid (.-p %)) (.-o %)))
        vec))
+
+(defn- recur-sub-classes
+  "Once an initial parent->child relationship is established, recursively place
+  children into parents to return a sorted set of all sub-classes regardless of depth
+  Sorted set is used to ensure consistent query results.
+
+  First takes predicate items and makes a map like this of parent -> children:
+  {100 [200 201]
+   201 [300 301]}
+
+  Then recursively gets children's children to return a map like this:
+  {100 #{200 201 300 301}
+   201 #{300 301}}
+
+   Initial pred-items argument looks like:
+   #{{:iri 'http://schema.org/Patient', :class true, :subclassOf [1002], :id 1003} ...}
+   "
+  [pred-items]
+  (let [subclass-map (reduce
+                       (fn [acc class]
+                         (if-let [parent-classes (:subclassOf class)]
+                           (reduce #(update %1 %2 conj (:id class)) acc parent-classes)
+                           acc))
+                       {} pred-items)]
+    (reduce-kv
+      (fn [acc parent children]
+        (loop [[child & r] children
+               all-children (apply sorted-set children)]
+          (if (nil? child)
+            (assoc acc parent all-children)
+            (if-let [child-children (get subclass-map child)]
+              (recur (into child-children r) (into all-children child-children))
+              (recur r all-children)))))
+      {} subclass-map)))
+
+
+(defn- pred-map->classes
+  "Filters the predicate map to only include classes"
+  [pred-map]
+  ;; in the predicate map, classes are duplicated with both subject id (number
+  ;; and iri - so here we just keep ones with subject-id so there are no duplicates
+  (keep #(when (and (number? (key %)) (:class (val %)))
+           (val %))
+        pred-map))
+
+
+(defn calc-subclass
+  "Calculates subclass map for use with queries for rdf:type."
+  [predicate-map]
+  (let [classes      (pred-map->classes predicate-map)
+        subclass-map (recur-sub-classes classes)]
+    ;; map subclasses for both subject-id and iri
+    (reduce
+      (fn [acc class]
+        (assoc acc (:id class) (get subclass-map (:id class))
+                   (:iri class) (get subclass-map (:id class))))
+      {} classes)))
+
 
 (defn schema-map
   "Returns a map of the schema for a db to allow quick lookups of schema properties.
@@ -105,6 +163,10 @@
                                (reduce (fn [[pred fullText] pred-flakes]
                                          (let [id        (.-s (first pred-flakes))
                                                p->v      (flake->pred-map pred-flakes)
+                                               class?    (contains? p->v const/$rdf:type)
+                                               iri       (get p->v const/$iri)
+                                               equivs    (when-let [equivs (get p->v const/$_predicate:equivalentProperty)]
+                                                           (if (sequential? equivs) equivs [equivs]))
                                                p-name    (get p->v const/$_predicate:name)
                                                p-type    (->> (get p->v const/$_predicate:type)
                                                               (get type-sid->type))
@@ -113,35 +175,48 @@
                                                                       (get p->v const/$_predicate:index)
                                                                       (get p->v const/$_predicate:unique)))
                                                fullText? (get p->v const/$_predicate:fullText)
-                                               p-props   {:name               p-name
-                                                          :id                 id
-                                                          :type               p-type
-                                                          :ref?               ref?
-                                                          :idx?               idx?
-                                                          :unique             (boolean (get p->v const/$_predicate:unique))
-                                                          :multi              (boolean (get p->v const/$_predicate:multi))
-                                                          :index              (boolean (get p->v const/$_predicate:index))
-                                                          :upsert             (boolean (get p->v const/$_predicate:upsert))
-                                                          :component          (boolean (get p->v const/$_predicate:component))
-                                                          :noHistory          (boolean (get p->v const/$_predicate:noHistory))
-                                                          :restrictCollection (get p->v const/$_predicate:restrictCollection)
-                                                          :retractDuplicates  (boolean (get p->v const/$_predicate:retractDuplicates))
-                                                          :spec               (when (get p->v const/$_predicate:spec) ;; specs are multi-cardinality - if one exists filter through to get all
-                                                                                (extract-spec-ids const/$_predicate:spec pred-flakes))
-                                                          :specDoc            (get p->v const/$_predicate:specDoc)
-                                                          :txSpec             (when (get p->v const/$_predicate:txSpec) ;; specs are multi-cardinality - if one exists filter through to get all
-                                                                                (extract-spec-ids const/$_predicate:txSpec pred-flakes))
-                                                          :txSpecDoc          (get p->v const/$_predicate:txSpecDoc)
-                                                          :restrictTag        (get p->v const/$_predicate:restrictTag)
-                                                          :fullText           fullText?}]
-                                           [(assoc pred id p-props
-                                                        p-name p-props)
-                                            (if fullText? (conj fullText id) fullText)])) [{} #{}]))]
-      {:t        (:t db)                                    ;; record time of spec generation, can use to determine cache validity
-       :coll     coll
-       :pred     pred
-       :prefix   (iri-util/system-context (<? prefix-flakes-ch))
-       :fullText fullText})))
+                                               p-props   (if class?
+                                                           {:iri        iri
+                                                            :class      true
+                                                            :subclassOf (when-let [sc (get p->v const/$rdfs:subClassOf)]
+                                                                          (if (sequential? sc) sc [sc]))
+                                                            :id         id}
+                                                           {:name               p-name
+                                                            :id                 id
+                                                            :iri                iri
+                                                            :equivalentProperty equivs
+                                                            :type               p-type
+                                                            :ref?               ref?
+                                                            :idx?               idx?
+                                                            :unique             (boolean (get p->v const/$_predicate:unique))
+                                                            :multi              (boolean (get p->v const/$_predicate:multi))
+                                                            :index              (boolean (get p->v const/$_predicate:index))
+                                                            :upsert             (boolean (get p->v const/$_predicate:upsert))
+                                                            :component          (boolean (get p->v const/$_predicate:component))
+                                                            :noHistory          (boolean (get p->v const/$_predicate:noHistory))
+                                                            :restrictCollection (get p->v const/$_predicate:restrictCollection)
+                                                            :retractDuplicates  (boolean (get p->v const/$_predicate:retractDuplicates))
+                                                            :spec               (when (get p->v const/$_predicate:spec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                                                  (extract-spec-ids const/$_predicate:spec pred-flakes))
+                                                            :specDoc            (get p->v const/$_predicate:specDoc)
+                                                            :txSpec             (when (get p->v const/$_predicate:txSpec) ;; specs are multi-cardinality - if one exists filter through to get all
+                                                                                  (extract-spec-ids const/$_predicate:txSpec pred-flakes))
+                                                            :txSpecDoc          (get p->v const/$_predicate:txSpecDoc)
+                                                            :restrictTag        (get p->v const/$_predicate:restrictTag)
+                                                            :fullText           fullText?})
+                                               ids       (cond-> (into [id] equivs)
+                                                                 p-name (conj p-name)
+                                                                 iri (conj iri))]
+                                           [(reduce #(assoc %1 %2 p-props) pred ids) ;; create a key for each possible 'id'
+                                            (if fullText? (conj fullText id) fullText)]))
+                                       [{} #{}]))]
+      {:t          (:t db)                                  ;; record time of spec generation, can use to determine cache validity
+       :coll       coll
+       :pred       pred
+       :prefix     (iri-util/system-context (<? prefix-flakes-ch))
+       :fullText   fullText
+       :subclasses (delay (calc-subclass pred))             ;; delay because might not be needed
+       })))
 
 (defn setting-map
   [db]
