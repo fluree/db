@@ -1,7 +1,7 @@
 (ns fluree.db.util.json
   (:require #?(:clj [cheshire.core :as cjson])
             #?(:clj [cheshire.parse :as cparse])
-            #?(:clj [cheshire.generate :refer [add-encoder encode-seq]])
+            #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
             #?(:clj [fluree.db.flake])
             #?(:cljs [goog.object :as gobject])
             [fluree.db.util.bytes :as butil]
@@ -14,6 +14,16 @@
 #?(:clj (add-encoder Flake encode-seq))
 
 #?(:clj (add-encoder (Class/forName "[B") encode-seq))
+
+#?(:clj
+   (defn encode-BigDecimal-as-string
+     "Turns on/off json-encoding of a java.math.Bigdecimal as a string"
+     [enable]
+     (if enable
+       (add-encoder java.math.BigDecimal
+                     (fn [n jsonGenerator]
+                       (.writeString jsonGenerator (str n))))
+       (remove-encoder java.math.BigDecimal))))
 
 ;;https://purelyfunctional.tv/mini-guide/json-serialization-api-clojure/
 #?(:cljs
