@@ -1,5 +1,6 @@
 (ns fluree.db.util.json
   (:require #?(:clj [cheshire.core :as cjson])
+            #?(:clj [cheshire.parse :as cparse])
             #?(:clj [cheshire.generate :refer [add-encoder encode-seq]])
             #?(:clj [fluree.db.flake])
             #?(:cljs [goog.object :as gobject])
@@ -45,7 +46,13 @@
                      (instance? InputStream x) (slurp x)
                      :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
                                            {:status 500 :error :db/unexpected-error})))
-               (cjson/decode true))
+               ;; set binding parameter to decode BigDecimals
+               ;; without truncation.  Unfortunately, this causes
+               ;; all floating point and doubles to be designated
+               ;; as BigDecimals.
+               (as-> x'
+                      (binding [cparse/*use-bigdecimals?* true]
+                        (cjson/decode x' true))))
      :cljs (-> (if (string? x)
                  x
                  (butil/UTF8->string x))
