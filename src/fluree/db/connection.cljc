@@ -226,49 +226,46 @@
 
 (defn msg-producer
   "Shuffles outgoing messages to the web socket in order."
-  [conn]
-  (let [state      (:state conn)
-        req-chan   (:req-chan conn)
-        publish-fn (or (:publish conn)
-                       default-publish-fn)]
-    (async/go-loop [i 0]
-      (let [msg (async/<! req-chan)]
-        (when msg
-          (try*
-            (let [_ (log/trace "Outgoing message to websocket: " msg)
-                  [operation data resp-chan opts] msg
-                  {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
-                                               timeout 60000}} opts]
-              (when resp-chan
-                (swap! state assoc-in [:pending-req req-id] resp-chan)
-                (async/go
-                  (let [[resp c] (async/alts! [resp-chan (async/timeout timeout)])]
-                    ;; clear request from state
-                    (swap! state update :pending-req #(dissoc % req-id))
-                    ;; return result
-                    (if (= c resp-chan)
-                      resp
-                      ;; if timeout channel comes back first, respond with timeout error
-                      (ex-info (str "Request " req-id " timed out.")
-                               {:status 408
-                                :error  :db/timeout})))))
-              (let [published? (async/<! (publish-fn conn [operation req-id data]))]
-                (when-not (true? published?)
-                  (cond
-                    (util/exception? published?)
-                    (log/error published? "Error processing message in producer.")
+  [{:keys [state req-chan publish]
+    :or   {publish default-publish-fn}
+    :as   conn}]
+  (async/go-loop [i 0]
+    (when-let [msg (async/<! req-chan)]
+      (try*
+       (let [_ (log/trace "Outgoing message to websocket: " msg)
+             [operation data resp-chan opts] msg
+             {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
+                                          timeout 60000}} opts]
+         (when resp-chan
+           (swap! state assoc-in [:pending-req req-id] resp-chan)
+           (async/go
+             (let [[resp c] (async/alts! [resp-chan (async/timeout timeout)])]
+               ;; clear request from state
+               (swap! state update :pending-req #(dissoc % req-id))
+               ;; return result
+               (if (= c resp-chan)
+                 resp
+                 ;; if timeout channel comes back first, respond with timeout error
+                 (ex-info (str "Request " req-id " timed out.")
+                          {:status 408
+                           :error  :db/timeout})))))
+         (let [published? (async/<! (publish conn [operation req-id data]))]
+           (when-not (true? published?)
+             (cond
+               (util/exception? published?)
+               (log/error published? "Error processing message in producer.")
 
-                    (nil? published?)
-                    (log/error "Error processing message in producer. Socket closed.")
+               (nil? published?)
+               (log/error "Error processing message in producer. Socket closed.")
 
-                    :else
-                    (log/error "Error processing message in producer. Socket closed. Published result" published?)))))
-            (catch* e
-                    (let [[_ _ resp-chan] (when (sequential? msg) msg)]
-                      (if (and resp-chan (channel? resp-chan))
-                        (async/put! resp-chan e)
-                        (log/error e (str "Error processing ledger request, no valid return channel: " (pr-str msg)))))))
-          (recur (inc i)))))))
+               :else
+               (log/error "Error processing message in producer. Socket closed. Published result" published?)))))
+       (catch* e
+               (let [[_ _ resp-chan] (when (sequential? msg) msg)]
+                 (if (and resp-chan (channel? resp-chan))
+                   (async/put! resp-chan e)
+                   (log/error e (str "Error processing ledger request, no valid return channel: " (pr-str msg)))))))
+      (recur (inc i)))))
 
 
 (defn ping-transactor
