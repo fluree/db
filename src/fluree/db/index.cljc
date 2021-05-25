@@ -136,30 +136,43 @@
        (filter-after t)
        (flake/disj-all flakes)))
 
-(defn remove-latest
-  [[floor & other-flakes]]
-  (last (reduce (fn [[latest rest] flake]
-                  (if (pos? (flake/cmp-tx (flake/t latest) (flake/t flake)))
-                    [latest (conj rest flake)]
-                    [flake (conj rest latest)]))
-                [floor #{}]
-                other-flakes)))
+;; (defn remove-latest
+;;   [[floor & other-flakes]]
+;;   (last (reduce (fn [[latest others] flake]
+;;                   (if (pos? (flake/cmp-tx (flake/t latest) (flake/t flake)))
+;;                     [latest (conj others flake)]
+;;                     [flake (conj others latest)]))
+;;                 [floor #{}]
+;;                 other-flakes)))
 
-(defn flakes-before
+;; (defn flakes-before
+;;   [t flakes]
+;;   (->> flakes
+;;        (group-by (fn [f]
+;;                    (juxt flake/s flake/p flake/o)))
+;;        vals
+;;        (mapcat   (fn [flakes]
+;;                    (->> flakes
+;;                         (filter (complement (partial after-t? t)))
+;;                         remove-latest)))))
+
+(defn stale-by
   [t flakes]
   (->> flakes
-       (group-by (fn [f]
-                   (juxt flake/s flake/p flake/o)))
+       (group-by (juxt flake/s flake/p flake/o))
        vals
-       (mapcat #(->> %
-                     (filter (complement (partial after-t? t)))
-                     remove-latest))))
+       (mapcat (fn [flakes]
+                 (let [lf (last flakes)]
+                   (if (flake/op lf)
+                     (butlast flakes)
+                     flakes))))))
 
 (defn t-range
   [from-t to-t flakes]
-  (let [previous     (flakes-before from-t flakes)
+  (let [;;previous     (flakes-before from-t flakes)
+        stale-flakes (stale-by from-t flakes)
         subsequent   (filter-after to-t flakes)
-        out-of-range (concat previous subsequent)]
+        out-of-range (concat stale-flakes #_previous subsequent)]
     (flake/disj-all flakes out-of-range)))
 
 (defn current-flakes
@@ -183,17 +196,15 @@
 
                    ;; no boundary
                    (and (nil? ciel) leftmost?)
-                   novelty)
-        after-t  (filter-after through-t subrange)]
-    (flake/disj-all subrange after-t)))
+                   novelty)]
+    (flakes-through through-t subrange)))
 
 (defn novelty-flakes-before
-  [{:keys [floor ciel leftmost? flakes], node-t :t, :as node} t idx-novelty remove-preds]
-  (let [subrange-through-t (novelty-subrange node t idx-novelty)]
-    (filter (fn [f]
-              (and (true? (flake/op f))
-                   (not (contains? remove-preds (flake/p f)))))
-            subrange-through-t)))
+  [{:keys [flakes] :as node} t idx-novelty remove-preds]
+  (->> idx-novelty
+       (novelty-subrange node t)
+       (filter (fn [f]
+                 (not (contains? remove-preds (flake/p f)))))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
@@ -209,7 +220,10 @@
        (update :flakes flake/conj-all (novelty-flakes-before leaf t idx-novelty remove-preds))
 
        (< leaf-t t)
-       (update :flakes flake/disj-all (filter-after t flakes))
+       (update :flakes flake/disj-all (concat (filter-after t flakes)
+                                              (filter (fn [f]
+                                                        (contains? remove-preds (flake/p f)))
+                                                      flakes)))
 
        :finally
        (assoc :t t)))))
