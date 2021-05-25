@@ -266,17 +266,17 @@
   (-forward-time-travel [db flakes] (forward-time-travel db nil flakes))
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
   (-c-prop [this property collection]
-    ;; collection properties
-    (assert (#{:name :id :sid} property) (str "Invalid collection property: " (pr-str property)))
+    ;; collection properties TODO-deprecate :id property below in favor of :partition
+    (assert (#{:name :id :sid :partition :spec :specDoc} property) (str "Invalid collection property: " (pr-str property)))
     (if (neg-int? collection)
       (get-in schema [:coll "_tx" property])
       (get-in schema [:coll collection property])))
   (-p-prop [this property predicate]
     ;; predicate properties
     (assert (#{:name :id :type :ref? :idx? :unique :multi :index :upsert :component :noHistory :restrictCollection
-               :spec :specDoc :txSpec :txSpecDoc :restrictTag} property) (str "Invalid predicate property: " (pr-str property)))
+               :spec :specDoc :txSpec :txSpecDoc :restrictTag :retractDuplicates} property) (str "Invalid predicate property: " (pr-str property)))
     (cond->> (get-in schema [:pred predicate property])
-             (= :restrictCollection property) (dbproto/-c-prop this :id)))
+             (= :restrictCollection property) (dbproto/-c-prop this :partition)))
   (-tag [this tag-id]
     ;; resolves a tags's value given a tag subject id
     (go-try
@@ -296,7 +296,7 @@
             tag)))))
   (-tag-id [this tag-name]
     (go-try
-      (let [tag-pred-id 30]
+      (let [tag-pred-id const/$_tag:id]
         (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
                 first
                 flake/s))))

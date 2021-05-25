@@ -31,6 +31,12 @@
      ;; session/db returns a promise channel
      (session/db conn ledger nil))))
 
+(defn to-t
+  "Given a db and any time value (block, ISO-8601 time/duration, or t)
+  will return the underlying ledger's t value as of that time value."
+  [db block-or-t-or-time]
+  (time-travel/to-t db block-or-t-or-time))
+
 (defn- add-db-auth-sid
   "Resolves auth subject id from any identity value. Will
   throw an exception if it is unable to resolve to an established identity.
@@ -141,10 +147,14 @@
   ([conn ledger]
    (root-db conn ledger nil))
   ([conn ledger {:keys [roles auth block syncTo syncTimeout] :as opts}]
-   (let [pc (async/promise-chan)]
+   (let [pc (async/promise-chan)
+         opts' #?(:clj nil
+                  :cljs (if (identical? *target* "nodejs")
+                          opts ; need to pass auth/jwt for nodejs in closed-api
+                          nil))]
      (async/go
        (try*
-         (let [dbx (cond-> (<? (session/db conn ledger nil))
+         (let [dbx (cond-> (<? (session/db conn ledger opts'))
                            syncTo (-> (syncTo-db syncTo syncTimeout) <?)
                            block (-> (time-travel/as-of-block block) <?)
                            roles (-> (add-db-permissions auth roles) <?) ;; should only ever have roles -or- auth

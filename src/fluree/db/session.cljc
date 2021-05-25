@@ -78,39 +78,41 @@
   (reset! session-cache (cache-factory)))
 
 (defn- full-load-existing-db
-  [{:keys [conn network dbid blank-db] :as session}]
+  [session]
   (let [pc (async/promise-chan)]
     (async/go
       (try*
-       (let [db-info         (<? (ops/ledger-info-async conn [network dbid]))
-             _               (when (not= :ready (keyword (:status db-info)))
-                               (throw (ex-info (if (empty? db-info)
-                                                 (str "Ledger " network "/" dbid
-                                                      " is not found on this ledger group.")
-                                                 (str "Ledger " network "/" dbid
-                                                      " is not currently available. Status is: "
-                                                      (:status db-info) "."))
-                                               {:status 400
-                                                :error  :db/unavailable})))
-             last-indexed-db (<? (storage/reify-db conn network dbid blank-db (:index db-info)))
-             latest-block    (:block db-info)
-             db              (when last-indexed-db
-                               (loop [db         last-indexed-db
-                                      next-block (-> last-indexed-db :block inc)]
-                                 (if (> next-block latest-block)
-                                   db
-                                   (let [block-data (<? (storage/read-block conn network dbid next-block))]
-                                     (if block-data
-                                       (let [{:keys [flakes block t]} block-data
-                                             db* (<? (dbproto/-with db block flakes))]
-                                         (recur db* (inc next-block)))
-                                       (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
-                                                       {:status 500 :error :db/unexpected-error})))))))
-             db*             (assoc db :schema (<? (schema/schema-map db)))
-             db**            (assoc db* :settings (<? (schema/setting-map db*)))]
-         (async/put! pc db**))
-       (catch* e
-               (async/put! pc e))))
+        (let [blank-db        (:blank-db session)
+              {:keys [conn network dbid]} session
+              db-info         (<? (ops/ledger-info-async conn [network dbid]))
+              _               (when (not= :ready (keyword (:status db-info)))
+                                (throw (ex-info (if (empty? db-info)
+                                                  (str "Ledger " network "/" dbid
+                                                       " is not found on this ledger group.")
+                                                  (str "Ledger " network "/" dbid
+                                                       " is not currently available. Status is: "
+                                                       (:status db-info) "."))
+                                                {:status 400
+                                                 :error  :db/unavailable})))
+              last-indexed-db (<? (storage/reify-db conn network dbid blank-db (:index db-info)))
+              latest-block    (:block db-info)
+              db              (when last-indexed-db
+                                (loop [db         last-indexed-db
+                                       next-block (-> last-indexed-db :block inc)]
+                                  (if (> next-block latest-block)
+                                    db
+                                    (let [block-data (<? (storage/read-block conn network dbid next-block))]
+                                      (if block-data
+                                        (let [{:keys [flakes block t]} block-data
+                                              db* (<? (dbproto/-with db block flakes))]
+                                          (recur db* (inc next-block)))
+                                        (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
+                                                        {:status 500 :error :db/unexpected-error})))))))
+              db*             (assoc db :schema (<? (schema/schema-map db)))
+              db**            (assoc db* :settings (<? (schema/setting-map db*)))]
+          (async/put! pc db**))
+        (catch* e
+                (async/put! pc e))))
     pc))
 
 (defn cas-db!
@@ -166,6 +168,21 @@
   [session block]
   (swap! (:state session) assoc :db/indexing nil :db/indexed block))
 
+
+(def alias->id-cache (atom #?(:clj  (cache/fifo-cache-factory {:threshold 100})
+                              :cljs (cache/lru-cache-factory {:threshold 100}))))
+
+(defn ledger-alias->id
+  "Returns ledger id from alias."
+  [network alias]
+  (or (get-in @alias->id-cache [network alias])
+      (let [
+            ;; TODO - temporarily turned off alias
+            dbid alias]
+        (swap! alias->id-cache assoc-in [network alias] dbid)
+        dbid)))
+
+
 (defn resolve-ledger
   "Resolves a ledger identity in the form of 'network/alias' and returns a
   two-tuple of [network ledger-id].
@@ -180,18 +197,18 @@
   - testnet/testledger - Look for ledger with an alias testledger on network testnet.
   - testnet/$testledger - look for a ledger with id testledger on network testnet (skip alias lookup).
   - [testnet testledger] - already in form of [network ledger-id]"
-  [_conn ledger]
+  [conn ledger]
   (if (sequential? ledger)
     ledger
     (let [ledger      (keyword ledger)
           network     (namespace ledger)
-          maybe-alias (name ledger)]
-      (if (and network maybe-alias)
-        (if (str/starts-with? maybe-alias "$")
-          [network (subs maybe-alias 1)]
-          [network maybe-alias])
-        (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
-                        {:status 400, :error :db/invalid-db}))))))
+          maybe-alias (name ledger)
+
+          _           (when-not (and network maybe-alias) (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
+                                                                          {:status 400 :error :db/invalid-db})))]
+      (if (str/starts-with? maybe-alias "$")
+        [network (subs maybe-alias 1)]
+        [network (ledger-alias->id network maybe-alias) maybe-alias]))))
 
 
 ;; note all process-ledger-update operations must return a go-channel
@@ -395,7 +412,6 @@
       (assoc session* :new? true)
       session*)))
 
-
 ;; TO-DO check for expired jwt when specified
 (defn session
   "Returns connection to the given ledger, and ensures it is cached.
@@ -474,14 +490,13 @@
   "Gets the latest db from the central DB atom if available, or loads it from scratch.
   DB is returned as a core async promise channel."
   [session]
-  (swap! (:state session) #(-> %
-                               (assoc :req/last (util/current-time-millis))
-                               (update :req/count inc)))
+  (swap! (:state session) #(assoc % :req/last (util/current-time-millis)
+                                    :req/count (inc (:req/count %))))
   (let [db (:db/db @(:state session))]
     (if (nil? db)
       (do
         (swap! (:schema-cache session) empty)               ;; always clear schema cache on new load
-        (swap! (:state session) assoc :db/db (full-load-existing-db session))
+        (swap! (:state session) #(assoc % :db/db (full-load-existing-db session)))
         (:db/db @(:state session)))
       db)))
 

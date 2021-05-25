@@ -26,6 +26,7 @@
           sid     (.-s flake)
           ctx     {:sid     sid
                    :auth_id (or (:auth db) (:auth permissions))
+                   :instant (util/current-time-millis)
                    :db      root-db
                    :state   (atom {:stack   []
                                    :credits 10000000
@@ -46,9 +47,15 @@
                                      (:fnstr (meta f)) ": " #?(:clj (.getMessage e) :cljs (str e)))
                                 {:status 400
                                  :error  :db/db-function-error})))]
-            (if res
-              true
-              (recur r)))
+            (cond
+              (util/exception? res)
+              res
+
+              (not res)                                     ;; not yet a true response, try next
+              (recur r)
+
+              :else                                         ;; first true response will allow
+              true))
           false)))))
 
 
