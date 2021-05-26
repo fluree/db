@@ -14,30 +14,16 @@
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
      :clj (:import (fluree.db.flake Flake))))
 
+(defprotocol Storage
+  (exists? [s key] "Returns true when `key` exists in `s`")
+  (read [s key] "Reads raw bytes from `s` associated with `key`")
+  (write [s key data] "Writes `data` as raw bytes to `s` and associates it with `key`"))
+
 #?(:clj
    (defn block-storage-path
      "For a ledger server, will return the relative storage path it is using for blocks for a given ledger."
      [network dbid]
      (io/file network dbid "block")))
-
-(defn storage-exists?
-  "Returns truthy if the provided key exists in storage."
-  [conn key]
-  (let [storage-exists-fn (:storage-exists conn)]
-    (storage-exists-fn key)))
-
-(defn storage-read
-  "Reads raw bytes from storage based on provided key.
-  Returns core async channel with eventual response"
-  [conn key]
-  (let [storage-read-fn (:storage-read conn)]
-    (storage-read-fn key)))
-
-(defn storage-write
-  "Writes raw bytes to storage based with provided key."
-  [conn key val]
-  (let [storage-write-fn (:storage-write conn)]
-    (storage-write-fn key val)))
 
 (defn serde
   "Returns serializer from connection."
@@ -69,7 +55,7 @@
   [conn network ledger-id block]
   (go-try
     (let [key  (ledger-block-key network ledger-id block)
-          data (<? (storage-read conn key))]
+          data (<? (read conn key))]
       (when data
         (serdeproto/-deserialize-block (serde conn) data)))))
 
@@ -78,7 +64,7 @@
   [conn network ledger-id block version]
   (go-try
     (let [key  (str (ledger-block-key network ledger-id block) "--v" version)
-          data (<? (storage-read conn key))]
+          data (<? (read conn key))]
       (when data
         (serdeproto/-deserialize-block (serde conn) data)))))
 
@@ -97,7 +83,7 @@
     (let [persisted-data (select-keys block-data [:block :t :flakes])
           key            (str (ledger-block-key network dbid (:block persisted-data)) "--v" version)
           ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
-      (<? (storage-write conn key ser)))))
+      (<? (write conn key ser)))))
 
 (defn write-block
   "Block data should look like:
@@ -114,7 +100,7 @@
     (let [persisted-data (select-keys block-data [:block :t :flakes])
           key            (ledger-block-key network dbid (:block persisted-data))
           ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
-      (<? (storage-write conn key ser)))))
+      (<? (write conn key ser)))))
 
 (defn child-data
   "Given a child, unresolved node, extracts just the data that will go into
@@ -131,7 +117,7 @@
          leaf-id (ledger-node-key network dbid idx-type id-base "l")
          data    {:flakes flakes}
          ser     (serdeproto/-serialize-leaf (serde conn) data)]
-     (<? (storage-write conn leaf-id ser))
+     (<? (write conn leaf-id ser))
      (assoc leaf :id leaf-id))))
 
 (defn write-branch-data
@@ -139,7 +125,7 @@
   [conn key data]
   (go-try
    (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-     (<? (storage-write conn key ser))
+     (<? (write conn key ser))
      key)))
 
 (defn write-branch
@@ -170,7 +156,7 @@
                        :block   block
                        :garbage garbage}
           ser         (serdeproto/-serialize-garbage (serde conn) data)]
-      (<? (storage-write conn garbage-key ser))
+      (<? (write conn garbage-key ser))
       garbage-key)))
 
 (defn write-db-root
@@ -198,20 +184,20 @@
                        :fork      fork
                        :forkBlock fork-block}
           ser         (serdeproto/-serialize-db-root (serde conn) data)]
-      (<? (storage-write conn db-root-key ser))
+      (<? (write conn db-root-key ser))
       db-root-key))))
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
-   (let [data  (<? (storage-read conn key))]
+   (let [data  (<? (read conn key))]
      (when data
        (serdeproto/-deserialize-branch serializer data)))))
 
 (defn read-leaf
   [{:keys [serializer] :as conn} key]
   (go-try
-   (let [data (<? (storage-read conn key))]
+   (let [data (<? (read conn key))]
      (when data
        (serdeproto/-deserialize-leaf serializer data)))))
 
@@ -252,7 +238,7 @@
   [conn network dbid block]
   (go-try
     (let [key  (ledger-garbage-key network dbid block)
-          data (storage-read conn key)]
+          data (read conn key)]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) (<? data))))))
 
@@ -262,7 +248,7 @@
   [conn network dbid block]
   (go-try
     (let [key  (ledger-root-key network dbid block)
-          data (storage-read conn key)]
+          data (read conn key)]
       (when data
         (serdeproto/-deserialize-db-root (serde conn) (<? data))))))
 

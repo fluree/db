@@ -103,30 +103,34 @@
 
 ;; all ledger messages are fire and forget
 
-;; we do need to establish an upstream connection from a ledger to us, so we can propogate
-;; blocks, flushes, etc.
+;; we do need to establish an upstream connection from a ledger to us, so we can
+;; propogate blocks, flushes, etc.
 
-(defrecord Connection [id servers state req-chan sub-chan pub-chan
-                       storage-read storage-write object-cache parallelism
-                       serializer default-network
-                       transactor? publish transact-handler
-                       tx-private-key tx-key-id
-                       meta
-                       add-listener remove-listener
-                       close]
+(defrecord Connection [id servers state req-chan sub-chan pub-chan storage-read
+                       storage-write storage-exists object-cache parallelism
+                       serializer default-network transactor? publish
+                       transact-handler tx-private-key tx-key-id meta
+                       add-listener remove-listener close]
+
+  storage/Storage
+  (exists? [_ key]
+    (storage-exists key))
+  (read [conn key]
+    (storage-read key))
+  (write [conn key data]
+    (storage-write key data))
 
   dbproto/IndexResolver
   (resolve
     [conn {:keys [id leaf tempid] :as node}]
     (if (= :empty id)
       (storage/resolve-empty-leaf node)
-      (let [object-cache (:object-cache conn)]
-        (object-cache
-         [id tempid]
-         (fn [_]
-           (storage/resolve-index-node conn node
-                                       (fn []
-                                         (object-cache [id tempid] nil)))))))))
+      (object-cache
+       [id tempid]
+       (fn [_]
+         (storage/resolve-index-node conn node
+                                     (fn []
+                                       (object-cache [id tempid] nil))))))))
 
 
 (defn- normalize-servers
