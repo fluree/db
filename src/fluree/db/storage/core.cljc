@@ -1,4 +1,5 @@
 (ns fluree.db.storage.core
+  (:refer-clojure :exclude [read])
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [clojure.data.avl :as avl]
@@ -17,7 +18,8 @@
 (defprotocol Storage
   (exists? [s key] "Returns true when `key` exists in `s`")
   (read [s key] "Reads raw bytes from `s` associated with `key`")
-  (write [s key data] "Writes `data` as raw bytes to `s` and associates it with `key`"))
+  (write [s key data] "Writes `data` as raw bytes to `s` and associates it with `key`")
+  (rename [s old-key new-key] "Remove `old-key` and associates it's data to `new-key`"))
 
 #?(:clj
    (defn block-storage-path

@@ -107,18 +107,20 @@
 ;; propogate blocks, flushes, etc.
 
 (defrecord Connection [id servers state req-chan sub-chan pub-chan storage-read
-                       storage-write storage-exists object-cache parallelism
-                       serializer default-network transactor? publish
-                       transact-handler tx-private-key tx-key-id meta
+                       storage-write storage-exists storage-rename object-cache
+                       parallelism serializer default-network transactor?
+                       publish transact-handler tx-private-key tx-key-id meta
                        add-listener remove-listener close]
 
   storage/Storage
   (exists? [_ key]
     (storage-exists key))
-  (read [conn key]
+  (read [_ key]
     (storage-read key))
-  (write [conn key data]
+  (write [_ key data]
     (storage-write key data))
+  (rename [_ old-key new-key]
+    (storage-rename old-key new-key))
 
   dbproto/IndexResolver
   (resolve
