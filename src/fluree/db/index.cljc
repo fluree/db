@@ -136,26 +136,6 @@
        (filter-after t)
        (flake/disj-all flakes)))
 
-;; (defn remove-latest
-;;   [[floor & other-flakes]]
-;;   (last (reduce (fn [[latest others] flake]
-;;                   (if (pos? (flake/cmp-tx (flake/t latest) (flake/t flake)))
-;;                     [latest (conj others flake)]
-;;                     [flake (conj others latest)]))
-;;                 [floor #{}]
-;;                 other-flakes)))
-
-;; (defn flakes-before
-;;   [t flakes]
-;;   (->> flakes
-;;        (group-by (fn [f]
-;;                    (juxt flake/s flake/p flake/o)))
-;;        vals
-;;        (mapcat   (fn [flakes]
-;;                    (->> flakes
-;;                         (filter (complement (partial after-t? t)))
-;;                         remove-latest)))))
-
 (defn stale-by
   [t flakes]
   (->> flakes
@@ -169,8 +149,7 @@
 
 (defn t-range
   [from-t to-t flakes]
-  (let [;;previous     (flakes-before from-t flakes)
-        stale-flakes (stale-by from-t flakes)
+  (let [stale-flakes (stale-by from-t flakes)
         subsequent   (filter-after to-t flakes)
         out-of-range (concat stale-flakes #_previous subsequent)]
     (flake/disj-all flakes out-of-range)))
