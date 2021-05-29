@@ -309,13 +309,12 @@
                                     :nonce         nonce
                                     :expire        expire}]
           (if private-key
-            (let [cmd          (-> cmd-data
-                                   (util/without-nils)
-                                   (json/stringify))
-                  sig          (crypto/sign-message cmd private-key)
-                  persisted-id (submit-command-async conn {:cmd cmd
-                                                           :sig sig})]
-              persisted-id) (ops/unsigned-command-async conn cmd-data)))
+            (let [cmd (-> cmd-data
+                          (util/without-nils)
+                          (json/stringify))
+                  sig (crypto/sign-message cmd private-key)]
+              (submit-command-async conn {:cmd cmd, :sig sig}))
+            (ops/unsigned-command-async conn cmd-data)))
         (catch Exception e e))))
 
 

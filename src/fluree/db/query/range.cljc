@@ -258,7 +258,7 @@
   flakes from the first `offset` subjects encountered, including a maximum of
   `flake-limit` flakes from a maximum of `subject-limit` subjects."
   [flake-stream {:keys [subject-limit flake-limit offset]}]
-  (let [offset-subject-xf (comp (partition-by (fn [^Flake f]
+  (let [offset-subject-xf (comp (partition-by (fn [f]
                                                 (flake/s f)))
                                 (drop offset))
         subject-ch        (chan 1 offset-subject-xf)
