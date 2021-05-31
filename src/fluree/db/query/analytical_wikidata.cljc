@@ -152,7 +152,7 @@
                               (map #(:value (% res)) headers-as-kws)) results)]
     {:headers headers
      :vars    {}
-     :tuples  tuples}))
+     :tuples  (into #{} tuples)}))
 
 
 (defn get-wikidata-tuples
