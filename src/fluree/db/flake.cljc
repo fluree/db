@@ -280,8 +280,8 @@
 
 (defn cc-cmp-class [x]
   (if (string? x)
-    :string
-    :number))
+    "string"
+    "number"))
 
 ;; if possibly doing cross-type value comparison, use this instead
 (defn cmp-val-xtype [o1 o2]
