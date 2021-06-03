@@ -21,18 +21,23 @@
   (-> default-comparators keys set))
 
 (defn node?
+  "Returns `true` if `x` is an index node map"
   [x]
   (not (-> x :leaf nil?)))
 
 (defn leaf?
+  "Returns `true` if `node` is a leaf node"
   [node]
   (-> node :leaf true?))
 
 (defn branch?
+  "Returns `true` if `node` is a branch node"
   [node]
   (-> node :leaf false?))
 
 (defn resolved?
+  "Returns `true` if the data associated with the index node map `node` is fully
+  resolved from storage"
   [node]
   (cond
     (leaf? node)   (not (nil? (:flakes node)))
@@ -82,6 +87,8 @@
                ::branch branch}))))
 
 (defn empty-leaf
+  "Returns a blank leaf node for the provided `network`, `dbid`, and index
+  comparator `cmp`."
   [network dbid cmp]
   {:comparator cmp
    :network network
@@ -100,13 +107,18 @@
   [floor node])
 
 (defn child-map
+  "Returns avl sorted map whose keys are the floor flakes of the index node
+  sequence `child-nodes`, and whose values are the corresponding nodes from
+  `child-nodes`."
   [cmp & child-nodes]
   (->> child-nodes
        (mapcat child-entry)
        (apply avl/sorted-map-by cmp)))
 
 (defn empty-branch
-  [conn network dbid cmp]
+  "Returns a blank branch node which contains a single empty leaf node for the
+  provided `network`, `dbid`, and index comparator `cmp`."
+  [network dbid cmp]
   (let [child-node (empty-leaf network dbid cmp)
         children   (child-map cmp child-node)]
     {:comparator cmp
@@ -123,31 +135,44 @@
      :leftmost? true}))
 
 (defn after-t?
+  "Returns `true` if `flake` has a transaction value after the provided `t`"
   [t flake]
   (-> flake flake/t (< t)))
 
 (defn filter-after
+  "Returns a sequence containing only flakes from the flake set `flakes` with
+  transaction values after the provided `t`."
   [t flakes]
   (filter (partial after-t? t) flakes))
 
 (defn flakes-through
+  "Returns an avl-subset of the avl-set `flakes` with transaction values on or
+  before the provided `t`."
   [t flakes]
   (->> flakes
        (filter-after t)
        (flake/disj-all flakes)))
 
 (defn stale-by
+  "Returns a sequence of flakes from the sorted set `flakes` that are out of date
+  by the transaction `t` because `flakes` contains another flake with the same
+  subject and predicate and a transaction value later than that flake but on or
+  before `t`."
   [t flakes]
   (->> flakes
+       (flakes-through t)
        (group-by (juxt flake/s flake/p flake/o))
        vals
        (mapcat (fn [flakes]
-                 (let [lf (last flakes)]
-                   (if (flake/op lf)
-                     (butlast flakes)
-                     flakes))))))
+                 (let [sorted-flakes (sort-by flake/t flakes)
+                       last-flake    (first sorted-flakes)]
+                   (if (flake/op last-flake)
+                     (rest sorted-flakes)
+                     sorted-flakes))))))
 
 (defn t-range
+  "Returns a sorted set of flakes that are not out of date between the
+  transactions `from-t` and `to-t`."
   [from-t to-t flakes]
   (let [stale-flakes (stale-by from-t flakes)
         subsequent   (filter-after to-t flakes)

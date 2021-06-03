@@ -360,11 +360,11 @@
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot (index/empty-branch conn network dbid spot-cmp)
-        psot (index/empty-branch conn network dbid psot-cmp)
-        post (index/empty-branch conn network dbid post-cmp)
-        opst (index/empty-branch conn network dbid opst-cmp)
-        tspo (index/empty-branch conn network dbid tspo-cmp)
+        spot (index/empty-branch network dbid spot-cmp)
+        psot (index/empty-branch network dbid psot-cmp)
+        post (index/empty-branch network dbid post-cmp)
+        opst (index/empty-branch network dbid opst-cmp)
+        tspo (index/empty-branch network dbid tspo-cmp)
 
         stats       {:flakes 0, :size 0, :indexed 0}
         fork        nil
