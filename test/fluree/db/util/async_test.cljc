@@ -3,9 +3,10 @@
     #?@(:clj  [[clojure.test :refer :all]
                [clojure.core.async :refer [chan <! >! go]]]
         :cljs [[cljs.test :refer-macros [deftest is testing]]
-               [cljs.core.async :refer [chan go put! >!]]])
+               [cljs.core.async :refer [chan go put! >! <!]]])
     [test-helpers :refer [test-async]]
-    [fluree.db.util.async :as async]))
+    [fluree.db.util.async :as async])
+  #?(:clj  (:import (clojure.lang ExceptionInfo))))
 
 
 (deftest db-util-async-test
@@ -18,7 +19,7 @@
       (let [msg (ex-info "To access the server, either open-api must be true or a valid auth must be available."
                         {:status 401
                          :error  :db/invalid-request})]
-        (is (thrown?  #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) (async/throw-if-exception msg))))))
+        (is (thrown? #?(:clj ExceptionInfo :cljs js/Error) (async/throw-if-exception msg))))))
 
   (testing "merge-into?"
     (testing "multiple channels into a vector"

@@ -1,11 +1,9 @@
 (ns fluree.db.util.bytes-test
   (:require
-    #?@(:clj  [[clojure.test :refer :all]
-               [clojure.core.async :refer [chan <! >! go]]]
-        :cljs [[cljs.test :refer-macros [deftest is testing]]
-               [cljs.core.async :refer [chan go put! >!]]])
-    [test-helpers :refer [test-async]]
-    [fluree.db.util.bytes :as bytes]))
+    #?(:clj  [clojure.test :refer :all]
+        :cljs [cljs.test :refer-macros [deftest is testing]])
+    [fluree.db.util.bytes :as bytes])
+  #?(:clj (:import (java.io Reader))))
 
 
 (deftest db-util-bytes-test
@@ -16,7 +14,7 @@
 
   (testing "to-reader"
     #?(:clj
-       (is (instance? java.io.Reader (bytes/to-reader "Fluree rocks!")))
+       (is (instance? Reader (bytes/to-reader "Fluree rocks!")))
 
        :cljs
        (is (thrown? js/Error (bytes/to-reader "Not available in ClojureScript"))))))

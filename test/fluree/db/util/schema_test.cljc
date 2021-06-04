@@ -1,8 +1,7 @@
 (ns fluree.db.util.schema-test
   (:require
-    #?@(:clj  [[clojure.test :refer :all]]
-        :cljs [[cljs.test :refer-macros [deftest is testing]]
-               [goog.date]])
+    #?(:clj  [clojure.test :refer :all]
+        :cljs [cljs.test :refer-macros [deftest is testing]])
     [fluree.db.constants :as const]
     [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
     [fluree.db.util.schema :as s])
