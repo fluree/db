@@ -54,8 +54,8 @@
   (reduce-kv (fn [acc idx key]
                (let [key-as-var   (variable? key)
                      static-value (get interm-vars key-as-var)]
-                 (when (and (= idx 1) (not key-as-var)
-                            (not (try (dbproto/-p-prop db :name (re-find #"[_a-zA-Z0-9/]*" key)))))
+                 (when (and (= idx 1) (not key-as-var) (not= "_id" key)
+                            (not (dbproto/-p-prop db :name (re-find #"[_a-zA-Z0-9/]*" key))))
                    (throw (ex-info (str "Invalid predicate provided: " key)
                                    {:status 400
                                     :error  :db/invalid-query})))
@@ -328,7 +328,8 @@
                                                            v)]
                                            (if single-v?
                                              [acc (assoc clause' idx-of (first v))]
-                                             [(assoc acc k v) clause']))) [{} search] common-keys)
+                                             [(assoc acc k v) clause'])))
+                                       [{} search] common-keys)
                 ;; Currently, only pass in object-fn to search opts. Seems to be faster to filter
                 ;; subject after. I'm sure this depends on a number of variables
                 ;; TODO - determine what, when, and how to filter - in index range? after index-range?
@@ -769,7 +770,8 @@
                                                             headers)))
                          (calculate-aggregate res)
                          second)
-                    v)] {k var-value}))
+                    v)]
+    {k var-value}))
 
 (declare clause->tuples)
 
