@@ -107,7 +107,7 @@
                         pred-spec
                         (assoc pred-spec :componentFollow? componentFollow?))
            ;; TODO - I think we can eliminate the check below for fallbacks and ensure we always have an 'as' in every spec
-           k          (or (:as pred-spec') (:name pred-spec') (:p pred-spec')) ;; use :as, then full pred name, then just p-id as backup
+           k          (or (:as pred-spec') (:name pred-spec') (:iri pred-spec') (:p pred-spec')) ;; use :as, then full pred name, then just p-id as backup
            {:keys [multi? ref? limit orderBy offset p]} pred-spec'
            [k-val offset-map] (cond
                                 (and multi?

@@ -256,7 +256,9 @@
      :name       name
      :as         (if (and compact? name)
                    (second (re-find #"/(.+)" name))
-                   (or name (str p)))
+                   (or name
+                       (dbproto/-p-prop db :iri p)
+                       (str p)))
      :multi?     (dbproto/-p-prop db :multi p)
      :component? (dbproto/-p-prop db :component p)
      :tag?       (= :tag (dbproto/-p-prop db :type p))
