@@ -36,7 +36,7 @@
 
 (def ^:const context-dir "contexts/")
 
-(defn- load-external
+(defn load-external
   "Loads external JSON-LD context if it is registered with Fluree, else returns nil.
   If throw? is true, will throw with exception if context is not available."
   ([context-iri] (load-external context-iri false))
@@ -125,11 +125,13 @@
 
   If the iri is not compacted, returns original iri string."
   [compact-iri context]
-  (if-let [[prefix rest] (parse-prefix compact-iri)]
-    (if-let [p-iri (get-in context [prefix :id])]
-      (str p-iri rest)
-      compact-iri)
-    compact-iri))
+  (let [[prefix rest] (parse-prefix compact-iri)
+        expanded (when prefix
+                   (when-let [p-iri (get-in context [prefix :id])]
+                     (str p-iri rest)))]
+    (or expanded                                            ;; use expanded if avail
+        (get-in context [compact-iri :id])                  ;; try to see if entire name is in context
+        compact-iri)))                                      ;; no matches, return original name
 
 
 (defn expand-db
