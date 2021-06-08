@@ -10,8 +10,7 @@
                [cljs.core.async :refer [<! >! go]]
                [cljs.js :as cjs]
                [goog.net.XhrIo :as xhr]
-               [goog.object :as gobject]
-               [xhr-mocklet :as xhr-mock]]))
+               [goog.object :as gobject]]))
   #?(:clj  (:import (aleph.utils RequestTimeoutException)
                     (clojure.lang ExceptionInfo))
      :cljs (:import [goog.net.ErrorCode])))
@@ -22,11 +21,13 @@
 
 #?(:cljs (set! *stub-server* {:uri "http://localhost"}))
 
+;==========================
 ; xhr stub for cljs - start
 #?(:cljs
    ; create instance of xhrio
    (def xhr (goog.net.XhrIo.)))
-
+; xhr stub for cljs - end
+;==========================
 
 ;==========================
 ; http stub for clj - start
