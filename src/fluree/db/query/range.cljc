@@ -418,7 +418,11 @@
                                   (let [obj-fn (if-let [obj-fn (:object-fn opts)]
                                                  (fn [x] (and (obj-fn x) (= x o)))
                                                  (fn [x] (= x o)))]
-                                    (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn))))
+                                    ;; check for special case where search specifies _id and an integer, i.e. [nil _id 12345]
+                                    (if (and (= "_id" p) (int? o))
+                                      ;; TODO - below should not need a `take 1` - `:limit 1` does not work properly - likely fixed in tsop branch, remove take 1 once :limit works
+                                      (take 1 (<? (index-range db :spot = [o] (assoc opts :limit 1))))
+                                      (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn)))))
 
                                   p
                                   (<? (index-range db :psot = [p s o t] opts))
