@@ -3,7 +3,8 @@
     [fluree.db.util.xhttp :as fx]
     [fluree.db.util.json :as fj]
     [test-helpers :refer [test-async]]
-    #?@(:clj  [[clojure.test :refer :all]
+    #?@(:clj  [[byte-streams :as bs]
+               [clojure.test :refer :all]
                [clojure.core.async :refer [<! >! go]]
                [stub-http.core :refer :all]]
         :cljs [[cljs.test :refer-macros [deftest is testing use-fixtures]]
@@ -14,6 +15,11 @@
   #?(:clj  (:import (aleph.utils RequestTimeoutException)
                     (clojure.lang ExceptionInfo))
      :cljs (:import [goog.net.ErrorCode])))
+
+(def ledger-auth {:private "a603e772faec02056d4ec3318187487d62ec46647c0cba7320c7f2a79bed2615"
+                  :auth    "TfCFawNeET5FFHAfES61vMf9aGc1vmehjT2"
+                  :sid     105553116266496
+                  :token   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"})
 
 ;TODO - pull http/xhr mocks into separate class
 (def healthcheck-uri "http://localhost/fdb/health")
@@ -32,8 +38,17 @@
 ;==========================
 ; http stub for clj - start
 #?(:clj (defn start-and-stop-stub-server [f]
-          (binding [*stub-server* (start! {{:method "post" :path "/something" }
-                                           {:status 200 :content-type "application/json" :body (fj/stringify {:hello "world"})}})]
+          (binding [*stub-server* (start! {{:method "get" :path "/get-check"}
+                                           {:status 200 :content-type "text/plain" :body (fj/stringify {:hello "mars"})}
+
+                                           {:method "get" :path "/get-check-wikidata"}
+                                           {:status 200
+                                            :content-type "application/octet-stream"
+                                            :headers ["Content-Type" "application/octet-stream"]
+                                            :body (-> {:hello "mars"} fj/stringify bs/to-byte-array)}
+
+                                           {:method "post" :path "/something"}
+                                           {:status 200 :content-type "text/plain" :body (fj/stringify {:hello "world"})}})]
             (try
               (f)
               (finally
@@ -43,31 +58,9 @@
 ; http stub for clj - end
 ;==========================
 
-
-(deftest http-post
-  (testing "http-post - valid request"
-    (test-async
-      (go
-        (when-let [res #?(:cljs nil                         ;skip test for now
-                          :clj  (-> (str (:uri *stub-server*) "/something")
-                                    (fx/post-json "message" {})
-                                    <!))]
-          (is (map? res))
-          (is (= "world" (:hello res)))))))
-  (testing "http-post - invalid request"
-    (test-async
-      (go
-        (when-let [res #?(:cljs nil
-                          :clj  (-> (str (:uri *stub-server*) "/nothing")
-                                    (fx/post-json "message" {})
-                                    <!))]
-          (is (instance? ExceptionInfo res))
-          (is (-> res
-                  ex-data
-                  :error
-                  (= :xhttp/unknown-error))))))))
-
-
+; TODO - outstanding tests
+;get output-format :wikidata - need to research passing binary content for response
+;websocket unit tests
 (deftest db-util-xhttp-test
   (testing "format-error-response"
     (testing "timeout"
@@ -130,6 +123,89 @@
                 :error
                 (= :xhttp/abort))))))
 
+  (testing "http-post - valid request"
+    (test-async
+      (go
+        (when-let [res #?(:cljs nil                         ;skip test for now
+                          :clj  (-> (str (:uri *stub-server*) "/something")
+                                    (fx/post-json "message" {})
+                                    <!))]
+          (is (map? res))
+          (is (= "world" (:hello res)))))))
+  (testing "http-post - invalid request"
+    (test-async
+      (go
+        (when-let [res #?(:cljs nil
+                          :clj  (-> (str (:uri *stub-server*) "/nothing")
+                                    (fx/post-json "message" {})
+                                    <!))]
+          (is (instance? ExceptionInfo res))
+          (is (-> res
+                  ex-data
+                  :error
+                  (= :xhttp/unknown-error)))))))
 
+  (testing "get - output-format :binary"
+    (test-async
+      (go
+        (when-let [res #?(:cljs nil
+                          :clj  (->> {:headers {"Accept" "application/json"}
+                                      :body     "message"
+                                      :request-timeout 100
+                                      :output-format :binary}
+                                     (fx/get (str (:uri *stub-server*) "/get-check"))
+                                     <!
+                                     ))]
+          (is (bytes? res))
+          (is (= "mars" (-> res fj/parse :hello)))))))
+  (testing "get - output-format :text"
+    (test-async
+      (go
+        (when-let [res #?(:cljs nil
+                          :clj  (->> {:headers {"Accept" "application/json"}
+                                      :body     "message"
+                                      :request-timeout 100
+                                      :output-format :text}
+                                     (fx/get (str (:uri *stub-server*) "/get-check"))
+                                     <!))]
+          (is (string? res))
+          (is (= "mars" (-> res fj/parse :hello)))))))
+  (testing "get - output-format :json"
+    (test-async
+      (go
+        (when-let [res #?(:cljs nil
+                          :clj  (->> {:headers {"Accept" "application/json"}
+                                      :body     "message"
+                                      :token (:token ledger-auth)
+                                      :request-timeout 100
+                                      :output-format :json}
+                                     (fx/get (str (:uri *stub-server*) "/get-check"))
+                                     <!))]
+          (is (map? res))
+          (is (= "mars" (:hello res)))))))
+  (testing "get - error"
+    (test-async
+      (go
+        (when-let [res #?(:cljs nil
+                          :clj  (->> {:headers {"Accept" "application/json"}
+                                      :body     "message"
+                                      :request-timeout 100
+                                      :output-format :json}
+                                     (fx/get (str (:uri *stub-server*) "/nothing"))
+                                     <!))]
+          (is (instance? ExceptionInfo res))
+          (is (-> res
+                  ex-data
+                  :error
+                  (= :xhttp/unknown-error)))))))
 
-  )
+  (testing "get-json - valid request"
+    (test-async
+      (go
+        (when-let [res #?(:cljs nil
+                          :clj  (->> {:headers {"Cache-Control" "no-cache"}
+                                      :body     "message"}
+                                     (fx/get-json (str (:uri *stub-server*) "/get-check"))
+                                     <!))]
+          (is (map? res))
+          (is (= "mars" (:hello res))))))))
