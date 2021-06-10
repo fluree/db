@@ -439,14 +439,13 @@
                  nonce   (System/currentTimeMillis)}} opts]
      (if private-key
        ;; private key, so generate command locally and submit signed command
-       (go-try
-         (let [command      (tx->command ledger txn private-key opts)
-               txid         (:id command)
-               persist-resp (<? (submit-command-async conn command))
-               result       (if txid-only
-                              persist-resp
-                              (monitor-tx-async conn ledger txid timeout))]
-           result))
+       (let [command      (tx->command ledger txn private-key opts)
+             txid         (:id command)
+             persist-resp (submit-command-async conn command)
+             result       (if txid-only
+                            persist-resp
+                            (monitor-tx-async conn ledger txid timeout))]
+         result)
        ;; no private key provided, request ledger to sign request
        (let [tx-map (util/without-nils
                       {:db     ledger
