@@ -1,6 +1,6 @@
 {:deps  {org.clojure/clojure               {:mvn/version "1.10.3"}
-         org.clojure/clojurescript         {:mvn/version "1.10.844"}
-         org.clojure/core.async            {:mvn/version "1.3.610"}
+         org.clojure/clojurescript         {:mvn/version "1.10.866"}
+         org.clojure/core.async            {:mvn/version "1.3.618"}
          org.clojure/core.cache            {:mvn/version "1.0.207"}
          org.clojars.mmb90/cljs-cache      {:mvn/version "0.1.4"}
          org.clojure/data.avl              {:mvn/version "0.1.0"}
@@ -17,8 +17,8 @@
          org.slf4j/slf4j-api               {:mvn/version "1.7.30"}
 
          ;; storage
-         cc.qbits/alia                     {:mvn/version "4.3.6"}
-         cc.qbits/alia-async               {:mvn/version "4.3.6"}
+         cc.qbits/alia                     {:mvn/version "5.0.0"}
+         cc.qbits/alia-async               {:mvn/version "5.0.0"}
          cc.qbits/hayt                     {:mvn/version "4.1.0"}
 
          ;; Lucene
@@ -37,7 +37,7 @@
          com.fluree/alphabase              {:mvn/version "3.2.1"}
 
          com.fluree/crypto                 {:mvn/version "0.3.5"}
-         org.bouncycastle/bcprov-jdk15on   {:mvn/version "1.68"}}
+         org.bouncycastle/bcprov-jdk15on   {:mvn/version "1.69"}}
 
  :paths ["src" "resources"]
  :aliases
@@ -55,7 +55,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.0.829"}
+   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.0.861"}
                  org.clojure/test.check {:mvn/version "1.1.0"}}
    :main-opts ["-m" "kaocha.runner"]}
 
@@ -76,7 +76,7 @@
    :main-opts ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
 
   :jar
-  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.0.211"}}
+  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.0.216"}}
    :exec-fn      hf.depstar/jar
    :exec-args    {:jar "target/fluree-db.jar"
                   :group-id :mvn/group-id
