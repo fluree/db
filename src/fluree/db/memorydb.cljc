@@ -14,7 +14,11 @@
 (defn fake-conn []
   "Returns a fake connection object that is suitable for use with the memorydb if
   no other conn is available."
-  {:transactor? false})
+  {:transactor? false
+   :meta {:novelty-min 1000000,
+          :novelty-max 2000000
+          :dev? true
+          :open-api true}})
 
 (defn new-db
   "Creates a local, in-memory but bootstrapped db (primarily for testing)."
@@ -32,7 +36,8 @@
              schema   (<? (schema/schema-map db*))]
          (async/put! pc (assoc db* :schema schema
                                    :ecount genesis-ecount
-                                   :block 1))))
+                                   :block 1
+                                   :conn conn))))
      pc)))
 
 
