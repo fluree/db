@@ -1,0 +1,2 @@
+{:source-paths #{"src"}
+ :output {:pattern "::{{level}} file={{filename}},line={{row}},col={{col}}::{{message}}"}}

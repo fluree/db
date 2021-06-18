@@ -100,4 +100,21 @@
                   "target/fluree-db.jar"]}
 
   :meta
-  {:main-opts ["-m" "fluree.db.meta"]}}}
+  {:main-opts ["-m" "fluree.db.meta"]}
+
+  :coverage
+  {:extra-paths ["test"]
+   :extra-deps  {cloverage/cloverage {:mvn/version "1.2.2"}}
+   :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
+
+  :eastwood
+  {:extra-deps {jonase/eastwood {:mvn/version "RELEASE"}}
+   :main-opts ["-m" "eastwood.lint" {:source-paths ["src"] :out "scanning_results/eastwood.out"}]}
+
+  :ancient
+  {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
+   :main-opts ["-m" "antq.core"]}
+
+  :clj-kondo
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.06.01"}}
+   :main-opts ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
