@@ -15,7 +15,7 @@
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
      :clj (:import (fluree.db.flake Flake))))
 
-(defprotocol Storage
+(defprotocol Store
   (exists? [s key] "Returns true when `key` exists in `s`")
   (read [s key] "Reads raw bytes from `s` associated with `key`")
   (write [s key data] "Writes `data` as raw bytes to `s` and associates it with `key`")
@@ -192,16 +192,14 @@
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
-   (let [data  (<? (read conn key))]
-     (when data
-       (serdeproto/-deserialize-branch serializer data)))))
+   (when-let [data  (<? (read conn key))]
+     (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [serializer] :as conn} key]
   (go-try
-   (let [data (<? (read conn key))]
-     (when data
-       (serdeproto/-deserialize-leaf serializer data)))))
+   (when-let [data (<? (read conn key))]
+     (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."

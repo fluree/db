@@ -5,6 +5,7 @@
                :cljs [cljs.core.async :as async])
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
+            [fluree.db.index :as index]
             [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
@@ -112,7 +113,7 @@
                        publish transact-handler tx-private-key tx-key-id meta
                        add-listener remove-listener close]
 
-  storage/Storage
+  storage/Store
   (exists? [_ key]
     (storage-exists key))
   (read [_ key]
@@ -122,7 +123,7 @@
   (rename [_ old-key new-key]
     (storage-rename old-key new-key))
 
-  dbproto/IndexResolver
+  index/Resolver
   (resolve
     [conn {:keys [id leaf tempid] :as node}]
     (if (= :empty id)

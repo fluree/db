@@ -21,6 +21,3 @@
 (defn db?
   [db]
   (satisfies? IFlureeDb db))
-
-(defprotocol IndexResolver
-  (resolve [r node] "Populate index branch and leaf node maps with either their child node attributes or the flakes the store, respectively."))

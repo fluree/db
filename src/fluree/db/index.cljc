@@ -1,6 +1,6 @@
 (ns fluree.db.index
+  (:refer-clojure :exclude [resolve])
   (:require [clojure.data.avl :as avl]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
@@ -36,6 +36,11 @@
   (or (branch? x)
       (leaf? x)))
 
+(defprotocol Resolver
+  (resolve [r node]
+    "Populate index branch and leaf node maps with either their child node
+     attributes or the flakes the store, respectively."))
+
 (defn resolved?
   "Returns `true` if the data associated with the index node map `node` is fully
   resolved from storage"
@@ -65,25 +70,25 @@
           val))))
 
 (defn lookup-leaf
-  [branch flake]
+  [r branch flake]
   (go-try
    (when (and (branch? branch)
               (resolved? branch))
      (loop [child (lookup branch flake)]
        (if (leaf? child)
          child
-         (recur (<? (resolve child))))))))
+         (recur (<? (resolve r child))))))))
 
 (defn lookup-leaf-after
-  [branch flake]
+  [r branch flake]
   (go-try
    (when (and (branch? branch)
               (resolved? branch))
      (loop [child (lookup-after branch flake)]
        (if (leaf? child)
          child
-         (recur (<? (resolve child)))))
-     (ex-info (str "lookup-leaf is only supported on resolved branch nodes.")
+         (recur (<? (resolve r child)))))
+     (ex-info (str "lookup-leaf is only supported for resolved branch nodes.")
               {:status 500, :error :db/unexpected-error,
                ::branch branch}))))
 

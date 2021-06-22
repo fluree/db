@@ -95,12 +95,12 @@
         out         (chan)]
     (go
       (let [idx-root  (get db idx)
-            root-node (<! (dbproto/resolve conn idx-root))]
+            root-node (<! (index/resolve conn idx-root))]
         (loop [next-flake start-flake]
           (if (and next-flake
                    (not (pos? (idx-compare next-flake end-flake))))
-            (let [next-node     (<! (index/lookup-leaf root-node next-flake))
-                  resolved-node (<! (dbproto/resolve conn next-node))]
+            (let [next-node     (<! (index/lookup-leaf conn root-node next-flake))
+                  resolved-node (<! (index/resolve conn next-node))]
               (when (>! out resolved-node)
                 (recur (:ciel resolved-node))))
             (async/close! out)))))
