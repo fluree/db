@@ -20,20 +20,21 @@
   and transaction flake attributes"
   (-> default-comparators keys set))
 
-(defn node?
-  "Returns `true` if `x` is an index node map"
-  [x]
-  (not (-> x :leaf nil?)))
-
 (defn leaf?
-  "Returns `true` if `node` is a leaf node"
+  "Returns `true` if `node` is a map for a leaf node"
   [node]
   (-> node :leaf true?))
 
 (defn branch?
-  "Returns `true` if `node` is a branch node"
+  "Returns `true` if `node` is a map for branch node"
   [node]
   (-> node :leaf false?))
+
+(defn node?
+  "Returns `true` if `x` is an index node map"
+  [x]
+  (or (branch? x)
+      (leaf? x)))
 
 (defn resolved?
   "Returns `true` if the data associated with the index node map `node` is fully
@@ -87,7 +88,7 @@
                ::branch branch}))))
 
 (defn empty-leaf
-  "Returns a blank leaf node for the provided `network`, `dbid`, and index
+  "Returns a blank leaf node map for the provided `network`, `dbid`, and index
   comparator `cmp`."
   [network dbid cmp]
   {:comparator cmp

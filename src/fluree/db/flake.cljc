@@ -283,8 +283,9 @@
     "string"
     "number"))
 
-;; if possibly doing cross-type value comparison, use this instead
-(defn cmp-val-xtype [o1 o2]
+(defn cmp-val-xtype
+  "Use this instead of `cmp-val` if possibly doing cross-type value comparison"
+  [o1 o2]
   (if (and (some? o1) (some? o2))
     (let [o1-str   (cc-cmp-class o1)
           o2-str   (cc-cmp-class o2)
@@ -300,10 +301,11 @@
     #?(:clj (Boolean/compare b1 b2) :cljs (compare b1 b2))
     0))
 
-(defn cmp-meta [m1 m2]
+(defn cmp-meta
   "Meta will always be a map or nil, but can be searched using an integer to
-  perform effective range scans if needed.
-  i.e. (Integer/MIN_VALUE) to (Integer/MAX_VALUE) will always include all meta values."
+  perform effective range scans if needed. i.e. (Integer/MIN_VALUE)
+  to (Integer/MAX_VALUE) will always include all meta values."
+  [m1 m2]
   (let [m1h (if (int? m1) m1 (hash m1))
         m2h (if (int? m2) m2 (hash m2))]
     #?(:clj (Integer/compare m1h m2h) :cljs (- m1h m2h))))
@@ -360,8 +362,9 @@
     (cmp-subj (s f1) (s f2))
     (cmp-meta (m f1) (m f2))))
 
-;; note that opst sorts values as subjects
-(defn cmp-flakes-opst [f1 f2]
+(defn cmp-flakes-opst
+  "note that opst sorts values as subjects"
+  [f1 f2]
   (combine-cmp
     (cmp-subj (o f1) (o f2))
     (cmp-pred (p f1) (p f2))
