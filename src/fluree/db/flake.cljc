@@ -194,7 +194,7 @@
   (.-m f))
 
 (defn- equiv-flake
-  [^Flake f ^Flake o]
+  [f o]
   (and (= (s f) (s o))
        (= (p f) (p o))
        (= (o f) (o o))))
@@ -211,7 +211,7 @@
 
 
 (defn Flake->parts
-  [^Flake flake]
+  [flake]
   [(s flake) (p flake) (o flake) (t flake) (op flake) (m flake)])
 
 (def maximum
@@ -220,7 +220,7 @@
 
 (defn- assoc-flake
   "Assoc for Flakes"
-  [^Flake flake k v]
+  [flake k v]
   (let [[s p o t op m] (Flake->parts flake)]
     (case k
       :s (->Flake v p o t op m)
@@ -234,7 +234,7 @@
 
 
 (defn- get-flake-val
-  [^Flake flake k not-found]
+  [flake k not-found]
   (case k
     :s (s flake) "s" (s flake)
     :p (p flake) "p" (p flake)
@@ -247,7 +247,7 @@
 
 (defn- nth-flake
   "Gets position i in flake."
-  [^Flake flake i not-found]
+  [flake i not-found]
   (case i 0 (s flake)
           1 (p flake)
           2 (o flake)
@@ -316,7 +316,7 @@
 
 (defn cmp-subj
   "Comparator for subject values. The supplied values are reversed before the
-  comparison to account for subject's decreasing sort order"
+  comparison to account for the decreasing sort order of subjects"
   [s1 s2]
   (cmp-long s2 s1))
 
@@ -325,7 +325,7 @@
 
 (defn cmp-tx
   "Comparator for transaction values. The supplied values are reversed before the
-  comparison to account for transaction's decreasing sort order"
+  comparison to account for the decreasing sort order of transactions"
   [t1 t2]
   (cmp-long t2 t1))
 
@@ -337,7 +337,7 @@
   [op1 op2]
   (cmp-bool op1 op2))
 
-(defn cmp-flakes-spot [^Flake f1, ^Flake f2]
+(defn cmp-flakes-spot [f1 f2]
   (combine-cmp
     (cmp-subj (s f1) (s f2))
     (cmp-pred (p f1) (p f2))
@@ -345,7 +345,7 @@
     (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-psot [^Flake f1, ^Flake f2]
+(defn cmp-flakes-psot [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-subj (s f1) (s f2))
@@ -353,7 +353,7 @@
     (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-post [^Flake f1, ^Flake f2]
+(defn cmp-flakes-post [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-obj (o f1) (o f2))
@@ -361,7 +361,7 @@
     (cmp-meta (m f1) (m f2))))
 
 ;; note that opst sorts values as subjects
-(defn cmp-flakes-opst [^Flake f1, ^Flake f2]
+(defn cmp-flakes-opst [f1 f2]
   (combine-cmp
     (cmp-subj (o f1) (o f2))
     (cmp-pred (p f1) (p f2))
@@ -372,7 +372,7 @@
 ;; then apply changes in reverse. The alternative would be to reverse an entire
 ;; node, which might work better for generic caching purposes.
 
-(defn cmp-flakes-spot-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-spot-novelty [f1 f2]
   (combine-cmp
     (cmp-subj (s f1) (s f2))
     (cmp-pred (p f1) (p f2))
@@ -381,7 +381,7 @@
     (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
 
-(defn cmp-flakes-psot-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-psot-novelty [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-subj (s f2) (s f1))
@@ -391,7 +391,7 @@
     (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-post-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-post-novelty [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-obj (o f1) (o f2))
@@ -401,7 +401,7 @@
     (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-opst-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-opst-novelty [f1 f2]
   (combine-cmp
     (cmp-subj (o f1) (o f2))
     (cmp-pred (p f1) (p f2))
@@ -414,7 +414,7 @@
 (defn cmp-flakes-block
   "Comparison for flakes in blocks. Like cmp-flakes-spot-novelty, but with 't'
   moved up front."
-  [^Flake f1, ^Flake f2]
+  [f1 f2]
   (combine-cmp
    (cmp-tx (t f1) (t f2))
    (cmp-subj (s f1) (s f2))
@@ -426,7 +426,7 @@
 
 (defn cmp-flakes-history
   "Note this is not suitable for a set, only a vector/list."
-  [^Flake f1, ^Flake f2]
+  [f1 f2]
   (combine-cmp
     (cmp-long (t f1) (t f2))
     #?(:clj  (Boolean/compare (op f2) (op f1))
@@ -438,7 +438,7 @@
   the boolean operation descending so assertions (true) come before retractions (false)
   so that we can 're-play' the log in reverse order to come up with historical states.
   Suitable only for sorting a vector, not a sorted set."
-  [^Flake f1, ^Flake f2]
+  [f1 f2]
   (combine-cmp
     (cmp-long (t f1) (t f2))
     #?(:clj  (Boolean/compare (op f2) (op f1))
@@ -455,16 +455,16 @@
   "Takes a flake and returns one with the provided block and op flipped from true/false.
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
-  ([^Flake flake]
+  ([flake]
    (->Flake (s flake) (p flake) (o flake) (t flake) (not (op flake)) (m flake)))
-  ([^Flake flake tx]
+  ([flake tx]
    (->Flake (s flake) (p flake) (o flake) tx (not (op flake)) (m flake))))
 
 (defn change-t
   "Takes a flake and returns one with the provided block and op flipped from true/false.
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
-  ([^Flake flake t]
+  ([flake t]
    (->Flake (s flake) (p flake) (o flake) t (op flake) (m flake))))
 
 
@@ -497,7 +497,7 @@
 (defn split-by-flake
   "Splits a sorted set at a given flake. If there is an exact match for flake,
   puts it in the left-side. Primarily for use with last-flake."
-  [^Flake f ss]
+  [f ss]
   (let [[l e r] (avl/split-key f ss)]
     [(if e (conj l e) l) r]))
 
