@@ -16,11 +16,6 @@
          logback-bundle/core-bundle        {:mvn/version "0.3.0"}
          org.slf4j/slf4j-api               {:mvn/version "1.7.30"}
 
-         ;; storage
-         cc.qbits/alia                     {:mvn/version "5.0.0"}
-         cc.qbits/alia-async               {:mvn/version "5.0.0"}
-         cc.qbits/hayt                     {:mvn/version "4.1.0"}
-
          ;; Lucene
          clucie/clucie                     {:mvn/version "0.4.2"}
 
