@@ -30,12 +30,6 @@
   [node]
   (-> node :leaf false?))
 
-(defn node?
-  "Returns `true` if `x` is an index node map"
-  [x]
-  (or (branch? x)
-      (leaf? x)))
-
 (defprotocol Resolver
   (resolve [r node]
     "Populate index branch and leaf node maps with either their child node
