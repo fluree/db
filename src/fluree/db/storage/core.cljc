@@ -142,9 +142,7 @@
                             (mapv child-data))
          floor         (->> child-vals first :floor)
          ciel          (->> child-vals rseq first :ciel)
-         data          {:children child-vals
-                        :floor    floor
-                        :ciel     ciel}]
+         data          {:children child-vals}]
      (<? (write-branch-data conn branch-id data))
      (assoc branch :id branch-id))))
 
