@@ -22,3 +22,6 @@ package-lock.json
 /resources/public/js/compiled
 /cljs-test-runner-out/*
 /pom.xml
+/.clj-kondo/.cache
+/.eastwood
+/scanning_results
