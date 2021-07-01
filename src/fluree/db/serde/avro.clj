@@ -204,6 +204,16 @@
                  {:name "flakes", :type {:type  :array
                                          :items "fluree.Flake"}}]}))
 
+(def FdbTransaction-schema
+  (avro/parse-schema
+   avro-Flake
+   {:type      :record
+    :name      "FdbTransaction"
+    :namespace "fluree"
+    :fields    [{:name "t", :type :long}
+                {:name "flakes", :type {:type  :array
+                                        :items "fluree.Flake"}}]}))
+
 
 
 ;;; -----------------------------------------

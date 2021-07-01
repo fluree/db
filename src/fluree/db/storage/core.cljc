@@ -3,6 +3,7 @@
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [clojure.data.avl :as avl]
+            [clojure.string :as str]
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]
             [fluree.db.dbproto :as dbproto]
@@ -43,6 +44,11 @@
 (defn ledger-node-key
   [network ledger-id idx-type base-id node-type]
   (str network "_" ledger-id "_" (name idx-type) "_" base-id "-" node-type))
+
+
+(defn ledger-transaction-key
+  [network ledger-id txid]
+  (str/join "_" [network ledger-id "transaction" txid]))
 
 (defn ledger-block-key
   [network ledger-id block]
