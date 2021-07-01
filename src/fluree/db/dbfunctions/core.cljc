@@ -11,25 +11,18 @@
 
 (declare resolve-fn)
 
-(comment
-  ;; db-fn records
-  {:_fn/name     "max"
-   :_fn/params   ["?numbers"]
-   :_fn/doc      "Returns the maximum number based on a list of numbers"
-   :_fn/spec     {"?numbers" [:numbers]}
-   :_fn/source   "Source code for the function"
-   :_fn/language nil})                                        ;; only clojure for now
-
-
-
-
-(def db-fn-cache (atom #?(:clj  (cache/fifo-cache-factory {} :threshold 500)
-                          :cljs (cache/lru-cache-factory {} :threshold 500))))
-
-(defn clear-db-fn-cache
+(defn db-fn-cache-factory
+  "Returns an empty TTL cache for db-function caching.
+  Implication of this caching strategy is changes to db functions that get
+  update will take 5 seconds to recompile, benefit is that the same function
+  call for a ledger will not have to recompile every time."
   []
-  #?(:clj  (reset! db-fn-cache (cache/fifo-cache-factory {} :threshold 500))
-     :cljs (reset! db-fn-cache (cache/lru-cache-factory {} :threshold 500))))
+  (cache/ttl-cache-factory {} :ttl 5000))
+
+(def db-fn-cache (atom (db-fn-cache-factory)))
+
+(defn clear-db-fn-cache []
+  (reset! db-fn-cache (db-fn-cache-factory)))
 
 
 (defn tx-fn?
@@ -122,32 +115,32 @@
   [db fn-name funType]
   (go-try
     (let [forward-time-travel-db? (:tt-id db)]
-      (or (if-not forward-time-travel-db? (get @db-fn-cache [(:network db) (:dbid db) fn-name]))
-          (let [res (if-let [local-fn (get default-fn-map (symbol fn-name))]
-                      (resolve-local-fn local-fn)
-                      (let [query       {:selectOne ["_fn/params" "_fn/code" "_fn/spec"]
-                                         :from      ["_fn/name" (name fn-name)]}
-                            res         (<? (dbproto/-query db query))
-                            _           (if (empty? res)
-                                          (throw (ex-info (str "Unknown function: " (pr-str fn-name))
-                                                          {:status 400
-                                                           :error  :db/invalid-fn})))
-                            params      (read-string (get res "_fn/params"))
-                            code        (<? (resolve-fn db (read-string (get res "_fn/code")) funType params))
-                            spec        (get res "_fn/spec")
-                            params'     (->> params
-                                             (mapv (fn [x] (symbol x)))
-                                             (cons '?ctx)
-                                             (into []))
-                            custom-func #?(:clj (list #'clojure.core/fn params' code)
-                                           :cljs (build-fn params' code))]
-                        {:f      custom-func
-                         :params params
-                         :arity  (hash-set (count params))
-                         :&args? false
-                         :spec   spec
-                         :code   nil}))]
-            (if-not forward-time-travel-db? (swap! db-fn-cache assoc [(:network db) (:dbid db) fn-name] res))
+      (or (when-not forward-time-travel-db?
+            (get @db-fn-cache [fn-name (:network db) (:dbid db)]))
+          (let [res (let [query       {:selectOne ["_fn/params" "_fn/code" "_fn/spec"]
+                                       :from      ["_fn/name" (name fn-name)]}
+                          res         (<? (dbproto/-query db query))
+                          _           (if (empty? res)
+                                        (throw (ex-info (str "Unknown function: " (pr-str fn-name))
+                                                        {:status 400
+                                                         :error  :db/invalid-fn})))
+                          params      (read-string (get res "_fn/params"))
+                          code        (<? (resolve-fn db (read-string (get res "_fn/code")) funType params))
+                          spec        (get res "_fn/spec")
+                          params'     (->> params
+                                           (mapv (fn [x] (symbol x)))
+                                           (cons '?ctx)
+                                           (into []))
+                          custom-func #?(:clj (list #'clojure.core/fn params' code)
+                                         :cljs (build-fn params' code))]
+                      {:f      custom-func
+                       :params params
+                       :arity  (hash-set (count params))
+                       :&args? false
+                       :spec   spec
+                       :code   nil})]
+            (when-not forward-time-travel-db?
+              (swap! db-fn-cache assoc [fn-name (:network db) (:dbid db)] res))
             res)))))
 
 (defn find-fn
@@ -199,6 +192,17 @@
                         :else (throw (ex-info (str "Illegal element (" (pr-str x) ") in vector: " (pr-str vec) ".") {}))))))))))
 
 
+(defn find-local-fn*
+  "Looks up function in local-function map. If exists returns map of function details,
+  if doesn't exist returns nil."
+  [fn-name]
+  (when-let [local-fn (get default-fn-map (symbol fn-name))]
+    (resolve-local-fn local-fn)))
+
+
+(def find-local-fn (memoize find-local-fn*))
+
+
 (defn resolve-fn
   "Resolves a full code form expression."
   ([db form]
@@ -210,7 +214,8 @@
      (let [fn-name (first form)
            args    (rest form)
            args-n  (count args)
-           fn-map  (<? (find-fn db fn-name type))
+           fn-map  (or (find-local-fn fn-name)
+                       (<? (find-fn db fn-name type)))
            {:keys [f arity arglist &args?]} fn-map
            _       (when (not (or &args? (arity args-n)))
                      (throw (ex-info (str "Incorrect arity for function " fn-name ". Expected " arity ", provided: " args-n ".") {})))
@@ -232,7 +237,6 @@
                                         (false? arg)
                                         (nil? arg)) arg
                                     (vector? arg) (<? (parse-vector db arg type params))
-                                    (nil? arg) arg
                                     :else (throw (ex-info (str "Illegal element (" (pr-str arg) (type arg)
                                                                ") in function argument: " (pr-str form) ".") {})))]
                          (recur r (conj acc arg*))) acc))
