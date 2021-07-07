@@ -38,7 +38,7 @@
  :aliases
  {:mvn/group-id com.fluree
   :mvn/artifact-id db
-  :mvn/version "1.0.0-rc21"
+  :mvn/version "1.0.0-rc22"
 
   :cljstest
   {:extra-paths ["test"]
