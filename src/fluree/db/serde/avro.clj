@@ -211,6 +211,9 @@
     :name      "FdbTransaction"
     :namespace "fluree"
     :fields    [{:name "t", :type :long}
+                {:name "block", :type :long}
+                {:name "cmd", :type :string}
+                {:name "nonce", :type :string}
                 {:name "flakes", :type {:type  :array
                                         :items "fluree.Flake"}}]}))
 
@@ -254,6 +257,17 @@
     (catch Exception e (log/error e "Error serializing block data: " (pr-str (select-keys block-data [:block :t :flakes])))
                        (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
                                        {:status 500 :error :db/unexpected-error})))))
+
+(defn serialize-transaction
+  [txn]
+  (try
+    (let [tx-map (select-keys txn [:block :t :flakes])]
+      (avro/binary-encoded FdbTransaction-schema tx-map))
+    (catch Exception e (log/error e "Error serializing transaction: " (-> txn
+                                                                          (select-keys [:block :t :flakes])
+                                                                          pr-str))
+           (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
+                           {:status 500 :error :db/unexpected-error})))))
 
 (defn decode-key
   "Given a key, figures out what type of data it is and decodes it with the
