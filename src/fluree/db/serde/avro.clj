@@ -113,8 +113,8 @@
      :namespace "fluree"
      :fields    [{:name "id", :type :string}
                  {:name "leaf" :type :boolean}              ;; is this a leaf (data) node?
-                 {:name "first", :type "fluree.Flake"}
-                 {:name "rhs", :type [:null "fluree.Flake"]}
+                 {:name "floor", :type "fluree.Flake"}
+                 {:name "ciel", :type [:null "fluree.Flake"]}
                  {:name "size", :type :int}]}))
 
 
@@ -132,8 +132,7 @@
      :name      "FdbBranchNode"
      :namespace "fluree"
      :fields    [{:name "children", :type {:type  :array
-                                           :items "fluree.FdbChildNode"}}
-                 {:name "rhs", :type [:null "fluree.Flake"]}]}))
+                                           :items "fluree.FdbChildNode"}}]}))
 
 (def FdbLeafNode-schema
   (avro/parse-schema
@@ -142,8 +141,7 @@
      :name      "FdbLeafNode"
      :namespace "fluree"
      :fields    [{:name "flakes", :type {:type  :array
-                                         :items "fluree.Flake"}}
-                 {:name "his", :type [:null :string]}]}))
+                                         :items "fluree.Flake"}}]}))
 
 
 (def FdbRootDb-schema
@@ -160,9 +158,10 @@
                  {:name "fork", :type [:null :string]}
                  {:name "forkBlock", :type [:null :long]}
                  {:name "spot", :type "fluree.FdbChildNode"} ;; spot
-                 {:name "psot" :type "fluree.FdbChildNode"} ;; psot
-                 {:name "post" :type "fluree.FdbChildNode"} ;; post
-                 {:name "opst" :type "fluree.FdbChildNode"} ;; opst
+                 {:name "psot", :type "fluree.FdbChildNode"} ;; psot
+                 {:name "post", :type "fluree.FdbChildNode"} ;; post
+                 {:name "opst", :type "fluree.FdbChildNode"} ;; opst
+                 {:name "tspo", :type "fluree.FdbChildNode"} ;; tspo
                  {:name "timestamp" :type [:null :long]}
                  {:name "prevIndex" :type [:null :long]}]}))
 
@@ -247,7 +246,8 @@
                                        {:status 500 :error :db/unexpected-error})))))
 
 (defn decode-key
-  "Given a key, figures out what type of data it is and decodes it with the appropriate schema."
+  "Given a key, figures out what type of data it is and decodes it with the
+  appropriate schema."
   [k data]
   (log/warn "AVRO decode key:" k)
   (cond

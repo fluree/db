@@ -1,7 +1,8 @@
 (ns fluree.db.flake
-  (:refer-clojure :exclude [split-at sorted-set-by take])
+  (:refer-clojure :exclude [split-at sorted-set-by take last])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
+            [fluree.db.util.core :as util]
             #?(:clj [abracad.avro :as avro]))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
@@ -14,6 +15,14 @@
                                   :cljs (- 2r11111111111111111111111111111111111111111111 1)))
 
 (declare equiv-flake assoc-flake get-flake-val nth-flake)
+
+(def inc-t
+  "Increments a transaction value"
+  dec)
+
+(def dec-t
+  "Decrements a transaction value"
+  inc)
 
 (defn lshift
   [n bits]
@@ -160,12 +169,35 @@
           (binding [*out* w]
             (pr [(.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f)]))))
 
+(defn s
+  [^Flake f]
+  (.-s f))
+
+(defn p
+  [^Flake f]
+  (.-p f))
+
+(defn o
+  [^Flake f]
+  (.-o f))
+
+(defn t
+  [^Flake f]
+  (.-t f))
+
+(defn op
+  [^Flake f]
+  (.-op f))
+
+(defn m
+  [^Flake f]
+  (.-m f))
 
 (defn- equiv-flake
-  [^Flake f ^Flake o]
-  (and (= (.-s f) (.-s o))
-       (= (.-p f) (.-p o))
-       (= (.-o f) (.-o o))))
+  [f o]
+  (and (= (s f) (s o))
+       (= (p f) (p o))
+       (= (o f) (o o))))
 
 (defn parts->Flake
   "Used primarily to generate flakes for comparator. If you wish to
@@ -179,13 +211,16 @@
 
 
 (defn Flake->parts
-  [^Flake flake]
-  [(.-s flake) (.-p flake) (.-o flake) (.-t flake) (.-op flake) (.-m flake)])
+  [flake]
+  [(s flake) (p flake) (o flake) (t flake) (op flake) (m flake)])
 
+(def maximum
+  "The largest flake possible"
+  (->Flake util/max-long 0 util/max-long 0 true nil))
 
 (defn- assoc-flake
   "Assoc for Flakes"
-  [^Flake flake k v]
+  [flake k v]
   (let [[s p o t op m] (Flake->parts flake)]
     (case k
       :s (->Flake v p o t op m)
@@ -199,26 +234,26 @@
 
 
 (defn- get-flake-val
-  [^Flake flake k not-found]
+  [flake k not-found]
   (case k
-    :s (.-s flake) "s" (.-s flake)
-    :p (.-p flake) "p" (.-p flake)
-    :o (.-o flake) "o" (.-o flake)
-    :t (.-t flake) "t" (.-t flake)
-    :op (.-op flake) "op" (.-op flake)
-    :m (.-m flake) "m" (.-m flake)
+    :s (s flake) "s" (s flake)
+    :p (p flake) "p" (p flake)
+    :o (o flake) "o" (o flake)
+    :t (t flake) "t" (t flake)
+    :op (op flake) "op" (op flake)
+    :m (m flake) "m" (m flake)
     not-found))
 
 
 (defn- nth-flake
   "Gets position i in flake."
-  [^Flake flake i not-found]
-  (case i 0 (.-s flake)
-          1 (.-p flake)
-          2 (.-o flake)
-          3 (.-t flake)
-          4 (.-op flake)
-          5 (.-m flake)
+  [flake i not-found]
+  (case i 0 (s flake)
+          1 (p flake)
+          2 (o flake)
+          3 (t flake)
+          4 (op flake)
+          5 (m flake)
           (or not-found
               #?(:clj  (throw (IndexOutOfBoundsException.))
                  :cljs (throw (js/Error. (str "Index " i " out of bounds for flake: " flake)))))))
@@ -243,14 +278,14 @@
     (compare o1 o2)
     0))
 
-
 (defn cc-cmp-class [x]
   (if (string? x)
     "string"
     "number"))
 
-;; if possibly doing cross-type value comparison, use this instead
-(defn cmp-val-xtype [o1 o2]
+(defn cmp-val-xtype
+  "Use this instead of `cmp-val` if possibly doing cross-type value comparison"
+  [o1 o2]
   (if (and (some? o1) (some? o2))
     (let [o1-str   (cc-cmp-class o1)
           o2-str   (cc-cmp-class o2)
@@ -266,121 +301,139 @@
     #?(:clj (Boolean/compare b1 b2) :cljs (compare b1 b2))
     0))
 
-(defn cmp-meta [m1 m2]
+(defn cmp-meta
   "Meta will always be a map or nil, but can be searched using an integer to
-  perform effective range scans if needed.
-  i.e. (Integer/MIN_VALUE) to (Integer/MAX_VALUE) will always include all meta values."
+  perform effective range scans if needed. i.e. (Integer/MIN_VALUE)
+  to (Integer/MAX_VALUE) will always include all meta values."
+  [m1 m2]
   (let [m1h (if (int? m1) m1 (hash m1))
         m2h (if (int? m2) m2 (hash m2))]
     #?(:clj (Integer/compare m1h m2h) :cljs (- m1h m2h))))
 
-
-(defn cmp-pred [p1 p2]
-  (if (and p1 p2)
-    #?(:clj (Long/compare p1 p2) :cljs (- p1 p2))
-    0))
 
 (defn cmp-long [l1 l2]
   (if (and l1 l2)
     #?(:clj (Long/compare l1 l2) :cljs (- l1 l2))
     0))
 
+(defn cmp-subj
+  "Comparator for subject values. The supplied values are reversed before the
+  comparison to account for the decreasing sort order of subjects"
+  [s1 s2]
+  (cmp-long s2 s1))
 
-(defn cmp-flakes-spot [^Flake f1, ^Flake f2]
+(defn cmp-pred [p1 p2]
+  (cmp-long p1 p2))
+
+(defn cmp-tx
+  "Comparator for transaction values. The supplied values are reversed before the
+  comparison to account for the decreasing sort order of transactions"
+  [t1 t2]
+  (cmp-long t2 t1))
+
+(defn cmp-obj
+  [o1 o2]
+  (cmp-val-xtype o1 o2))
+
+(defn cmp-op
+  [op1 op2]
+  (cmp-bool op1 op2))
+
+(defn cmp-flakes-spot [f1 f2]
   (combine-cmp
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val (.-o f1) (.-o f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-subj (s f1) (s f2))
+    (cmp-pred (p f1) (p f2))
+    (cmp-obj (o f1) (o f2))
+    (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-psot [^Flake f1, ^Flake f2]
+(defn cmp-flakes-psot [f1 f2]
   (combine-cmp
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-val (.-o f1) (.-o f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-pred (p f1) (p f2))
+    (cmp-subj (s f1) (s f2))
+    (cmp-obj (o f1) (o f2))
+    (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-post [^Flake f1, ^Flake f2]
+(defn cmp-flakes-post [f1 f2]
   (combine-cmp
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val (.-o f1) (.-o f2))
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-pred (p f1) (p f2))
+    (cmp-obj (o f1) (o f2))
+    (cmp-subj (s f1) (s f2))
+    (cmp-meta (m f1) (m f2))))
 
-;; note that opst sorts values in reverse order (as they are subjects)
-(defn cmp-flakes-opst [^Flake f1, ^Flake f2]
+(defn cmp-flakes-opst
+  "note that opst sorts values as subjects"
+  [f1 f2]
   (combine-cmp
-    (cmp-long (.-o f2) (.-o f1))                            ;; reversed
-    (cmp-long (.-p f1) (.-p f2))
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-subj (o f1) (o f2))
+    (cmp-pred (p f1) (p f2))
+    (cmp-subj (s f1) (s f2))
+    (cmp-meta (m f1) (m f2))))
 
+;; When we look up an item in history, we can quickly find the relevant items,
+;; then apply changes in reverse. The alternative would be to reverse an entire
+;; node, which might work better for generic caching purposes.
 
-
-;; when we look up an item in history, we can quickly find the relevant items, then apply changes in reverse
-;; the alternative would be to reverse an entire node, which might work better for generic caching purposes.
-
-(defn cmp-flakes-spot-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-spot-novelty [f1 f2]
   (combine-cmp
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val-xtype (.-o f1) (.-o f2))
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
-    (cmp-bool (.-op f1) (.-op f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-subj (s f1) (s f2))
+    (cmp-pred (p f1) (p f2))
+    (cmp-obj (o f1) (o f2))
+    (cmp-tx (t f1) (t f2))
+    (cmp-bool (op f1) (op f2))
+    (cmp-meta (m f1) (m f2))))
 
-
-(defn cmp-flakes-psot-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-psot-novelty [f1 f2]
   (combine-cmp
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-val-xtype (.-o f1) (.-o f2))
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
-    (cmp-bool (.-op f1) (.-op f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-pred (p f1) (p f2))
+    (cmp-subj (s f2) (s f1))
+    (cmp-obj (o f1) (o f2))
+    (cmp-tx (t f1) (t f2))
+    (cmp-bool (op f1) (op f2))
+    (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-post-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-post-novelty [f1 f2]
   (combine-cmp
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val-xtype (.-o f1) (.-o f2))
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
-    (cmp-bool (.-op f1) (.-op f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-pred (p f1) (p f2))
+    (cmp-obj (o f1) (o f2))
+    (cmp-subj (s f1) (s f2))
+    (cmp-tx (t f1) (t f2))
+    (cmp-bool (op f1) (op f2))
+    (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-opst-novelty [^Flake f1, ^Flake f2]
+(defn cmp-flakes-opst-novelty [f1 f2]
   (combine-cmp
-    (cmp-long (.-o f2) (.-o f1))                            ;; reversed
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
-    (cmp-bool (.-op f1) (.-op f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+    (cmp-subj (o f1) (o f2))
+    (cmp-pred (p f1) (p f2))
+    (cmp-subj (s f1) (s f2))
+    (cmp-tx (t f1) (t f2))
+    (cmp-bool (op f1) (op f2))
+    (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-block [^Flake f1, ^Flake f2]
-  "Comparison for flakes in blocks.
-  Like cmp-flakes-spot-novelty, but 't' is moved up front."
+(defn cmp-flakes-block
+  "Comparison for flakes in blocks. Like cmp-flakes-spot-novelty, but with 't'
+  moved up front."
+  [f1 f2]
   (combine-cmp
-    (cmp-long (.-t f2) (.-t f1))                            ;; reversed
-    (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val-xtype (.-o f1) (.-o f2))
-    (cmp-bool (.-op f1) (.-op f2))
-    (cmp-meta (.-m f1) (.-m f2))))
+   (cmp-tx (t f1) (t f2))
+   (cmp-subj (s f1) (s f2))
+   (cmp-pred (p f1) (p f2))
+   (cmp-obj (o f1) (o f2))
+   (cmp-bool (op f1) (op f2))
+   (cmp-meta (m f1) (m f2))))
 
 
 (defn cmp-flakes-history
   "Note this is not suitable for a set, only a vector/list."
-  [^Flake f1, ^Flake f2]
+  [f1 f2]
   (combine-cmp
-    (cmp-long (.-t f1) (.-t f2))
-    #?(:clj  (Boolean/compare (.-op f2) (.-op f1))
-       :cljs (compare (.-op f2) (.-op f1)))))
+    (cmp-long (t f1) (t f2))
+    #?(:clj  (Boolean/compare (op f2) (op f1))
+       :cljs (compare (op f2) (op f1)))))
 
 
 (defn cmp-history-quick-reverse-sort
@@ -388,11 +441,11 @@
   the boolean operation descending so assertions (true) come before retractions (false)
   so that we can 're-play' the log in reverse order to come up with historical states.
   Suitable only for sorting a vector, not a sorted set."
-  [^Flake f1, ^Flake f2]
+  [f1 f2]
   (combine-cmp
-    (cmp-long (.-t f1) (.-t f2))
-    #?(:clj  (Boolean/compare (.-op f2) (.-op f1))
-       :cljs (compare (.-op f2) (.-op f1)))))
+    (cmp-long (t f1) (t f2))
+    #?(:clj  (Boolean/compare (op f2) (op f1))
+       :cljs (compare (op f2) (op f1)))))
 
 
 (defn new-flake
@@ -402,20 +455,20 @@
 
 
 (defn flip-flake
-  "Takes a flake and returns one with the provided block and .-op flipped from true/false.
+  "Takes a flake and returns one with the provided block and op flipped from true/false.
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
-  ([^Flake flake]
-   (->Flake (.-s flake) (.-p flake) (.-o flake) (.-t flake) (not (.-op flake)) (.-m flake)))
-  ([^Flake flake t]
-   (->Flake (.-s flake) (.-p flake) (.-o flake) t (not (.-op flake)) (.-m flake))))
+  ([flake]
+   (->Flake (s flake) (p flake) (o flake) (t flake) (not (op flake)) (m flake)))
+  ([flake tx]
+   (->Flake (s flake) (p flake) (o flake) tx (not (op flake)) (m flake))))
 
 (defn change-t
-  "Takes a flake and returns one with the provided block and .-op flipped from true/false.
+  "Takes a flake and returns one with the provided block and op flipped from true/false.
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
-  ([^Flake flake t]
-   (->Flake (.-s flake) (.-p flake) (.-o flake) t (.-op flake) (.-m flake))))
+  ([flake t]
+   (->Flake (s flake) (p flake) (o flake) t (op flake) (m flake))))
 
 
 
@@ -432,7 +485,6 @@
 
 (defn lookup
   [ss start-flake end-flake]
-  ;(log/warn "index-range-flakes" {:start-test >= :start-flake start-flake :end-test <= :end-flake end-flake})
   (avl/subrange ss >= start-flake <= end-flake))
 
 (defn subrange
@@ -448,7 +500,7 @@
 (defn split-by-flake
   "Splits a sorted set at a given flake. If there is an exact match for flake,
   puts it in the left-side. Primarily for use with last-flake."
-  [^Flake f ss]
+  [f ss]
   (let [[l e r] (avl/split-key f ss)]
     [(if e (conj l e) l) r]))
 
@@ -457,6 +509,33 @@
   [comparator & flakes]
   (apply avl/sorted-set-by comparator flakes))
 
+(defn transient-reduce
+  [reducer ss coll]
+  (->> coll
+       (reduce reducer (transient ss))
+       persistent!))
+
+(defn conj-all
+  "Adds all flakes in the `to-add` collection from the AVL-backed sorted flake set
+  `sorted-set`. This function uses transients for intermediate set values for
+  better performance because of the slower batched update performance of
+  AVL-backed sorted sets."
+  [ss to-add]
+  (transient-reduce conj! ss to-add))
+
+(defn disj-all
+  "Removes all flakes in the `to-remove` collection from the AVL-backed sorted
+  flake set `sorted-set`. This function uses transients for intermediate set
+  values for better performance because of the slower batched update performance
+  of AVL-backed sorted sets."
+  [ss to-remove]
+  (transient-reduce disj! ss to-remove))
+
+(defn last
+  "Returns the last item in `ss` in constant time as long as `ss` is a sorted
+  set."
+  [ss]
+  (->> ss rseq first))
 
 (defn size-flake
   "Base size of a flake is 38 bytes... then add size for 'o' and 'm'.
@@ -473,7 +552,7 @@
   it should be 'close enough'
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
-  (let [o (.-o f)]
+  (let [o (o f)]
     (+ 37 #?(:clj  (condp = (type o)
                      String (+ 38 (* 2 (count o)))
                      Long 8
@@ -484,9 +563,9 @@
                      ;; else
                      (count (pr-str o)))
              :cljs (count (pr-str o)))
-       (if (nil? (.-m f))
+       (if (nil? (m f))
          1
-         (* 2 (count (pr-str (.-m f))))))))
+         (* 2 (count (pr-str (m f))))))))
 
 
 (defn size-bytes
@@ -512,4 +591,3 @@
     flake-set
     (let [k (nth flake-set n)]
       (first (avl/split-key k flake-set)))))
-
