@@ -19,6 +19,20 @@
   ([message] (throw (ex-info message {:status 400 :error :db/invalid-type})))
   ([x p-type] (type-check-error (str "Could not coerce value to " (util/keyword->str p-type) ": " x "."))))
 
+
+(defn- regex-match
+  "Checks value is a string and matches against provided regex.
+  If fails, returns a type check error.
+
+  If optional message is provided, includes message in error response."
+  [re x p-type]
+  (if (string? x)
+    (if (re-matches re x)
+      x
+      (type-check-error x p-type))
+    (type-check-error (str "Could not coerce non-string value to " (util/keyword->str p-type) ": " x "."))))
+
+
 (defn type-check
   "(type-check type object) transforms a object to match the type. If it cannot be transformed, it throws an ex-info with a map from paths into the object to errors encountered at those paths."
   [x p-type]
@@ -40,6 +54,14 @@
         :instant (try*
                    (util/date->millis x)
                    (catch* _ (type-check-error x p-type)))
+
+        :date (regex-match #"^\d{4}-\d\d-\d\d$" x p-type)
+
+        :dateTime (regex-match #"^\d{4}-\d\d-\d\d(T\d\d:\d\d:\d\d(\.\d+)?)?(([+-]\d\d:\d\d)|Z)?$" x p-type)
+
+        :time (regex-match #"^\d\d:\d\d:\d\d(\.\d+)?$" x p-type)
+
+        :duration (regex-match #"^P(?!$)(\d+Y)?(\d+M)?(\d+W)?(\d+D)?(T(?=\d+[HMS])(\d+H)?(\d+M)?(\d+S)?)?$" x p-type)
 
         :uuid (cond
                 (string? x) x

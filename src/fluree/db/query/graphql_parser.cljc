@@ -153,26 +153,30 @@
                  :kind        "ENUM"
                  :name        "SortOrder"}))
 
-(def graphql-type-map {:string  "String"
+(def graphql-type-map {:string   "String"
                        ;; floating point
-                       :float   "Float"
-                       :double  "Double"
-                       :bigdec  "BigDec"
+                       :float    "Float"
+                       :double   "Double"
+                       :bigdec   "BigDec"
                        ;; integers
-                       :int     "Int"
-                       :long    "Long"
-                       :bigint  "BigInt"
-                       ;; instant
-                       :instant "Instant"
+                       :int      "Int"
+                       :long     "Long"
+                       :bigint   "BigInt"
+                       ;; times, instants
+                       :instant  "Instant"
+                       :date     "Date"
+                       :time     "Time"
+                       :dateTime "DateTime"
+                       :duration "Duration"
                        ;; boolean
-                       :boolean "Boolean"
+                       :boolean  "Boolean"
                        ;; other
-                       :tag     "String"
-                       :uuid    "String"
-                       :uri     "String"
-                       :bytes   "String"
-                       :json    "JSON"
-                       :geojson "JSON"})
+                       :tag      "String"
+                       :uuid     "String"
+                       :uri      "String"
+                       :bytes    "String"
+                       :json     "JSON"
+                       :geojson  "JSON"})
 
 (defn collection-predicate-types
   [collection-map]

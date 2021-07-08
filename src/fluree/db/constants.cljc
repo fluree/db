@@ -169,6 +169,10 @@
 (def ^:const _predicate$type:tag 15)
 (def ^:const _predicate$type:json 16)
 (def ^:const _predicate$type:geojson 17)
+(def ^:const _predicate$type:date 18)
+(def ^:const _predicate$type:time 19)
+(def ^:const _predicate$type:dateTime 20)
+(def ^:const _predicate$type:duration 21)
 ;; _rule/ops tags
 (def ^:const _rule$ops:all 30)
 (def ^:const _rule$ops:transact 31)

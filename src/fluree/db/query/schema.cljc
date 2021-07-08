@@ -8,22 +8,26 @@
   #?(:clj (:import (fluree.db.flake Flake))))
 
 ;; map of tag subject ids for each of the _predicate/type values for quick lookups
-(def ^:const type-sid->type {(flake/->sid const/$_tag const/_predicate$type:string)  :string
-                             (flake/->sid const/$_tag const/_predicate$type:ref)     :ref
-                             (flake/->sid const/$_tag const/_predicate$type:boolean) :boolean
-                             (flake/->sid const/$_tag const/_predicate$type:instant) :instant
-                             (flake/->sid const/$_tag const/_predicate$type:uuid)    :uuid
-                             (flake/->sid const/$_tag const/_predicate$type:uri)     :uri
-                             (flake/->sid const/$_tag const/_predicate$type:bytes)   :bytes
-                             (flake/->sid const/$_tag const/_predicate$type:int)     :int
-                             (flake/->sid const/$_tag const/_predicate$type:long)    :long
-                             (flake/->sid const/$_tag const/_predicate$type:bigint)  :bigint
-                             (flake/->sid const/$_tag const/_predicate$type:float)   :float
-                             (flake/->sid const/$_tag const/_predicate$type:double)  :double
-                             (flake/->sid const/$_tag const/_predicate$type:bigdec)  :bigdec
-                             (flake/->sid const/$_tag const/_predicate$type:tag)     :tag
-                             (flake/->sid const/$_tag const/_predicate$type:json)    :json
-                             (flake/->sid const/$_tag const/_predicate$type:geojson) :geojson})
+(def ^:const type-sid->type {(flake/->sid const/$_tag const/_predicate$type:string)   :string
+                             (flake/->sid const/$_tag const/_predicate$type:ref)      :ref
+                             (flake/->sid const/$_tag const/_predicate$type:boolean)  :boolean
+                             (flake/->sid const/$_tag const/_predicate$type:instant)  :instant
+                             (flake/->sid const/$_tag const/_predicate$type:uuid)     :uuid
+                             (flake/->sid const/$_tag const/_predicate$type:uri)      :uri
+                             (flake/->sid const/$_tag const/_predicate$type:bytes)    :bytes
+                             (flake/->sid const/$_tag const/_predicate$type:int)      :int
+                             (flake/->sid const/$_tag const/_predicate$type:long)     :long
+                             (flake/->sid const/$_tag const/_predicate$type:bigint)   :bigint
+                             (flake/->sid const/$_tag const/_predicate$type:float)    :float
+                             (flake/->sid const/$_tag const/_predicate$type:double)   :double
+                             (flake/->sid const/$_tag const/_predicate$type:bigdec)   :bigdec
+                             (flake/->sid const/$_tag const/_predicate$type:tag)      :tag
+                             (flake/->sid const/$_tag const/_predicate$type:json)     :json
+                             (flake/->sid const/$_tag const/_predicate$type:geojson)  :geojson
+                             (flake/->sid const/$_tag const/_predicate$type:date)     :date
+                             (flake/->sid const/$_tag const/_predicate$type:time)     :time
+                             (flake/->sid const/$_tag const/_predicate$type:dateTime) :dateTime
+                             (flake/->sid const/$_tag const/_predicate$type:duration) :duration})
 
 (def ^:const lang-sid->lang {(flake/->sid const/$_tag const/_setting$language:ar) :ar
                              (flake/->sid const/$_tag const/_setting$language:bn) :bn
