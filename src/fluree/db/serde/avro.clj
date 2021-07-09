@@ -213,7 +213,6 @@
     :fields    [{:name "t", :type :long}
                 {:name "block", :type :long}
                 {:name "cmd", :type :string}
-                {:name "nonce", :type :string}
                 {:name "flakes", :type {:type  :array
                                         :items "fluree.Flake"}}]}))
 
@@ -261,7 +260,7 @@
 (defn serialize-transaction
   [txn]
   (try
-    (let [tx-map (select-keys txn [:block :t :flakes])]
+    (let [tx-map (select-keys txn [:cmd :flakes :t :block])]
       (avro/binary-encoded FdbTransaction-schema tx-map))
     (catch Exception e (log/error e "Error serializing transaction: " (-> txn
                                                                           (select-keys [:block :t :flakes])
