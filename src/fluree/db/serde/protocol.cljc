@@ -2,6 +2,8 @@
 
 
 (defprotocol StorageSerializer
+  (-serialize-transaction [this tx] "Serializes transaction")
+  (-deserialize-transaction [this tx] "Deserializes transaction")
   (-serialize-block [this block] "Serializes block")
   (-deserialize-block [this block] "Deserializes block")
   (-serialize-db-root [this db-root] "Serializes the database index root.")

@@ -4,6 +4,9 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.log :as log]))
 
+(defn deserialize-transaction
+  [txn]
+  (update txn :flakes #(mapv flake/parts->Flake %)))
 
 (defn deserialize-block
   [block]
@@ -41,6 +44,10 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
+  (-serialize-transaction [_ txn]
+    (throw (ex-info "-serialize-transaction not supported for JSON." {})))
+  (-deserialize-transaction [_ txn]
+    (-> txn json/parse deserialize-transaction))
   (-serialize-block [_ block]
     (throw (ex-info "-serialize-block not supported for JSON." {})))
   (-deserialize-block [_ block]

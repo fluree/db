@@ -249,14 +249,6 @@
                        'UUID         #'->UUID})
 
 
-(defn serialize-block
-  [block-data]
-  (try
-    (avro/binary-encoded FdbBlock-schema (select-keys block-data [:block :t :flakes]))
-    (catch Exception e (log/error e "Error serializing block data: " (pr-str (select-keys block-data [:block :t :flakes])))
-                       (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
-                                       {:status 500 :error :db/unexpected-error})))))
-
 (defn serialize-transaction
   [txn]
   (try
@@ -267,6 +259,14 @@
                                                                           pr-str))
            (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
                            {:status 500 :error :db/unexpected-error})))))
+
+(defn serialize-block
+  [block-data]
+  (try
+    (avro/binary-encoded FdbBlock-schema (select-keys block-data [:block :t :flakes]))
+    (catch Exception e (log/error e "Error serializing block data: " (pr-str (select-keys block-data [:block :t :flakes])))
+                       (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
+                                       {:status 500 :error :db/unexpected-error})))))
 
 (defn decode-key
   "Given a key, figures out what type of data it is and decodes it with the
@@ -292,6 +292,11 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
+  (-serialize-transaction [_ txn]
+    (serialize-transaction txn))
+  (-deserialize-transaction [_ txn]
+    (binding [avro/*avro-readers* bindings]
+      (avro/decode FdbTransaction-schema txn)))
   (-serialize-block [_ block]
     (serialize-block block))
   (-deserialize-block [_ block]

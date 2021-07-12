@@ -6,6 +6,10 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
+  (-serialize-transaction [_ tx-data]
+    tx-data)
+  (-deserialize-transaction [_ tx]
+    tx)
   (-serialize-block [_ block-data]
     block-data)
   (-deserialize-block [_ block-key]
@@ -30,4 +34,3 @@
     pointer)
   (-deserialize-db-pointer [_ pointer]
     pointer))
-
