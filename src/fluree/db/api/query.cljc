@@ -32,20 +32,14 @@
     :history - history query"
   [flureeQL]
   (cond
-    (:select flureeQL)
-    :standard
-
-    (:selectOne flureeQL)
+    (or (:select flureeQL)
+        (:selectOne flureeQL)
+        (:selectDistinct flureeQL)
+        (:selectReduced flureeQL))
     :standard
 
     (:history flureeQL)
     :history
-
-    (:selectDistinct flureeQL)
-    :standard
-
-    (:selectReduced flureeQL)                               ;; SPARQL standard, no special treatment over :selectDistinct
-    :standard
 
     (:block flureeQL)                                       ;; block checked last, as block is allowed in above query types
     :block
