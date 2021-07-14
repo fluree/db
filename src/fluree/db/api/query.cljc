@@ -1,12 +1,14 @@
 ;; Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS that are directly exposed
 (ns fluree.db.api.query
   (:require [clojure.string :as str]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [#?(:clj  clojure.core.async :cljs cljs.core.async)
+             :as async :refer [<! go]]
+            [fluree.db.storage.core :as storage]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.block :as query-block]
+            [fluree.db.query.transaction :as query-tx]
             [fluree.db.session :as session]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.permissions :as permissions]
@@ -29,6 +31,7 @@
     :standard - basic or analytical query
     :multi - multi-query
     :block - block query
+    :transaction - transaction query
     :history - history query"
   [flureeQL]
   (cond
@@ -43,6 +46,9 @@
 
     (:block flureeQL)                                       ;; block checked last, as block is allowed in above query types
     :block
+
+    (:transaction flureeQL)
+    :transaction
 
     ;; (:construct flureeQL) - we don't yet have support for SPARQL-like construct queries
     ;; :construct
@@ -237,6 +243,29 @@
          :time   (response-time-formatted start)}
         result'))))
 
+(defn transaction-query-async
+  [conn ledger {:keys [opts] :as query}]
+  (go-try
+   (let [start         #?(:clj (System/nanoTime)
+                          :cljs (util/current-time-millis))
+         auth          (when-let [auth-id (:auth opts)]
+                         ["_auth/id" auth-id])
+
+         {:keys [network dbid] :as db}
+         (<? (db conn ledger {:auth auth}))]
+     (if-let [txid (:transaction query)]
+       (if-let [tx (<! (query-tx/lookup db txid))]
+         {:status 200
+          :result tx
+          :fuel   100
+          :time   (response-time-formatted start)}
+         {:status 404
+          :fuel   100
+          :time   (response-time-formatted start)})
+       (throw (ex-info (str "Invalid transaction query. Missing :transaction key. query: "
+                            (pr-str query))
+                       {:status 400
+                        :error  :db/invalid-query}))))))
 
 (defn get-history-pattern
   [history]
@@ -482,11 +511,11 @@
       (catch* e e))))
 
 (defn query
-  "Generic query interface. Will determine if multi-query, standard query, block or history
-  and dispatch appropriately.
+  "Generic query interface. Will determine if multi-query, standard query, block,
+  transaction, or history and dispatch appropriately.
 
-  For now, sources is expected to be just a db. In the case of a block query, which requires
-  a conn + ledger, those will be extracted from the db."
+  For now, sources is expected to be just a db. In the case of a block query,
+  which requires a conn + ledger, those will be extracted from the db."
   [source flureeQL]
   (let [query-type (query-type flureeQL)]
     (case query-type
@@ -495,4 +524,7 @@
       :block (let [conn   (:conn source)
                    ledger (keyword (:network source) (:dbid source))]
                (block-query-async conn ledger flureeQL))
+      :transaction (let [conn   (:conn source)
+                         ledger (keyword (:network source) (:dbid source))]
+                     (transaction-query-async source flureeQL))
       :multi (multi-query-async source flureeQL))))

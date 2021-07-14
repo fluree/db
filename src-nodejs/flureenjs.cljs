@@ -958,6 +958,30 @@
              (log/error e)
              (reject e))))))))
 
+(defn ^:export transaction-query
+  ([conn ledger query-map] (transaction-query conn ledger query-map nil))
+  ([conn ledger query-map opts]
+   (js/Promise.
+     (fn [resolve reject]
+       (async/go
+         (try
+           (let [query-map*  (js->clj query-map :keywordize-keys true)
+                 clj-opts    (merge (:opts query-map*)
+                                    (when opts (js->clj opts :keywordize-keys true)))
+                 _           (conn-handler/check-connection conn clj-opts)
+                 auth-id     (or (:auth clj-opts)
+                                 (:auth-id clj-opts)
+                                 (some->> (:jwt clj-opts)
+                                          (conn-handler/validate-token conn)
+                                          :auth))
+                 result*     (<? (query/transaction-query-async
+                                  conn ledger
+                                  (update query-map* :opts merge (merge clj-opts (util/without-nils {:auth auth-id})))))]
+             (resolve (clj->js result*)))
+           (catch :default e
+             (log/error e)
+             (reject e))))))))
+
 
 (defn ^:export block-range
   "Returns a promise containing blocks from start (inclusive)

@@ -747,6 +747,10 @@
   [conn ledger query-map]
   (query-api/block-query-async conn ledger query-map))
 
+(defn transaction-query-async
+  [conn ledger query-map]
+  (query-api/transaction-query-async conn ledger query-map))
+
 (defn get-history-pattern
   [history]
   (let [subject (cond (util/subj-ident? history)
@@ -858,6 +862,11 @@
           (<? (block-query-async conn db-name (-> parsed-gql-query
                                                   (dissoc :type)
                                                   (assoc :opts opts))))
+
+          (= :transaction (:type parsed-gql-query))
+          (<? (transaction-query-async conn db-name (-> parsed-gql-query
+                                                        (dissoc :type)
+                                                        (assoc :opts opts))))
 
           (:tx parsed-gql-query)
           (<? (transact-async conn db-name (:tx parsed-gql-query) opts))

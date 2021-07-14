@@ -47,13 +47,13 @@
 
 
 (defn ledger-transaction-key
-  [network ledger-id tx-id]
-  (str/join "_" [network ledger-id "transaction" tx-id]))
+  [network ledger-id txid]
+  (str/join "_" [network ledger-id "transaction" txid]))
 
 (defn read-transaction
-  [conn network ledger-id tx-id]
-  (go
-    (let [tx-key  (ledger-transaction-key network ledger-id tx-id)
+  [conn network ledger-id txid]
+  (go-try
+    (let [tx-key  (ledger-transaction-key network ledger-id txid)
           tx-data (<? (read conn tx-key))]
       (when tx-data
         (serdeproto/-deserialize-transaction (serde conn) tx-data)))))
