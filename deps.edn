@@ -71,7 +71,7 @@
    :main-opts ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
 
   :jar
-  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "RELEASE"}}
+  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.267"}}
    :exec-fn      hf.depstar/jar
    :exec-args    {:jar "target/fluree-db.jar"
                   :group-id :mvn/group-id
