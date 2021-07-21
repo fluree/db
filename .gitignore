@@ -25,3 +25,4 @@ package-lock.json
 /.clj-kondo/.cache
 /.eastwood
 /scanning_results
+.dir-locals.el
