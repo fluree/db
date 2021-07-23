@@ -5,6 +5,7 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
+            [clojure.walk :refer [keywordize-keys]]
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
             [clucie.store :as lucene-store])
@@ -38,6 +39,13 @@
                       (str/starts-with? (:name pred)
                                         collection))))
        (map :id)))
+
+(defn sanitize
+  [pred-map]
+  (reduce-kv (fn [m k v]
+               (let [k* (-> k str keyword)]
+                 (assoc m k* v)))
+             {} pred-map))
 
 (defn storage-path
   [base-path {:keys [network dbid] :as db}]
@@ -93,23 +101,27 @@
 
 (defn put-subject
   [idx-writer subj pred-vals]
-  (let [subj-id  (str subj)
-        cid      (-> subj flake/sid->cid str)
-        subj-map (merge {:_id subj-id, :_collection cid}
-                        pred-vals)
-        map-keys (keys subj-map)]
-    (lucene/update! idx-writer subj-map map-keys :_id subj)))
+  (with-open [r (writer->reader idx-writer)]
+    (let [anlz      (.getAnalyzer idx-writer)
+          prev-subj (or (get-subject r anlz subj)
+                        {:_id         (str subj)
+                         :_collection (-> subj flake/sid->cid str)})
+          updates   (sanitize pred-vals)
+          subj-map  (merge prev-subj updates)
+          map-keys  (keys subj-map)]
+      (lucene/update! idx-writer subj-map map-keys :_id subj))))
 
 (defn purge-subject
   [idx-writer subj pred-vals]
   (with-open [idx-reader (writer->reader idx-writer)]
     (let [anlz (.getAnalyzer idx-writer)]
       (when-let [{id :_id, :as subj-map} (get-subject idx-reader anlz subj)]
-        (let [purge-map (->> subj-map
+        (let [attrs     (sanitize pred-vals)
+              purge-map (->> subj-map
                              (filter (fn [[k v]]
                                       (or (#{:_id :_collection} k)
-                                          (not (contains? pred-vals k))
-                                          (not (= v (get pred-vals k))))))
+                                          (not (contains? attrs k))
+                                          (not (= v (get attrs k))))))
                              (into {}))
               map-keys  (keys purge-map)]
           (lucene/update! idx-writer purge-map map-keys :_id id))))))
