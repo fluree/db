@@ -15,7 +15,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [http.async.client.websocket :as ws])
+            #?(:clj [http.async.client.websocket :as ws]))
   (:import #?@(:clj ((org.httpkit.client TimeoutException)
                      (org.asynchttpclient.ws WebSocket))
                :cljs ((goog.net.ErrorCode)))))
