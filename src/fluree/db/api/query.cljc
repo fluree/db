@@ -14,7 +14,10 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log])
+  #?(:clj (:import (fluree.db.flake Flake))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 ;; main query interface for APIs, etc.
 
@@ -153,7 +156,7 @@
 (defn- format-block-resp-pretty
   [db curr-block cache fuel]
   (go-try (let [[asserted-subjects
-                 retracted-subjects] (loop [[flake & r] (:flakes curr-block)
+                 retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
                                             asserted-subjects  {}
                                             retracted-subjects {}]
                                        (if-not flake
@@ -279,7 +282,7 @@
 
 
 (defn- auth-match
-  [auth-set t-map flake]
+  [auth-set t-map ^Flake flake]
   (let [[auth id] (get-in t-map [(.-t flake) :auth])]
     (or (auth-set auth)
         (auth-set id))))
@@ -293,7 +296,7 @@
 (defn- format-history-resp
   [db resp auth show-auth]
   (go-try
-    (let [ts    (-> (map #(.-t %) resp) set)
+    (let [ts    (-> (map #(.-t ^Flake %) resp) set)
           t-map (<? (async/go-loop [[t & r] ts
                                     acc {}]
                       (if t
@@ -306,7 +309,7 @@
                                                                                  :where     [[t, "_tx/auth", "?auth"],
                                                                                              ["?auth", "_auth/id", "?id"]]}))))]
                           (recur r acc*)) acc)))
-          res   (loop [[flake & r] resp
+          res   (loop [[^Flake flake & r] resp
                        acc {}]
                   (cond (and flake auth
                              (not (auth-match auth t-map flake)))

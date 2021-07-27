@@ -6,6 +6,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             #?(:cljs [cljs.reader :refer [read-string]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (def collection-arguments
   {:limit {:type "Int" :default-value 100}
    :_id   {:type "ID"}

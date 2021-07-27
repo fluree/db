@@ -9,6 +9,8 @@
             [fluree.db.session :as session]
             [fluree.db.util.async :as async-util]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (declare bootstrap-flakes genesis-ecount)
 
 (defn fake-conn []
@@ -85,10 +87,10 @@
                              [(flake/->sid const/$_user 1002) const/$_user:username "lois"]]))
 
   ;; able to use new db (db2) like any normal db.
-  @(fluree.db.api/query db2 {:select [:*] :from "_user"})
+  @(fluree.db.api/query db2 {:select [:*] :from "_user"}))
 
 
-  )
+
 
 ;; TODO - this is now duplicated with fluree.db.ledger.bootstrap - consolidate when this becomes an actually supported db.
 (def ^:const genesis-ecount

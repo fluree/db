@@ -3,6 +3,8 @@
                :cljs [goog.log :as glog]))
   #?(:cljs (:import goog.debug.Console)))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 ; Added deprecated parameter since compiling in strict mode
 #?(:cljs

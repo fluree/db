@@ -9,24 +9,23 @@
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
             [clucie.store :as lucene-store])
-  (:import fluree.db.flake.Flake
-           java.io.Closeable
-           java.io.File
-           org.apache.lucene.analysis.Analyzer
-           org.apache.lucene.analysis.en.EnglishAnalyzer
-           org.apache.lucene.analysis.cn.smart.SmartChineseAnalyzer
-           org.apache.lucene.analysis.hi.HindiAnalyzer
-           org.apache.lucene.analysis.es.SpanishAnalyzer
-           org.apache.lucene.analysis.ar.ArabicAnalyzer
-           org.apache.lucene.analysis.id.IndonesianAnalyzer
-           org.apache.lucene.analysis.ru.RussianAnalyzer
-           org.apache.lucene.analysis.bn.BengaliAnalyzer
-           org.apache.lucene.analysis.br.BrazilianAnalyzer
-           org.apache.lucene.analysis.fr.FrenchAnalyzer
-           org.apache.lucene.index.IndexWriter
-           org.apache.lucene.index.IndexReader
-           org.apache.lucene.index.IndexNotFoundException
-           org.apache.lucene.store.Directory))
+  (:import (fluree.db.flake Flake)
+           (java.io File Closeable)
+           (org.apache.lucene.analysis Analyzer)
+           (org.apache.lucene.analysis.en EnglishAnalyzer)
+           (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
+           (org.apache.lucene.analysis.hi HindiAnalyzer)
+           (org.apache.lucene.analysis.es SpanishAnalyzer)
+           (org.apache.lucene.analysis.ar ArabicAnalyzer)
+           (org.apache.lucene.analysis.id IndonesianAnalyzer)
+           (org.apache.lucene.analysis.ru RussianAnalyzer)
+           (org.apache.lucene.analysis.bn BengaliAnalyzer)
+           (org.apache.lucene.analysis.br BrazilianAnalyzer)
+           (org.apache.lucene.analysis.fr FrenchAnalyzer)
+           (org.apache.lucene.index IndexWriter IndexReader)
+           (org.apache.lucene.store Directory)))
+
+(set! *warn-on-reflection* true)
 
 (def search-limit Integer/MAX_VALUE)
 
@@ -116,6 +115,14 @@
   [{:keys [storage]}]
   (lucene-store/store-reader storage))
 
+(defn writer->reader
+  ^IndexReader [^IndexWriter w]
+  (-> w .getDirectory reader))
+
+(defn writer->storage-path
+  [^IndexWriter w]
+  (-> w .getDirectory .toString))
+
 (defn get-subject
   [{:keys [analyzer] :as idx} subj-id]
   (let [subj-id  (str subj-id)]
@@ -125,7 +132,7 @@
           first))))
 
 (defn put-subject
-  [idx ^IndexWriter wrtr subj pred-vals]
+  [idx wrtr subj pred-vals]
   (let [prev-subj (or (get-subject idx subj)
                       {:_id         (str subj)
                        :_collection (-> subj flake/sid->cid str)})
@@ -146,6 +153,18 @@
                          (into {}))
           map-keys  (keys purge-map)]
       (lucene/update! wrtr purge-map map-keys :_id id))))
+
+(defn block-registry-file
+  [writer]
+  (let [parent (writer->storage-path writer)
+        path   (str/join "/" [parent "block_registry.edn"])]
+    (io/as-file path)))
+
+(defn read-block-registry
+  [writer]
+  (let [^File registry-file (block-registry-file writer)]
+    (when (.exists registry-file)
+      (-> registry-file slurp edn/read-string))))
 
 (defn register-block
   [{:keys [block-registry]} _wrtr block-status]

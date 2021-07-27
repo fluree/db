@@ -3,6 +3,8 @@
             [alphabase.core :as alphabase]
             [fluree.db.util.core :as util :refer [try* catch*]]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (def ^:private EMAIL #"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
 (defn safe-name
@@ -39,8 +41,10 @@
          (if (nil? object) object (error))
 
          (string? spec)
-         (let [optional  (.endsWith spec "?")
-               base-spec (if optional (subs spec 0 (dec (.length spec))) spec)]
+         (let [optional  (.endsWith ^String spec "?")
+               base-spec (if optional
+                           (subs spec 0 (dec (.length ^String spec)))
+                           spec)]
            (cond
              (and optional (nil? object))
              nil
@@ -118,7 +122,7 @@
 
              (= base-spec "bytes")
              (cond
-               (string? object) (let [uc (.toLowerCase object)]
+               (string? object) (let [uc (.toLowerCase ^String object)]
                                   (if (re-matches #"^[0-9a-f]+$" uc)
                                     uc
                                     (error "Bytes type must be in hex string form.")))

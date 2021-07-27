@@ -18,11 +18,12 @@
             #?(:clj [fluree.db.serde.avro :refer [avro-serde]])
             [fluree.db.conn-events :as conn-events]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; socket connections are keyed by connection-id and contain :socket - ws, :id - socket-id :health - status of health checks.
 (def server-connections-atom (atom {}))
 
 (def server-regex #"^(?:((?:https?):)//)([^:/\s#]+)(?::(\d*))?")
-
 
 
 (defn- acquire-healthy-server
@@ -196,7 +197,6 @@
         (<? (establish-socket (:id conn) (:sub-chan conn) (:pub-chan conn) (:servers conn))))))
 
 
-
 (defn get-server
   "returns promise channel, check for errors"
   [conn-id servers]
@@ -322,6 +322,7 @@
 
           :else
           (do
+            (log/trace "Received message:" (pr-str (json/parse msg)))
             (conn-events/process-events conn (json/parse msg))
             (recur 0)))))))
 
@@ -440,7 +441,6 @@
   Will return true if a function exists for that key and it was removed."
   [conn network dbid key]
   (remove-listener* (:state conn) network dbid key))
-
 
 
 (defn add-token
@@ -572,15 +572,14 @@
   Provide servers in either a sequence or as a string that is comma-separated."
   [servers & [opts]]
   (let [conn        (generate-connection servers opts)
-        transactor? (:transactor? opts)
-        dev?        (-> conn :meta :dev?)]
+        transactor? (:transactor? opts)]
     (when-not transactor?
       (async/go
         (let [socket (async/<! (get-socket conn))]
           (if (or (nil? socket)
                   (util/exception? socket))
             (do
-              (log/warn "Cannot establish connection to a healthy server, disconnecting.")
+              (log/error "Cannot establish connection to a healthy server, disconnecting. Error:" socket)
               (async/close! conn))
             ;; kick off consumer
             (msg-consumer conn)))))

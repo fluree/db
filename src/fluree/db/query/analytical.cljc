@@ -15,6 +15,8 @@
             #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn variable? [form]
   (when (and (or (string? form) (keyword? form) (symbol? form)) (= (first (name form)) \?))
     (symbol form)))
@@ -911,6 +913,6 @@
   (async/<!! (q {:select   ["?handle" "?num"]
                  :where    [["?person" "person/handle" "?handle"]]
                  :optional [["?person" "person/favNums" "?num"]]
-                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db))
+                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))
 
-  )
+

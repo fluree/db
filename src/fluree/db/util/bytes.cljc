@@ -2,6 +2,8 @@
   (:require #?(:clj [byte-streams :as bs])
             #?(:cljs [goog.crypt :as gcrypt])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defn string->UTF8
   [x]

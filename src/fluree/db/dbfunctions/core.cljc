@@ -9,6 +9,8 @@
             [fluree.db.dbfunctions.fns :as fns]
             [clojure.string :as str]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (declare resolve-fn)
 
 (defn db-fn-cache-factory

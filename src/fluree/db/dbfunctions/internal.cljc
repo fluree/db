@@ -9,7 +9,10 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.dbproto :as dbproto]
-            [clojure.string :as str]))
+            [clojure.string :as str])
+  #?(:clj (:import (fluree.db.flake Flake))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn- parse-select-map
   [param-str]
@@ -47,10 +50,18 @@
 (defn- function-error
   [e function-name & args]
   (log/error e "Function Error: " function-name "args: " (pr-str args))
-  (throw (ex-info (clojure.core/str "Error in database function: " function-name ": " (if (clojure.core/nil? (.getMessage e)) (.getClass e) (.getMessage e))
-                                    ". Provided: " (if (coll? args) (clojure.string/join " " args) args))
-                  {:status 400
-                   :error  :db/invalid-fn})))
+  (throw
+    (ex-info
+      (let [^Throwable e' e
+            msg (.getMessage e')
+            err-msg (if (clojure.core/nil? msg)
+                      (.getClass e')
+                      msg)
+            args' (if (coll? args) (str/join " " args) args)]
+        (format "Error in database function: %s: %s. Provided: %s"
+                function-name err-msg args'))
+      {:status 400
+       :error  :db/invalid-fn})))
 
 (defn boolean
   "Coerce to boolean. Everything except `false' and `nil' is true in boolean context."
@@ -464,7 +475,7 @@
               prev-vals (<? (dbproto/-search db' [(:sid ?ctx) (:pid ?ctx)])) ;; could be multi-cardinality, only take first one (consider throwing?)
               fuel      (count prev-vals)
               pO        (some-> (first prev-vals)
-                                (.-o))]
+                                (#(let [^Flake f %] (.-o f))))]
           ;predName (dbproto/-p-prop db :name (:pid ?ctx))
           ;pOQuery  {:select [predName]
           ;          :from   sid}
@@ -557,8 +568,8 @@
   "Given an array of flakes, returns the sum of the objects of the true flakes"
   [flakes]
   (try*
-    (let [trueF (filterv #(true? (.-op %)) flakes)
-          objs  (map #(.-o %) trueF)
+    (let [trueF (filterv #(true? (.-op ^Flake %)) flakes)
+          objs  (map #(.-o ^Flake %) trueF)
           sum   (reduce clojure.core/+ objs)]
       sum)
     (catch* e (function-error e "objT" flakes))))
@@ -567,8 +578,8 @@
   "Given an array of flakes, returns the sum of the objects of the false flakes"
   [flakes]
   (try*
-    (let [falseF (filterv #(false? (.-op %)) flakes)
-          objs   (map #(.-o %) falseF)
+    (let [falseF (filterv #(false? (.-op ^Flake %)) flakes)
+          objs   (map #(.-o ^Flake %) falseF)
           sum    (reduce clojure.core/+ objs)]
       sum)
     (catch* e (function-error e "objF" flakes))))

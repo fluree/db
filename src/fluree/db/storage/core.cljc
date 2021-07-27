@@ -15,6 +15,8 @@
      :clj
            (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (declare ->UnresolvedNode)
 
 #?(:clj

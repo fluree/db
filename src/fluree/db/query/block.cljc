@@ -8,6 +8,8 @@
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn- filter-block-flakes
   "Applies filter(s) to flakes in a block"
   [db block]
