@@ -17,29 +17,31 @@
          org.slf4j/slf4j-api               {:mvn/version "1.7.32"}
 
          ;; Lucene
-         clucie/clucie                     {:mvn/version "0.4.2"}
+         clucie/clucie                       {:mvn/version "0.4.2"}
 
-         ;; messaging
-         aleph/aleph                       {:mvn/version "0.4.7-alpha7"}
+         ;; http
+         http-kit/http-kit                   {:mvn/version "2.5.3"}
+         http.async.client/http.async.client {:git/url "https://github.com/fluree/http.async.client.git"
+                                              :sha     "c1223b8d2478e83814db6327127cea0d9ab26ef5"}
 
          ;; benchmarking
-         criterium/criterium               {:mvn/version "0.4.6"}
+         criterium/criterium                 {:mvn/version "0.4.6"}
 
          ;; serialization / compression
-         com.damballa/abracad              {:mvn/version "0.4.13"}
-         com.taoensso/nippy                {:mvn/version "3.1.1"}
-         org.xerial.snappy/snappy-java     {:mvn/version "1.1.8.4"}
-         com.fluree/alphabase              {:mvn/version "3.2.1"}
+         com.taoensso/nippy                  {:mvn/version "3.1.1"}
+         org.xerial.snappy/snappy-java       {:mvn/version "1.1.8.4"}
+         com.fluree/alphabase                {:mvn/version "3.2.1"}
 
-         com.fluree/crypto                 {:mvn/version "0.3.5"}
-         org.bouncycastle/bcprov-jdk15on   {:mvn/version "1.69"}}
+         ;; cryptography
+         com.fluree/crypto                   {:mvn/version "0.3.5"}
+         org.bouncycastle/bcprov-jdk15on     {:mvn/version "1.69"}}
 
  :paths ["src" "resources"]
 
  :aliases
- {:mvn/group-id com.fluree
+ {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version "1.0.0-rc25"
+  :mvn/version     "1.0.0-rc25"
 
   :dev
   {:extra-paths ["dev"]
@@ -48,17 +50,17 @@
 
   :cljstest
   {:extra-paths ["test"]
-   :extra-deps {olical/cljs-test-runner {:mvn/version "3.8.0"}}
-   :main-opts ["-m" "cljs-test-runner.main"
-               "-D" "doo.edn"
-               "-c" "build-test.edn"
-               "-x" "chrome-headless"]}
+   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
+   :main-opts   ["-m" "cljs-test-runner.main"
+                 "-D" "doo.edn"
+                 "-c" "build-test.edn"
+                 "-x" "chrome-headless"]}
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.0.861"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.0.861"}
                  org.clojure/test.check {:mvn/version "1.1.0"}}
-   :main-opts ["-m" "kaocha.runner"]}
+   :main-opts   ["-m" "kaocha.runner"]}
 
   :js-deps
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
@@ -74,16 +76,16 @@
 
   :webworker
   {:extra-paths ["src-cljs"]
-   :main-opts ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
+   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
 
   :jar
   {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.267"}}
    :exec-fn      hf.depstar/jar
-   :exec-args    {:jar "target/fluree-db.jar"
-                  :group-id :mvn/group-id
+   :exec-args    {:jar         "target/fluree-db.jar"
+                  :group-id    :mvn/group-id
                   :artifact-id :mvn/artifact-id
-                  :version :mvn/version
-                  :sync-pom true}}
+                  :version     :mvn/version
+                  :sync-pom    true}}
 
   :install
   {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
