@@ -37,12 +37,18 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 1. Install clojure tools-deps (version 1.10.1.697 or later).
     1. macOS: `brew install clojure/tools/clojure`
     1. Arch Linux: `pacman -S clojure`
+1. Install Node & NPM
+    1. macOS: `brew install node`
+    1. Arch Linux: `pacman -S nodejs`
 
 ### Building
 
 1. `make deps` - install all local dependencies
-1. `make` or `make jar` - make Java .jar file
-1. `make nodejs` - make JavaScript Fluree DB
-1. `make browser` - make JavaScript WebWorker Fluree DB
-1. `make clean` - clean all build directories/files
+1. `make` - make everything below
+1. `make jar` - make Java JAR file
+1. `make nodejs` - make JavaScript Fluree DB for Node
+1. `make browser` - make JavaScript Fluree DB for browsers
+1. `make webworker` - make JavaScript Fluree DB for web worker
+
 1. `make install` - install jar file into local .m2/maven
+1. `make clean` - clean all build directories/files
