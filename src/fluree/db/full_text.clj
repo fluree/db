@@ -23,6 +23,46 @@
            org.apache.lucene.analysis.fr.FrenchAnalyzer
            org.apache.lucene.index.IndexWriter))
 
+(defprotocol BlockRegistry
+  (read-current-block [r])
+  (register-block [r status])
+  (clear [r]))
+
+(defrecord DiskRegistry [^File file]
+  BlockRegistry
+  (read-current-block
+    [_]
+    (when (.exists file)
+      (-> file slurp edn/read-string)))
+  (register-block
+    [_ status]
+    (->> status prn-str (spit file)))
+  (clear
+    [_]
+    (when (.exists file)
+      (io/delete-file file))))
+
+(defn disk-registry
+  [base-path]
+  (let [path (str/join "/" [base-path "block_registry.edn"])]
+    (-> path io/as-file ->DiskRegistry)))
+
+(defrecord MemoryRegistry [state]
+  BlockRegistry
+  (read-current-block
+    [_]
+    @state)
+  (register-block
+    [_ status]
+    (reset! state status))
+  (clear
+    [_]
+    (reset! state nil)))
+
+(defn memory-registry
+  []
+  (->MemoryRegistry (atom nil)))
+
 (defn predicate?
   [^Flake f]
   (= const/$_predicate:fullText
@@ -125,30 +165,6 @@
                              (into {}))
               map-keys  (keys purge-map)]
           (lucene/update! idx-writer purge-map map-keys :_id id))))))
-
-(defn block-registry-file
-  [writer]
-  (let [parent (writer->storage-path writer)
-        path   (str/join "/" [parent "block_registry.edn"])]
-    (io/as-file path)))
-
-(defn read-block-registry
-  [writer]
-  (let [^File registry-file (block-registry-file writer)]
-    (when (.exists registry-file)
-      (-> registry-file slurp edn/read-string))))
-
-(defn register-block
-  [writer status]
-  (let [registry-file (block-registry-file writer)
-        registry      (prn-str status)]
-    (spit registry-file registry)))
-
-(defn forget-block-registry
-  [writer]
-  (let [^File registry-file (block-registry-file writer)]
-    (when (.exists registry-file)
-      (io/delete-file registry-file))))
 
 (defn forget
   [^IndexWriter w]
