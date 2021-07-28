@@ -14,7 +14,7 @@
          ;; logging
          org.clojure/tools.logging         {:mvn/version "1.1.0"}
          logback-bundle/core-bundle        {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api               {:mvn/version "1.7.31"}
+         org.slf4j/slf4j-api               {:mvn/version "1.7.32"}
 
          ;; Lucene
          clucie/clucie                     {:mvn/version "0.4.2"}
@@ -116,5 +116,5 @@
    :main-opts ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.06.18"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.07.28"}}
    :main-opts ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
