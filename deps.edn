@@ -28,7 +28,7 @@
          criterium/criterium                 {:mvn/version "0.4.6"}
 
          ;; serialization / compression
-         nubank/abracad                      {:mvn/version "0.4.15"}
+         nubank/abracad                      {:mvn/version "0.4.17"}
          com.taoensso/nippy                  {:mvn/version "3.1.1"}
          org.xerial.snappy/snappy-java       {:mvn/version "1.1.8.4"}
          com.fluree/alphabase                {:mvn/version "3.2.1"}
