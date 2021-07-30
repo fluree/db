@@ -1,11 +1,10 @@
 (ns fluree.db.dbfunctions.internal
   (:refer-clojure :exclude [max min get inc dec + - * / == quot mod rem contains? get-in < <= > >=
                             boolean re-find and or count str nth rand nil? empty? hash-set not subs not=])
-  (:require [clojure.tools.reader.edn :as edn]
+  (:require [#?(:cljs cljs.reader :clj clojure.edn) :as edn]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [#?(:cljs cljs.core.async :clj clojure.core.async) :as async]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.dbproto :as dbproto]
