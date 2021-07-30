@@ -19,6 +19,7 @@ figwheel_server.log
 /node_modules
 package-lock.json
 /out/*
+!/out/.gitkeep
 /resources/public/js/compiled
 /cljs-test-runner-out/*
 /pom.xml

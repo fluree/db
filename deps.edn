@@ -35,6 +35,7 @@
          org.bouncycastle/bcprov-jdk15on   {:mvn/version "1.69"}}
 
  :paths ["src" "resources"]
+
  :aliases
  {:mvn/group-id com.fluree
   :mvn/artifact-id db
