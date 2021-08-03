@@ -286,7 +286,8 @@
     (reduce-kv
       (fn [acc k v]
         (let [pred (str collection-name "/" k)]
-          (if-let [p-map (build-predicate-map db pred)]
+          (if-let [p-map (or (build-predicate-map db pred)
+                             (build-predicate-map db k))]
             (assoc acc (:p p-map) (merge p-map v))
             acc)))
       nil ns-lookup-spec-map)))
@@ -340,10 +341,10 @@
     ;; when schema is at a newer version, reset cache (version is 't' and negative, so decreases with newer)
     (when (< schema-version (:version @select-cache))
       (reset! select-cache {:version schema-version}))
-    (or (get @select-cache [schema-version select opts])
+    (or (get @select-cache [schema-version select (dissoc opts :fuel)]) ;; :fuel is a volatile! and will be different every time, exclude from cache lookup
         (let [select-smt  (parse select opts)
               select-smt* (assoc select-smt :select (parse-db* db (:select select-smt)))]
-          (swap! select-cache assoc [schema-version select opts] select-smt*)
+          (swap! select-cache assoc [schema-version select (dissoc opts :fuel)] select-smt*)
           select-smt*))))
 
 

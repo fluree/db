@@ -8,10 +8,10 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [clojure.set :as set]
             [fluree.db.query.analytical :as analytical]
-            [fluree.db.query.schema :as schema]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try into? merge-into?]])
+            [fluree.db.util.async :refer [<? go-try into? merge-into?]]
+            [fluree.db.constants :as const])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -149,9 +149,13 @@
                                                   true ((fn [n] (flakes->res db cache fuel max-fuel {:wildcard? true} n)))))
                                      offset-map]))
 
-                                ;; if a ref, put out an {:_id ...}
+                                ;; if a ref, put out an {:_id ...}, if @type expand into IRI
                                 ref?
-                                [{:_id (.-o flake)} offset-map]
+                                (if (= const/$rdf:type (:p pred-spec'))
+                                  [(or (get-in db [:schema :pred (.-o flake) :iri])
+                                       {:_id (.-o flake)})
+                                   offset-map]
+                                  [{:_id (.-o flake)} offset-map])
 
                                 ;; else just output value
                                 :else
@@ -960,7 +964,7 @@
           ;; all other queries
           (go-try
             (let [select-smt   (or select selectOne selectDistinct
-                                   (throw (ex-info "Query missing :select or :selectOne." {:status 400 :error :db/invalid-query})))
+                                   (throw (ex-info "Query missing select, selectOne or selectDistinct." {:status 400 :error :db/invalid-query})))
                   {:keys [orderBy limit component offset]} opts'
                   select-spec  (parse-db db select-smt opts')
                   select-spec' (if (not (nil? component))

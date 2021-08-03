@@ -4,17 +4,24 @@
             #?(:clj [clojure.java.io :as io])
             [clojure.string :as str]
             [fluree.db.util.json :as json]
-            [fluree.db.util.core :as util])
+            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [clojure.edn :as edn])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 ;; utilities related to iris, prefixes, expansion and compaction
 
 (defn parse-prefix
   [s]
-  (let [[_ prefix rest] (re-find #"([^:]+):(.+)" s)]
-    (if (nil? prefix)
-      nil
-      [prefix rest])))
+  (try*
+    (let [[_ prefix rest] (re-find #"([^:]+):(.+)" s)]
+      (if (nil? prefix)
+        nil
+        [prefix rest]))
+    (catch* e
+            (log/warn (str "Error attempting to parse iri: " s))
+            (throw e))))
 
 
 (defn system-context
@@ -28,11 +35,20 @@
                        iri    (some #(when (= const/$_prefix:iri (.-p %))
                                        (.-o %)) p-flakes)]
                    (if (and prefix iri)
-                     (assoc-in acc [prefix :id] iri)
+                     (assoc-in acc [prefix :iri] iri)
                      acc))) {})))
 
+(defn internalize-context
+  "Takes a standard JSON context and does some validation, turns
+  key parts that are frequently used/looked up (like @id) into keywords (like :id)"
+  [ctx]
+  (reduce-kv (fn [acc k v]
+               (assoc acc k (if (map? v)
+                              (assoc v :iri (get v "@id")
+                                       :type (get v "@type"))
+                              {:iri v})))
+             {} ctx))
 
-(declare expanded-context)
 
 (def ^:const context-dir "contexts/")
 
@@ -43,15 +59,17 @@
   ([context-iri throw?]
    #?(:cljs (throw (ex-info (str "Loading external contexts is not supported in JS Fluree at this point.")
                             {:status 400 :error :db/invalid-context}))
-      :clj  (let [path    (second (str/split context-iri #"://")) ;; remove i.e. http://, or https://
-                  context (some-> (str context-dir path ".json")
-                                  io/resource
-                                  slurp)]
+      :clj  (let [path     (second (str/split context-iri #"://")) ;; remove i.e. http://, or https://
+                  edn-ctx  (some-> (str context-dir path ".edn")
+                                   io/resource
+                                   slurp)
+                  json-ctx (when-not edn-ctx
+                             (some-> (str context-dir path ".json")
+                                     io/resource
+                                     slurp))]
               (cond
-                context (-> context
-                            (json/parse false)
-                            (get "@context"))
-
+                edn-ctx (edn/read-string edn-ctx)           ;; we already convert edn contexts
+                json-ctx (-> json-ctx (json/parse false) (get "@context") internalize-context)
                 throw? (throw (ex-info (str "External context is not registered with Fluree: " context-iri
                                             ". You could supply the context map from the URL directly "
                                             "in your transaction and try again.")
@@ -68,26 +86,21 @@
   also be defined as {'pfx': {'@id': 'http://blah.com/ns#'}, ...}. This normalizes
   the map so lookups can be consistent."
   [context]
-  (let [context* (cond
-                   (map? context)
-                   context
+  (cond
+    (map? context)
+    (internalize-context context)
 
-                   (string? context)
-                   (load-external context true)
+    (string? context)
+    (load-external context true)
 
-                   (vector? context)
-                   (->> context
-                        (mapv #(load-external % true))
-                        (apply merge-with util/deep-merge))
+    (vector? context)
+    (->> context
+         (mapv #(load-external % true))
+         (apply merge-with util/deep-merge))
 
-                   :else
-                   (throw (ex-info (str "Unrecognized context provided: " context ".")
-                                   {:status 400 :error :db/invalid-context})))]
-    (reduce-kv (fn [acc k v]
-                 (assoc acc k (if (map? v)
-                                (assoc v :id (get v "@id"))
-                                {:id v})))
-               {} context*)))
+    :else
+    (throw (ex-info (str "Unrecognized context provided: " context ".")
+                    {:status 400 :error :db/invalid-context}))))
 
 
 (defn expanded-context
@@ -103,21 +116,35 @@
        (fn [acc prefix prefix-map]
          (if (= \@ (first prefix))
            (dissoc acc prefix)
-           (let [iri         (:id prefix-map)
+           (let [iri         (:iri prefix-map)
                  sub-context (when-let [ctx (get prefix-map "@context")]
                                (expanded-context ctx (merge default-context acc)))
-                 [val-prefix rest] (parse-prefix iri)
+                 [val-prefix rest] (try* (parse-prefix iri)
+                                         (catch* e (throw (ex-info (str "While expanding context, error parsing prefix: " prefix prefix-map)
+                                                                   {:status     500
+                                                                    :error      :db/unexpected-error
+                                                                    :prefix-map prefix-map}))))
                  iri*        (if-let [expanded-prefix (or (get-in context* [val-prefix :id])
                                                           (get default-context val-prefix))]
                                (str expanded-prefix rest)
                                iri)]
              (assoc acc prefix (assoc prefix-map
-                                 :id iri*
+                                 :iri iri*
                                  :prefix prefix
                                  :context sub-context
-                                 :type (get prefix-map "@type")
                                  :container (get prefix-map "@container"))))))
        {} context*))))
+
+
+(defn item-ctx
+  "If a compact-iri resolves to something in the context, returns the context map
+  for that specific item."
+  [compact-iri context]
+  (or (get context compact-iri)                             ;; first try compact-iri without parsing
+      (when-let [[prefix rest] (parse-prefix compact-iri)]
+        (when-let [sub-ctx (get context prefix)]
+          ;; if prefix has an entry in the context, update the :iri to include the new full IRI
+          (assoc sub-ctx :iri (str (:iri sub-ctx) rest))))))
 
 
 (defn expand
@@ -125,13 +152,9 @@
 
   If the iri is not compacted, returns original iri string."
   [compact-iri context]
-  (let [[prefix rest] (parse-prefix compact-iri)
-        expanded (when prefix
-                   (when-let [p-iri (get-in context [prefix :id])]
-                     (str p-iri rest)))]
-    (or expanded                                            ;; use expanded if avail
-        (get-in context [compact-iri :id])                  ;; try to see if entire name is in context
-        compact-iri)))                                      ;; no matches, return original name
+  (or (:iri (item-ctx compact-iri context))
+      ;; no matches, return original name
+      compact-iri))
 
 
 (defn expand-db
