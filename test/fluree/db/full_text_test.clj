@@ -30,4 +30,6 @@
                       (is (= "baz" (:1001 subject-under-test))
                           "the updated predicate can be retrieved")
                       (is (= "bar" (:1002 subject-under-test))
-                          "unchanged predicates are retained"))))))))))))
+                          "unchanged predicates are retained")
+                      (is (not (-> subject-under-test vals set (contains? "foo")))
+                          "previous predicate values are not retained"))))))))))))
