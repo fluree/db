@@ -115,11 +115,12 @@
                        close]
   #?@(:clj
       [full-text/IndexConnection
-       (open-storage [conn network dbid lang]
-                     (-> conn
-                         :meta
-                         :file-storage-path
-                         (full-text/disk-index network dbid lang)))]))
+       (open-storage [{:keys [storage-type] :as conn} network dbid lang]
+                     (when (= storage-type :file)
+                       (-> conn
+                           :meta
+                           :file-storage-path
+                           (full-text/disk-index network dbid lang))))]))
 
 
 (defn- normalize-servers
