@@ -7,10 +7,10 @@
     "source-map-support": "^0.5.19"
   },
   "devDependencies": {
-    "karma": "^5.1.1",
+    "karma": "^6.3.4",
     "karma-chrome-launcher": "^3.1.0",
     "karma-cljs-test": "^0.1.0",
-    "webpack": "^4.44.1",
+    "webpack": "^5.44.0",
     "webpack-cli": "^3.3.12"
   },
   "browserslist": {

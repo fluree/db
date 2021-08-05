@@ -10,6 +10,7 @@
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
             #?(:clj [fluree.crypto :as crypto])
+            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.xhttp :as xhttp]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try channel?]]
@@ -133,8 +134,16 @@
        (fn [_]
          (storage/resolve-index-node conn node
                                      (fn []
-                                       (object-cache [id tempid] nil))))))))
+                                       (object-cache [id tempid] nil)))))))
 
+  #?@(:clj
+      [full-text/IndexConnection
+       (open-storage [{:keys [storage-type] :as conn} network dbid lang]
+                     (when (= storage-type :file)
+                       (-> conn
+                           :meta
+                           :file-storage-path
+                           (full-text/disk-index network dbid lang))))]))
 
 (defn- normalize-servers
   "Split servers in a string into a vector.

@@ -328,8 +328,8 @@
                                          (assoc acc partition c-props
                                                     c-name c-props)))
                                      ;; put in defaults for _tx
-                                     {-1    {:name "_tx" :id -1 :sid -1}
-                                      "_tx" {:name "_tx" :id -1 :sid -1}}))
+                                     {-1    {:name "_tx" :id -1 :sid -1 :partition -1 :spec nil :specDoc nil}
+                                      "_tx" {:name "_tx" :id -1 :sid -1 :partition -1 :spec nil :specDoc nil}}))
           [pred fullText] (->> predicate-flakes
                                (partition-by #(.-s %))
                                (reduce (fn [[pred fullText] pred-flakes]
