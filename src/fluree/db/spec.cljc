@@ -82,7 +82,16 @@
 
 
              (= base-spec "float")
-             (if (number? object) (float object) (error))
+             (cond
+               (number? object)
+               (float object)
+
+               (string? object)
+               #?(:clj  (Float/parseFloat object)
+                  :cljs (js/parseFloat object))
+
+               :else
+               (error))
 
              ;; Doubles can exceed what JavaScript/JSON supports, so we allow them to come over as a string.
              (= base-spec "double")
