@@ -37,10 +37,10 @@
   [db idx match]
   (let [[p1 p2 p3 t op m] match]
     (case idx
-      :spot [p1 (dbproto/-p-prop db :id p2) p3 t op m]
-      :psot [p2 (dbproto/-p-prop db :id p1) p3 t op m]
-      :post [p3 (dbproto/-p-prop db :id p1) p2 t op m]
-      :opst [p3 (dbproto/-p-prop db :id p2) p1 t op m])))
+      :spot [p1 (pred-id-strict db p2) p3 t op m]
+      :psot [p2 (pred-id-strict db p1) p3 t op m]
+      :post [p3 (pred-id-strict db p1) p2 t op m]
+      :opst [p3 (pred-id-strict db p2) p1 t op m])))
 
 
 
