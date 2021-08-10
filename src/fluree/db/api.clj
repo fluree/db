@@ -1095,7 +1095,7 @@
 ;; ======================================
 
 (defn db
-  "Returns a queryable database from the connection for the specified ledger."
+  "Returns an immutable queryable database value from the connection for the specified ledger."
   ([conn ledger]
    (session/db conn ledger nil))
   ([conn ledger opts]
