@@ -101,9 +101,7 @@
 
 
 (defn tx->command
-  "INTERNAL USE ONLY
-
-  Helper function to fill out the parts of the transaction that are incomplete,
+  "Helper function to fill out the parts of the transaction that are incomplete,
   producing a signed command.
 
   Optional opts is a map with the following keys. If not provided,
