@@ -1,35 +1,30 @@
 (ns fluree.db.api
   (:gen-class)
   (:refer-clojure :exclude [range])
-  (:require [clojure.string :as str]
-            [fluree.db.connection :as connection]
-            [fluree.db.session :as session]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.graphdb :as graphdb]
-            [fluree.db.permissions :as permissions]
-            [fluree.db.auth :as auth]
-            [fluree.db.api.query :as query-api]
-            [fluree.db.api.ledger :as ledger-api]
-            [fluree.db.query.block :as query-block]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.query.fql :as fql]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.util.json :as json]
-            [fluree.db.util.core :as util]
-            [fluree.db.operations :as ops]
+            [fluree.db.api.auth :as auth-api]
+            [fluree.db.api.ledger :as ledger-api]
+            [fluree.db.api.query :as query-api]
+            [fluree.db.connection :as connection]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
+            [fluree.db.graphdb :as graphdb]
+            [fluree.db.operations :as ops]
+            [fluree.db.query.block :as query-block]
+            [fluree.db.query.fql :as fql]
             [fluree.db.query.graphql-parser :as graphql]
-            [fluree.db.time-travel :as time-travel]
+            [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql-parser :as sparql]
             [fluree.db.query.sql :as sql]
-            [fluree.db.util.async :refer [<? <?? go-try channel?]]
-            [fluree.db.flake :as flake]
+            [fluree.db.session :as session]
+            [fluree.db.time-travel :as time-travel]
+            [fluree.db.util.async :refer [<? channel? go-try]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log])
-  (:import (java.util UUID)))
-
-
-
+  (:import java.util.UUID))
 
 ;; ======================================
 ;;
@@ -52,88 +47,50 @@
 
 
 (defn sign
-  "INTERNAL USE ONLY
-
-  Returns a signature for a message given provided private key."
+  "DEPRECATED: use fluree.db.api.auth/sign instead."
   [message private-key]
-  (crypto/sign-message message private-key))
+  (log/warn "sign DEPRECATED - use fluree.db.api.auth/sign instead")
+  (auth-api/sign message private-key))
 
 
 (defn public-key-from-private
-  "INTERNAL USE ONLY
-
-  Returns a public key given a private key."
-  [private-key] (crypto/pub-key-from-private private-key))
+  "DEPRECATED: use fluree.db.api.auth/public-key-from-private instead."
+  [private-key]
+  (log/warn "public-key-from-private DEPRECATED - use fluree.db.api.auth/public-key-from-private instead")
+  (auth-api/public-key-from-private private-key))
 
 
 (defn public-key
-  "INTERNAL USE ONLY
-
-  Returns a public key from a message and a signature."
-  [message signature] (crypto/pub-key-from-message message signature))
+  "DEPRECATED: use fluree.db.api.auth/public-key instead."
+  [message signature]
+  (log/warn "public-key DEPRECATED - use fluree.db.api.auth/public-key instead")
+  (auth-api/public-key message signature))
 
 
 (defn new-private-key
-  "INTERNAL USE ONLY
-
-  Generates a new private key, returned in a map along with
-  the public key and account id. Return keys are :public, :private, and :id."
+  "DEPRECATED: use fluree.db.api.auth/new-private-key instead."
   []
-  (let [kp      (crypto/generate-key-pair)
-        account (crypto/account-id-from-private (:private kp))]
-    (assoc kp :id account)))
+  (log/warn "new-private-key DEPRECATED - use fluree.db.api.auth/new-private-key instead")
+  (auth-api/new-private-key))
 
 
 (defn set-default-key-async
-  "Sets a new default private key for the entire tx-group, network or db level.
-  This will only succeed if signed by the default private key for the tx-group,
-  or if setting for a dbid, either the tx-group or network.
-
-  It will overwrite any existing default private key.
-
-  Returns core async channel that will respond with true or false, indicating success."
+  "DEPRECATED: use fluree.db.api.auth/set-default-key-async instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
   ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
   ([conn network dbid private-key opts]
-   (let [{:keys [nonce expire signing-key]} opts
-         timestamp (System/currentTimeMillis)
-         nonce     (or nonce timestamp)
-         expire    (or expire (+ timestamp 30000)) ;; 5 min default
-         cmd-map   {:type        :default-key
-                    :network     network
-                    :dbid        dbid
-                    :private-key private-key
-                    :nonce       nonce
-                    :expire      expire}
-         cmd       (when signing-key
-                     (-> cmd-map
-                         (util/without-nils)
-                         (json/stringify)))
-         sig       (when signing-key
-                     (crypto/sign-message cmd signing-key))]
-     (if signing-key
-       (ops/command-async conn {:cmd cmd :sig sig})
-       (ops/unsigned-command-async conn cmd-map)))))
+   (log/warn "set-default-key-async DEPRECATED - use fluree.db.api.auth/set-default-key-async instead")
+   (auth-api/set-default-key-async conn network dbid private-key opts)))
 
 (defn set-default-key
-  "Sets a new default private key for the entire tx-group, network or db level.
-  This will only succeed if signed by the default private key for the tx-group,
-  or if setting for a dbid, either the tx-group or network.
-
-  It will overwrite any existing default private key.
-
-  Returns a promise of true or false, indicating success."
+  "DEPRECATED: use fluree.db.api.auth/set-default-key instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
   ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
   ([conn network dbid private-key opts]
-   (let [p (promise)]
-     (async/go
-       (deliver p (async/<! (set-default-key-async conn network dbid private-key opts))))
-     p)))
-
-
+   (log/warn "set-default-key DEPRECATED - use fluree.db.api.auth/set-default-key instead")
+   (auth-api/set-default-key conn network dbid private-key opts)))
 
 (defn account-id
   "INTERNAL USE ONLY
