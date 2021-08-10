@@ -783,21 +783,19 @@
 (defn block-query-async
   "Given a map with a `:block` with a block number value, return a channel that will receive the raw flakes contained in that block.
 
-  Can also specify `:prettyPrint` `true` in the query map to receive the flakes as a map with predicate names."
+  Can also specify `:pretty-print` `true` in the query map to receive the flakes as a map with predicate names."
   [conn ledger query-map]
   (query-api/block-query-async conn ledger query-map))
 
 (defn block-query
   "Given a map with a `:block` with a block number value, return a promise of the raw flakes contained in that block.
 
-  Can also specify `:prettyPrint` `true` in the query map to receive the flakes as a map with predicate names."
+  Can also specify `:pretty-print` `true` in the query map to receive the flakes as a map with predicate names."
   [conn ledger query-map]
   (let [p (promise)]
     (async/go
-      (let [res (block-query-async conn ledger query-map)]
-        (if (channel? res)
-          (deliver p (async/<! res))
-          (deliver p res)))) p))
+      (deliver p (async/<! (block-query-async conn ledger query-map))))
+    p))
 
 (defn get-history-pattern
   "INTERNAL USE ONLY"
@@ -836,14 +834,14 @@
 (defn history-query-async
   "Given a map with a `:history` key that has a subject ident or id, return a channel that will receive the history of that subject.
 
-  Can also specify `:prettyPrint` `true` in the query map to receive the history as a map with predicate names instead of raw flakes."
+  Can also specify `:pretty-print` `true` in the query map to receive the history as a map with predicate names instead of raw flakes."
   [sources query-map]
   (query-api/history-query-async sources query-map))
 
 (defn history-query
   "Given a map with a `:history` key that has a subject ident or id, return a promise of the history of that subject.
 
-  Can also specify `:prettyPrint` `true` in the query map to receive the history as a map with predicate names instead of raw flakes."
+  Can also specify `:pretty-print` `true` in the query map to receive the history as a map with predicate names instead of raw flakes."
   [sources query-map]
   (let [p (promise)]
     (async/go
