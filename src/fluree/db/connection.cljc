@@ -139,11 +139,8 @@
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [{:keys [storage-type] :as conn} network dbid lang]
-                     (when (= storage-type :file)
-                       (-> conn
-                           :meta
-                           :file-storage-path
-                           (full-text/disk-index network dbid lang))))]))
+                     (when-let [path (-> conn :meta :file-storage-path)]
+                       (full-text/disk-index path network dbid lang)))]))
 
 (defn- normalize-servers
   "Split servers in a string into a vector.
