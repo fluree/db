@@ -11,7 +11,8 @@
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try into? merge-into?]]
-            [fluree.db.constants :as const])
+            [fluree.db.constants :as const]
+            [fluree.db.util.iri :as iri-util])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -921,9 +922,10 @@
          tuples)))
 
 (defn- ad-hoc-query
-  [db fuel max-fuel query-map opts]
+  [db fuel max-fuel {:keys [context] :as query-map} opts]
   (go-try
-    (let [where-result (<? (analytical/q query-map fuel max-fuel db opts))]
+    (let [query-map*   (assoc query-map :context (iri-util/query-context context db))
+          where-result (<? (analytical/q query-map* fuel max-fuel db opts))]
       (cond (util/exception? where-result)
             where-result
 

@@ -421,11 +421,11 @@
 ;; Can be: ["?item" "rdf:type" "?collection"] -> but item is already bound. Need forward filtering here...
 
 (defn collection->tuples
-  [db res clause]
+  [db res clause context]
   (go-try (let [subject-var (variable? (first clause))
                 object-var  (variable? (last clause))
                 class-sid   (when subject-var
-                              (iri-util/class-sid (last clause) db))]
+                              (iri-util/class-sid (last clause) db context))]
             (when (or (and subject-var object-var)
                       (and (nil? subject-var) (nil? object-var)))
               (throw (ex-info "When using rdf:type, either a subject or a type (collection) must be specified."
@@ -869,7 +869,7 @@
 
           (and (= 3 (count clause)) (or (= (second clause) "rdf:type")
                                         (= (second clause) "a")))
-          [(<? (collection->tuples db res clause)) r]
+          [(<? (collection->tuples db res clause (:context q-map))) r]
 
           (= 3 (count clause))
           [(<? (fdb-clause->tuples db res clause fuel max-fuel)) r]

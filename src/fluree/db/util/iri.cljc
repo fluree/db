@@ -167,8 +167,8 @@
   "Returns the class subject id (or nil).
   First attempts to expand the class-iri to a full iri.
   If a match exists, returns the subject id for the class."
-  [class-iri db]
-  (let [expanded-iri (expand-db class-iri db)]
+  [class-iri db context]
+  (let [expanded-iri (expand class-iri context)]
     (get-in db [:schema :pred expanded-iri :id])))
 
 
@@ -201,3 +201,11 @@
       (some (fn [match-fn]
               (match-fn iri))
             match-fns))))
+
+
+(defn query-context
+  "Context primarily for use with queries. Merges DB context based on prefix."
+  [ctx db]
+  (let [db-ctx (get-in db [:schema :prefix])]
+    (cond->> db-ctx
+             ctx (merge (expanded-context ctx)))))
