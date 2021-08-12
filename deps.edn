@@ -82,8 +82,7 @@
    :exec-args    {:jar "target/fluree-db.jar"
                   :group-id :mvn/group-id
                   :artifact-id :mvn/artifact-id
-                  :version :mvn/version
-                  :sync-pom true}}
+                  :version :mvn/version}}
 
   :install
   {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
