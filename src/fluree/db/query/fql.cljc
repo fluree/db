@@ -460,36 +460,34 @@
 ;; TODO - this needs to be made somewhat lazy, can pull entire DB easily
 (defn- where-filter
   "Takes a where clause and returns subjects that match."
-  ([db where-clause]
-   (where-filter db where-clause nil))
-  ([db where-clause default-collection]
-   (go-try
-     (let [[op* statements] (parse-where db where-clause default-collection)]
-       (when (not-empty statements)
-         (loop [[smt & r] statements
-                acc #{}]
-           (if-not smt
-             acc
-             (let [[p op match] smt
-                   _    (when (not (valid-where-predicate? db p))
-                          (throw (ex-info (str "Non-indexed predicates are not valid in where clause statements. Provided: " (dbproto/-p-prop db :name p))
-                                          {:status 400
-                                           :error  :db/invalid-query})))
-                   subs (->> (condp identical? op           ;; TODO - apply .-s transducer to index-range once support is there
-                               not= (concat (<? (query-range/index-range db :post > [p match] <= [p]))
-                                            (<? (query-range/index-range db :post >= [p] < [p match])))
-                               = (<? (query-range/index-range db :post = [p match]))
-                               > (<? (query-range/index-range db :post > [p match] <= [p]))
-                               >= (<? (query-range/index-range db :post >= [p match] <= [p]))
-                               < (<? (query-range/index-range db :post >= [p] < [p match]))
-                               <= (<? (query-range/index-range db :post >= [p] <= [p match])) ())
-                             (map s))
-                   acc* (case op*
-                          :or (into acc subs)
-                          :and (set/intersection acc (into #{} subs)))]
-               (if (and (= :and op*) (empty? acc*))
-                 acc*
-                 (recur r acc*))))))))))
+  [db where-clause default-collection]
+  (go-try
+    (let [[op* statements] (parse-where db where-clause default-collection)]
+      (when (not-empty statements)
+        (loop [[smt & r] statements
+               acc #{}]
+          (if-not smt
+            acc
+            (let [[p op match] smt
+                  _    (when (not (valid-where-predicate? db p))
+                         (throw (ex-info (str "Non-indexed predicates are not valid in where clause statements. Provided: " (dbproto/-p-prop db :name p))
+                                         {:status 400
+                                          :error  :db/invalid-query})))
+                  subs (->> (condp identical? op            ;; TODO - apply .-s transducer to index-range once support is there
+                              not= (concat (<? (query-range/index-range db :post > [p match] <= [p]))
+                                           (<? (query-range/index-range db :post >= [p] < [p match])))
+                              = (<? (query-range/index-range db :post = [p match]))
+                              > (<? (query-range/index-range db :post > [p match] <= [p]))
+                              >= (<? (query-range/index-range db :post >= [p match] <= [p]))
+                              < (<? (query-range/index-range db :post >= [p] < [p match]))
+                              <= (<? (query-range/index-range db :post >= [p] <= [p match])) ())
+                            (map s))
+                  acc* (case op*
+                         :or (into acc subs)
+                         :and (set/intersection acc (into #{} subs)))]
+              (if (and (= :and op*) (empty? acc*))
+                acc*
+                (recur r acc*)))))))))
 
 
 (defn parse-map [x valid-var]
@@ -937,6 +935,109 @@
                                                       query-map opts)]
               (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))))
 
+
+(defn- basic-query-multi-subject
+  "Returns list of resolvable subject ids when provided a list of identities"
+  [db identities]
+  (go-try
+    (loop [[ident & r] identities
+           acc []]
+      (if-not ident
+        acc
+        (let [s (<? (dbproto/-subid db ident false))]
+          (recur r (if s (conj acc s) acc)))))))
+
+
+(defn- basic-query-type
+  "Returns a two-tuple of the type of basic query to be executed, and secondly the
+  subject id or ids to be searched for using that particular query type"
+  [db from where fuel]
+  (go-try
+    (cond
+      ;; legacy string where clause - should be the first thing we deprecate and use ad-hoc instead
+      (string? where)
+      (let [default-collection (when (string? from) from)
+            subjects           (<? (where-filter db where default-collection))]
+        (when fuel (vswap! fuel + (count subjects)))
+        [:multi-subject subjects])
+
+      ;; string could be a predicate, collection, or @id subject
+      (string? from)
+      (if (#{"_block" "_tx"} from)
+        [:tx-collection nil]
+        (if-let [cid (dbproto/-c-prop db :id from)]
+          [:collection cid]
+          (if-let [pid (dbproto/-p-prop db :id from)]
+            [:predicate pid]
+            ;; assume this is an @id iri, lookup
+            (let [sid (<? (dbproto/-subid db from false))]
+              (when fuel (vswap! fuel + (count from)))
+              [:subject sid]))))
+
+      ;; single subject ident
+      (util/subj-ident? from)
+      (let [sid (<? (dbproto/-subid db from false))]
+        (when fuel (vswap! fuel inc))
+        [:subject sid])
+
+      ;; multi-subject
+      (and (sequential? from) (every? util/subj-ident? from))
+      (let [subjects (<? (basic-query-multi-subject db from))]
+        (when fuel (vswap! fuel + (count from)))
+        [:multi-subject subjects])
+
+      :else
+      (ex-info (str "Invalid 'from' or 'where' in query:" (or from where))
+               {:status 400 :error :db/invalid-query}))))
+
+
+(defn- basic-query-orderBy
+  "Handles ordering basic query results."
+  [orderBy offset limit results]
+  (let [[sortPred sortOrder] (cond (vector? orderBy) [(second orderBy) (first orderBy)]
+                                   (string? orderBy) [orderBy "ASC"])]
+    (sort-offset-and-limit-res sortPred sortOrder offset limit results)))
+
+
+(defn basic-query
+  "Executes a basic query (not ad-hoc/advanced). Eventually we will probably deprecate basic query.
+  A basic query has a 'from' key in the query, whereas an ad-hoc query has a 'where' key in the query
+  with a vector value."
+  [db fuel max-fuel query-map opts]
+  (go-try
+    (let [{:keys [select selectOne selectDistinct where from]} query-map
+          select-smt   (or select selectOne selectDistinct
+                           (throw (ex-info "Query missing select, selectOne or selectDistinct." {:status 400 :error :db/invalid-query})))
+          {:keys [orderBy limit component offset]} opts
+          select-spec  (parse-db db select-smt opts)
+          select-spec' (if (not (nil? component))
+                         (assoc select-spec :componentFollow? component)
+                         select-spec)
+          cache        (volatile! {})
+          [q-type _ids] (<? (basic-query-type db from where fuel))
+          opts*        (if orderBy
+                         (dissoc opts :limit :offset)
+                         opts)
+          q-result     (case q-type
+                         :collection (let [flakes (<? (query-range/collection db from opts*))]
+                                       (<? (flake-select db cache fuel max-fuel select-spec' flakes)))
+                         :tx-collection (let [flakes (<? (query-range/_block-or_tx-collection db opts*))]
+                                          (<? (flake-select db cache fuel max-fuel select-spec' flakes)))
+                         :predicate (let [xf       (cond-> (map s)
+                                                           fuel (comp (fuel-flake-transducer fuel max-fuel))
+                                                           true (comp (distinct)))
+                                          subjects (->> (<? (query-range/index-range db :psot = [from] opts*))
+                                                        (sequence xf))]
+                                      (<? (subject-select db cache fuel max-fuel select-spec' subjects limit)))
+                         :subject (when _ids
+                                    (<? (subject-select db cache fuel max-fuel select-spec' [_ids] limit offset)))
+                         :multi-subject (<? (subject-select db cache fuel max-fuel select-spec' _ids (:limit opts*) (:offset opts*))))
+          take-one?    (and selectOne (coll? q-result) (not (util/exception? q-result)))]
+      (cond->> q-result
+               orderBy (basic-query-orderBy orderBy offset limit)
+               take-one? first))))
+
+
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
@@ -964,80 +1065,4 @@
           ;; ad-hoc query
           (ad-hoc-query db fuel max-fuel query-map opts')
           ;; all other queries
-          (go-try
-            (let [select-smt   (or select selectOne selectDistinct
-                                   (throw (ex-info "Query missing select, selectOne or selectDistinct." {:status 400 :error :db/invalid-query})))
-                  {:keys [orderBy limit component offset]} opts'
-                  select-spec  (parse-db db select-smt opts')
-                  select-spec' (if (not (nil? component))
-                                 (assoc select-spec :componentFollow? component)
-                                 select-spec)
-                  cache        (volatile! {})
-                  [sortPred sortOrder] (if orderBy (cond (vector? orderBy) [(second orderBy) (first orderBy)]
-                                                         (string? orderBy) [orderBy "ASC"]
-                                                         :else [nil nil])
-                                                   [nil nil])
-                  result       (cond
-                                 (string? where)
-                                 (let [default-collection (when (string? from) from)
-                                       subjects           (<? (where-filter db where default-collection))]
-                                   (<? (subject-select db cache fuel max-fuel select-spec'
-                                                       subjects (if orderBy nil limit) (if orderBy nil offset))))
-
-                                 ;; predicate-based query
-                                 (and (string? from) (str/includes? #?(:clj from :cljs (str from)) "/"))
-                                 (let [xf       (cond-> (map s)
-                                                        fuel (comp (fuel-flake-transducer fuel max-fuel))
-                                                        true (comp (distinct)))
-                                       opts     (if orderBy {} {:limit limit :offset offset})
-                                       subjects (->> (<? (query-range/index-range db :psot = [from] opts))
-                                                     (sequence xf))]
-                                   (<? (subject-select db cache fuel max-fuel select-spec' subjects limit)))
-
-
-                                 ;; collection-based query -> _block or _tx
-                                 (and (string? from) (#{"_block" "_tx"} from))
-                                 (let [opts   (if orderBy {} {:limit limit :offset offset})
-                                       flakes (<? (query-range/_block-or_tx-collection db opts))]
-                                   (<? (flake-select db cache fuel max-fuel select-spec' flakes)))
-
-                                 ;; collection-based query
-                                 (string? from)
-                                 (let [opts              (if orderBy {} {:limit limit :offset offset})
-                                       collection-flakes (<? (query-range/collection db from opts))]
-                                   (<? (flake-select db cache fuel max-fuel select-spec' collection-flakes)))
-
-                                 ;; single subject _id provided
-                                 (util/subj-ident? from)
-                                 (let [subjects (some-> (<? (dbproto/-subid db from false))
-                                                        (vector))
-                                       res      (<? (subject-select db cache fuel max-fuel select-spec' subjects limit offset))]
-                                   (when fuel (vswap! fuel inc)) ;; charge 1 for the lookup
-                                   res)
-
-                                 ;; multiple subject ids provided
-                                 (and (sequential? from) (every? util/subj-ident? from))
-                                 (let [subjects (loop [[n & r] from
-                                                       acc []]
-                                                  (if-not n
-                                                    acc
-                                                    (let [s    (if (int? n)
-                                                                 n
-                                                                 (do (when fuel (vswap! fuel inc))
-                                                                     (<? (dbproto/-subid db n false))))
-                                                          acc* (if s
-                                                                 (conj acc s)
-                                                                 acc)]
-                                                      (recur r acc*))))
-                                       subjects (into [] subjects)]
-                                   (<? (subject-select db cache fuel max-fuel select-spec' subjects (if orderBy nil limit) (if orderBy nil offset))))
-
-                                 :else
-                                 (ex-info (str "Invalid 'from' in query:" (pr-str query-map))
-                                          {:status 400 :error :db/invalid-query}))
-                  res          (if sortPred
-                                 (sort-offset-and-limit-res sortPred sortOrder offset limit result)
-                                 result)]
-              (if (and selectOne (coll? res) (not (util/exception? res)))
-                (first res)
-                res))))))))
+          (basic-query db fuel max-fuel query-map opts'))))))
