@@ -95,19 +95,19 @@
    :dbid dbid
    :id :empty
    :leaf true
-   :floor flake/maximum
-   :ciel nil
+   :first flake/maximum
+   :rhs nil
    :size 0
    :block 0
    :t 0
    :leftmost? true})
 
 (defn child-entry
-  [{:keys [floor] :as node}]
-  [floor node])
+  [{:keys [first] :as node}]
+  [first node])
 
 (defn child-map
-  "Returns avl sorted map whose keys are the floor flakes of the index node
+  "Returns avl sorted map whose keys are the first flakes of the index node
   sequence `child-nodes`, and whose values are the corresponding nodes from
   `child-nodes`."
   [cmp & child-nodes]
@@ -126,8 +126,8 @@
      :dbid dbid
      :id :empty
      :leaf false
-     :floor flake/maximum
-     :ciel nil
+     :first flake/maximum
+     :rhs nil
      :children children
      :size 0
      :block 0
@@ -184,22 +184,22 @@
   (t-range t t flakes))
 
 (defn novelty-subrange
-  [{:keys [floor ciel leftmost?] :as node} through-t novelty]
+  [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]
   (let [subrange (cond
                    ;; standard case.. both left and right boundaries
-                   (and ciel (not leftmost?))
-                   (avl/subrange novelty > floor <= ciel)
+                   (and rhs (not leftmost?))
+                   (avl/subrange novelty > first-flake <= rhs)
 
                    ;; right only boundary
-                   (and ciel leftmost?)
-                   (avl/subrange novelty <= ciel)
+                   (and rhs leftmost?)
+                   (avl/subrange novelty <= rhs)
 
                    ;; left only boundary
-                   (and (nil? ciel) (not leftmost?))
-                   (avl/subrange novelty > floor)
+                   (and (nil? rhs) (not leftmost?))
+                   (avl/subrange novelty > first-flake)
 
                    ;; no boundary
-                   (and (nil? ciel) leftmost?)
+                   (and (nil? rhs) leftmost?)
                    novelty)]
     (flakes-through through-t subrange)))
 
@@ -207,7 +207,7 @@
   "Find the value of `leaf` at transaction `t` by adding new flakes from
   `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later
   than `t` from `leaf` if `t` is older than `leaf`."
-  [{:keys [ciel leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty]
+  [{:keys [rhs leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty]
   (if (= leaf-t t)
     leaf
     (cond-> leaf

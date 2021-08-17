@@ -10,11 +10,11 @@
   (assoc block :flakes (mapv flake/parts->Flake (:flakes block))))
 
 (defn- deserialize-child-node
-  "Turns :floor and :ciel into flakes"
+  "Turns :first and :rhs into flakes"
   [child-node]
   (assoc child-node
-         :floor (some-> child-node :floor flake/parts->Flake)
-         :ciel  (some-> child-node :ciel flake/parts->Flake)))
+         :first (some-> child-node :floor flake/parts->Flake)
+         :rhs  (some-> child-node :rhs flake/parts->Flake)))
 
 (defn- deserialize-db-root
   [db-root]
@@ -30,7 +30,7 @@
 (defn- deserialize-branch-node
   [branch]
   (assoc branch :children (mapv deserialize-child-node (:children branch))
-         :ciel (some-> (:ciel branch)
+         :rhs (some-> (:rhs branch)
                        (flake/parts->Flake))))
 
 

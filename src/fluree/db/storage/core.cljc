@@ -108,7 +108,7 @@
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
   [child]
-  (select-keys child [:id :leaf :floor :ciel :size]))
+  (select-keys child [:id :leaf :first :rhs :size]))
 
 (defn write-leaf
   "Computes a new unique id for `leaf` and writes it to storage under that id.
@@ -140,8 +140,8 @@
          child-vals    (->> children
                             (map val)
                             (mapv child-data))
-         floor         (->> child-vals first :floor)
-         ciel          (->> child-vals rseq first :ciel)
+         first-flake         (->> child-vals first :first)
+         rhs          (->> child-vals rseq first :rhs)
          data          {:children child-vals}]
      (<? (write-branch-data conn branch-id data))
      (assoc branch :id branch-id))))
@@ -281,7 +281,7 @@
                                                                      (zero? i)))
                                               (merge child)))
                                         children)
-           child-entries   (mapcat (juxt :floor identity)
+           child-entries   (mapcat (juxt :first identity)
                                    child-attrs)]
        (apply avl/sorted-map-by comparator child-entries))
      (throw (ex-info (str "Unable to retrieve index branch with id "

@@ -20,13 +20,13 @@
                                (swap! count-atom + node-count)
                                (conj str-vec (str ":" (.-block index) "-" node-count)))
                              str-vec)
-        floor        ^Flake (:floor index)
+        first-flake        ^Flake (:first index)
         main-str           (apply str str-vec)
         addl-indent        (if (neg? (- indent-floor (count main-str)))
                              " "
                              (apply str (repeat (- indent-floor (count main-str)) " ")))
         str-vec            [main-str addl-indent]
-        str-vec            (conj str-vec (str (.-s floor) "-" (.-p floor) " "))
+        str-vec            (conj str-vec (str (.-s first-flake) "-" (.-p first-flake) " "))
         str-vec            (conj str-vec (pr-str pos-idx))]
     (println (apply str str-vec))
     (when (index/index-node? index)

@@ -102,7 +102,7 @@
             (let [next-node     (<! (index/lookup-leaf conn root-node next-flake))
                   resolved-node (<! (index/resolve conn next-node))]
               (when (>! out resolved-node)
-                (recur (:ciel resolved-node))))
+                (recur (:rhs resolved-node))))
             (async/close! out)))))
     out))
 
