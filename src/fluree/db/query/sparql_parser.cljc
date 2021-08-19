@@ -86,7 +86,7 @@
           (str/starts-with? source "wd")
           (let [predicate (if (str/starts-with? predicate "?")
                             predicate
-                            name)]
+                            (str source ":" predicate))]
             ["$wd" predicate])
 
           (= source "fullText")
@@ -231,7 +231,7 @@
                         {:status 400
                          :error  :db/invalid-query}))))
 
-(def supported-path-mod #{"+","*"})
+(def supported-path-mod #{"+"})
 
 (defn handle-path-mod
   [mod]
