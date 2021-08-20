@@ -3,7 +3,7 @@
             [clojure.java.io :as io]
             [clojure.edn :as edn]
             [clojure.string :as str])
-  (:import (java.io PushbackReader))
+  (:import (java.io PushbackReader Closeable))
   (:gen-class))
 
 (set! *warn-on-reflection* true)
@@ -43,7 +43,7 @@
 (defn deps-edn []
   (let [deps-edn-file (io/file "deps.edn")]
     (when (.exists deps-edn-file)
-      (with-open [deps-edn-rdr (-> deps-edn-file io/reader PushbackReader.)]
+      (with-open [^Closeable deps-edn-rdr (-> deps-edn-file io/reader PushbackReader.)]
         (edn/read deps-edn-rdr)))))
 
 
