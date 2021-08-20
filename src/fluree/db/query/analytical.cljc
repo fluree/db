@@ -13,7 +13,8 @@
             [clojure.string :as str]
             [fluree.db.util.log :as log]
             #?(:cljs [cljs.reader])
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto])
+  #?(:clj (:import (java.io Closeable))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -388,7 +389,7 @@
              (let [lang (-> db :settings :language (or :default))
                    [var search search-param] clause
                    var (variable? var)]
-               (with-open [store (full-text/open-storage conn network dbid lang)]
+               (with-open [^Closeable store (full-text/open-storage conn network dbid lang)]
                  (full-text/search db store [var search search-param]))))))
 
 
