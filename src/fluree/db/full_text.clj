@@ -3,15 +3,13 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.full-text.block-registry :as block-registry]
-            [clojure.edn :as edn]
-            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :refer [keywordize-keys]]
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
             [clucie.store :as lucene-store])
   (:import (fluree.db.flake Flake)
-           (java.io File Closeable)
+           (java.io Closeable)
            (org.apache.lucene.analysis Analyzer)
            (org.apache.lucene.analysis.en EnglishAnalyzer)
            (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
@@ -23,7 +21,7 @@
            (org.apache.lucene.analysis.bn BengaliAnalyzer)
            (org.apache.lucene.analysis.br BrazilianAnalyzer)
            (org.apache.lucene.analysis.fr FrenchAnalyzer)
-           (org.apache.lucene.index IndexWriter IndexReader)
+           (org.apache.lucene.index IndexWriter)
            (org.apache.lucene.store Directory)))
 
 (set! *warn-on-reflection* true)
