@@ -116,14 +116,6 @@
   [{:keys [storage]}]
   (lucene-store/store-reader storage))
 
-(defn writer->reader
-  ^IndexReader [^IndexWriter w]
-  (-> w .getDirectory reader))
-
-(defn writer->storage-path
-  [^IndexWriter w]
-  (-> w .getDirectory .toString))
-
 (defn get-subject
   [{:keys [analyzer] :as idx} subj-id]
   (let [subj-id  (str subj-id)]
@@ -154,18 +146,6 @@
                          (into {}))
           map-keys  (keys purge-map)]
       (lucene/update! wrtr purge-map map-keys :_id id))))
-
-(defn block-registry-file
-  [writer]
-  (let [parent (writer->storage-path writer)
-        path   (str/join "/" [parent "block_registry.edn"])]
-    (io/as-file path)))
-
-(defn read-block-registry
-  [writer]
-  (let [^File registry-file (block-registry-file writer)]
-    (when (.exists registry-file)
-      (-> registry-file slurp edn/read-string))))
 
 (defn register-block
   [{:keys [block-registry]} _wrtr block-status]
