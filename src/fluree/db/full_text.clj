@@ -119,7 +119,7 @@
 (defn get-subject
   [{:keys [analyzer] :as idx} subj-id]
   (let [subj-id  (str subj-id)]
-    (with-open [rdr (reader idx)]
+    (with-open [^Closeable rdr (reader idx)]
       (-> rdr
           (lucene/search {:_id subj-id} 1 analyzer 0 1)
           first))))
