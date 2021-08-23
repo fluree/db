@@ -1,7 +1,8 @@
 (ns fluree.db.spec
   (:require [fluree.db.util.json :as json]
             [alphabase.core :as alphabase]
-            [fluree.db.util.core :as util :refer [try* catch*]]))
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [clojure.string :as str]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -41,9 +42,9 @@
          (if (nil? object) object (error))
 
          (string? spec)
-         (let [optional  (.endsWith ^String spec "?")
+         (let [optional  (str/ends-with? spec "?")
                base-spec (if optional
-                           (subs spec 0 (dec (.length ^String spec)))
+                           (subs spec 0 (dec (count spec)))
                            spec)]
            (cond
              (and optional (nil? object))
