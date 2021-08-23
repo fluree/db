@@ -579,7 +579,7 @@
           (if (or (nil? socket)
                   (util/exception? socket))
             (do
-              (log/error "Cannot establish connection to a healthy server, disconnecting. Error:" socket)
+              (log/error socket "Cannot establish connection to a healthy server, disconnecting.")
               (async/close! conn))
             ;; kick off consumer
             (msg-consumer conn)))))
