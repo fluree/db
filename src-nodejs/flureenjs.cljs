@@ -47,13 +47,13 @@
 ;; -- Implement *eval*       --
 ;; ----------------------------
 ;; https://stackoverflow.com/questions/47177243/clojure-dynamic-binding-read-string-and-eval-unable-to-resolve-symbol
-(defn init-state [state]
+(defn -init-state [state]
   (assoc-in state [:cljs.analyzer/namespaces 'fluree.db.dbfunctions.fns]
             (analyzer-state 'fluree.db.dbfunctions.fns)))
 
-(def nj-state (cljs.js/empty-state init-state))
+(def -ns-state (cljs.js/empty-state -init-state))
 
-(let [st nj-state]
+(let [st -ns-state]
   (set! *eval*
         (fn [form]
           (let [result   (atom {:result nil})
@@ -79,10 +79,10 @@
 
 
 ;; define your app data so that it doesn't get over-written on reload
-(defonce app-state (atom {:product "Fluree NodeJs Library"
-                          :version "v1.0.0-rc21"}))
+(defonce -app-state (atom {:product "Fluree NodeJs Library"
+                           :version "v1.0.0-rc21"}))
 
-(println (:product @app-state) (:version @app-state))
+(println (:product @-app-state) (:version @-app-state))
 
 
 ;; ======================================
@@ -90,7 +90,7 @@
 ;; Get handle to Node.js crypto module
 ;;
 ;; ======================================
-(def ^:const njs-crypto
+(def ^:const -njs-crypto
   (try
     (js/require "crypto")
     (catch :default ex
@@ -100,8 +100,6 @@
         nil))))
 
 
-(declare db-instance)
-
 ;; ======================================
 ;;
 ;; Support logging at different levels
@@ -110,7 +108,7 @@
 (log/set-level! :warning)                                   ;; default to log only warnings or errors
 ;(def ^:export logging-levels log/levels)
 
-(defn ^:export set-logging
+(defn ^:export setLogging
   "Configure logging for Fluree processes.  Supported options:
   1. level [Values: severe, warning, info, config, fine, finer, finest]
   "
@@ -125,32 +123,34 @@
 ;; Auth-related
 ;;
 ;; ======================================
-(defn ^:export account-id
+(defn ^:export accountId
   "Returns account id from either a public key or message and signature."
   ([public-key] (crypto/account-id-from-public public-key))
   ([message signature] (crypto/account-id-from-message message signature)))
 
 
-(defn ^:export http-signature
+(defn ^:export httpSignature
   "Takes an http request and creates an http signature using a private key"
-  ([req-method url request private-key] (http-signature req-method url request private-key nil))
+  ([req-method url request private-key] (httpSignature req-method url request private-key nil))
   ([req-method url request private-key auth]
    (-> request
        js->clj
        (as-> request (http-signatures/sign-request req-method url request private-key auth)))))
 
 
-(defn ^:export public-key-from-private
+(defn ^:export publicKeyFromPrivate
   "Returns a public key given a private key."
-  [private-key] (crypto/pub-key-from-private private-key))
+  [private-key]
+  (crypto/pub-key-from-private private-key))
 
 
-(defn ^:export public-key
+(defn ^:export publicKey
   "Returns a public key from a message and a signature."
-  [message signature] (crypto/pub-key-from-message message signature))
+  [message signature]
+  (crypto/pub-key-from-message message signature))
 
 
-(defn- generate-key-pair
+(defn- -generate-key-pair
   "Generates a private-public key pair using the Node.js
   crypto module. The JavaScript code looks like:
 
@@ -160,22 +160,22 @@
               public:  ecdh.getPublicKey('hex','compressed')};
   "
   []
-  (if njs-crypto
-    (let [ecdh      (js-invoke njs-crypto "createECDH" "secp256k1")
+  (if -njs-crypto
+    (let [ecdh      (js-invoke -njs-crypto "createECDH" "secp256k1")
           _         (js-invoke ecdh "generateKeys")]
       {:private (js-invoke ecdh "getPrivateKey" "hex")
        :public (js-invoke ecdh "getPublicKey" "hex" "compressed")})
     (throw "Node.js crypto module not accessible")))
 
 
-(defn ^:export new-private-key
+(defn ^:export newPrivateKey
   "Generates a new private key, returned in a map along with
   the public key and account id. Return keys are :public,
   :private, and :id.
   "
   []
   (try
-    (let [kp      (generate-key-pair)
+    (let [kp      (-generate-key-pair)
           account (crypto/account-id-from-private (:private kp))]
       (assoc kp :id account))
     (catch :default e
@@ -189,7 +189,7 @@
   (crypto/sign-message message private-key))
 
 
-(defn ^:export set-default-key
+(defn ^:export setDefaultKey
   "Sets a new default private key for the entire tx-group, network or db level.
   This will only succeed if signed by the default private key for the tx-group,
   or if setting for a dbid, either the tx-group or network.
@@ -199,9 +199,9 @@
   It will respond with true or false.
 
   Returns promise that eventually contains the results. "
-  ([conn private-key] (set-default-key conn nil nil private-key nil))
-  ([conn network private-key] (set-default-key conn network nil private-key nil))
-  ([conn network dbid private-key] (set-default-key conn network dbid private-key nil))
+  ([conn private-key] (setDefaultKey conn nil nil private-key nil))
+  ([conn network private-key] (setDefaultKey conn network nil private-key nil))
+  ([conn network dbid private-key] (setDefaultKey conn network dbid private-key nil))
   ([conn network dbid private-key opts]
    (js/Promise.
      (fn [resolve reject]
@@ -242,7 +242,7 @@
 ;;
 ;; ======================================
 
-(defn ^:export connect
+(defn ^:export connectSync
   "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
    supplied, separated by commas."
   [servers-string & [opts]]
@@ -251,7 +251,7 @@
       (as-> clj-opts (conn-handler/connect servers-string clj-opts))))
 
 
-(defn ^:export connect-p
+(defn ^:export connect
   "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
    supplied, separated by commas.
    Returns a promise that eventually contains the connection object."
@@ -272,11 +272,11 @@
 ;; Login Operations
 ;;
 ;; ======================================
-(defn ^:export password-generate
+(defn ^:export passwordGenerate
   "Attempts to generate a new user auth record account.
 
   Returns a promise that eventually contains the token or an exception."
-  ([conn ledger password user] (password-generate conn ledger password user nil))
+  ([conn ledger password user] (passwordGenerate conn ledger password user nil))
   ([conn ledger password user opts]
    (-> opts
        (js->clj :keywordize-keys true)
@@ -284,7 +284,7 @@
        (as-> data (conn-handler/password-generate conn ledger password data)))))
 
 
-(defn ^:export password-login
+(defn ^:export passwordLogin
   "Returns a JWT token if successful.
   Must supply ledger, password and either user or auth identifier.
   Expire is optional
@@ -300,7 +300,7 @@
   ([conn ledger password user auth expire] (conn-handler/password-login conn ledger password user auth expire)))
 
 
-(defn ^:export renew-token
+(defn ^:export renewToken
   "Renews a JWT token if successful.
   Returns a promise that eventually contains the token or an exception"
   ([conn jwt] (conn-handler/renew-token conn jwt nil))
@@ -309,70 +309,12 @@
 
 ;; ======================================
 ;;
-;; Listeners
-;;
-;; ======================================
-(defn block-event->map
-  "Takes block event data from (listen...) and adds an :added and
-  :retracted key containing maps of data organized by subject
-  and containing full predicate names."
-  [conn ledger block-event]
-  (js/Promise.
-    (fn [resolve reject]
-      (async/go
-        (try
-          (let [db     (<? (db-instance conn ledger))
-                {add true retract false} (group-by #(nth % 4) (:flakes block-event))
-                to-map (fn [flakes]
-                         (let [by-subj (group-by first flakes)]
-                           (reduce-kv (fn [acc sid flakes]
-                                        (conj acc
-                                              (reduce (fn [m flake]
-                                                        (let [p-schema (get-in db [:schema :pred (second flake)])
-                                                              v        (nth flake 2)]
-                                                          (if (:multi p-schema)
-                                                            (update m (:name p-schema) conj v)
-                                                            (assoc m (:name p-schema) v))))
-                                                      {"_id" sid} flakes)))
-                                      [] by-subj)))]
-            (resolve (assoc block-event :added (to-map add)
-                               :retracted (to-map retract))))
-          (catch :default e
-            (log/error e)
-            (reject e)))))))
-
-
-(defn ^:export listen
-  "Listens to all events of a given ledger. Supply a ledger identity,
-  any key, and a two-argument function that will be called with each event.
-  The key is any arbitrary key, and is only used to close the listener via close-listener,
-  otherwise it is opaque to the listener.
-  The callback function's first argument is the event header/metadata and the second argument
-  is the event data itself."
-  [conn ledger key callback]
-  (conn-handler/listen conn ledger key callback))
-
-
-(defn ^:export close-listener
-  "Closes a listener."
-  [conn ledger key]
-  (conn-handler/close-listener conn ledger key))
-
-
-(defn ^:export listeners
-  "Return a list of listeners currently registered for each ledger along with their respective keys."
-  [conn]
-  (conn-handler/listeners conn))
-
-
-;; ======================================
-;;
 ;; Ledger/DB Operations
 ;;
 ;; ======================================
-(defn ^:private db-instance
+(defn ^:private -db-instance
   "Returns a queryable database from the connection."
-  ([conn ledger] (db-instance conn ledger {}))
+  ([conn ledger] (-db-instance conn ledger {}))
   ([conn ledger opts]
    (let [pc (async/promise-chan)]
      (async/go
@@ -392,14 +334,14 @@
            (async/close! pc))))
      pc)))
 
-(defn ^:export db
+(defn ^:export dbSync
   "Returns a queryable database from the connection."
   [conn ledger & [opts]]
   (-> opts
       (js->clj :keywordize-keys true)
-      (as-> clj-opts (db-instance conn ledger clj-opts))))
+      (as-> clj-opts (-db-instance conn ledger clj-opts))))
 
-(defn ^:export db-p
+(defn ^:export db
   "Returns a queryable database from the connection."
   [conn ledger & [opts]]
   (js/Promise.
@@ -408,14 +350,14 @@
         (try
           (-> opts
               (js->clj :keywordize-keys true)
-              (as-> clj-opts (db-instance conn ledger clj-opts))
+              (as-> clj-opts (-db-instance conn ledger clj-opts))
               resolve)
           (catch :default e
             (log/error e)
             (reject e)))))))
 
 
-(defn ^:export collection-id
+(defn ^:export collectionId
   "Returns promise containing collection id given a collection name.
   If collection doesn't exist, returns nil."
   [db collection]
@@ -433,7 +375,7 @@
             (reject e)))))))
 
 
-(defn ^:export predicate-id
+(defn ^:export predicateId
   "Returns promise containing predicate id given a predicate.
   If predicate doesn't exist, returns nil."
   [db predicate]
@@ -451,7 +393,7 @@
             (reject e)))))))
 
 
-(defn ^:export predicate-name
+(defn ^:export predicateName
   "Returns promise containing predicate name given a predicate.
   If predicate doesn't exist, returns nil."
   [db predicate]
@@ -488,7 +430,7 @@
             (reject e)))))))
 
 
-(defn ^:export delete-ledger
+(defn ^:export deleteLedger
   "Completely deletes a ledger.
   Returns a promise that will have a response with a corresponding status of success.
 
@@ -499,7 +441,7 @@
   being in a deletion state during the deletion process.
 
   Attempts to use a ledger in a deletion state will throw an exception."
-  ([conn ledger] (delete-ledger conn ledger nil))
+  ([conn ledger] (deleteLedger conn ledger nil))
   ([conn ledger opts]
    (js/Promise.
      (fn [resolve reject]
@@ -532,40 +474,8 @@
              (reject e))))))))
 
 
-(defn ^:export ledger-info
+(defn ^:export ledgerInfo
   "Returns promise with ledger's status as a map, including index, indexes, block, and status.
-  If ledger doesn't exist, will return an empty map."
-  [conn ledger]
-  (js/Promise.
-    (fn [resolve reject]
-      (async/go
-        (try
-          (-> (ops/ledger-info-async conn ledger)
-              <?
-              clj->js
-              (resolve))
-          (catch :default e
-            (log/error e)
-            (reject e)))))))
-
-
-(defn ^:export ledger-list
-  "Returns promise with a list of ledgers the connected server is currently serving."
-  [conn]
-  (js/Promise.
-    (fn [resolve reject]
-      (async/go
-        (try
-          (-> (ops/ledgers-async conn)
-              <?
-              clj->js
-              (resolve))
-          (catch :default e
-            (log/error e)
-            (reject e)))))))
-
-(defn ^:export ledger-stats
-  "Returns promise with ledger stats, including db size and # of flakes.
   If ledger doesn't exist, will return an empty map."
   [conn ledger]
   (js/Promise.
@@ -581,7 +491,23 @@
             (reject e)))))))
 
 
-(defn ^:export new-ledger
+(defn ^:export ledgerList
+  "Returns promise with a list of ledgers the connected server is currently serving."
+  [conn]
+  (js/Promise.
+    (fn [resolve reject]
+      (async/go
+        (try
+          (-> (ops/ledgers-async conn)
+              <?
+              clj->js
+              (resolve))
+          (catch :default e
+            (log/error e)
+            (reject e)))))))
+
+
+(defn ^:export newLedger
   "Attempts to create new ledger.
 
    A successful result will kick off a process on the ledger server(s) to bootstrap.
@@ -598,7 +524,7 @@
    - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
    - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
    "
-  ([conn ledger] (new-ledger conn ledger nil))
+  ([conn ledger] (newLedger conn ledger nil))
   ([conn ledger opts]
    (js/Promise.
      (fn [resolve reject]
@@ -652,7 +578,7 @@
              (reject (clj->js (assoc (ex-data e) :message (ex-message e)))))))))))
 
 
-(defn ^:export resolve-ledger
+(defn ^:export resolveLedger
   "Resolves a ledger identity in the form of 'network/ledger-or-alias' and returns a
   tuple of either [network ledger alias] or [network ledger].
 
@@ -679,7 +605,7 @@
 
 
 (defn ^:export session
-  "Returns actual session object for a given ledger."
+  "Returns session object for a given ledger."
   [conn ledger]
   (js/Promise.
     (fn [resolve reject]
@@ -719,7 +645,7 @@
             (reject e)))))))
 
 
-(defn ^:export forward-time-travel
+(defn ^:export forwardTimeTravel
   "Returns a promise containing a new db based on the provided db,
    including the provided flakes. Flakes can contain one or more 't's,
    but should be sequential and start after the current 't' of the provided
@@ -751,7 +677,7 @@
             (reject e)))))))
 
 
-(defn ^:export is-forward-time-travel-db
+(defn ^:export isForwardTimeTravelDb
   "Returns true if provided db is a forward-time-travel db."
   [db]
   (js/Promise.
@@ -774,7 +700,7 @@
 ;; Transactions
 ;;
 ;; ======================================
-(defn ^:export monitor-tx
+(defn ^:export monitorTx
   "Monitors a database for a specific transaction id included in a block.
 
   Returns a promise that will eventually contain a response or an exception
@@ -795,7 +721,7 @@
             (reject (clj->js e))))))))
 
 
-(defn tx->command
+(defn txToCommand
   "Helper function to fill out the parts of the transaction that are incomplete,
   producing a signed command.
 
@@ -814,7 +740,7 @@
     - sig  - the signature of the above stringified map
     - id   - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
     - db   - the ledger for this transaction"
-  ([ledger txn private-key] (tx->command ledger txn private-key nil))
+  ([ledger txn private-key] (txToCommand ledger txn private-key nil))
   ([ledger txn private-key opts]
    (when-not private-key
      (throw (ex-info "Private key not provided"
@@ -910,11 +836,11 @@
 ;; Queries
 ;;
 ;; ======================================
-(defn ^:export block-range-with-txn
+(defn ^:export blockRangeWithTxn
   "Returns a Promise that will eventually contain transaction information for blocks from
    start block (inclusive) to end if provided (exclusive). Each block is a separate map,
    containing keys :block :tx"
-  ([conn ledger block-map] (block-range-with-txn conn ledger block-map nil))
+  ([conn ledger block-map] (blockRangeWithTxn conn ledger block-map nil))
   ([conn ledger block-map opts]
    (js/Promise.
      (fn [resolve reject]
@@ -924,7 +850,7 @@
                                (js->clj :keywordize-keys true))
                  block-map (js->clj block-map :keywordize-keys true)
                  {:keys [start end]} block-map
-                 db-chan   (async/<! (db-instance conn ledger clj-opts))
+                 db-chan   (async/<! (-db-instance conn ledger clj-opts))
                  db-blocks (<? (query-block/block-range db-chan start end clj-opts))
                  result    (query-range/block-with-tx-data db-blocks)]
              (resolve (clj->js result)))
@@ -933,8 +859,8 @@
              (reject e))))))))
 
 
-(defn ^:export block-query
-  ([conn ledger query-map] (block-query conn ledger query-map nil))
+(defn ^:export blockQuery
+  ([conn ledger query-map] (blockQuery conn ledger query-map nil))
   ([conn ledger query-map opts]
    (js/Promise.
      (fn [resolve reject]
@@ -958,13 +884,13 @@
              (reject e))))))))
 
 
-(defn ^:export block-range
+(defn ^:export blockRange
   "Returns a promise containing blocks from start (inclusive)
    to end if provided (exclusive).
 
    Each block is a separate map, containing keys :block, :t and :flakes."
-  ([db start] (block-range db start nil nil))
-  ([db start end] (block-range db start end nil))
+  ([db start] (blockRange db start nil nil))
+  ([db start end] (blockRange db start end nil))
   ([db start end opts]
    (js/Promise.
      (fn [resolve reject]
@@ -982,7 +908,7 @@
              (reject e))))))))
 
 
-(defn ^:export collection-flakes
+(defn ^:export collectionFlakes
   "Returns spot index range for only the requested collection."
   [db collection]
   (js/Promise.
@@ -1013,7 +939,7 @@
                  clj-opts     (merge (:opts param*)
                                      (when opts (js->clj opts :keywordize-keys true)))
                  {gql-query :query vars :variables} param*
-                 db-ch        (db-instance conn ledger clj-opts)
+                 db-ch        (-db-instance conn ledger clj-opts)
                  db           (<? db-ch)
                  parsed-query (<? (graphql/parse-graphql-to-flureeql db gql-query vars clj-opts))
                  result       (if (util/exception? parsed-query)
@@ -1048,8 +974,8 @@
              (reject (clj->js e)))))))))
 
 
-(defn ^:export history-query
-  ([sources query-map] (history-query sources query-map nil))
+(defn ^:export historyQuery
+  ([sources query-map] (historyQuery sources query-map nil))
   ([sources query-map opts]
    (js/Promise.
      (fn [resolve reject]
@@ -1066,8 +992,8 @@
              (reject e))))))))
 
 
-(defn ^:export multi-query
-  ([source multi-query-map] (multi-query source multi-query-map nil))
+(defn ^:export multiQuery
+  ([source multi-query-map] (multiQuery source multi-query-map nil))
   ([source multi-query-map opts]
    (js/Promise.
      (fn [resolve reject]
@@ -1105,7 +1031,7 @@
             (reject (clj->js e))))))))
 
 
-(defn ^:export query-with
+(defn ^:export queryWith
   "Execute a query against a database source, with the
   given flakes applied.
 
@@ -1167,3 +1093,60 @@
            (catch :default e
              (log/error e)
              (reject (clj->js e)))))))))
+
+;; ======================================
+;;
+;; Listeners
+;;
+;; ======================================
+(defn blockEventToMap
+  "Takes block event data from (listen...) and adds an :added and
+  :retracted key containing maps of data organized by subject
+  and containing full predicate names."
+  [conn ledger block-event]
+  (js/Promise.
+    (fn [resolve reject]
+      (async/go
+        (try
+          (let [db     (<? (-db-instance conn ledger))
+                {add true retract false} (group-by #(nth % 4) (:flakes block-event))
+                to-map (fn [flakes]
+                         (let [by-subj (group-by first flakes)]
+                           (reduce-kv (fn [acc sid flakes]
+                                        (conj acc
+                                              (reduce (fn [m flake]
+                                                        (let [p-schema (get-in db [:schema :pred (second flake)])
+                                                              v        (nth flake 2)]
+                                                          (if (:multi p-schema)
+                                                            (update m (:name p-schema) conj v)
+                                                            (assoc m (:name p-schema) v))))
+                                                      {"_id" sid} flakes)))
+                                      [] by-subj)))]
+            (resolve (assoc block-event :added (to-map add)
+                               :retracted (to-map retract))))
+          (catch :default e
+            (log/error e)
+            (reject e)))))))
+
+
+(defn ^:export listen
+  "Listens to all events of a given ledger. Supply a ledger identity,
+  any key, and a two-argument function that will be called with each event.
+  The key is any arbitrary key, and is only used to close the listener via close-listener,
+  otherwise it is opaque to the listener.
+  The callback function's first argument is the event header/metadata and the second argument
+  is the event data itself."
+  [conn ledger key callback]
+  (conn-handler/listen conn ledger key callback))
+
+
+(defn ^:export closeListener
+  "Closes a listener."
+  [conn ledger key]
+  (conn-handler/close-listener conn ledger key))
+
+
+(defn ^:export listeners
+  "Return a list of listeners currently registered for each ledger along with their respective keys."
+  [conn]
+  (conn-handler/listeners conn))
