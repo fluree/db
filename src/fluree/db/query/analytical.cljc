@@ -839,6 +839,13 @@
           (= 2 (count clause))
           [(update res :vars merge (bind-clause->vars res clause)) r]
 
+          (= 1 (count clause))
+          (if (sequential? (first clause))
+            (throw (ex-info (str "Invalid where clause, it appears you have an extra nested vector here: " clause)
+                            {:status 400 :error :db/invalid-query}))
+            (throw (ex-info (str "Invalid where clause, it should have 2+ tuples but instead found: " clause)
+                            {:status 400 :error :db/invalid-query})))
+
           :else
           (let [[db clause] (<? (get-source-clause db clause prefixes opts))]
             (cond (= "$wd" db) (<? (wikidata->tuples q-map clause r res optional? fuel max-fuel))
