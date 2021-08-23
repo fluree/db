@@ -11,10 +11,9 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.permissions :as permissions]
             [fluree.db.auth :as auth]
-            [fluree.db.flake :as flake]
+            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.async :refer [<? go-try]])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -296,7 +295,7 @@
 (defn- format-history-resp
   [db resp auth show-auth]
   (go-try
-    (let [ts    (-> (map #(.-t ^Flake %) resp) set)
+    (let [ts    (set (map #(.-t ^Flake %) resp))
           t-map (<? (async/go-loop [[t & r] ts
                                     acc {}]
                       (if t
@@ -337,7 +336,7 @@
      download blocks using the #Flake format to support internal query
      handling."
     [blocks]
-     (mapv (fn [block] (assoc block :flakes (mapv vec (:flakes block)))) blocks)))
+    (mapv (fn [block] (assoc block :flakes (mapv vec (:flakes block)))) blocks)))
 
 (defn history-query-async
   [sources query-map]

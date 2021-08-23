@@ -1,8 +1,7 @@
 (ns fluree.db.util.schema
   (:require [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.constants :as const])
-  #?(:clj
-     (:import (fluree.db.flake Flake))))
+  #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
 

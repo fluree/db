@@ -13,10 +13,8 @@
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.log :as log]
             [clojure.string :as str])
-  #?(:clj
-     (:import (fluree.db.flake Flake))))
+  #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
 

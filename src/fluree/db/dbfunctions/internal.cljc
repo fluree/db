@@ -8,7 +8,8 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.dbproto :as dbproto]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            #?(:cljs [fluree.db.flake :refer [Flake]]))
   #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
