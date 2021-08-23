@@ -10,6 +10,8 @@
                     (java.net URLEncoder URLDecoder))
      :cljs (:refer-clojure :exclude [random-uuid])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 ;; javascript is 2^53 - 1
 (def ^:const max-long #?(:clj  (Long/MAX_VALUE)
@@ -77,10 +79,10 @@
     date
 
     #?@(:clj  [(instance? Instant date)
-               (.toEpochMilli date)
+               (.toEpochMilli ^Instant date)
 
                (instance? Date date)
-               (.getTime date)]
+               (.getTime ^Date date)]
         :cljs [(instance? js/Date date)
                (.getTime date)])
 
@@ -217,7 +219,7 @@
 
 (defn url-decode
   ([string] (url-decode string "UTF-8"))
-  ([string encoding]
+  ([string ^String encoding]
    #?(:clj  (some-> string str (URLDecoder/decode encoding))
       :cljs (some-> string str (js/decodeURIComponent)))))
 

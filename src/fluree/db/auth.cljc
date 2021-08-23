@@ -2,6 +2,8 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.async :refer [<? go-try]]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defn roles
   "Given an _auth identity, returns associated roles.

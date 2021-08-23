@@ -4,7 +4,10 @@
             [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util])
+  (:import (fluree.db.flake Flake)))
+
+(set! *warn-on-reflection* true)
 
 ;; transaction utilities
 
@@ -63,7 +66,8 @@
    (if-not sorted?
      (gen-tx-hash tx-flakes)
      (->> tx-flakes
-          (mapv #(vector (.-s %) (.-p %) (.-o %) (.-t %) (.-op %) (.-m %)))
+          (mapv #(let [^Flake f %]
+                   (vector (.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f))))
           (json/stringify)
           (crypto/sha3-256)))))
 

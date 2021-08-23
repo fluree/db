@@ -18,6 +18,8 @@
   #?(:clj
      (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (declare db current-db session)
 
 (defrecord DbSession [conn network dbid db-name update-chan transact-chan state schema-cache blank-db close id])

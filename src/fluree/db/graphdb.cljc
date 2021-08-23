@@ -13,10 +13,10 @@
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.log :as log]
             [clojure.string :as str])
-  #?(:clj
-     (:import (fluree.db.flake Flake))))
+  #?(:clj (:import (fluree.db.flake Flake))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn validate-ledger-name
   "Returns when ledger name is valid.
@@ -139,9 +139,10 @@
          (if (empty? flakes)
            (async/put! resp-ch (assoc db :block block))
            (let [flakes (sort flake/cmp-flakes-block flakes)
+                 ^Flake first-flake (first flakes)
                  db*    (loop [[^Flake f & r] flakes
-                               t        (.-t (first flakes)) ;; current 't' value
-                               t-flakes []                  ;; all flakes for current 't'
+                               t        (.-t first-flake) ;; current 't' value
+                               t-flakes []                ;; all flakes for current 't'
                                db       db]
                           (cond (and f (= t (.-t f)))
                                 (recur r t (conj t-flakes f) db)

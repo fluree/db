@@ -7,6 +7,8 @@
     #?(:clj [clojure.core.async.impl.dispatch :as dispatch]))
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<?]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; some macros for working with core async
 
 #?(:clj
@@ -60,7 +62,8 @@
   to maintain a full stack trace when jumping between multiple contexts."
   [x]
   (if (instance? #?(:clj Throwable :cljs js/Error) x)
-    (throw (ex-info #?(:clj (or (.getMessage x) (str x)) :cljs (str x))
+    (throw (ex-info #?(:clj (or (.getMessage ^Throwable x) (str x))
+                       :cljs (str x))
                     (or (ex-data x) {})
                     x))
     x))
