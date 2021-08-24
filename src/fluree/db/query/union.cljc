@@ -1,7 +1,5 @@
 (ns fluree.db.query.union
-  (:require [fluree.db.util.core :as util]
-            [clojure.set :as set]
-            [fluree.db.util.log :as log]))
+  (:require [fluree.db.util.core :as util]))
 
 
 (defn intersecting-keys-tuples
@@ -84,14 +82,16 @@
      :tuples  c-data}))
 
 
-(defn b-data-map
+(defn- b-data-map
   "For situation where just some variables in a union intersect between the a-tuples and b-tuples,
   creates a map of b-tuples where key is intersecting variables for fast lookup, and value is a
-  map of original tuple along with :idx which is the original order (row number) of b-tuples
+  *list* of map(s) of original tuple along with :idx which is the original order (row number) of b-tuples
   to ensure consistent ordering.
 
+  There can be multiple matches in b-tuples for a key, as the other non-matching variables differ.
+
   Matches between a-tuples and b-tuples will remove entries from this map and merge results, entries
-  left in this map will be items in b-tuples that did not match a-tuples."
+  remaining in this map will be items in b-tuples that did not match a-tuples."
   [b-common-idx b-data]
   (loop [b-data* b-data
          i       0
@@ -102,8 +102,20 @@
             common (map #(get tuple %) b-common-idx)]
         (recur (rest b-data*)
                (inc i)
-               (assoc acc common {:idx   i
-                                  :tuple tuple}))))))
+               (update acc common conj {:idx   i
+                                        :tuple tuple}))))))
+
+
+(defn flatten-b-data-map
+  "Takes a b-data map as per above and re-flattens it into a list of tuples in the original order.
+
+  This is used after removing matching entries in b-data-map, so this will often end up being a subset
+  of the original b-data-map."
+  [b-data-map]
+  (->> (vals b-data-map)
+       (apply concat)
+       (sort-by :idx)
+       (map :tuple)))
 
 
 (defn intersecting
@@ -120,6 +132,32 @@
     [common-idx not-common-idx not-common]))
 
 
+(defn- pad-b-tuples
+  "B-tuples that do not match and get merged with an a-tuple must be concatenated to the
+  list in the order of the combined tuple headers. This will take a list of b-tuples and
+  put nil values into all columns that are unique to a.
+
+  If a-headers were [?x ?y ?z] and b-headers were [?y ?a ?b] the combined headers will be:
+  [?x ?y ?z ?a ?b]
+
+  Because these are b-only values, ?x and ?z will always be nil.
+  If we have a b-tuple of [42 36 49] we'd want a final result of [nil 42 nil 36 49]"
+  [b-tuples a-headers a-common-idx b-common-idx b-only-idx]
+  (let [a-nil-pad      (vec (repeat (count a-headers) nil)) ;; tuple of a-headers length with all nil vals
+        a->b-positions (partition 2 (interleave a-common-idx b-common-idx))] ;; for common indexes, tuples of position in a-header to position in b-header
+    (map
+      (fn [b-tuple]
+        (let [a-headers-merged (reduce
+                                 (fn [acc [a-idx b-idx]]
+                                   (assoc acc a-idx (get b-tuple b-idx)))
+                                 a-nil-pad
+                                 a->b-positions)]
+          (concat
+            a-headers-merged
+            (map #(get b-tuple %) b-only-idx))))
+      b-tuples)))
+
+
 (defn some-intersecting
   "Some headers from a and/or b tuples intersect. Need to build out all columns.
   Where common values exist for intersecting headers, merge into more complete rows.
@@ -133,31 +171,25 @@
         a-common-idx (map #(util/index-of (:headers a-tuples) %) common-headers)
         [b-common-idx b-only-idx b-only-headers] (intersecting common-headers b-headers)
         b-pos-map    (b-data-map b-common-idx b-data)
-        a-nil-pad    (vec (repeat (count a-headers) nil))
         b-nil-pad    (repeat (count b-only-headers) nil)
-        a-pad-fn     (fn [b-tuple]
-                       (concat
-                         (reduce
-                           (fn [acc [a-idx b-idx]]
-                             (assoc acc a-idx (get b-tuple b-idx)))
-                           a-nil-pad
-                           (partition 2 (interleave a-common-idx b-common-idx)))
-                         (map #(get b-tuple %) b-only-idx)))
         c-data       (loop [a-data*    a-data
                             b-pos-map* b-pos-map
                             acc        []]
                        (if (empty? a-data*)
-                         (let [only-b (->> (vals b-pos-map*)
-                                           (sort-by :idx)
-                                           (map #(a-pad-fn (:tuple %))))]
-                           (concat acc only-b))
-                         (let [a-item (vec (first a-data*))
-                               match  (map #(get a-item %) a-common-idx)]
-                           (if-let [b-match (get b-pos-map* match)]
+                         (concat acc (-> b-pos-map*
+                                         flatten-b-data-map
+                                         (pad-b-tuples a-headers a-common-idx b-common-idx b-only-idx)))
+                         (let [a-item    (vec (first a-data*))
+                               match-key (map #(get a-item %) a-common-idx)]
+                           (if-let [b-matches (get b-pos-map* match-key)]
                              (recur (rest a-data*)
-                                    (dissoc b-pos-map* match)
-                                    (conj acc (concat a-item
+                                    (dissoc b-pos-map* match-key)
+                                    (reduce
+                                      (fn [acc* b-match]
+                                        (conj acc*
+                                              (concat a-item
                                                       (map #(get (:tuple b-match) %) b-only-idx))))
+                                      acc b-matches))
                              (recur (rest a-data*)
                                     b-pos-map*
                                     (conj acc (concat a-item
