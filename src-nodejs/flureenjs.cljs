@@ -28,13 +28,13 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [goog.string.format]
-            [cljs.nodejs :as node-js]                       ;; NodeJS support
+            [cljs.nodejs :as node-js] ; NodeJS support
 
-    ; shared clojurescript code
+            ;; shared clojurescript code
             [fluree.db.connection-js :as conn-handler]
             [fluree.db.api-js :as fdb-js]
 
-    ;; self-hosted clojurescript
+            ;; self-hosted clojurescript
             [cljs.js]
             [cljs.analyzer]
             [cljs.env]
@@ -245,15 +245,6 @@
 ;;
 ;; ======================================
 
-(defn ^:export connectSync
-  "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
-   supplied, separated by commas."
-  [servers-string & [opts]]
-  (-> opts
-      (js->clj :keywordize-keys true)
-      (as-> clj-opts (conn-handler/connect servers-string clj-opts))))
-
-
 (defn ^:export connect
   "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
    supplied, separated by commas.
@@ -394,13 +385,6 @@
            (async/put! pc e)
            (async/close! pc))))
      pc)))
-
-(defn ^:export dbSync
-  "Returns a queryable database from the connection."
-  [conn ledger & [opts]]
-  (-> opts
-      (js->clj :keywordize-keys true)
-      (as-> clj-opts (-db-instance conn ledger clj-opts))))
 
 (defn ^:export db
   "Returns a queryable database from the connection."
