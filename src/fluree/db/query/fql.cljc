@@ -639,51 +639,51 @@
 
   This will produce the results of each of the select clauses based on the source tuples."
   [select pp-keys single-result? db fuel max-fuel opts parallelism tuples-res]
-  ;;(go-try
-  (let [expandMaps (build-expand-map select pp-keys)
-        queue-ch (async/chan)
-        res-ch (async/chan)
-        stop! (fn [] (async/close! queue-ch) (async/close! res-ch))
-        opts* (-> (dissoc opts :limit :offset :orderBy :groupBy)
-                  (assoc :fuel (volatile! 0)))
-        af (fn [tuple-res port]
-             (async/go
-               (try*
-                 (let [tuple-res' (if single-result? [tuple-res] tuple-res)
-                       query-fuel (volatile! 0)]
-                   (->> expandMaps
-                        (keep #(expand-map db (assoc opts* :fuel fuel) tuple-res' %)) ;; returns async channels, executes expandmap query
-                        (async/merge)
-                        (async/into [])
-                        (async/<!)                          ;; all expandmaps with final results now in single vector
-                        (reduce replace-expand-maps tuple-res') ;; update original tuple with expandmaps result(s)
-                        (#(if single-result? [(first %) @query-fuel] [% @query-fuel])) ;; return two-tuple with second element being fuel consumed
-                        (async/put! port)))
-                 (async/close! port)
-                 (catch* e (async/put! port e) (async/close! port)))))]
+  (go-try
+    (let [expandMaps (build-expand-map select pp-keys)
+          queue-ch (async/chan)
+          res-ch (async/chan)
+          stop! (fn [] (async/close! queue-ch) (async/close! res-ch))
+          opts* (-> (dissoc opts :limit :offset :orderBy :groupBy)
+                    (assoc :fuel (volatile! 0)))
+          af (fn [tuple-res port]
+               (async/go
+                 (try*
+                   (let [tuple-res' (if single-result? [tuple-res] tuple-res)
+                         query-fuel (volatile! 0)]
+                     (->> expandMaps
+                          (keep #(expand-map db (assoc opts* :fuel fuel) tuple-res' %)) ;; returns async channels, executes expandmap query
+                          (async/merge)
+                          (async/into [])
+                          (async/<!)                          ;; all expandmaps with final results now in single vector
+                          (reduce replace-expand-maps tuple-res') ;; update original tuple with expandmaps result(s)
+                          (#(if single-result? [(first %) @query-fuel] [% @query-fuel])) ;; return two-tuple with second element being fuel consumed
+                          (async/put! port)))
+                   (async/close! port)
+                   (catch* e (async/put! port e) (async/close! port)))))]
 
-    (async/onto-chan! queue-ch tuples-res)
-    (async/pipeline-async parallelism res-ch af queue-ch)
+      (async/onto-chan! queue-ch tuples-res)
+      (async/pipeline-async parallelism res-ch af queue-ch)
 
-    (loop [acc []]
-      (let [next-res (async/<! res-ch)]
-        (cond
-          (nil? next-res)
-          acc
+      (loop [acc []]
+        (let [next-res (async/<! res-ch)]
+          (cond
+            (nil? next-res)
+            acc
 
-          (util/exception? next-res)
-          (do
-            (stop!)
-            next-res)
+            (util/exception? next-res)
+            (do
+              (stop!)
+              next-res)
 
-          :else
-          (let [total-fuel (vswap! fuel + (second next-res))]
-            (if (> total-fuel max-fuel)
-              (do (stop!)
-                  (ex-info (str "Query exceeded max fuel while processing: " max-fuel
-                                ". If you have permission, you can set the max fuel for a query with: 'opts': {'fuel' 10000000}")
-                           {:error :db/insufficient-fuel :status 400}))
-              (recur (conj acc (first next-res))))))))))
+            :else
+            (let [total-fuel (vswap! fuel + (second next-res))]
+              (if (> total-fuel max-fuel)
+                (do (stop!)
+                    (ex-info (str "Query exceeded max fuel while processing: " max-fuel
+                                  ". If you have permission, you can set the max fuel for a query with: 'opts': {'fuel' 10000000}")
+                             {:error :db/insufficient-fuel :status 400}))
+                (recur (conj acc (first next-res)))))))))))
 
 
 (defn select-fn
