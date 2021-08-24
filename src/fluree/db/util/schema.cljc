@@ -74,9 +74,9 @@
   [flakes pred-ecount]
   (keep #(let [f ^Flake %]
            (if (and (or (= (.-p f) const/$_predicate:index)
-                      (= (.-p f) const/$_predicate:unique))
+                        (= (.-p f) const/$_predicate:unique))
                   (= (.-o f) true)
-                  (>= pred-ecount (.-s f))) (.-s f)) flakes)))
+                  (>= pred-ecount (.-s f))) (.-s f))) flakes))
 
 (defn remove-from-post-preds
   "Returns any predicate subject flakes that are removing
@@ -86,7 +86,7 @@
            (when (and (true? (.-op f))
                     (or (= (.-p f) const/$_predicate:index)
                         (= (.-p f) const/$_predicate:unique))
-                    (= (.-o f) false)) (.-s f)) flakes)))
+                    (= (.-o f) false)) (.-s f))) flakes))
 
 (defn schema-change?
   "Returns true if any of the provided flakes are a schema flake."
