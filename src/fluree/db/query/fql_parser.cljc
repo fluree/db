@@ -251,7 +251,7 @@
   [db p compact?]
   (let [name (dbproto/-p-prop db :name p)]
     {:p          p
-     :limit      100
+     :limit      nil
      :name       name
      :as         (if (and compact? name)
                    (second (re-find #"/(.+)" name))
