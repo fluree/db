@@ -374,23 +374,6 @@
         res))))
 
 
-
-
-;(defn flakes->res-xf
-;  "Transducer for filling out a result from a sequence of
-;  flakes all from the same subject."
-;  [db cache fuel max-fuel select-spec]
-;  (fn [xf]
-;    (fn
-;      ([] (xf))                                             ;; transducer start
-;      ([result] (xf result))                                ;; transducer stop
-;      ([result flakes]
-;       (if-let [res (flakes->res db cache fuel max-fuel select-spec flakes)]
-;         (xf result res)
-;         ;; if no response, just return result which will include nothing in the result set
-;         result)))))
-
-
 ;; TODO - use pipeline-async to do selects in parallel
 (defn flake-select
   "Runs a select statement based on a sequence of flakes."
@@ -414,15 +397,8 @@
        (->> flakes-by-sub
             (map #(flakes->res db cache fuel max-fuel select-spec %))
             (merge-into? [])
-            (<?))
+            (<?))))))
 
-       ;; sequential processing - will be slower for larger queries, but negligible for small queries. Fuel will always be accurate.
-       #_(loop [[sub-flakes & r] flakes-by-sub
-                acc []]
-           (if-not sub-flakes
-             acc
-             (let [res (<? (flakes->res db cache fuel max-fuel select-spec sub-flakes))]
-               (recur r (conj acc res)))))))))
 
 (defn subject-select
   "Like flake select, but takes a collection of subject ids which we
