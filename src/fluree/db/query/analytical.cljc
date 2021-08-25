@@ -387,7 +387,7 @@
              (let [lang (-> db :settings :language (or :default))
                    [var search search-param] clause
                    var (variable? var)]
-               (with-open [^Closeable store (full-text/open-storage conn network dbid lang)]
+               (with-open [store (full-text/open-storage conn network dbid lang)]
                  (full-text/search store db [var search search-param]))))))
 
 
