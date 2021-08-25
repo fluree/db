@@ -390,7 +390,7 @@
                    [var search search-param] clause
                    var (variable? var)]
                (with-open [^Closeable store (full-text/open-storage conn network dbid lang)]
-                 (full-text/search db store [var search search-param]))))))
+                 (full-text/search store db [var search search-param]))))))
 
 
 ;; Can be: ["?item" "rdf:type" "person"]
@@ -922,5 +922,3 @@
                  :where    [["?person" "person/handle" "?handle"]]
                  :optional [["?person" "person/favNums" "?num"]]
                  :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))
-
-
