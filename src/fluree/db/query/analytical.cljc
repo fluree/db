@@ -388,7 +388,7 @@
                    [var search search-param] clause
                    var  (variable? var)]
                (with-open [store (full-text/open-storage conn network dbid lang)]
-                 (full-text/search db store [var search search-param]))))))
+                 (full-text/search store db [var search search-param]))))))
 
 
 ;; Can be: ["?item" "rdf:type" "person"]
@@ -886,6 +886,4 @@
   (async/<!! (q {:select   ["?handle" "?num"]
                  :where    [["?person" "person/handle" "?handle"]]
                  :optional [["?person" "person/favNums" "?num"]]
-                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db))
-
-  )
+                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))
