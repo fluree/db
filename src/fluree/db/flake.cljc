@@ -95,7 +95,7 @@
 
              clojure.lang.Associative
              (entryAt [f k] (some->> (get f k nil) (clojure.lang.MapEntry k)))
-             (containsKey [_ k] (#{:s :p :o :t :op :m} k))
+             (containsKey [_ k] (boolean (#{:s :p :o :t :op :m} k)))
              (assoc [f k v] (assoc-flake f k v))
 
              Object
