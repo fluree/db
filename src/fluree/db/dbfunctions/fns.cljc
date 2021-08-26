@@ -8,6 +8,8 @@
             [fluree.db.util.core :as util])
   #?(:cljs (:require-macros [fluree.db.dbfunctions.fns :refer [extract]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defmacro extract
   "Resolves a value if a channel.

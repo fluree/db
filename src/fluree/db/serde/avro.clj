@@ -8,6 +8,8 @@
   (:import (java.net URI)
            (java.util UUID)))
 
+(set! *warn-on-reflection* true)
+
 ;;; -----------------------------------------
 ;;;
 ;;; Supporting avro records
@@ -190,8 +192,8 @@
                  {:name "status", :type [:null :string]}    ;; status code
                  {:name "message", :type [:null :string]}   ;; status message
                  {:name "fork", :type [:null :string]}      ;; db-ident of db this was forked from
-                 {:name "forkBlock", :type [:null :long]}   ;; if forked, what block point is the fork at
-                 ]}))
+                 {:name "forkBlock", :type [:null :long]}]}))   ;; if forked, what block point is the fork at
+
 
 
 (def FdbBlock-schema

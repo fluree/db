@@ -5,6 +5,8 @@
             #?(:cljs [cljs.reader]))
   #?(:clj (:import (java.time Instant))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 ;; Change all filter functions to be: https://www.w3.org/TR/sparql11-query/#SparqlOps
 ;; https://docs.data.world/tutorials/sparql/list-of-sparql-filter-functions.html
@@ -189,6 +191,6 @@
 
 (comment
 
-  (filter-row ['?nums '?fruit '?age] [1 "apple" 15] "(bound ?nums)")
+  (filter-row ['?nums '?fruit '?age] [1 "apple" 15] "(bound ?nums)"))
 
-  )
+

@@ -8,6 +8,8 @@
                    (java.time.format DateTimeFormatter)
                    (java.net URL))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; signatures of http requests. see:
 ;; https://tools.ietf.org/id/draft-cavage-http-signatures-08.html
 

@@ -74,7 +74,7 @@
              (is (instance? ByteArrayInputStream x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             (is (= (-> x :fv) (-> x* :fv float)) )
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))
          (testing "maximum values"
@@ -229,7 +229,7 @@
              (is (instance? ByteArrayInputStream x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             (is (= (-> x :fv) (-> x* :fv float)) )
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))
          (testing "maximum values"

@@ -6,6 +6,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.schema :as schema]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn where-clause-valid?
   "Checks to see if the where clause has ' = ', ' > ', ' < ', ' <= ', or ' >= ', and returns true if yes"
   [where-clause]

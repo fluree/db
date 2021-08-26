@@ -6,6 +6,8 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try into? merge-into?]]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defn basic-to-analytical-transpiler
   [query-map opts]
@@ -87,7 +89,7 @@
   (async/<!! (fluree.db.api/query-async (fluree.db.api/db (:conn user/system) "fluree/test")
                                         qy))
 
-  (conj [1 2 3] 1 2)
+  (conj [1 2 3] 1 2))
 
-  )
+
 
