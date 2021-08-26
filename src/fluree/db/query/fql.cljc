@@ -137,11 +137,11 @@
                                 (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select])]
                                   [(loop [[^Flake flake & r] flakes
                                           acc []]
-                                     (if-not flake
-                                       acc
+                                     (if flake
                                        (let [sub-sel (<? (query-range/index-range db :spot = [(.-o flake)]))]
                                          (when fuel (vswap! fuel + (count sub-sel)))
-                                         (recur r (conj acc (<? (flakes->res db cache fuel max-fuel nested-select-spec sub-sel)))))))
+                                         (recur r (conj acc (<? (flakes->res db cache fuel max-fuel nested-select-spec sub-sel)))))
+                                       acc))
                                    offset-map])
 
                                 ;; resolve tag
@@ -161,14 +161,14 @@
                                 (and componentFollow? (:component? pred-spec'))
                                 [(loop [[^Flake flake & r] flakes
                                         acc []]
-                                   (if-not flake
-                                     acc
+                                   (if flake
                                      (let [children (<? (query-range/index-range db :spot = [(.-o flake)] {:limit (:limit pred-spec')}))
                                            acc*     (if (empty? children)
                                                       (conj acc {:_id (.-o flake)})
                                                       (conj acc (<? (flakes->res db cache fuel max-fuel {:wildcard? true :compact? compact?} children))))]
                                        (when fuel (vswap! fuel + (count children)))
-                                       (recur r acc*))))
+                                       (recur r acc*))
+                                     acc))
                                  offset-map]
 
                                 ;; if a ref, put out an {:_id ...}
@@ -355,29 +355,29 @@
                                      offset-map {}]
                                 (if (empty? p-flakes)
                                   acc
-                                  (let [FLAKES-P         (first p-flakes)
-                                        pred-spec        (get-in select-spec [:select :pred-id (.-p (first FLAKES-P))])
+                                  (let [flakes           (first p-flakes)
+                                        pred-spec        (get-in select-spec [:select :pred-id (.-p (first flakes))])
                                         componentFollow? (component-follow? pred-spec select-spec)
                                         [acc flakes' offset-map'] (cond
                                                                     (:recur pred-spec)
-                                                                    [(<? (flake->recur db FLAKES-P pred-spec acc fuel max-fuel cache))
+                                                                    [(<? (flake->recur db flakes pred-spec acc fuel max-fuel cache))
                                                                      (rest p-flakes) offset-map]
 
                                                                     pred-spec
-                                                                    (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec FLAKES-P componentFollow? false offset-map))]
+                                                                    (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec flakes componentFollow? false offset-map))]
                                                                       [acc (rest p-flakes) offset-map])
 
                                                                     (:wildcard? select-spec)
-                                                                    [(first (<? (add-pred db cache fuel max-fuel acc select-spec FLAKES-P componentFollow? false)))
+                                                                    [(first (<? (add-pred db cache fuel max-fuel acc select-spec flakes componentFollow? false)))
                                                                      (rest p-flakes)
                                                                      offset-map]
 
                                                                     (and (empty? (:select select-spec)) (:id? select-spec))
-                                                                    [{:_id (.-s (first FLAKES-P))} (rest p-flakes) offset-map]
+                                                                    [{:_id (.-s (first flakes))} (rest p-flakes) offset-map]
 
                                                                     :else
                                                                     [acc (rest p-flakes) offset-map])
-                                        acc*             (assoc acc :_id (.-s (first FLAKES-P)))]
+                                        acc*             (assoc acc :_id (.-s (first flakes)))]
                                     (recur flakes' acc* offset-map'))))
             sort-preds        (reduce (fn [acc spec]
                                         (if (or (and (:multi? spec) (:orderBy spec))
