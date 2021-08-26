@@ -12,12 +12,34 @@
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try into? merge-into?]])
+  (:refer-clojure :exclude [vswap!])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [clojure.core])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (declare flakes->res query)
+
+(defn vswap!
+  "This silly fn exists to work around a bug in go macros where they sometimes clobber
+  type hints and issue reflection warnings. The vswap! macro uses interop so those forms
+  get macroexpanded into the go block. You'll then see reflection warnings for reset
+  deref. By letting the macro expand into this fn instead, it avoids the go bug.
+  I've filed a JIRA issue here: https://clojure.atlassian.net/browse/ASYNC-240
+  NB: I couldn't figure out how to get a var-arg version working so this only supports
+  0-3 args. I didn't see any usages in here that need more than 2, but note well and
+  feel free to add additional arities if needed (but maybe see if that linked bug has
+  been fixed first in which case delete this thing with a vengeance and remove the
+  refer-clojure exclude in the ns form).
+  - WSM 2021-08-26"
+  ([vol f]
+   (clojure.core/vswap! vol f))
+  ([vol f arg1]
+   (clojure.core/vswap! vol f arg1))
+  ([vol f arg1 arg2]
+   (clojure.core/vswap! vol f arg1 arg2))
+  ([vol f arg1 arg2 arg3]
+   (clojure.core/vswap! vol f arg1 arg2 arg3)))
 
 (defn fuel-flake-transducer
   "Can sit in a flake pipeline and accumulate a count of 'fuel-per' for every flake pulled
