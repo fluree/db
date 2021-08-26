@@ -10,6 +10,7 @@
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.query.analytical-wikidata :as wikidata]
             [fluree.db.query.analytical-filter :as filter]
+            [fluree.db.query.union :as union]
             [clojure.string :as str]
             [fluree.db.util.log :as log]
             #?(:cljs [cljs.reader])
@@ -664,39 +665,6 @@
      :vars    (merge (:vars a-tuples) (:vars b-tuples))
      :tuples  c-tuples}))
 
-(defn outer-union
-  "UNION clause takes a left-hand side, which is inner-joined, and a right-hand side, which is inner-joined.
-  Any tuples unbound by the other set are included."
-  [a-tuples b-tuples]
-  (let [common-keys               (intersecting-keys-tuples a-tuples b-tuples)
-        a-idxs                    (map #(util/index-of (:headers a-tuples) %) common-keys)
-        b-idxs                    (map #(util/index-of (:headers b-tuples) %) common-keys)
-        b-not-idxs                (-> b-tuples :headers count (#(range 0 %))
-                                      set (set/difference (set b-idxs)) (#(apply vector %)))
-        ; We find all the rows where a-tuples are matched - or we nil them
-        ; we also return all the b-tuple row nums that were matched.
-        [c-tuples b-matched-rows] (reduce
-                                    (fn [[c-tuples b-matched-rows] a-tuple]
-                                      (let [[matches matched-rows] (find-match+row-nums a-tuple a-idxs (:tuples b-tuples) b-idxs b-not-idxs)
-                                            matches (or matches [(concat a-tuple (repeat (count b-not-idxs) nil))])]
-                                        ;; TODO - revise this fn - below was susceptible to stack overflows, quick fix to retain original ordering in case important
-                                        [(into (vec c-tuples) matches) #_(concat c-tuples matches)
-                                         (set/union b-matched-rows matched-rows)]))
-                                    [[] #{}] (:tuples a-tuples))
-        b-unmatched-rows          (remove b-matched-rows (range 0 (count (:tuples b-tuples))))
-        c-headers                 (concat (:headers a-tuples) (map #(nth (:headers b-tuples) %) b-not-idxs))
-        ;; For unmatched b-tuples, need to follow the pattern of c-headers, returning nil when there's no match
-        b-idxs->c-idxs            (map #(util/index-of (:headers b-tuples) %) c-headers)
-        c-from-unmatched-b-tuples (map (fn [b-row]
-                                         (let [b-tuple (into [] (nth (:tuples b-tuples) b-row))]
-                                           (map (fn [c-idx]
-                                                  (if (nil? c-idx) nil (get b-tuple c-idx)))
-                                                b-idxs->c-idxs)))
-                                       b-unmatched-rows)
-        c-tuples                  (concat c-tuples c-from-unmatched-b-tuples)]
-    {:headers c-headers
-     :vars    (merge (:vars a-tuples) (:vars b-tuples))
-     :tuples  c-tuples}))
 
 (declare resolve-where-clause)
 
@@ -817,7 +785,7 @@
                                           new-res (keys vars))
                         new-res** (res-absorb-vars new-res*)]
                     (if tuples
-                      (recur rest (outer-union tuples new-res**))
+                      (recur rest (union/results tuples new-res**))
                       (recur rest new-res**)))
                   [tuples r]))
 
@@ -922,5 +890,3 @@
                  :where    [["?person" "person/handle" "?handle"]]
                  :optional [["?person" "person/favNums" "?num"]]
                  :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))
-
-

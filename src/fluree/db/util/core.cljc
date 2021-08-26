@@ -55,10 +55,9 @@
      (cljs-exceptions/try* ~@body)
      (clj-exceptions/try* ~@body)))
 
-;; index-of from: https://gist.github.com/fgui/48443e08844e42c674cd
 (defn index-of [coll value]
-  (some (fn [[item idx]] (if (= value item) idx))
-        (partition 2 (interleave coll (iterate inc 0)))))
+  (some (fn [[item idx]] (when (= value item) idx))
+        (partition 2 (interleave coll (range)))))
 
 (defn random-uuid []
   "Generates random UUID in both clojure/script"
