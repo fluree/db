@@ -513,9 +513,9 @@
   [conn network dbid block]
   (go-try
     (let [key  (ledger-root-key network dbid block)
-          data (storage-read conn key)]
+          data (<? (storage-read conn key))]
       (when data
-        (serdeproto/-deserialize-db-root (serde conn) (<? data))))))
+        (serdeproto/-deserialize-db-root (serde conn) data)))))
 
 
 (defn reify-db
