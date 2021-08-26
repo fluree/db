@@ -95,7 +95,7 @@
 
              clojure.lang.Associative
              (entryAt [f k] (some->> (get f k nil) (clojure.lang.MapEntry k)))
-             (containsKey [_ k] (#{:s :p :o :t :op :m} k))
+             (containsKey [_ k] (boolean (#{:s :p :o :t :op :m} k)))
              (assoc [f k v] (assoc-flake f k v))
 
              Object
@@ -159,7 +159,7 @@
 #?(:clj (defmethod print-method Flake [^Flake f, ^java.io.Writer w]
           (.write w (str "#Flake "))
           (binding [*out* w]
-            (pr {:s (.-s f), :p (.-p f), :o (.-o f), :t (.-t f), :op (.-op f), :m (.-m f)}))))
+            (pr [(.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f)]))))
 
 
 (defn- equiv-flake
