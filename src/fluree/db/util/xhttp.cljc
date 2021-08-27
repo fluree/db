@@ -9,9 +9,10 @@
                [manifold.deferred :as d])
             #?(:clj
                [manifold.stream :as s])
-            #?(:cljs [goog.net.XhrIo :as xhr])
+            #?(:cljs ["axios" :as axios])
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
+            [clojure.string :as str]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
@@ -32,30 +33,37 @@
 
 (defn format-error-response
   [url e]
-  (let [status #?(:cljs (when-let [st (.getStatus e)]
-                          (when (> st 0)
-                            st))
+  (let [status #?(:cljs (when-let [resp (.-response e)]
+                          (when-let [st (.-status resp)]
+                            (when (> st 0)
+                              st)))
                   :clj (:status (ex-data e)))
-        error #?(:cljs (condp = (.getLastErrorCode e)
-                         goog.net.ErrorCode.NO_ERROR :xhttp/no-error
-                         goog.net.ErrorCode.EXCEPTION :xhttp/exception
-                         goog.net.ErrorCode.HTTP_ERROR :xhttp/http-error
-                         goog.net.ErrorCode.ABORT :xhttp/abort
-                         goog.net.ErrorCode.TIMEOUT :xhttp/timeout
-                         ;; else
-                         :xhttp/unknown-error)
+        error #?(:cljs (cond
+                         (str/starts-with? (.-message e) "timeout")
+                         :xhttp/timeout
+
+                         (and status (<= 300 status 499))
+                         :xhttp/http-error
+
+                         (and status (>= status 500))
+                         :xhttp/exception
+
+                         :else
+                         (do (log/error "XHTTP Request Error:" (.-request e))
+                             :xhttp/unknown-error))
+
                  :clj  (cond
                          (instance? TimeoutException e)
                          :xhttp/timeout
 
-                        (and status (<= 300 status 499))
-                        :xhttp/http-error
+                         (and status (<= 300 status 499))
+                         :xhttp/http-error
 
-                        (and status (>= status 500))
-                        :xhttp/exception
+                         (and status (>= status 500))
+                         :xhttp/exception
 
-                        :else
-                        :xhttp/unknown-error))
+                         :else
+                         :xhttp/unknown-error))
         message (str "xhttp error - " url
                      (if (and status (> status 0)) (str ": " status) "")
                      #?(:clj (str " - " (.getMessage ^Throwable e))))]
@@ -65,18 +73,17 @@
                      status (assoc :status status)))))
 
 
-(defn throw-if-timeout [response]
-  (if (= TimeoutException (-> response
-                              :error
-                              :error/via
-                              first
-                              :type))
-    (throw (TimeoutException. (-> response :error :error/cause)))
-    response))
+#?(:clj
+   (defn throw-if-timeout [response]
+     (if (= TimeoutException (-> response
+                                 :error
+                                 :error/via
+                                 first
+                                 :type))
+       (throw (TimeoutException. (-> response :error :error/cause)))
+       response)))
 
 
-
-;; TODO - determine if pooling XhrIo instances makes any significant advantage
 
 (defn post-json
   "Posts JSON content.
@@ -91,34 +98,32 @@
     #?(:clj (http/post url {:headers headers
                             :timeout request-timeout
                             :body    (json/stringify message)}
-             ;; TODO: Do we really want manifold here? It's only here because
-             ;; we used to use aleph which itself uses manifold. When I ported
-             ;; this code to http-kit I left it in here b/c it can treat
-             ;; Clojure promises as manifold deferreds and it was the smallest
-             ;; possible change. - WSM 2021-05-26
-             (d/catch
-               (d/chain
-                 (http/post url {:headers headers
-                                 :timeout request-timeout
-                                 :body    (json/stringify message)}
-                            throw-if-timeout)
-                 (fn [response]
-                   (let [body (-> response :body bs/to-string json/parse)]
-                     (async/put! response-chan body))))
-               (fn [e] (async/put! response-chan (format-error-response url e)))))
-       :cljs (try
-               (xhr/send url (fn [event]
-                               (let [xhr (-> event .-target)
-                                     success? (.isSuccess xhr)]
-                                 (if success?
-                                   (async/put! response-chan (-> (.getResponseJson xhr)
-                                                                 (js->clj :keywordize-keys true)))
-                                   (async/put! response-chan (format-error-response url xhr)))))
-                         "POST"
-                         (json/stringify message)
-                         (clj->js headers)
-                         request-timeout)
-               (catch :default e (log/warn "CAUGHT ERROR!") (async/put! response-chan e))))
+                       ;; TODO: Do we really want manifold here? It's only here because
+                       ;; we used to use aleph which itself uses manifold. When I ported
+                       ;; this code to http-kit I left it in here b/c it can treat
+                       ;; Clojure promises as manifold deferreds and it was the smallest
+                       ;; possible change. - WSM 2021-05-26
+                       (d/catch
+                           (d/chain
+                             (http/post url {:headers headers
+                                             :timeout request-timeout
+                                             :body    (json/stringify message)}
+                                        throw-if-timeout)
+                             (fn [response]
+                               (let [body (-> response :body bs/to-string json/parse)]
+                                 (async/put! response-chan body))))
+                           (fn [e] (async/put! response-chan (format-error-response url e)))))
+       :cljs
+       (-> axios
+           (.request (clj->js {:url url
+                               :method "post"
+                               :timeout request-timeout
+                               :headers headers
+                               :data message}))
+           (.then (fn [resp]
+                    (async/put! response-chan (:data (js->clj resp :keywordize-keys true)))))
+           (.catch (fn [err]
+                     (async/put! response-chan (format-error-response url err))))))
     response-chan))
 
 
@@ -172,23 +177,21 @@
                                 :error   :db/invalid-query}]
                      (async/put! response-chan error))
                    (async/put! response-chan (format-error-response url e)))))
-       :cljs (try
-               (xhr/send url (fn [event]
-                               (let [xhr (-> event .-target)
-                                     success? (.isSuccess xhr)]
-                                 (if success?
-                                   (async/put! response-chan
-                                               (case output-format
-                                                 :text (.getResponseText xhr)
-                                                 :json (.getResponseJson xhr)
-                                                 ;; else
-                                                 (throw (ex-info "http get only supports output formats of json and text for now." {}))))
-                                   (async/put! response-chan (format-error-response url xhr)))))
-                         "GET"
-                         body
-                         (clj->js headers)
-                         request-timeout)
-               (catch :default e (log/warn "CAUGHT ERROR!") (async/put! response-chan e))))
+       :cljs (-> axios
+                 (.request (clj->js {:url url
+                                     :method "get"
+                                     :timeout request-timeout
+                                     :headers headers}))
+                 (.then (fn [resp]
+                          (let [data (:data (js->clj resp :keywordize-keys true))]
+                            (async/put! response-chan
+                                        (case output-format
+                                          :text data
+                                          :json data
+                                          ;; else
+                                          (throw (ex-info "http get only supports output formats of json and text." {})))))))
+                 (.catch (fn [err]
+                           (async/put! response-chan (format-error-response url err))))))
     response-chan))
 
 

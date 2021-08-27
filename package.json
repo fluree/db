@@ -1,10 +1,11 @@
 {
   "dependencies": {
-    "@cljs-oss/module-deps": "^1.1.1",
-    "@fluree/sjcl": "^1.0.8-3",
-    "js-sha3": "^0.8.0",
-    "scrypt-js": "^2.0.4",
-    "source-map-support": "^0.5.19"
+    "@cljs-oss/module-deps": "1.1.1",
+    "@fluree/sjcl": "1.0.8-3",
+    "axios": "0.21.1",
+    "js-sha3": "0.8.0",
+    "scrypt-js": "2.0.4",
+    "source-map-support": "0.5.19"
   },
   "devDependencies": {
     "karma": "^6.3.4",
