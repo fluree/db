@@ -28,27 +28,27 @@
         sig-authority (try (crypto/account-id-from-message cmd sig)
                            (catch Exception _
                              (throw (ex-info (format "Transaction %s has an invalid signature." id)
-                                             {:status 400 :error :db/invalid-transaction}))))
+                                             {:status 400 :error :db/invalid-signature}))))
         ;; merge everything together into one map for transaction.
         current-time  (System/currentTimeMillis)
         {:keys [auth authority expire]} cmd-map
         expired?      (and expire (< expire current-time))
         _             (when expired?
                         (throw (ex-info (format "Transaction %s is expired. Current time: %s expire time: %s." id current-time expire)
-                                        {:status 400 :error :db/invalid-transaction})))
+                                        {:status 400 :error :db/expired-transaction})))
         cmd-map*      (cond
                         (and (nil? auth) (nil? authority))
                         (assoc cmd-map :auth sig-authority)
 
                         (and (nil? auth) authority)
                         (throw (ex-info (format "Transaction %s invalid. An authority without an auth is not allowed." id)
-                                        {:status 400 :error :db/invalid-transaction}))
+                                        {:status 400 :error :db/missing-auth}))
 
                         (and auth authority)
                         (if (= authority sig-authority)
                           cmd-map
                           (throw (ex-info (format "Transaction %s is invalid. Signing authority: %s does not match command authority: %s." id sig-authority authority)
-                                          {:status 400 :error :db/invalid-transaction})))
+                                          {:status 400 :error :db/invalid-authority})))
 
                         (and auth (nil? authority))
                         (if (= auth sig-authority)
