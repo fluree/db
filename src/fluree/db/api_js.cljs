@@ -9,7 +9,7 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.session :as session]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [go-try <? into?]]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util]

@@ -11,7 +11,7 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.query.block :as query-block]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [go-try <? into?]]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]

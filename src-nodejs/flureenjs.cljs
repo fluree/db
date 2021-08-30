@@ -23,7 +23,7 @@
             [fluree.db.query.sql :as sql]
             [fluree.db.session :as session]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [go-try <? into? channel?]]
+            [fluree.db.util.async :refer [go-try <? channel?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]

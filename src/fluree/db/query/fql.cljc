@@ -11,7 +11,7 @@
             [fluree.db.query.schema :as schema]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try into? merge-into?]])
+            [fluree.db.util.async :refer [<? go-try merge-into?]])
   (:refer-clojure :exclude [vswap!])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [clojure.core])))

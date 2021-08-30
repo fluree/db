@@ -2,7 +2,7 @@
   (:require [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
-            [fluree.db.util.async :refer [<? go-try into?]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
