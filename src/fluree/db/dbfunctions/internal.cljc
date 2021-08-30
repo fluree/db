@@ -7,6 +7,7 @@
             [#?(:cljs cljs.core.async :clj clojure.core.async) :as async]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
+            #?(:cljs [fluree.db.util.string :refer [format]])
             [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
             #?(:cljs [fluree.db.flake :refer [Flake]]))
