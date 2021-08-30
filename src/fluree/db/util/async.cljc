@@ -84,7 +84,7 @@
 
 (defn into?
   "Like async/into, but checks each item for an error response and returns exception
-  onto the response channel insted of results if thee is one."
+  onto the response channel instead of results if there is one."
   [coll chan]
   (async/go
     (try*
