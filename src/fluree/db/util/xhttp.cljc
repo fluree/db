@@ -10,6 +10,7 @@
             #?(:clj
                [manifold.stream :as s])
             #?(:cljs ["axios" :as axios])
+            #?(:cljs ["ws" :as NodeWebSocket])
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
             [clojure.string :as str]
@@ -253,7 +254,9 @@
        (async/put! resp-chan ws))
 
      :cljs
-     (let [ws (js/WebSocket. url)
+     (let [ws (if (identical? *target* "nodejs")
+                (NodeWebSocket. url)
+                (js/WebSocket. url))
            open? (async/promise-chan)
            timeout-chan (async/timeout timeout)]
 

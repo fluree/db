@@ -5,7 +5,8 @@
     "axios": "0.21.1",
     "js-sha3": "0.8.0",
     "scrypt-js": "2.0.4",
-    "source-map-support": "0.5.19"
+    "source-map-support": "0.5.19",
+    "ws": "7.4.6"
   },
   "devDependencies": {
     "karma": "^6.3.4",
