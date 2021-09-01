@@ -311,6 +311,7 @@
           (async/put! return-ch
                       (assoc node k data)))
         (catch* e
+                (log/error e "Error resolving index node")
                 (when error-fn
                   (error-fn))
                 (async/put! return-ch e)
