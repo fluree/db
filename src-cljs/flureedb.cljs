@@ -16,7 +16,6 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.query.http-signatures :as http-signatures]
-            [goog.string.format]
     ;shared clojurescript code
             [fluree.db.api-js :as fdb-js]
             [fluree.db.connection-js :as conn-handler]))

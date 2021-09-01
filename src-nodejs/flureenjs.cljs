@@ -27,7 +27,6 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [goog.string.format]
             [cljs.nodejs :as node-js]                       ;; NodeJS support
 
     ; shared clojurescript code

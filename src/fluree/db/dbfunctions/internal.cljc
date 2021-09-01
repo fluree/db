@@ -58,8 +58,8 @@
                       (.getClass e')
                       msg)
             args' (if (coll? args) (str/join " " args) args)]
-        (format "Error in database function: %s: %s. Provided: %s"
-                function-name err-msg args'))
+        (clojure.core/str "Error in database function: " function-name ": "
+                          err-msg ". Provided: " args'))
       {:status 400
        :error  :db/invalid-fn})))
 

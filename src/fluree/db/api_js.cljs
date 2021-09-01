@@ -13,7 +13,6 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util]
-            [goog.string.format]
             [fluree.db.connection-js :as conn-handler]))
 
 ;; supporting code for JS APIS (webworker, flureedb (both browser and nodejs)
@@ -91,6 +90,8 @@
                      :else
                      acc)) {} prefixes))
 
+(defn format-duration-millis [start end]
+  (str (- end start) "ms"))
 
 ;; ======================================
 ;;
@@ -143,9 +144,7 @@
                 :result (if (sequential? result)
                           (doall result) result)
                 :fuel   @fuel
-                :time   (-> (- (util/current-time-millis) start-ms)
-                            (/ 1000000)
-                            (#(goog.string/format "%.2fms" (float %))))
+                :time   (format-duration-millis start-ms (util/current-time-millis))
                 :block  (:block db*)}
 
                :else
@@ -435,9 +434,7 @@
                                   (doall result')
                                   result')
                         :fuel   100
-                        :time   (-> (- (util/current-time-millis) start)
-                                    (/ 1000000)
-                                    (#(goog.string/format "%.2fms" (float %))))}
+                        :time   (format-duration-millis start (util/current-time-millis))}
                        result')]
          result*)
        (catch :default e
