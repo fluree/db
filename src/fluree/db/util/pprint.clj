@@ -2,7 +2,10 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.index :as index]
             [clojure.core.async :as async])
-  (:import (fluree.db.flake Flake)))
+  (:import (fluree.db.flake Flake)
+           (fluree.db.index DataNode)))
+
+(set! *warn-on-reflection* true)
 
 
 (defn pprint-root
@@ -18,7 +21,7 @@
         str-vec            (if (index/data-node? index)
                              (let [node-count (count (:flakes index))]
                                (swap! count-atom + node-count)
-                               (conj str-vec (str ":" (.-block index) "-" node-count)))
+                               (conj str-vec (str ":" (.-block ^DataNode index) "-" node-count)))
                              str-vec)
         first-flake        ^Flake (dbproto/-first-flake index)
         main-str           (apply str str-vec)

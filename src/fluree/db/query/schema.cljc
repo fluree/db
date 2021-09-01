@@ -42,7 +42,7 @@
 
 (defn flake->pred-map
   [flakes]
-  (reduce (fn [acc ^Flake flake]                            ;; quick lookup map of predicate's predicate ids
+  (reduce (fn [acc ^Flake flake]                                   ;; quick lookup map of predicate's predicate ids
             (let [p         (.-p flake)
                   o         (.-o flake)
                   existing? (get acc p)]
@@ -59,7 +59,8 @@
 (defn- extract-spec-ids
   [spec-pid schema-flakes]
   (->> schema-flakes
-       (keep #(when (= spec-pid (.-p %)) (.-o %)))
+       (keep #(let [f ^Flake %]
+                (when (= spec-pid (.-p f)) (.-o f))))
        vec))
 
 (defn- recur-sub-classes
@@ -137,13 +138,16 @@
           prefix-flakes-ch (query-range/index-range db :spot
                                                     >= [(flake/max-subject-id const/$_prefix)]
                                                     <= [(flake/min-subject-id const/$_prefix)])
-          [collection-flakes predicate-flakes] (partition-by #(<= (.-s %) flake/MAX-COLL-SUBJECTS) schema-flakes)
+          [collection-flakes predicate-flakes] (partition-by #(<= (.-s ^Flake %) flake/MAX-COLL-SUBJECTS) schema-flakes)
           coll             (->> collection-flakes
-                                (partition-by #(.-s %))
+                                (partition-by #(.-s ^Flake %))
                                 (reduce (fn [acc coll-flakes]
-                                          (let [sid       (.-s (first coll-flakes))
+                                          (let [^Flake first-flake (first coll-flakes)
+                                                sid       (.-s first-flake)
                                                 p->v      (->> coll-flakes ;; quick lookup map of collection's predicate ids
-                                                               (reduce #(assoc %1 (.-p %2) (.-o %2)) {}))
+                                                               (reduce #(let [f ^Flake %2]
+                                                                          (assoc %1 (.-p f) (.-o f)))
+                                                                       {}))
                                                 partition (or (get p->v const/$_collection:partition)
                                                               (flake/sid->i sid))
                                                 c-name    (get p->v const/$_collection:name)
@@ -163,9 +167,10 @@
                                         {-1    {:name "_tx" :id -1 :sid -1}
                                          "_tx" {:name "_tx" :id -1 :sid -1}}))
           [pred fullText] (->> predicate-flakes
-                               (partition-by #(.-s %))
+                               (partition-by #(.-s ^Flake %))
                                (reduce (fn [[pred fullText] pred-flakes]
-                                         (let [id        (.-s (first pred-flakes))
+                                         (let [^Flake first-flake (first pred-flakes)
+                                               id        (.-s first-flake)
                                                p->v      (flake->pred-map pred-flakes)
                                                class?    (contains? p->v const/$rdf:type)
                                                iri       (get p->v const/$iri)

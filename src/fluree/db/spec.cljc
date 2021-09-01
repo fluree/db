@@ -2,8 +2,9 @@
   (:require [fluree.db.util.json :as json]
             [alphabase.core :as alphabase]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
             [clojure.string :as str]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (def ^:private EMAIL #"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 

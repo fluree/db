@@ -7,6 +7,8 @@
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn where-clause-valid?
   "Checks to see if the where clause has ' = ', ' > ', ' < ', ' <= ', or ' >= ', and returns true if yes"
   [where-clause]
@@ -252,7 +254,7 @@
   [db p compact?]
   (let [name (dbproto/-p-prop db :name p)]
     {:p          p
-     :limit      100
+     :limit      nil
      :name       name
      :as         (if (and compact? name)
                    (second (re-find #"/(.+)" name))

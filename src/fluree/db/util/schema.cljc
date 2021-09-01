@@ -1,8 +1,9 @@
 (ns fluree.db.util.schema
   (:require [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.constants :as const])
-  #?(:clj
-     (:import (fluree.db.flake Flake))))
+  #?(:clj (:import (fluree.db.flake Flake))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 
 (def ^:const schema-sid-start (flake/min-subject-id const/$_predicate))
@@ -89,19 +90,23 @@
 
 (defn add-to-post-preds?
   [flakes pred-ecount]
-  (keep #(if (and (or (= (.-p %) const/$_predicate:index)
-                      (= (.-p %) const/$_predicate:unique))
-                  (= (.-o %) true)
-                  (>= pred-ecount (.-s %))) (.-s %)) flakes))
+  (keep #(let [f ^Flake %]
+           (if (and (or (= (.-p f) const/$_predicate:index)
+                        (= (.-p f) const/$_predicate:unique))
+                  (= (.-o f) true)
+                  (>= pred-ecount (.-s f))) (.-s f)))
+        flakes))
 
 (defn remove-from-post-preds
   "Returns any predicate subject flakes that are removing
   an existing index, either via index: true or unique: true."
   [flakes]
-  (keep #(when (and (true? (.-op %))
-                    (or (= (.-p %) const/$_predicate:index)
-                        (= (.-p %) const/$_predicate:unique))
-                    (= (.-o %) false)) (.-s %)) flakes))
+  (keep #(let [f ^Flake %]
+           (when (and (true? (.-op f))
+                    (or (= (.-p f) const/$_predicate:index)
+                        (= (.-p f) const/$_predicate:unique))
+                    (= (.-o f) false)) (.-s f)))
+        flakes))
 
 (defn schema-change?
   "Returns true if any of the provided flakes are a schema flake."
@@ -116,9 +121,11 @@
 (defn get-language-change
   "Returns the language being added, if any. Else returns nil."
   [flakes]
-  (some #(when (and (is-language-flake? %)
-                    (is-setting-flake? %)
-                    (true? (.-op %))) (.-o %)) flakes))
+  (some #(let [f ^Flake %]
+           (when (and (is-language-flake? f)
+                    (is-setting-flake? f)
+                    (true? (.-op f))) (.-o f)))
+        flakes))
 
 (defn is-pred-flake?
   "Returns true if flake is a schema flake."

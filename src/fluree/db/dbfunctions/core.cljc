@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.core
   (:refer-clojure :exclude [read-string])
-  (:require [#?(:cljs cljs.reader :clj clojure.tools.reader.edn) :refer [read-string]]
+  (:require [#?(:cljs cljs.reader :clj clojure.edn) :refer [read-string]]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :refer [try* catch*]]
@@ -8,6 +8,8 @@
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.dbfunctions.fns :as fns]
             [clojure.string :as str]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (declare resolve-fn)
 
@@ -272,23 +274,6 @@
                  (throw (ex-info (str "Error parsing function: " fn-str)
                                  {:status 400 :error :db/invalid-tx}))))))))
 
-
-(defn execute-tx-fn
-  "Executes a transaction function"
-  [db auth_id credits s p o fuel block-instant]
-  (go-try
-    (let [fn-str  (subs o 1)                                ;; remove preceding '#'
-          credits 10000000
-          ctx     {:db      db
-                   :instant block-instant
-                   :sid     s
-                   :pid     p
-                   :auth_id auth_id
-                   :state   fuel}
-          f       (<? (parse-fn db fn-str "txn" nil))
-          res     (f ctx)]
-      (if (channel? res)
-        (<? res) res))))
 
 
 (comment

@@ -6,6 +6,8 @@
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 #?(:cljs
    (def inline-grammar
      "SQL grammar in instaparse compatible BNF format loaded at compile time so it's

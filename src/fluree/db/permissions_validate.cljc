@@ -9,6 +9,8 @@
             [fluree.db.util.schema :as schema-util])
   #?(:clj (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; goal is a quick check if we can not check every result. Many queries are small,
 ;; so an extended effort in here is not worth the time, we can just check each result
 (defn no-filter?
@@ -102,7 +104,7 @@
   (b) truthy value if flake is allowed
   (c) falsey value if flake not allowed"
   ([db flake] (allow-flake? db flake (:permissions db)))
-  ([db flake permissions]
+  ([db ^Flake flake permissions]
    (async/go
      (if (root-permission? permissions)
        true

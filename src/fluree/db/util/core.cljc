@@ -10,6 +10,8 @@
                     (java.net URLEncoder URLDecoder))
      :cljs (:refer-clojure :exclude [random-uuid])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 ;; javascript is 2^53 - 1
 (def ^:const max-long #?(:clj  (Long/MAX_VALUE)
@@ -53,10 +55,9 @@
      (cljs-exceptions/try* ~@body)
      (clj-exceptions/try* ~@body)))
 
-;; index-of from: https://gist.github.com/fgui/48443e08844e42c674cd
 (defn index-of [coll value]
-  (some (fn [[item idx]] (if (= value item) idx))
-        (partition 2 (interleave coll (iterate inc 0)))))
+  (some (fn [[item idx]] (when (= value item) idx))
+        (partition 2 (interleave coll (range)))))
 
 (defn random-uuid []
   "Generates random UUID in both clojure/script"
@@ -77,10 +78,10 @@
     date
 
     #?@(:clj  [(instance? Instant date)
-               (.toEpochMilli date)
+               (.toEpochMilli ^Instant date)
 
                (instance? Date date)
-               (.getTime date)]
+               (.getTime ^Date date)]
         :cljs [(instance? js/Date date)
                (.getTime date)])
 
@@ -218,7 +219,7 @@
 
 (defn url-decode
   ([string] (url-decode string "UTF-8"))
-  ([string encoding]
+  ([string ^String encoding]
    #?(:clj  (some-> string str (URLDecoder/decode encoding))
       :cljs (some-> string str (js/decodeURIComponent)))))
 

@@ -9,6 +9,7 @@
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
             #?(:clj [fluree.crypto :as crypto])
+            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.xhttp :as xhttp]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try channel?]]
@@ -17,11 +18,12 @@
             #?(:clj [fluree.db.serde.avro :refer [avro-serde]])
             [fluree.db.conn-events :as conn-events]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; socket connections are keyed by connection-id and contain :socket - ws, :id - socket-id :health - status of health checks.
 (def server-connections-atom (atom {}))
 
 (def server-regex #"^(?:((?:https?):)//)([^:/\s#]+)(?::(\d*))?")
-
 
 
 (defn- acquire-healthy-server
@@ -111,7 +113,12 @@
                        tx-private-key tx-key-id
                        meta
                        add-listener remove-listener
-                       close])
+                       close]
+  #?@(:clj
+      [full-text/IndexConnection
+       (open-storage [{:keys [storage-type] :as conn} network dbid lang]
+                     (when-let [path (-> conn :meta :file-storage-path)]
+                       (full-text/disk-index path network dbid lang)))]))
 
 
 (defn- normalize-servers
@@ -188,7 +195,6 @@
     (or (get-in @server-connections-atom [(:id conn) :ws :socket])
         ;; attempt to connect
         (<? (establish-socket (:id conn) (:sub-chan conn) (:pub-chan conn) (:servers conn))))))
-
 
 
 (defn get-server
@@ -316,6 +322,7 @@
 
           :else
           (do
+            (log/trace "Received message:" (pr-str (json/parse msg)))
             (conn-events/process-events conn (json/parse msg))
             (recur 0)))))))
 
@@ -434,7 +441,6 @@
   Will return true if a function exists for that key and it was removed."
   [conn network dbid key]
   (remove-listener* (:state conn) network dbid key))
-
 
 
 (defn add-token
@@ -566,15 +572,14 @@
   Provide servers in either a sequence or as a string that is comma-separated."
   [servers & [opts]]
   (let [conn        (generate-connection servers opts)
-        transactor? (:transactor? opts)
-        dev?        (-> conn :meta :dev?)]
+        transactor? (:transactor? opts)]
     (when-not transactor?
       (async/go
         (let [socket (async/<! (get-socket conn))]
           (if (or (nil? socket)
                   (util/exception? socket))
             (do
-              (log/warn "Cannot establish connection to a healthy server, disconnecting.")
+              (log/error socket "Cannot establish connection to a healthy server, disconnecting.")
               (async/close! conn))
             ;; kick off consumer
             (msg-consumer conn)))))

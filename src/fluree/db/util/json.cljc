@@ -1,6 +1,7 @@
 (ns fluree.db.util.json
   (:require #?(:clj [cheshire.core :as cjson])
-            #?(:clj [cheshire.generate :refer [add-encoder encode-seq]])
+            #?(:clj [cheshire.parse :as cparse])
+            #?(:clj [cheshire.generate :refer [add-encoder encode-seq remove-encoder]])
             #?(:clj [fluree.db.flake])
             #?(:cljs [goog.object :as gobject])
             [fluree.db.util.bytes :as butil]
@@ -8,11 +9,24 @@
   #?(:clj
      (:import (fluree.db.flake Flake)
               (java.io ByteArrayInputStream)
-              (byte_streams InputStream))))
+              (byte_streams InputStream)
+              (com.fasterxml.jackson.core JsonGenerator))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 #?(:clj (add-encoder Flake encode-seq))
 
 #?(:clj (add-encoder (Class/forName "[B") encode-seq))
+
+#?(:clj
+   (defn encode-BigDecimal-as-string
+     "Turns on/off json-encoding of a java.math.Bigdecimal as a string"
+     [enable]
+     (if enable
+       (add-encoder java.math.BigDecimal
+                     (fn [n ^JsonGenerator jsonGenerator]
+                       (.writeString jsonGenerator (str n))))
+       (remove-encoder java.math.BigDecimal))))
 
 ;;https://purelyfunctional.tv/mini-guide/json-serialization-api-clojure/
 #?(:cljs
@@ -46,7 +60,13 @@
                       (instance? InputStream x) (slurp x)
                       :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
                                             {:status 500 :error :db/unexpected-error})))
-                (cjson/parse-string keywordize-keys?))
+                ;; set binding parameter to decode BigDecimals
+                ;; without truncation.  Unfortunately, this causes
+                ;; all floating point and doubles to be designated
+                ;; as BigDecimals.
+                (as-> x'
+                      (binding [cparse/*use-bigdecimals?* true]
+                        (cjson/decode x' keywordize-keys?))))
       :cljs (-> (if (string? x)
                   x
                   (butil/UTF8->string x))
@@ -142,6 +162,4 @@
        :coordinates [0 0]}
       (stringify)
       (parse)
-      (valid-geojson?))
-
-  )
+      (valid-geojson?)))

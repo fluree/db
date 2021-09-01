@@ -13,10 +13,34 @@
             [fluree.db.util.async :refer [<? go-try into? merge-into?]]
             [fluree.db.constants :as const]
             [fluree.db.util.iri :as iri-util])
+  (:refer-clojure :exclude [vswap!])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [clojure.core])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (declare flakes->res query)
+
+(defn vswap!
+  "This silly fn exists to work around a bug in go macros where they sometimes clobber
+  type hints and issue reflection warnings. The vswap! macro uses interop so those forms
+  get macroexpanded into the go block. You'll then see reflection warnings for reset
+  deref. By letting the macro expand into this fn instead, it avoids the go bug.
+  I've filed a JIRA issue here: https://clojure.atlassian.net/browse/ASYNC-240
+  NB: I couldn't figure out how to get a var-arg version working so this only supports
+  0-3 args. I didn't see any usages in here that need more than 2, but note well and
+  feel free to add additional arities if needed (but maybe see if that linked bug has
+  been fixed first in which case delete this thing with a vengeance and remove the
+  refer-clojure exclude in the ns form).
+  - WSM 2021-08-26"
+  ([vol f]
+   (clojure.core/vswap! vol f))
+  ([vol f arg1]
+   (clojure.core/vswap! vol f arg1))
+  ([vol f arg1 arg2]
+   (clojure.core/vswap! vol f arg1 arg2))
+  ([vol f arg1 arg2 arg3]
+   (clojure.core/vswap! vol f arg1 arg2 arg3)))
 
 (defn fuel-flake-transducer
   "Can sit in a flake pipeline and accumulate a count of 'fuel-per' for every flake pulled
@@ -96,17 +120,20 @@
              limit (take limit)) res))
 
 (defn- add-pred
-  ([db cache fuel max-fuel acc pred-spec ^Flake flake componentFollow? recur?]
-   (add-pred db cache fuel max-fuel acc pred-spec ^Flake flake componentFollow? recur? {}))
-  ([db cache fuel max-fuel acc pred-spec ^Flake flake componentFollow? recur? offset-map]
+  "Adds a predicate to a select spec graph crawl. flakes input is a list of flakes
+  all with the same subject and predicate values."
+  ([db cache fuel max-fuel acc pred-spec flakes componentFollow? recur?]
+   (add-pred db cache fuel max-fuel acc pred-spec flakes componentFollow? recur? {}))
+  ([db cache fuel max-fuel acc pred-spec flakes componentFollow? recur? offset-map]
    (go-try
-     (let [pred-spec  (if (and (:wildcard? pred-spec) (nil? (:as pred-spec)))
+     (let [compact?   (:compact? pred-spec)                 ;retain original value
+           pred-spec  (if (and (:wildcard? pred-spec) (nil? (:as pred-spec)))
                         ;; nested 'refs' can be wildcard, but also have a pred-spec... so only get a default wildcard spec if we have no other spec
-                        (wildcard-pred-spec db cache (.-p flake) (:compact? pred-spec))
+                        (wildcard-pred-spec db cache (-> flakes first :p) compact?)
                         pred-spec)
-           pred-spec' (if (contains? pred-spec :componentFollow?)
-                        pred-spec
-                        (assoc pred-spec :componentFollow? componentFollow?))
+           pred-spec' (cond-> pred-spec
+                              (not (contains? pred-spec :componentFollow?)) (assoc :componentFollow? componentFollow?)
+                              (not (contains? pred-spec :compact?)) (assoc :compact? compact?))
            ;; TODO - I think we can eliminate the check below for fallbacks and ensure we always have an 'as' in every spec
            k          (or (:as pred-spec') (:name pred-spec') (:iri pred-spec') (:p pred-spec')) ;; use :as, then full pred name, then just p-id as backup
            {:keys [multi? ref? limit orderBy offset p]} pred-spec'
@@ -119,8 +146,11 @@
                                  (if (get offset-map p)
                                    (update offset-map p dec)
                                    (assoc offset-map p (dec offset)))]
+
+                                ;; check if have hit limit of predicate spec
                                 (and multi?
                                      (not orderBy)
+                                     limit
                                      (>= (count (get acc k)) limit))
                                 [nil offset-map]
 
@@ -128,48 +158,58 @@
                                 (and (not recur?)
                                      (or (:select pred-spec') (:wildcard? pred-spec')))
                                 (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select])]
-                                  [(<? (cond->> (<? (query-range/index-range db :spot = [(.-o flake)]))
-                                                fuel (sequence (fuel-flake-transducer fuel max-fuel))
-                                                true ((fn [n] (flakes->res db cache fuel max-fuel nested-select-spec n)))))
+                                  [(loop [[^Flake flake & r] flakes
+                                          acc []]
+                                     (if flake
+                                       (let [sub-sel (<? (query-range/index-range db :spot = [(.-o flake)]))]
+                                         (when fuel (vswap! fuel + (count sub-sel)))
+                                         (recur r (conj acc (<? (flakes->res db cache fuel max-fuel nested-select-spec sub-sel)))))
+                                       acc))
                                    offset-map])
 
                                 ;; resolve tag
                                 (:tag? pred-spec')
-                                [(or (get @cache [(.-o flake) (:name pred-spec')])
-                                     (let [res (<? (dbproto/-tag db (.-o flake) (:name pred-spec')))]
-                                       (vswap! cache assoc [(.-o flake) (:name pred-spec')] res)
-                                       res)) offset-map]
+                                [(loop [[^Flake flake & r] flakes
+                                        acc []]
+                                   (if flake
+                                     (let [res (or (get @cache [(.-o flake) (:name pred-spec')])
+                                                   (let [res (<? (dbproto/-tag db (.-o flake) (:name pred-spec')))]
+                                                     (vswap! cache assoc [(.-o flake) (:name pred-spec')] res)
+                                                     res))]
+                                       (recur r (if res (conj acc res) acc)))
+                                     acc))
+                                 offset-map]
 
                                 ; is a component, get children
                                 (and componentFollow? (:component? pred-spec'))
-                                (let [children (<? (query-range/index-range db :spot = [(.-o flake)] {:limit (:limit pred-spec')}))]
-                                  (if (empty? children)
-                                    [{:_id (.-o flake)} offset-map] ;; no permission (empty results), so just return _id
-                                    [(<? (cond->> children
-                                                  fuel (sequence (fuel-flake-transducer fuel max-fuel))
-                                                  true ((fn [n] (flakes->res db cache fuel max-fuel {:wildcard? true} n)))))
-                                     offset-map]))
+                                [(loop [[^Flake flake & r] flakes
+                                        acc []]
+                                   (if flake
+                                     (let [children (<? (query-range/index-range db :spot = [(.-o flake)] {:limit (:limit pred-spec')}))
+                                           acc*     (if (empty? children)
+                                                      (conj acc {:_id (.-o flake)})
+                                                      (conj acc (<? (flakes->res db cache fuel max-fuel {:wildcard? true :compact? compact?} children))))]
+                                       (when fuel (vswap! fuel + (count children)))
+                                       (recur r acc*))
+                                     acc))
+                                 offset-map]
 
                                 ;; if a ref, put out an {:_id ...}, if @type expand into IRI
                                 ref?
                                 (if (= const/$rdf:type (:p pred-spec'))
-                                  [(or (get-in db [:schema :pred (.-o flake) :iri])
-                                       {:_id (.-o flake)})
+                                  [(mapv #(or (get-in db [:schema :pred (.-o ^Flake %) :iri])
+                                              {:_id (.-o ^Flake %)}) flakes)
                                    offset-map]
-                                  [{:_id (.-o flake)} offset-map])
+                                  [(mapv #(hash-map :_id (.-o ^Flake %)) flakes) offset-map])
+
 
                                 ;; else just output value
                                 :else
-                                [(.-o flake) offset-map])]
+                                [(mapv #(.-o ^Flake %) flakes) offset-map])]
        (cond
-         (and (not (nil? k-val)) multi?)
-         [(assoc acc k (conj (get acc k []) k-val)) offset-map]
-
-         (not (nil? k-val))
-         [(assoc acc k k-val) offset-map]
-
-         :else
-         [acc offset-map])))))
+         (empty? k-val) [acc offset-map]
+         multi? [(assoc acc k k-val) offset-map]
+         :else [(assoc acc k (first k-val)) offset-map])))))
 
 
 (defn full-select-spec
@@ -212,12 +252,12 @@
         acc
         (let [[pred-id pred-spec] n
               {:keys [offset limit as name p]} pred-spec
-              sub-ids    (->> (<? (query-range/index-range db :opst = [subject-id pred-id]))
-                              (map s)
-                              (not-empty))
-              _          (when (and sub-ids fuel) (add-fuel fuel (count sub-ids) max-fuel))
+              sub-ids (->> (<? (query-range/index-range db :opst = [subject-id pred-id]))
+                           (map s)
+                           (not-empty))
+              _ (when (and sub-ids fuel) (add-fuel fuel (count sub-ids) max-fuel))
               sub-result (loop [[sid & r'] sub-ids
-                                n    0
+                                n 0
                                 acc' []]
                            (cond
                              (or (not sid) (and limit (>= n limit)))
@@ -227,13 +267,13 @@
                              (recur r' (inc n) acc')
 
                              :else
-                             (let [sub-flakes    (<? (query-range/index-range db :spot = [sid]))
+                             (let [sub-flakes (<? (query-range/index-range db :spot = [sid]))
                                    sub-pred-spec (select-keys pred-spec [:wildcard? :compact? :select :limit])
-                                   acc'*         (if (empty? sub-flakes)
-                                                   acc'
-                                                   (do
-                                                     (when fuel (add-fuel fuel (count sub-flakes) max-fuel))
-                                                     (conj acc' (<? (flakes->res db cache fuel max-fuel sub-pred-spec sub-flakes)))))]
+                                   acc'* (if (empty? sub-flakes)
+                                           acc'
+                                           (do
+                                             (when fuel (add-fuel fuel (count sub-flakes) max-fuel))
+                                             (conj acc' (<? (flakes->res db cache fuel max-fuel sub-pred-spec sub-flakes)))))]
                                (recur r' (inc n) acc'*))))]
           (recur r (assoc acc (or as name p) sub-result)))))))
 
@@ -275,7 +315,7 @@
   recur-depth and recur-seen values. Uses flake as the recursion flake being operated on."
   [select-spec ^Flake flake]
   (let [recur-subject (.-o flake)
-        recur-pred    (.-p flake)
+        recur-pred (.-p flake)
         {:keys [recur-seen recur-depth]} select-spec]
     (-> select-spec
         (assoc-in [:select :pred-id recur-pred] select-spec) ;; move current pred-spec to child in :select key for next recursion round
@@ -286,28 +326,32 @@
 
 
 
-;; TODO - reverse refs
 (defn flake->recur
-  ([db ^Flake flake select-spec acc fuel max-fuel cache]
-   (go-try
-     (let [recur-subject (.-o flake)                        ;; ref, so recur subject is the object of the incoming flake
-           {:keys [multi? as recur recur-seen recur-depth limit]} select-spec ;; recur contains # with requested recursion depth
-           seen?         (contains? recur-seen recur-subject) ;; subject has been seen before, stop recursion
-           max-depth?    (> recur-depth recur)              ;; reached max depth
-           sub-flakes    (cond->> (<? (query-range/index-range db :spot = [recur-subject]))
-                                  fuel (sequence (fuel-flake-transducer fuel max-fuel)))
-           stop?         (or seen? max-depth? (empty? sub-flakes))
-           add-result    (if multi?
-                           (fn [results as new-result]
-                             (update results as conjv new-result))
-                           (fn [results as new-result]
-                             (assoc results as new-result)))]
-       (if stop?
-         acc
-         (let [select-spec* (recur-select-spec select-spec flake)
+  "Performs recursion on a select spec graph crawl when specified. flakes input is list
+  of flakes all with the same subject and predicate values."
+  [db flakes select-spec results fuel max-fuel cache]
+  (go-try
+    (let [{:keys [multi? as recur-seen recur-depth limit]} select-spec ;; recur contains # with requested recursion depth
+          max-depth? (> recur-depth (:recur select-spec))]
+      (if max-depth?
+        results
+        (loop [[^Flake flake & r] flakes
+               i   0
+               acc []]
+          (if (or (not flake) (and limit (< i limit)))
+            (cond (empty? acc) results
+                  multi? (assoc results as acc)
+                  :else (assoc results as (first acc)))
+            (let [recur-subject (.-o flake)                 ;; ref, so recur subject is the object of the incoming flake
+                  seen?         (contains? recur-seen recur-subject) ;; subject has been seen before, stop recursion
 
-               res          (<? (flakes->res db cache fuel max-fuel select-spec* sub-flakes))]
-           (add-result acc as res)))))))
+                  sub-flakes    (cond->> (<? (query-range/index-range db :spot = [recur-subject]))
+                                         fuel (sequence (fuel-flake-transducer fuel max-fuel)))
+                  skip?         (or seen? (empty? sub-flakes))
+                  select-spec*  (recur-select-spec select-spec flake)]
+              (if skip?
+                (recur r (inc i) acc)
+                (recur r (inc i) (conj acc (<? (flakes->res db cache fuel max-fuel select-spec* sub-flakes))))))))))))
 
 
 (defn flakes->res
@@ -334,36 +378,35 @@
                                      (<?)
                                      (merge base-acc))
                                 base-acc)
-            result            (loop [flakes     flakes
+            result            (loop [p-flakes   (partition-by :p flakes)
                                      acc        acc+refs
                                      offset-map {}]
-                                (if (empty? flakes)
+                                (if (empty? p-flakes)
                                   acc
-                                  (let [f                (first flakes)
-                                        pred-spec        (get-in select-spec [:select :pred-id (.-p f)])
+                                  (let [flakes           (first p-flakes)
+                                        pred-spec        (get-in select-spec [:select :pred-id (-> flakes first :p)])
                                         componentFollow? (component-follow? pred-spec select-spec)
                                         [acc flakes' offset-map'] (cond
                                                                     (:recur pred-spec)
-                                                                    [(<? (flake->recur db f pred-spec acc fuel max-fuel cache))
-                                                                     (rest flakes) offset-map]
+                                                                    [(<? (flake->recur db flakes pred-spec acc fuel max-fuel cache))
+                                                                     (rest p-flakes) offset-map]
 
                                                                     pred-spec
-                                                                    (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec f componentFollow? false offset-map))]
-                                                                      [acc (rest flakes) offset-map])
+                                                                    (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec flakes componentFollow? false offset-map))]
+                                                                      [acc (rest p-flakes) offset-map])
 
                                                                     (:wildcard? select-spec)
-                                                                    [(first (<? (add-pred db cache fuel max-fuel acc
-                                                                                          select-spec f componentFollow? false)))
-                                                                     (rest flakes)
+                                                                    [(first (<? (add-pred db cache fuel max-fuel acc select-spec flakes componentFollow? false)))
+                                                                     (rest p-flakes)
                                                                      offset-map]
 
                                                                     (and (empty? (:select select-spec)) (:id? select-spec))
-                                                                    [{:_id (.-s f)} (rest flakes) offset-map]
+                                                                    [{:_id (-> flakes first :s)} (rest p-flakes) offset-map]
 
                                                                     :else
-                                                                    [acc (rest flakes) offset-map])
-                                        acc              (assoc acc :_id (.-s f))]
-                                    (recur flakes' acc offset-map'))))
+                                                                    [acc (rest p-flakes) offset-map])
+                                        acc*             (assoc acc :_id (-> flakes first :s))]
+                                    (recur flakes' acc* offset-map'))))
             sort-preds        (reduce (fn [acc spec]
                                         (if (or (and (:multi? spec) (:orderBy spec))
                                                 (and (:reverse? spec) (:orderBy spec)))
@@ -378,23 +421,6 @@
         res))))
 
 
-
-
-;(defn flakes->res-xf
-;  "Transducer for filling out a result from a sequence of
-;  flakes all from the same subject."
-;  [db cache fuel max-fuel select-spec]
-;  (fn [xf]
-;    (fn
-;      ([] (xf))                                             ;; transducer start
-;      ([result] (xf result))                                ;; transducer stop
-;      ([result flakes]
-;       (if-let [res (flakes->res db cache fuel max-fuel select-spec flakes)]
-;         (xf result res)
-;         ;; if no response, just return result which will include nothing in the result set
-;         result)))))
-
-
 ;; TODO - use pipeline-async to do selects in parallel
 (defn flake-select
   "Runs a select statement based on a sequence of flakes."
@@ -404,11 +430,11 @@
    ;; for a flake select, we convert all the initial predicates
    ;; to their predicate id to allow for a quick lookup
    (go-try
-     (let [xf            (comp (cond-> (partition-by s)
-                                       fuel (comp (fuel-flakes-transducer fuel max-fuel))
-                                       offset (comp (drop offset))
-                                       limit (comp (take limit)))
-                               (halt-when (fn [x] (and max-fuel (>= @fuel max-fuel)))))
+     (let [xf (comp (cond-> (partition-by s)
+                            fuel (comp (fuel-flakes-transducer fuel max-fuel))
+                            offset (comp (drop offset))
+                            limit (comp (take limit)))
+                    (halt-when (fn [x] (and max-fuel (>= @fuel max-fuel)))))
            flakes-by-sub (sequence xf flakes)]
        ;; parallel processing - issues: (a) Exhaustion of Fuel will not stop work,
        ;;                               (b) Volatile is used for fuel, could have RACE conditions on multi-threaded
@@ -418,15 +444,8 @@
        (->> flakes-by-sub
             (map #(flakes->res db cache fuel max-fuel select-spec %))
             (merge-into? [])
-            (<?))
+            (<?))))))
 
-       ;; sequential processing - will be slower for larger queries, but negligible for small queries. Fuel will always be accurate.
-       #_(loop [[sub-flakes & r] flakes-by-sub
-                acc []]
-           (if-not sub-flakes
-             acc
-             (let [res (<? (flakes->res db cache fuel max-fuel select-spec sub-flakes))]
-               (recur r (conj acc res)))))))))
 
 (defn subject-select
   "Like flake select, but takes a collection of subject ids which we
@@ -436,7 +455,7 @@
   ([db cache fuel max-fuel select-spec subjects limit offset]
    (go-try
      (loop [[s & r] subjects
-            n   0
+            n 0
             acc []]
        (cond
          (or (nil? s) (and limit (> n limit)))
@@ -446,10 +465,10 @@
          (recur r (inc n) acc)
 
          :else
-         (recur r (inc n)
-                (conj acc (->> (<? (query-range/index-range db :spot = [s]))
-                               ((fn [n] (flakes->res db cache fuel max-fuel select-spec n)))
-                               (<?)))))))))
+         (let [flakes (<? (query-range/index-range db :spot = [s]))]
+           (when fuel (vswap! fuel + (count flakes)))
+           (recur r (inc n) (conj acc (<? (flakes->res db cache fuel max-fuel select-spec flakes))))))))))
+
 
 (defn valid-where-predicate?
   [db p]
@@ -491,21 +510,21 @@
 
 
 (defn parse-map [x valid-var]
-  (let [_             (when-not (= 1 (count (keys x)))
-                        (throw (ex-info (str "Invalid aggregate selection, provided: " x)
-                                        {:status 400 :error :db/invalid-query})))
+  (let [_ (when-not (= 1 (count (keys x)))
+            (throw (ex-info (str "Invalid aggregate selection, provided: " x)
+                            {:status 400 :error :db/invalid-query})))
         var-as-symbol (-> x keys first symbol)
-        _             (when-not (valid-var var-as-symbol)
-                        (throw (ex-info (str "Invalid select variable in aggregate select, provided: " x)
-                                        {:status 400 :error :db/invalid-query})))]
+        _ (when-not (valid-var var-as-symbol)
+            (throw (ex-info (str "Invalid select variable in aggregate select, provided: " x)
+                            {:status 400 :error :db/invalid-query})))]
     {:variable  var-as-symbol
      :selection (-> x vals first)}))
 
 (defn parse-select
   [vars interim-vars select-smt]
-  (let [_        (or (every? #(or (string? %) (map? %)) select-smt)
-                     (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt) {:status 400 :error :db/invalid-query})))
-        vars     (set vars)
+  (let [_ (or (every? #(or (string? %) (map? %)) select-smt)
+              (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt) {:status 400 :error :db/invalid-query})))
+        vars (set vars)
         all-vars (set (concat vars (keys interim-vars)))]
     (map (fn [select]
            (let [var-symbol (if (map? select) nil (-> select symbol))]
@@ -518,15 +537,15 @@
 
 (defn get-pretty-print-keys
   [select]
-  (let [vars  (map (fn [select]
-                     (cond (:as select)
-                           (-> select :as str (subs 1))
+  (let [vars (map (fn [select]
+                    (cond (:as select)
+                          (-> select :as str (subs 1))
 
-                           (:code select)
-                           (-> select :code str)
+                          (:code select)
+                          (-> select :code str)
 
-                           (:variable select)
-                           (-> select :variable str (subs 1)))) select)
+                          (:variable select)
+                          (-> select :variable str (subs 1)))) select)
         freqs (frequencies vars)]
     (if (every? #(= 1 %) (vals freqs))
       vars
@@ -641,26 +660,26 @@
   [select pp-keys single-result? db fuel max-fuel opts parallelism tuples-res]
   (go-try
     (let [expandMaps (build-expand-map select pp-keys)
-          queue-ch   (async/chan)
-          res-ch     (async/chan)
-          stop!      (fn [] (async/close! queue-ch) (async/close! res-ch))
-          opts*      (-> (dissoc opts :limit :offset :orderBy :groupBy)
-                         (assoc :fuel (volatile! 0)))
-          af         (fn [tuple-res port]
-                       (async/go
-                         (try*
-                           (let [tuple-res' (if single-result? [tuple-res] tuple-res)
-                                 query-fuel (volatile! 0)]
-                             (->> expandMaps
-                                  (keep #(expand-map db (assoc opts* :fuel fuel) tuple-res' %)) ;; returns async channels, executes expandmap query
-                                  (async/merge)
-                                  (async/into [])
-                                  (async/<!)                ;; all expandmaps with final results now in single vector
-                                  (reduce replace-expand-maps tuple-res') ;; update original tuple with expandmaps result(s)
-                                  (#(if single-result? [(first %) @query-fuel] [% @query-fuel])) ;; return two-tuple with second element being fuel consumed
-                                  (async/put! port)))
-                           (async/close! port)
-                           (catch* e (async/put! port e) (async/close! port)))))]
+          queue-ch (async/chan)
+          res-ch (async/chan)
+          stop! (fn [] (async/close! queue-ch) (async/close! res-ch))
+          opts* (-> (dissoc opts :limit :offset :orderBy :groupBy)
+                    (assoc :fuel (volatile! 0)))
+          af (fn [tuple-res port]
+               (async/go
+                 (try*
+                   (let [tuple-res' (if single-result? [tuple-res] tuple-res)
+                         query-fuel (volatile! 0)]
+                     (->> expandMaps
+                          (keep #(expand-map db (assoc opts* :fuel fuel) tuple-res' %)) ;; returns async channels, executes expandmap query
+                          (async/merge)
+                          (async/into [])
+                          (async/<!)                          ;; all expandmaps with final results now in single vector
+                          (reduce replace-expand-maps tuple-res') ;; update original tuple with expandmaps result(s)
+                          (#(if single-result? [(first %) @query-fuel] [% @query-fuel])) ;; return two-tuple with second element being fuel consumed
+                          (async/put! port)))
+                   (async/close! port)
+                   (catch* e (async/put! port e) (async/close! port)))))]
 
       (async/onto-chan! queue-ch tuples-res)
       (async/pipeline-async parallelism res-ch af queue-ch)
@@ -691,8 +710,8 @@
   when provided the list of tuples that result from the :where portion of the original query."
   [headers vars select]
   (let [{:keys [as variable value]} select
-        select-val   (or as variable)
-        idx          (get-header-idx headers select)
+        select-val (or as variable)
+        idx (get-header-idx headers select)
         tuple-select (cond
                        value (constantly value)
                        idx (fn [tuple] (nth tuple idx))
@@ -731,12 +750,12 @@
   ;; TODO - check/throw max fuel
   [fuel max-fuel headers orderBy tuples]
   (let [[order var option] orderBy
-        comparator  (if (= "DESC" order) (fn [a b] (compare b a)) compare)
+        comparator (if (= "DESC" order) (fn [a b] (compare b a)) compare)
         compare-idx (util/index-of headers (symbol var))
-        no-case?    (and (string? option) (= "NOCASE" (str/upper-case option)))
-        keyfn       (if no-case?
-                      #(str/upper-case (nth % compare-idx))
-                      #(nth % compare-idx))]
+        no-case? (and (string? option) (= "NOCASE" (str/upper-case option)))
+        keyfn (if no-case?
+                #(str/upper-case (nth % compare-idx))
+                #(nth % compare-idx))]
     (if compare-idx
       (let [fuel-total (vswap! fuel + (* (if no-case? 4 2) (count tuples)))]
         (when (> fuel-total max-fuel)
@@ -751,28 +770,28 @@
   ([db fuel max-fuel {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select limit expandMaps? selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
    (go-try (if
              (and aggregates (= 1 (count select)))          ;; only aggregate
-             (let [res  (second (analytical/calculate-aggregate res (first aggregates)))
+             (let [res (second (analytical/calculate-aggregate res (first aggregates)))
                    res' (if prettyPrint
                           {(-> select first :as str (subs 1)) res}
                           res)]
                (if inVector? [res'] res'))
 
              (let [{:keys [headers tuples]} (if aggregates (analytical/add-aggregate-cols res aggregates) res)
-                   offset'        (when (and offset (not groupBy)) ;; groupBy results cannot be offset (not sure why! was there)
-                                    offset)
+                   offset' (when (and offset (not groupBy)) ;; groupBy results cannot be offset (not sure why! was there)
+                             offset)
                    single-result? (and (not prettyPrint) (not inVector?))
-                   pp-keys        (when prettyPrint (get-pretty-print-keys select))
-                   xf             (apply comp
-                                         (cond-> [(map (select-tuples-fn headers vars select))] ;; a function that formats a :where result tuple to specified :select clause
-                                                 single-result? (conj (map first))
-                                                 selectDistinct? (conj (fuel-flake-transducer fuel max-fuel 5)) ;; distinct charges 5 per item touched
-                                                 selectDistinct? (conj (distinct))
-                                                 offset' (conj (drop offset'))
-                                                 group-limit (conj (take group-limit))
-                                                 prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
-                   result         (cond->> tuples
-                                           orderBy (order-result-tuples fuel max-fuel headers orderBy)
-                                           true (into [] xf))]
+                   pp-keys (when prettyPrint (get-pretty-print-keys select))
+                   xf (apply comp
+                             (cond-> [(map (select-tuples-fn headers vars select))] ;; a function that formats a :where result tuple to specified :select clause
+                                     single-result? (conj (map first))
+                                     selectDistinct? (conj (fuel-flake-transducer fuel max-fuel 5)) ;; distinct charges 5 per item touched
+                                     selectDistinct? (conj (distinct))
+                                     offset' (conj (drop offset'))
+                                     group-limit (conj (take group-limit))
+                                     prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
+                   result (cond->> tuples
+                                   orderBy (order-result-tuples fuel max-fuel headers orderBy)
+                                   true (into [] xf))]
                (if expandMaps?
                  (<? (pipeline-expandmaps-result select pp-keys single-result? db fuel max-fuel opts 8 result))
                  result))))))
@@ -786,15 +805,15 @@
                                                  (str "Invalid groupBy clause, must be a string or vector. Provided: " groupBy)
                                                  {:status 400 :error :db/invalid-query})))
         group-idxs (map #(util/index-of headers %) groupBy)
-        _          (when (some nil? group-idxs)
-                     (throw (ex-info
-                              (str "Invalid groupBy clause - are all groupBy vars declared in the where clause. Provided: " groupBy)
-                              {:status 400 :error :db/invalid-query})))]
+        _ (when (some nil? group-idxs)
+            (throw (ex-info
+                     (str "Invalid groupBy clause - are all groupBy vars declared in the where clause. Provided: " groupBy)
+                     {:status 400 :error :db/invalid-query})))]
     (reduce
       (fn [res tuple]
-        (let [k  (map #(nth tuple %) group-idxs)
+        (let [k (map #(nth tuple %) group-idxs)
               k' (if inVector? (into [] k) (first k))
-              v  tuple]
+              v tuple]
           (assoc res k' (conj (get res k' []) v))))
       {} tuples)))
 
@@ -821,7 +840,7 @@
    {:keys [groupBy orderBy limit selectOne? selectDistinct? inVector? offset] :as select-spec}
    opts]
   (go-try (if groupBy
-            (let [order-fn  (build-order-fn orderBy groupBy)
+            (let [order-fn (build-order-fn orderBy groupBy)
                   group-map (cond->> (ad-hoc-group-by res groupBy)
                                      order-fn (into (sorted-map-by order-fn)))]
               (if selectOne?
@@ -834,13 +853,13 @@
                 ; loop through map of groups
                 (loop [[group-key & rest-keys] (keys group-map)
                        [group & rest-groups] (vals group-map)
-                       limit  (if (= 0 limit) nil limit)    ; limit of 0 is ALL
+                       limit (if (= 0 limit) nil limit)     ; limit of 0 is ALL
                        offset (or offset 0)
-                       acc    {}]
-                  (let [group-count  (count group)
+                       acc {}]
+                  (let [group-count (count group)
                         group-as-res {:headers headers :vars vars :tuples group}]
                     (cond
-                      ;? process all groups
+                      ;? processed all groups
                       (nil? group) acc
 
                       ;? exceeded limit
@@ -858,24 +877,34 @@
                       ; 1) set orderBy to nil so order-offset-and-limit-results is not executed
                       ; 2) set offset to 0 so a drop is not performed
                       ; 3) then call process-ad-hoc-group
-                      (-> (cond->> (<? (process-ad-hoc-group
-                                         db fuel max-fuel
-                                         group-as-res
-                                         (assoc select-spec :orderBy nil :offset 0 :limit nil)
-                                         (assoc opts :offset 0 :limit nil)))
-                                   (< 0 offset) (drop offset)
-                                   (and limit (< 0 limit)) (take limit))
-                          (as-> res' (recur rest-keys
-                                            rest-groups
-                                            (when-not (nil? limit) (- limit (count res')))
-                                            (cond
-                                              (<= offset 0) 0
-                                              selectDistinct? (- offset 1)
-                                              :else (- offset (- group-count (count res'))))
-                                            (if (or (nil? res') (empty? res')) acc (assoc acc group-key res'))))))))))
+                      ; 4) May return a singleton aggregate
+                      (let [res (<? (process-ad-hoc-group
+                                      db fuel max-fuel
+                                      group-as-res
+                                      (assoc select-spec :orderBy nil :offset 0 :limit nil)
+                                      (assoc opts :offset 0 :limit nil)))]
+                        (if (and (coll? res) (seq res))
+                          ; non-empty collection
+                          (-> (cond->> res
+                                       (< 0 offset) (drop offset)
+                                       (and limit (< 0 limit)) (take limit))
+                              (as-> res' (recur rest-keys
+                                                rest-groups
+                                                (when-not (nil? limit) (- limit (count res')))
+                                                (cond
+                                                  (<= offset 0) 0
+                                                  selectDistinct? (- offset 1)
+                                                  :else (- offset (- group-count (count res'))))
+                                                (if (or (nil? res') (empty? res')) acc (assoc acc group-key res')))))
+                          ; empty collection (?) or singleton aggregate
+                          (recur rest-keys
+                                 rest-groups
+                                 (when-not (nil? limit) (- limit 1))
+                                 (if (<= offset 0) 0 (- offset 1))
+                                 (assoc acc group-key res)))))))))
             ; no group by
             (let [limit (if selectOne? 1 limit)
-                  res   (<? (process-ad-hoc-group db fuel max-fuel res select-spec limit opts))]
+                  res (<? (process-ad-hoc-group db fuel max-fuel res select-spec limit opts))]
               (cond (not (coll? res)) (if inVector? [res] res)
                     selectOne? (first res)
                     :else res)))))
@@ -883,19 +912,19 @@
 
 (defn get-ad-hoc-select-spec
   [headers vars {:keys [selectOne select selectDistinct selectReduced]} opts]
-  (let [select-smt    (or selectOne select selectDistinct selectReduced)
-        inVector?     (vector? select-smt)
-        select-smt    (if inVector? select-smt [select-smt])
+  (let [select-smt (or selectOne select selectDistinct selectReduced)
+        inVector? (vector? select-smt)
+        select-smt (if inVector? select-smt [select-smt])
         parsed-select (parse-select headers vars select-smt)
-        aggregates    (filter #(contains? % :code) parsed-select)
-        expandMap?    (some #(contains? % :selection) parsed-select)
-        aggregates    (if (empty? aggregates) nil aggregates)
-        orderBy       (when-let [orderBy (:orderBy opts)]
-                        (if (or (string? orderBy) (and (vector? orderBy) (#{"DESC" "ASC"} (first orderBy))))
-                          (if (vector? orderBy) orderBy ["ASC" orderBy])
-                          (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
-                                          {:status 400
-                                           :error  :db/invalid-query}))))]
+        aggregates (filter #(contains? % :code) parsed-select)
+        expandMap? (some #(contains? % :selection) parsed-select)
+        aggregates (if (empty? aggregates) nil aggregates)
+        orderBy (when-let [orderBy (:orderBy opts)]
+                  (if (or (string? orderBy) (and (vector? orderBy) (#{"DESC" "ASC"} (first orderBy))))
+                    (if (vector? orderBy) orderBy ["ASC" orderBy])
+                    (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
+                                    {:status 400
+                                     :error  :db/invalid-query}))))]
     {:select          parsed-select
      :aggregates      aggregates
      :expandMaps?     expandMap?
@@ -1041,7 +1070,9 @@
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
-  (let [{:keys [select selectOne selectDistinct where from limit offset component orderBy groupBy prettyPrint opts]} query-map
+  (log/debug "Running query:" (pr-str query-map))
+  (let [{:keys [select selectOne selectDistinct where from limit offset
+                component orderBy groupBy prettyPrint opts]} query-map
         opts' (cond-> (merge {:limit   limit :offset (or offset 0) :component component
                               :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
                              opts)
@@ -1058,9 +1089,9 @@
                     (async/put! pc res)))
                 pc))))
       (let [max-fuel (:max-fuel opts')
-            fuel     (or (:fuel opts)                       ;; :fuel volatile! can be provided upstream
-                         (when (or max-fuel (:meta opts))
-                           (volatile! 0)))]
+            fuel (or (:fuel opts)                           ;; :fuel volatile! can be provided upstream
+                     (when (or max-fuel (:meta opts))
+                       (volatile! 0)))]
         (if (sequential? where)
           ;; ad-hoc query
           (ad-hoc-query db fuel max-fuel query-map opts')

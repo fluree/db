@@ -11,6 +11,8 @@
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defn value-with-nil-pred
   "Checks whether an index range is :spot, starts with [s1 -1 o1] and ends with [s1 int/max p1]"
@@ -123,7 +125,7 @@
            m1                 (or m1 (if (identical? >= start-test) util/min-integer util/max-integer))
            m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
            ;; flip values, because they do have a lexicographical sort order
-           start-flake        (flake/->Flake s1 p1 o1 t1 op1 m1)
+           ^Flake start-flake (flake/->Flake s1 p1 o1 t1 op1 m1)
            end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
            limit              (or (:limit opts) util/max-long)
            permissions        (:permissions db)
@@ -273,7 +275,7 @@
            m1                 (or m1 (if (identical? >= start-test) util/min-integer util/max-integer))
            m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
            ;; flip values, because they do have a lexicographical sort order
-           start-flake        (flake/->Flake s1 p1 o1 t1 op1 m1)
+           ^Flake start-flake (flake/->Flake s1 p1 o1 t1 op1 m1)
            end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
            {:keys [flake-limit limit offset]
             :or   {flake-limit util/max-long
@@ -300,10 +302,18 @@
                              acc       []]                  ;; acc is all of the flakes we have accumulated thus far
                         (let [base-result  (flake/subrange (:flakes next-node) start-test start-flake end-test end-flake)
                               base-result' (cond->> base-result
-                                                    (value-with-nil-pred idx start-flake end-flake) (filter #(= (.-o %) (.-o start-flake)))
-                                                    subject-fn (filter #(subject-fn (.-s %)))
-                                                    predicate-fn (filter #(predicate-fn (.-p %)))
-                                                    object-fn (filter #(object-fn (.-o %))))
+
+                                                    (value-with-nil-pred idx start-flake end-flake)
+                                                    (filter #(= (.-o ^Flake %) (.-o start-flake)))
+
+                                                    subject-fn
+                                                    (filter #(subject-fn (.-s ^Flake %)))
+
+                                                    predicate-fn
+                                                    (filter #(predicate-fn (.-p ^Flake %)))
+
+                                                    object-fn
+                                                    (filter #(object-fn (.-o ^Flake %))))
                               rhs          (dbproto/-rhs next-node) ;; can be nil if at farthest right point
                               [offset* i* s* acc*] (if (and max-limit? (= 0 offset) no-filter?)
                                                      (let [i+   (count base-result')
@@ -311,7 +321,7 @@
                                                        ;; we don't care about s if max-limit
                                                        [0 (+ i i+) s acc*])
 
-                                                     (let [partitioned              (partition-by #(.-s %) base-result')
+                                                     (let [partitioned              (partition-by #(.-s ^Flake %) base-result')
                                                            count-partitioned-result (count partitioned)]
                                                        (if (> offset count-partitioned-result)
                                                          [(- offset count-partitioned-result) i s acc]
@@ -438,7 +448,11 @@
                                   (let [obj-fn (if-let [obj-fn (:object-fn opts)]
                                                  (fn [x] (and (obj-fn x) (= x o)))
                                                  (fn [x] (= x o)))]
-                                    (<? (index-range db :psot = [p s* nil t] (assoc opts :object-fn obj-fn))))
+                                    ;; check for special case where search specifies _id and an integer, i.e. [nil _id 12345]
+                                    (if (and (= "_id" p) (int? o))
+                                      ;; TODO - below should not need a `take 1` - `:limit 1` does not work properly - likely fixed in tsop branch, remove take 1 once :limit works
+                                      (take 1 (<? (index-range db :spot = [o] (assoc opts :limit 1))))
+                                      (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn)))))
 
                                   p
                                   (<? (index-range db :psot = [p s* o t] opts))
@@ -487,7 +501,7 @@
   (loop [[flake' & r] flakes result* []]
     (if (nil? flake')
       result*
-      (let [obj     (.-o flake')
+      (let [obj     (.-o ^Flake flake')
             cmd-map (try*
                       (json/parse obj)
                       (catch* e nil))                       ; log an error if transaction is not parsable?
@@ -514,11 +528,27 @@
     (if (nil? block')
       result*
       (let [{:keys [block t flakes]} block'
-            prev-hash   (some #(when (= (.-p %) const/$_block:prevHash) (.-o %)) flakes)
-            hash        (some #(when (= (.-p %) const/$_block:hash) (.-o %)) flakes)
-            instant     (some #(when (= (.-p %) const/$_block:instant) (.-o %)) flakes)
-            sigs        (some #(when (= (.-p %) const/$_block:sigs) (.-o %)) flakes)
-            txn-flakes  (filter #(= (.-p %) const/$_tx:tx) flakes)
+            prev-hash   (some
+                          #(let [f ^Flake %]
+                             (when (= (.-p f) const/$_block:prevHash)
+                               (.-o f)))
+                          flakes)
+            hash        (some
+                          #(let [f ^Flake %]
+                             (when (= (.-p f) const/$_block:hash)
+                               (.-o f)))
+                          flakes)
+            instant     (some
+                          #(let [f ^Flake %]
+                             (when (= (.-p f) const/$_block:instant)
+                               (.-o f)))
+                          flakes)
+            sigs        (some
+                          #(let [f ^Flake %]
+                             (when (= (.-p f) const/$_block:sigs)
+                               (.-o f)))
+                          flakes)
+            txn-flakes  (filter #(= (.-p ^Flake %) const/$_tx:tx) flakes)
             txn-flakes' (txn-from-flakes txn-flakes)]
         (recur r (conj result* {:block     block
                                 :t         t

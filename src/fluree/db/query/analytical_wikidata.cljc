@@ -8,6 +8,8 @@
        :cljs [cljs.core.async :as async])
     [fluree.db.util.async :refer [<? go-try merge-into?]]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn variable? [form]
   (when (and (or (string? form) (symbol? form)) (= (first (name form)) \?))
     (symbol form)))

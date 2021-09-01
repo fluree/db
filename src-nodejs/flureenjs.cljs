@@ -81,7 +81,7 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce app-state (atom {:product "Fluree NodeJs Library"
-                          :version "v1.0.0-rc18"}))
+                          :version "v1.0.0-rc21"}))
 
 (println (:product @app-state) (:version @app-state))
 

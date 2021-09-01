@@ -4,12 +4,15 @@
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defmulti process-event (fn [_ event-type _ _] event-type))
 
 ;; internal, connection-specific events to capture and process
 
 (defmethod process-event :set-ws-id
   [conn _ _ ws-id]
+  (log/trace "set websocket id:" ws-id)
   (swap! (:state conn) assoc :socket-id ws-id))
 
 
@@ -17,6 +20,7 @@
   [conn event-type subject event-data]
   ;; any event not explicitly captured above is assumed to be a 'global' event.
   ;; send to any registered callback functions
+  (log/trace "process event:" event-type event-data)
   (let [callbacks (get-in @(:state conn) [:listeners subject])]
     (doseq [[k f] callbacks]
       (#?(:clj future :cljs do)
@@ -42,6 +46,7 @@
           {:keys [state]} conn]
       (case event-type
         :response (when-let [res-chan (get-in @state [:pending-req subject])]
+                    (log/trace "Found response channel for subject" subject)
                     (swap! state update :pending-req #(dissoc % subject))
                     (cond
                       error-data

@@ -5,6 +5,8 @@
             #?(:clj [abracad.avro :as avro]))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; maximum number of collections. 19 bits - 524,287 - javascript 9 bits - 511
 (def ^:const MAX-COLLECTION-ID #?(:clj  2r1111111111111111111
                                   :cljs 2r111111111))
@@ -91,10 +93,9 @@
              (assocEx [f k v] (UnsupportedOperationException. "assocEx is not supported on Flake"))
              (without [f k] (UnsupportedOperationException. "without is not supported on Flake"))
 
-
              clojure.lang.Associative
              (entryAt [f k] (some->> (get f k nil) (clojure.lang.MapEntry k)))
-             (containsKey [_ k] (#{:s :p :o :t :op :m} k))
+             (containsKey [_ k] (boolean (#{:s :p :o :t :op :m} k)))
              (assoc [f k v] (assoc-flake f k v))
 
              Object
@@ -213,15 +214,16 @@
 (defn- nth-flake
   "Gets position i in flake."
   [^Flake flake i not-found]
-  (case i 0 (.-s flake)
-          1 (.-p flake)
-          2 (.-o flake)
-          3 (.-t flake)
-          4 (.-op flake)
-          5 (.-m flake)
-          (or not-found
-              #?(:clj  (throw (IndexOutOfBoundsException.))
-                 :cljs (throw (js/Error. (str "Index " i " out of bounds for flake: " flake)))))))
+  (let [ii (int i)]
+    (case ii 0 (.-s flake)
+             1 (.-p flake)
+             2 (.-o flake)
+             3 (.-t flake)
+             4 (.-op flake)
+             5 (.-m flake)
+             (or not-found
+                 #?(:clj  (throw (IndexOutOfBoundsException.))
+                    :cljs (throw (js/Error. (str "Index " i " out of bounds for flake: " flake))))))))
 
 
 #?(:clj
