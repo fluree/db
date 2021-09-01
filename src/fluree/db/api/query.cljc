@@ -198,15 +198,7 @@
         (recur fuel cache (first rest-blocks) (rest rest-blocks) acc')
         acc'))))
 
-(defn- response-time-formatted
-  "Returns response time, formatted as string. Must provide start time of request
-   for clj as (System/nanoTime), or for cljs epoch milliseconds"
-  [start-time]
-  #?(:clj  (-> (- (System/nanoTime) start-time)
-               (/ 1000000)
-               (#(format "%.2fms" (float %))))
-     :cljs (-> (- (util/current-time-millis) start-time)
-               (str "ms"))))
+
 
 
 (defn block-range
@@ -242,7 +234,7 @@
                    (doall result')
                    result')
          :fuel   100
-         :time   (response-time-formatted start)}
+         :time   (util/response-time-formatted start)}
         result'))))
 
 
@@ -405,7 +397,7 @@
         {:status 200
          :result result
          :fuel   @fuel
-         :time   (response-time-formatted start)
+         :time   (util/response-time-formatted start)
          :block  (:block db*)}
         result))))
 
@@ -458,7 +450,7 @@
               {:result response
                :fuel   fuel-global
                :status status-global
-               :time   (response-time-formatted start-time)}
+               :time   (util/response-time-formatted start-time)}
               response)
             (let [{:keys [meta _remove-meta?]} (get-in queries [alias :opts])
                   res            (async/<! port)

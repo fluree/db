@@ -90,8 +90,6 @@
                      :else
                      acc)) {} prefixes))
 
-(defn format-duration-millis [start end]
-  (str (- end start) "ms"))
 
 ;; ======================================
 ;;
@@ -144,7 +142,7 @@
                 :result (if (sequential? result)
                           (doall result) result)
                 :fuel   @fuel
-                :time   (format-duration-millis start-ms (util/current-time-millis))
+                :time   (util/response-time-formatted start-ms)
                 :block  (:block db*)}
 
                :else
@@ -434,7 +432,7 @@
                                   (doall result')
                                   result')
                         :fuel   100
-                        :time   (format-duration-millis start (util/current-time-millis))}
+                        :time   (util/response-time-formatted start)}
                        result')]
          result*)
        (catch :default e
