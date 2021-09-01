@@ -96,6 +96,18 @@
   #?(:clj  (System/currentTimeMillis)
      :cljs (.getTime (js/Date.))))
 
+
+(defn response-time-formatted
+  "Returns response time, formatted as string. Must provide start time of request
+   for clj as (System/nanoTime), or for cljs epoch milliseconds"
+  [start-time]
+  #?(:clj  (-> (- (System/nanoTime) start-time)
+               (/ 1000000)
+               (#(format "%.2fms" (float %))))
+     :cljs (-> (- (current-time-millis) start-time)
+               (str "ms"))))
+
+
 (defn deep-merge [v & vs]
   (letfn [(rec-merge [v1 v2]
             (if (and (map? v1) (map? v2))
