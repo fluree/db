@@ -40,7 +40,7 @@
  :aliases
  {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version     "1.0.0-rc26"
+  :mvn/version     "1.0.0-rc27"
 
   :dev
   {:extra-paths ["dev"]
