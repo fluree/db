@@ -20,8 +20,7 @@
 
          ;; http
          http-kit/http-kit                   {:mvn/version "2.5.3"}
-         http.async.client/http.async.client {:git/url "https://github.com/fluree/http.async.client.git"
-                                              :sha     "c1223b8d2478e83814db6327127cea0d9ab26ef5"}
+         com.fluree/http.async.client        {:mvn/version "1.3.1-7-0xf9fd"}
 
          ;; benchmarking
          criterium/criterium                 {:mvn/version "0.4.6"}
