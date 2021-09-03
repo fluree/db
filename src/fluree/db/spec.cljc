@@ -146,4 +146,5 @@
         ;; else
         (type-check-error (str "Unknown type: " p-type "."))))
 
-    (catch* _ (type-check-error (str "Unexpected error attempting to conform to: " p-type " with value: " x ".")))))
+    (catch* _ (type-check-error (str "Could not conform value to: " p-type
+                                     " with value: " (pr-str x) #?@(:clj [" of type " (type x)]) ".")))))
