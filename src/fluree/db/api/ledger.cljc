@@ -99,7 +99,6 @@
   (let [{:keys [conn network dbid]} db
         newer-block? (fn [block] (>= block syncTo))
         event-fn     (fn [evt data]
-                       (log/warn "NEW EVENT:" (pr-str evt) (pr-str data))
                        (when (and (= :local-ledger-update evt) (newer-block? (:block data)))
                          (conn/remove-listener conn network dbid listen-id)
                          (async/go                          ;; note: avoided async/pipe as I don't believe promise-chan from session/db technically 'closes'
