@@ -10,6 +10,6 @@
  :externs            ["sjcl-externs.js"]
  :install-deps       true
  :npm-deps           {}
- :bundle-cmd         {:none    ["npx" "webpack" "out/webworker/index.js" "-o" "out/webworker/main.js" "--mode=development" "--target=webworker"]
-                      :default ["npx" "webpack" "out/webworker/index.js" "-o" "out/webworker/main.js" "--target=webworker"]}
+ :bundle-cmd         {:none    ["npx" "webpack" "--config" "./webpack.webworker.config.js" "--mode=development"]
+                      :default ["npx" "webpack" "--config" "./webpack.webworker.config.js"]}
  :closure-defines {cljs.core/*global* "self"}}
