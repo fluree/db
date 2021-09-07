@@ -10,6 +10,9 @@
     "utf-8-validate": "^5.0.5",
     "ws": "^8.2.1"
   },
+  "browser": {
+    "ws": false
+  },
   "devDependencies": {
     "karma": "6.3.4",
     "karma-chrome-launcher": "3.1.0",
