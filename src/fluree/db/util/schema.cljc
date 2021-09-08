@@ -54,17 +54,27 @@
   [^Flake f]
   (< (.-s f) 0))
 
+(defn is-schema-sid?
+  "Returns true if subject id is that of a schema element."
+  [sid]
+  (or
+    (<= schema-sid-start sid schema-sid-end)
+    (<= prefix-sid-start sid prefix-sid-end)))
+
 (defn is-schema-flake?
   "Returns true if flake is a schema flake."
   [^Flake f]
-  (or
-    (<= schema-sid-start (.-s f) schema-sid-end)
-    (<= prefix-sid-start (.-s f) prefix-sid-end)))
+  (is-schema-sid? (.-s f)))
+
+(defn is-setting-sid?
+  "Returns true if sid is for a root setting."
+  [sid]
+  (<= setting-sid-start sid setting-sid-end))
 
 (defn is-setting-flake?
   "Returns true if flake is a root setting flake."
   [^Flake f]
-  (<= setting-sid-start (.-s f) setting-sid-end))
+  (is-setting-sid? (.-s f)))
 
 (defn is-language-flake?
   "Returns true if flake is a language flake."
@@ -91,10 +101,11 @@
 (defn add-to-post-preds?
   [flakes pred-ecount]
   (keep #(let [f ^Flake %]
-           (if (and (or (= (.-p f) const/$_predicate:index)
-                        (= (.-p f) const/$_predicate:unique))
-                  (= (.-o f) true)
-                  (>= pred-ecount (.-s f))) (.-s f)))
+           (when (and (or (= (.-p f) const/$_predicate:index)
+                          (= (.-p f) const/$_predicate:unique))
+                      (= (.-o f) true)
+                      (>= pred-ecount (.-s f)))
+             (.-s f)))
         flakes))
 
 (defn remove-from-post-preds

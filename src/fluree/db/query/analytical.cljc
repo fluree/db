@@ -60,7 +60,7 @@
   (reduce-kv (fn [acc idx key]
                (let [key-as-var   (variable? key)
                      static-value (get interm-vars key-as-var)]
-                 (when (and (= idx 1) (not key-as-var) (not= "_id" key)
+                 #_(when (and (= idx 1) (not key-as-var) (not= "_id" key)
                             (not (dbproto/-p-prop db :name (if (string? key)
                                                              (re-find #"[_a-zA-Z0-9/]*" key)
                                                              key))))
@@ -321,7 +321,7 @@
             (if var-first? tuples (distinct (map #(-> % second vector) tuples))))))
 
 (defn fdb-clause->tuples
-  [db {:keys [headers tuples vars] :as res} clause fuel max-fuel]
+  [db {:keys [headers tuples vars] :as res} clause context fuel max-fuel]
   (go-try (let [{:keys [search rel opts]} (clause->rel db vars clause)
                 common-keys (intersecting-keys-tuples-clause res clause)
                 object-fn   (:object-fn opts)
@@ -342,7 +342,8 @@
                 ;; Currently, only pass in object-fn to search opts. Seems to be faster to filter
                 ;; subject after. I'm sure this depends on a number of variables
                 ;; TODO - determine what, when, and how to filter - in index range? after index-range?
-                search-opts {:object-fn (or (:object-fn opts) object-fn)}
+                search-opts {:object-fn (or (:object-fn opts) object-fn)
+                             :context context}
                 res         (<? (query-range/search db clause' search-opts))
                 ;; Currently, not supporting subject and predicate fns, but leaving this here.
                 ;{:keys [subject-fn predicate-fn]} opts
@@ -420,11 +421,13 @@
 ;; Can be: ["?item" "rdf:type" "?collection"] -> but item is already bound. Need forward filtering here...
 
 (defn collection->tuples
+  "Returns result for :rdf/type where statement."
   [db res clause context]
-  (go-try (let [subject-var (variable? (first clause))
-                object-var  (variable? (last clause))
+  (go-try (let [[s _ o] clause
+                subject-var (variable? s)
+                object-var  (variable? o)
                 class-sid   (when subject-var
-                              (iri-util/class-sid (last clause) db context))]
+                              (iri-util/class-sid o db context))]
             (when (or (and subject-var object-var)
                       (and (nil? subject-var) (nil? object-var)))
               (throw (ex-info "When using rdf:type, either a subject or a type (collection) must be specified."
@@ -433,8 +436,7 @@
 
             (cond
               object-var
-              (let [s       (first clause)
-                    subject (if (number? s) s (<? (dbproto/-subid db s)))
+              (let [subject (if (number? s) s (<? (dbproto/-subid db s)))
                     cid     (flake/sid->cid subject)
                     cname   (dbproto/-c-prop db :name cid)]
                 {:headers [object-var]
@@ -442,7 +444,7 @@
                  :vars    {}})
 
               ;; everything below has a subject-var, no need to check for that
-              (#{"_tx" "_block"} (last clause))
+              (#{"_tx" "_block"} o)
               (let [min-sid (-> db :t)
                     max-sid 0]
                 {:headers [subject-var]
@@ -458,11 +460,11 @@
 
               ;; not a class, try a collection if matches
               :else
-              (if-let [collection (dbproto/-c-prop db :partition (last clause))]
+              (if-let [collection (dbproto/-c-prop db :partition o)]
                 {:headers [subject-var]
                  :tuples  (map #(conj [] %) (range (flake/min-subject-id collection) (-> db :ecount (get collection) inc)))
                  :vars    {}}
-                (throw (ex-info (str "No matching classes or collections for: " (last clause))
+                (throw (ex-info (str "No matching classes or collections for: " o)
                                 {:status 400 :error :db/invalid-query})))))))
 
 
@@ -796,7 +798,7 @@
 (defn clause->tuples
   "Tuples and optional? are only used for Wikidata, because need to both limit calls to Wikidata,
   and ensure that returned results are as limited as possible (but still relevant)."
-  [db {:keys [prefixes] :as q-map} {:keys [vars] :as res} clause r optional? fuel max-fuel opts]
+  [db {:keys [prefixes context] :as q-map} {:keys [vars] :as res} clause r optional? fuel max-fuel opts]
   (go-try
     (cond (map? clause)
           ;; Could be a union, bind, filter, optional, and more
@@ -839,7 +841,7 @@
           [(<? (collection->tuples db res clause (:context q-map))) r]
 
           (= 3 (count clause))
-          [(<? (fdb-clause->tuples db res clause fuel max-fuel)) r]
+          [(<? (fdb-clause->tuples db res clause context fuel max-fuel)) r]
 
           (= 2 (count clause))
           [(update res :vars merge (bind-clause->vars res clause)) r]
@@ -859,7 +861,7 @@
                   [(full-text->tuples db res clause) r]
 
                   :else
-                  [(<? (fdb-clause->tuples db res clause fuel max-fuel)) r])))))
+                  [(<? (fdb-clause->tuples db res clause context fuel max-fuel)) r])))))
 
 
 (defn resolve-where-clause
@@ -896,31 +898,3 @@
                 res          filter-res]
             res)))
 
-
-(comment
-  (def conn (:conn user/system))
-  (def db (async/<!! (fluree.db.api/db conn "fluree/test")))
-
-
-
-  (async/<!! (q {:select ["?chat", "?comment"]
-                 :where  [["?chat" "_predicate/name" "?comment"]]} (volatile! 0) 1000 db {}))
-
-  (async/<!! (fdb-clause->tuples db ['?chat "chat/comments" '?comment] (volatile! 0) 1000000))
-
-  (async/<!! (where->inner-joins db [["?t", "_block/number", "?number"],
-                                     ["?maxBlock" "(max ?number)"],
-                                     ["?t", "_block/hash", "?hash"]]
-                                 {:select   ["?hash", "?pHash", "?number"]
-                                  :where    [["?t", "_block/number", "?number"],
-                                             {"?maxBlock" "(max ?number)"},
-                                             ["?t", "_block/hash", "?hash"]]
-                                  :optional [["?t" "_block/prevHash" "?pHash"]]} nil nil))
-
-
-
-
-  (async/<!! (q {:select   ["?handle" "?num"]
-                 :where    [["?person" "person/handle" "?handle"]]
-                 :optional [["?person" "person/favNums" "?num"]]
-                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))

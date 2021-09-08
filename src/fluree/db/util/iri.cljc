@@ -163,13 +163,23 @@
   (expand compact-iri (get-in db [:schema :prefix])))
 
 
+(defn class-sid*
+  [prefix suffix db]
+  (when prefix
+    (let [match (str prefix suffix)]
+      (get-in db [:schema :pred match :id]))))
+
 (defn class-sid
   "Returns the class subject id (or nil).
   First attempts to expand the class-iri to a full iri.
   If a match exists, returns the subject id for the class."
   [class-iri db context]
-  (let [expanded-iri (expand class-iri context)]
-    (get-in db [:schema :pred expanded-iri :id])))
+  (if context
+    (or (get-in db [:schema :pred class-iri :id])
+        (-> context (get "") :iri (class-sid* class-iri db))
+        (when-let [[prefix rest] (parse-prefix class-iri)]
+          (-> context (get prefix) :iri (class-sid* rest db))))
+    (get-in db [:schema :pred class-iri :id])))
 
 
 (defn reverse-context
@@ -207,5 +217,14 @@
   "Context primarily for use with queries. Merges DB context based on prefix."
   [ctx db]
   (let [db-ctx (get-in db [:schema :prefix])]
-    (cond->> db-ctx
-             ctx (merge (expanded-context ctx)))))
+    (cond
+      (string? ctx)
+      (assoc-in db-ctx ["" :iri] ctx)
+
+      (map? ctx)
+      (reduce-kv
+        (fn [acc k v]
+          (assoc-in acc [k :iri] v))
+        db-ctx ctx)
+
+      :else db-ctx)))

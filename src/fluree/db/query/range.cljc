@@ -7,7 +7,8 @@
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.util.async :refer [<? go-try]])
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.iri :as iri-util])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
@@ -413,16 +414,17 @@
 (defn search
   ([db fparts]
    (search db fparts {}))
-  ([db fparts opts]
+  ([db fparts {:keys [context object-fn] :as opts}]
    (go-try (let [[s p o t] fparts
-                 idx-predicate? (dbproto/-p-prop db :idx? p)
-                 ref?           (if p (dbproto/-p-prop db :ref? p) false) ;; ref? is either a type :tag or :ref
+                 pid            (when p (iri-util/class-sid p db context))
+                 idx-predicate? (dbproto/-p-prop db :idx? pid)
+                 ref?           (if p (dbproto/-p-prop db :ref? pid) false) ;; ref? is either a type :tag or :ref
                  o-coerce?      (and ref? (string? o))
                  o              (cond (not o-coerce?)
                                       o
 
-                                      (= :tag (dbproto/-p-prop db :type p))
-                                      (<? (coerce-tag-object db p o))
+                                      (= :tag (dbproto/-p-prop db :type pid))
+                                      (<? (coerce-tag-object db pid o))
 
                                       :else                 ;; type is :ref, supplied iri
                                       (<? (dbproto/-subid db [const/$iri o])))
@@ -439,27 +441,29 @@
                                   s
                                   (if (nil? s*)             ;; subject could not be resolved, no results
                                     nil
-                                    (<? (index-range db :spot = [s* p o t] opts)))
+                                    (<? (index-range db :spot = [s* pid o t] opts)))
 
-                                  (and p (non-nil-non-boolean? o) idx-predicate? (not (fn? o)))
-                                  (<? (index-range db :post = [p o s* t] opts))
+                                  (and idx-predicate? (non-nil-non-boolean? o) (not (fn? o)))
+                                  (<? (index-range db :post = [pid o s* t] opts))
 
                                   (and p (not idx-predicate?) o)
-                                  (let [obj-fn (if-let [obj-fn (:object-fn opts)]
-                                                 (fn [x] (and (obj-fn x) (= x o)))
-                                                 (fn [x] (= x o)))]
+                                  (let [obj-fn (if (boolean? o)
+                                                 (if object-fn
+                                                   (fn [x] (and (= x o) (object-fn x)))
+                                                   (fn [x] (= x o)))
+                                                 object-fn)]
                                     ;; check for special case where search specifies _id and an integer, i.e. [nil _id 12345]
                                     (if (and (= "_id" p) (int? o))
                                       ;; TODO - below should not need a `take 1` - `:limit 1` does not work properly - likely fixed in tsop branch, remove take 1 once :limit works
                                       (take 1 (<? (index-range db :spot = [o] (assoc opts :limit 1))))
-                                      (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn)))))
+                                      (<? (index-range db :psot = [pid s nil t] (assoc opts :object-fn obj-fn)))))
 
-                                  p
-                                  (<? (index-range db :psot = [p s* o t] opts))
+                                  pid
+                                  (<? (index-range db :psot = [pid s* o t] opts))
 
                                   o
-                                  (<? (index-range db :opst = [o p s* t] opts)))
-                 res*           (if (and ref? (= :tag (dbproto/-p-prop db :type p)))
+                                  (<? (index-range db :opst = [o pid s* t] opts)))
+                 res*           (if (and ref? (= :tag (dbproto/-p-prop db :type pid)))
                                   (<? (coerce-tag-flakes db res))
                                   res)]
              res*))))
