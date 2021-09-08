@@ -395,8 +395,13 @@
           opts*         (assoc opts :sources source-opts
                                     :max-fuel (or (:fuel opts) 1000000)
                                     :fuel fuel)
-          _             (when-not (and (or select selectOne selectDistinct selectReduced construct) (or from where))
-                          (throw (ex-info (str "Invalid query.")
+          _             (when-not (and (or select selectOne selectDistinct selectReduced construct)
+                                       (or from where))
+                          (throw (ex-info (str "Invalid query, must have from or where statement, along with one of select, selectOne, selectDistinct, selectReduced, or construct.")
+                                          {:status 400
+                                           :error  :db/invalid-query})))
+          _             (when (and from where)
+                          (throw (ex-info (str "Invalid query, must have either a 'where' or a 'from' statement.")
                                           {:status 400
                                            :error  :db/invalid-query})))
           start #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
