@@ -66,65 +66,132 @@
           (assoc-in [:novelty :post] post)
           (assoc-in [:novelty :size] total-size)))))
 
-(defn with-t
-  "Processes a single transaction, adding it to the DB.
-  Assumes flakes are already properly sorted."
-  ([db flakes] (with-t db flakes nil))
-  ([db flakes opts]
-   (go-try
-     (let [t                    (.-t ^Flake (first flakes))
-           _                    (when (not= t (dec (:t db)))
-                                  (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
-                                                  {:status 500
-                                                   :error  :db/unexpected-error})))
-           add-flakes           (filter #(not (exclude-predicates (.-p ^Flake %))) flakes)
-           add-preds            (into #{} (map #(.-p ^Flake %) add-flakes))
-           idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
-           ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
-           flakes-bytes         (flake/size-bytes add-flakes)
-           schema-change?       (schema-util/schema-change? add-flakes)
-           root-setting-change? (schema-util/setting-change? add-flakes)
-           pred-ecount          (-> db :ecount (get const/$_predicate))
-           add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
-           db*                  (loop [[add-pred & r] add-pred-to-idx?
-                                       db db]
-                                  (if add-pred
-                                    (recur r (<? (add-predicate-to-idx db add-pred opts)))
-                                    db))
-           ;; this could require reindexing, so we handle remove predicates later
-           db*                  (-> db*
-                                    (assoc :t t)
-                                    (update-in [:stats :size] + flakes-bytes) ;; total db ~size
-                                    (update-in [:stats :flakes] + (count add-flakes)))]
-       (loop [[^Flake f & r] add-flakes
-              spot   (get-in db* [:novelty :spot])
-              psot   (get-in db* [:novelty :psot])
-              post   (get-in db* [:novelty :post])
-              opst   (get-in db* [:novelty :opst])
-              ecount (:ecount db)]
-         (if-not f
-           (let [db*  (assoc db* :ecount ecount
-                                 :novelty {:spot spot :psot psot :post post :opst opst
-                                           :size (+ flakes-bytes (get-in db* [:novelty :size]))})
-                 db** (if (or schema-change? (nil? (:schema db*)))
-                        (assoc db* :schema (<? (schema/schema-map db*)))
-                        db*)]
-             (cond-> db**
 
-                     root-setting-change?
-                     (assoc :settings (<? (schema/setting-map db**)))))
-           (let [cid     (flake/sid->cid (.-s f))
-                 ecount* (update ecount cid #(if % (max % (.-s f)) (.-s f)))]
-             (recur r
-                    (conj spot f)
-                    (conj psot f)
-                    (if (get idx?-map (.-p f))
-                      (conj post f)
-                      post)
-                    (if (get ref?-map (.-p f))
-                      (conj opst f)
-                      opst)
-                    ecount*))))))))
+(defn- with-db-size
+  "Calculates db size. On JVM, would typically be used in a separate thread for concurrency"
+  [current-size flakes]
+  (+ current-size (flake/size-bytes flakes)))
+
+
+(defn- with-t-novelty
+  [db flakes flakes-bytes]
+  (let [{:keys [novelty schema]} db
+        pred-map (:pred schema)
+        {:keys [spot psot post opst size]} novelty]
+    (loop [[[p p-flakes] & r] (group-by #(.-p ^Flake %) flakes)
+           spot (transient spot)
+           psot (transient psot)
+           post (transient post)
+           opst (transient opst)]
+      (if p-flakes
+        (let [exclude? (exclude-predicates p)
+              {:keys [idx? ref?]} (get pred-map p)]
+          (if exclude?
+            (recur r spot psot post opst)
+            (recur r
+                   (reduce conj! spot p-flakes)
+                   (reduce conj! psot p-flakes)
+                   (if idx?
+                     (reduce conj! post p-flakes)
+                     post)
+                   (if ref?
+                     (reduce conj! opst p-flakes)
+                     opst))))
+        {:spot (persistent! spot)
+         :psot (persistent! psot)
+         :post (persistent! post)
+         :opst (persistent! opst)
+         :size (+ size #?(:clj @flakes-bytes :cljs flakes-bytes))}))))
+
+
+(defn- with-t-ecount
+  "Calculates updated ecount based on flakes for with-t. Also records if a schema or settings change
+  occurred."
+  [{:keys [ecount schema] :as db} flakes]
+  (loop [[flakes-s & r] (partition-by #(.-s ^Flake %) flakes)
+         schema-change?  (boolean (nil? schema))            ;; if no schema for any reason, make sure one is generated
+         setting-change? false
+         ecount          ecount]
+    (if flakes-s
+      (let [sid (.-s ^Flake (first flakes-s))
+            cid (flake/sid->cid sid)]
+        (recur r
+               (if (true? schema-change?)
+                   schema-change?
+                   (boolean (schema-util/is-schema-sid? sid)))
+               (if (true? setting-change?)
+                 setting-change?
+                 (schema-util/is-setting-sid? sid))
+               (update ecount cid #(if % (max % sid) sid))))
+      {:schema-change?  schema-change?
+       :setting-change? setting-change?
+       :ecount          ecount})))
+
+
+(defn- with-t-add-pred-idx
+  "If the schema changed and existing predicates are newly marked as :index true or :unique true they
+   must be added to novelty (if novelty-max is not exceeded)."
+  [proposed-db before-db flakes opts]
+  (go-try
+    (let [pred-ecount      (-> before-db :ecount (get const/$_predicate))
+          add-pred-to-idx? (schema-util/add-to-post-preds? flakes pred-ecount)]
+      (if (seq add-pred-to-idx?)
+        (loop [[add-pred & r] add-pred-to-idx?
+               db proposed-db]
+          (if add-pred
+            (recur r (<? (add-predicate-to-idx db add-pred opts)))
+            db))
+        proposed-db))))
+
+
+(defn- with-t-updated-schema
+  "If the schema changed, there may be also be new flakes with the transaction that rely on those
+  schema changes. Re-run novelty with the updated schema so things make it into the proper indexes.
+
+  This is not common, so while this duplicates the novelty work, in most circumstances
+  it allows novelty to be run in parallel and this function is never triggered."
+  [proposed-db before-db flakes flake-bytes opts]
+  (go-try
+    (let [schema-map (<? (schema/schema-map proposed-db))
+          novelty    (with-t-novelty (assoc before-db :schema schema-map) flakes flake-bytes)]
+      (-> proposed-db
+          (assoc :schema schema-map
+                 :novelty novelty)
+          (with-t-add-pred-idx before-db flakes opts)
+          <?))))
+
+
+(defn- with-t-updated-settings
+  "If settings changed, return new settings map."
+  [proposed-db]
+  (go-try
+    (assoc proposed-db :settings (<? (schema/setting-map proposed-db)))))
+
+
+(defn with-t
+  ([db flakes] (with-t db flakes nil))
+  ([{:keys [stats t] :as db} flakes opts]
+   (go-try
+     (let [new-t           (.-t ^Flake (first flakes))
+           _               (when (not= new-t (dec t))
+                             (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " t " is not beyond supplied transaction t: " new-t ".")
+                                             {:status 500
+                                              :error  :db/unexpected-error})))
+           bytes #?(:clj   (future (flake/size-bytes flakes)) ;; calculate in separate thread for CLJ
+                    :cljs (flake/size-bytes flakes))
+           novelty #?(:clj (future (with-t-novelty db flakes bytes)) ;; calculate in separate thread for CLJ
+                      :cljs (with-t-novelty db flakes bytes))
+           {:keys [schema-change? setting-change? ecount]} (with-t-ecount db flakes)
+           stats*          (-> stats
+                               (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
+                               (update :flakes + (count flakes)))]
+       (cond-> (assoc db :t new-t
+                         :novelty #?(:clj @novelty :cljs novelty)
+                         :ecount ecount
+                         :stats stats*)
+               schema-change? (-> (with-t-updated-schema db flakes bytes opts) <?)
+               setting-change? (-> with-t-updated-settings <?))))))
+
 
 (defn with
   "Returns db 'with' flakes added as a core async promise channel.
