@@ -213,18 +213,46 @@
             match-fns))))
 
 
+;; TODO - generating a compacting-fn that works for queries just like above up front will make this
+;; more efficient
+(defn compact
+  "Foes through context and attempts to shorten iri if matches context, else returns original IRI.
+
+  Uses query context format where context values have {:iri 'iri-here'}, so must already be parsed."
+  [iri context]
+  (let [match-iris (->> (vals context) (map :iri) (sort-by #(* -1 (count %)))) ;; should retain user-provided order assuming context is not massive
+        flipped    (reduce-kv #(assoc %1 (:iri %3) %2) {} context)]
+    (or (some
+          #(when (str/starts-with? iri %)                   ;; match
+             (let [prefix (get flipped %)
+                   suffix (subs iri (count %))]
+               (cond
+                 (= "" prefix)
+                 (subs iri (count %))
+
+                 (= "" suffix)
+                 prefix
+
+                 :else
+                 (str prefix ":" suffix))))
+          match-iris)
+        iri)))
+
+
 (defn query-context
   "Context primarily for use with queries. Merges DB context based on prefix."
   [ctx db]
   (let [db-ctx (get-in db [:schema :prefix])]
-    (cond
-      (string? ctx)
-      (assoc-in db-ctx ["" :iri] ctx)
+    (if ctx
+      (cond
+        (string? ctx)
+        (assoc-in db-ctx ["" :iri] ctx)
 
-      (map? ctx)
-      (reduce-kv
-        (fn [acc k v]
-          (assoc-in acc [k :iri] v))
-        db-ctx ctx)
+        (map? ctx)
+        (reduce-kv
+          (fn [acc k v]
+            (assoc-in acc [k :iri] v))
+          db-ctx ctx)
 
-      :else db-ctx)))
+        :else (throw (ex-info "Invalid query context provided." {:status 400 :error :db/invalid-query})))
+      db-ctx)))

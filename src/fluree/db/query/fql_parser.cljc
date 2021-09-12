@@ -5,7 +5,9 @@
             [fluree.db.spec :as spec]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.schema :as schema]
-            [fluree.db.util.schema :as schema-util]))
+            [fluree.db.util.schema :as schema-util]
+            [fluree.db.util.iri :as iri-util]
+            [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -177,8 +179,9 @@
   :offset - offset the number of results, if specified (0 default)
   :select - sub-selection for this predicate - only applicable to 'ref' predicates
   :compact - If we are to remove namespaces (or names from reverse refs)
+  :context - parsed context if supplied with original query
   "
-  [select opts]
+  [select context opts]
   (let [select           (if (coll? select) (to-select-map select) select)
         default-compact? (:compact opts)]
     (reduce-kv
@@ -197,7 +200,8 @@
                          default-compact?)]
           (cond
             (= "*" pred) (assoc acc :wildcard? true
-                                    :compact? compact?)
+                                    :compact? compact?
+                                    :context context)
             (= "_id" pred) (assoc acc :id? true)
             :else
             (let [_          (when (and v' (not (map? v)))
@@ -207,7 +211,7 @@
 
                   sub-select (some-> (dissoc v' "_limit" "_offset" "_as" "_recur" "_component" "_orderBy" "_compact")
                                      (not-empty)
-                                     (parse opts))
+                                     (parse context opts))
                   namespace? (str/includes? pred "/")
                   reverse?   (str/includes? pred "/_")
                   pred'      (if reverse? (str/replace pred "/_" "/") pred)
@@ -237,7 +241,8 @@
                               :recur-depth      0           ;; updated with recursion depth while processing
                               :recur-seen       #{}
                               :orderBy          (get v' "_orderBy")
-                              :select           (:select sub-select)}]
+                              :select           (:select sub-select)
+                              :context          context}]
               (cond
                 reverse?
                 (assoc-in acc [:select :reverse pred'] spec)
@@ -251,16 +256,33 @@
 
 
 (defn p->pred-config
-  [db p compact?]
-  (let [name (dbproto/-p-prop db :name p)]
+  [db p context compact?]
+  (let [name (dbproto/-p-prop db :name p)
+        iri  (dbproto/-p-prop db :iri p)]
     {:p          p
      :limit      nil
-     :name       name
-     :as         (if (and compact? name)
+     :name       name                                       ;; TODO: With :as being the primary name used, how is this used if at all any longer?
+     :as         (cond
+                   (and compact? name)                      ;; TODO - legacy, favor using a @context to shorten pred names, look to remove
                    (second (re-find #"/(.+)" name))
-                   (or name
-                       (dbproto/-p-prop db :iri p)
-                       (str p)))
+
+                   (= const/$iri p)
+                   (or (some #(when (= "@id" (:iri (val %)))
+                                (key %)) context)
+                       "@id")
+
+                   (= const/$rdf:type p)
+                   (or (some #(when (= "@type" (:iri (val %)))
+                                (key %)) context)
+                       "@type")
+
+                   iri
+                   (if context
+                     (iri-util/compact iri context)
+                     iri)
+
+                   :else
+                   (or name (str p)))
      :multi?     (dbproto/-p-prop db :multi p)
      :component? (dbproto/-p-prop db :component p)
      :tag?       (= :tag (dbproto/-p-prop db :type p))
@@ -271,9 +293,9 @@
   "For a flake selection, build out parts of the
   base set of predicates so we don't need to look them up
   each time... like multi, component, etc."
-  [db pred-name]
+  [db pred-name context]
   (when-let [p (dbproto/-p-prop db :id pred-name)]
-    (p->pred-config db p false)))
+    (p->pred-config db p context false)))
 
 
 (defn ns-lookup-pred-spec
@@ -283,20 +305,20 @@
 
   This fills out the predicate spec that couldn't be done earlier because
   we did not know the collection."
-  [db collection-id ns-lookup-spec-map]
+  [db collection-id {:keys [context] :as ns-lookup-spec-map}]
   (let [collection-name (dbproto/-c-prop db :name collection-id)]
     (reduce-kv
       (fn [acc k v]
         (let [pred (str collection-name "/" k)]
-          (if-let [p-map (or (build-predicate-map db pred)
-                             (build-predicate-map db k))]
+          (if-let [p-map (or (build-predicate-map db pred context)
+                             (build-predicate-map db k context))]
             (assoc acc (:p p-map) (merge p-map v))
             acc)))
       nil ns-lookup-spec-map)))
 
 
 (defn- parse-db*
-  [db sub-select]
+  [db sub-select context]
   (loop [[[k v] & r] sub-select
          acc {}]
     (if-not k
@@ -308,7 +330,7 @@
                           acc* {}]
                      (if-not k*
                        acc*
-                       (let [p-map (build-predicate-map db k*)
+                       (let [p-map (build-predicate-map db k* context)
                              acc** (if p-map
                                      (assoc acc* (:p p-map) (merge p-map v*))
                                      acc*)]
@@ -318,7 +340,7 @@
                    (if-not k*
                      acc*
                      (let [acc** (if (:select v*)
-                                   (assoc acc* k* (assoc v* :select (parse-db* db (:select v*))))
+                                   (assoc acc* k* (assoc v* :select (parse-db* db (:select v*) context)))
                                    (assoc acc* k* v*))]
                        (recur r* acc**))))
             acc' (assoc acc k v'')]
@@ -338,15 +360,16 @@
    names that it can into more complete select statement maps.
 
    Caches results based on database version."
-  [db select opts]
-  (let [schema-version (schema-util/version db)]
+  [db select context opts]
+  (let [schema-version (schema-util/version db)
+        cache-key      [schema-version select context (dissoc opts :fuel)]]
     ;; when schema is at a newer version, reset cache (version is 't' and negative, so decreases with newer)
     (when (< schema-version (:version @select-cache))
       (reset! select-cache {:version schema-version}))
-    (or (get @select-cache [schema-version select (dissoc opts :fuel)]) ;; :fuel is a volatile! and will be different every time, exclude from cache lookup
-        (let [select-smt  (parse select opts)
-              select-smt* (assoc select-smt :select (parse-db* db (:select select-smt)))]
-          (swap! select-cache assoc [schema-version select (dissoc opts :fuel)] select-smt*)
+    (or (get @select-cache cache-key)                       ;; :fuel is a volatile! and will be different every time, exclude from cache lookup
+        (let [select-smt  (parse select context opts)
+              select-smt* (assoc select-smt :select (parse-db* db (:select select-smt) context))]
+          (swap! select-cache assoc cache-key select-smt*)
           select-smt*))))
 
 
