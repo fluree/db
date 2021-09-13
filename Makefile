@@ -1,4 +1,4 @@
-.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljstest test clean
+.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljstest test lint ci clean
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -62,6 +62,11 @@ cljtest:
 	clojure -M:cljtest
 
 test: cljtest cljstest
+
+lint:
+	clojure -M:eastwood
+
+ci: test lint
 
 clean:
 	rm -rf target
