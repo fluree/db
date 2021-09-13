@@ -110,8 +110,8 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "RELEASE"}}
-   :main-opts ["-m" "eastwood.lint" {:source-paths ["src"] :out "scanning_results/eastwood.out"}]}
+  {:extra-deps {jonase/eastwood {:mvn/version "0.9.9"}}
+   :main-opts ["-m" "eastwood.lint" {:source-paths ["src"]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
