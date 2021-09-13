@@ -139,23 +139,23 @@
                             :error  :db/unexpected-error})))
          (if (empty? flakes)
            (async/put! resp-ch (assoc db :block block))
-           (let [flakes (sort flake/cmp-flakes-block flakes)
+           (let [flakes             (sort flake/cmp-flakes-block flakes)
                  ^Flake first-flake (first flakes)
-                 db*    (loop [[^Flake f & r] flakes
-                               t        (.-t first-flake) ;; current 't' value
-                               t-flakes []                ;; all flakes for current 't'
-                               db       db]
-                          (cond (and f (= t (.-t f)))
-                                (recur r t (conj t-flakes f) db)
+                 db*                (loop [[^Flake f & r] flakes
+                                           t        (.-t first-flake) ;; current 't' value
+                                           t-flakes []      ;; all flakes for current 't'
+                                           db       db]
+                                      (cond (and f (= t (.-t f)))
+                                            (recur r t (conj t-flakes f) db)
 
-                                :else
-                                (let [db' (-> db
-                                              (assoc :t (inc t)) ;; due to permissions, an entire 't' may be filtered out, set to 't' prior to the new flakes
-                                              (with-t t-flakes opts)
-                                              (<?))]
-                                  (if (nil? f)
-                                    (assoc db' :block block)
-                                    (recur r (.-t f) [f] db')))))]
+                                            :else
+                                            (let [db' (-> db
+                                                          (assoc :t (inc t)) ;; due to permissions, an entire 't' may be filtered out, set to 't' prior to the new flakes
+                                                          (with-t t-flakes opts)
+                                                          (<?))]
+                                              (if (nil? f)
+                                                (assoc db' :block block)
+                                                (recur r (.-t f) [f] db')))))]
 
              (async/put! resp-ch db*)))
          (catch* e
@@ -295,12 +295,12 @@
   [this tag-id & [pred]]
   (go-try
     (let [pred-name (graphdb-pred-name this pred)
-          tag (let [tag-pred-id 30]
-                (some-> (<? (query-range/index-range
-                              (dbproto/-rootdb this)
-                              :spot = [tag-id tag-pred-id]))
-                        ^Flake (first)
-                        (.-o)))]
+          tag       (let [tag-pred-id 30]
+                      (some-> (<? (query-range/index-range
+                                    (dbproto/-rootdb this)
+                                    :spot = [tag-id tag-pred-id]))
+                              ^Flake (first)
+                              (.-o)))]
       (case pred-name
         ::no-pred tag
         nil nil
