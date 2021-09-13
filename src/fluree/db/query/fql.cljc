@@ -263,12 +263,13 @@
         acc
         (let [[pred-id pred-spec] n
               {:keys [offset limit as name p]} pred-spec
-              sub-ids (->> (<? (query-range/index-range db :opst = [subject-id pred-id]))
-                           (map s)
-                           (not-empty))
-              _ (when (and sub-ids fuel) (add-fuel fuel (count sub-ids) max-fuel))
+              sub-ids    (->> (<? (query-range/index-range db :opst = [subject-id pred-id]))
+                              (map s)
+                              (not-empty))
+              _          (when (and sub-ids fuel)
+                           (add-fuel fuel (count sub-ids) max-fuel))
               sub-result (loop [[sid & r'] sub-ids
-                                n 0
+                                n    0
                                 acc' []]
                            (cond
                              (or (not sid) (and limit (>= n limit)))
@@ -522,27 +523,28 @@
 
 (defn parse-map
   [x valid-var]
-  (let [_ (when-not (= 1 (count (keys x)))
-            (throw (ex-info (str "Invalid aggregate selection, provided: " x)
-                            {:status 400 :error :db/invalid-query})))
-        var-as-symbol (-> x keys first symbol)
-        _ (when-not (valid-var var-as-symbol)
-            (throw (ex-info (str "Invalid select variable in aggregate select, provided: " x)
-                            {:status 400 :error :db/invalid-query})))]
+  (when-not (= 1 (count (keys x)))
+    (throw (ex-info (str "Invalid aggregate selection, provided: " x)
+                    {:status 400 :error :db/invalid-query})))
+  (let [var-as-symbol (-> x keys first symbol)]
+    (when-not (valid-var var-as-symbol)
+      (throw (ex-info (str "Invalid select variable in aggregate select, provided: " x)
+                      {:status 400 :error :db/invalid-query})))
     {:variable  var-as-symbol
      :selection (-> x vals first)}))
 
 (defn parse-select
   [vars interim-vars select-smt]
-  (let [_ (or (every? #(or (string? %) (map? %)) select-smt)
-              (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt) {:status 400 :error :db/invalid-query})))
-        vars (set vars)
-        all-vars (set (concat vars (keys interim-vars)))]
+  (when-not (every? #(or (string? %) (map? %)) select-smt)
+      (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: "
+                           select-smt)
+                      {:status 400 :error :db/invalid-query})))
+  (let [vars* (set vars)]
     (map (fn [select]
            (let [var-symbol (if (map? select) nil (-> select symbol))]
-             (cond (vars var-symbol) {:variable var-symbol}
-                   (analytical/aggregate? select) (analytical/parse-aggregate select vars)
-                   (map? select) (parse-map select all-vars)
+             (cond (vars* var-symbol) {:variable var-symbol}
+                   (analytical/aggregate? select) (analytical/parse-aggregate select vars*)
+                   (map? select) (parse-map select (into vars* (keys interim-vars))) ;; parse-map needs all vars including interim
                    (get interim-vars var-symbol) {:value (get interim-vars var-symbol)}
                    :else (throw (ex-info (str "Invalid select in statement, provided: " select)
                                          {:status 400 :error :db/invalid-query})))))
@@ -722,12 +724,11 @@
   [headers vars select]
   (let [{:keys [as variable value]} select
         select-val (or as variable)
-        idx (get-header-idx headers select)
-        tuple-select (cond
-                       value (constantly value)
-                       idx (fn [tuple] (nth tuple idx))
-                       (get vars select-val) (constantly (get vars select-val)))]
-    tuple-select))
+        idx        (get-header-idx headers select)]
+    (cond
+      value (constantly value)
+      idx (fn [tuple] (nth tuple idx))
+      (get vars select-val) (constantly (get vars select-val)))))
 
 
 (defn- select-tuples-fn
@@ -779,8 +780,7 @@
   ([db fuel max-fuel res select-spec opts]
    (process-ad-hoc-group db fuel max-fuel res select-spec nil opts))
   ([db fuel max-fuel {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select expandMaps? selectDistinct? inVector? prettyPrint context] :as select-spec} group-limit opts]
-   (go-try (if
-             (and aggregates (= 1 (count select)))          ;; only aggregate
+   (go-try (if (and aggregates (= 1 (count select)))        ;; only aggregate
              (let [res  (second (analytical/calculate-aggregate res (first aggregates)))
                    res' (if prettyPrint
                           {(-> select first :as str (subs 1)) res}

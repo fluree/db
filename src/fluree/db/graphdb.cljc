@@ -351,7 +351,7 @@
     (cond->> (get-in schema [:pred predicate property])
              (= :restrictCollection property) (dbproto/-c-prop this :partition)))
   (-tag [this tag-id]
-    ;; resolves a tags's value given a tag subject id
+    ;; resolves a tag's value given a tag subject id
     (go-try
       (let [tag-pred-id 30]
         (some-> (<? (query-range/index-range (dbproto/-rootdb this) :spot = [tag-id tag-pred-id]))

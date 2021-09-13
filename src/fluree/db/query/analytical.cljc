@@ -60,13 +60,6 @@
   (reduce-kv (fn [acc idx key]
                (let [key-as-var   (variable? key)
                      static-value (get interm-vars key-as-var)]
-                 #_(when (and (= idx 1) (not key-as-var) (not= "_id" key)
-                            (not (dbproto/-p-prop db :name (if (string? key)
-                                                             (re-find #"[_a-zA-Z0-9/]*" key)
-                                                             key))))
-                   (throw (ex-info (str "Invalid predicate provided: " key)
-                                   {:status 400
-                                    :error  :db/invalid-query})))
                  (cond static-value
                        (update acc :search #(conj % static-value))
 
@@ -343,13 +336,8 @@
                 ;; subject after. I'm sure this depends on a number of variables
                 ;; TODO - determine what, when, and how to filter - in index range? after index-range?
                 search-opts {:object-fn (or (:object-fn opts) object-fn)
-                             :context context}
+                             :context   context}
                 res         (<? (query-range/search db clause' search-opts))
-                ;; Currently, not supporting subject and predicate fns, but leaving this here.
-                ;{:keys [subject-fn predicate-fn]} opts
-                ;res         (cond->> res
-                ;                     subject-fn    (filter #(subject-fn (.-s %)))
-                ;                     predicate-fn  (filter #(predicate-fn (.-p %))))
                 _           (add-fuel (count res) fuel max-fuel)
                 tuples      (get-ns-arrays (vals rel) res)
                 tuples'     (if recur-depth
@@ -395,7 +383,7 @@
                               :error  :db/invalid-query}))
              (let [lang (-> db :settings :language (or :default))
                    [var search search-param] clause
-                   var (variable? var)]
+                   var  (variable? var)]
                (with-open [^Closeable store (full-text/open-storage conn network dbid lang)]
                  (full-text/search store db [var search search-param]))))))
 

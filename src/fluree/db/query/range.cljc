@@ -366,7 +366,7 @@
 
 (defn non-nil-non-boolean?
   [o]
-  (and (not (nil? o))
+  (and (some? o)
        (not (boolean? o))))
 
 
@@ -386,15 +386,18 @@
 
 
 (defn coerce-tag-flakes
+  "Coerces a list of tag flakes into flakes that contain the tag name (not subj id) as the .-o value."
   [db flakes]
-  (async/go-loop [[flake & r] flakes
-                  acc []]
-    (if flake
-      (if (is-tag-flake? flake)
-        (let [[s p o t op m] (flake/Flake->parts flake)
-              o (<? (dbproto/-tag db o p))]
-          (recur r (conj acc (flake/parts->Flake [s p o t op m]))))
-        (recur r (conj acc flake))) acc)))
+  (go-try
+    (loop [[^Flake flake & r] flakes
+           acc []]
+      (if flake
+        (->> (<? (dbproto/-tag db (:o flake) (:p flake)))
+             (assoc flake :o)
+             (conj acc)
+             (recur r))
+        acc))))
+
 
 (defn coerce-tag-object
   "When a predicate is type :tag and the query object (o) is a string,
@@ -462,11 +465,15 @@
                                   (<? (index-range db :psot = [pid s* o t] opts))
 
                                   o
-                                  (<? (index-range db :opst = [o pid s* t] opts)))
-                 res*           (if (and ref? (= :tag (dbproto/-p-prop db :type pid)))
-                                  (<? (coerce-tag-flakes db res))
-                                  res)]
-             res*))))
+                                  (<? (index-range db :opst = [o pid s* t] opts)))]
+             (cond
+               (and ref? (= :tag (dbproto/-p-prop db :type pid)))
+               (<? (coerce-tag-flakes db res))
+
+               (= "@id" p)
+               (map #(assoc % :o (iri-util/compact (:o %) context)) res)
+
+               :else res)))))
 
 
 (defn collection
