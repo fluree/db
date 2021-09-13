@@ -188,7 +188,7 @@
                             (async/put! response-chan
                                         (case output-format
                                           :text data
-                                          :json data
+                                          :json (json/stringify data)
                                           ;; else
                                           (throw (ex-info "http get only supports output formats of json and text." {})))))))
                  (.catch (fn [err]
