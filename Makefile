@@ -48,10 +48,10 @@ deploy: target/fluree-db.jar
 	clojure -M:deploy
 
 docs/fluree.db.api.html docs/index.html: src/fluree/db/api.clj
-	clojure -M:docs $(@D)
+	clojure -X:docs "{:output-path $(@D)}"
 
 docs/%.html: docs/%.md
-	clojure -M:docs $(@D)
+	clojure -X:docs "{:output-path $(@D)}"
 
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 

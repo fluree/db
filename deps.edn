@@ -94,7 +94,8 @@
   :docs
   {:extra-paths ["src-docs"]
    :extra-deps  {codox/codox {:mvn/version "0.10.7"}}
-   :main-opts   ["-m" "fluree.db.docs"]}
+   :exec-fn     fluree.db.docs/exec
+   :exec-args   {}}
 
   :deploy
   {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
