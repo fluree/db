@@ -292,7 +292,7 @@
               _                    (invalid-ledger-name? network "network")
               [network-alias ledger-alias] (when alias
                                              (graphdb/validate-ledger-ident ledger))
-              _                    (when alias (invalid-ledger-name? ledger-alias))
+              _                    (when alias (invalid-ledger-name? ledger-alias "alias"))
               alias*               (when alias (str network-alias "/" ledger-alias))
               timestamp            (System/currentTimeMillis)
               nonce                (or nonce timestamp)
@@ -330,6 +330,7 @@
          (if (channel? res)
            (deliver p (async/<! res))
            (deliver p res)))) p)))
+
 
 (defn delete-ledger-async
   "Completely deletes a ledger.
@@ -944,9 +945,9 @@
   (query-range/collection db collection))
 
 
-
-(defn flakes
-  "Returns a lazy sequence of raw flakes from the blockchain history from
+(comment ;; TODO: Write me someday?
+  (defn flakes
+    "Returns a lazy sequence of raw flakes from the blockchain history from
   start block/transaction (inclusive) to end block/transaction (exclusive).
 
   A nil start defaults to the genesis block. A nil end includes the last block of the known database.
@@ -965,10 +966,10 @@
   :limit     - Limit results to this quantity of matching flakes
   :offset    - Begin results after this number of matching flakes (for paging - use in conjunction with limit)
   :chunk     - Results are fetched in chunks. Optionally specify the size of a chunk if optimization is needed."
-  ([conn] (flakes conn nil nil {}))
-  ([conn start] (flakes conn start nil {}))
-  ([conn start end] (flakes conn start end {}))
-  ([conn start end {:keys [subject predicate limit offset chunk]}]))
+    ([conn] (flakes conn nil nil {}))
+    ([conn start] (flakes conn start nil {}))
+    ([conn start end] (flakes conn start end {}))
+    ([conn start end {:keys [subject predicate limit offset chunk]}])))
 
 
 

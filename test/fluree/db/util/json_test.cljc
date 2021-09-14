@@ -16,7 +16,7 @@
 #?(:clj
    (defn string->stream
      ([s] (string->stream s "UTF-8"))
-     ([s encoding]
+     ([^String s ^String encoding]
       (-> s
           (.getBytes encoding)
           (ByteArrayInputStream.)))))
@@ -90,7 +90,7 @@
              (is (= (:name x) (:name x*)))
              ; the value of Float/MAX_VALUE is actually allocated as a double
              ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse json stringify"
@@ -141,7 +141,7 @@
              (is (= (:name x) (:name x*)))
              ; the value of Float/MAX_VALUE is actually allocated as a double
              ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse byte-array"
@@ -192,7 +192,7 @@
              (is (= (:name x) (:name x*)))
              ; the value of Float/MAX_VALUE is actually allocated as a double
              ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))))
      (testing ":fdb-json-bigdec-string: false"
@@ -245,7 +245,7 @@
              (is (= (:name x) (:name x*)))
              ; the value of Float/MAX_VALUE is actually allocated as a double
              ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse json stringify"
@@ -296,7 +296,7 @@
              (is (= (:name x) (:name x*)))
              ; the value of Float/MAX_VALUE is actually allocated as a double
              ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse byte-array"
@@ -347,7 +347,7 @@
              (is (= (:name x) (:name x*)))
              ; the value of Float/MAX_VALUE is actually allocated as a double
              ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (-> x :fv) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))))))
 

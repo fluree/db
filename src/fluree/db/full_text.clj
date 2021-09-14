@@ -72,7 +72,7 @@
         analyzer      (lang->analyzer lang)]
     (->Index subject-store analyzer registry)))
 
-(defn memory-index
+(defn memory-index ^Index
   [lang]
   (let [subject-store (lucene-store/memory-store)
         analyzer      (lang->analyzer lang)
@@ -106,7 +106,7 @@
                  (assoc m k* v)))
              {} pred-map))
 
-(defn writer
+(defn writer ^IndexWriter
   [{:keys [storage analyzer]}]
   (lucene-store/store-writer storage analyzer))
 

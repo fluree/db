@@ -72,10 +72,10 @@
     (symbol string)
 
     (string? string)
-    (str "\"" string "\""))
+    (str "\"" string "\"")
 
-  :else
-  string)
+    :else
+    string))
 
 (defn ad-hoc-clause-to-wikidata
   [clause optional?]
