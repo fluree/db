@@ -176,7 +176,7 @@
   [class-iri db context]
   (if context
     (or (get-in db [:schema :pred class-iri :id])
-        (-> context (get "") :iri (class-sid* class-iri db))
+        (-> context (get "@vocab") :iri (class-sid* class-iri db))
         (when-let [[prefix rest] (parse-prefix class-iri)]
           (-> context (get prefix) :iri (class-sid* rest db))))
     (get-in db [:schema :pred class-iri :id])))
@@ -216,25 +216,27 @@
 ;; TODO - generating a compacting-fn that works for queries just like above up front will make this
 ;; more efficient
 (defn compact
-  "Foes through context and attempts to shorten iri if matches context, else returns original IRI.
+  "Goes through context and attempts to shorten iri if matches context, else returns original IRI.
 
   Uses query context format where context values have {:iri 'iri-here'}, so must already be parsed."
   [iri context]
-  (let [match-iris (->> (vals context) (map :iri) (sort-by #(* -1 (count %)))) ;; should retain user-provided order assuming context is not massive
-        flipped    (reduce-kv #(assoc %1 (:iri %3) %2) {} context)]
+  (let [match-iris (->> (vals context) (map :iri) (sort-by #(* -1 (count %))))]
     (or (some
-          #(when (str/starts-with? iri %)                   ;; match
-             (let [prefix (get flipped %)
-                   suffix (subs iri (count %))]
-               (cond
-                 (= "" prefix)
-                 (subs iri (count %))
+          (fn [iri-substr]
+            (when (str/starts-with? iri iri-substr)         ;; match
+              (let [prefix (some #(when (= iri-substr (:iri (val %))) ;; match - now find original corresponding prefix key
+                                    (key %))
+                                 context)
+                    suffix (subs iri (count iri-substr))]
+                (cond
+                  (= "@vocab" prefix)                       ;; special vocabulary reference (default context)
+                  (subs iri (count iri-substr))
 
-                 (= "" suffix)
-                 prefix
+                  (= "" suffix)                             ;; exact match, no prefix needed, just substitute
+                  prefix
 
-                 :else
-                 (str prefix ":" suffix))))
+                  :else
+                  (str prefix ":" suffix)))))
           match-iris)
         iri)))
 
@@ -246,7 +248,7 @@
     (if ctx
       (cond
         (string? ctx)
-        (assoc-in db-ctx ["" :iri] ctx)
+        (assoc-in db-ctx ["@vocab" :iri] ctx)
 
         (map? ctx)
         (reduce-kv
