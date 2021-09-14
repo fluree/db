@@ -15,6 +15,8 @@
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
      :clj (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defprotocol Store
   (exists? [s key] "Returns true when `key` exists in `s`")
   (read [s key] "Reads raw bytes from `s` associated with `key`")
@@ -246,9 +248,9 @@
   [conn network dbid block]
   (go-try
     (let [key  (ledger-root-key network dbid block)
-          data (read conn key)]
+          data (<? (read conn key))]
       (when data
-        (serdeproto/-deserialize-db-root (serde conn) (<? data))))))
+        (serdeproto/-deserialize-db-root (serde conn) data)))))
 
 
 (defn reify-db

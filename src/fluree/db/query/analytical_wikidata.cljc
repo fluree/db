@@ -6,9 +6,9 @@
     [fluree.db.util.log :as log]
     #?(:clj  [clojure.core.async :as async]
        :cljs [cljs.core.async :as async])
-    #?(:cljs [goog.string :as gstring])
-    #?(:cljs [goog.string.format])
     [fluree.db.util.async :refer [<? go-try merge-into?]]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn variable? [form]
   (when (and (or (string? form) (symbol? form)) (= (first (name form)) \?))
@@ -83,8 +83,8 @@
            (= "$wd" (first clause)) (drop 1)
            true                     (map wikiDataVar?)
            true                     (str/join " ")
-           true                     (#?(:clj format :cljs gstring/format) "%s .")
-           optional?                (#?(:clj format :cljs gstring/format) "OPTIONAL {%s}")))
+           true                     (#(str % " ."))
+           optional?                (#(str "OPTIONAL {" % "}"))))
 
 (defn parse-prefixes
   [prefixes]

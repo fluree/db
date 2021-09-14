@@ -16,6 +16,8 @@
             [fluree.db.util.log :as log]
             [clojure.string :as str]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn validate-ledger-name
   "Returns when ledger name is valid.
   Otherwise throws."
@@ -138,7 +140,10 @@
      (async/go
        (try*
          (when (and (not= block (inc (:block db))))
-           (throw (ex-info (str "Invalid 'with' called for db " (:dbid db) " because current db 'block', " (:block db) " must be one less than supplied block " block ".")
+           (throw (ex-info (str "Invalid 'with' called for db " (:dbid db)
+                                " because current db 'block', " (:block db)
+                                " must be one less than supplied block "
+                                block ".")
                            {:status 500
                             :error  :db/unexpected-error})))
          (if (empty? flakes)

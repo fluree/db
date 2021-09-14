@@ -26,8 +26,10 @@
             [fluree.db.util.async :refer [<? <?? go-try channel?]]
             [fluree.db.flake :as flake]
             [fluree.db.util.log :as log])
-  (:import (java.util UUID)))
+  (:import (java.util UUID)
+           (fluree.db.flake Flake)))
 
+(set! *warn-on-reflection* true)
 
 
 
@@ -652,7 +654,7 @@
 (defn format-block-resp-pretty
   [db curr-block cache fuel]
   (go-try (let [[asserted-subjects
-                 retracted-subjects] (loop [[flake & r] (:flakes curr-block)
+                 retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
                                             asserted-subjects  {}
                                             retracted-subjects {}]
                                        (if-not flake
@@ -700,14 +702,14 @@
   (->> (remove nil? args) (apply min)))
 
 (defn auth-match
-  [auth-set t-map flake]
+  [auth-set t-map ^Flake flake]
   (let [[auth id] (get-in t-map [(.-t flake) :auth])]
     (or (auth-set auth)
         (auth-set id))))
 
 (defn format-history-resp
   [db resp auth show-auth]
-  (go-try (let [ts    (-> (map #(.-t %) resp) set)
+  (go-try (let [ts    (-> (map #(.-t ^Flake %) resp) set)
                 t-map (<? (async/go-loop [[t & r] ts
                                           acc {}]
                             (if t
@@ -720,7 +722,7 @@
                                                                                        :where     [[t, "_tx/auth", "?auth"],
                                                                                                    ["?auth", "_auth/id", "?id"]]}))))]
                                 (recur r acc*)) acc)))
-                resp  (-> (loop [[flake & r] resp
+                resp  (-> (loop [[^Flake flake & r] resp
                                  acc {}]
                             (cond (and flake auth
                                        (not (auth-match auth t-map flake)))

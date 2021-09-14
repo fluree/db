@@ -12,6 +12,8 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defn root-db
   "Returns a queryable database from the connection for the specified ledger."
@@ -158,8 +160,8 @@
                            syncTo (-> (syncTo-db syncTo syncTimeout) <?)
                            block (-> (time-travel/as-of-block block) <?)
                            roles (-> (add-db-permissions auth roles) <?) ;; should only ever have roles -or- auth
-                           auth (-> (add-db-permissions auth roles) <?) ;; if both, auth overrides roles
-                           )]
+                           auth (-> (add-db-permissions auth roles) <?))] ;; if both, auth overrides roles
+
            (async/put! pc dbx))
          (catch* e
            (async/put! pc e)

@@ -13,6 +13,8 @@
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn- pred-id-strict
   "Will throw if predicate doesn't exist."
   [db p]

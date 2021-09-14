@@ -1,64 +1,65 @@
-{:deps  {org.clojure/clojure               {:mvn/version "1.10.3"}
-         org.clojure/clojurescript         {:mvn/version "1.10.866"}
-         org.clojure/core.async            {:mvn/version "1.3.618"}
-         org.clojure/core.cache            {:mvn/version "1.0.207"}
-         org.clojars.mmb90/cljs-cache      {:mvn/version "0.1.4"}
-         org.clojure/data.avl              {:mvn/version "0.1.0"}
-         org.clojure/data.xml              {:mvn/version "0.2.0-alpha6"}
-         org.clojure/tools.reader          {:mvn/version "1.3.6"}
-         environ/environ                   {:mvn/version "1.2.0"}
-         byte-streams/byte-streams         {:mvn/version "0.2.4"}
-         cheshire/cheshire                 {:mvn/version "5.10.1"}
-         instaparse/instaparse             {:mvn/version "1.4.10"}
+{:deps  {org.clojure/clojure                 {:mvn/version "1.10.3"}
+         org.clojure/clojurescript           {:mvn/version "1.10.879"}
+         org.clojure/core.async              {:mvn/version "1.3.618"}
+         org.clojure/core.cache              {:mvn/version "1.0.217"}
+         org.clojars.mmb90/cljs-cache        {:mvn/version "0.1.4"}
+         org.clojure/data.avl                {:mvn/version "0.1.0"}
+         org.clojure/data.xml                {:mvn/version "0.2.0-alpha6"}
+         environ/environ                     {:mvn/version "1.2.0"}
+         byte-streams/byte-streams           {:mvn/version "0.2.4"}
+         cheshire/cheshire                   {:mvn/version "5.10.1"}
+         instaparse/instaparse               {:mvn/version "1.4.10"}
 
          ;; logging
-         org.clojure/tools.logging         {:mvn/version "1.1.0"}
-         logback-bundle/core-bundle        {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api               {:mvn/version "1.7.32"}
+         org.clojure/tools.logging           {:mvn/version "1.1.0"}
+         logback-bundle/core-bundle          {:mvn/version "0.3.0"}
+         org.slf4j/slf4j-api                 {:mvn/version "1.7.32"}
 
          ;; Lucene
-         clucie/clucie                     {:mvn/version "0.4.2"}
+         clucie/clucie                       {:mvn/version "0.4.2"}
 
-         ;; messaging
-         aleph/aleph                       {:mvn/version "0.4.7-alpha7"}
+         ;; http
+         http-kit/http-kit                   {:mvn/version "2.5.3"}
+         com.fluree/http.async.client        {:mvn/version "1.3.1-7-0xf9fd"}
 
          ;; benchmarking
-         criterium/criterium               {:mvn/version "0.4.6"}
+         criterium/criterium                 {:mvn/version "0.4.6"}
 
          ;; serialization / compression
-         com.damballa/abracad              {:mvn/version "0.4.13"}
-         com.taoensso/nippy                {:mvn/version "3.1.1"}
-         org.xerial.snappy/snappy-java     {:mvn/version "1.1.8.4"}
-         com.fluree/alphabase              {:mvn/version "3.2.1"}
+         nubank/abracad                      {:mvn/version "0.4.17"}
+         com.taoensso/nippy                  {:mvn/version "3.1.1"}
+         org.xerial.snappy/snappy-java       {:mvn/version "1.1.8.4"}
+         com.fluree/alphabase                {:mvn/version "3.2.1"}
 
-         com.fluree/crypto                 {:mvn/version "0.3.5"}
-         org.bouncycastle/bcprov-jdk15on   {:mvn/version "1.69"}}
+         ;; cryptography
+         com.fluree/crypto                   {:mvn/version "0.3.6"}
+         org.bouncycastle/bcprov-jdk15on     {:mvn/version "1.69"}}
 
  :paths ["src" "resources"]
 
  :aliases
- {:mvn/group-id com.fluree
+ {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version "1.0.0-rc25"
+  :mvn/version     "1.0.0-rc27"
 
   :dev
-  {:extra-paths ["dev"]
+  {:extra-paths ["dev" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps {org.clojure/tools.namespace {:mvn/version "1.1.0"}
                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}}
 
   :cljstest
   {:extra-paths ["test"]
-   :extra-deps {olical/cljs-test-runner {:mvn/version "3.8.0"}}
-   :main-opts ["-m" "cljs-test-runner.main"
-               "-D" "doo.edn"
-               "-c" "build-test.edn"
-               "-x" "chrome-headless"]}
+   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
+   :main-opts   ["-m" "cljs-test-runner.main"
+                 "-D" "doo.edn"
+                 "-c" "build-test.edn"
+                 "-x" "chrome-headless"]}
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha {:mvn/version "1.0.861"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.0.887"}
                  org.clojure/test.check {:mvn/version "1.1.0"}}
-   :main-opts ["-m" "kaocha.runner"]}
+   :main-opts   ["-m" "kaocha.runner"]}
 
   :js-deps
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
@@ -74,16 +75,16 @@
 
   :webworker
   {:extra-paths ["src-cljs"]
-   :main-opts ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
+   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
 
   :jar
-  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.267"}}
+  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.278"}}
    :exec-fn      hf.depstar/jar
-   :exec-args    {:jar "target/fluree-db.jar"
-                  :group-id :mvn/group-id
+   :exec-args    {:jar         "target/fluree-db.jar"
+                  :group-id    :mvn/group-id
                   :artifact-id :mvn/artifact-id
-                  :version :mvn/version
-                  :sync-pom true}}
+                  :version     :mvn/version
+                  :sync-pom    true}}
 
   :install
   {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
@@ -117,5 +118,5 @@
    :main-opts ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.07.28"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.08.06"}}
    :main-opts ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}

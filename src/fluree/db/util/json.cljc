@@ -9,7 +9,10 @@
   #?(:clj
      (:import (fluree.db.flake Flake)
               (java.io ByteArrayInputStream)
-              (byte_streams InputStream))))
+              (byte_streams InputStream)
+              (com.fasterxml.jackson.core JsonGenerator))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 #?(:clj (add-encoder Flake encode-seq))
 
@@ -21,7 +24,7 @@
      [enable]
      (if enable
        (add-encoder java.math.BigDecimal
-                     (fn [n jsonGenerator]
+                     (fn [n ^JsonGenerator jsonGenerator]
                        (.writeString jsonGenerator (str n))))
        (remove-encoder java.math.BigDecimal))))
 
@@ -158,6 +161,5 @@
        :coordinates [0 0]}
       (stringify)
       (parse)
-      (valid-geojson?))
+      (valid-geojson?)))
 
-  )

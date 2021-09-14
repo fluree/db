@@ -11,10 +11,12 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.permissions :as permissions]
             [fluree.db.auth :as auth]
-            [fluree.db.flake :as flake]
+            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.async :refer [<? go-try]])
+  #?(:clj (:import (fluree.db.flake Flake))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 ;; main query interface for APIs, etc.
 
@@ -153,7 +155,7 @@
 (defn- format-block-resp-pretty
   [db curr-block cache fuel]
   (go-try (let [[asserted-subjects
-                 retracted-subjects] (loop [[flake & r] (:flakes curr-block)
+                 retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
                                             asserted-subjects  {}
                                             retracted-subjects {}]
                                        (if-not flake
@@ -196,15 +198,7 @@
         (recur fuel cache (first rest-blocks) (rest rest-blocks) acc')
         acc'))))
 
-(defn- response-time-formatted
-  "Returns response time, formatted as string. Must provide start time of request
-   for clj as (System/nanoTime), or for cljs epoch milliseconds"
-  [start-time]
-  #?(:clj  (-> (- (System/nanoTime) start-time)
-               (/ 1000000)
-               (#(format "%.2fms" (float %))))
-     :cljs (-> (- (util/current-time-millis) start-time)
-               (str "ms"))))
+
 
 
 (defn block-range
@@ -240,7 +234,7 @@
                    (doall result')
                    result')
          :fuel   100
-         :time   (response-time-formatted start)}
+         :time   (util/response-time-formatted start)}
         result'))))
 
 
@@ -280,7 +274,7 @@
 
 
 (defn- auth-match
-  [auth-set t-map flake]
+  [auth-set t-map ^Flake flake]
   (let [[auth id] (get-in t-map [(.-t flake) :auth])]
     (or (auth-set auth)
         (auth-set id))))
@@ -294,7 +288,7 @@
 (defn- format-history-resp
   [db resp auth show-auth]
   (go-try
-    (let [ts    (-> (map #(.-t %) resp) set)
+    (let [ts    (set (map #(.-t ^Flake %) resp))
           t-map (<? (async/go-loop [[t & r] ts
                                     acc {}]
                       (if t
@@ -307,7 +301,7 @@
                                                                                  :where     [[t, "_tx/auth", "?auth"],
                                                                                              ["?auth", "_auth/id", "?id"]]}))))]
                           (recur r acc*)) acc)))
-          res   (loop [[flake & r] resp
+          res   (loop [[^Flake flake & r] resp
                        acc {}]
                   (cond (and flake auth
                              (not (auth-match auth t-map flake)))
@@ -335,7 +329,7 @@
      download blocks using the #Flake format to support internal query
      handling."
     [blocks]
-     (mapv (fn [block] (assoc block :flakes (mapv vec (:flakes block)))) blocks)))
+    (mapv (fn [block] (assoc block :flakes (mapv vec (:flakes block)))) blocks)))
 
 (defn history-query-async
   [sources query-map]
@@ -404,7 +398,7 @@
         {:status 200
          :result result
          :fuel   @fuel
-         :time   (response-time-formatted start)
+         :time   (util/response-time-formatted start)
          :block  (:block db*)}
         result))))
 
@@ -457,7 +451,7 @@
               {:result response
                :fuel   fuel-global
                :status status-global
-               :time   (response-time-formatted start-time)}
+               :time   (util/response-time-formatted start-time)}
               response)
             (let [{:keys [meta _remove-meta?]} (get-in queries [alias :opts])
                   res            (async/<! port)

@@ -6,6 +6,8 @@
             [clojure.string :as str]
             [fluree.db.util.core :as util]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn- base64->base64url
   [b64]
   (-> b64

@@ -1,5 +1,7 @@
 (ns fluree.db.constants)
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 ;; Version
 

@@ -27,3 +27,4 @@ package-lock.json
 /.eastwood
 /scanning_results
 .dir-locals.el
+.cljs_node_repl
