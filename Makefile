@@ -36,7 +36,7 @@ out/flureeworker.js: package.json package-lock.json node_modules build-webworker
 webworker: out/flureeworker.js
 
 deps:
-	clojure -A:cljtest:cljstest -P
+	clojure -A:cljtest:cljstest:eastwood:docs -P
 
 src/deps.cljs: package.json
 	clojure -M:js-deps
