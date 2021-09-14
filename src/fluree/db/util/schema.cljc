@@ -57,7 +57,7 @@
   "Returns true if flake is a root setting flake."
   [^Flake f]
   (cond
-    (and (<= tag-sid-start (.-s f) tag-sid-end)) true
+    (<= tag-sid-start (.-s f) tag-sid-end) true
     (is-setting-flake? f) true
     (<= auth-sid-start (.-s f) auth-sid-end) true
     (<= role-sid-start (.-s f) role-sid-end) true

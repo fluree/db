@@ -1,6 +1,7 @@
 (ns fluree.db.docs
   (:require [codox.main :as codox]
-            [fluree.db.meta :as meta]))
+            [fluree.db.meta :as meta]
+            [clojure.string :as str]))
 
 
 (defn project-name-and-version
@@ -16,10 +17,13 @@
   [opts]
   (codox/generate-docs opts))
 
+(defn exec [opts]
+  (as-> opts $
+       (update $ :output-path #(when (str/blank? %) "docs")) ;; output docs to this dir by default
+       (merge {:description "Fluree DB Clojure API Documentation"
+               :namespaces  ['fluree.db.api]} $)   ;; include only these namespaces in docs
+       (merge (project-name-and-version) $)
+       (generate $)))
 
 (defn -main [& [output-dir]]
-  (let [opts  {:description "Fluree DB Clojure API Documentation"
-               :namespaces  ['fluree.db.api]            ;; include only these namespaces in docs
-               :output-path (or output-dir "docs")}     ;; place docs in this folder
-        opts* (merge opts (project-name-and-version))]
-    (generate opts*)))
+  (exec {:output-path output-dir}))

@@ -13,9 +13,10 @@
 
 (declare bootstrap-flakes genesis-ecount)
 
-(defn fake-conn []
+(defn fake-conn
   "Returns a fake connection object that is suitable for use with the memorydb if
   no other conn is available."
+  []
   {:transactor? false})
 
 (defn new-db

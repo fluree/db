@@ -1,7 +1,9 @@
 (ns fluree.db.full-text-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.flake :as flake]
-            [fluree.db.full-text :as full-text]))
+            [fluree.db.full-text :as full-text])
+  (:import (java.io Closeable)
+           (org.apache.lucene.index IndexWriter)))
 
 (deftest full-text-index-test
   (testing "full-text index"
