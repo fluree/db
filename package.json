@@ -6,9 +6,9 @@
     "bufferutil": "^4.0.3",
     "js-sha3": "^0.8.0",
     "scrypt-js": "^3.0.1",
-    "source-map-support": "^0.5.19",
+    "source-map-support": "^0.5.20",
     "utf-8-validate": "^5.0.5",
-    "ws": "^8.2.1"
+    "ws": "^8.2.2"
   },
   "browser": {
     "ws": false

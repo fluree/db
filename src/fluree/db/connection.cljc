@@ -350,7 +350,7 @@
                res          (<? (xhttp/get url {:request-timeout 5000
                                                 :headers         headers*
                                                 :output-format   #?(:clj  :binary
-                                                                    :cljs :text)}))]
+                                                                    :cljs :json)}))]
 
            res))))))
 
