@@ -240,6 +240,15 @@
           match-iris)
         iri)))
 
+(defn add-trailing-slash
+  "In certain circumstances we want context partial IRIs to end in either a '/' or '#'.
+  If it ends in neither, we assume it was meant to end in '/' and add it to the end.
+
+  i.e. if provided https://schema.org, we'll change it to https://schema.org/"
+  [partial-iri]
+  (if (#{\/ \#} (last partial-iri))
+    partial-iri
+    (str partial-iri "/")))
 
 (defn query-context
   "Context primarily for use with queries. Merges DB context based on prefix."
@@ -248,12 +257,14 @@
     (if ctx
       (cond
         (string? ctx)
-        (assoc-in db-ctx ["@vocab" :iri] ctx)
+        (assoc-in db-ctx ["@vocab" :iri] (add-trailing-slash ctx))
 
         (map? ctx)
         (reduce-kv
           (fn [acc k v]
-            (assoc-in acc [k :iri] v))
+            (if (= "@vocab" k)
+              (assoc-in acc [k :iri] (add-trailing-slash v))
+              (assoc-in acc [k :iri] v)))
           db-ctx ctx)
 
         :else (throw (ex-info "Invalid query context provided." {:status 400 :error :db/invalid-query})))
