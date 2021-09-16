@@ -48,10 +48,10 @@ deploy: target/fluree-db.jar
 	clojure -M:deploy
 
 docs/fluree.db.api.html docs/index.html: src/fluree/db/api.clj
-	clojure -X:docs "{:output-path $(@D)}"
+	clojure -X:docs :output-path "\"$(@D)\""
 
 docs/%.html: docs/%.md
-	clojure -X:docs "{:output-path $(@D)}"
+	clojure -X:docs :output-path "\"$(@D)\""
 
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
@@ -64,7 +64,7 @@ cljtest:
 test: cljtest cljstest
 
 eastwood:
-	clojure -M:test:docs:eastwood
+	clojure -M:test:eastwood
 
 ci: test eastwood
 
