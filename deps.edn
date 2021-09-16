@@ -40,7 +40,7 @@
  :aliases
  {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version     "1.0.0-rc27"
+  :mvn/version     "1.0.0-rc28" ; Change this down in the docs alias too!
 
   :dev
   {:extra-paths ["dev" "src-cljs" "src-nodejs" "src-docs"]
@@ -100,7 +100,7 @@
                  ;; TODO: Eliminate this copy of the version string
                  ;; Hopefully they'll address this upstream:
                  ;; https://github.com/weavejester/codox/issues/204
-                 :version     "1.0.0-rc27"
+                 :version     "1.0.0-rc28"
                  :output-path "docs"}}
 
   :deploy
