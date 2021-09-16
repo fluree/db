@@ -64,7 +64,7 @@ cljtest:
 test: cljtest cljstest
 
 eastwood:
-	clojure -M:test:docs:eastwood
+	clojure -M:test:eastwood
 
 ci: test eastwood
 
