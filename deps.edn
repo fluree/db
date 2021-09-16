@@ -1,6 +1,6 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.10.3"}
          org.clojure/clojurescript       {:mvn/version "1.10.879"}
-         org.clojure/core.async          {:mvn/version "1.3.618"}
+         org.clojure/core.async          {:mvn/version "1.3.622"}
          org.clojure/core.cache          {:mvn/version "1.0.217"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
@@ -78,7 +78,7 @@
    :main-opts   ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
 
   :jar
-  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.297"}}
+  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
    :exec-fn      hf.depstar/jar
    :exec-args    {:jar         "target/fluree-db.jar"
                   :group-id    :mvn/group-id
@@ -134,5 +134,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.08.06"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.09.15"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
