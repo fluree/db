@@ -292,37 +292,37 @@
 (defn- graphdb-tag
   "resolves a tags's value given a tag subject id; optionally shortening the
   return value if it starts with the given predicate name"
-  [this tag-id & [pred]]
-  (go-try
-    (let [pred-name (graphdb-pred-name this pred)
-          tag       (let [tag-pred-id 30]
-                      (some-> (<? (query-range/index-range
-                                    (dbproto/-rootdb this)
-                                    :spot = [tag-id tag-pred-id]))
-                              ^Flake (first)
-                              (.-o)))]
-      (case pred-name
-        ::no-pred tag
-        nil nil
-        (if (str/includes? tag ":")
-          (second (str/split tag #":"))
-          tag)))))
+  ([this tag-id]
+   (go-try
+     (let [tag-pred-id 30]
+       (some-> (<? (query-range/index-range (dbproto/-rootdb this)
+                                            :spot = [tag-id tag-pred-id]))
+         ^Flake (first)
+         (.-o)))))
+  ([this tag-id pred]
+   (go-try
+     (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
+           tag       (<? (dbproto/-tag this tag-id))]
+       (when (and pred-name tag)
+         (if (str/includes? tag ":")
+           (-> (str/split tag #":") second)
+           tag))))))
 
 (defn- graphdb-tag-id
-  [this tag-name & [pred]]
-  (go-try
-    (if (str/includes? tag-name "/")
-      (<? (dbproto/-tag-id this tag-name))
-      (let [pred-name (graphdb-pred-name this pred)]
-        (case pred-name
-          ::no-pred (let [tag-pred-id const/$_tag:id]
-                      (some-> (<? (query-range/index-range
-                                    (dbproto/-rootdb this)
-                                    :post = [tag-pred-id tag-name]))
-                              ^Flake (first)
-                              (.-s)))
-          nil nil
-          (<? (dbproto/-tag-id this (str pred-name ":" tag-name))))))))
+  ([this tag-name]
+   (go-try
+     (let [tag-pred-id const/$_tag:id]
+       (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
+         ^Flake (first)
+         (.-s)))))
+  ([this tag-name pred]
+   (go-try
+     (if (str/includes? tag-name "/")
+       (<? (dbproto/-tag-id this tag-name))
+       (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
+         (when pred-name
+           (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
+
 
 ;; ================ end GraphDB record support fns ============================
 
