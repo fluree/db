@@ -92,10 +92,16 @@
                   "target/fluree-db.jar"]}
 
   :docs
-  {:extra-paths ["src-docs"]
-   :extra-deps  {codox/codox {:mvn/version "0.10.7"}}
-   :exec-fn     fluree.db.docs/exec
-   :exec-args   {}}
+  {:extra-deps  {codox/codox {:mvn/version "0.10.7"}}
+   :exec-fn     codox.main/generate-docs
+   :exec-args   {:namespaces  [fluree.db.api]
+                 :description "Fluree DB Clojure API Documentation"
+                 :name        com.fluree/db
+                 ;; TODO: Eliminate this copy of the version string
+                 ;; Hopefully they'll address this upstream:
+                 ;; https://github.com/weavejester/codox/issues/204
+                 :version     "1.0.0-rc27"
+                 :output-path "docs"}}
 
   :deploy
   {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
