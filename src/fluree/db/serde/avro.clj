@@ -381,5 +381,5 @@
 
 (defn avro-serde
   "Returns an Avro serializer / deserializer."
-  []
+  ^Serializer []
   (->Serializer))

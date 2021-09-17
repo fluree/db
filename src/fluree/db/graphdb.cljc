@@ -9,12 +9,12 @@
             [fluree.db.index :as index]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.log :as log]
-            [clojure.string :as str]))
+            [clojure.string :as str])
+  #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -261,57 +261,94 @@
                                      e)))))
     return-chan))
 
-(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst tspo schema settings comparators schema-cache novelty permissions fork fork-block current-db-fn]
+;; ================ GraphDB record support fns ================================
+
+(defn- graphdb-latest-db [{:keys [current-db-fn permissions]}]
+  (go-try
+    (let [current-db (<? (current-db-fn))]
+      (assoc current-db :permissions permissions))))
+
+(defn- graphdb-root-db [this]
+  (assoc this :permissions {:root?      true
+                            :collection {:all? true}
+                            :predicate  {:all? true}}))
+
+(defn- graphdb-c-prop [{:keys [schema]} property collection]
+  ;; collection properties TODO-deprecate :id property below in favor of :partition
+  (assert (#{:name :id :sid :partition :spec :specDoc} property)
+          (str "Invalid collection property: " (pr-str property)))
+  (if (neg-int? collection)
+    (get-in schema [:coll "_tx" property])
+    (get-in schema [:coll collection property])))
+
+(defn- graphdb-p-prop [{:keys [schema] :as this} property predicate]
+  (assert (#{:name :id :type :ref? :idx? :unique :multi :index :upsert
+             :component :noHistory :restrictCollection :spec :specDoc :txSpec
+             :txSpecDoc :restrictTag :retractDuplicates} property)
+          (str "Invalid predicate property: " (pr-str property)))
+  (cond->> (get-in schema [:pred predicate property])
+           (= :restrictCollection property) (dbproto/-c-prop this :partition)))
+
+(defn- graphdb-pred-name
+  "Lookup the predicate name if needed; return ::no-pred if pred arg is nil so
+  we can differentiate between that and (dbproto/-p-prop ...) returning nil"
+  [this pred]
+  (cond
+    (nil? pred) ::no-pred
+    (string? pred) pred
+    :else (dbproto/-p-prop this :name pred)))
+
+(defn- graphdb-tag
+  "resolves a tags's value given a tag subject id; optionally shortening the
+  return value if it starts with the given predicate name"
+  ([this tag-id]
+   (go-try
+     (let [tag-pred-id 30]
+       (some-> (<? (query-range/index-range (dbproto/-rootdb this)
+                                            :spot = [tag-id tag-pred-id]))
+               first
+               (flake/o)))))
+  ([this tag-id pred]
+   (go-try
+     (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
+           tag       (<? (dbproto/-tag this tag-id))]
+       (when (and pred-name tag)
+         (if (str/includes? tag ":")
+           (-> (str/split tag #":") second)
+           tag))))))
+
+(defn- graphdb-tag-id
+  ([this tag-name]
+   (go-try
+     (let [tag-pred-id const/$_tag:id]
+       (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
+               first
+               (flake/s)))))
+  ([this tag-name pred]
+   (go-try
+     (if (str/includes? tag-name "/")
+       (<? (dbproto/-tag-id this tag-name))
+       (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
+         (when pred-name
+           (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
+
+
+;; ================ end GraphDB record support fns ============================
+
+(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst
+                    tspo schema settings comparators schema-cache novelty
+                    permissions fork fork-block current-db-fn]
   dbproto/IFlureeDb
-  (-latest-db [this]
-    (go-try
-      (let [current-db (<? (current-db-fn))]
-        (assoc current-db :permissions permissions))))
-  (-rootdb [this] (assoc this :permissions {:root? true :collection {:all? true} :predicate {:all? true}}))
+  (-latest-db [this] (graphdb-latest-db this))
+  (-rootdb [this] (graphdb-root-db this))
   (-forward-time-travel [db flakes] (forward-time-travel db nil flakes))
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
-  (-c-prop [this property collection]
-    ;; collection properties TODO-deprecate :id property below in favor of :partition
-    (assert (#{:name :id :sid :partition :spec :specDoc} property) (str "Invalid collection property: " (pr-str property)))
-    (if (neg-int? collection)
-      (get-in schema [:coll "_tx" property])
-      (get-in schema [:coll collection property])))
-  (-p-prop [this property predicate]
-    ;; predicate properties
-    (assert (#{:name :id :type :ref? :idx? :unique :multi :index :upsert :component :noHistory :restrictCollection
-               :spec :specDoc :txSpec :txSpecDoc :restrictTag :retractDuplicates} property) (str "Invalid predicate property: " (pr-str property)))
-    (cond->> (get-in schema [:pred predicate property])
-             (= :restrictCollection property) (dbproto/-c-prop this :partition)))
-  (-tag [this tag-id]
-    ;; resolves a tags's value given a tag subject id
-    (go-try
-      (let [tag-pred-id 30]
-        (some-> (<? (query-range/index-range (dbproto/-rootdb this) :spot = [tag-id tag-pred-id]))
-                first
-                flake/o))))
-  (-tag [this tag-id pred]
-    ;; resolves a tag's value given a tag subject id, and shortens the return value if it
-    ;; starts with the predicate name.
-    (go-try
-      (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
-            tag       (<? (dbproto/-tag this tag-id))]
-        (when (and pred-name tag)
-          (if (str/includes? tag ":")
-            (-> (str/split tag #":") second)
-            tag)))))
-  (-tag-id [this tag-name]
-    (go-try
-      (let [tag-pred-id const/$_tag:id]
-        (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
-                first
-                flake/s))))
-  (-tag-id [this tag-name pred]
-    (go-try
-      (if (str/includes? tag-name "/")
-        (<? (dbproto/-tag-id this tag-name))
-        (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
-          (when pred-name
-            (<? (dbproto/-tag-id this (str pred-name ":" tag-name))))))))
+  (-c-prop [this property collection] (graphdb-c-prop this property collection))
+  (-p-prop [this property predicate] (graphdb-p-prop this property predicate))
+  (-tag [this tag-id] (graphdb-tag this tag-id))
+  (-tag [this tag-id pred] (graphdb-tag this tag-id pred))
+  (-tag-id [this tag-name] (graphdb-tag-id this tag-name))
+  (-tag-id [this tag-name pred] (graphdb-tag-id this tag-name pred))
   (-subid [this ident] (subid this ident false))
   (-subid [this ident strict?] (subid this ident strict?))
   (-search [this fparts] (query-range/search this fparts))
@@ -321,24 +358,22 @@
   (-with-t [this flakes] (with-t this flakes nil))
   (-with-t [this flakes opts] (with-t this flakes opts))
   (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil)))
-;#?@(:cljs
-;    [IPrintWithWriter
-;     (-pr-writer [db w opts]
-;                 (-write w "#FlureeGraphDB ")
-;                 (-write w (pr {:network (:network db) :dbid (:dbid db) :block (:block db) :t (:t db) :stats (:stats db) :permissions (:permissions db)})))])
 
 #?(:cljs
    (extend-type GraphDb
      IPrintWithWriter
      (-pr-writer [db w opts]
        (-write w "#FlureeGraphDB ")
-       (-write w (pr {:network (:network db) :dbid (:dbid db) :block (:block db) :t (:t db) :stats (:stats db) :permissions (:permissions db)})))))
+       (-write w (pr {:network     (:network db) :dbid (:dbid db) :block (:block db)
+                      :t           (:t db) :stats (:stats db)
+                      :permissions (:permissions db)})))))
 
 #?(:clj
-   (defmethod print-method GraphDb [^GraphDb db, ^java.io.Writer w]
+   (defmethod print-method GraphDb [^GraphDb db, ^Writer w]
      (.write w (str "#FlureeGraphDB "))
      (binding [*out* w]
-       (pr {:network (:network db) :dbid (:dbid db) :block (:block db) :t (:t db) :stats (:stats db) :permissions (:permissions db)}))))
+       (pr {:network (:network db) :dbid (:dbid db) :block (:block db)
+            :t       (:t db) :stats (:stats db) :permissions (:permissions db)}))))
 
 (defn new-novelty-map
   [comparators]
@@ -376,7 +411,9 @@
         fork-block  nil
         schema      nil
         settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst tspo schema settings index/default-comparators schema-cache novelty permissions fork fork-block current-db-fn)))
+    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst tspo schema
+               settings index/default-comparators schema-cache novelty
+               permissions fork fork-block current-db-fn)))
 
 (defn graphdb?
   [db]
