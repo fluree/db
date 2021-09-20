@@ -474,10 +474,14 @@
 (defn- where-filter
   "Takes a where clause and returns subjects that match."
   ([db where-clause]
-   (where-filter db where-clause nil))
-  ([db where-clause default-collection]
+   (where-filter db where-clause nil nil))
+  ([db where-clause default-collection {:keys [limit offset]}]
    (go-try
-     (let [[op* statements] (parse-where db where-clause default-collection)]
+     (let [[op* statements] (parse-where db where-clause default-collection)
+           limit (when limit
+                   (if offset
+                     (+ offset limit)
+                     limit))]
        (when (not-empty statements)
          (loop [[smt & r] statements
                 acc #{}]
@@ -489,19 +493,23 @@
                                        {:status 400
                                         :error  :db/invalid-query})))
                    subs (->> (condp identical? op           ;; TODO - apply .-s transducer to index-range once support is there
-                               not= (concat (<? (query-range/index-range db :post > [p match] <= [p]))
-                                            (<? (query-range/index-range db :post >= [p] < [p match])))
-                               = (<? (query-range/index-range db :post = [p match]))
-                               > (<? (query-range/index-range db :post > [p match] <= [p]))
-                               >= (<? (query-range/index-range db :post >= [p match] <= [p]))
-                               < (<? (query-range/index-range db :post >= [p] < [p match]))
-                               <= (<? (query-range/index-range db :post >= [p] <= [p match])) ())
+                               not= (concat (<? (query-range/index-range db :post > [p match] <= [p] {:limit limit}))
+                                            (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit})))
+                               = (<? (query-range/index-range db :post = [p match] {:limit limit}))
+                               > (<? (query-range/index-range db :post > [p match] <= [p] {:limit limit}))
+                               >= (<? (query-range/index-range db :post >= [p match] <= [p] {:limit limit}))
+                               < (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit}))
+                               <= (<? (query-range/index-range db :post >= [p] <= [p match] {:limit limit}))
+                               [])
                              (map s))
                    acc* (case op*
                           :or (into acc subs)
                           :and (set/intersection acc (into #{} subs)))]
-               (if (and (= :and op*) (empty? acc*))
-                 acc*
+               (if (or (and (= :and op*) (empty? acc*))
+                       (and limit (> (count subs) limit)))
+                 (if offset
+                   (drop offset acc*)
+                   acc*)
                  (recur r acc*))))))))))
 
 
@@ -1004,7 +1012,7 @@
                    result (cond
                             (string? where)
                             (let [default-collection (when (string? from) from)
-                                  subjects (<? (where-filter db where default-collection))]
+                                  subjects (<? (where-filter db where default-collection {:limit limit :offset offset}))]
                               (<? (subject-select db cache fuel max-fuel select-spec'
                                                   subjects (if orderBy nil limit) (if orderBy nil offset))))
 
