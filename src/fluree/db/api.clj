@@ -437,34 +437,33 @@
   - timeout     - will respond with an exception if timeout reached before response available."
   ([conn ledger txn] (transact-async conn ledger txn nil))
   ([conn ledger txn opts]
-   (let [{:keys [private-key txid-only timeout auth nonce deps expire]
-          :or   {timeout 60000
-                 nonce   (System/currentTimeMillis)}} opts]
-     (if private-key
-       ;; private key, so generate command locally and submit signed command
-       (let [command      (tx->command ledger txn private-key opts)
-             txid         (:id command)
-             persist-resp (submit-command-async conn command)
-             result       (if txid-only
-                            persist-resp
-                            (monitor-tx-async conn ledger txid timeout))]
-         result)
-       ;; no private key provided, request ledger to sign request
-       (let [tx-map (util/without-nils
-                      {:db     ledger
-                       :tx     txn
-                       :auth   auth
-                       :nonce  nonce
-                       :deps   deps
-                       :expire expire})]
-         (go-try
-           ;; will received txid once transaction is persisted, else an error
-           (let [txid (<? (ops/transact-async conn tx-map))]
-             (if txid-only
-               txid
-               ;; tx is persisted, monitor for txid
-               (let [tx-result (<? (monitor-tx-async conn ledger txid timeout))]
-                 tx-result)))))))))
+   (go-try
+     (let [{:keys [private-key txid-only timeout auth nonce deps expire]
+            :or   {timeout 60000
+                   nonce   (System/currentTimeMillis)}} opts]
+       (if private-key
+         ;; private key, so generate command locally and submit signed command
+         (let [command      (tx->command ledger txn private-key opts)
+               txid         (:id command)
+               persist-resp (<? (submit-command-async conn command))
+               result       (if txid-only
+                              persist-resp
+                              (<? (monitor-tx-async conn ledger txid timeout)))]
+           result)
+         ;; no private key provided, request ledger to sign request
+         (let [tx-map (util/without-nils
+                        {:db     ledger
+                         :tx     txn
+                         :auth   auth
+                         :nonce  nonce
+                         :deps   deps
+                         :expire expire})
+               ;; will received txid once transaction is persisted, else an error
+               txid (<? (ops/transact-async conn tx-map))
+               result (if txid-only
+                        txid
+                        (<? (monitor-tx-async conn ledger txid timeout)))]
+           result))))))
 
 
 (defn transact
