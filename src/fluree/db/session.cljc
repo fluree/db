@@ -156,7 +156,9 @@
 
 
 (defn acquire-indexing-lock!
-  "Attempts to acquire indexing lock, and if successful returns true, else false."
+  "Attempts to acquire indexing lock. Returns two-tuple of [lock? promise-chan]
+  where lock? indicates if the lock was successful, and promise-chan is whatever
+  promise-chan is registered for indexing."
   [session pc]
   (let [swap-res (swap! (:state session)
                         (fn [s]
