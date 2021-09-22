@@ -160,9 +160,13 @@
                                   [(loop [[^Flake flake & r] flakes
                                           acc []]
                                      (if flake
-                                       (let [sub-sel (<? (query-range/index-range db :spot = [(.-o flake)]))]
+                                       (let [sub-sel (<? (query-range/index-range db :spot = [(.-o flake)]))
+                                             res     (when (seq sub-sel)
+                                                       (<? (flakes->res db cache fuel max-fuel nested-select-spec sub-sel)))]
                                          (when fuel (vswap! fuel + (count sub-sel)))
-                                         (recur r (conj acc (<? (flakes->res db cache fuel max-fuel nested-select-spec sub-sel)))))
+                                         (recur r (if (seq res)
+                                                    (conj acc res)
+                                                    acc)))
                                        acc))
                                    offset-map])
 
@@ -195,7 +199,15 @@
 
                                 ;; if a ref, put out an {:_id ...}
                                 ref?
-                                [(mapv #(hash-map :_id (.-o ^Flake %)) flakes) offset-map]
+                                (if (true? (-> db :permissions :root?))
+                                  [(mapv #(hash-map :_id (.-o ^Flake %)) flakes) offset-map]
+                                  (loop [[^Flake f & r] flakes
+                                         acc []]
+                                    (if f
+                                      (if (seq (<? (query-range/index-range db :spot = [(.-o f)])))
+                                        (recur r (conj acc {:_id (.-o f)}))
+                                        (recur r acc))
+                                      [acc offset-map])))
 
                                 ;; else just output value
                                 :else
