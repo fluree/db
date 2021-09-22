@@ -478,35 +478,39 @@
   ([db where-clause default-collection {:keys [limit offset]}]
    (go-try
      (let [[op* statements] (parse-where db where-clause default-collection)
-           limit (when limit
-                   (if offset
-                     (+ offset limit)
-                     limit))]
+           limit* (when (and limit (not= :and op*))
+                    (if offset
+                      (+ offset limit)
+                      limit))]
        (when (not-empty statements)
          (loop [[smt & r] statements
                 acc #{}]
            (if-not smt
-             acc
+             (cond->> acc
+                      offset (drop offset)
+                      limit (take limit))
              (let [[p op match] smt
                    _ (when (not (valid-where-predicate? db p))
                        (throw (ex-info (str "Non-indexed predicates are not valid in where clause statements. Provided: " (dbproto/-p-prop db :name p))
                                        {:status 400
                                         :error  :db/invalid-query})))
                    subs (->> (condp identical? op           ;; TODO - apply .-s transducer to index-range once support is there
-                               not= (concat (<? (query-range/index-range db :post > [p match] <= [p] {:limit limit}))
-                                            (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit})))
-                               = (<? (query-range/index-range db :post = [p match] {:limit limit}))
-                               > (<? (query-range/index-range db :post > [p match] <= [p] {:limit limit}))
-                               >= (<? (query-range/index-range db :post >= [p match] <= [p] {:limit limit}))
-                               < (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit}))
-                               <= (<? (query-range/index-range db :post >= [p] <= [p match] {:limit limit}))
+                               not= (concat (<? (query-range/index-range db :post > [p match] <= [p] {:limit limit*}))
+                                            (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit*})))
+                               = (<? (query-range/index-range db :post = [p match] {:limit limit*}))
+                               > (<? (query-range/index-range db :post > [p match] <= [p] {:limit limit*}))
+                               >= (<? (query-range/index-range db :post >= [p match] <= [p] {:limit limit*}))
+                               < (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit*}))
+                               <= (<? (query-range/index-range db :post >= [p] <= [p match] {:limit limit*}))
                                [])
                              (map s))
                    acc* (case op*
                           :or (into acc subs)
-                          :and (set/intersection acc (into #{} subs)))]
+                          :and (if (empty? acc)
+                                 (into acc subs)
+                                 (set/intersection acc (into #{} subs))))]
                (if (or (and (= :and op*) (empty? acc*))
-                       (and limit (> (count subs) limit)))
+                       (and (not= :and op*) limit* (> (count subs) limit*)))
                  (if offset
                    (drop offset acc*)
                    acc*)
