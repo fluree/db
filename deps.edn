@@ -87,7 +87,7 @@
                   :sync-pom    true}}
 
   :install
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.0"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "install"
                   "target/fluree-db.jar"]}
 
@@ -103,7 +103,7 @@
                  :output-path "docs"}}
 
   :deploy
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.0"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "deploy"
                   "target/fluree-db.jar"]}
 
