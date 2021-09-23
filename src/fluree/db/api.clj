@@ -1,36 +1,33 @@
 (ns fluree.db.api
   (:gen-class)
   (:refer-clojure :exclude [range])
-  (:require [clojure.string :as str]
-            [fluree.db.connection :as connection]
-            [fluree.db.session :as session]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.graphdb :as graphdb]
-            [fluree.db.permissions :as permissions]
-            [fluree.db.auth :as auth]
-            [fluree.db.api.query :as query-api]
-            [fluree.db.api.ledger :as ledger-api]
-            [fluree.db.query.block :as query-block]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.query.fql :as fql]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.util.json :as json]
-            [fluree.db.util.core :as util]
-            [fluree.db.operations :as ops]
+            [fluree.db.api.auth :as auth-api]
+            [fluree.db.api.ledger :as ledger-api]
+            [fluree.db.api.query :as query-api]
+            [fluree.db.connection :as connection]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
+            [fluree.db.graphdb :as graphdb]
+            [fluree.db.operations :as ops]
+            [fluree.db.query.block :as query-block]
+            [fluree.db.query.fql :as fql]
             [fluree.db.query.graphql-parser :as graphql]
-            [fluree.db.time-travel :as time-travel]
+            [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql-parser :as sparql]
             [fluree.db.query.sql :as sql]
-            [fluree.db.util.async :refer [<? <?? go-try channel?]]
-            [fluree.db.flake :as flake]
+            [fluree.db.session :as session]
+            [fluree.db.time-travel :as time-travel]
+            [fluree.db.util.async :refer [<? channel? go-try]]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log])
   (:import (java.util UUID)
            (fluree.db.flake Flake)))
 
 (set! *warn-on-reflection* true)
-
 
 
 ;; ======================================
@@ -54,66 +51,55 @@
 
 
 (defn sign
-  "Returns a signature for a message given provided private key."
+  "DEPRECATED: use fluree.db.api.auth/sign instead."
   [message private-key]
-  (crypto/sign-message message private-key))
+  (log/warn "sign DEPRECATED - use fluree.db.api.auth/sign instead")
+  (auth-api/sign message private-key))
 
 
 (defn public-key-from-private
-  "Returns a public key given a private key."
-  [private-key] (crypto/pub-key-from-private private-key))
+  "DEPRECATED: use fluree.db.api.auth/public-key-from-private instead."
+  [private-key]
+  (log/warn "public-key-from-private DEPRECATED - use fluree.db.api.auth/public-key-from-private instead")
+  (auth-api/public-key-from-private private-key))
 
 
 (defn public-key
-  "Returns a public key from a message and a signature."
-  [message signature] (crypto/pub-key-from-message message signature))
+  "DEPRECATED: use fluree.db.api.auth/public-key instead."
+  [message signature]
+  (log/warn "public-key DEPRECATED - use fluree.db.api.auth/public-key instead")
+  (auth-api/public-key message signature))
 
 
 (defn new-private-key
-  "Generates a new private key, returned in a map along with
-  the public key and account id. Return keys are :public, :private, and :id."
+  "DEPRECATED: use fluree.db.api.auth/new-private-key instead."
   []
-  (let [kp      (crypto/generate-key-pair)
-        account (crypto/account-id-from-private (:private kp))]
-    (assoc kp :id account)))
+  (log/warn "new-private-key DEPRECATED - use fluree.db.api.auth/new-private-key instead")
+  (auth-api/new-private-key))
 
 
 (defn set-default-key-async
-  "Sets a new default private key for the entire tx-group, network or db level.
-  This will only succeed if signed by the default private key for the tx-group,
-  or if setting for a dbid, either the tx-group or network.
-
-  It will overwrite any existing default private key.
-
-  Returns core async channel that will respond with true or false."
+  "DEPRECATED: use fluree.db.api.auth/set-default-key-async instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
   ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
   ([conn network dbid private-key opts]
-   (let [{:keys [nonce expire signing-key]} opts
-         timestamp (System/currentTimeMillis)
-         nonce     (or nonce timestamp)
-         expire    (or expire (+ timestamp 30000))          ;; 5 min default
-         cmd-map   {:type        :default-key
-                    :network     network
-                    :dbid        dbid
-                    :private-key private-key
-                    :nonce       nonce
-                    :expire      expire}
-         cmd       (when signing-key
-                     (-> cmd-map
-                         (util/without-nils)
-                         (json/stringify)))
-         sig       (when signing-key
-                     (crypto/sign-message cmd signing-key))]
-     (if signing-key
-       (ops/command-async conn {:cmd cmd :sig sig})
-       (ops/unsigned-command-async conn cmd-map)))))
+   (log/warn "set-default-key-async DEPRECATED - use fluree.db.api.auth/set-default-key-async instead")
+   (auth-api/set-default-key-async conn network dbid private-key opts)))
 
-
+(defn set-default-key
+  "DEPRECATED: use fluree.db.api.auth/set-default-key instead."
+  ([conn private-key] (set-default-key-async conn nil nil private-key nil))
+  ([conn network private-key] (set-default-key-async conn network nil private-key nil))
+  ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
+  ([conn network dbid private-key opts]
+   (log/warn "set-default-key DEPRECATED - use fluree.db.api.auth/set-default-key instead")
+   (auth-api/set-default-key conn network dbid private-key opts)))
 
 (defn account-id
-  "Returns account id from either a public key or message and signature."
+  "INTERNAL USE ONLY
+
+  Returns account id from either a public key or message and signature."
   ([public-key] (crypto/account-id-from-public public-key))
   ([message signature] (crypto/account-id-from-message message signature)))
 
@@ -123,7 +109,7 @@
   producing a signed command.
 
   Optional opts is a map with the following keys. If not provided,
-  defaults will be attempted.
+  sensible defaults will be used.
   - auth        - The auth id for the auth record being used. The private key must
                   correspond to this auth record, or an authority of this auth record.
   - expire      - When this transaction should expire if not yet attempted.
@@ -159,7 +145,7 @@
                             [key-auth-id nil])
          timestamp   (System/currentTimeMillis)
          nonce       (or nonce timestamp)
-         expire      (or expire (+ timestamp 30000))        ;; 5 min default
+         expire      (or expire (+ timestamp 30000)) ;; 5 min default
          cmd         (try (-> {:type      :tx
                                :db        db-name
                                :tx        txn
@@ -207,9 +193,10 @@
              :message (str "Timeout of " timeout-ms " ms for reached without transaction being included in new block. Transaction is still being processed. To view transaction results, issue: {\"select\": [\"*\"], \"from\": [\"_tx/id\", \"" tid "\" ]}")})
           res)))))
 
-
 (defn submit-command-async
-  "Submits a fully signed command to the connected ledger group.
+  "INTERNAL USE ONLY
+
+  Submits a fully signed command to the connected ledger group.
   Commands have two required keys:
     - cmd  - a map with the transactional data as a JSON string
     - sig - the signature of the stringified tx map
@@ -223,9 +210,7 @@
    :db     testnet/mydb   - db name, use testnet/$mydb to peg to a dbid
    :tx     [{...}, {...}] - transactional data
    :auth   ABC12345676    - only required if using an authority's signature, else inferred from signature
-   :fuel   10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth
-                            doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel
-                            will not be debited.
+   :fuel   10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
    :nonce  1234           - nonce ensures uniqueness, making sure two identical transactions have different txids
    :expire 1547049123614  - don't even attempt this transaction after this moment in time
    :deps   []             - optional one or more txids that must execute successfully before this tx executes
@@ -240,18 +225,18 @@
 
   A new ledger command looks like:
   Note new ledgers are issued as a command, and auth/signature should have proper authority on ledger servers.
-  {:type      new-db          - command type is required on all commands
+  {:type      new-db         - command type is required on all commands
    :db        testnet/mydb   - db name - as network/dbid
    :alias     testnet/mydb   - optional alias, will default to 'db' if not specified.
    :fork      testnet/forkdb - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a dbid
    :forkBlock 42             - if forking a db, optionally provides a block to fork at, else will default to current block
    :auth      ABC12345676    - only required if using an authority's signature
-   :fuel      10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth
-                               doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel
-                               will not be debited.
+   :fuel      10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
    :nonce     1234           - nonce ensures uniqueness, making sure two identical transactions have different txids
    :expire    1547049123614  - don't even attempt this transaction after this moment in time
   }
+
+  Returns an async channel that will receive the result.
   "
   [conn command]
   ;; returns once persists, not upon transaction success
@@ -259,11 +244,11 @@
 
 
 (defn new-ledger-async
-  "Attempts to create new ledger.
+  "Attempts to create new ledger with the given ledger name (ex. `fluree/example` or `:fluree/example`).
 
   A successful result will kick off a process on the ledger server(s) to bootstrap.
 
-  Once successful, will return with a command-id.
+  Returns a channel which will receive a command-id after the ledger has been successfully created.
 
   Ledger creation is handled asynchronously and may not be immediately available.
 
@@ -322,6 +307,18 @@
 
 
 (defn new-ledger
+  "Attempts to create new ledger with the given ledger name (ex. `fluree/example` or `:fluree/example`).
+
+  Returns a promise of a command-id, if the ledger bootrapping process is successful.
+
+  Options include:
+  - :alias       - Alias, if different than db-ident.
+  - :root        - Root account id to bootstrap with (string). Defaults to connection default account id.
+  - :doc         - Optional doc string about this db.
+  - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
+  - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
+  - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+  "
   ([conn ledger] (new-ledger conn ledger nil))
   ([conn ledger opts]
    (let [p (promise)]
@@ -334,7 +331,7 @@
 
 (defn delete-ledger-async
   "Completely deletes a ledger.
-  Returns a future that will have a response with a corresponding status of success.
+  Returns a channel that will receive a boolean indicating success or failure.
 
   A 200 status indicates the deletion has been successfully initiated.
   The full deletion happens in the background on the respective ledger.
@@ -360,10 +357,21 @@
                   sig          (crypto/sign-message cmd private-key)
                   persisted-id (submit-command-async conn {:cmd cmd
                                                            :sig sig})]
-              persisted-id) (ops/unsigned-command-async conn cmd-data)))
+              persisted-id)
+            (ops/unsigned-command-async conn cmd-data)))
         (catch Exception e e))))
 
 (defn delete-ledger
+  "Completely deletes a ledger.
+  Returns a future that will have a boolean indicating success or failure.
+
+  A 200 status indicates the deletion has been successfully initiated.
+  The full deletion happens in the background on the respective ledger.
+
+  Query servers get notified when this process initiates, and ledger will be marked as
+  being in a deletion state during the deletion process.
+
+  Attempts to use a ledger in a deletion state will throw an exception."
   ([conn ledger] (delete-ledger conn ledger nil))
   ([conn ledger opts]
    (let [p (promise)]
@@ -374,6 +382,9 @@
            (deliver p res)))) p)))
 
 (defn multi-txns-async
+  "Submits multiple transactions to a ledger, one after the other. If a transaction fails
+  subsequent transactions will still be attempted. Returns a channel with the
+  results. See `transact` for details about opts."
   ([conn ledger txns]
    (multi-txns-async conn ledger txns nil))
   ([conn ledger txns opts]
@@ -394,7 +405,7 @@
                             persist-resp
                             (monitor-tx-async conn ledger final-txid timeout))]
          result)
-       ; no private key provided, not allowed
+       ;; no private key provided, not allowed
        (throw (ex-info "You must provide a private key when submitting multiple transactions simultaneoulsy."
                        {:status 400
                         :error  :db/invalid-command}))))))
@@ -413,7 +424,7 @@
 
 (defn transact-async
   "Submits a transaction for a ledger and a transaction. Returns a core async channel
-  that will eventually have the result of the tx, the txid (if :txid-only option used), or
+  that will eventually have either the result of the tx, the txid (if :txid-only option used), or
   an exception due to an invalid transaction or if the timeout occurs prior to a response.
 
   Will locally sign a final transaction command if a private key is provided via :private-key
@@ -618,11 +629,6 @@
           result    (query-range/block-with-tx-data db-blocks)]
       result)))
 
-(defn- db-ident?
-  [source]
-  (= (-> source (str/split #"/") count) 2))
-
-
 (defn query-async
   "Execute a query against a database source, or optionally
   additional sources if the query spans multiple data sets.
@@ -642,6 +648,8 @@
     p))
 
 (defn query-with-async
+  "INTERNAL USE ONLY
+  "
   [sources param]
   (go-try
     (let [{:keys [query flakes]} param
@@ -653,22 +661,23 @@
 
 
 (defn format-block-resp-pretty
+  "INTERNAL USE ONLY"
   [db curr-block cache fuel]
   (go-try (let [[asserted-subjects
                  retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
                                             asserted-subjects  {}
                                             retracted-subjects {}]
-                                       (if-not flake
-                                         [asserted-subjects retracted-subjects]
-                                         (let [subject   (.-s flake)
-                                               asserted? (true? (.-op flake))
-                                               flake'    (if asserted? flake
-                                                                       (flake/flip-flake flake))]
-                                           (if asserted?
-                                             (recur r (update asserted-subjects subject #(vec (conj % flake')))
-                                                    retracted-subjects)
-                                             (recur r asserted-subjects
-                                                    (update retracted-subjects subject #(vec (conj % flake'))))))))
+                 (if-not flake
+                   [asserted-subjects retracted-subjects]
+                   (let [subject   (.-s flake)
+                         asserted? (true? (.-op flake))
+                         flake'    (if asserted? flake
+                                       (flake/flip-flake flake))]
+                     (if asserted?
+                       (recur r (update asserted-subjects subject #(vec (conj % flake')))
+                              retracted-subjects)
+                       (recur r asserted-subjects
+                              (update retracted-subjects subject #(vec (conj % flake'))))))))
                 retracted (loop [[subject & r] (vals retracted-subjects)
                                  acc []]
                             (if-not subject
@@ -686,6 +695,7 @@
 
 
 (defn format-blocks-resp-pretty
+  "INTERNAL USE ONLY"
   [db resp]
   (async/go-loop [fuel (volatile! 0)
                   cache (volatile! {})
@@ -699,16 +709,19 @@
         acc'))))
 
 (defn min-safe
+  "INTERNAL USE ONLY"
   [& args]
   (->> (remove nil? args) (apply min)))
 
 (defn auth-match
+  "INTERNAL USE ONLY"
   [auth-set t-map ^Flake flake]
   (let [[auth id] (get-in t-map [(.-t flake) :auth])]
     (or (auth-set auth)
         (auth-set id))))
 
 (defn format-history-resp
+  "INTERNAL USE ONLY"
   [db resp auth show-auth]
   (go-try (let [ts    (-> (map #(.-t ^Flake %) resp) set)
                 t-map (<? (async/go-loop [[t & r] ts
@@ -765,17 +778,31 @@
                       (throw (ex-info (str "Invalid block range provided: " (pr-str range)) {:status 400 :error :db/invalid-query})))
           [block-start block-end]
           (if (< block-end block-start)
-            [block-end block-start]                         ;; make sure smallest number comes first
+            [block-end block-start] ; make sure smallest number comes first
             [block-start block-end])
           block-end (if (> block-end db-block)
                       db-block block-end)]
       [block-start block-end])))
 
 (defn block-query-async
+  "Given a map with a `:block` with a block number value, return a channel that will receive the raw flakes contained in that block.
+
+  Can also specify `:pretty-print` `true` in the query map to receive the flakes as a map with predicate names."
   [conn ledger query-map]
   (query-api/block-query-async conn ledger query-map))
 
+(defn block-query
+  "Given a map with a `:block` with a block number value, return a promise of the raw flakes contained in that block.
+
+  Can also specify `:pretty-print` `true` in the query map to receive the flakes as a map with predicate names."
+  [conn ledger query-map]
+  (let [p (promise)]
+    (async/go
+      (deliver p (async/<! (block-query-async conn ledger query-map))))
+    p))
+
 (defn get-history-pattern
+  "INTERNAL USE ONLY"
   [history]
   (let [subject (cond (util/subj-ident? history)
                       [history]
@@ -809,11 +836,16 @@
     [pattern idx]))
 
 (defn history-query-async
+  "Given a map with a `:history` key that has a subject ident or id, return a channel that will receive the history of that subject.
+
+  Can also specify `:pretty-print` `true` in the query map to receive the history as a map with predicate names instead of raw flakes."
   [sources query-map]
   (query-api/history-query-async sources query-map))
 
-
 (defn history-query
+  "Given a map with a `:history` key that has a subject ident or id, return a promise of the history of that subject.
+
+  Can also specify `:pretty-print` `true` in the query map to receive the history as a map with predicate names instead of raw flakes."
   [sources query-map]
   (let [p (promise)]
     (async/go
@@ -835,25 +867,49 @@
   :errors key containing the error(s) using their respective aliases.
 
   If all queries have the identical error status, the overall response status will be that status.
-  If some queries are 200 status but others have errors, the overall response will be a 207 (WevDAV's multi-status response)
+  If some queries are 200 status but others have errors, the overall response will be a 207 (WebDAV's multi-status response)
   If all queries have error responses, but mixed, the overall response will be 400 unless there is also a 5xx
   status code, in which case it will be 500.
 
   Queries leverage multi-threading.
 
   All queries are for the same block. :block can be included on the main map. Whether or not a block
-  is specified in the main map, any of the individual queries specify a block, it will be ignored. "
+  is specified in the main map, any of the individual queries specify a block, it will be ignored.
+
+  Returns a channel that will receive the result."
   [sources multi-query-map]
   (query-api/multi-query-async sources multi-query-map))
 
 
 (defn multi-query
+  "Like query, but takes a map of multiple queries - where map keys are any user-provided aliases
+  and values are queries as if sent directly to 'query'.
+
+  If not {:meta true}, any responses with errors will not be returned.
+
+  If {:meta true} ->
+  The response :result contains all provided queries, with keys being the same user-provided aliases
+  and values being the query results only.
+
+  Queries with any non-200 response will not be included in the :result, but will be in a separate
+  :errors key containing the error(s) using their respective aliases.
+
+  If all queries have the identical error status, the overall response status will be that status.
+  If some queries are 200 status but others have errors, the overall response will be a 207 (WebDAV's multi-status response)
+  If all queries have error responses, but mixed, the overall response will be 400 unless there is also a 5xx
+  status code, in which case it will be 500.
+
+  Queries leverage multi-threading.
+
+  All queries are for the same block. :block can be included on the main map. Whether or not a block
+  is specified in the main map, any of the individual queries specify a block, it will be ignored.
+
+  Returns a promise of the result."
   [sources multi-query-map]
   (let [p (promise)]
     (async/go
       (deliver p (async/<! (multi-query-async sources multi-query-map))))
     p))
-
 
 (defn graphql-async
   "Execute a graphql query against the specified database.
@@ -893,6 +949,17 @@
           :else
           (<? (multi-query-async db-ch (assoc parsed-gql-query :opts opts))))))))
 
+(defn graphql
+  "Execute a graphql query against the specified database.
+  Query must come in as a map with keys:
+  - query - required graphql string query
+  - variables - optional substitution variables supplied with query
+  - opts - optional map of options (same as flureeQL :opts map), however not all options would be relevant for graphql"
+  [conn db-name query-map]
+  (let [p (promise)]
+    (async/go
+      (deliver p (async/<! (graphql-async conn db-name query-map))))
+    p))
 
 (defn sql-async
   "Execute an SQL query against a specified database"
@@ -904,16 +971,39 @@
        (update :opts merge opts)
        (as-> q (query-async db q)))))
 
+(defn sql
+  "Execute an SQL query against a specified database. Returns the a promise of the query results."
+  ([db sql-str]
+   (sql db sql-str {}))
+  ([db sql-str opts]
+   (let [p (promise)]
+    (async/go
+      (deliver p (async/<! (sql-async db sql-str opts))))
+    p)))
+
 (defn sparql-async
-  "Exceute a sparql query against a specified database"
+  "Exceute a sparql query against a specified database. Returns a core async channel,
+  which will recieve the query result."
   ([db sparql-str]
    (sparql-async db sparql-str nil))
   ([db sparql-str opts]
    (->> (sparql/sparql-to-ad-hoc sparql-str)
         (#(query-async db (assoc % :opts (merge (:opts %) opts)))))))
 
-(defn index
-  "Returns a raw collection of flakes from the specified index as a lazy sequence.
+(defn sparql
+  "Execute an sparql query against a specified database. Returns a promise of the query results."
+  ([db sparql-str]
+   (sparql db sparql-str {}))
+  ([db sparql-str opts]
+   (let [p (promise)]
+    (async/go
+      (deliver p (async/<! (sparql-async db sparql-str opts))))
+    p)))
+
+#_(defn index
+  "INTERNAL USE ONLY
+
+  Returns a raw collection of flakes from the specified index as a lazy sequence.
 
   Optionally specify a start and/or stop point to restrict the collection to a range
   along with an operator of <, <=, >, >=. If you wish to restrict to a specific
@@ -940,6 +1030,7 @@
 
 
 (defn collection-flakes
+  "INTERNAL USE ONLY"
   [db collection]
   (query-range/collection db collection))
 
@@ -1008,13 +1099,14 @@
 ;; ======================================
 
 (defn db
-  "Returns a queryable database from the connection for the specified ledger."
+  "Returns an immutable queryable database value from the connection for the specified ledger."
   ([conn ledger]
    (session/db conn ledger nil))
   ([conn ledger opts]
    (ledger-api/db conn ledger opts)))
 
 (defn get-db-at-block
+  "Returns a channel with queryable database value from the given block number."
   [conn ledger block every-n-sec]
   (let [db-chan (async/promise-chan)]
     (go-try (loop [n 1]
@@ -1023,13 +1115,15 @@
                     done?    (>= db-block block)]
                 (if done?
                   (async/put! db-chan root-db)
-                  (do (<? (clojure.core.async/timeout (* every-n-sec 1000)))
+                  (do (<? (async/timeout (* every-n-sec 1000)))
                       (recur (inc n)))))))
     db-chan))
 
 
 (defn resolve-ledger
-  "Resolves a ledger identity in the form of 'network/ledger-or-alias' and returns a
+  "INTERNAL USE ONLY
+
+  Resolves a ledger identity in the form of 'network/ledger-or-alias' and returns a
   two-tuple of [network ledger].
 
   An alias lookup is always performed first, and if an alias doesn't exist it is assumed
@@ -1047,7 +1141,13 @@
 
 (defn connect
   "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
-   supplied, separated by commas."
+   supplied, separated by commas.
+
+  Optional opts is a map with the following keys. If not provided,
+  sensible defaults will be used.
+    :tx-private-key - Will be used to sign every command passed through this connection,
+                      as long as it is not overidden on the transaction.
+    :memory         - How much memory to limit the object LRU cache to. "
   [ledger-servers & [opts]]
   (connection/connect ledger-servers opts))
 
@@ -1089,13 +1189,15 @@
 
 
 (defn close-listener
-  "Closes a listener."
+  "Closes a listener. See `listen` for details."
   [conn ledger key]
   (let [[network ledger-id] (session/resolve-ledger conn ledger)]
     (connection/remove-listener conn network ledger-id key)))
 
 (defn block-event->map
-  "Takes block event data from (listen...) and adds an :added and
+  "INTERNAL USE ONLY
+
+  Takes block event data from (listen...) and adds an :added and
   :retracted key containing maps of data organized by subject
   and containing full predicate names."
   [conn ledger block-event]
@@ -1114,7 +1216,7 @@
                                               {"_id" sid} flakes)))
                               [] by-subj)))]
     (assoc block-event :added (to-map add)
-                       :retracted (to-map retract))))
+           :retracted (to-map retract))))
 
 (defn session
   "Returns actual session object for a given ledger."
@@ -1125,7 +1227,7 @@
   "Returns core async promise channel with ledger's status as a map, including index, indexes, block, and status.
   If ledger doesn't exist, will return an empty map."
   [conn ledger]
-  (ops/ledger-info-async conn ledger))
+  (ops/ledger-stats-async conn ledger))
 
 
 (defn ledger-info
@@ -1154,16 +1256,22 @@
 
 
 (defn ledger-stats-async
-  "Returns core async promise channel with ledger info, including db size and # of flakes.
+  "DEPRECATED: use `ledger-info-async` instead.
+
+  Returns core async promise channel with ledger info, including db size and # of flakes.
   If ledger doesn't exist, will return an empty map."
   [conn ledger]
+  (log/warn "ledger-stats-async DEPRECATED: use ledger-info-async instead.")
   (ops/ledger-stats-async conn ledger))
 
 
 (defn ledger-stats
-  "Returns promise with ledger info, including db size and # of flakes.
+  "DEPRECATED: use `ledger-info` instead.
+
+  Returns promise with ledger info, including db size and # of flakes.
   If ledger doesn't exist, will return an empty map."
   [conn ledger]
+  (log/warn "ledger-stats DEPRECATED: use ledger-info instead.")
   (let [p (promise)]
     (async/go
       (deliver p (async/<! (ops/ledger-stats-async conn ledger))))
