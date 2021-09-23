@@ -1,11 +1,13 @@
 (ns fluree.db.util.async
   (:require
     [fluree.db.util.core :refer [try* catch*]]
-    #?(:clj  [clojure.core.async :refer [go <!] :as async]
-       :cljs [cljs.core.async :refer [go <!] :as async])
-    #?(:clj [clojure.core.async.impl.ioc-macros :as ioc])
-    #?(:clj [clojure.core.async.impl.dispatch :as dispatch]))
+    #?@(:clj  [[clojure.core.async :refer [go <!] :as async]
+               [clojure.core.async.impl.protocols :as async-protocols]]
+        :cljs [[cljs.core.async :refer [go <!] :as async]
+               [cljs.core.async.impl.protocols :as async-protocols]]))
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<?]])))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 ;; some macros for working with core async
 
@@ -60,7 +62,8 @@
   to maintain a full stack trace when jumping between multiple contexts."
   [x]
   (if (instance? #?(:clj Throwable :cljs js/Error) x)
-    (throw (ex-info #?(:clj (or (.getMessage x) (str x)) :cljs (str x))
+    (throw (ex-info #?(:clj (or (.getMessage ^Throwable x) (str x))
+                       :cljs (str x))
                     (or (ex-data x) {})
                     x))
     x))
@@ -81,7 +84,7 @@
 
 (defn into?
   "Like async/into, but checks each item for an error response and returns exception
-  onto the response channel insted of results if thee is one."
+  onto the response channel instead of results if there is one."
   [coll chan]
   (async/go
     (try*
@@ -95,5 +98,4 @@
 (defn channel?
   "Returns true if core async channel."
   [x]
-  #?(:clj  (satisfies? clojure.core.async.impl.protocols/Channel x)
-     :cljs (satisfies? cljs.core.async.impl.protocols/Channel x)))
+  (satisfies? async-protocols/Channel x))

@@ -1,4 +1,4 @@
-FROM clojure:tools-deps-1.10.1.763-slim-buster
+FROM clojure:tools-deps-1.10.3.967-slim-bullseye
 
 RUN mkdir -p /usr/src/flureedb
 WORKDIR /usr/src/flureedb

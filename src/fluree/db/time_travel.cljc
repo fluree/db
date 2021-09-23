@@ -9,6 +9,8 @@
                :cljs [cljs.core.async :as async]))
   #?(:clj (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; TODO - add duration support for javascript
 (defn duration-parse
   "Given a duration, returns a ISO-8601 formatted time string of now minus duration"
@@ -46,8 +48,8 @@
                         (throw (ex-info (str "There is no data as of " epoch-as-of)
                                         {:status 400
                                          :error  :db/invalid-block})))
-          t           (apply min-key #(.-s %) ts)]
-      (or (.-s t) t (:t db)))))
+          t           (apply min-key #(.-s ^Flake %) ts)]
+      (or (.-s ^Flake t) t (:t db)))))
 
 (defn- t-to-block
   [db t]
@@ -56,7 +58,7 @@
                         (query-range/index-range :psot >= ["_block/number" t] <= ["_block/number"] {:limit 1})
                         (<?)
                         (first)
-                        (.-o))]
+                        (#(let [^Flake f %] (.-o f))))]
       (if (> block 1)
         block 1))))
 
@@ -67,7 +69,7 @@
                                  (query-range/index-range :opst = [t "_block/transactions"])
                                  (<?)
                                  (first)
-                                 (.-s))
+                                 (#(let [^Flake f %] (.-s f))))
                 block    (<? (t-to-block db border-t))]
             (if (> block 1)
               block 1))))
@@ -109,7 +111,7 @@
                     (query-range/index-range :post = ["_block/number" block])
                     (<?)
                     (first)
-                    (.-t))]
+                    (#(let [^Flake f %] (.-t f))))]
       (when-not block-t
         (throw (ex-info (str "Invalid block key provided: " (pr-str block))
                         {:status 400

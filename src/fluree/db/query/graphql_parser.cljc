@@ -6,6 +6,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             #?(:cljs [cljs.reader :refer [read-string]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (def collection-arguments
   {:limit {:type "Int" :default-value 100}
    :_id   {:type "ID"}
@@ -498,8 +500,8 @@
 
 
 (defn read-and-add-fragments
-  [graphql-str]
   "Takes a GraphQL string, replaces all fragments"
+  [graphql-str]
   (let [vec*             (try*
                            (read-string graphql-str)
                            (catch* ex
@@ -686,10 +688,10 @@
      :history     (read-string subject)}))
 
 (defn clean-where-and-block-query
-  [query]
   "FlureeQL does not allow a query with both where and from clauses. If a where is included at the top-level
   of a GraphQL query, we dissoc :from
   Additionally, query+ only considers :block declared at the top-level."
+  [query]
   (let [from-where-clean (reduce-kv (fn [acc key value]
                                       (let [new-acc   (if (and (contains? value :from)
                                                                (contains? value :where))

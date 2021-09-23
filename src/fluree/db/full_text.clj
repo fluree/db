@@ -3,30 +3,28 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.full-text.block-registry :as block-registry]
-            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.walk :refer [keywordize-keys]]
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
             [clucie.store :as lucene-store])
-  (:import fluree.db.flake.Flake
-           java.io.Closeable
-           java.io.File
-           org.apache.lucene.analysis.Analyzer
-           org.apache.lucene.analysis.en.EnglishAnalyzer
-           org.apache.lucene.analysis.cn.smart.SmartChineseAnalyzer
-           org.apache.lucene.analysis.hi.HindiAnalyzer
-           org.apache.lucene.analysis.es.SpanishAnalyzer
-           org.apache.lucene.analysis.ar.ArabicAnalyzer
-           org.apache.lucene.analysis.id.IndonesianAnalyzer
-           org.apache.lucene.analysis.ru.RussianAnalyzer
-           org.apache.lucene.analysis.bn.BengaliAnalyzer
-           org.apache.lucene.analysis.br.BrazilianAnalyzer
-           org.apache.lucene.analysis.fr.FrenchAnalyzer
-           org.apache.lucene.index.IndexWriter
-           org.apache.lucene.index.IndexReader
-           org.apache.lucene.index.IndexNotFoundException
-           org.apache.lucene.store.Directory))
+  (:import (fluree.db.flake Flake)
+           (java.io Closeable)
+           (org.apache.lucene.analysis Analyzer)
+           (org.apache.lucene.analysis.en EnglishAnalyzer)
+           (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
+           (org.apache.lucene.analysis.hi HindiAnalyzer)
+           (org.apache.lucene.analysis.es SpanishAnalyzer)
+           (org.apache.lucene.analysis.ar ArabicAnalyzer)
+           (org.apache.lucene.analysis.id IndonesianAnalyzer)
+           (org.apache.lucene.analysis.ru RussianAnalyzer)
+           (org.apache.lucene.analysis.bn BengaliAnalyzer)
+           (org.apache.lucene.analysis.br BrazilianAnalyzer)
+           (org.apache.lucene.analysis.fr FrenchAnalyzer)
+           (org.apache.lucene.index IndexWriter)
+           (org.apache.lucene.store Directory)))
+
+(set! *warn-on-reflection* true)
 
 (def search-limit Integer/MAX_VALUE)
 
@@ -74,7 +72,7 @@
         analyzer      (lang->analyzer lang)]
     (->Index subject-store analyzer registry)))
 
-(defn memory-index
+(defn memory-index ^Index
   [lang]
   (let [subject-store (lucene-store/memory-store)
         analyzer      (lang->analyzer lang)
@@ -108,7 +106,7 @@
                  (assoc m k* v)))
              {} pred-map))
 
-(defn writer
+(defn writer ^IndexWriter
   [{:keys [storage analyzer]}]
   (lucene-store/store-writer storage analyzer))
 
@@ -119,13 +117,13 @@
 (defn get-subject
   [{:keys [analyzer] :as idx} subj-id]
   (let [subj-id  (str subj-id)]
-    (with-open [rdr (reader idx)]
+    (with-open [^Closeable rdr (reader idx)]
       (-> rdr
           (lucene/search {:_id subj-id} 1 analyzer 0 1)
           first))))
 
 (defn put-subject
-  [idx ^IndexWriter wrtr subj pred-vals]
+  [idx wrtr subj pred-vals]
   (let [prev-subj (or (get-subject idx subj)
                       {:_id         (str subj)
                        :_collection (-> subj flake/sid->cid str)})

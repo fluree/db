@@ -5,6 +5,8 @@
     #?(:clj  [clojure.core.async :as async]
        :cljs [cljs.core.async :as async])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn- conn-closed?
   "Returns true if connection has been closed."
   [conn]

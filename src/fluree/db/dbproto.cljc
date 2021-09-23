@@ -1,6 +1,8 @@
 (ns fluree.db.dbproto
   (:refer-clojure :exclude [-lookup]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defprotocol IResolve
   "All nodes must implement this protocol. It's includes the minimal functionality
    necessary to avoid resolving nodes unless strictly necessary."

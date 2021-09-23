@@ -24,7 +24,11 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log])
-  (:import java.util.UUID))
+  (:import (java.util UUID)
+           (fluree.db.flake Flake)))
+
+(set! *warn-on-reflection* true)
+
 
 ;; ======================================
 ;;
@@ -273,7 +277,7 @@
               _                    (invalid-ledger-name? network "network")
               [network-alias ledger-alias] (when alias
                                              (graphdb/validate-ledger-ident ledger))
-              _                    (when alias (invalid-ledger-name? ledger-alias))
+              _                    (when alias (invalid-ledger-name? ledger-alias "alias"))
               alias*               (when alias (str network-alias "/" ledger-alias))
               timestamp            (System/currentTimeMillis)
               nonce                (or nonce timestamp)
@@ -323,6 +327,7 @@
          (if (channel? res)
            (deliver p (async/<! res))
            (deliver p res)))) p)))
+
 
 (defn delete-ledger-async
   "Completely deletes a ledger.
@@ -443,34 +448,33 @@
   - timeout     - will respond with an exception if timeout reached before response available."
   ([conn ledger txn] (transact-async conn ledger txn nil))
   ([conn ledger txn opts]
-   (let [{:keys [private-key txid-only timeout auth nonce deps expire]
-          :or   {timeout 60000
-                 nonce   (System/currentTimeMillis)}} opts]
-     (if private-key
-       ;; private key, so generate command locally and submit signed command
-       (let [command      (tx->command ledger txn private-key opts)
-             txid         (:id command)
-             persist-resp (submit-command-async conn command)
-             result       (if txid-only
-                            persist-resp
-                            (monitor-tx-async conn ledger txid timeout))]
-         result)
-       ;; no private key provided, request ledger to sign request
-       (let [tx-map (util/without-nils
-                      {:db     ledger
-                       :tx     txn
-                       :auth   auth
-                       :nonce  nonce
-                       :deps   deps
-                       :expire expire})]
-         (go-try
-           ;; will received txid once transaction is persisted, else an error
-           (let [txid (<? (ops/transact-async conn tx-map))]
-             (if txid-only
-               txid
-               ;; tx is persisted, monitor for txid
-               (let [tx-result (<? (monitor-tx-async conn ledger txid timeout))]
-                 tx-result)))))))))
+   (go-try
+     (let [{:keys [private-key txid-only timeout auth nonce deps expire]
+            :or   {timeout 60000
+                   nonce   (System/currentTimeMillis)}} opts]
+       (if private-key
+         ;; private key, so generate command locally and submit signed command
+         (let [command      (tx->command ledger txn private-key opts)
+               txid         (:id command)
+               persist-resp (<? (submit-command-async conn command))
+               result       (if txid-only
+                              persist-resp
+                              (<? (monitor-tx-async conn ledger txid timeout)))]
+           result)
+         ;; no private key provided, request ledger to sign request
+         (let [tx-map (util/without-nils
+                        {:db     ledger
+                         :tx     txn
+                         :auth   auth
+                         :nonce  nonce
+                         :deps   deps
+                         :expire expire})
+               ;; will received txid once transaction is persisted, else an error
+               txid (<? (ops/transact-async conn tx-map))
+               result (if txid-only
+                        txid
+                        (<? (monitor-tx-async conn ledger txid timeout)))]
+           result))))))
 
 
 (defn transact
@@ -660,7 +664,7 @@
   "INTERNAL USE ONLY"
   [db curr-block cache fuel]
   (go-try (let [[asserted-subjects
-                 retracted-subjects] (loop [[flake & r] (:flakes curr-block)
+                 retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
                                             asserted-subjects  {}
                                             retracted-subjects {}]
                  (if-not flake
@@ -711,7 +715,7 @@
 
 (defn auth-match
   "INTERNAL USE ONLY"
-  [auth-set t-map flake]
+  [auth-set t-map ^Flake flake]
   (let [[auth id] (get-in t-map [(.-t flake) :auth])]
     (or (auth-set auth)
         (auth-set id))))
@@ -719,7 +723,7 @@
 (defn format-history-resp
   "INTERNAL USE ONLY"
   [db resp auth show-auth]
-  (go-try (let [ts    (-> (map #(.-t %) resp) set)
+  (go-try (let [ts    (-> (map #(.-t ^Flake %) resp) set)
                 t-map (<? (async/go-loop [[t & r] ts
                                           acc {}]
                             (if t
@@ -732,7 +736,7 @@
                                                                                        :where     [[t, "_tx/auth", "?auth"],
                                                                                                    ["?auth", "_auth/id", "?id"]]}))))]
                                 (recur r acc*)) acc)))
-                resp  (-> (loop [[flake & r] resp
+                resp  (-> (loop [[^Flake flake & r] resp
                                  acc {}]
                             (cond (and flake auth
                                        (not (auth-match auth t-map flake)))
@@ -1031,9 +1035,9 @@
   (query-range/collection db collection))
 
 
-
-(defn flakes
-  "Returns a lazy sequence of raw flakes from the blockchain history from
+(comment ;; TODO: Write me someday?
+  (defn flakes
+    "Returns a lazy sequence of raw flakes from the blockchain history from
   start block/transaction (inclusive) to end block/transaction (exclusive).
 
   A nil start defaults to the genesis block. A nil end includes the last block of the known database.
@@ -1052,10 +1056,10 @@
   :limit     - Limit results to this quantity of matching flakes
   :offset    - Begin results after this number of matching flakes (for paging - use in conjunction with limit)
   :chunk     - Results are fetched in chunks. Optionally specify the size of a chunk if optimization is needed."
-  ([conn] (flakes conn nil nil {}))
-  ([conn start] (flakes conn start nil {}))
-  ([conn start end] (flakes conn start end {}))
-  ([conn start end {:keys [subject predicate limit offset chunk]}]))
+    ([conn] (flakes conn nil nil {}))
+    ([conn start] (flakes conn start nil {}))
+    ([conn start end] (flakes conn start end {}))
+    ([conn start end {:keys [subject predicate limit offset chunk]}])))
 
 
 

@@ -6,6 +6,8 @@
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 #?(:cljs
    (def inline-grammar
      "SQL grammar in instaparse compatible BNF format loaded at compile time so it's
@@ -175,8 +177,8 @@
 
     (cond->> (or subject
                  {::subj template/collection-var, ::pred pred})
-      coll     (template/fill-in-collection coll)
-      :finally bounce)))
+      coll (template/fill-in-collection coll)
+      true bounce)))
 
 
 (defmethod rule-parser :set-quantifier
@@ -214,7 +216,7 @@
                       (= :selectDistinct))]
     (cond-> {::subj subj, ::pred pred, ::obj val}
       distinct? (update ::obj (partial template/build-fn-call "distinct"))
-      :finally  (-> (update ::obj (partial template/build-fn-call func))
+      true      (-> (update ::obj (partial template/build-fn-call func))
                     bounce))))
 
 
@@ -225,9 +227,9 @@
         pred-var                 (some-> pred template/build-var)
         selected                 (or obj pred-var)
         triple                   [subj pred pred-var]]
-    (cond->  {::select [selected]}
+    (cond-> {::select [selected]}
       (template/predicate? pred) (assoc ::where [triple])
-      :finally                   bounce)))
+      true                       bounce)))
 
 
 (defmethod rule-parser :select-list
@@ -393,7 +395,7 @@
              :where     (template/fill-in-collection from where)
              ::coll     coll}
       (seq group) (assoc :opts {:groupBy group})
-      :finally    bounce)))
+      true        bounce)))
 
 
 (defmethod rule-parser :join-condition
@@ -467,8 +469,8 @@
                                            first
                                            (template/fill-in-collection (first coll)))]
     (cond-> query
-      ordering  (update :opts assoc :orderBy ordering)
-      :finally  bounce)))
+      ordering (update :opts assoc :orderBy ordering)
+      true     bounce)))
 
 
 (defn parse

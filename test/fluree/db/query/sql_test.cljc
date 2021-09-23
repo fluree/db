@@ -60,10 +60,7 @@
 
             (is (= [["?person" "person/age" 18]
                     ["?person" "person/name" "?personName"]]
-                   (:where subject)))))
-
-        (testing "in the where clause"
-          (let [query   "SELECT name, age FROM person"])))
+                   (:where subject))))))
 
       (testing "with qualified fields"
         (let [query   "SELECT person.name FROM person WHERE person.age = 18"

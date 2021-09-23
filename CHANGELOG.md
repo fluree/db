@@ -2,6 +2,9 @@
 # Changelog
 All notable changes to FlureeDB will be documented in this file.
 
+## 1.0.0-rc29
+- Fixed issue with BigDecimal & BigInteger AVRO serialization introduced in 1.0.0-rc27
+
 ## 1.0.0-rc15
 - Fix issue where selectDistinct executed twice for analytical queries (FC-1076)
 
