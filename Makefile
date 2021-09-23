@@ -1,4 +1,4 @@
-.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljstest test eastwood ci clean
+.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -55,8 +55,15 @@ docs/%.html: docs/%.md
 
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
-cljstest: node_modules package-lock.json
-	clojure -M:cljstest
+cljs-browser-test: node_modules package-lock.json
+	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
+	clojure -M:cljs-browser-test
+
+cljs-node-test: node_modules package-lock.json
+	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
+	clojure -M:cljs-node-test
+
+cljstest: cljs-browser-test cljs-node-test
 
 cljtest:
 	clojure -M:cljtest
