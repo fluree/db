@@ -47,13 +47,19 @@
    :extra-deps {org.clojure/tools.namespace {:mvn/version "1.1.0"}
                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}}
 
-  :cljstest
-  {:extra-paths ["test"]
+  :cljs-browser-test
+  {:extra-paths ["src-cljs" "test"]
    :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
    :main-opts   ["-m" "cljs-test-runner.main"
                  "-D" "doo.edn"
-                 "-c" "build-test.edn"
+                 "-c" "build-browser-test.edn"
                  "-x" "chrome-headless"]}
+
+  :cljs-node-test
+  {:extra-paths ["src-nodejs" "test"]
+   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
+   :main-opts   ["-m" "cljs-test-runner.main"
+                 "-c" "build-nodejs-test.edn"]}
 
   :cljtest
   {:extra-paths ["test"]
