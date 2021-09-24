@@ -2,7 +2,7 @@
 
 version=$(clojure -M:meta version)
 
-if [[ $version =~ -rc\d+$ || $version =~ -beta\d+$ ]]; then
+if [[ $version =~ -rc[0-9]+$ || $version =~ -beta[0-9]+$ ]]; then
   npm publish --tag=beta
 else
   npm publish
