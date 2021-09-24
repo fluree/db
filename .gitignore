@@ -28,3 +28,7 @@ package-lock.json
 /scanning_results
 .dir-locals.el
 .cljs_node_repl
+/packages/flureedb/flureedb.js
+/packages/flureenjs/flureenjs.js
+/packages/flureeworker/flureeworker.js
+/packages/*/LICENSE

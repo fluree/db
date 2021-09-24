@@ -1,0 +1,30 @@
+{
+  "name": "@fluree/flureenjs",
+  "preferGlobal": false,
+  "requires": true,
+  "version": "1.0.0-rc30",
+  "description": "Node.js Library facilitating access to a Fluree instance",
+  "main": "flureenjs.js",
+  "homepage": "https://docs.flur.ee/tools/1.0.0/nodejs/overview",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fluree/db.git"
+  },
+  "author": "Fluree PBC (https://flur.ee)",
+  "license": "SEE LICENSE IN LICENSE",
+  "dependencies": {
+    "@cljs-oss/module-deps": "^1.1.1",
+    "@fluree/sjcl": "^1.0.8-3",
+    "js-sha3": "^0.8.0",
+    "npm": ">= 7.5.4",
+    "scrypt-js": "^3.0.1",
+    "source-map-support": "^0.5.19"
+  },
+  "scripts": {},
+  "keywords": [
+    "fluree",
+    "nodejs",
+    "database",
+    "ledger"
+  ]
+}

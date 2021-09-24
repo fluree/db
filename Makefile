@@ -1,4 +1,4 @@
-.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
+.PHONY: all deps jar install deploy deploy-browser deploy-jar sync-versions nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -9,6 +9,8 @@ BROWSER_SOURCES := src-cljs/flureedb.cljs
 WEBWORKER_SOURCES := src-cljs/flureeworker.cljs
 NODEJS_SOURCES := $(shell find src-nodejs)
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
+
+VERSION := $(shell clojure -M:meta version)
 
 all: jar browser nodejs webworker docs
 
@@ -44,8 +46,30 @@ src/deps.cljs: package.json
 install: target/fluree-db.jar
 	clojure -M:install
 
-deploy: target/fluree-db.jar
+sync-versions:
+	cd packages/flureedb && npm version $(VERSION) --allow-same-version
+	cd packages/flureenjs && npm version $(VERSION) --allow-same-version
+	cd packages/flureeworker && npm version $(VERSION) --allow-same-version
+
+deploy-jar: target/fluree-db.jar
 	clojure -M:deploy
+
+packages/%/LICENSE: LICENSE
+	cp $< $@
+
+deploy-browser: out/flureedb.js sync-versions packages/flureedb/LICENSE
+	cp out/flureedb.js packages/flureedb/
+	cd packages/flureedb && npm publish
+
+deploy-nodejs: out/flureenjs.js sync-versions packages/flureenjs/LICENSE
+	cp out/flureenjs.js packages/flureenjs/
+	cd packages/flureenjs && npm publish
+
+deploy-worker: out/flureeworker.js sync-versions packages/flureeworker/LICENSE
+	cp out/flureeworker.js packages/flureeworker/
+	cd packages/flureeworker && npm publish
+
+deploy: deploy-jar deploy-browser deploy-nodejs deploy-worker
 
 docs/fluree.db.api.html docs/index.html: src/fluree/db/api.clj
 	clojure -X:docs :output-path "\"$(@D)\""

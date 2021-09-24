@@ -1,0 +1,19 @@
+{
+  "name": "@fluree/flureedb",
+  "version": "1.0.0-rc30",
+  "description": "JavaScript library facilitating access to a Fluree instance",
+  "main": "flureedb.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fluree/db.git"
+  },
+  "author": "Fluree PBC (https://flur.ee)",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {},
+  "keywords": [
+    "fluree",
+    "javascript",
+    "database",
+    "ledger"
+  ]
+}
