@@ -20,7 +20,12 @@
     "scrypt-js": "^3.0.1",
     "source-map-support": "^0.5.19"
   },
-  "scripts": {},
+  "devDependencies": {
+    "jest": "27.2.1"
+  },
+  "scripts": {
+    "test": "jest"
+  },
   "keywords": [
     "fluree",
     "nodejs",

@@ -30,5 +30,6 @@ package-lock.json
 .cljs_node_repl
 /packages/flureedb/flureedb.js
 /packages/flureenjs/flureenjs.js
+/packages/flureenjs/flureenjs.bare.js
 /packages/flureeworker/flureeworker.js
 /packages/*/LICENSE

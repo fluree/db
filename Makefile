@@ -62,8 +62,8 @@ deploy-browser: out/flureedb.js sync-versions packages/flureedb/LICENSE
 	cd packages/flureedb && npm publish
 
 deploy-nodejs: out/flureenjs.js sync-versions packages/flureenjs/LICENSE
-	cp out/flureenjs.js packages/flureenjs/
-	cd packages/flureenjs && npm publish
+	tail -n +2 out/flureenjs.js > packages/flureenjs/flureenjs.bare.js # remove shebang from compiler output
+	cd packages/flureenjs && sh wrap-umd.sh && npm run test && npm publish
 
 deploy-worker: out/flureeworker.js sync-versions packages/flureeworker/LICENSE
 	cp out/flureeworker.js packages/flureeworker/
