@@ -72,7 +72,7 @@ deploy-nodejs-old: out/flureenjs.js sync-version packages/flureenjs/LICENSE
 deploy-worker: out/flureeworker.js sync-version packages/flureeworker/LICENSE
 	cp out/flureeworker.js packages/flureeworker/
 	cp package.json packages/flureeworker/
-	cd packages/flureeworker && npx change-package-name @fluree/flureeworker && ../../script/npm-publish.sh
+	cd packages/flureeworker && npx change-package-name @fluree/flureeworker && ../../script/npm-publish.sh $(VERSION)
 
 deploy: deploy-jar deploy-browser deploy-nodejs deploy-worker
 
