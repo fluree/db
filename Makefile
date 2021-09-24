@@ -55,13 +55,12 @@ deploy-jar: target/fluree-db.jar
 packages/%/LICENSE: LICENSE
 	cp $< $@
 
-packages/%/package.json: | package.json
-	cp $| $@
-	cd $(@D) && npx change-package-name @fluree/$(@D)
+packages/%/package.json: package.json
+	cp $< $@
 
 deploy-browser: out/flureedb.js sync-version packages/flureedb/package.json packages/flureedb/LICENSE
 	cp out/flureedb.js packages/flureedb/
-	cd packages/flureedb && npm publish
+	cd packages/flureedb && npx change-package-name @fluree/flureedb && npm publish
 
 deploy-nodejs: out/flureenjs.js sync-versions packages/flureenjs/LICENSE
 	tail -n +2 out/flureenjs.js > packages/flureenjs/flureenjs.bare.js # remove shebang from compiler output
@@ -69,11 +68,11 @@ deploy-nodejs: out/flureenjs.js sync-versions packages/flureenjs/LICENSE
 
 deploy-nodejs-old: out/flureenjs.js sync-version packages/flureenjs/package.json packages/flureenjs/LICENSE
 	cp out/flureenjs.js packages/flureenjs/
-	cd packages/flureenjs && npm publish
+	cd packages/flureenjs && npx change-package-name @fluree/flureenjs && npm publish
 
 deploy-worker: out/flureeworker.js sync-version packages/flureeworker/package.json packages/flureeworker/LICENSE
 	cp out/flureeworker.js packages/flureeworker/
-	cd packages/flureeworker && npm publish
+	cd packages/flureeworker && npx change-package-name @fluree/flureeworker && npm publish
 
 deploy: deploy-jar deploy-browser deploy-nodejs deploy-worker
 
