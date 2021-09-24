@@ -47,7 +47,7 @@ install: target/fluree-db.jar
 	clojure -M:install
 
 sync-version:
-	npm version $(VERSION) --allow-same-version
+	npm version $(VERSION) --allow-same-version --no-git-tag-version --force
 
 deploy-jar: target/fluree-db.jar
 	clojure -M:deploy
@@ -56,7 +56,7 @@ packages/%/LICENSE: LICENSE
 	cp $< $@
 
 deploy-browser: out/flureedb.js sync-version packages/flureedb/LICENSE
-	cp out/flureedb.js packages/flureedb/
+	cp out/flureedb.js packages/flureedb/index.js
 	cp package.json packages/flureedb/
 	cd packages/flureedb && npx change-package-name @fluree/flureedb && ../../script/npm-publish.sh $(VERSION)
 
@@ -70,7 +70,7 @@ deploy-nodejs-old: out/flureenjs.js sync-version packages/flureenjs/LICENSE
 	cd packages/flureenjs && npx change-package-name @fluree/flureenjs && ../../script/npm-publish.sh $(VERSION)
 
 deploy-worker: out/flureeworker.js sync-version packages/flureeworker/LICENSE
-	cp out/flureeworker.js packages/flureeworker/
+	cp out/flureeworker.js packages/flureeworker/index.js
 	cp package.json packages/flureeworker/
 	cd packages/flureeworker && npx change-package-name @fluree/flureeworker && ../../script/npm-publish.sh $(VERSION)
 
