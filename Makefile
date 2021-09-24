@@ -55,8 +55,8 @@ deploy-jar: target/fluree-db.jar
 packages/%/LICENSE: LICENSE
 	cp $< $@
 
-packages/%/package.json:
-	cp $< $@
+packages/%/package.json: | package.json
+	cp $| $@
 	cd $(@D) && npx change-package-name @fluree/$(@D)
 
 deploy-browser: out/flureedb.js sync-version packages/flureedb/package.json packages/flureedb/LICENSE
