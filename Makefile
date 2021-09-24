@@ -58,16 +58,16 @@ packages/%/LICENSE: LICENSE
 deploy-browser: out/flureedb.js sync-version packages/flureedb/LICENSE
 	cp out/flureedb.js packages/flureedb/
 	cp package.json packages/flureedb/
-	cd packages/flureedb && npx change-package-name @fluree/flureedb && ../../script/npm-publish.sh
+	cd packages/flureedb && npx change-package-name @fluree/flureedb && ../../script/npm-publish.sh $(VERSION)
 
 deploy-nodejs: out/flureenjs.js sync-versions packages/flureenjs/LICENSE
 	tail -n +2 out/flureenjs.js > packages/flureenjs/flureenjs.bare.js # remove shebang from compiler output
-	cd packages/flureenjs && bb syn_npm_deps.clj && sh wrap-umd.sh && npm run test && npm publish
+	cd packages/flureenjs && bb syn_npm_deps.clj && sh wrap-umd.sh && npm run test &&  ../../script/npm-publish.sh $(VERSION)
 
 deploy-nodejs-old: out/flureenjs.js sync-version packages/flureenjs/LICENSE
 	cp out/flureenjs.js packages/flureenjs/
-	cp package.json packages/flureeworker/
-	cd packages/flureenjs && npx change-package-name @fluree/flureenjs && ../../script/npm-publish.sh
+	cp package.json packages/flureenjs/
+	cd packages/flureenjs && npx change-package-name @fluree/flureenjs && ../../script/npm-publish.sh $(VERSION)
 
 deploy-worker: out/flureeworker.js sync-version packages/flureeworker/LICENSE
 	cp out/flureeworker.js packages/flureeworker/
