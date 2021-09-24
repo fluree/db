@@ -107,5 +107,7 @@ ci: test eastwood
 clean:
 	rm -rf target
 	rm -rf out/*
+	rm -rf packages/*/*.js
+	rm -rf packages/*/*.json
 	rm -rf docs/*.html
 	rm -rf node_modules
