@@ -1,4 +1,4 @@
-.PHONY: all deps jar install deploy deploy-browser deploy-jar sync-versions nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
+.PHONY: all deps jar install deploy deploy-browser deploy-jar sync-version nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -46,10 +46,8 @@ src/deps.cljs: package.json
 install: target/fluree-db.jar
 	clojure -M:install
 
-sync-versions:
-	cd packages/flureedb && npm version $(VERSION) --allow-same-version
-	cd packages/flureenjs && npm version $(VERSION) --allow-same-version
-	cd packages/flureeworker && npm version $(VERSION) --allow-same-version
+sync-version:
+	npm version $(VERSION) --allow-same-version
 
 deploy-jar: target/fluree-db.jar
 	clojure -M:deploy
@@ -57,7 +55,10 @@ deploy-jar: target/fluree-db.jar
 packages/%/LICENSE: LICENSE
 	cp $< $@
 
-deploy-browser: out/flureedb.js sync-versions packages/flureedb/LICENSE
+packages/%/package.json: package.json
+	cp $< $@
+
+deploy-browser: out/flureedb.js sync-version packages/flureedb/package.json packages/flureedb/LICENSE
 	cp out/flureedb.js packages/flureedb/
 	cd packages/flureedb && npm publish
 
@@ -65,7 +66,11 @@ deploy-nodejs: out/flureenjs.js sync-versions packages/flureenjs/LICENSE
 	tail -n +2 out/flureenjs.js > packages/flureenjs/flureenjs.bare.js # remove shebang from compiler output
 	cd packages/flureenjs && bb syn_npm_deps.clj && sh wrap-umd.sh && npm run test && npm publish
 
-deploy-worker: out/flureeworker.js sync-versions packages/flureeworker/LICENSE
+deploy-nodejs-old: out/flureenjs.js sync-version packages/flureenjs/package.json packages/flureenjs/LICENSE
+	cp out/flureenjs.js packages/flureenjs/
+	cd packages/flureenjs && npm publish
+
+deploy-worker: out/flureeworker.js sync-version packages/flureeworker/package.json packages/flureeworker/LICENSE
 	cp out/flureeworker.js packages/flureeworker/
 	cd packages/flureeworker && npm publish
 

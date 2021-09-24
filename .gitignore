@@ -34,3 +34,5 @@ package-lock.json
 /packages/flureenjs/package.json
 /packages/flureeworker/flureeworker.js
 /packages/*/LICENSE
+/packages/*/package.json
+
