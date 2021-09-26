@@ -328,7 +328,14 @@
               subject (parse query)]
           (is (= 10
                  (-> subject :opts :limit))
-              "correctly constructs the groupBy clause"))))
+              "correctly constructs the limit clause")))
+
+      (testing "offsetting"
+        (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 LIMIT 10 OFFSET 5"
+              subject (parse query)]
+          (is (= 5
+                 (-> subject :opts :offset))
+              "correctly constructs the offset clause"))))
 
     (testing "with multiple collections"
       (let [query   "SELECT person.name, job.title FROM person JOIN job ON person.job = job.$ WHERE person.age = 18"
