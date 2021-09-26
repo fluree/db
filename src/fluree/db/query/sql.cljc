@@ -37,7 +37,7 @@
   #{:all :and :as :asc :at :between :case :coalesce :collate :corresponding
     :cross :current-date :current-time :current-timestamp :desc :distinct :else
     :end :except :exists :false :from :full :group-by :having :in :inner
-    :intersect :is :join :left :local :natural :not :null :nullif :on :or
+    :intersect :is :join :left :limit :local :natural :not :null :nullif :on :or
     :order-by :right :select :some :table :then :trim :true :unique :unknown
     :using :values :when :where})
 
@@ -459,6 +459,9 @@
   [[_ _ & rst]]
   (->> rst parse-all bounce))
 
+(defmethod rule-parser :limit-clause
+  [[_ _ lim]]
+  (-> lim parse-rule bounce))
 
 (defmethod rule-parser :direct-select-statement
   [[_ & rst]]
@@ -467,9 +470,11 @@
         ordering                  (some->> parse-map
                                            :order-by-clause
                                            first
-                                           (template/fill-in-collection (first coll)))]
+                                           (template/fill-in-collection (first coll)))
+        limit                     (some->> parse-map :limit-clause first)]
     (cond-> query
-      ordering (update :opts assoc :orderBy ordering)
+      ordering (assoc-in [:opts :orderBy] ordering)
+      limit    (assoc-in [:opts :limit] limit)
       true     bounce)))
 
 
