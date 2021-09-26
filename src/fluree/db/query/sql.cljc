@@ -12,11 +12,11 @@
    (def inline-grammar
      "SQL grammar in instaparse compatible BNF format loaded at compile time so it's
      available to cljs and js artifacts."
-     (inline-resource "sql-92.bnf")))
+     (inline-resource "fluree-sql.bnf")))
 
 #?(:clj
    (def sql
-     (-> "sql-92.bnf"
+     (-> "fluree-sql.bnf"
          io/resource
          (insta/parser :input-format :ebnf)))
 
