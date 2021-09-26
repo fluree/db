@@ -321,7 +321,14 @@
                 subject (parse query)]
             (is (= ["?personAge" "?personEmail"]
                    (-> subject :opts :groupBy))
-                "correctly constructs the groupBy clause")))))
+                "correctly constructs the groupBy clause"))))
+
+      (testing "limiting"
+        (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 LIMIT 10"
+              subject (parse query)]
+          (is (= 10
+                 (-> subject :opts :limit))
+              "correctly constructs the groupBy clause"))))
 
     (testing "with multiple collections"
       (let [query   "SELECT person.name, job.title FROM person JOIN job ON person.job = job.$ WHERE person.age = 18"
