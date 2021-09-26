@@ -39,7 +39,7 @@ grouping-column-reference ::= column-reference [ <space> collate-clause ]
 having ::= 'having' | 'HAVING'
 having-clause ::= having <space> search-condition
 
-select-list ::= asterisk | select-list-element [ { comma <space> select-list-element } ]
+select-list ::= asterisk | select-list-element [ { comma [ <space> ] select-list-element } ]
 
 select-list-element ::= derived-column | (qualifier <period> asterisk)
 

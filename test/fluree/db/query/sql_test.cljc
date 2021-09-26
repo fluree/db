@@ -49,6 +49,21 @@
                    (:where subject))
                 "correctly constructs the where clause"))))
 
+      (testing "with a comma-separated select list"
+        (testing "with spaces"
+          (let [query   "SELECT name, email FROM person"
+                subject (parse query)]
+            (is (= ["?personName" "?personEmail"]
+                   (:select subject))
+                "correctly constructs the select clause")))
+
+        (testing "without spaces"
+          (let [query   "SELECT name,email FROM person"
+                subject (parse query)]
+            (is (= ["?personName" "?personEmail"]
+                   (:select subject))
+                "correctly constructs the select clause"))))
+
       (testing "with subject _id placeholder"
         (testing "in the select list"
           (let [query   "SELECT $, name FROM person WHERE age = 18"
