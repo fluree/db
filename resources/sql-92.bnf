@@ -1,4 +1,4 @@
-direct-select-statement ::= query-expression [ <space> order-by-clause ]
+direct-select-statement ::= query-expression [ <space> order-by-clause ] [ <space> limit-clause ]
 
 query-expression   ::=  non-join-query-expression | joined-table
 
@@ -18,6 +18,9 @@ from-clause ::= from <space> table-reference [ { comma <space> table-reference }
 
 order-by ::= 'order by' | 'ORDER BY'
 order-by-clause ::= order-by <space> sort-specification-list
+
+limit ::= 'limit' | 'LIMIT'
+limit-clause ::= limit <space> unsigned-integer
 
 where ::= 'where' | 'WHERE'
 where-clause ::=  where <space> search-condition
