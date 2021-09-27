@@ -49,6 +49,21 @@
                    (:where subject))
                 "correctly constructs the where clause"))))
 
+      (testing "with a comma-separated select list"
+        (testing "with spaces"
+          (let [query   "SELECT name, email FROM person"
+                subject (parse query)]
+            (is (= ["?personName" "?personEmail"]
+                   (:select subject))
+                "correctly constructs the select clause")))
+
+        (testing "without spaces"
+          (let [query   "SELECT name,email FROM person"
+                subject (parse query)]
+            (is (= ["?personName" "?personEmail"]
+                   (:select subject))
+                "correctly constructs the select clause"))))
+
       (testing "with subject _id placeholder"
         (testing "in the select list"
           (let [query   "SELECT $, name FROM person WHERE age = 18"
@@ -321,7 +336,21 @@
                 subject (parse query)]
             (is (= ["?personAge" "?personEmail"]
                    (-> subject :opts :groupBy))
-                "correctly constructs the groupBy clause")))))
+                "correctly constructs the groupBy clause"))))
+
+      (testing "limiting"
+        (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 LIMIT 10"
+              subject (parse query)]
+          (is (= 10
+                 (-> subject :opts :limit))
+              "correctly constructs the limit clause")))
+
+      (testing "offsetting"
+        (let [query   "SELECT email FROM person WHERE age BETWEEN 18 AND 35 LIMIT 10 OFFSET 5"
+              subject (parse query)]
+          (is (= 5
+                 (-> subject :opts :offset))
+              "correctly constructs the offset clause"))))
 
     (testing "with multiple collections"
       (let [query   "SELECT person.name, job.title FROM person JOIN job ON person.job = job.$ WHERE person.age = 18"
