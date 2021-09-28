@@ -15,7 +15,7 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.log :as log]
             [clojure.string :as str]
-            [fluree.db.util.iri :as iri-util])
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -287,7 +287,7 @@
 
                         ;; assume iri
                         (string? ident)
-                        (let [iri (iri-util/expand-db ident db)]
+                        (let [iri (json-ld/expand ident (get-in db [:schema :prefix]))]
                           (some-> (<? (query-range/index-range db :post = [const/$iri iri]))
                                   ^Flake (first)
                                   (.-s)))

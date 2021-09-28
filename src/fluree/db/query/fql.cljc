@@ -12,7 +12,7 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try into? merge-into?]]
             [fluree.db.constants :as const]
-            [fluree.db.util.iri :as iri-util])
+            [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [vswap!])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [clojure.core])))
@@ -124,7 +124,7 @@
   [db cache context ^Flake flake]
   (let [type-sid (.-o flake)]
     (if-let [iri (get-in db [:schema :pred type-sid :iri])]
-      (let [compacted (iri-util/compact iri context)]
+      (let [compacted (json-ld/compact iri context)]
         (vswap! cache assoc type-sid compacted)
         compacted)
       {:_id type-sid})))
@@ -211,7 +211,7 @@
 
                                 ;; @id value, so might need to shorten based on context
                                 (= const/$iri p)
-                                [(mapv #(iri-util/compact (.-o ^Flake %) context) flakes) offset-map]
+                                [(mapv #(json-ld/compact (.-o ^Flake %) context) flakes) offset-map]
 
 
                                 ;; else just output value
@@ -1103,7 +1103,7 @@
             fuel       (or (:fuel opts)                     ;; :fuel volatile! can be provided upstream
                            (when (or max-fuel (:meta opts))
                              (volatile! 0)))
-            query-map* (assoc query-map :context (iri-util/query-context context db))]
+            query-map* (assoc query-map :context (json-ld/parse-context (get-in db [:schema :prefix]) context))]
         (if (sequential? where)
           ;; ad-hoc query
           (ad-hoc-query db fuel max-fuel query-map* opts')

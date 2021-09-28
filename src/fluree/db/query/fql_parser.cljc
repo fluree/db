@@ -4,10 +4,9 @@
             [clojure.string :as str]
             [fluree.db.spec :as spec]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
-            [fluree.db.util.iri :as iri-util]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -267,18 +266,18 @@
                    (second (re-find #"/(.+)" name))
 
                    (= const/$iri p)
-                   (or (some #(when (= "@id" (:iri (val %)))
+                   (or (some #(when (= "@id" (:id (val %)))
                                 (key %)) context)
                        "@id")
 
                    (= const/$rdf:type p)
-                   (or (some #(when (= "@type" (:iri (val %)))
+                   (or (some #(when (= "@type" (:id (val %)))
                                 (key %)) context)
                        "@type")
 
                    iri
                    (if context
-                     (iri-util/compact iri context)
+                     (json-ld/compact iri context)
                      iri)
 
                    :else

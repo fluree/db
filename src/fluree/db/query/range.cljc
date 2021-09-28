@@ -8,7 +8,8 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.iri :as iri-util])
+            [fluree.db.util.iri :as iri-util]
+            [fluree.json-ld :as json-ld])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
@@ -471,7 +472,7 @@
                (<? (coerce-tag-flakes db res))
 
                (= "@id" p)
-               (map #(assoc % :o (iri-util/compact (:o %) context)) res)
+               (map #(assoc % :o (json-ld/compact (:o %) context)) res)
 
                :else res)))))
 
