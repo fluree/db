@@ -143,7 +143,7 @@
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-transaction})))
    (let [db-name     (if (sequential? ledger)
-                       (str (first ledger) "/$" (second ledger))
+                       (str (first ledger) "/" (second ledger))
                        ledger)
          {:keys [auth expire nonce deps]} opts
          _           (when deps (assert (sequential? deps) "Command/transaction 'deps', when provided, must be a sequential list/array."))

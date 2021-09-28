@@ -213,7 +213,9 @@
                                      (parse context opts))
                   namespace? (str/includes? pred "/")
                   reverse?   (str/includes? pred "/_")
-                  pred'      (if reverse? (str/replace pred "/_" "/") pred)
+                  pred'      (if reverse?
+                               (str/replace pred "/_" "/")
+                               (json-ld/expand pred context))
                   as         (cond
                                (contains? v' "_as")
                                (get v' "_as")
