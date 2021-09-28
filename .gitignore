@@ -31,5 +31,6 @@ package-lock.json
 /packages/flureedb/flureedb.js
 /packages/flureenjs/flureenjs.js
 /packages/flureenjs/flureenjs.bare.js
+/packages/flureenjs/package.json
 /packages/flureeworker/flureeworker.js
 /packages/*/LICENSE
