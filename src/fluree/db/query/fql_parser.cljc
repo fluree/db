@@ -212,15 +212,16 @@
                                      (not-empty)
                                      (parse context opts))
                   namespace? (str/includes? pred "/")
-                  reverse?   (str/includes? pred "/_")
-                  pred'      (if reverse?
-                               (str/replace pred "/_" "/")
-                               (json-ld/expand pred context))
+                  reversed   (or (get-in context [pred :reverse])
+                                 (when (str/includes? pred "/_")
+                                   (str/replace pred "/_" "/")))
+                  pred'      (or reversed
+                                 (json-ld/expand pred context))
                   as         (cond
                                (contains? v' "_as")
                                (get v' "_as")
 
-                               (and default-compact? reverse?)
+                               (and default-compact? reversed)
                                (re-find #"^[^/]+" pred)
 
                                (and default-compact? namespace?)
@@ -232,7 +233,7 @@
                               :wildcard?        (:wildcard? sub-select)
                               :id?              (:id? sub-select)
                               :namespace?       namespace?
-                              :reverse?         reverse?
+                              :reverse?         (some? reversed)
                               :componentFollow? (get v' "_component")
                               :compact?         compact?    ;; remove namespace from result if same as _collection
                               :limit            (get v' "_limit" 100)
@@ -245,7 +246,7 @@
                               :select           (:select sub-select)
                               :context          context}]
               (cond
-                reverse?
+                reversed
                 (assoc-in acc [:select :reverse pred'] spec)
 
                 namespace?
