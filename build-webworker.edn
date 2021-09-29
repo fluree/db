@@ -1,5 +1,5 @@
-{:output-to          "out/webworker/index.js"
- :output-dir         "out/webworker"
+{:output-to          "js/webworker/webpack.js"
+ :output-dir         "js/webworker/build"
  :target             :bundle
  :main               flureeworker
  :optimizations      :advanced

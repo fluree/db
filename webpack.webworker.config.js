@@ -2,10 +2,10 @@ const path = require('path');
 
 module.exports = {
   target: "webworker",
-  entry: "./out/webworker/index.js",
+  entry: "./js/webworker/webpack.js",
   output: {
-    filename: "main.js",
-    path: path.resolve(__dirname, "./out/webworker/"),
+    filename: "index.js",
+    path: path.resolve(__dirname, "./js/webworker/"),
   },
   resolve: {
     fallback: {

@@ -1,5 +1,5 @@
-{:output-to          "out/test/index.js"
- :output-dir         "out/test"
+{:output-to          "js/test/webpack.js"
+ :output-dir         "js/test/build"
  :target             :bundle
  :bundle-cmd         {:none    ["npx" "webpack" "--config" "./webpack.test.config.js" "--mode=development"]
                       :default ["npx" "webpack" "--config" "./webpack.test.config.js"]}

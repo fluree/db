@@ -1,25 +1,40 @@
 {
-  "version": "1.0.0-rc32",
+  "name": "@fluree/flureedb",
+  "version": "1.0.0-rc30",
+  "homepage": "https://github.com/fluree/db",
+  "description": "Fluree client library for browser, webworker, and node",
+  "author": "Fluree PBC (https://flur.ee/)",
+  "repository": "github:fluree/db",
+  "license": "See license in LICENSE file",
   "dependencies": {
     "@cljs-oss/module-deps": "^1.1.1",
     "@fluree/sjcl": "^1.0.8-3",
     "axios": "^0.21.4",
-    "bufferutil": "^4.0.3",
+    "bufferutil": "^4.0.4",
     "js-sha3": "^0.8.0",
     "scrypt-js": "^3.0.1",
     "source-map-support": "^0.5.20",
-    "utf-8-validate": "^5.0.5",
+    "utf-8-validate": "^5.0.6",
     "ws": "^8.2.2"
   },
+  "files": [
+    "js/*/index.js"
+  ],
   "browser": {
-    "ws": false
+    "ws": false,
+    "main": "js/browser/index.js"
+  },
+  "main": "js/nodejs/index.js",
+  "scripts": {
+    "test": "jest js/nodejs/index.test.js"
   },
   "devDependencies": {
-    "karma": "6.3.4",
-    "karma-chrome-launcher": "3.1.0",
-    "karma-cljs-test": "0.1.0",
-    "webpack": "5.51.1",
-    "webpack-cli": "4.8.0"
+    "karma": "^6.3.4",
+    "karma-chrome-launcher": "^3.1.0",
+    "karma-cljs-test": "^0.1.0",
+    "webpack": "^5.51.1",
+    "webpack-cli": "^4.8.0",
+    "jest": "^27.2.1"
   },
   "browserslist": {
     "production": [

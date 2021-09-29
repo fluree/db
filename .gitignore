@@ -18,8 +18,6 @@ figwheel_server.log
 .cpcache
 /node_modules
 package-lock.json
-/out/*
-!/out/.gitkeep
 /resources/public/js/compiled
 /cljs-test-runner-out/*
 /pom.xml
@@ -28,11 +26,7 @@ package-lock.json
 /scanning_results
 .dir-locals.el
 .cljs_node_repl
-/packages/flureedb/flureedb.js
-/packages/flureenjs/flureenjs.js
-/packages/flureenjs/flureenjs.bare.js
-/packages/flureenjs/package.json
-/packages/flureeworker/flureeworker.js
-/packages/*/LICENSE
-/packages/*/package.json
-
+/js/*/index.js.LICENSE.txt
+/js/*/build
+/js/*/webpack.js
+/js/test

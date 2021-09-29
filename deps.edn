@@ -40,7 +40,7 @@
  :aliases
  {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version     "1.0.0-rc33" ; Change this down in the docs alias too!
+  :mvn/version     "1.0.0-rc30" ; Change this down in the docs alias too!
 
   :dev
   {:extra-paths ["dev" "src-cljs" "src-nodejs" "src-docs"]

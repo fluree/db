@@ -1,5 +1,5 @@
-{:output-to          "out/browser/index.js"
- :output-dir         "out/browser"
+{:output-to          "js/browser/webpack.js"
+ :output-dir         "js/browser/build"
  :target             :bundle
  :main               flureedb
  :optimizations      :advanced

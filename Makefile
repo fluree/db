@@ -1,4 +1,6 @@
-.PHONY: all deps jar install deploy deploy-browser deploy-jar sync-version nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
+.PHONY: all deps jar install deploy deploy-browser deploy-jar sync-version nodejs \
+        browser webworker cljtest cljs-browser-test cljs-node-test cljstest test \
+        eastwood ci clean-browser clean-node clean-webworker clean
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -14,7 +16,7 @@ VERSION := $(shell clojure -M:meta version)
 
 all: jar browser nodejs webworker docs
 
-target/fluree-db.jar: out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
+target/fluree-db.jar: js node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
 	clojure -X:jar
 
 jar: target/fluree-db.jar
@@ -22,20 +24,21 @@ jar: target/fluree-db.jar
 package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
-out/flureenjs.js: package.json package-lock.json node_modules build-nodejs.edn deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
-	clojure -M:nodejs && cp out/nodejs/flureenjs.js out/flureenjs.js
+js/nodejs/index.js: package.json package-lock.json node_modules build-nodejs.edn deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
+	clojure -M:nodejs && cd $(@D) && ./wrap-umd.sh
+	npm run test
 
-nodejs: out/flureenjs.js
+nodejs: js/nodejs/index.js
 
-out/flureedb.js: package.json package-lock.json node_modules build-browser.edn deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
-	clojure -M:browser && cp out/browser/main.js out/flureedb.js
+js/browser/index.js: package.json package-lock.json node_modules build-browser.edn deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
+	clojure -M:browser
 
-browser: out/flureedb.js
+browser: js/browser/index.js
 
-out/flureeworker.js: package.json package-lock.json node_modules build-webworker.edn deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
-	clojure -M:webworker && cp out/webworker/main.js out/flureeworker.js
+js/webworker/index.js: package.json package-lock.json node_modules build-webworker.edn deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
+	clojure -M:webworker
 
-webworker: out/flureeworker.js
+webworker: js/webworker/index.js
 
 deps:
 	clojure -A:cljtest:cljstest:eastwood:docs -P
@@ -49,32 +52,8 @@ install: target/fluree-db.jar
 sync-version:
 	npm version $(VERSION) --allow-same-version --no-git-tag-version --force
 
-deploy-jar: target/fluree-db.jar
+deploy: target/fluree-db.jar
 	clojure -M:deploy
-
-packages/%/LICENSE: LICENSE
-	cp $< $@
-
-deploy-browser: out/flureedb.js sync-version packages/flureedb/LICENSE
-	cp out/flureedb.js packages/flureedb/index.js
-	cp package.json packages/flureedb/
-	cd packages/flureedb && npx change-package-name @fluree/flureedb && ../../script/npm-publish.sh $(VERSION)
-
-deploy-nodejs: out/flureenjs.js sync-versions packages/flureenjs/LICENSE
-	tail -n +2 out/flureenjs.js > packages/flureenjs/flureenjs.bare.js # remove shebang from compiler output
-	cd packages/flureenjs && bb syn_npm_deps.clj && sh wrap-umd.sh && npm run test &&  ../../script/npm-publish.sh $(VERSION)
-
-deploy-nodejs-old: out/flureenjs.js sync-version packages/flureenjs/LICENSE
-	cp out/flureenjs.js packages/flureenjs/
-	cp package.json packages/flureenjs/
-	cd packages/flureenjs && npx change-package-name @fluree/flureenjs && ../../script/npm-publish.sh $(VERSION)
-
-deploy-worker: out/flureeworker.js sync-version packages/flureeworker/LICENSE
-	cp out/flureeworker.js packages/flureeworker/index.js
-	cp package.json packages/flureeworker/
-	cd packages/flureeworker && npx change-package-name @fluree/flureeworker && ../../script/npm-publish.sh $(VERSION)
-
-deploy: deploy-jar deploy-browser deploy-nodejs deploy-worker
 
 docs/fluree.db.api.html docs/index.html: src/fluree/db/api.clj
 	clojure -X:docs :output-path "\"$(@D)\""
@@ -84,12 +63,10 @@ docs/%.html: docs/%.md
 
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
-cljs-browser-test: node_modules package-lock.json
-	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
+cljs-browser-test: node_modules package-lock.json clean-cljs-test
 	clojure -M:cljs-browser-test
 
 cljs-node-test: node_modules package-lock.json
-	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
 	clojure -M:cljs-node-test
 
 cljstest: cljs-browser-test cljs-node-test
@@ -104,10 +81,26 @@ eastwood:
 
 ci: test eastwood
 
-clean:
+clean-browser:
+	rm -rf js/browser/index.js
+	rm -rf js/browser/webpack.js
+	rm -rf js/browser/build
+
+clean-node:
+	rm -rf js/nodejs/index.js
+	rm -rf js/nodejs/webpack.js
+	rm -rf js/nodejs/build
+
+clean-webworker:
+	rm -rf js/webworker/index.js
+	rm -rf js/webworker/webpack.js
+	rm -rf js/webworker/build
+
+clean-cljs-test:
+	rm -rf js/test/index.js
+	rm -rf js/test/webpack.js
+	rm -rf js/test/build
+
+clean: clean-browser clean-node clean-webworker clean-cljs-test
 	rm -rf target
-	rm -rf out/*
-	rm -rf packages/*/*.js
-	rm -rf packages/*/*.json
-	rm -rf docs/*.html
 	rm -rf node_modules
