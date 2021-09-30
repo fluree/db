@@ -67,6 +67,10 @@
 (def ^:const $rdfs:subPropertyOf 202)
 (def ^:const $rdfs:Class 203)
 (def ^:const $rdf:Property 204)
+;; owl
+(def ^:const $owl:Class 205)
+(def ^:const $owl:ObjectProperty 206)
+(def ^:const $owl:DatatypeProperty 207)
 
 (def ^:const $_tag:id 30)
 (def ^:const $_tag:doc 31)

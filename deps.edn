@@ -10,7 +10,7 @@
          cheshire/cheshire                   {:mvn/version "5.10.1"}
          instaparse/instaparse               {:mvn/version "1.4.10"}
          com.fluree/json-ld                  {:git/url "https://github.com/fluree/json-ld.git"
-                                              :sha "faedd0cd3ecc64ad703f7512c0146941e2cdc36a"}
+                                              :sha "d3d928ee930ee76c581567fd10a806c0a8a2aca1"}
 
          ;; logging
          org.clojure/tools.logging           {:mvn/version "1.1.0"}
