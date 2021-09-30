@@ -158,6 +158,11 @@
   (doto wrtr .deleteAll .commit)
   (block-registry/reset block-registry))
 
+(defn wildcard?
+  [param]
+  (or (str/includes? param "*")
+      (str/includes? param "?")))
+
 (defn search
   [{:keys [storage analyzer]} db [var search search-param]]
   (let [search (-> search
@@ -176,7 +181,10 @@
                                                  {p search-param}))
                                           (into #{}))]
                    [{:_collection cid} search-params]))
-        res    (lucene/search storage query search-limit analyzer 0 search-limit)]
+        res    (if (wildcard? search-param)
+                 (do (println "wildcard!")
+                     (lucene/wildcard-search storage query search-limit analyzer 0 search-limit))
+                 (lucene/search storage query search-limit analyzer 0 search-limit))]
     {:headers [var]
      :tuples  (map #(->> % :_id read-string (conj [])) res)
      :vars    {}}))
