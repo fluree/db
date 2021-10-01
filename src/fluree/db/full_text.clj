@@ -182,8 +182,7 @@
                                           (into #{}))]
                    [{:_collection cid} search-params]))
         res    (if (wildcard? search-param)
-                 (do (println "wildcard!")
-                     (lucene/wildcard-search storage query search-limit analyzer 0 search-limit))
+                 (lucene/wildcard-search storage query search-limit analyzer 0 search-limit)
                  (lucene/search storage query search-limit analyzer 0 search-limit))]
     {:headers [var]
      :tuples  (map #(->> % :_id read-string (conj [])) res)
