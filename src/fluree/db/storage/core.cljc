@@ -1,7 +1,6 @@
 (ns fluree.db.storage.core
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
-            [clojure.data.avl :as avl]
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]
             [fluree.db.dbproto :as dbproto]
@@ -240,13 +239,13 @@
   ([novelty first-flake rhs leftmost? through-t]
    (let [novelty-subrange (cond
                             ;; standard case.. both left and right boundaries
-                            (and rhs (not leftmost?)) (avl/subrange novelty > first-flake <= rhs)
+                            (and rhs (not leftmost?)) (flake/subrange novelty > first-flake <= rhs)
 
                             ;; right only boundary
-                            (and rhs leftmost?) (avl/subrange novelty <= rhs)
+                            (and rhs leftmost?) (flake/subrange novelty <= rhs)
 
                             ;; left only boundary
-                            (and (nil? rhs) (not leftmost?)) (avl/subrange novelty > first-flake)
+                            (and (nil? rhs) (not leftmost?)) (flake/subrange novelty > first-flake)
 
                             ;; no boundary
                             (and (nil? rhs) leftmost?) novelty)]
@@ -372,7 +371,7 @@
               idx-node    (index/->IndexNode block t
                                              rhs
                                              ;; child nodes are in a sorted map with {<lastFlake> <UnresolvedNode>} as k/v
-                                             (apply avl/sorted-map-by comparator (interleave (map :first child-nodes) child-nodes))
+                                             (apply flake/sorted-map-by comparator (interleave (map :first child-nodes) child-nodes))
                                              config
                                              leftmost?)]
           (async/put! return-ch idx-node))

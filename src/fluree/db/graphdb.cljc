@@ -4,7 +4,6 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
-            [clojure.data.avl :as avl]
             [fluree.db.query.fql :as fql]
             [fluree.db.index :as index]
             [fluree.db.query.range :as query-range]
@@ -413,7 +412,7 @@
   (->> [:spot :psot :post :opst]
        (reduce
          (fn [m idx]
-           (let [ss (avl/sorted-set-by (get-in index-configs [idx :historyComparator]))]
+           (let [ss (flake/sorted-set-by (get-in index-configs [idx :historyComparator]))]
              (assoc m idx ss)))
          {:size 0})))
 
@@ -427,7 +426,7 @@
         child-node   (storage/map->UnresolvedNode
                        {:conn  conn :config index-config :network network :dbid dbid :id :empty :leaf true
                         :first first-flake :rhs nil :size 0 :block 0 :t 0 :tt-id nil :leftmost? true})
-        children     (avl/sorted-map-by comparator first-flake child-node)
+        children     (flake/sorted-map-by comparator first-flake child-node)
         idx-node     (index/->IndexNode 0 0 nil children index-config true)]
     ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
     idx-node))

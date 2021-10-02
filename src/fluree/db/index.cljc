@@ -1,5 +1,5 @@
 (ns fluree.db.index
-  (:require [clojure.data.avl :as avl]
+  (:require [fluree.db.flake :as flake]
             [fluree.db.dbproto :as dbproto]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
@@ -26,11 +26,11 @@
   dbproto/INode
   (-lookup [this flake]
     (val
-      (or (avl/nearest children <= flake)
+      (or (flake/nearest children <= flake)
           (first children))))
   (-lookup-after [_ flake]
     (val
-      (or (avl/nearest children > flake)
+      (or (flake/nearest children > flake)
           (last children))))
   (-lookup-leaf [this flake]
     (go-try

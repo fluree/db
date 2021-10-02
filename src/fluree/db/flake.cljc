@@ -1,5 +1,5 @@
 (ns fluree.db.flake
-  (:refer-clojure :exclude [split-at sorted-set-by take])
+  (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             #?(:clj [abracad.avro :as avro]))
@@ -412,13 +412,13 @@
   ([^Flake flake t]
    (->Flake (.-s flake) (.-p flake) (.-o flake) t (not (.-op flake)) (.-m flake))))
 
+
 (defn change-t
   "Takes a flake and returns one with the provided block and .-op flipped from true/false.
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
   ([^Flake flake t]
    (->Flake (.-s flake) (.-p flake) (.-o flake) t (.-op flake) (.-m flake))))
-
 
 
 (defn slice
@@ -432,14 +432,12 @@
                           {:status 500
                            :error  :db/unexpected-error}))))
 
-(defn lookup
-  [ss start-flake end-flake]
-  ;(log/warn "index-range-flakes" {:start-test >= :start-flake start-flake :end-test <= :end-flake end-flake})
-  (avl/subrange ss >= start-flake <= end-flake))
 
 (defn subrange
-  [ss start-test start-flake end-test end-flake]
-  (avl/subrange ss start-test start-flake end-test end-flake))
+  ([ss test flake]
+   (avl/subrange ss test flake))
+  ([ss start-test start-flake end-test end-flake]
+   (avl/subrange ss start-test start-flake end-test end-flake)))
 
 
 (defn split-at
@@ -458,6 +456,16 @@
 (defn sorted-set-by
   [comparator & flakes]
   (apply avl/sorted-set-by comparator flakes))
+
+
+(defn sorted-map-by
+  [comparator & keyvals]
+  (apply avl/sorted-map-by comparator keyvals))
+
+
+(defn nearest
+  [ss test flake]
+  (avl/nearest ss test flake))
 
 
 (defn size-flake
