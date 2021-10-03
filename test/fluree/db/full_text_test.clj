@@ -10,13 +10,13 @@
     (let [lang :en]
       (with-open [idx (full-text/memory-index lang)]
         (testing "after initialization"
-          (-> idx full-text/writer .close)
           (testing "populated with predicates for a subject"
             (let [cid       12345
                   subj-num  10
                   subj-id   (flake/->sid cid subj-num)
                   pred-vals {1001 "foo", 1002 "bar"}]
-              (with-open [wrtr (full-text/writer idx)]
+              (with-open [wrtr (doto (full-text/writer idx)
+                                 .commit)]
                 (full-text/put-subject idx wrtr subj-id pred-vals)
                 (.commit wrtr)
                 (let [subject-under-test (full-text/get-subject idx subj-id)]
