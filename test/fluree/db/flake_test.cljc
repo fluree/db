@@ -84,11 +84,13 @@
 #?(:clj
    (deftest multi-type-obj-vals
      (testing "Multi-type object values sort correctly"
-       (let [flakes   (conj test-flakes
+       (let [now (java.time.Instant/now)
+             flakes   (conj test-flakes
                             (flake/->Flake 4000000 2000 "hello 1" -1000 true nil) ;; class java.lang.String
                             (flake/->Flake 4000000 2000 (long 500000000) -1000 true nil) ;; class java.lang.Long
                             (flake/->Flake 4000000 2000 (int 1234) -1000 true nil) ;; class java.lang.Integer
                             (flake/->Flake 4000000 2000 (bigdec 12345) -1000 true nil) ;; class java.math.BigDecimal
+                            (flake/->Flake 4000000 2000  now -1000 true nil) ;; java.time.Instant
                             ;; extras of same types
                             (flake/->Flake 4000000 2000 "hello 2" -1000 true nil)
                             (flake/->Flake 4000000 2000 (int 2021) -1000 true nil)
@@ -103,18 +105,13 @@
          (is (= flakes-n (count psot)))
          (is (= flakes-n (count post)))
 
-         ;; will sort first based on data type (stringified), then value
+         ;; will sort numbers, regardless of type
          (is (= (into []
                       (flake/slice spot
                                    (flake/->Flake 4000000 2000 (int 1234) nil nil nil)
                                    (flake/->Flake 4000000 2000 (bigdec 12345) nil nil nil)))
                 [(flake/->Flake 4000000 2000 (int 1234) -1000 true nil)
                  (flake/->Flake 4000000 2000 (int 2021) -1000 true nil)
-                 (flake/->Flake 4000000 2000 (long 500000000) -1000 true nil)
-                 (flake/->Flake 4000000 2000 (long 900000000) -1000 true nil)
-                 (flake/->Flake 4000000 2000 "hello 1" -1000 true nil)
-                 (flake/->Flake 4000000 2000 "hello 2" -1000 true nil)
-                 (flake/->Flake 4000000 2000 (bigdec 10) -1000 true nil)
                  (flake/->Flake 4000000 2000 (bigdec 12345) -1000 true nil)]))
 
          ;; just like last test except one less of both boundaries
@@ -122,18 +119,14 @@
                       (flake/slice spot
                                    (flake/->Flake 4000000 2000 (int 1235) nil nil nil)
                                    (flake/->Flake 4000000 2000 (bigdec 12344) nil nil nil)))
-                [(flake/->Flake 4000000 2000 (int 2021) -1000 true nil)
-                 (flake/->Flake 4000000 2000 (long 500000000) -1000 true nil)
-                 (flake/->Flake 4000000 2000 (long 900000000) -1000 true nil)
-                 (flake/->Flake 4000000 2000 "hello 1" -1000 true nil)
-                 (flake/->Flake 4000000 2000 "hello 2" -1000 true nil)
-                 (flake/->Flake 4000000 2000 (bigdec 10) -1000 true nil)]))
+                [(flake/->Flake 4000000 2000 (int 2021) -1000 true nil)]))
 
+         ;; will pick up string values as java.lang.String < java.time.Instant
          (is (= (into []
                       (flake/slice spot
-                                   (flake/->Flake 4000000 2000 (int 2021) nil nil nil)
-                                   (flake/->Flake 4000000 2000 "hello 1" nil nil nil)))
-                [(flake/->Flake 4000000 2000 (int 2021) -1000 true nil)
-                 (flake/->Flake 4000000 2000 (long 500000000) -1000 true nil)
-                 (flake/->Flake 4000000 2000 (long 900000000) -1000 true nil)
-                 (flake/->Flake 4000000 2000 "hello 1" -1000 true nil)]))))))
+                                   (flake/->Flake 4000000 2000 (long 900000000) -1000 true nil)
+                                   (flake/->Flake 4000000 2000  now -1000 true nil)))
+                [(flake/->Flake 4000000 2000 (long 900000000) -1000 true nil)
+                 (flake/->Flake 4000000 2000 "hello 1" -1000 true nil)
+                 (flake/->Flake 4000000 2000 "hello 2" -1000 true nil)
+                 (flake/->Flake 4000000 2000 now -1000 true nil)]))))))

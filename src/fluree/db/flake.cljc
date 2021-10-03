@@ -254,12 +254,11 @@
 ;; if possibly doing cross-type value comparison, use this instead
 (defn cmp-val-xtype [o1 o2]
   (if (and (some? o1) (some? o2))
-    (let [o1-str   (cc-cmp-class o1)
-          o2-str   (cc-cmp-class o2)
-          type-cmp (compare o1-str o2-str)]
-      (if (= 0 type-cmp)
+    (if (= (type o1) (type o2))
+      (compare o1 o2)
+      (if (and (number? o1) (number? o2))
         (compare o1 o2)
-        type-cmp))
+        (compare (str (type o1)) (str (type o2)))))
     0))
 
 
@@ -292,7 +291,7 @@
   (combine-cmp
     (cmp-long (.-s f2) (.-s f1))                            ;; reversed
     (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val (.-o f1) (.-o f2))
+    (cmp-val-xtype (.-o f1) (.-o f2))
     (cmp-meta (.-m f1) (.-m f2))))
 
 
@@ -300,14 +299,14 @@
   (combine-cmp
     (cmp-pred (.-p f1) (.-p f2))
     (cmp-long (.-s f2) (.-s f1))                            ;; reversed
-    (cmp-val (.-o f1) (.-o f2))
+    (cmp-val-xtype (.-o f1) (.-o f2))
     (cmp-meta (.-m f1) (.-m f2))))
 
 
 (defn cmp-flakes-post [^Flake f1, ^Flake f2]
   (combine-cmp
     (cmp-pred (.-p f1) (.-p f2))
-    (cmp-val (.-o f1) (.-o f2))
+    (cmp-val-xtype (.-o f1) (.-o f2))
     (cmp-long (.-s f2) (.-s f1))                            ;; reversed
     (cmp-meta (.-m f1) (.-m f2))))
 
