@@ -158,30 +158,47 @@
   (doto wrtr .deleteAll .commit)
   (block-registry/reset block-registry))
 
+(defn parse-domain
+  [search]
+  (-> search
+      (str/split #"^fullText:")
+      second))
+
+(defn predicate-domain?
+  [domain]
+  (str/includes? domain "/"))
+
+(defn build-predicate-query
+  [db pred param]
+  (let [id (dbproto/-p-prop db :id pred)]
+    {id param}))
+
+(defn build-collection-query
+  [db coll param]
+  (let [id     (dbproto/-c-prop db :id coll)
+        params (->> coll
+                    (full-text-predicates db)
+                    (map (fn [pred-id]
+                           {pred-id param}))
+                    (into #{}))]
+    [{:_collection id} params]))
+
+(defn build-query
+  [db domain param]
+  (if (predicate-domain? domain)
+    (build-predicate-query db domain param)
+    (build-collection-query db domain param)))
+
 (defn wildcard?
   [param]
   (or (str/includes? param "*")
       (str/includes? param "?")))
 
 (defn search
-  [{:keys [storage analyzer]} db [var search search-param]]
-  (let [search (-> search
-                   (str/split #"^fullText:")
-                   second)
-        query  (if (str/includes? search "/")
-                 ;; This is a predicate-specific query, i.e. fullText:_user/username
-                 (let [pid  (dbproto/-p-prop db :id search)]
-                   {pid search-param})
-
-                 ;; This is a collection-based query, i.e. fullText:_user
-                 (let [cid           (str (dbproto/-c-prop db :id search))
-                       predicates    (full-text-predicates db search)
-                       search-params (->> predicates
-                                          (map (fn [p]
-                                                 {p search-param}))
-                                          (into #{}))]
-                   [{:_collection cid} search-params]))
-        res    (if (wildcard? search-param)
+  [{:keys [storage analyzer]} db [var search param]]
+  (let [domain (parse-domain search)
+        query  (build-query db domain param)
+        res    (if (wildcard? param)
                  (lucene/wildcard-search storage query search-limit analyzer 0 search-limit)
                  (lucene/search storage query search-limit analyzer 0 search-limit))]
     {:headers [var]
