@@ -88,15 +88,15 @@
      (.-p f)))
 
 (defn full-text-predicates
-  [db cid]
+  [db coll-name]
   (->> db
        :schema
        :pred
        vals
        (filter (fn [pred]
                  (and (:fullText pred)
-                      (= cid
-                         (-> pred :id flake/sid->cid)))))
+                      (str/starts-with? (:name pred)
+                                        (str coll-name "/")))))
        (map :id)))
 
 (defn sanitize
