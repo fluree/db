@@ -63,18 +63,24 @@
                       "populated subject can be retrieved")))
               (testing "search"
                 (let [db (test-db)]
-                  (with-open [wrtr (full-text/writer idx)]
-                    (let [var                "?msg"
-                          search             (str "fullText:" bio-pred-name)
-                          param              "president"
-                          subject-under-test (full-text/search idx db [var search param])]
-                      (is (= [var]
-                             (:headers subject-under-test))
-                          "returns the correct headers")
-                      (is (some (fn [t]
-                                  (= t [subj-id]))
-                                (:tuples subject-under-test))
-                          "includes the subject id in the returned tuples list")))))
+                  (let [var                "?msg"
+                        search             (str "fullText:" bio-pred-name)
+                        param              "president"
+                        subject-under-test (full-text/search idx db [var search param])]
+                    (is (= [var]
+                           (:headers subject-under-test))
+                        "returns the correct headers")
+                    (is (some (fn [t]
+                                (= t [subj-id]))
+                              (:tuples subject-under-test))
+                        "includes the subject id in the returned tuples list")
+                    (testing "with wildcard"
+                      (let [param              "pres*"
+                            subject-under-test (full-text/search idx db [var search param])]
+                        (is (some (fn [t]
+                                    (= t [subj-id]))
+                                  (:tuples subject-under-test))
+                            "includes the subject id in the returned tuples list"))))))
               (testing "when updating a single predicate"
                 (let [bio-update  "No really, I was POTUS"
                       pred-update {bio-pred-id bio-update}]
