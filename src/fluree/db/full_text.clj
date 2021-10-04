@@ -88,15 +88,15 @@
      (.-p f)))
 
 (defn full-text-predicates
-  [db collection]
+  [db cid]
   (->> db
        :schema
        :pred
        vals
        (filter (fn [pred]
                  (and (:fullText pred)
-                      (str/starts-with? (:name pred)
-                                        collection))))
+                      (= cid
+                         (-> pred :id flake/sid->cid)))))
        (map :id)))
 
 (defn sanitize
@@ -170,18 +170,17 @@
 
 (defn build-predicate-query
   [db pred param]
-  (let [id (dbproto/-p-prop db :id pred)]
-    {id param}))
+  (let [pid (dbproto/-p-prop db :id pred)]
+    {pid param}))
 
 (defn build-collection-query
   [db coll param]
-  (let [id     (dbproto/-c-prop db :id coll)
-        params (->> coll
-                    (full-text-predicates db)
-                    (map (fn [pred-id]
-                           {pred-id param}))
+  (let [cid    (dbproto/-c-prop db :id coll)
+        params (->> (full-text-predicates db cid)
+                    (map (fn [pid]
+                           {pid param}))
                     (into #{}))]
-    [{:_collection id} params]))
+    [{:_collection cid} params]))
 
 (defn build-query
   [db domain param]
