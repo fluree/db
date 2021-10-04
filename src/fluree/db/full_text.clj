@@ -199,7 +199,8 @@
         query  (build-query db domain param)
         res    (if (wildcard? param)
                  (lucene/wildcard-search storage query search-limit analyzer 0 search-limit)
-                 (lucene/search storage query search-limit analyzer 0 search-limit))]
+                 (lucene/search storage query search-limit analyzer 0 search-limit))
+        tuples (map #(->> % :_id read-string vector) res)]
     {:headers [var]
-     :tuples  (map #(->> % :_id read-string (conj [])) res)
+     :tuples  tuples
      :vars    {}}))
