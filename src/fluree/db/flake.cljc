@@ -195,10 +195,10 @@
   (.-m f))
 
 (defn- equiv-flake
-  [f o]
-  (and (= (s f) (s o))
-       (= (p f) (p o))
-       (= (o f) (o o))))
+  [f other]
+  (and (= (s f) (s other))
+       (= (p f) (p other))
+       (= (o f) (o other))))
 
 (defn parts->Flake
   "Used primarily to generate flakes for comparator. If you wish to
