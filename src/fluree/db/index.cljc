@@ -217,5 +217,5 @@
       (< leaf-t t)
       (update :flakes flake/disj-all (filter-after t flakes))
 
-      :finally
+      true
       (assoc :t t))))
