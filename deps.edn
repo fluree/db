@@ -11,49 +11,55 @@
          instaparse/instaparse           {:mvn/version "1.4.10"}
 
          ;; logging
-         org.clojure/tools.logging           {:mvn/version "1.1.0"}
-         logback-bundle/core-bundle          {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api                 {:mvn/version "1.7.32"}
+         org.clojure/tools.logging       {:mvn/version "1.1.0"}
+         logback-bundle/core-bundle      {:mvn/version "0.3.0"}
+         org.slf4j/slf4j-api             {:mvn/version "1.7.32"}
 
          ;; Lucene
-         clucie/clucie                       {:mvn/version "0.4.2"}
+         clucie/clucie                   {:mvn/version "0.4.2"}
 
          ;; http
-         http-kit/http-kit                   {:mvn/version "2.5.3"}
-         com.fluree/http.async.client        {:mvn/version "1.3.1-7-0xf9fd"}
+         http-kit/http-kit               {:mvn/version "2.5.3"}
+         com.fluree/http.async.client    {:mvn/version "1.3.1-7-0xf9fd"}
 
          ;; benchmarking
-         criterium/criterium                 {:mvn/version "0.4.6"}
+         criterium/criterium             {:mvn/version "0.4.6"}
 
          ;; serialization / compression
-         com.damballa/abracad                {:mvn/version "0.4.13"}
-         com.taoensso/nippy                  {:mvn/version "3.1.1"}
-         org.xerial.snappy/snappy-java       {:mvn/version "1.1.8.4"}
-         com.fluree/alphabase                {:mvn/version "3.2.1"}
+         com.fluree/abracad              {:mvn/version "0.4.18"}
+         com.taoensso/nippy              {:mvn/version "3.1.1"}
+         org.xerial.snappy/snappy-java   {:mvn/version "1.1.8.4"}
+         com.fluree/alphabase            {:mvn/version "3.2.1"}
 
          ;; cryptography
-         com.fluree/crypto                   {:mvn/version "0.3.6"}
-         org.bouncycastle/bcprov-jdk15on     {:mvn/version "1.69"}}
+         com.fluree/crypto               {:mvn/version "0.3.6"}
+         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.69"}}
 
  :paths ["src" "resources"]
 
  :aliases
  {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version     "1.0.0-rc28" ; Change this down in the docs alias too!
+  :mvn/version     "1.0.0-rc30" ; Change this down in the docs alias too!
 
   :dev
-  {:extra-paths ["dev" "src-cljs" "src-nodejs" "src-docs"]
+  {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps {org.clojure/tools.namespace {:mvn/version "1.1.0"}
                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}}
 
-  :cljstest
-  {:extra-paths ["test"]
+  :cljs-browser-test
+  {:extra-paths ["src-cljs" "test"]
    :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
    :main-opts   ["-m" "cljs-test-runner.main"
                  "-D" "doo.edn"
-                 "-c" "build-test.edn"
+                 "-c" "build-browser-test.edn"
                  "-x" "chrome-headless"]}
+
+  :cljs-node-test
+  {:extra-paths ["src-nodejs" "test"]
+   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
+   :main-opts   ["-m" "cljs-test-runner.main"
+                 "-c" "build-nodejs-test.edn"]}
 
   :cljtest
   {:extra-paths ["test"]
@@ -87,7 +93,7 @@
                   :sync-pom    true}}
 
   :install
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.0"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "install"
                   "target/fluree-db.jar"]}
 
@@ -99,11 +105,11 @@
                  :name        com.fluree/db
                  ;; TODO: Eliminate this copy of the version string
                  ;; I think that tools.build might be the best way to do that
-                 :version     "1.0.0-rc28"
+                 :version     "1.0.0-rc30"
                  :output-path "docs"}}
 
   :deploy
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.1.5"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.0"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "deploy"
                   "target/fluree-db.jar"]}
 
@@ -135,4 +141,3 @@
   :clj-kondo
   {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.09.15"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
-

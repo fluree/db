@@ -143,7 +143,7 @@
   (swap! (:state session) assoc :db/db (full-load-existing-db session)))
 
 
-(defn indexing?
+(defn indexing-promise-ch
   "Returns block currently being indexed (truthy), or nil (falsey) if not currently indexing."
   [session]
   (:db/indexing @(:state session)))
@@ -156,19 +156,27 @@
 
 
 (defn acquire-indexing-lock!
-  "Attempts to acquire indexing lock, and if successful returns true, else false."
-  [session block]
-  (swap! (:state session)
-         (fn [s]
-           (cond-> s
-                   (nil? (:db/indexing s)) (assoc :db/indexing block))))
-  ;; if we got the lock, indexing value will be same as block (true)
-  (= block (indexing? session)))
+  "Attempts to acquire indexing lock. Returns two-tuple of [lock? promise-chan]
+  where lock? indicates if the lock was successful, and promise-chan is whatever
+  promise-chan is registered for indexing."
+  [session pc]
+  (let [swap-res (swap! (:state session)
+                        (fn [s]
+                          (if (nil? (:db/indexing s))
+                            (assoc s :db/indexing pc)
+                            s)))
+        res-pc (:db/indexing swap-res)
+        lock? (= pc res-pc)]
+    ;; return two-tuple of if lock was acquired and whatever promise channel is registered.
+    [lock? res-pc]))
+
 
 (defn release-indexing-lock!
   "Releases indexing lock, and updates the last indexed value on the connection with provided block number."
   [session block]
-  (swap! (:state session) assoc :db/indexing nil :db/indexed block))
+  (swap! (:state session)
+         (fn [s]
+           (assoc s :db/indexing nil :db/indexed block))))
 
 
 (def alias->id-cache (atom #?(:clj  (cache/fifo-cache-factory {:threshold 100})
@@ -233,7 +241,8 @@
         ;; no-op
         ;; TODO - we can avoid logging here if we are the transactor
         (<= block current-block)
-        (log/info (str (:network session) "/$" (:dbid session) ": Received block " block ", but DB is already more current. No-op."))
+        (log/info (str (:network session) "/" (:dbid session) ": Received block: " block
+                       ", but DB is already more current at block: " current-block ". No-op."))
 
         ;; next block is correct, update cached db
         (= block (+ 1 current-block))

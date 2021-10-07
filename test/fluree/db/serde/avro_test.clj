@@ -1,7 +1,8 @@
 (ns fluree.db.serde.avro-test
   (:require [clojure.test :refer :all]
             [fluree.db.serde.avro :refer :all]
-            [fluree.db.flake :refer [->Flake]]))
+            [fluree.db.flake :refer [->Flake]])
+  (:import (java.math BigInteger BigDecimal)))
 
 (defn- rand-long [] (long (rand Long/MAX_VALUE)))
 

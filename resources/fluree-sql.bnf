@@ -1,4 +1,4 @@
-direct-select-statement ::= query-expression [ <space> order-by-clause ]
+direct-select-statement ::= query-expression [ <space> order-by-clause ] [ <space> limit-clause ] [ <space> offset-clause ]
 
 query-expression   ::=  non-join-query-expression | joined-table
 
@@ -19,6 +19,12 @@ from-clause ::= from <space> table-reference [ { comma <space> table-reference }
 order-by ::= 'order by' | 'ORDER BY'
 order-by-clause ::= order-by <space> sort-specification-list
 
+limit ::= 'limit' | 'LIMIT'
+limit-clause ::= limit <space> unsigned-integer
+
+offset ::= 'offset' | 'OFFSET'
+offset-clause ::= offset <space> unsigned-integer
+
 where ::= 'where' | 'WHERE'
 where-clause ::=  where <space> search-condition
 
@@ -33,7 +39,7 @@ grouping-column-reference ::= column-reference [ <space> collate-clause ]
 having ::= 'having' | 'HAVING'
 having-clause ::= having <space> search-condition
 
-select-list ::= asterisk | select-list-element [ { comma <space> select-list-element } ]
+select-list ::= asterisk | select-list-element [ { comma [ <space> ] select-list-element } ]
 
 select-list-element ::= derived-column | (qualifier <period> asterisk)
 

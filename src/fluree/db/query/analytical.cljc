@@ -15,7 +15,8 @@
             [fluree.db.util.log :as log]
             #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto])
-  #?(:clj (:import (java.io Closeable))))
+  #?(:clj (:import (java.io Closeable)
+                   (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -389,7 +390,7 @@
                               :error  :db/invalid-query}))
              (let [lang (-> db :settings :language (or :default))
                    [var search search-param] clause
-                   var (variable? var)]
+                   var  (variable? var)]
                (with-open [^Closeable store (full-text/open-storage conn network dbid lang)]
                  (full-text/search store db [var search search-param]))))))
 
@@ -418,9 +419,11 @@
 
                     (let [partition (dbproto/-c-prop db :partition (last clause))
                           max-sid   (-> db :ecount (get partition))
-                          min-sid   (flake/min-subject-id partition)]
+                          min-sid   (flake/min-subject-id partition)
+                          flakes    (<? (query-range/index-range db :spot >= [max-sid] <= [min-sid]))
+                          xf        (comp (map (fn [^Flake f] [(.-s f)])) (distinct))]
                       {:headers [subject-var]
-                       :tuples  (map #(conj [] %) (range min-sid (inc max-sid)))
+                       :tuples  (sequence xf flakes)
                        :vars    {}}))
 
                   object-var

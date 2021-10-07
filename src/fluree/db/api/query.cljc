@@ -1,5 +1,6 @@
-;; Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS that are directly exposed
 (ns fluree.db.api.query
+  "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
+  that are directly exposed"
   (:require [clojure.string :as str]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
