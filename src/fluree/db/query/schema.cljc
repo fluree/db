@@ -121,6 +121,15 @@
       {} classes)))
 
 
+(defn is-class?
+  "Returns true if _predicate value is a class, else assumed to be a property/predicate.
+
+  Takes predicate->value map as input."
+  [p->v]
+  (when-let [type (get p->v const/$rdf:type)]
+    (#{const/$rdfs:Class const/$owl:Class} type)))
+
+
 (defn schema-map
   "Returns a map of the schema for a db to allow quick lookups of schema properties.
   Schema is a map with keys:
@@ -172,7 +181,7 @@
                                          (let [^Flake first-flake (first pred-flakes)
                                                id        (.-s first-flake)
                                                p->v      (flake->pred-map pred-flakes)
-                                               class?    (contains? p->v const/$rdf:type)
+                                               class?    (is-class? p->v)
                                                iri       (get p->v const/$iri)
                                                equivs    (when-let [equivs (get p->v const/$_predicate:equivalentProperty)]
                                                            (if (sequential? equivs) equivs [equivs]))
