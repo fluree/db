@@ -134,7 +134,8 @@
      :name      "FdbBranchNode"
      :namespace "fluree"
      :fields    [{:name "children", :type {:type  :array
-                                           :items "fluree.FdbChildNode"}}]}))
+                                           :items "fluree.FdbChildNode"}}
+                 {:name "rhs", :type [:null "fluree.Flake"]}]}))
 
 (def FdbLeafNode-schema
   (avro/parse-schema
