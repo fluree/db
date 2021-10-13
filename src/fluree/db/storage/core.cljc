@@ -209,13 +209,15 @@
                                      (pr-str index))
                                 {:status 500
                                  :error  :db/unexpected-error})))]
-    (assoc index-data
-           :comparator cmp
-           :network network
-           :dbid dbid
-           :block block
-           :t t
-           :leftmost? true)))
+    (cond-> index-data
+      (:rhs index-data)   (update :rhs flake/parts->Flake)
+      (:first index-data) (update :first flake/parts->Flake)
+      true                (assoc :comparator cmp
+                                 :network network
+                                 :dbid dbid
+                                 :block block
+                                 :t t
+                                 :leftmost? true))))
 
 
 (defn reify-db-root
