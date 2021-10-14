@@ -145,7 +145,7 @@
                             [key-auth-id nil])
          timestamp   (System/currentTimeMillis)
          nonce       (or nonce timestamp)
-         expire      (or expire (+ timestamp 30000)) ;; 5 min default
+         expire      (or expire (+ timestamp 300000)) ;; 5 min default
          cmd         (try (-> {:type      :tx
                                :db        db-name
                                :tx        txn
