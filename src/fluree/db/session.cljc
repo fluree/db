@@ -290,25 +290,23 @@
   then perform the shutdown on the cached session, else will return
   false."
   ([session]
-   (if (closed? session)
-     false
-     (let [{:keys [conn update-chan transact-chan state network dbid id]} session
-           closed? (closed? session)]
-       (if closed?
-         (do
-           (remove-cache! network dbid)
-           false)
-         (do
-           (swap! state assoc :closed? true)
-           ;; remove updates callback from connection
-           ((:remove-listener conn) network dbid id)
-           (async/close! update-chan)
-           (when transact-chan
-             (async/close! transact-chan))
-           (remove-cache! network dbid)
-           (when (fn? (:close session))
-             ((:close session)))
-           true)))))
+   (let [{:keys [conn update-chan transact-chan state network dbid id]} session
+         closed? (closed? session)]
+     (if closed?
+       (do
+         (remove-cache! network dbid)
+         false)
+       (do
+         (swap! state assoc :closed? true)
+         ;; remove updates callback from connection
+         ((:remove-listener conn) network dbid id)
+         (async/close! update-chan)
+         (when transact-chan
+           (async/close! transact-chan))
+         (remove-cache! network dbid)
+         (when (fn? (:close session))
+           ((:close session)))
+         true))))
   ([network dbid]
    (if-let [session (from-cache network dbid)]
      (close session)

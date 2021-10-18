@@ -473,7 +473,7 @@
                                   ;; value is vector of single-argument callback functions that will receive [header data]
                                   :listeners    {}})
         {:keys [storage-read storage-exists storage-write storage-rename storage-list
-                parallelism req-chan sub-chan pub-chan default-network
+                parallelism req-chan sub-chan pub-chan default-network group
                 object-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
@@ -503,7 +503,7 @@
                              (close-websocket conn-id)
                              (swap! state-atom assoc :close? true)
                              ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
-                             #?(:clj (dbfunctions/clear-db-fn-cache)
+                             #?(:clj  (dbfunctions/clear-db-fn-cache)
                                 :cljs (when (identical? "nodejs" cljs.core/*target*)
                                         (dbfunctions/clear-db-fn-cache)))
                              (session/close-all-sessions conn-id)
@@ -532,6 +532,7 @@
                             :sub-chan         sub-chan
                             :pub-chan         pub-chan
                             :close            close
+                            :group            group
                             :storage-list     storage-list
                             :storage-read     storage-read*
                             :storage-exists   storage-exists*
