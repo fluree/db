@@ -454,8 +454,7 @@
            (when new?
 
              (when connect?
-               ;; send a subscription request to this database. This is idempotent in the
-               ;; unlikely case of multiple sessions simultaneously being created (of which only one will 'win').
+               ;; send a subscription request to this database.
                (ops/subscribe session opts)
 
                ;; register a callback fn for this session to listen for updates and push onto update chan
@@ -498,16 +497,17 @@
 (defn current-db
   "Gets the latest db from the central DB atom if available, or loads it from scratch.
   DB is returned as a core async promise channel."
-  [session]
-  (swap! (:state session) #(assoc % :req/last (util/current-time-millis)
-                                    :req/count (inc (:req/count %))))
-  (let [db (:db/db @(:state session))]
-    (if (nil? db)
-      (do
-        (swap! (:schema-cache session) empty)               ;; always clear schema cache on new load
-        (swap! (:state session) #(assoc % :db/db (full-load-existing-db session)))
-        (:db/db @(:state session)))
-      db)))
+  [{:keys [state] :as session}]
+  (swap! state #(assoc % :req/last (util/current-time-millis)
+                         :req/count (inc (:req/count %))))
+  (or (:db/db @state)
+      (let [_         (swap! (:schema-cache session) empty) ;; always clear schema cache on new load
+            new-state (swap! state
+                             (fn [st]
+                               (if (:db/db st)
+                                 st
+                                 (assoc st :db/db (full-load-existing-db session)))))]
+        (:db/db new-state))))
 
 
 (defn blank-db
