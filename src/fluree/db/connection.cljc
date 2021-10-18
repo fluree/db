@@ -106,7 +106,7 @@
 ;; we do need to establish an upstream connection from a ledger to us, so we can propogate
 ;; blocks, flushes, etc.
 
-(defrecord Connection [id servers state req-chan sub-chan pub-chan
+(defrecord Connection [id servers state req-chan sub-chan pub-chan group
                        storage-read storage-write object-cache parallelism
                        serializer default-network
                        transactor? publish transact-handler
