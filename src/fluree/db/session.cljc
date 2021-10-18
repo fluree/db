@@ -110,9 +110,11 @@
                                           (recur db* (inc next-block)))
                                         (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
                                                         {:status 500 :error :db/unexpected-error})))))))
-              db*             (assoc db :schema (<? (schema/schema-map db)))
-              db**            (assoc db* :settings (<? (schema/setting-map db*)))]
-          (async/put! pc db**))
+              db-schema       (schema/schema-map db)        ;; returns async chan
+              db-settings     (schema/setting-map db)       ;; returns async chan
+              db*             (assoc db :schema (<? db-schema)
+                                        :settings (<? db-settings))]
+          (async/put! pc db*))
         (catch* e
                 (async/put! pc e))))
     pc))
@@ -165,8 +167,8 @@
                           (if (nil? (:db/indexing s))
                             (assoc s :db/indexing pc)
                             s)))
-        res-pc (:db/indexing swap-res)
-        lock? (= pc res-pc)]
+        res-pc   (:db/indexing swap-res)
+        lock?    (= pc res-pc)]
     ;; return two-tuple of if lock was acquired and whatever promise channel is registered.
     [lock? res-pc]))
 
