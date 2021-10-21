@@ -110,9 +110,11 @@
                                           (recur db* (inc next-block)))
                                         (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
                                                         {:status 500 :error :db/unexpected-error})))))))
-              db*             (assoc db :schema (<? (schema/schema-map db)))
-              db**            (assoc db* :settings (<? (schema/setting-map db*)))]
-          (async/put! pc db**))
+              db-schema       (schema/schema-map db)        ;; returns async chan
+              db-settings     (schema/setting-map db)       ;; returns async chan
+              db*             (assoc db :schema (<? db-schema)
+                                        :settings (<? db-settings))]
+          (async/put! pc db*))
         (catch* e
                 (async/put! pc e))))
     pc))
@@ -165,8 +167,8 @@
                           (if (nil? (:db/indexing s))
                             (assoc s :db/indexing pc)
                             s)))
-        res-pc (:db/indexing swap-res)
-        lock? (= pc res-pc)]
+        res-pc   (:db/indexing swap-res)
+        lock?    (= pc res-pc)]
     ;; return two-tuple of if lock was acquired and whatever promise channel is registered.
     [lock? res-pc]))
 
@@ -290,25 +292,23 @@
   then perform the shutdown on the cached session, else will return
   false."
   ([session]
-   (if (closed? session)
-     false
-     (let [{:keys [conn update-chan transact-chan state network dbid id]} session
-           closed? (closed? session)]
-       (if closed?
-         (do
-           (remove-cache! network dbid)
-           false)
-         (do
-           (swap! state assoc :closed? true)
-           ;; remove updates callback from connection
-           ((:remove-listener conn) network dbid id)
-           (async/close! update-chan)
-           (when transact-chan
-             (async/close! transact-chan))
-           (remove-cache! network dbid)
-           (when (fn? (:close session))
-             ((:close session)))
-           true)))))
+   (let [{:keys [conn update-chan transact-chan state network dbid id]} session
+         closed? (closed? session)]
+     (if closed?
+       (do
+         (remove-cache! network dbid)
+         false)
+       (do
+         (swap! state assoc :closed? true)
+         ;; remove updates callback from connection
+         ((:remove-listener conn) network dbid id)
+         (async/close! update-chan)
+         (when transact-chan
+           (async/close! transact-chan))
+         (remove-cache! network dbid)
+         (when (fn? (:close session))
+           ((:close session)))
+         true))))
   ([network dbid]
    (if-let [session (from-cache network dbid)]
      (close session)
@@ -456,8 +456,7 @@
            (when new?
 
              (when connect?
-               ;; send a subscription request to this database. This is idempotent in the
-               ;; unlikely case of multiple sessions simultaneously being created (of which only one will 'win').
+               ;; send a subscription request to this database.
                (ops/subscribe session opts)
 
                ;; register a callback fn for this session to listen for updates and push onto update chan
@@ -500,16 +499,17 @@
 (defn current-db
   "Gets the latest db from the central DB atom if available, or loads it from scratch.
   DB is returned as a core async promise channel."
-  [session]
-  (swap! (:state session) #(assoc % :req/last (util/current-time-millis)
-                                    :req/count (inc (:req/count %))))
-  (let [db (:db/db @(:state session))]
-    (if (nil? db)
-      (do
-        (swap! (:schema-cache session) empty)               ;; always clear schema cache on new load
-        (swap! (:state session) #(assoc % :db/db (full-load-existing-db session)))
-        (:db/db @(:state session)))
-      db)))
+  [{:keys [state] :as session}]
+  (swap! state #(assoc % :req/last (util/current-time-millis)
+                         :req/count (inc (:req/count %))))
+  (or (:db/db @state)
+      (let [_         (swap! (:schema-cache session) empty) ;; always clear schema cache on new load
+            new-state (swap! state
+                             (fn [st]
+                               (if (:db/db st)
+                                 st
+                                 (assoc st :db/db (full-load-existing-db session)))))]
+        (:db/db new-state))))
 
 
 (defn blank-db

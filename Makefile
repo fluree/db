@@ -80,3 +80,4 @@ clean:
 	rm -rf out/*
 	rm -rf docs/*.html
 	rm -rf node_modules
+	rm -f pom.xml

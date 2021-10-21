@@ -18,9 +18,9 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defprotocol Store
-  (exists? [s key] "Returns true when `key` exists in `s`")
-  (read [s key] "Reads raw bytes from `s` associated with `key`")
-  (write [s key data] "Writes `data` as raw bytes to `s` and associates it with `key`")
+  (exists? [s k] "Returns true when `k` exists in `s`")
+  (read [s k] "Reads raw bytes from `s` associated with `k`")
+  (write [s k data] "Writes `data` as raw bytes to `s` and associates it with `k`")
   (rename [s old-key new-key] "Remove `old-key` and associates it's data to `new-key`"))
 
 #?(:clj
