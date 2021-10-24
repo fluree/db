@@ -4,8 +4,7 @@
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 (def default-comparators
   "Map of default index comparators for the five index types"
