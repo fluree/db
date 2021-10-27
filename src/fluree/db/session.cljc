@@ -110,9 +110,11 @@
                                           (recur db* (inc next-block)))
                                         (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
                                                         {:status 500 :error :db/unexpected-error})))))))
-              db*             (assoc db :schema (<? (schema/schema-map db)))
-              db**            (assoc db* :settings (<? (schema/setting-map db*)))]
-          (async/put! pc db**))
+              db-schema       (schema/schema-map db)        ;; returns async chan
+              db-settings     (schema/setting-map db)       ;; returns async chan
+              db*             (assoc db :schema (<? db-schema)
+                                        :settings (<? db-settings))]
+          (async/put! pc db*))
         (catch* e
                 (async/put! pc e))))
     pc))
@@ -143,7 +145,7 @@
   (swap! (:state session) assoc :db/db (full-load-existing-db session)))
 
 
-(defn indexing?
+(defn indexing-promise-ch
   "Returns block currently being indexed (truthy), or nil (falsey) if not currently indexing."
   [session]
   (:db/indexing @(:state session)))
@@ -156,19 +158,27 @@
 
 
 (defn acquire-indexing-lock!
-  "Attempts to acquire indexing lock, and if successful returns true, else false."
-  [session block]
-  (swap! (:state session)
-         (fn [s]
-           (cond-> s
-                   (nil? (:db/indexing s)) (assoc :db/indexing block))))
-  ;; if we got the lock, indexing value will be same as block (true)
-  (= block (indexing? session)))
+  "Attempts to acquire indexing lock. Returns two-tuple of [lock? promise-chan]
+  where lock? indicates if the lock was successful, and promise-chan is whatever
+  promise-chan is registered for indexing."
+  [session pc]
+  (let [swap-res (swap! (:state session)
+                        (fn [s]
+                          (if (nil? (:db/indexing s))
+                            (assoc s :db/indexing pc)
+                            s)))
+        res-pc   (:db/indexing swap-res)
+        lock?    (= pc res-pc)]
+    ;; return two-tuple of if lock was acquired and whatever promise channel is registered.
+    [lock? res-pc]))
+
 
 (defn release-indexing-lock!
   "Releases indexing lock, and updates the last indexed value on the connection with provided block number."
   [session block]
-  (swap! (:state session) assoc :db/indexing nil :db/indexed block))
+  (swap! (:state session)
+         (fn [s]
+           (assoc s :db/indexing nil :db/indexed block))))
 
 
 (def alias->id-cache (atom #?(:clj  (cache/fifo-cache-factory {:threshold 100})
@@ -233,7 +243,8 @@
         ;; no-op
         ;; TODO - we can avoid logging here if we are the transactor
         (<= block current-block)
-        (log/info (str (:network session) "/$" (:dbid session) ": Received block " block ", but DB is already more current. No-op."))
+        (log/info (str (:network session) "/" (:dbid session) ": Received block: " block
+                       ", but DB is already more current at block: " current-block ". No-op."))
 
         ;; next block is correct, update cached db
         (= block (+ 1 current-block))
@@ -281,25 +292,23 @@
   then perform the shutdown on the cached session, else will return
   false."
   ([session]
-   (if (closed? session)
-     false
-     (let [{:keys [conn update-chan transact-chan state network dbid id]} session
-           closed? (closed? session)]
-       (if closed?
-         (do
-           (remove-cache! network dbid)
-           false)
-         (do
-           (swap! state assoc :closed? true)
-           ;; remove updates callback from connection
-           ((:remove-listener conn) network dbid id)
-           (async/close! update-chan)
-           (when transact-chan
-             (async/close! transact-chan))
-           (remove-cache! network dbid)
-           (when (fn? (:close session))
-             ((:close session)))
-           true)))))
+   (let [{:keys [conn update-chan transact-chan state network dbid id]} session
+         closed? (closed? session)]
+     (if closed?
+       (do
+         (remove-cache! network dbid)
+         false)
+       (do
+         (swap! state assoc :closed? true)
+         ;; remove updates callback from connection
+         ((:remove-listener conn) network dbid id)
+         (async/close! update-chan)
+         (when transact-chan
+           (async/close! transact-chan))
+         (remove-cache! network dbid)
+         (when (fn? (:close session))
+           ((:close session)))
+         true))))
   ([network dbid]
    (if-let [session (from-cache network dbid)]
      (close session)
@@ -447,8 +456,7 @@
            (when new?
 
              (when connect?
-               ;; send a subscription request to this database. This is idempotent in the
-               ;; unlikely case of multiple sessions simultaneously being created (of which only one will 'win').
+               ;; send a subscription request to this database.
                (ops/subscribe session opts)
 
                ;; register a callback fn for this session to listen for updates and push onto update chan
@@ -491,16 +499,17 @@
 (defn current-db
   "Gets the latest db from the central DB atom if available, or loads it from scratch.
   DB is returned as a core async promise channel."
-  [session]
-  (swap! (:state session) #(assoc % :req/last (util/current-time-millis)
-                                    :req/count (inc (:req/count %))))
-  (let [db (:db/db @(:state session))]
-    (if (nil? db)
-      (do
-        (swap! (:schema-cache session) empty)               ;; always clear schema cache on new load
-        (swap! (:state session) #(assoc % :db/db (full-load-existing-db session)))
-        (:db/db @(:state session)))
-      db)))
+  [{:keys [state] :as session}]
+  (swap! state #(assoc % :req/last (util/current-time-millis)
+                         :req/count (inc (:req/count %))))
+  (or (:db/db @state)
+      (let [_         (swap! (:schema-cache session) empty) ;; always clear schema cache on new load
+            new-state (swap! state
+                             (fn [st]
+                               (if (:db/db st)
+                                 st
+                                 (assoc st :db/db (full-load-existing-db session)))))]
+        (:db/db new-state))))
 
 
 (defn blank-db

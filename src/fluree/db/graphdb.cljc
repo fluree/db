@@ -12,10 +12,10 @@
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.log :as log]
             [clojure.string :as str]
             [fluree.json-ld :as json-ld])
-  #?(:clj (:import (fluree.db.flake Flake))))
+  #?(:clj (:import (fluree.db.flake Flake)
+                   (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -206,23 +206,23 @@
                             :error  :db/unexpected-error})))
          (if (empty? flakes)
            (async/put! resp-ch (assoc db :block block))
-           (let [flakes (sort flake/cmp-flakes-block flakes)
+           (let [flakes             (sort flake/cmp-flakes-block flakes)
                  ^Flake first-flake (first flakes)
-                 db*    (loop [[^Flake f & r] flakes
-                               t        (.-t first-flake) ;; current 't' value
-                               t-flakes []                ;; all flakes for current 't'
-                               db       db]
-                          (cond (and f (= t (.-t f)))
-                                (recur r t (conj t-flakes f) db)
+                 db*                (loop [[^Flake f & r] flakes
+                                           t        (.-t first-flake) ;; current 't' value
+                                           t-flakes []      ;; all flakes for current 't'
+                                           db       db]
+                                      (cond (and f (= t (.-t f)))
+                                            (recur r t (conj t-flakes f) db)
 
-                                :else
-                                (let [db' (-> db
-                                              (assoc :t (inc t)) ;; due to permissions, an entire 't' may be filtered out, set to 't' prior to the new flakes
-                                              (with-t t-flakes opts)
-                                              (<?))]
-                                  (if (nil? f)
-                                    (assoc db' :block block)
-                                    (recur r (.-t f) [f] db')))))]
+                                            :else
+                                            (let [db' (-> db
+                                                          (assoc :t (inc t)) ;; due to permissions, an entire 't' may be filtered out, set to 't' prior to the new flakes
+                                                          (with-t t-flakes opts)
+                                                          (<?))]
+                                              (if (nil? f)
+                                                (assoc db' :block block)
+                                                (recur r (.-t f) [f] db')))))]
 
              (async/put! resp-ch db*)))
          (catch* e
@@ -324,61 +324,98 @@
                                      e)))))
     return-chan))
 
-(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst schema settings index-configs schema-cache novelty permissions fork fork-block current-db-fn]
+;; ================ GraphDB record support fns ================================
+
+(defn- graphdb-latest-db [{:keys [current-db-fn permissions]}]
+  (go-try
+    (let [current-db (<? (current-db-fn))]
+      (assoc current-db :permissions permissions))))
+
+(defn- graphdb-root-db [this]
+  (assoc this :permissions {:root?      true
+                            :collection {:all? true}
+                            :predicate  {:all? true}}))
+
+(defn- graphdb-c-prop [{:keys [schema]} property collection]
+  ;; collection properties TODO-deprecate :id property below in favor of :partition
+  (assert (#{:name :id :sid :partition :spec :specDoc :base-iri} property)
+          (str "Invalid collection property: " (pr-str property)))
+  (if (neg-int? collection)
+    (get-in schema [:coll "_tx" property])
+    (get-in schema [:coll collection property])))
+
+(defn- graphdb-p-prop [{:keys [schema] :as this} property predicate]
+  (assert (#{:name :id :iri :type :ref? :idx? :unique :multi :index :upsert
+             :component :noHistory :restrictCollection :spec :specDoc :txSpec
+             :txSpecDoc :restrictTag :retractDuplicates :subclass :new?} property)
+          (str "Invalid predicate property: " (pr-str property)))
+  (cond->> (get-in schema [:pred predicate property])
+           (= :restrictCollection property) (dbproto/-c-prop this :partition)))
+
+(defn- graphdb-pred-name
+  "Lookup the predicate name if needed; return ::no-pred if pred arg is nil so
+  we can differentiate between that and (dbproto/-p-prop ...) returning nil"
+  [this pred]
+  (cond
+    (nil? pred) ::no-pred
+    (string? pred) pred
+    :else (dbproto/-p-prop this :name pred)))
+
+(defn- graphdb-tag
+  "resolves a tags's value given a tag subject id; optionally shortening the
+  return value if it starts with the given predicate name"
+  ([this tag-id]
+   (go-try
+     (let [tag-pred-id 30]
+       (some-> (<? (query-range/index-range (dbproto/-rootdb this)
+                                            :spot = [tag-id tag-pred-id]))
+         ^Flake (first)
+         (.-o)))))
+  ([this tag-id pred]
+   (go-try
+     (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
+           tag       (<? (dbproto/-tag this tag-id))]
+       (when (and pred-name tag)
+         (if (str/includes? tag ":")
+           (-> (str/split tag #":") second)
+           tag))))))
+
+(defn- graphdb-tag-id
+  ([this tag-name]
+   (go-try
+     (let [tag-pred-id const/$_tag:id]
+       (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
+         ^Flake (first)
+         (.-s)))))
+  ([this tag-name pred]
+   (go-try
+     (if (str/includes? tag-name "/")
+       (<? (dbproto/-tag-id this tag-name))
+       (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
+         (when pred-name
+           (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
+
+
+;; ================ end GraphDB record support fns ============================
+
+(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst
+                    schema settings index-configs schema-cache novelty
+                    permissions fork fork-block current-db-fn]
   dbproto/IFlureeDb
-  (-latest-db [this]
-    (go-try
-      (let [current-db (<? (current-db-fn))]
-        (assoc current-db :permissions permissions))))
-  (-rootdb [this] (assoc this :permissions {:root? true :collection {:all? true} :predicate {:all? true}}))
+  (-latest-db [this] (graphdb-latest-db this))
+  (-rootdb [this] (graphdb-root-db this))
   (-forward-time-travel [db flakes] (forward-time-travel db nil flakes))
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
-  (-c-prop [this property collection]
-    ;; collection properties TODO-deprecate :id property below in favor of :partition
-    (assert (#{:name :id :sid :partition :spec :specDoc :base-iri} property) (str "Invalid collection property: " (pr-str property)))
-    (if (neg-int? collection)
-      (get-in schema [:coll "_tx" property])
-      (get-in schema [:coll collection property])))
+  (-c-prop [this property collection] (graphdb-c-prop this property collection))
   (-class-prop [this property class]
     (if (= :subclass property)
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
-  (-p-prop [this property predicate]
-    ;; predicate properties
-    (assert (#{:name :id :iri :type :ref? :idx? :unique :multi :index :upsert :component :noHistory :restrictCollection
-               :spec :specDoc :txSpec :txSpecDoc :restrictTag :retractDuplicates :subclass :new?} property) (str "Invalid predicate property: " (pr-str property)))
-    (cond->> (get-in schema [:pred predicate property])
-             (= :restrictCollection property) (dbproto/-c-prop this :partition)))
-  (-tag [this tag-id]
-    ;; resolves a tag's value given a tag subject id
-    (go-try
-      (let [tag-pred-id 30]
-        (some-> (<? (query-range/index-range (dbproto/-rootdb this) :spot = [tag-id tag-pred-id]))
-                ^Flake (first)
-                (.-o)))))
-  (-tag [this tag-id pred]
-    ;; resolves a tag's value given a tag subject id, and shortens the return value if it
-    ;; starts with the predicate name.
-    (go-try
-      (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
-            tag       (<? (dbproto/-tag this tag-id))]
-        (when (and pred-name tag)
-          (if (str/includes? tag ":")
-            (-> (str/split tag #":") second)
-            tag)))))
-  (-tag-id [this tag-name]
-    (go-try
-      (let [tag-pred-id const/$_tag:id]
-        (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
-                ^Flake (first)
-                (.-s)))))
-  (-tag-id [this tag-name pred]
-    (go-try
-      (if (str/includes? tag-name "/")
-        (<? (dbproto/-tag-id this tag-name))
-        (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
-          (when pred-name
-            (<? (dbproto/-tag-id this (str pred-name ":" tag-name))))))))
+  (-p-prop [this property predicate] (graphdb-p-prop this property predicate))
+  (-tag [this tag-id] (graphdb-tag this tag-id))
+  (-tag [this tag-id pred] (graphdb-tag this tag-id pred))
+  (-tag-id [this tag-name] (graphdb-tag-id this tag-name))
+  (-tag-id [this tag-name pred] (graphdb-tag-id this tag-name pred))
   (-subid [this ident] (subid this ident false))
   (-subid [this ident strict?] (subid this ident strict?))
   (-search [this fparts] (query-range/search this fparts))
@@ -388,24 +425,22 @@
   (-with-t [this flakes] (with-t this flakes nil))
   (-with-t [this flakes opts] (with-t this flakes opts))
   (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil)))
-;#?@(:cljs
-;    [IPrintWithWriter
-;     (-pr-writer [db w opts]
-;                 (-write w "#FlureeGraphDB ")
-;                 (-write w (pr {:network (:network db) :dbid (:dbid db) :block (:block db) :t (:t db) :stats (:stats db) :permissions (:permissions db)})))])
 
 #?(:cljs
    (extend-type GraphDb
      IPrintWithWriter
      (-pr-writer [db w opts]
        (-write w "#FlureeGraphDB ")
-       (-write w (pr {:network (:network db) :dbid (:dbid db) :block (:block db) :t (:t db) :stats (:stats db) :permissions (:permissions db)})))))
+       (-write w (pr {:network     (:network db) :dbid (:dbid db) :block (:block db)
+                      :t           (:t db) :stats (:stats db)
+                      :permissions (:permissions db)})))))
 
 #?(:clj
-   (defmethod print-method GraphDb [^GraphDb db, ^java.io.Writer w]
+   (defmethod print-method GraphDb [^GraphDb db, ^Writer w]
      (.write w (str "#FlureeGraphDB "))
      (binding [*out* w]
-       (pr {:network (:network db) :dbid (:dbid db) :block (:block db) :t (:t db) :stats (:stats db) :permissions (:permissions db)}))))
+       (pr {:network (:network db) :dbid (:dbid db) :block (:block db)
+            :t       (:t db) :stats (:stats db) :permissions (:permissions db)}))))
 
 (defn new-novelty-map
   [index-configs]
@@ -431,18 +466,19 @@
     ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
     idx-node))
 
-(def default-index-configs {:spot (index/map->IndexConfig {:index-type        :spot
-                                                           :comparator        flake/cmp-flakes-spot
-                                                           :historyComparator flake/cmp-flakes-spot-novelty})
-                            :psot (index/map->IndexConfig {:index-type        :psot
-                                                           :comparator        flake/cmp-flakes-psot
-                                                           :historyComparator flake/cmp-flakes-psot-novelty})
-                            :post (index/map->IndexConfig {:index-type        :post
-                                                           :comparator        flake/cmp-flakes-post
-                                                           :historyComparator flake/cmp-flakes-post-novelty})
-                            :opst (index/map->IndexConfig {:index-type        :opst
-                                                           :comparator        flake/cmp-flakes-opst
-                                                           :historyComparator flake/cmp-flakes-opst-novelty})})
+(def default-index-configs
+  {:spot (index/map->IndexConfig {:index-type        :spot
+                                  :comparator        flake/cmp-flakes-spot
+                                  :historyComparator flake/cmp-flakes-spot-novelty})
+   :psot (index/map->IndexConfig {:index-type        :psot
+                                  :comparator        flake/cmp-flakes-psot
+                                  :historyComparator flake/cmp-flakes-psot-novelty})
+   :post (index/map->IndexConfig {:index-type        :post
+                                  :comparator        flake/cmp-flakes-post
+                                  :historyComparator flake/cmp-flakes-post-novelty})
+   :opst (index/map->IndexConfig {:index-type        :opst
+                                  :comparator        flake/cmp-flakes-opst
+                                  :historyComparator flake/cmp-flakes-opst-novelty})})
 
 (defn blank-db
   [conn network dbid schema-cache current-db-fn]
@@ -464,7 +500,9 @@
         fork-block  nil
         schema      nil
         settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst schema settings default-index-configs schema-cache novelty permissions fork fork-block current-db-fn)))
+    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst schema
+               settings default-index-configs schema-cache novelty permissions
+               fork fork-block current-db-fn)))
 
 (defn graphdb?
   [db]

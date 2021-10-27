@@ -41,10 +41,10 @@
         "nil is equal to nil"))
   (testing "unreverse-var"
     (is (= "my/reverse-ref" (f/unreverse-var "my/_reverse-ref"))
-        "reverse ref underscore removed"))
+        "reverse ref underscore removed")))
 
 
 
 
-  )
+
 

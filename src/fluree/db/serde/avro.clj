@@ -221,7 +221,7 @@
   so they need to get converted back."
   [ecount]
   (->> ecount
-       (map #(vector (Integer. ^String (key %)) (val %)))
+       (map #(vector (Integer/parseInt (key %)) (val %)))
        (into {})))
 
 
@@ -323,5 +323,5 @@
 
 (defn avro-serde
   "Returns an Avro serializer / deserializer."
-  []
+  ^Serializer []
   (->Serializer))

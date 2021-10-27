@@ -82,11 +82,11 @@
                                               false
 
                                               (str/includes? match ".")
-                                              #?(:clj  (Double. match)
+                                              #?(:clj  (Double/parseDouble match)
                                                  :cljs (js/parseFloat match))
 
                                               :else
-                                              #?(:clj  (Long. match)
+                                              #?(:clj  (Long/parseLong match)
                                                  :cljs (js/parseInt match)))
                                             (catch* _
                                                     (throw (ex-info (str "Invalid where clause in argument: " arg)

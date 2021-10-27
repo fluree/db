@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
       - name: Run tests
-        run: script/run-in-docker.sh make test
+        run: script/run-in-docker.sh make ci
       - name: Build Docker image
         run: docker build -t fluree/db .
       - name: Notify Slack fail

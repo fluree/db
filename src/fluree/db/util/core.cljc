@@ -59,8 +59,9 @@
   (some (fn [[item idx]] (when (= value item) idx))
         (partition 2 (interleave coll (range)))))
 
-(defn random-uuid []
+(defn random-uuid
   "Generates random UUID in both clojure/script"
+  []
   #?(:clj  (UUID/randomUUID)
      :cljs (clojure.core/random-uuid)))
 
@@ -95,6 +96,18 @@
   []
   #?(:clj  (System/currentTimeMillis)
      :cljs (.getTime (js/Date.))))
+
+
+(defn response-time-formatted
+  "Returns response time, formatted as string. Must provide start time of request
+   for clj as (System/nanoTime), or for cljs epoch milliseconds"
+  [start-time]
+  #?(:clj  (-> (- (System/nanoTime) start-time)
+               (/ 1000000)
+               (#(format "%.2fms" (float %))))
+     :cljs (-> (- (current-time-millis) start-time)
+               (str "ms"))))
+
 
 (defn deep-merge [v & vs]
   (letfn [(rec-merge [v1 v2]

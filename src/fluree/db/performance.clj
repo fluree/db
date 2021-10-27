@@ -2,7 +2,8 @@
   (:require [clojure.java.io :as io]
             [criterium.core :as criterium]
             [fluree.db.api :as fdb]
-            [clojure.tools.logging :as log]))
+            [clojure.tools.logging :as log]
+            [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
 
@@ -176,7 +177,7 @@
                                     (format-res :addDeleteData))
         _                      (log/info "Add and delete data bench: " add-delete-bench)
         res                    (reduce (fn [acc res] (assoc acc (-> (:issued res)
-                                                                    (clojure.string/replace #"\s+" " "))
+                                                                    (str/replace #"\s+" " "))
                                                                 (dissoc res :issued)))
                                        {} (concat query-bench analytical-query-bench block-query-bench
                                                   history-query-bench sparql-query-bench graphql-query-bench

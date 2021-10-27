@@ -620,7 +620,7 @@
           (-> (set/rename-keys q {:select select-key})
               (dissoc :selectKey))
           q))
-      (let [[q r] (if (and (string? item))
+      (let [[q r] (if (string? item)
                     [(assoc query :selectKey (keyword (str "select" (str/capitalize item)))) r]
 
                     (condp = (first item)

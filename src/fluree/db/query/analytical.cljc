@@ -449,9 +449,13 @@
               ;; not a class, try a collection if matches
               :else
               (if-let [collection (dbproto/-c-prop db :partition o)]
-                {:headers [subject-var]
-                 :tuples  (map #(conj [] %) (range (flake/min-subject-id collection) (-> db :ecount (get collection) inc)))
-                 :vars    {}}
+                (let [max-sid   (-> db :ecount (get collection))
+                      min-sid   (flake/min-subject-id collection)
+                      flakes    (<? (query-range/index-range db :spot >= [max-sid] <= [min-sid]))
+                      xf        (comp (map (fn [^Flake f] [(.-s f)])) (distinct))]
+                  {:headers [subject-var]
+                   :tuples  (sequence xf flakes)
+                   :vars    {}})
                 (throw (ex-info (str "No matching classes or collections for: " o)
                                 {:status 400 :error :db/invalid-query})))))))
 

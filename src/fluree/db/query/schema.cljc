@@ -1,7 +1,7 @@
 (ns fluree.db.query.schema
   (:require [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.constants :as const]
-            [fluree.db.util.async :refer [<? go-try into?]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.iri :as iri-util])
