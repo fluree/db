@@ -346,9 +346,9 @@
 (defn read-branch
   "Reads and deserializes branch node."
   [conn key]
-  (go-try (let [data (storage-read conn key)]
+  (go-try (let [data (<? (storage-read conn key))]
             (when data
-              (serdeproto/-deserialize-branch (serde conn) (<? data))))))
+              (serdeproto/-deserialize-branch (serde conn) data)))))
 
 
 (defn reify-branch
