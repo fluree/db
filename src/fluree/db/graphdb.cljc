@@ -44,6 +44,15 @@
   "Predicates to exclude from the database"
   #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
 
+(defn exclude-flake?
+  [f]
+  (->> f
+       flake/p
+       (contains? exclude-predicates)))
+
+(def include-flake?
+  (complement exclude-flake?))
+
 (defn add-predicate-to-idx
   "Adds a predicate to post index when :index true is turned on.
   Ensures adding the predicate into novelty won't blow past novelty-max.
@@ -77,8 +86,8 @@
                                  (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
                                                  {:status 500
                                                   :error  :db/unexpected-error})))
-          add-flakes           (filter #(not (exclude-predicates (flake/p %))) flakes)
-          add-preds            (into #{} (map #(flake/p %) add-flakes))
+          add-flakes           (filter include-flake? flakes)
+          add-preds            (into #{} (map flake/p add-flakes))
           idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
           ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
           flakes-bytes         (flake/size-bytes add-flakes)
