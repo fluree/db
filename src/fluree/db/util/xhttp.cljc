@@ -32,6 +32,10 @@
                         (fn [_] sni-client/default-client)))
 
 
+;; allow large websocket frames of ~10mb
+#?(:clj (System/setProperty "org.asynchttpclient.webSocketMaxFrameSize" "10000000"))
+
+
 (defn format-error-response
   [url e]
   (let [status #?(:cljs (when-let [resp (.-response e)]
