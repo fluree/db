@@ -489,8 +489,10 @@
   (avl/subrange ss >= start-flake <= end-flake))
 
 (defn subrange
-  [ss start-test start-flake end-test end-flake]
-  (avl/subrange ss start-test start-flake end-test end-flake))
+  ([ss test flake]
+   (avl/subrange ss test flake))
+  ([ss start-test start-flake end-test end-flake]
+   (avl/subrange ss start-test start-flake end-test end-flake)))
 
 
 (defn split-at
