@@ -45,7 +45,7 @@
   If a match exists, returns the subject id for the class."
   [class-iri db context]
   (let [iri (if context
-              (json-ld/expand class-iri context)
+              (json-ld/expand-iri class-iri context)
               class-iri)]
     (get-in db [:schema :pred iri :id])))
 

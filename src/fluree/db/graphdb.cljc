@@ -286,7 +286,7 @@
 
                         ;; assume iri
                         (string? ident)
-                        (let [iri (json-ld/expand ident (get-in db [:schema :prefix]))]
+                        (let [iri (json-ld/expand-iri ident (get-in db [:schema :prefix]))]
                           (some-> (<? (query-range/index-range db :post = [const/$iri iri]))
                                   ^Flake (first)
                                   (.-s)))

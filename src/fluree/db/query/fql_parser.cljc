@@ -216,7 +216,7 @@
                                  (when (str/includes? pred "/_")
                                    (str/replace pred "/_" "/")))
                   pred'      (or reversed
-                                 (json-ld/expand pred context))
+                                 (json-ld/expand-iri pred context))
                   as         (cond
                                (contains? v' "_as")
                                (get v' "_as")
