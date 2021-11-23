@@ -34,7 +34,7 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 
 ### Prerequisites
 
-1. Install clojure tools-deps (version 1.10.1.697 or later).
+1. Install clojure tools-deps (version 1.10.3.933 or later).
     1. macOS: `brew install clojure/tools/clojure`
     1. Arch Linux: `pacman -S clojure`
 1. Install Node & NPM
@@ -43,12 +43,22 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 
 ### Building
 
-1. `make deps` - install all local dependencies
-1. `make` - make everything below
-1. `make jar` - make Java JAR file
-1. `make nodejs` - make JavaScript Fluree DB for Node
-1. `make browser` - make JavaScript Fluree DB for browsers
-1. `make webworker` - make JavaScript Fluree DB for web worker
+* `make deps` - install all local dependencies
+* `make` - make everything below
+* `make jar` - make Java JAR file
+* `make nodejs` - make JavaScript Fluree DB for Node
+* `make browser` - make JavaScript Fluree DB for browsers
+* `make webworker` - make JavaScript Fluree DB for web worker
 
-1. `make install` - install jar file into local .m2/maven
-1. `make clean` - clean all build directories/files
+* `make install` - install jar file into local .m2/maven
+* `make clean` - clean all build directories/files
+
+### Tests
+
+* `make test` - run all automated tests below
+* `make cljtest` - run all CLJ tests
+* `make cljstest` - run CLJS tests in headless Chrome & NodeJS
+* `make cljs-browser-test` - run CLJS tests in headless Chrome
+    * Needs karma-cli installed globally: `npm install -g karma-cli`
+    * Needs Google Chrome browser installed
+* `make cljs-node-test` - run CLJS tests in NodeJS
