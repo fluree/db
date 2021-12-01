@@ -52,16 +52,6 @@
           (or (first children))
           val))))
 
-(defn lookup-after
-  [branch flake]
-  (when (and (branch? branch)
-             (resolved? branch))
-    (let [{:keys [children]} branch]
-      (-> children
-          (avl/nearest > flake)
-          (or (last children))
-          val))))
-
 (defn lookup-leaf
   [r branch flake]
   (go-try
@@ -72,18 +62,6 @@
          child
          (recur (<? (resolve r child))))))))
 
-(defn lookup-leaf-after
-  [r branch flake]
-  (go-try
-   (when (and (branch? branch)
-              (resolved? branch))
-     (loop [child (lookup-after branch flake)]
-       (if (leaf? child)
-         child
-         (recur (<? (resolve r child)))))
-     (ex-info (str "lookup-leaf is only supported for resolved branch nodes.")
-              {:status 500, :error :db/unexpected-error,
-               ::branch branch}))))
 
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `network`, `dbid`, and index

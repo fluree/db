@@ -22,10 +22,10 @@
            (= 3 (flake/sid->cid s1) (flake/sid->cid s2)))))
 
 (defn process-functions
-  [^Flake flake functions db permissions]
+  [flake functions db permissions]
   (async/go
     (let [root-db (dbproto/-rootdb db)
-          sid     (.-s flake)
+          sid     (flake/s flake)
           ctx     {:sid     sid
                    :auth_id (or (:auth db) (:auth permissions))
                    :instant (util/current-time-millis)
@@ -62,7 +62,7 @@
 
 
 (defn check-explicit-functions
-  [^Flake flake db permissions fns-paths]
+  [flake db permissions fns-paths]
   (async/go
     (let [trace? (:trace? permissions)]
       (loop [[f & r] fns-paths
@@ -104,12 +104,12 @@
   (b) truthy value if flake is allowed
   (c) falsey value if flake not allowed"
   ([db flake] (allow-flake? db flake (:permissions db)))
-  ([db ^Flake flake permissions]
+  ([db flake permissions]
    (async/go
      (if (root-permission? permissions)
        true
-       (let [cid       (flake/sid->cid (.-s flake))
-             pid       (.-p flake)
+       (let [cid       (flake/sid->cid (flake/s flake))
+             pid       (flake/p flake)
              fns-paths [[:collection cid pid] [:collection cid :all] [:predicate pid]]
              check     (async/<! (check-explicit-functions flake db permissions fns-paths))]
          (if (util/exception? check)
@@ -140,4 +140,3 @@
                         (recur r (conj acc flake))
                         (recur r acc)))))
                 acc))))
-

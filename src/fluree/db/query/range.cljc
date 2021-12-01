@@ -94,10 +94,10 @@
   inclusive and one-by-one"
   [{:keys [conn] :as db} idx start-flake end-flake]
   (let [idx-compare (get-in db [:comparators idx])
+        idx-root    (get db idx)
         out         (chan)]
     (go
-      (let [idx-root  (get db idx)
-            root-node (<! (index/resolve conn idx-root))]
+      (let [root-node (<! (index/resolve conn idx-root))]
         (loop [next-flake start-flake]
           (if (and next-flake
                    (not (pos? (idx-compare next-flake end-flake))))
