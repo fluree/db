@@ -286,8 +286,7 @@
           subject-limit :limit, :or {offset 0}}
          opts
 
-         fast-forward-db? (:tt-id db)
-         novelty          (get-in db [:novelty idx])
+         novelty (get-in db [:novelty idx])
 
          [s1 p1 o1 t1 op1 m1]
          (match->flake-parts db idx start-match)
