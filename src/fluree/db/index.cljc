@@ -153,12 +153,8 @@
   [from-t to-t flakes]
   (let [stale-flakes (stale-by from-t flakes)
         subsequent   (filter-after to-t flakes)
-        out-of-range (concat stale-flakes #_previous subsequent)]
+        out-of-range (concat stale-flakes subsequent)]
     (flake/disj-all flakes out-of-range)))
-
-(defn current-flakes
-  [{:keys [t flakes]}]
-  (t-range t t flakes))
 
 (defn novelty-subrange
   [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]

@@ -88,46 +88,40 @@
          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
      (flake/->Flake s' p o' t op m'))))
 
-(defn resolve-node-range
-  "Returns a channel that will eventually contain a stream of index nodes from
-  index `idx` within the database `db` between `start-flake` and `end-flake`,
-  inclusive and one-by-one"
+(defn leaf-range
   [{:keys [conn] :as db} idx start-flake end-flake]
-  (let [idx-compare (get-in db [:comparators idx])
-        idx-root    (get db idx)
-        out         (chan)]
+  (let [idx-root    (get db idx)
+        idx-compare (get-in db [:comparators idx])
+        leaf-ch     (chan)]
     (go
       (let [root-node (<! (index/resolve conn idx-root))]
         (loop [next-flake start-flake]
           (if (and next-flake
                    (not (pos? (idx-compare next-flake end-flake))))
-            (let [next-node     (<! (index/lookup-leaf conn root-node next-flake))
-                  resolved-node (<! (index/resolve conn next-node))]
-              (when (>! out resolved-node)
-                (recur (:rhs resolved-node))))
-            (async/close! out)))))
-    out))
+            (let [next-leaf     (<! (index/lookup-leaf conn root-node next-flake))
+                  resolved-leaf (<! (index/resolve conn next-leaf))]
+              (when (>! leaf-ch resolved-leaf)
+                (recur (:rhs resolved-leaf))))
+            (async/close! leaf-ch)))))
+    leaf-ch))
 
-(defn flake-subrange-xf
-  [start-test start-flake end-test end-flake]
-  (mapcat (fn [flake-range]
-            (flake/subrange flake-range start-test start-flake
-                            end-test end-flake))))
-
-(defn expand-history-range
-  "Returns a channel that will eventually contain a stream of flakes between
-  `start-flake` and `end-flake`, according to `start-test` and `end-test`,
-  respectively, and also contained within the history range between `from-t` and
-  `to-t` for some index data node in the `node-stream` channel."
-  [node-stream {:keys [from-t to-t novelty start-test start-flake end-test end-flake]}]
-  (let [at-t-xf        (map (fn [leaf]
-                              (index/at-t leaf to-t novelty)))
-        tx-range-xf    (map (fn [{:keys [flakes]}]
-                              (index/t-range from-t to-t flakes)))
-        flake-range-xf (flake-subrange-xf start-test start-flake end-test end-flake)
-        history-xf     (comp at-t-xf tx-range-xf flake-range-xf)
-        history-chan   (async/chan 1 history-xf)]
-    (async/pipe node-stream history-chan)))
+(defn flake-range
+  "Returns a channel that will eventually contain a stream of index nodes from
+  index `idx` within the database `db` between `start-flake` and `end-flake`,
+  inclusive and one-by-one"
+  [{:keys [conn] :as db} idx {:keys [from-t to-t start-test start-flake
+                                     end-test end-flake]}]
+  (let [novelty  (get-in db [:novelty idx])]
+    (-> db
+        (leaf-range idx start-flake end-flake)
+        (async/pipe (chan 1 (comp (map (fn [leaf]
+                                         (index/at-t leaf to-t novelty)))
+                                  (map :flakes)
+                                  (map (partial index/t-range from-t to-t))
+                                  (mapcat (fn [flakes]
+                                            (flake/subrange flakes
+                                                            start-test start-flake
+                                                            end-test end-flake)))))))))
 
 (defn filter-authorized
   "Returns a channel that will eventually contain only the schema flakes and the
@@ -200,76 +194,57 @@
    (time-range db idx start-test start-match end-test end-match {}))
   ([{t :t :as db} idx start-test start-match end-test end-match opts]
    (let [{:keys [limit from-t to-t]
-          :or   {from-t t}}
+          :or   {from-t t, to-t t}}
          opts
 
-         novelty     (get-in db [:novelty idx])
          idx-compare (get-in db [:comparators idx])
          start-parts (match->flake-parts db idx start-match)
          end-parts   (match->flake-parts db idx end-match)
-
          out-chan    (chan 1 (map (fn [flakes]
                                     (apply flake/sorted-set-by idx-compare flakes))))]
      (go
        (let [start-flake (<? (resolve-match-flake db start-test start-parts))
              end-flake   (<? (resolve-match-flake db end-test end-parts))]
-         (-> db
-             (resolve-node-range idx start-flake end-flake)
-             (expand-history-range {:from-t from-t
-                                    :to-t to-t
-                                    :novelty novelty
-                                    :start-test start-test
-                                    :start-flake start-flake
-                                    :end-test end-test
-                                    :end-flake end-flake})
+         (-> (flake-range db idx
+                          {:from-t from-t
+                           :to-t to-t
+                           :start-test start-test
+                           :start-flake start-flake
+                           :end-test end-test
+                           :end-flake end-flake})
              (filter-authorized db start-flake end-flake)
              (take-only limit)
              (->> (async/into []))
              (async/pipe out-chan))))
      out-chan)))
 
-(defn indexed-flakes-xf
-  "Returns a transducer that first extracts a flake set under the `:flakes` keys
-  from it's input stream of index nodes, filters those flakes down to those
-  between the `start-flake` and `end-flake` options according to the
-  `start-test` and `end-test` options, respectively, and further filters the
-  flake stream according to the `subject-fn`, `predicate-fn`, and `object-fn`
-  options if they are present."
-  [{:keys [t novelty start-test start-flake end-test end-flake
-           subject-fn predicate-fn object-fn]}]
-  (let [at-t-xf     (map (fn [leaf]
-                           (index/at-t leaf t novelty)))
-        current-xf  (map index/current-flakes)
-        subrange-xf (flake-subrange-xf start-test start-flake end-test end-flake)
-        xforms      (cond-> [at-t-xf current-xf subrange-xf]
-                      subject-fn   (conj (filter (fn [f]
-                                                   (subject-fn (flake/s f)))))
-                      predicate-fn (conj (filter (fn [f]
-                                                   (predicate-fn (flake/p f)))))
-                      object-fn    (conj (filter (fn [f]
-                                                   (object-fn (flake/o f))))))]
-    (apply comp xforms)))
-
-(defn extract-index-flakes
-  [node-stream opts]
-  (let [index-chan (chan 1 (indexed-flakes-xf opts))]
-    (async/pipe node-stream index-chan)))
+(defn filter-index-flakes
+  [flake-ch {:keys [subject-fn predicate-fn object-fn]}]
+  (let [filters   (cond-> []
+                    subject-fn   (conj (filter (fn [f]
+                                                 (subject-fn (flake/s f)))))
+                    predicate-fn (conj (filter (fn [f]
+                                                 (predicate-fn (flake/p f)))))
+                    object-fn    (conj (filter (fn [f]
+                                                 (object-fn (flake/o f))))))
+        filter-xf (apply comp filters)
+        filter-ch (chan 1 filter-xf)]
+    (async/pipe flake-ch filter-ch)))
 
 (defn select-subject-window
-  "Returns a channel that contains the flakes from `flake-stream`, skipping the
+  "Returns a channel that contains the flakes from `flake-ch`, skipping the
   flakes from the first `offset` subjects encountered, including a maximum of
   `flake-limit` flakes from a maximum of `subject-limit` subjects."
-  [flake-stream {:keys [subject-limit flake-limit offset]}]
+  [flake-ch {:keys [subject-limit offset]}]
   (let [offset-subject-xf (comp (partition-by (fn [f]
                                                 (flake/s f)))
                                 (drop offset))
         subject-ch        (chan 1 offset-subject-xf)
-        flake-ch          (chan 1 cat)]
-    (-> flake-stream
+        out               (chan 1 cat)]
+    (-> flake-ch
         (async/pipe subject-ch)
         (take-only subject-limit)
-        (async/pipe flake-ch)
-        (take-only flake-limit))))
+        (async/pipe out))))
 
 (defn index-flake-stream
   ([db idx] (index-flake-stream db idx {}))
@@ -304,20 +279,21 @@
        (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
              end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))]
          (-> db
-             (resolve-node-range idx start-flake end-flake)
-             (extract-index-flakes {:subject-fn subject-fn
-                                    :predicate-fn predicate-fn
-                                    :object-fn object-fn
-                                    :start-test start-test
-                                    :start-flake start-flake
-                                    :end-test end-test
-                                    :end-flake end-flake
-                                    :novelty novelty
-                                    :t t})
+             (flake-range idx
+                          {:from-t t
+                           :to-t t
+                           :start-test start-test
+                           :start-flake start-flake
+                           :end-test end-test
+                           :end-flake end-flake})
+             (filter-index-flakes {:subject-fn subject-fn
+                                   :predicate-fn predicate-fn
+                                   :object-fn object-fn})
              (filter-authorized db start-flake end-flake)
              (select-subject-window {:subject-limit subject-limit
                                      :flake-limit flake-limit
                                      :offset offset})
+             (take-only flake-limit)
              (async/pipe out-chan))))
      out-chan)))
 
