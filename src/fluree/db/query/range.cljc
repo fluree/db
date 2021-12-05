@@ -89,6 +89,9 @@
      (flake/->Flake s' p o' t op m'))))
 
 (defn leaf-range
+  "Returns a channel that will eventually contain a stream of index nodes from
+  index `idx` within the database `db` between `start-flake` and `end-flake`,
+  inclusive and one-by-one"
   [{:keys [conn] :as db} idx start-flake end-flake]
   (let [idx-root    (get db idx)
         idx-compare (get-in db [:comparators idx])
@@ -148,11 +151,43 @@
                (async/close! out)))
            out)))))
 
+(defn flake-filter-xf
+  [{:keys [subject-fn predicate-fn object-fn]}]
+  (let [filter-xfs (cond-> []
+                     subject-fn   (conj (filter (fn [f]
+                                                  (subject-fn (flake/s f)))))
+                     predicate-fn (conj (filter (fn [f]
+                                                  (predicate-fn (flake/p f)))))
+                     object-fn    (conj (filter (fn [f]
+                                                  (object-fn (flake/o f))))))]
+    (apply comp filter-xfs)))
+
+(defn filter-index-flakes
+  [flake-ch filter-fns]
+  (let [filter-xf (flake-filter-xf filter-fns)]
+    (async/pipe flake-ch
+                (chan 1 filter-xf))))
+
 (defn take-only
   [flake-chan limit]
   (if limit
     (async/take limit flake-chan)
     flake-chan))
+
+(defn select-subject-window
+  "Returns a channel that contains the flakes from `flake-ch`, skipping the flakes
+  from the first `offset` subjects encountered and including the flakes from a
+  maximum of `subject-limit` subjects."
+  [flake-ch {:keys [subject-limit offset]}]
+  (let [offset-subject-xf (comp (partition-by (fn [f]
+                                                (flake/s f)))
+                                (drop offset))
+        subject-ch        (chan 1 offset-subject-xf)
+        out               (chan 1 cat)]
+    (-> flake-ch
+        (async/pipe subject-ch)
+        (take-only subject-limit)
+        (async/pipe out))))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
@@ -217,34 +252,6 @@
              (->> (async/into []))
              (async/pipe out-chan))))
      out-chan)))
-
-(defn filter-index-flakes
-  [flake-ch {:keys [subject-fn predicate-fn object-fn]}]
-  (let [filters   (cond-> []
-                    subject-fn   (conj (filter (fn [f]
-                                                 (subject-fn (flake/s f)))))
-                    predicate-fn (conj (filter (fn [f]
-                                                 (predicate-fn (flake/p f)))))
-                    object-fn    (conj (filter (fn [f]
-                                                 (object-fn (flake/o f))))))
-        filter-xf (apply comp filters)
-        filter-ch (chan 1 filter-xf)]
-    (async/pipe flake-ch filter-ch)))
-
-(defn select-subject-window
-  "Returns a channel that contains the flakes from `flake-ch`, skipping the
-  flakes from the first `offset` subjects encountered, including a maximum of
-  `flake-limit` flakes from a maximum of `subject-limit` subjects."
-  [flake-ch {:keys [subject-limit offset]}]
-  (let [offset-subject-xf (comp (partition-by (fn [f]
-                                                (flake/s f)))
-                                (drop offset))
-        subject-ch        (chan 1 offset-subject-xf)
-        out               (chan 1 cat)]
-    (-> flake-ch
-        (async/pipe subject-ch)
-        (take-only subject-limit)
-        (async/pipe out))))
 
 (defn index-flake-stream
   ([db idx] (index-flake-stream db idx {}))
