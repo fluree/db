@@ -156,9 +156,13 @@
          (let [out (chan)]
            (go-loop []
              (if-let [flake (<! flake-stream)]
-               (do (when (or (schema-util/is-schema-flake? flake)
-                             (<? (perm-validate/allow-flake? db flake)))
-                     (>! out flake))
+               (do (try* (when (or (schema-util/is-schema-flake? flake)
+                                   (<? (perm-validate/allow-flake? db flake)))
+                           (>! out flake))
+                         (catch* e
+                                 (log/error e
+                                            "Insufficient permissions to access flake" flake
+                                            "in ledger" (select-keys db [:network :dbid :t]))))
                    (recur))
                (async/close! out)))
            out)))))
