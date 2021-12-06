@@ -89,6 +89,18 @@
          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
      (flake/->Flake s' p o' t op m'))))
 
+(defn resolve-leaf
+  [{:keys [conn] :as db} root-node flake]
+  (go
+    (try*
+     (let [next-leaf     (<? (index/lookup-leaf conn root-node flake))
+           resolved-leaf (<? (index/resolve conn next-leaf))]
+       resolved-leaf)
+     (catch* e
+             (log/error e
+                        "Error resolving index leaf node containing flake" flake
+                        "in ledger" (select-keys db [:network :dbid :t]))))))
+
 (defn leaf-range
   "Returns a channel that will eventually contain a stream of index nodes from
   index `idx` within the database `db` between `start-flake` and `end-flake`,
@@ -103,16 +115,10 @@
           (loop [next-flake start-flake]
             (if (and next-flake
                      (not (pos? (idx-compare next-flake end-flake))))
-              (try*
-               (let [next-leaf     (<? (index/lookup-leaf conn root-node next-flake))
-                     resolved-leaf (<? (index/resolve conn next-leaf))]
-                 (when (>! leaf-ch resolved-leaf)
-                   (recur (:rhs resolved-leaf))))
-               (catch* e
-                       (log/error e
-                                  "Error resolving index leaf node containing flake" next-flake
-                                  "in ledger" (select-keys db [:network :dbid :t]))
-                       (async/close! leaf-ch)))
+              (if-let [next-leaf (<! (resolve-leaf db root-node next-flake))]
+                (when (>! leaf-ch next-leaf)
+                  (recur (:rhs next-leaf)))
+                (async/close! leaf-ch))
               (async/close! leaf-ch)))
           (do (log/error root-node
                          "Error resolving root node for index" idx
