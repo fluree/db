@@ -216,6 +216,58 @@
     >  [> match <= (max-match idx)]
     >= [>= match < (max-match idx)]))
 
+(defn index-range-stream
+  ([db idx] (index-range-stream db idx {}))
+  ([db idx opts] (index-range-stream db idx >= (min-match idx) <= (max-match idx) opts))
+  ([db idx test match] (index-range-stream db idx test match {}))
+  ([db idx test match opts]
+   (let [[start-test start-match end-test end-match]
+         (expand-range-interval idx test match)]
+     (index-range-stream db idx start-test start-match end-test end-match opts)))
+  ([db idx start-test start-match end-test end-match]
+   (index-range-stream db idx start-test start-match end-test end-match {}))
+  ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
+   (let [{:keys         [flake-limit offset subject-fn predicate-fn object-fn]
+          subject-limit :limit
+          :or           {offset 0}}
+         opts
+
+         novelty (get-in db [:novelty idx])
+
+         [s1 p1 o1 t1 op1 m1]
+         (match->flake-parts db idx start-match)
+
+         [s2 p2 o2 t2 op2 m2]
+         (match->flake-parts db idx end-match)
+
+         [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1
+                                                  (boolean? o2) o2
+                                                  :else nil)]
+                               [[nil nil] (fn [o] (= o bool))]
+                               [[o1 o2] object-fn])
+         out-chan (chan)]
+     (go
+       (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
+             end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))]
+         (-> db
+             (flake-range idx
+                          {:from-t t
+                           :to-t t
+                           :start-test start-test
+                           :start-flake start-flake
+                           :end-test end-test
+                           :end-flake end-flake})
+             (filter-index-flakes {:subject-fn subject-fn
+                                   :predicate-fn predicate-fn
+                                   :object-fn object-fn})
+             (filter-authorized db start-flake end-flake)
+             (select-subject-window {:subject-limit subject-limit
+                                     :flake-limit flake-limit
+                                     :offset offset})
+             (take-only flake-limit)
+             (async/pipe out-chan))))
+     out-chan)))
+
 (defn time-range
   "Range query across an index.
 
@@ -269,58 +321,6 @@
              (async/pipe out-chan))))
      out-chan)))
 
-(defn index-flake-stream
-  ([db idx] (index-flake-stream db idx {}))
-  ([db idx opts] (index-flake-stream db idx >= (min-match idx) <= (max-match idx) opts))
-  ([db idx test match] (index-flake-stream db idx test match {}))
-  ([db idx test match opts]
-   (let [[start-test start-match end-test end-match]
-         (expand-range-interval idx test match)]
-     (index-flake-stream db idx start-test start-match end-test end-match opts)))
-  ([db idx start-test start-match end-test end-match]
-   (index-flake-stream db idx start-test start-match end-test end-match {}))
-  ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
-   (let [{:keys         [flake-limit offset subject-fn predicate-fn object-fn]
-          subject-limit :limit
-          :or           {offset 0}}
-         opts
-
-         novelty (get-in db [:novelty idx])
-
-         [s1 p1 o1 t1 op1 m1]
-         (match->flake-parts db idx start-match)
-
-         [s2 p2 o2 t2 op2 m2]
-         (match->flake-parts db idx end-match)
-
-         [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1
-                                                  (boolean? o2) o2
-                                                  :else nil)]
-                               [[nil nil] (fn [o] (= o bool))]
-                               [[o1 o2] object-fn])
-         out-chan (chan)]
-     (go
-       (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
-             end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))]
-         (-> db
-             (flake-range idx
-                          {:from-t t
-                           :to-t t
-                           :start-test start-test
-                           :start-flake start-flake
-                           :end-test end-test
-                           :end-flake end-flake})
-             (filter-index-flakes {:subject-fn subject-fn
-                                   :predicate-fn predicate-fn
-                                   :object-fn object-fn})
-             (filter-authorized db start-flake end-flake)
-             (select-subject-window {:subject-limit subject-limit
-                                     :flake-limit flake-limit
-                                     :offset offset})
-             (take-only flake-limit)
-             (async/pipe out-chan))))
-     out-chan)))
-
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
 
@@ -342,13 +342,14 @@
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
   ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
-   (let [idx-compare (get-in db [:comparators idx])
-         out-chan    (chan 1 (map (fn [flakes]
-                                    (apply flake/sorted-set-by idx-compare flakes))))]
-     (-> db
-         (index-flake-stream idx start-test start-match end-test end-match opts)
-         (->> (async/into []))
-         (async/pipe out-chan)))))
+   (let [idx-compare (get-in db [:comparators idx])]
+     (go-try
+      (let [range-stream (index-range-stream db idx
+                                             start-test start-match
+                                             end-test end-match
+                                             opts)
+            idx-range    (<! (async/into [] range-stream))]
+        (apply flake/sorted-set-by idx-compare idx-range))))))
 
 (defn non-nil-non-boolean?
   [o]
