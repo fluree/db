@@ -91,20 +91,15 @@
 
 (defn resolve-leaf
   [{:keys [conn] :as db} root-node flake]
-  (go
-    (try*
-     (let [next-leaf     (<? (index/lookup-leaf conn root-node flake))
-           resolved-leaf (<? (index/resolve conn next-leaf))]
-       resolved-leaf)
-     (catch* e
-             (log/error e
-                        "Error resolving index leaf node containing flake" flake
-                        "in ledger" (select-keys db [:network :dbid :t]))))))
+  (go-try
+   (let [next-leaf     (<? (index/lookup-leaf conn root-node flake))
+         resolved-leaf (<? (index/resolve conn next-leaf))]
+     resolved-leaf)))
 
 (defn leaf-range
-  "Returns a channel that will eventually contain a stream of index nodes from
-  index `idx` within the database `db` between `start-flake` and `end-flake`,
-  inclusive and one-by-one"
+  "Returns a channel that will eventually contain a stream of index leaf nodes
+  from index `idx` within the database `db` starting with the node containing
+  `start-flake` and ending with the node containing `end-flake` one-by-one."
   [{:keys [conn] :as db} idx start-flake end-flake]
   (let [idx-root    (get db idx)
         idx-compare (get-in db [:comparators idx])
@@ -127,9 +122,9 @@
     leaf-ch))
 
 (defn flake-range
-  "Returns a channel that will eventually contain a stream of index nodes from
-  index `idx` within the database `db` between `start-flake` and `end-flake`,
-  inclusive and one-by-one"
+  "Returns a channel that will eventually contain a stream of flakes from index
+  `idx` within the database `db` between `start-flake` and `end-flake`,
+  inclusive, one-by-one, and sorted by the order of `idx`"
   [{:keys [conn] :as db} idx {:keys [from-t to-t start-test start-flake
                                      end-test end-flake]}]
   (let [novelty  (get-in db [:novelty idx])]
@@ -191,25 +186,24 @@
                 (chan 1 filter-xf))))
 
 (defn take-only
-  [flake-chan limit]
+  [ch limit]
   (if limit
-    (async/take limit flake-chan)
-    flake-chan))
+    (async/take limit ch)
+    ch))
 
 (defn select-subject-window
   "Returns a channel that contains the flakes from `flake-ch`, skipping the flakes
   from the first `offset` subjects encountered and including the flakes from a
   maximum of `subject-limit` subjects."
-  [flake-ch {:keys [subject-limit offset]}]
-  (let [offset-subject-xf (comp (partition-by (fn [f]
-                                                (flake/s f)))
-                                (drop offset))
-        subject-ch        (chan 1 offset-subject-xf)
-        out               (chan 1 cat)]
+  [flake-ch {:keys [subject-limit offset]
+             :or   {offset 0}}]
+  (let [subj-ch (chan 1 (comp (partition-by flake/s)
+                              (drop offset)))
+        out-ch  (chan 1 cat)]
     (-> flake-ch
-        (async/pipe subject-ch)
+        (async/pipe subj-ch)
         (take-only subject-limit)
-        (async/pipe out))))
+        (async/pipe out-ch))))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
@@ -286,8 +280,9 @@
   ([db idx start-test start-match end-test end-match]
    (index-flake-stream db idx start-test start-match end-test end-match {}))
   ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match opts]
-   (let [{:keys [flake-limit offset subject-fn predicate-fn object-fn]
-          subject-limit :limit, :or {offset 0}}
+   (let [{:keys         [flake-limit offset subject-fn predicate-fn object-fn]
+          subject-limit :limit
+          :or           {offset 0}}
          opts
 
          novelty (get-in db [:novelty idx])
