@@ -308,23 +308,24 @@
             ;; assume connection dropped, close!
             (do
               (log/warn "Connection has gone stale. Perhaps network conditions are poor. Disconnecting socket.")
-              #?(:cljs
-                 (let [cb (:keep-alive-fn conn)]
-                   (cond
+              (let [cb (:keep-alive-fn conn)]
+                (cond
 
-                     (nil? cb)
-                     (log/trace "No keep-alive callback is registered")
+                  (nil? cb)
+                  (log/trace "No keep-alive callback is registered")
 
-                     ;clojurescript-recognized function - yay!
-                     (fn? cb)
-                     (cb)
+                  (fn? cb)
+                  (cb)
 
-                     ;try javascript eval
-                     (string? cb)
+                  (string? cb)
+                  #?(:cljs
+                     ;; try javascript eval
                      (eval cb)
+                     :clj
+                     (log/warn "Unsupported clojure callback registered" {:keep-alive-fn cb}))
 
-                     :else
-                     (log/warn "Unsupported callback registered" {:keep-alive-fn cb}))))
+                  :else
+                  (log/warn "Unsupported callback registered" {:keep-alive-fn cb})))
               (close-websocket (:id conn))
               (session/close-all-sessions (:id conn)))
             (do
@@ -569,9 +570,8 @@
                             :tx-key-id        (when tx-private-key
                                                 #?(:clj  (crypto/account-id-from-private tx-private-key)
                                                    :cljs nil))
-                            :keep-alive-fn    (if (or (fn? keep-alive-fn) (string? keep-alive-fn))
-                                                #?(:clj  nil
-                                                   :cljs keep-alive-fn))
+                            :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
+                                                keep-alive-fn)
                             :add-listener     (partial add-listener* state-atom)
                             :remove-listener  (partial remove-listener* state-atom)}]
     (map->Connection settings)))
