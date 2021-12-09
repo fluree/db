@@ -135,9 +135,7 @@
   "Takes an http request and creates an http signature using a private key"
   ([req-method url request private-key] (httpSignature req-method url request private-key nil))
   ([req-method url request private-key auth]
-   (-> request
-       js->clj
-       (as-> request (http-signatures/sign-request req-method url request private-key auth)))))
+   (http-signatures/sign-request req-method url (js->clj request) private-key auth)))
 
 
 (defn ^:export publicKeyFromPrivate
@@ -243,6 +241,14 @@
 ;; Network Operations
 ;;
 ;; ======================================
+
+(defn ^:export connectSync
+  "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
+   supplied, separated by commas."
+  ([servers-string] (connect servers-string nil))
+  ([servers-string opts]
+   (let [opts' (js->clj opts :keywordize-keys true)]
+     (conn-handler/connect servers-string opts'))))
 
 (defn ^:export connect
   "Connect to a ledger server using URL address. If using a ledger group, multiple addresses can be
@@ -400,6 +406,21 @@
             (log/error e)
             (reject e)))))))
 
+(defn ^:export dbSchema
+  "Returns db's schema map."
+  [db]
+  (js/Promise.
+    (fn [resolve reject]
+      (async/go
+        (try
+          (-> (<? db)
+              :schema
+              clj->js
+              (resolve))
+          (catch :default e
+            (log/error e)
+            (reject e)))))))
+
 
 (defn ^:export collectionId
   "Returns promise containing collection id given a collection name.
@@ -455,7 +476,7 @@
             (reject e)))))))
 
 
-(defn ^:export subid
+(defn ^:export subId
   "Returns promise containing subject id given a subject
   identity or a subject id.
   If subject doesn't exist, returns nil."
@@ -472,6 +493,12 @@
           (catch :default e
             (log/error e)
             (reject e)))))))
+
+
+(defn ^:export subid
+  [db ident]
+  (log/warn "DEPRECATED: subid - use subId instead")
+  (subId db ident))
 
 
 (defn ^:export deleteLedger
@@ -526,8 +553,7 @@
     (fn [resolve reject]
       (async/go
         (try
-          (-> (ops/ledger-stats-async conn ledger)
-              <?
+          (-> (<? (ops/ledger-stats-async conn ledger))
               clj->js
               (resolve))
           (catch :default e
@@ -542,8 +568,7 @@
     (fn [resolve reject]
       (async/go
         (try
-          (-> (ops/ledgers-async conn)
-              <?
+          (-> (<? (ops/ledgers-async conn))
               clj->js
               (resolve))
           (catch :default e
@@ -679,8 +704,7 @@
         (try
           (-> flake-parts
               js->clj
-              (as-> fp (dbproto/-search (<? db) fp))
-              <?
+              (as-> fp (<? (dbproto/-search (<? db) fp)))
               (as-> flakes (map flake/Flake->parts flakes))
               clj->js
               (resolve))
@@ -1066,9 +1090,8 @@
       (async/go
         (try
           (-> (js->clj query-map :keywordize-keys true)
-               (as-> qm (query/query source qm))
-               <?
-               clj->js
+              (as-> qm (<? (query/query source qm)))
+              clj->js
                resolve)
           (catch :default e
             (log/error e)
@@ -1089,8 +1112,7 @@
           (let [{:keys [query flakes]} (js->clj param :keywordize-keys true)
                 flakes' (map flake/parts->Flake flakes)
                 db-with (dbproto/-forward-time-travel (<? db) flakes')]
-            (-> (query/query db-with query)
-                <?
+            (-> (<? (query/query db-with query))
                 clj->js
                 resolve))
           (catch :default e
@@ -1130,8 +1152,7 @@
                  json/parse
                  sql/parse
                  (update :opts merge clj-opts)
-                 (as-> q (query/query-async db q))
-                 <?
+                 (as-> q (<? (query/query-async db q)))
                  clj->js
                  resolve))
            (catch :default e
