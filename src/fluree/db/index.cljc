@@ -176,6 +176,24 @@
                    novelty)]
     (flakes-through through-t subrange)))
 
+(defn add-flakes
+  [leaf flakes]
+  (-> leaf
+      (update :flakes flake/conj-all flakes)
+      (update :size (fn [size]
+                      (->> flakes
+                           (map flake/size-flake)
+                           (reduce + size))))))
+
+(defn rem-flakes
+  [leaf flakes]
+  (-> leaf
+      (update :flakes flake/disj-all flakes)
+      (update :size (fn [size]
+                      (->> flakes
+                           (map flake/size-flake)
+                           (reduce - size))))))
+
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
   `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later
@@ -185,10 +203,10 @@
     leaf
     (cond-> leaf
       (> leaf-t t)
-      (update :flakes flake/conj-all (novelty-subrange leaf t idx-novelty))
+      (add-flakes (novelty-subrange leaf t idx-novelty))
 
       (< leaf-t t)
-      (update :flakes flake/disj-all (filter-after t flakes))
+      (rem-flakes (filter-after t flakes))
 
       true
       (assoc :t t))))
