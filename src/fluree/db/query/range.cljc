@@ -179,12 +179,9 @@
 (defn flake-filter-xf
   [{:keys [subject-fn predicate-fn object-fn]}]
   (let [filter-xfs (cond-> []
-                     subject-fn   (conj (filter (fn [f]
-                                                  (subject-fn (flake/s f)))))
-                     predicate-fn (conj (filter (fn [f]
-                                                  (predicate-fn (flake/p f)))))
-                     object-fn    (conj (filter (fn [f]
-                                                  (object-fn (flake/o f))))))]
+                     subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
+                     predicate-fn (conj (filter (fn [f] (predicate-fn (flake/p f)))))
+                     object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
     (apply comp filter-xfs)))
 
 (defn filter-index-flakes
