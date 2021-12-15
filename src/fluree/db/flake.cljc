@@ -340,42 +340,6 @@
   [op1 op2]
   (cmp-bool op1 op2))
 
-(defn cmp-flakes-spot [f1 f2]
-  (combine-cmp
-    (cmp-subj (s f1) (s f2))
-    (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (o f2))
-    (cmp-meta (m f1) (m f2))))
-
-
-(defn cmp-flakes-psot [f1 f2]
-  (combine-cmp
-    (cmp-pred (p f1) (p f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-obj (o f1) (o f2))
-    (cmp-meta (m f1) (m f2))))
-
-
-(defn cmp-flakes-post [f1 f2]
-  (combine-cmp
-    (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (o f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-meta (m f1) (m f2))))
-
-(defn cmp-flakes-opst
-  "note that opst sorts values as subjects"
-  [f1 f2]
-  (combine-cmp
-    (cmp-subj (o f1) (o f2))
-    (cmp-pred (p f1) (p f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-meta (m f1) (m f2))))
-
-;; When we look up an item in history, we can quickly find the relevant items,
-;; then apply changes in reverse. The alternative would be to reverse an entire
-;; node, which might work better for generic caching purposes.
-
 (defn cmp-flakes-spot-novelty [f1 f2]
   (combine-cmp
     (cmp-subj (s f1) (s f2))
