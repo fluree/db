@@ -1,7 +1,7 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.10.3"}
-         org.clojure/clojurescript       {:mvn/version "1.10.879"}
          org.clojure/core.async          {:mvn/version "1.3.622"}
          org.clojure/core.cache          {:mvn/version "1.0.217"}
+         org.clojure/clojurescript       {:mvn/version "1.10.891"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
          org.clojure/data.xml            {:mvn/version "0.2.0-alpha6"}
