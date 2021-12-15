@@ -15,8 +15,8 @@
   "Turns :first and :rhs into flakes"
   [child-node]
   (assoc child-node
-         :first (some-> child-node :floor flake/parts->Flake)
-         :rhs  (some-> child-node :rhs flake/parts->Flake)))
+         :first (some-> child-node :first flake/parts->Flake)
+         :rhs   (some-> child-node :rhs flake/parts->Flake)))
 
 (defn- deserialize-db-root
   [db-root]
