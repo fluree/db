@@ -340,7 +340,7 @@
   [op1 op2]
   (cmp-bool op1 op2))
 
-(defn cmp-flakes-spot-novelty [f1 f2]
+(defn cmp-flakes-spot [f1 f2]
   (combine-cmp
     (cmp-subj (s f1) (s f2))
     (cmp-pred (p f1) (p f2))
@@ -349,7 +349,7 @@
     (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
 
-(defn cmp-flakes-psot-novelty [f1 f2]
+(defn cmp-flakes-psot [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-subj (s f2) (s f1))
@@ -359,7 +359,7 @@
     (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-post-novelty [f1 f2]
+(defn cmp-flakes-post [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-obj (o f1) (o f2))
@@ -369,7 +369,7 @@
     (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-opst-novelty [f1 f2]
+(defn cmp-flakes-opst [f1 f2]
   (combine-cmp
     (cmp-subj (o f1) (o f2))
     (cmp-pred (p f1) (p f2))
@@ -380,7 +380,7 @@
 
 
 (defn cmp-flakes-block
-  "Comparison for flakes in blocks. Like cmp-flakes-spot-novelty, but with 't'
+  "Comparison for flakes in blocks. Like cmp-flakes-spot, but with 't'
   moved up front."
   [f1 f2]
   (combine-cmp
