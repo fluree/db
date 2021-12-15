@@ -21,7 +21,7 @@
   (exists? [s k] "Returns true when `k` exists in `s`")
   (read [s k] "Reads raw bytes from `s` associated with `k`")
   (write [s k data] "Writes `data` as raw bytes to `s` and associates it with `k`")
-  (rename [s old-key new-key] "Remove `old-key` and associates it's data to `new-key`"))
+  (rename [s old-key new-key] "Remove `old-key` and associate its data to `new-key`"))
 
 #?(:clj
    (defn block-storage-path
