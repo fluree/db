@@ -16,7 +16,9 @@
             (str x))))
 
 (defn type-check
-  "(type-check type object) transforms a object to match the type. If it cannot be transformed, it throws an ex-info with a map from paths into the object to errors encountered at those paths."
+  "(type-check type object) transforms an object to match the type. If it
+  cannot be transformed, it throws an ex-info with a map from paths into the
+  object to errors encountered at those paths."
   ([object spec]
    (let [errors    (atom {})
          conformed (type-check object spec [] errors)
