@@ -61,7 +61,8 @@
                                                             "host" server-name)
                                              sig-parts)
         signature   (get sig-map "signature")
-        _           (log/debug "Getting account id from signing string \""
+        _           (println "************ HOOBAJOOB WTFBBQ!!!!!!! ***************")
+        _           (println "Getting account id from signing string \""
                                sign-string "\" and signature \"" signature "\"")
         authority   (crypto/account-id-from-message sign-string signature)
         keyId       (get sig-map "keyId")
