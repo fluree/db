@@ -57,8 +57,8 @@
                                                :error  :db/invalid-auth}))))
         sig-parts   (str/split (get sig-map "headers" "") #" ")
         sign-string (generate-signing-string (assoc headers "method" request-method
-                                                            "path" uri
-                                                            "host" server-name)
+                                                            "path" uri)
+                                                            ;"host" server-name)
                                              sig-parts)
         signature   (get sig-map "signature")
         _           (println "************ HOOBAJOOB WTFBBQ!!!!!!! ***************")
