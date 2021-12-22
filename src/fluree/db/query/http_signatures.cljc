@@ -61,10 +61,10 @@
                                                             ;"host" server-name)
                                              sig-parts)
         signature   (get sig-map "signature")
-        _           (log/debug (str "Getting account id from signing string \""
-                                    sign-string "\" and signature \"" signature "\""))
+        _           (println (str "Getting account id from signing string \""
+                                  sign-string "\" and signature \"" signature "\""))
         authority   (crypto/account-id-from-message sign-string signature)
-        _           (log/debug "Got account-id:" authority)
+        _           (println "Got account-id:" authority)
         keyId       (get sig-map "keyId")
         auth        (if (= "na" keyId) nil keyId)]
     (log/debug "Verifying signature. Sign string: " sign-string " Signature: " signature " Account Id: " auth)
