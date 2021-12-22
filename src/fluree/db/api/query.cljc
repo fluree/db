@@ -200,8 +200,6 @@
         acc'))))
 
 
-
-
 (defn block-range
   "Returns a core async channel of blocks from start block (inclusive) to end if provided (exclusive).
   Each block is a separate map, containing keys :block, :t and :flakes.
