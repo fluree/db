@@ -1,35 +1,28 @@
 (ns fluree.db.query.range
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
+            [fluree.db.index :as index]
+            [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
+            [fluree.db.util.log :as log]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.permissions-validate :as perm-validate]
+            #?(:clj  [clojure.core.async :refer [chan go go-loop <! >!] :as async]
+               :cljs [cljs.core.async :refer [chan <! >!] :refer-macros [go go-loop] :as async])
+            #?(:clj [fluree.db.permissions-validate :as perm-validate])
             [fluree.db.util.async :refer [<? go-try]])
   #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
-(defn value-with-nil-pred
-  "Checks whether an index range is :spot, starts with [s1 -1 o1] and ends with [s1 int/max p1]"
-  [idx ^Flake start-flake ^Flake end-flake]
-  (and (= :spot idx)
-       (not (nil? (.-o start-flake)))
-       (= (.-o start-flake) (.-o end-flake))
-       (= -1 (.-p start-flake))
-       (= flake/MAX-PREDICATE-ID (.-p end-flake))))
-
-
 (defn- pred-id-strict
   "Will throw if predicate doesn't exist."
   [db p]
   (when p
     (or (dbproto/-p-prop db :id p)
-        (throw (ex-info (str "Invalid predicate, does not exist: " p) {:status 400 :error :db/invalid-predicate})))))
+        (throw (ex-info (str "Invalid predicate, does not exist: " p)
+                        {:status 400, :error :db/invalid-predicate})))))
 
 
 (defn- match->flake-parts
@@ -37,19 +30,21 @@
   returns flake-ordered components of [s p o t op m].
   Coerces idents and string predicate names."
   [db idx match]
-  (let [[p1 p2 p3 t op m] match]
+  (let [[p1 p2 p3 p4 op m] match]
     (case idx
-      :spot [p1 (dbproto/-p-prop db :id p2) p3 t op m]
-      :psot [p2 (dbproto/-p-prop db :id p1) p3 t op m]
-      :post [p3 (dbproto/-p-prop db :id p1) p2 t op m]
-      :opst [p3 (dbproto/-p-prop db :id p2) p1 t op m])))
-
+      :spot [p1 (dbproto/-p-prop db :id p2) p3 p4 op m]
+      :psot [p2 (dbproto/-p-prop db :id p1) p3 p4 op m]
+      :post [p3 (dbproto/-p-prop db :id p1) p2 p4 op m]
+      :opst [p3 (dbproto/-p-prop db :id p2) p1 p4 op m]
+      :tspo [p2 (dbproto/-p-prop db :id p3) p4 p1 op m])))
 
 
 (def ^{:private true :const true} subject-min-match [util/max-long])
 (def ^{:private true :const true} subject-max-match [util/min-long])
 (def ^{:private true :const true} pred-min-match [0])
 (def ^{:private true :const true} pred-max-match [flake/MAX-PREDICATE-ID])
+(def ^{:private true :const true} txn-max-match [util/min-long])
+(def ^{:private true :const true} txn-min-match [0])
 
 
 (defn- min-match
@@ -59,168 +54,256 @@
     :spot subject-min-match
     :psot pred-min-match
     :post pred-min-match
-    :opst subject-min-match))
+    :opst subject-min-match
+    :tspo txn-min-match))
 
 
 (defn- max-match
-  "Smallest index flake part match by index"
+  "Biggest index flake part match by index"
   [idx]
   (case idx
     :spot subject-max-match
     :psot pred-max-match
     :post pred-max-match
-    :opst subject-max-match))
+    :opst subject-max-match
+    :tspo txn-max-match))
 
+(defn resolve-subid
+  [db id]
+  (let [out (chan)]
+    (if-not id
+      (async/close! out)
+      (if (util/pred-ident? id)
+        (-> db
+            (dbproto/-subid id)
+            (async/pipe out))
+        (async/put! out id)))
+    out))
+
+(defn resolve-match-flake
+  [db test parts]
+  (go-try
+   (let [[s p o t op m] parts
+         s' (<? (resolve-subid db s))
+         o' (<? (resolve-subid db o))
+         m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
+     (flake/->Flake s' p o' t op m'))))
+
+(defn resolve-leaf
+  [{:keys [conn] :as db} root-node flake]
+  (go-try
+   (let [next-leaf     (<? (index/lookup-leaf conn root-node flake))
+         resolved-leaf (<? (index/resolve conn next-leaf))]
+     resolved-leaf)))
+
+(defn leaf-range
+  "Returns a channel that will eventually contain a stream of index leaf nodes
+  from index `idx` within the database `db` starting with the node containing
+  `start-flake` and ending with the node containing `end-flake` one-by-one. Any
+  exceptions encountered while resolving index nodes will be placed on
+  `error-ch`"
+  [{:keys [conn] :as db} idx start-flake end-flake error-ch]
+  (let [idx-root    (get db idx)
+        idx-compare (get-in db [:comparators idx])
+        leaf-ch     (chan)]
+    (go
+      (try* (let [root-node (<? (index/resolve conn idx-root))]
+              (do (loop [next-flake start-flake]
+                    (when (and next-flake
+                               (not (pos? (idx-compare next-flake end-flake))))
+                      (when-let [next-leaf (<? (resolve-leaf db root-node next-flake))]
+                        (when (>! leaf-ch next-leaf)
+                          (recur (:rhs next-leaf))))))
+                  (async/close! leaf-ch)))
+            (catch* e
+                    (log/error e
+                               "Error resolving leaf range for index" idx
+                               "between flake" start-flake "and" end-flake
+                               "in ledger" (select-keys db [:network :dbid :t]))
+                    (>! error-ch e))))
+    leaf-ch))
+
+(defn flake-range
+  "Returns a channel that will eventually contain a stream of flakes from index
+  `idx` within the database `db` between `start-flake` and `end-flake`,
+  inclusive, one-by-one, and sorted by the order of `idx`. Any exceptions
+  encountered while resolving index nodes will be placed on `error-ch`"
+  [{:keys [conn] :as db}
+   idx
+   {:keys [from-t to-t start-test start-flake
+           end-test end-flake]}
+   error-ch]
+  (let [novelty  (get-in db [:novelty idx])]
+    (-> db
+        (leaf-range idx start-flake end-flake error-ch)
+        (async/pipe (chan 1 (comp (map (fn [leaf]
+                                         (index/at-t leaf to-t novelty)))
+                                  (map :flakes)
+                                  (map (partial index/t-range from-t to-t))
+                                  (mapcat (fn [flakes]
+                                            (flake/subrange flakes
+                                                            start-test start-flake
+                                                            end-test end-flake)))))))))
+
+(defn filter-authorized
+  "Returns a channel that will eventually contain only the schema flakes and the
+  flakes validated by fluree.db.permissions-validate/allow-flake? function for
+  the database `db` from the `flake-stream` channel"
+  [flake-stream {:keys [permissions] :as db} start end error-ch]
+  #?(:cljs
+     flake-stream ; Note this bypasses all permissions in CLJS for now!
+
+     :clj
+     (let [s1 (flake/s start)
+           p1 (flake/p start)
+           s2 (flake/s end)
+           p2 (flake/p end)]
+       (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
+         flake-stream
+         (let [out-ch (chan)]
+           (go
+             (try* (loop []
+                     (when-let [flake (<! flake-stream)]
+                       (when (or (schema-util/is-schema-flake? flake)
+                                 (<? (perm-validate/allow-flake? db flake)))
+                         (>! out-ch flake))
+                       (recur)))
+                   (async/close! out-ch)
+                   (catch* e
+                           (log/error e
+                                      "Error validating flake in ledger"
+                                      (select-keys db [:network :dbid :t]))
+                           (>! error-ch e))))
+           out-ch)))))
+
+(defn flake-filter-xf
+  [{:keys [subject-fn predicate-fn object-fn]}]
+  (let [filter-xfs (cond-> []
+                     subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
+                     predicate-fn (conj (filter (fn [f] (predicate-fn (flake/p f)))))
+                     object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
+    (apply comp filter-xfs)))
+
+(defn filter-index-flakes
+  [flake-ch filter-fns]
+  (let [filter-xf (flake-filter-xf filter-fns)]
+    (async/pipe flake-ch
+                (chan 1 filter-xf))))
+
+(defn take-only
+  [ch limit]
+  (if limit
+    (async/take limit ch)
+    ch))
+
+(defn select-subject-window
+  "Returns a channel that contains the flakes from `flake-ch`, skipping the flakes
+  from the first `offset` subjects encountered and including the flakes from a
+  maximum of `subject-limit` subjects."
+  [flake-ch {:keys [subject-limit offset]
+             :or   {offset 0}}]
+  (let [subj-ch (chan 1 (comp (partition-by flake/s)
+                              (drop offset)))
+        out-ch  (chan 1 cat)]
+    (-> flake-ch
+        (async/pipe subj-ch)
+        (take-only subject-limit)
+        (async/pipe out-ch))))
+
+(defn index-range-stream
+  [{:keys [permissions t], :as db}
+   idx
+   {:keys [from-t to-t start-test start-flake end-test end-flake
+           flake-limit offset subject-fn predicate-fn object-fn]
+    subject-limit :limit
+    :or {offset 0}}
+   error-ch]
+
+  (let [novelty  (get-in db [:novelty idx])]
+    (-> db
+        (flake-range idx
+                     {:from-t t
+                      :to-t t
+                      :start-test start-test
+                      :start-flake start-flake
+                      :end-test end-test
+                      :end-flake end-flake}
+                     error-ch)
+        (filter-index-flakes {:subject-fn subject-fn
+                              :predicate-fn predicate-fn
+                              :object-fn object-fn})
+        (filter-authorized db start-flake end-flake error-ch)
+        (select-subject-window {:subject-limit subject-limit
+                                :flake-limit flake-limit
+                                :offset offset})
+        (take-only flake-limit))))
+
+(defn expand-range-interval
+  "Finds the full index or time range interval including the maximum and minimum
+  tests when only one test is provided"
+  [idx test match]
+  (condp identical? test
+    =  [>= match <= match]
+    <  [> (min-match idx) < match]
+    <= [> (min-match idx) <= match]
+    >  [> match <= (max-match idx)]
+    >= [>= match < (max-match idx)]))
 
 (defn time-range
   "Range query across an index.
 
-  Uses a DB, but in the future support supplying a connection and db name, as we don't need a 't'
+  Uses a DB, but in the future support supplying a connection and db name, as we
+  don't need a 't'
 
-  Ranges take the natural numeric sort orders, but all results will
-  return in reverse order (newest subjects and predicates first).
+  Ranges take the natural numeric sort orders, but all results will return in
+  reverse order (newest subjects and predicates first).
 
   Returns core async channel.
 
   opts:
-  :from-t - start transaction (transaction 't' is negative, so smallest number is most recent). Defaults to db's t
+  :from-t - start transaction (transaction 't' is negative, so smallest number
+            is most recent). Defaults to db's t
   :to-t - stop transaction - can be null, which pulls full history
-  :xform - xform applied to each result individually. This is not used when :chan is supplied.
+  :xform - xform applied to each result individually. This is not used
+           when :chan is supplied.
   :limit - max number of flakes to return"
   ([db idx] (time-range db idx {}))
   ([db idx opts] (time-range db idx >= (min-match idx) <= (max-match idx) opts))
   ([db idx test match] (time-range db idx test match {}))
   ([db idx test match opts]
-   ;; only one test provided, we need to figure out the other test.
    (let [[start-test start-match end-test end-match]
-         (condp identical? test
-           = [>= match <= match]
-           < [> (min-match idx) < match]
-           <= [> (min-match idx) <= match]
-           > [> match <= (max-match idx)]
-           >= [>= match < (max-match idx)])]
+         (expand-range-interval idx test match)]
      (time-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (time-range db idx start-test start-match end-test end-match {}))
-  ([db idx start-test start-match end-test end-match opts]
-   ;; formulate a comparison flake based on conditions
-   (go-try
-     (let [[s1 p1 o1 t1 op1 m1] (match->flake-parts db idx start-match)
-           [s2 p2 o2 t2 op2 m2] (match->flake-parts db idx end-match)
-           s1                 (if (util/pred-ident? s1)
-                                (<? (dbproto/-subid db s1))
-                                s1)
-           s2                 (if (util/pred-ident? s2)
-                                (<? (dbproto/-subid db s2))
-                                s2)
-           o1                 (if (util/pred-ident? o1)
-                                (<? (dbproto/-subid db o1))
-                                o1)
-           o2                 (if (util/pred-ident? o2)
-                                (<? (dbproto/-subid db o2))
-                                o2)
-           ;; for >=, start at the beginning of the possible range for exp and for > start at the end
-           p1                 (if (and (nil? p1) o1) -1 p1)
-           p2                 (if (and (nil? p2) o2) flake/MAX-PREDICATE-ID p2)
-           m1                 (or m1 (if (identical? >= start-test) util/min-integer util/max-integer))
-           m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
-           ;; flip values, because they do have a lexicographical sort order
-           ^Flake start-flake (flake/->Flake s1 p1 o1 t1 op1 m1)
-           end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
-           limit              (or (:limit opts) util/max-long)
-           permissions        (:permissions db)
-           idx-compare        (get-in db [:index-configs idx :comparator])
-           from-t             (or (:from-t opts) (:t db))
-           to-t               (:to-t opts)
-           ;; Note this bypasses all permissions in CLJS for now!
-           no-filter?         #?(:clj (perm-validate/no-filter? permissions s1 s2 p1 p2)
-                                 :cljs (if (identical? *target* "nodejs")
-                                         (perm-validate/no-filter? permissions s1 s2 p1 p2)
-                                         ;; always allow for browser-mode
-                                         true))
-           novelty            (get-in db [:novelty idx])
-           root-node          (-> db
-                                  (get idx)
-                                  dbproto/-resolve
-                                  <?)]
-       (loop [next-node (<? (dbproto/-lookup-leaf root-node start-flake))
-              i         0
-              acc       nil]
-         (let [flakes       (<? (dbproto/-resolve-history-range next-node from-t to-t novelty))
-               base-result  (flake/subrange flakes start-test start-flake end-test end-flake)
-               base-result' (if (value-with-nil-pred idx start-flake end-flake)
-                              (reduce
-                                (fn [filtered-result ^Flake f]
-                                  (if (= (.-o f) (.-o start-flake))
-                                    filtered-result
-                                    (disj filtered-result f)))
-                                base-result base-result)
-                              base-result)
+  ([{t :t :as db} idx start-test start-match end-test end-match opts]
+   (let [{:keys [limit from-t to-t]
+          :or   {from-t t, to-t t}}
+         opts
 
-               rhs          (dbproto/-rhs next-node)        ;; can be nil if at farthest right point
-               acc*         (if no-filter?
-                              (into (flake/take (- limit i) base-result') acc)
-                              (loop [[f & r] base-result'   ;; we must filter, check each flake
-                                     i'   i
-                                     acci base-result']
-                                (if (or (nil? f) (> i' limit))
-                                  (into acci acc)
-                                  (recur r
-                                         (inc i')
-                                         ;; Note this bypasses all permissions in CLJS (browser) for now!
-                                         #?(:clj  (if (<? (perm-validate/allow-flake? db f))
-                                                    acci
-                                                    (disj acci f))
-                                            :cljs (if (identical? *target* "nodejs")
-                                                    ; check permissions for nodejs
-                                                    (if (<? (perm-validate/allow-flake? db f))
-                                                      acci
-                                                      (disj acci f))
-                                                    ; always include for browser
-                                                    acci))))))
-               i*           (count acc*)
-               more?        (and rhs
-                                 (neg? (idx-compare rhs end-flake))
-                                 (< i* limit))]
-           (if-not more?
-             acc*
-             (recur (<? (dbproto/-lookup-leaf root-node rhs)) i* acc*))))))))
-
-
-(defn subject-groups->allow-flakes
-  "Starting with flakes grouped by subject id, filters the flakes until
-  either flake-limit or subject-limit reached."
-  [db subject-groups flake-start subject-start flake-limit subject-limit]
-  (go-try
-    (loop [[subject-flakes & r] subject-groups
-           flake-count   flake-start
-           subject-count subject-start
-           acc           []]
-      (if (or (nil? subject-flakes) (>= flake-count flake-limit) (>= subject-count subject-limit))
-        [flake-count subject-count acc]
-        (let [subject-filtered #?(:clj (<? (perm-validate/allow-flakes? db subject-flakes))
-                                  :cljs (if (identical? *target* "nodejs")
-                                          (<? (perm-validate/allow-flakes? db subject-flakes))
-                                          subject-flakes))
-              flakes-new-count         (count subject-filtered)
-              subject-new-count        (if (= 0 flakes-new-count) 0 1)]
-          (recur r (+ flake-count flakes-new-count)
-                 (+ subject-count subject-new-count)
-                 (into acc subject-filtered)))))))
-
-
-(defn find-next-valid-node
-  [root-node rhs t novelty fast-forward-db?]
-  (go-try
-    (loop [lookup-leaf (<? (dbproto/-lookup-leaf root-node rhs))]
-      (let [node (try*
-                   (<? (dbproto/-resolve-to-t lookup-leaf t novelty fast-forward-db?))
-                   (catch* e nil))]
-        (if node node
-                 (if-let [rhs (:rhs lookup-leaf)]
-                   (recur (<? (dbproto/-lookup-leaf root-node rhs)))
-                   nil))))))
-
+         idx-compare (get-in db [:comparators idx])
+         start-parts (match->flake-parts db idx start-match)
+         end-parts   (match->flake-parts db idx end-match)]
+     (go-try
+       (let [start-flake  (<? (resolve-match-flake db start-test start-parts))
+             end-flake    (<? (resolve-match-flake db end-test end-parts))
+             error-ch     (chan)
+             range-stream (index-range-stream db
+                                              idx
+                                              {:from-t from-t
+                                               :to-t to-t
+                                               :start-test start-test
+                                               :start-flake start-flake
+                                               :end-test end-test
+                                               :end-flake end-flake
+                                               :flake-limit limit}
+                                              error-ch)
+             range-vec-ch (async/into [] range-stream)]
+         (async/alt!
+           error-ch     ([e]
+                         (throw e))
+           range-vec-ch ([hist-range]
+                         (apply flake/sorted-set-by idx-compare hist-range))))))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
@@ -237,151 +320,65 @@
   ([db idx opts] (index-range db idx >= (min-match idx) <= (max-match idx) opts))
   ([db idx test match] (index-range db idx test match {}))
   ([db idx test match opts]
-   ;; only one test provided, we need to figure out the other test.
    (let [[start-test start-match end-test end-match]
-         (condp identical? test
-           = [>= match <= match]
-           < [> (min-match idx) < match]
-           <= [> (min-match idx) <= match]
-           > [> match <= (max-match idx)]
-           >= [>= match < (max-match idx)])]
+         (expand-range-interval idx test match)]
      (index-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
-  ([db idx start-test start-match end-test end-match opts]
-   ;; formulate a comparison flake based on conditions
-   (go-try
-     (let [[s1 p1 o1 t1 op1 m1] (match->flake-parts db idx start-match)
-           [s2 p2 o2 t2 op2 m2] (match->flake-parts db idx end-match)
-           {:keys [subject-fn predicate-fn object-fn]} opts
-           s1                 (if (util/pred-ident? s1)
-                                (<? (dbproto/-subid db s1))
-                                s1)
-           s2                 (if (util/pred-ident? s2)
-                                (<? (dbproto/-subid db s2))
-                                s2)
-           [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1 (boolean? o2) o2 :else nil)]
-                                 [[nil nil] (fn [o] (= o bool))]
-                                 [[o1 o2] object-fn])
-           o1                 (if (util/pred-ident? o1)
-                                (<? (dbproto/-subid db o1))
-                                o1)
-           o2                 (if (util/pred-ident? o2)
-                                (<? (dbproto/-subid db o2))
-                                o2)
-           ;; for >=, start at the beginning of the possible range for exp and for > start at the end
-           p1                 (if (and (nil? p1) o1) -1 p1)
-           p2                 (if (and (nil? p2) o2) flake/MAX-PREDICATE-ID p2)
-           m1                 (or m1 (if (identical? >= start-test) util/min-integer util/max-integer))
-           m2                 (or m2 (if (identical? <= end-test) util/max-integer util/min-integer))
-           ;; flip values, because they do have a lexicographical sort order
-           ^Flake start-flake (flake/->Flake s1 p1 o1 t1 op1 m1)
-           end-flake          (flake/->Flake s2 p2 o2 t2 op2 m2)
-           {:keys [flake-limit limit offset]
-            :or   {flake-limit util/max-long
-                   offset      0}} opts
-           limit              (or limit util/max-long)
-           max-limit?         (= limit util/max-long)
-           permissions        (:permissions db)
-           idx-compare        (get-in db [:index-configs idx :comparator])
-           t                  (:t db)
-           novelty            (get-in db [:novelty idx])
-           fast-forward-db?   (:tt-id db)
-           root-node          (-> (get db idx)
-                                  (dbproto/-resolve)
-                                  (<?))
-           node-start         (<? (find-next-valid-node root-node start-flake t novelty fast-forward-db?))
-           no-filter?         #?(:clj (perm-validate/no-filter? permissions s1 s2 p1 p2)
-                                 :cljs (if (identical? *target* "nodejs")
-                                         (perm-validate/no-filter? permissions s1 s2 p1 p2)
-                                         true))]
-       (if node-start (loop [next-node node-start
-                             offset    offset               ;; offset counts down from the offset
-                             i         0                    ;; i is count of flakes
-                             s         0                    ;; s is the count of subjects
-                             acc       []]                  ;; acc is all of the flakes we have accumulated thus far
-                        (let [base-result  (flake/subrange (:flakes next-node) start-test start-flake end-test end-flake)
-                              base-result' (cond->> base-result
+  ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match
+    {:keys [object-fn] :as opts}]
+   (let [idx-compare (get-in db [:comparators idx])
 
-                                                    (value-with-nil-pred idx start-flake end-flake)
-                                                    (filter #(= (.-o ^Flake %) (.-o start-flake)))
+         [s1 p1 o1 t1 op1 m1]
+         (match->flake-parts db idx start-match)
 
-                                                    subject-fn
-                                                    (filter #(subject-fn (.-s ^Flake %)))
+         [s2 p2 o2 t2 op2 m2]
+         (match->flake-parts db idx end-match)
 
-                                                    predicate-fn
-                                                    (filter #(predicate-fn (.-p ^Flake %)))
+         [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1
+                                                  (boolean? o2) o2
+                                                  :else nil)]
+                               [[nil nil] (fn [o] (= o bool))]
+                               [[o1 o2] object-fn])]
 
-                                                    object-fn
-                                                    (filter #(object-fn (.-o ^Flake %))))
-                              rhs          (dbproto/-rhs next-node) ;; can be nil if at farthest right point
-                              [offset* i* s* acc*] (if (and max-limit? (= 0 offset) no-filter?)
-                                                     (let [i+   (count base-result')
-                                                           acc* (into acc (take (- flake-limit i) base-result'))]
-                                                       ;; we don't care about s if max-limit
-                                                       [0 (+ i i+) s acc*])
-
-                                                     (let [partitioned              (partition-by #(.-s ^Flake %) base-result')
-                                                           count-partitioned-result (count partitioned)]
-                                                       (if (> offset count-partitioned-result)
-                                                         [(- offset count-partitioned-result) i s acc]
-                                                         (let [offset-res (drop offset partitioned)
-                                                               offset*    0
-                                                               [i* s* res-flakes] (if no-filter?
-                                                                                    (let [offset-res-count (count offset-res)
-                                                                                          subject-count    (+ s offset-res-count)
-                                                                                          limit-drop       (- subject-count limit)
-                                                                                          [s* limit-take*] (if (pos-int? limit-drop)
-                                                                                                             [limit (- offset-res-count limit-drop)]
-                                                                                                             [subject-count subject-count])
-                                                                                          res-flakes       (->> (take limit-take* offset-res)
-                                                                                                                (apply concat))
-                                                                                          res-i-count      (count res-flakes)
-                                                                                          i*               (+ i res-i-count)
-                                                                                          [i* res-flakes] (if (> i* flake-limit)
-                                                                                                            [flake-limit (take (- res-i-count (- i* flake-limit))
-                                                                                                                               res-flakes)]
-
-                                                                                                            [i* res-flakes])]
-                                                                                      [i* s* res-flakes])
-
-                                                                                    ;; if there is a filter, we want to handle limit and filtering
-                                                                                    ;; at the same time
-                                                                                    (<? (subject-groups->allow-flakes db offset-res i s flake-limit limit)))]
-                                                           [offset* i* s* (into acc res-flakes)]))))
-                              ;; TODO - handle situation where subject is across multiple nodes...
-                              more?        (and rhs
-                                                (neg? (idx-compare rhs end-flake))
-                                                (< i* flake-limit)
-                                                (< s* limit))
-                              next-node    (when more?
-                                             (<? (find-next-valid-node root-node rhs t novelty fast-forward-db?)))
-                              more?        (and more? next-node)]
-                          (if-not more?
-                            acc*
-                            (recur next-node offset* i* s* acc*))))
-                      nil)))))
-
+     (go-try
+      (let [start-flake  (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
+            end-flake    (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))
+            error-ch     (chan)
+            range-stream (index-range-stream db
+                                             idx
+                                             (assoc opts
+                                                    :from-t      t
+                                                    :to-t        t
+                                                    :start-test  start-test
+                                                    :start-flake start-flake
+                                                    :end-test    end-test
+                                                    :end-flake   end-flake
+                                                    :object-fn   object-fn)
+                                             error-ch)
+            range-vec-ch (async/into [] range-stream)]
+        (async/alt!
+           error-ch     ([e]
+                         (throw e))
+           range-vec-ch ([idx-range]
+                         (apply flake/sorted-set-by idx-compare idx-range))))))))
 
 (defn non-nil-non-boolean?
   [o]
   (and (not (nil? o))
        (not (boolean? o))))
 
-
 (defn tag-string?
   [possible-tag]
   (re-find #"^[a-zA-Z0-9-_]*/[a-zA-Z0-9-_]*:[a-zA-Z0-9-]*$" possible-tag))
 
-
 (def ^:const tag-sid-start (flake/min-subject-id const/$_tag))
 (def ^:const tag-sid-end (flake/max-subject-id const/$_tag))
-
 
 (defn is-tag-flake?
   "Returns true if flake is a root setting flake."
   [^Flake f]
-  (<= tag-sid-start (.-o f) tag-sid-end))
+  (<= tag-sid-start (flake/o f) tag-sid-end))
 
 
 (defn coerce-tag-flakes
@@ -394,7 +391,6 @@
               o (<? (dbproto/-tag db o p))]
           (recur r (conj acc (flake/parts->Flake [s p o t op m]))))
         (recur r (conj acc flake))) acc)))
-
 
 (defn search
   ([db fparts]
@@ -444,30 +440,26 @@
                                   res)]
              res*))))
 
-
 (defn collection
   "Returns spot index range for only the requested collection."
   ([db name] (collection db name nil))
   ([db name opts]
    (go
      (try*
-       (if-let [partition (dbproto/-c-prop db :partition name)]
-         (<? (index-range db :spot
-                          >= [(flake/max-subject-id partition)]
-                          <= [(flake/min-subject-id partition)]
-                          opts))
-
-         (throw (ex-info (str "Invalid collection name: " (pr-str name))
-                         {:status 400
-                          :error  :db/invalid-collection})))
-       (catch* e e)))))
-
+      (if-let [id (dbproto/-c-prop db :id name)]
+        (<? (index-range db :spot
+                         >= [(flake/max-subject-id id)]
+                         <= [(flake/min-subject-id id)]
+                         opts))
+        (throw (ex-info (str "Invalid collection name: " (pr-str name))
+                        {:status 400
+                         :error  :db/invalid-collection})))
+      (catch* e e)))))
 
 (defn _block-or_tx-collection
   "Returns spot index range for only the requested collection."
   [db opts]
   (index-range db :spot > [0] <= [util/min-long] opts))
-
 
 (defn txn-from-flakes
   "Returns vector of transactions from a set of flakes.
@@ -481,16 +473,15 @@
   (loop [[flake' & r] flakes result* []]
     (if (nil? flake')
       result*
-      (let [obj     (.-o ^Flake flake')
+      (let [obj     (flake/o flake')
             cmd-map (try*
-                      (json/parse obj)
-                      (catch* e nil))                       ; log an error if transaction is not parsable?
+                     (json/parse obj)
+                     (catch* e nil))                       ; log an error if transaction is not parsable?
             {:keys [type db tx nonce auth expire]} cmd-map]
         (recur r
                (if (= type "tx")
                  (conj result* {:db db :tx tx :nonce nonce :auth auth :expire expire})
                  result*))))))
-
 
 (defn block-with-tx-data
   "Returns block data as a map, with the following keys:
@@ -508,27 +499,11 @@
     (if (nil? block')
       result*
       (let [{:keys [block t flakes]} block'
-            prev-hash   (some
-                          #(let [f ^Flake %]
-                             (when (= (.-p f) const/$_block:prevHash)
-                               (.-o f)))
-                          flakes)
-            hash        (some
-                          #(let [f ^Flake %]
-                             (when (= (.-p f) const/$_block:hash)
-                               (.-o f)))
-                          flakes)
-            instant     (some
-                          #(let [f ^Flake %]
-                             (when (= (.-p f) const/$_block:instant)
-                               (.-o f)))
-                          flakes)
-            sigs        (some
-                          #(let [f ^Flake %]
-                             (when (= (.-p f) const/$_block:sigs)
-                               (.-o f)))
-                          flakes)
-            txn-flakes  (filter #(= (.-p ^Flake %) const/$_tx:tx) flakes)
+            prev-hash   (some #(when (= (flake/p %) const/$_block:prevHash) (flake/o %)) flakes)
+            hash        (some #(when (= (flake/p %) const/$_block:hash) (flake/o %)) flakes)
+            instant     (some #(when (= (flake/p %) const/$_block:instant) (flake/o %)) flakes)
+            sigs        (some #(when (= (flake/p %) const/$_block:sigs) (flake/o %)) flakes)
+            txn-flakes  (filter #(= (flake/p %) const/$_tx:tx) flakes)
             txn-flakes' (txn-from-flakes txn-flakes)]
         (recur r (conj result* {:block     block
                                 :t         t
@@ -538,4 +513,3 @@
                                 :sigs      sigs
                                 :flakes    flakes
                                 :txn       txn-flakes'}))))))
-
