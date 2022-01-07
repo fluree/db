@@ -43,6 +43,13 @@
      `(throw-err (clojure.core.async/<!! ~ch))))
 
 #?(:clj
+   (defmacro alts??
+     "Like alts!! but throws errors. Only works for Java platform - no JavaScript."
+     [ports & opts]
+     `(let [[result# ch#] (clojure.core.async/alts!! ~ports ~@opts)]
+        [(throw-err result#) ch#])))
+
+#?(:clj
    (defmacro go-try
      "Like go but catches the first thrown error and returns it."
      [& body]
