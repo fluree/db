@@ -1,4 +1,4 @@
-(ns fluree.db.graphdb
+(ns fluree.db.json-ld-db
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.storage.core :as storage]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -13,7 +13,11 @@
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [clojure.string :as str]
-            [fluree.json-ld :as json-ld])
+            [fluree.json-ld :as json-ld]
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.memorydb :as memdb]
+            [alphabase.core :as alphabase]
+            [fluree.db.json-ld.reify :as jld-reify])
   #?(:clj (:import (fluree.db.flake Flake)
                    (java.io Writer))))
 
@@ -76,31 +80,21 @@
   [db flakes flakes-bytes]
   (let [{:keys [novelty schema]} db
         pred-map (:pred schema)
-        {:keys [spot psot post opst size]} novelty]
-    (loop [[[p p-flakes] & r] (group-by #(.-p ^Flake %) flakes)
-           spot (transient spot)
-           psot (transient psot)
-           post (transient post)
-           opst (transient opst)]
-      (if p-flakes
-        (let [exclude? (exclude-predicates p)
-              {:keys [idx? ref?]} (get pred-map p)]
-          (if exclude?
-            (recur r spot psot post opst)
-            (recur r
-                   (reduce conj! spot p-flakes)
-                   (reduce conj! psot p-flakes)
-                   (if idx?
-                     (reduce conj! post p-flakes)
-                     post)
-                   (if ref?
-                     (reduce conj! opst p-flakes)
-                     opst))))
-        {:spot (persistent! spot)
-         :psot (persistent! psot)
-         :post (persistent! post)
-         :opst (persistent! opst)
-         :size (+ size #?(:clj @flakes-bytes :cljs flakes-bytes))}))))
+        {:keys [spot psot post opst size]} novelty
+        res      {:spot (into spot flakes)
+                  :psot (into psot flakes)
+                  :post (into post flakes)
+                  :opst (->> flakes
+                             (sort-by #(.-p ^Flake %))
+                             (partition-by #(.-p ^Flake %))
+                             (reduce
+                               (fn [opst* p-flakes]
+                                 (if (get-in pred-map [(.-p ^Flake (first p-flakes)) :ref?])
+                                   (into opst* p-flakes)
+                                   opst*))
+                               opst))
+                  :size (+ size #?(:clj @flakes-bytes :cljs flakes-bytes))}]
+    res))
 
 
 (defn- with-t-ecount
@@ -127,21 +121,6 @@
        :ecount          ecount})))
 
 
-(defn- with-t-add-pred-idx
-  "If the schema changed and existing predicates are newly marked as :index true or :unique true they
-   must be added to novelty (if novelty-max is not exceeded)."
-  [proposed-db before-db flakes opts]
-  (go-try
-    (let [pred-ecount      (-> before-db :ecount (get const/$_predicate))
-          add-pred-to-idx? (schema-util/add-to-post-preds? flakes pred-ecount)]
-      (if (seq add-pred-to-idx?)
-        (loop [[add-pred & r] add-pred-to-idx?
-               db proposed-db]
-          (if add-pred
-            (recur r (<? (add-predicate-to-idx db add-pred opts)))
-            db))
-        proposed-db))))
-
 
 (defn- with-t-updated-schema
   "If the schema changed, there may be also be new flakes with the transaction that rely on those
@@ -149,15 +128,12 @@
 
   This is not common, so while this duplicates the novelty work, in most circumstances
   it allows novelty to be run in parallel and this function is never triggered."
-  [proposed-db before-db flakes flake-bytes opts]
+  [proposed-db flakes flake-bytes]
   (go-try
-    (let [schema-map (<? (schema/schema-map proposed-db))
-          novelty    (with-t-novelty (assoc before-db :schema schema-map) flakes flake-bytes)]
-      (-> proposed-db
-          (assoc :schema schema-map
-                 :novelty novelty)
-          (with-t-add-pred-idx before-db flakes opts)
-          <?))))
+    (let [schema  (<? (vocab/vocab-map proposed-db))
+          novelty (with-t-novelty (assoc proposed-db :schema schema) flakes flake-bytes)]
+      (assoc proposed-db :schema schema
+                         :novelty novelty))))
 
 
 (defn- with-t-updated-settings
@@ -188,7 +164,7 @@
                          :novelty #?(:clj @novelty :cljs novelty)
                          :ecount ecount
                          :stats stats*)
-               schema-change? (-> (with-t-updated-schema db flakes bytes opts) <?)
+               schema-change? (-> (with-t-updated-schema flakes bytes) <?)
                setting-change? (-> with-t-updated-settings <?))))))
 
 
@@ -200,31 +176,19 @@
    (let [resp-ch (async/promise-chan)]
      (async/go
        (try*
-         (when (and (not= block (inc (:block db))))
-           (throw (ex-info (str "Invalid 'with' called for db " (:dbid db) " because current db 'block', " (:block db) " must be one less than supplied block " block ".")
-                           {:status 500
-                            :error  :db/unexpected-error})))
          (if (empty? flakes)
-           (async/put! resp-ch (assoc db :block block))
-           (let [flakes             (sort flake/cmp-flakes-block flakes)
-                 ^Flake first-flake (first flakes)
-                 db*                (loop [[^Flake f & r] flakes
-                                           t        (.-t first-flake) ;; current 't' value
-                                           t-flakes []      ;; all flakes for current 't'
-                                           db       db]
-                                      (cond (and f (= t (.-t f)))
-                                            (recur r t (conj t-flakes f) db)
-
-                                            :else
-                                            (let [db' (-> db
-                                                          (assoc :t (inc t)) ;; due to permissions, an entire 't' may be filtered out, set to 't' prior to the new flakes
-                                                          (with-t t-flakes opts)
-                                                          (<?))]
-                                              (if (nil? f)
-                                                (assoc db' :block block)
-                                                (recur r (.-t f) [f] db')))))]
-
-             (async/put! resp-ch db*)))
+           (async/put! resp-ch db)
+           (let [flakes-by-t (->> flakes
+                                  (sort flake/cmp-flakes-block)
+                                  (partition-by :t))]
+             (loop [[t-flakes & r] flakes-by-t
+                    db db]
+               (if t-flakes
+                 (let [db' (-> db
+                               (with-t t-flakes opts)
+                               <?)]
+                   (recur r db'))
+                 (async/put! resp-ch db)))))
          (catch* e
                  (async/put! resp-ch e))))
      resp-ch)))
@@ -398,9 +362,9 @@
 
 ;; ================ end GraphDB record support fns ============================
 
-(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst
-                    schema settings index-configs schema-cache novelty
-                    permissions fork fork-block current-db-fn]
+(defrecord JsonLdDb [conn network dbid block t tt-id stats spot psot post opst
+                     schema settings index-configs schema-cache novelty
+                     permissions fork fork-block current-db-fn ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
@@ -427,17 +391,17 @@
   (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil)))
 
 #?(:cljs
-   (extend-type GraphDb
+   (extend-type JsonLdDb
      IPrintWithWriter
      (-pr-writer [db w opts]
-       (-write w "#FlureeGraphDB ")
+       (-write w "#FlureeJsonLdDb ")
        (-write w (pr {:network     (:network db) :dbid (:dbid db) :block (:block db)
                       :t           (:t db) :stats (:stats db)
                       :permissions (:permissions db)})))))
 
 #?(:clj
-   (defmethod print-method GraphDb [^GraphDb db, ^Writer w]
-     (.write w (str "#FlureeGraphDB "))
+   (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
+     (.write w (str "#FlureeJsonLdDb "))
      (binding [*out* w]
        (pr {:network (:network db) :dbid (:dbid db) :block (:block db)
             :t       (:t db) :stats (:stats db) :permissions (:permissions db)}))))
@@ -480,237 +444,174 @@
                                   :comparator        flake/cmp-flakes-opst
                                   :historyComparator flake/cmp-flakes-opst-novelty})})
 
+(def genesis-ecount {const/$_predicate  (flake/->sid const/$_predicate 1000)
+                     const/$_collection (flake/->sid const/$_collection 19)
+                     const/$_tag        (flake/->sid const/$_tag 1000)
+                     const/$_fn         (flake/->sid const/$_fn 1000)
+                     const/$_user       (flake/->sid const/$_user 1000)
+                     const/$_auth       (flake/->sid const/$_auth 1000)
+                     const/$_role       (flake/->sid const/$_role 1000)
+                     const/$_rule       (flake/->sid const/$_rule 1000)
+                     const/$_setting    (flake/->sid const/$_setting 1000)
+                     const/$_prefix     (flake/->sid const/$_prefix 1000)
+                     const/$_shard      (flake/->sid const/$_shard 1000)})
+
+(def default-config {:context {"schema" "http://schema.org/"
+                               "wiki"   "https://www.wikidata.org/wiki/"}
+                     :methods {:ipfs {:endpoint "http://127.0.0.1:5001/"}
+                               :s3   {:access-key ""
+                                      :region     ""}}})
+
 (defn blank-db
-  [conn network dbid schema-cache current-db-fn]
-  (assert conn "No conn provided when creating new db.")
-  (assert network "No network provided when creating new db.")
-  (assert dbid "No dbid provided when creating new db.")
-  (let [novelty     (new-novelty-map default-index-configs)
-        permissions {:collection {:all? false}
-                     :predicate  {:all? true}
-                     :root?      true}
-        spot        (new-empty-index conn default-index-configs network dbid :spot)
-        psot        (new-empty-index conn default-index-configs network dbid :psot)
-        post        (new-empty-index conn default-index-configs network dbid :post)
-        opst        (new-empty-index conn default-index-configs network dbid :opst)
-        stats       {:flakes  0
-                     :size    0
-                     :indexed 0}
-        fork        nil
-        fork-block  nil
-        schema      nil
-        settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst schema
-               settings default-index-configs schema-cache novelty permissions
-               fork fork-block current-db-fn)))
+  ([config]
+   (let [{:keys [context did name push publish]} config
+         db-name       (or name (str (util/random-uuid)))
+         read-only? (nil? push)]
+     (-> (blank-db (memdb/fake-conn) "ipfs" db-name
+                   (atom {}) (fn []
+                               (throw
+                                 (ex-info "This is the earliest version of DB, not way to retrieve newer"
+                                          {}))))
+         (assoc :config (-> config
+                            (assoc :read-only? read-only?)
+                            (dissoc :context))
+                :context context))))
+  ([method {:keys [context methods did opts iri] :as config}]
+   (let [method* (keyword method)
+         method-config (or (get methods method*)
+                           (get-in default-config [:methods method])
+                           (throw (ex-info (str "Ledger method identifier has not corresponding configuration: "
+                                                method* ". Configured methods include: "
+                                                (or (keys methods) (keys (:methods default-config))) ".")
+                                           {:status 400 :error :db/invalid-ledger-method})))
+         db-name       (or iri (str (util/random-uuid)))]
+     (-> (blank-db (memdb/fake-conn) method db-name
+                   (atom {}) (fn []
+                               (throw
+                                 (ex-info "This is the earliest version of DB, not way to retrieve newer"
+                                          {}))))
+         (assoc :method-config method-config
+                :context context
+                :opts (assoc opts :did did)))))
+  ([conn network dbid schema-cache current-db-fn]
+   (assert conn "No conn provided when creating new db.")
+   (assert network "No network provided when creating new db.")
+   (assert dbid "No dbid provided when creating new db.")
+   (let [novelty     (new-novelty-map default-index-configs)
+         permissions {:collection {:all? false}
+                      :predicate  {:all? true}
+                      :root?      true}
+         spot        (new-empty-index conn default-index-configs network dbid :spot)
+         psot        (new-empty-index conn default-index-configs network dbid :psot)
+         post        (new-empty-index conn default-index-configs network dbid :post)
+         opst        (new-empty-index conn default-index-configs network dbid :opst)
+         stats       {:flakes  0
+                      :size    0
+                      :indexed 0}
+         fork        nil
+         fork-block  nil
+         schema      {:refs #{}}
+         settings    nil
+         db          (->JsonLdDb conn network dbid 0 0 nil stats spot psot post opst schema
+                                 settings default-index-configs schema-cache novelty permissions
+                                 fork fork-block current-db-fn genesis-ecount)]
+     (if current-db-fn
+       db
+       (assoc db :current-db-fn (constantly db))))))
 
-(defn graphdb?
+
+(defn load-db
+  ([db-name] (load-db db-name nil))
+  ([db-name config]
+   (let [blank-db (blank-db config)]
+     (jld-reify/load-db blank-db db-name))))
+
+
+(defn json-ld-db?
   [db]
-  (instance? GraphDb db))
+  (instance? JsonLdDb db))
 
-(def predefined-properties
-  {"http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
-   "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
-   "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
-   "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty})
-
-(def class+property-iris (into #{} (keys predefined-properties)))
-
-(defn class-or-property?
-  [{:keys [type] :as node}]
-  (some class+property-iris type))
-
-
-(defn json-ld-type-data
-  "Returns two-tuple of [class-subject-ids class-flakes]
-  where class-flakes will only contain newly generated class
-  flakes if they didn't already exist."
-  [class-iris t iris next-pid]
-  (loop [[class-iri & r] class-iris
-         class-sids   []
-         class-flakes []]
-    (if class-iri
-      (if-let [existing (get @iris class-iri)]
-        (recur r (conj class-sids existing) class-flakes)
-        (let [type-sid (if-let [predefined-pid (get predefined-properties class-iri)]
-                         predefined-pid
-                         (next-pid))]
-          (vswap! iris assoc class-iri type-sid)
-          (recur r
-                 (conj class-sids type-sid)
-                 (conj class-flakes (flake/->Flake type-sid const/$iri class-iri t true nil)))))
-      [class-sids class-flakes])))
-
-(defn add-property
-  [sid property {:keys [id value] :as v-map} t iris next-sid]
-  (let [existing-pid   (get @iris property)
-        pid            (or existing-pid
-                           (let [new-id (next-sid)]
-                             (vswap! iris assoc property new-id)
-                             new-id))
-        property-flake (when-not existing-pid
-                         (flake/->Flake pid const/$iri property t true nil))
-        flakes         (if id
-                         (let [[id-sid id-flake] (if-let [existing (get @iris id)]
-                                                   [existing nil]
-                                                   (let [id-sid (next-sid)]
-                                                     (vswap! iris assoc id id-sid)
-                                                     (if (str/starts-with? id "_:") ;; blank node
-                                                       [id-sid nil]
-                                                       [id-sid (flake/->Flake id-sid const/$iri id t true nil)])))]
-                           (cond-> [(flake/->Flake sid pid id-sid t true nil)]
-                                   id-flake (conj id-flake)))
-                         [(flake/->Flake sid pid value t true nil)])]
-    (cond-> flakes
-            property-flake (conj property-flake))))
-
-
-(defn json-ld-node->flakes
-  [node t iris next-pid next-sid]
-  (let [id           (:id node)
-        existing-sid (when id (get @iris id))
-        sid          (or existing-sid
-                         (let [new-sid (if (class-or-property? node)
-                                         (next-pid)
-                                         (next-sid))]
-                           (vswap! iris assoc id new-sid)
-                           new-sid))
-        base-flakes  (if (or (nil? id)
-                             existing-sid
-                             (str/starts-with? id "_:"))
-                       []
-                       [(flake/->Flake sid const/$iri id t true nil)])]
-    (fluree.db.util.log/warn "base-flakes: " id base-flakes)
-    (reduce-kv
-      (fn [flakes k v]
-        (case k
-          (:id :idx) flakes
-          :type (let [[type-sids class-flakes] (json-ld-type-data v t iris next-pid)
-                      type-flakes (map #(flake/->Flake sid const/$rdf:type % t true nil) type-sids)]
-                  (into flakes (concat class-flakes type-flakes)))
-          ;;else
-          (if (sequential? v)
-            (into flakes (mapcat #(add-property sid k % t iris next-sid) v))
-            (into flakes (add-property sid k v t iris next-sid)))))
-      base-flakes node)))
-
-(defn json-ld-graph->flakes
-  "Raw JSON-LD graph to a set of flakes"
-  [json-ld opts]
-  (let [t        (or (:t opts) -1)
-        block    (or (:block opts) 1)
-        expanded (fluree.json-ld/expand json-ld)
-        iris     (volatile! {})
-        last-pid (volatile! 1000)
-        last-sid (volatile! (flake/->sid const/$_default 0))
-        next-pid (fn [] (vswap! last-pid inc))
-        next-sid (fn [] (vswap! last-sid inc))]
-    (loop [[node & r] expanded
-           flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
-      (if node
-        (recur r (into flakes (json-ld-node->flakes node t iris next-pid next-sid)))
-        {:block  block
-         :t      t
-         :flakes flakes}))))
-
-(defn with-json-ld
-  [db block flakes]
-
-  )
 
 (comment
 
   (def conn (fluree.db.memorydb/fake-conn))
+
   (def db (blank-db conn "blah" "hi" (atom {}) (fn [] (throw (Exception. "NO CURRENT DB FN YET")))))
 
-  ;; database identifier
-  "fluree:ipfs:cid"
-  "fluree:ipns:docs.ipfs.io/introduction/index.html"
+  db
 
-  "fluree:hub:namespace/db/named-graph#iri"
-
-  "fluree:s3:us-west2.mybucket/cars"
-  ;; a specific URL
-  "fluree:http://127.0.0.1:5001/mynamespace/cars"
-
-  "did:fluree:ipfs:cid:iri#keys-1"
-
-  (set! methods {:ipfs {:server-type :ipfs
-                        :endpoint    "http://localhost:5001"
-                        :access-key  ""
-                        :secret      ""}})
-
-  (def myledger (connect "fluree:ipns:docs.ipfs.io/cars"
-                         {:server-type :ipfs
-                          :endpoint    "http://localhost:5001"
-                          :access-key  ""
-                          :secret      ""}))
-
-  (def myledger2 (connect "fluree:ipns:docs.ipfs.io/cars"
-                          {:server-type :fluree-hub
-                           :endpoint    "http://localhost:5001"
-                           :access-key  ""
-                           :secret      ""}))
-
-  (def vledger (combine myledger myledger2))
-
-  (transact myledger {})
-
-  (new-ledger new-ledger (combine myledger myledger2))
-
-
-
-  (def mydb "fluree:ipfs:<cid>")
-  (def mydb (db myledger 10))
-  (def mydb (db myledger "<hash>"))
-
-
-  (def mydb "fluree:ipns:docs.ipfs.io/cars/10")
-
-
-
-  {:server-type :fluree-peer                                ;; ipfs
-   :endpoint    "http://localhost:5001"
-   :access-key  ""
-   :secret      ""
-   }
-
-
-  (def flakes (json-ld-graph->flakes {"@context" {"owl" "http://www.w3.org/2002/07/owl#",
-                                                  "ex"  "http://example.org/ns#"},
-                                      "@graph"   [{"@id"   "ex:ontology",
-                                                   "@type" "owl:Ontology"}
-                                                  {"@id"   "ex:Book",
-                                                   "@type" "owl:Class"}
-                                                  {"@id"   "ex:Person",
-                                                   "@type" "owl:Class"}
-                                                  {"@id"   "ex:author",
-                                                   "@type" "owl:ObjectProperty"}
-                                                  {"@id"   "ex:name",
-                                                   "@type" "owl:DatatypeProperty"}
-                                                  {"@type"     "ex:Book",
-                                                   "ex:author" {"@id" "_:b1"}}
-                                                  {"@id"     "_:b1",
-                                                   "@type"   "ex:Person",
-                                                   "ex:name" {"@value" "Fred"
-                                                              "@type"  "xsd:string"}}]}
-                                     {}))
+  (def flakes (fluree.db.json-ld.flakes/json-ld-graph->flakes
+                {"@context" {"owl" "http://www.w3.org/2002/07/owl#",
+                             "ex"  "http://example.org/ns#"},
+                 "@graph"   [{"@id"   "ex:ontology",
+                              "@type" "owl:Ontology"}
+                             {"@id"   "ex:Book",
+                              "@type" "owl:Class"}
+                             {"@id"   "ex:Person",
+                              "@type" "owl:Class"}
+                             {"@id"   "ex:author",
+                              "@type" "owl:ObjectProperty"}
+                             {"@id"   "ex:name",
+                              "@type" "owl:DatatypeProperty"}
+                             {"@type"     "ex:Book",
+                              "ex:author" {"@id" "_:b1"}}
+                             {"@id"     "_:b1",
+                              "@type"   "ex:Person",
+                              "ex:name" {"@value" "Fred"
+                                         "@type"  "xsd:string"}}
+                             {"@id"     "ex:someMember",
+                              "@type"   "ex:Person",
+                              "ex:name" {"@value" "Brian"
+                                         "@type"  "xsd:string"}}]}
+                {}))
 
   flakes
 
-  (-> db
-      :novelty)
 
-  (def db2 (async/<!! (with db 1 (:flakes flakes))))
+  (def db2 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes))))
 
   (-> db2
-      :schema)
+      :novelty)
 
-  @(fluree.db.api/query (with db 1 (:flakes flakes))
-                        {:select ["*"]
-                         :from   "http://example.org/ns#ontology"})
+  @(fluree.db.api/query (async/go db2)
+                        {:context {"ex" "http://example.org/ns#"}
+                         :select  ["*"]
+                         :from    "http://example.org/ns#someMember"})
 
+  @(fluree.db.api/query (async/go db2)
+                        {:context {"ex" "http://example.org/ns#"}
+                         :select  ["?p" "?o"]
+                         :where   [["http://example.org/ns#someMember" "?p" "?o"]]})
+
+  (async/<!! (schema/schema-map db2))
+
+
+
+  (def flakes2 (fluree.db.json-ld.flakes/json-ld-graph->flakes
+                 {"@context" "https://schema.org/",
+                  "@graph"   [{"@id"             "http://worldcat.org/entity/work/id/2292573321",
+                               "@type"           "Book",
+                               "author"          {"@id" "http://viaf.org/viaf/17823"},
+                               "inLanguage"      "fr",
+                               "name"            "Rouge et le noir",
+                               "workTranslation" {"@type" "Book", "@id" "http://worldcat.org/entity/work/id/460647"}}
+                              {"@id"               "http://worldcat.org/entity/work/id/460647",
+                               "@type"             "Book",
+                               "about"             "Psychological fiction, French",
+                               "author"            {"@id" "http://viaf.org/viaf/17823"},
+                               "inLanguage"        "en",
+                               "name"              "Red and Black : A New Translation, Backgrounds and Sources, Criticism",
+                               "translationOfWork" {"@id" "http://worldcat.org/entity/work/id/2292573321"},
+                               "translator"        {"@id" "http://viaf.org/viaf/8453420"}}]}
+                 {}))
+  flakes2
+
+  (def db3 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes2))))
+
+  (-> db3 :schema :pred (get "https://schema.org/Book"))
+
+  @(fluree.db.api/query (async/go db3)
+                        {:context "https://schema.org/"
+                         :select  {"?s" ["*", {"workTranslation" ["*"]}]}
+                         :where   [["?s" "a" "Book"]]})
   )
-
-
