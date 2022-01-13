@@ -2,7 +2,7 @@
   (:require [clojure.java.io :as io]
             [criterium.core :as criterium]
             [fluree.db.api :as fdb]
-            [clojure.tools.logging :as log]
+            [fluree.db.util.log :as log]
             [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)

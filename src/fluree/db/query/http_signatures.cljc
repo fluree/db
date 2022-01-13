@@ -75,7 +75,7 @@
   with it. If it exists and is invalid, throws exception."
   [req]
   (when-let [sig-header-str (get (:headers req) "signature")]
-    (log/trace (str "Verifying http signature header: " sig-header-str))
+    (log/trace "Verifying http signature header:" sig-header-str)
     (verify-signature-header* req sig-header-str)))
 
 

@@ -530,7 +530,7 @@
                              (reset! default-cache-atom (default-object-cache-factory memory-object-size))
                              ;; user-supplied close function
                              (when (fn? close-fn) (close-fn))
-                             (log/info :conn-closed))
+                             (log/info "connection closed"))
         servers*           (normalize-servers servers transactor?)
         storage-read*      (or storage-read (default-storage-read conn-id servers* opts))
         storage-exists*    (or storage-exists storage-read (default-storage-read conn-id servers* opts))
