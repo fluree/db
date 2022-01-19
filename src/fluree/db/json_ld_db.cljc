@@ -362,7 +362,7 @@
 
 ;; ================ end GraphDB record support fns ============================
 
-(defrecord JsonLdDb [conn network dbid block t tt-id stats spot psot post opst
+(defrecord JsonLdDb [conn network dbid block t tt-id stats spot psot post opst tsop
                      schema settings index-configs schema-cache novelty
                      permissions fork fork-block current-db-fn ecount]
   dbproto/IFlureeDb
@@ -414,35 +414,6 @@
            (let [ss (flake/sorted-set-by (get-in index-configs [idx :historyComparator]))]
              (assoc m idx ss)))
          {:size 0})))
-
-(defn new-empty-index
-  [conn index-configs network dbid idx]
-  (let [index-config (get index-configs idx)
-        _            (assert index-config (str "No index config found for index: " idx))
-        comparator   (:historyComparator index-config)
-        _            (assert comparator (str "No index comparator found for index: " idx))
-        first-flake  (flake/->Flake util/max-long -1 util/max-long 0 true nil) ;; left hand side is the largest flake possible
-        child-node   (storage/map->UnresolvedNode
-                       {:conn  conn :config index-config :network network :dbid dbid :id :empty :leaf true
-                        :first first-flake :rhs nil :size 0 :block 0 :t 0 :tt-id nil :leftmost? true})
-        children     (flake/sorted-map-by comparator first-flake child-node)
-        idx-node     (index/->IndexNode 0 0 nil children index-config true)]
-    ;; mark all indexes as dirty to ensure they get written to disk on first indexing process
-    idx-node))
-
-(def default-index-configs
-  {:spot (index/map->IndexConfig {:index-type        :spot
-                                  :comparator        flake/cmp-flakes-spot
-                                  :historyComparator flake/cmp-flakes-spot-novelty})
-   :psot (index/map->IndexConfig {:index-type        :psot
-                                  :comparator        flake/cmp-flakes-psot
-                                  :historyComparator flake/cmp-flakes-psot-novelty})
-   :post (index/map->IndexConfig {:index-type        :post
-                                  :comparator        flake/cmp-flakes-post
-                                  :historyComparator flake/cmp-flakes-post-novelty})
-   :opst (index/map->IndexConfig {:index-type        :opst
-                                  :comparator        flake/cmp-flakes-opst
-                                  :historyComparator flake/cmp-flakes-opst-novelty})})
 
 (def genesis-ecount {const/$_predicate  (flake/->sid const/$_predicate 1000)
                      const/$_collection (flake/->sid const/$_collection 19)
@@ -497,24 +468,30 @@
    (assert conn "No conn provided when creating new db.")
    (assert network "No network provided when creating new db.")
    (assert dbid "No dbid provided when creating new db.")
-   (let [novelty     (new-novelty-map default-index-configs)
+   (let [novelty     (new-novelty-map index/default-comparators)
          permissions {:collection {:all? false}
                       :predicate  {:all? true}
                       :root?      true}
-         spot        (new-empty-index conn default-index-configs network dbid :spot)
-         psot        (new-empty-index conn default-index-configs network dbid :psot)
-         post        (new-empty-index conn default-index-configs network dbid :post)
-         opst        (new-empty-index conn default-index-configs network dbid :opst)
-         stats       {:flakes  0
-                      :size    0
-                      :indexed 0}
+
+         {spot-cmp :spot
+          psot-cmp :psot
+          post-cmp :post
+          opst-cmp :opst
+          tspo-cmp :tspo} index/default-comparators
+
+         spot (index/empty-branch network dbid spot-cmp)
+         psot (index/empty-branch network dbid psot-cmp)
+         post (index/empty-branch network dbid post-cmp)
+         opst (index/empty-branch network dbid opst-cmp)
+         tspo (index/empty-branch network dbid tspo-cmp)
+         stats       {:flakes  0, :size    0, :indexed 0}
          fork        nil
          fork-block  nil
          schema      {:refs #{}}
          settings    nil
-         db          (->JsonLdDb conn network dbid 0 0 nil stats spot psot post opst schema
-                                 settings default-index-configs schema-cache novelty permissions
-                                 fork fork-block current-db-fn genesis-ecount)]
+         db          (->JsonLdDb conn network dbid 0 0 nil stats spot psot post opst tspo schema
+                                 settings index/default-comparators schema-cache novelty
+                                 permissions fork fork-block current-db-fn genesis-ecount)]
      (if current-db-fn
        db
        (assoc db :current-db-fn (constantly db))))))

@@ -323,21 +323,24 @@
     (let [msg     (<? update-chan)
           session (from-cache network ledger-id)]
       (cond
-        (nil? msg)                                          ;; channel closed, likely connection closed. If it wasn't force close just in case.
-        (log/info (str "Channel closed for session updates for: " network "/" ledger-id "."))
+        (nil? msg) ;; channel closed, likely connection closed. If it wasn't force close just in case.
+        (log/info "Channel closed for session updates for:" (str network "/" ledger-id))
 
-        (nil? session)                                      ;; unlikely to happen... if channel was closed previous condition would trigger
-        (log/warn (str "Ledger update received for session that is no longer open: " network "/" ledger-id ". Message: " (pr-str (first msg))))
+        (nil? session) ;; unlikely to happen... if channel was closed previous condition would trigger
+        (log/warn "Ledger update received for session that is no longer open:" (str network "/" ledger-id)
+                  "Message: " (first msg))
 
         :else
         (do
           (try*
             (let [[event-type event-data] msg]
-              (log/trace (str "[process-ledger-updates[" network "/$" ledger-id "]: ") (util/trunc (pr-str msg) 200))
+              (log/trace "[process-ledger-updates[" (str network "/" ledger-id) "]: "
+                         (util/trunc (pr-str msg) 200))
               (<? (process-ledger-update session event-type event-data)))
             (catch* e
-                    (log/error e "Exception processing ledger updates for message: " msg)))
+              (log/error e "Exception processing ledger updates for message:" msg)))
           (recur))))))
+
 
 (defn- session-factory
   "Creates a connection without first checking if db exists. Only useful if reloading
@@ -488,7 +491,7 @@
                  (async/go-loop []
                    (let [req (async/<! (:transact-chan session))]
                      (if (nil? req)
-                       (log/info (str "Transactor session closing for db: " network "/$" ledger-id "[" ledger-alias "]"))
+                       (log/info "Transactor session closing for db:" (str network "/" ledger-id "[" ledger-alias "]"))
                        ;; do some initial validation, then send to handler for synchronous processing
                        (do (transact-handler conn req)
                            (recur))))))))

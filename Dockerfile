@@ -1,18 +1,15 @@
-FROM clojure:tools-deps-1.10.3.967-slim-bullseye
+FROM clojure:tools-deps-1.10.3.1058-slim-bullseye
 
 RUN mkdir -p /usr/src/flureedb
 WORKDIR /usr/src/flureedb
 
 # Install the tools we need to install the tools we need
-RUN apt-get update && apt-get install -y wget curl gnupg2 software-properties-common
-
-# Add Chrome source for running CLJS tests
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
-RUN sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
+RUN apt-get update && apt-get install -y wget curl gnupg2 software-properties-common chromium
+ENV CHROME_BIN=/usr/bin/chromium
 
 # Add node PPA to get newer versions
 RUN curl -sL https://deb.nodesource.com/setup_14.x | bash -
-RUN apt-get update && apt-get install -y nodejs google-chrome-stable
+RUN apt-get update && apt-get install -y nodejs build-essential
 
 COPY deps.edn Makefile ./
 RUN make deps

@@ -1,52 +1,69 @@
 (ns fluree.db.query.block
-  (:require [fluree.db.storage.core :as storage]
-            [fluree.db.permissions-validate :as perm-validate]
-            #?(:clj  [clojure.core.async :refer [>! <! >!! <!! go chan buffer close! thread
-                                                 alts! alts!! timeout] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.log :as log]))
+  (:require [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
+            [fluree.db.query.range :refer [index-range]]
+            [fluree.db.util.async :refer [<? go-try]])
+  (:import fluree.db.flake.Flake))
 
-#?(:clj (set! *warn-on-reflection* true))
+(defn lookup-block-t
+  [db block-num]
+  (go-try
+   (let [flake-set (<? (index-range db :post = [const/$_block:number block-num]
+                                    {:limit 1, :flake-limit 1}))]
+     (->> flake-set
+          first
+          flake/s))))
 
-(defn- filter-block-flakes
-  "Applies filter(s) to flakes in a block"
+(def block-metadata-mapping
+  {const/$_block:hash         :hash
+   const/$_block:transactions :txns
+   const/$_block:instant      :instant
+   const/$_block:number       :block
+   const/$_block:sigs         :sigs})
+
+(defn reduce-block-metadata
+  [m f]
+  (let [p (flake/p f)
+        o (flake/o f)]
+    (if-let [metadata-key (get block-metadata-mapping p)]
+      (if (= metadata-key :txns)
+        (update m metadata-key conj o)
+        (assoc m metadata-key o))
+      m)))
+
+(defn lookup-block-metadata
+  [db block-t]
+  (go-try
+   (let [spot-flakes (<? (index-range db :spot = [block-t]))]
+     (reduce reduce-block-metadata {:t block-t} spot-flakes))))
+
+(defn block-flakes
+  [db min-t max-t]
+  (index-range db :tspo >= [min-t] <= [max-t]))
+
+(defn lookup-block
   [db block]
-  (let [root? (-> db :permissions :root?)]
-    (async/go
-      (try*
-        (if root?
-          block
-          {:block  (:block block)
-           :t      (:t block)
-           :flakes (<? (perm-validate/allow-flakes? db (:flakes block)))})
-        (catch* e
-                (log/error (str "Unable to validate permissions on block " (:block block) " error: " e))
-                {:block (:block block)
-                 :t     (:t block)
-                 :flakes []})))))
+  (go-try
+    (let [block-t  (<? (lookup-block-t db block))
+          metadata (<? (lookup-block-metadata db block-t))
+
+          ;; reverse max and min here because t decrements)
+          [min-t max-t] (apply (juxt max min) (:txns metadata))
+          flakes        (<? (block-flakes db min-t max-t))]
+      (assoc metadata :flakes flakes))))
 
 (defn block-range
-  "Returns a async channel containing each of the blocks from start (inclusive) to end if provided (inclusive). Should received PERMISSIONED db."
-  [db start end opts]
-  (async/go
-    (loop [db         db
-           reverse?   (when end (< end start))
-           next-block start
-           acc        []]
-      (let [{:keys [conn network dbid]} db
-            last-block  (or end start)                      ;; allow for nil end-block for now
-            res         (<? (storage/block conn network dbid next-block))
-            res #?(:cljs (if (identical? "nodejs" cljs.core/*target*)
-                           (<? (filter-block-flakes db res))
-                           res)  ;; browser: always allow for now
-                   :clj (<? (filter-block-flakes db res)))
-            acc'        (concat acc [res])]
-        (if (or (= next-block last-block) (util/exception? res))
-          acc'
-          (if reverse?
-            (recur db reverse? (dec next-block) acc')
-            (recur db reverse? (inc next-block) acc')))))))
-
-
+  [db start end _opts]
+  (let [reverse?   (when end (< end start))
+        last-block (or end start)]
+    (go-try
+      (loop [current-block start
+             blocks []]
+        (if (> current-block last-block)
+          blocks
+          (let [block   (<? (lookup-block db current-block))
+                blocks* (conj blocks block)
+                next-block (if reverse?
+                             (dec current-block)
+                             (inc current-block))]
+            (recur next-block blocks*)))))))

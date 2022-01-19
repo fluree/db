@@ -267,6 +267,7 @@
 
                         (and (nil? s) (not (nil? p)) (not (nil? o)))
                         [[p o s t] :post]
+
                         :else
                         (throw (ex-info (str "History query not properly formatted. Must include at least an subject or predicate to query. Provided: " history)
                                         {:status 400
@@ -339,7 +340,7 @@
           db     (<? sources)                               ;; only support 1 source currently
 
           [block-start block-end] (if block (<? (resolve-block-range db query-map)))
-          result (if (= '(:history) (keys (dissoc query-map :block :pretty-print :prettyPrint :auth :show-auth :showAuth :opts)))
+          result (if (contains? query-map :history)
                    (let [meta?    (:meta opts)
                          ;; From-t is the higher number, meaning it is the older time
                          ;; To-t is the lower number, meaning it is the newer time

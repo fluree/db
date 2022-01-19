@@ -5,6 +5,7 @@
                :cljs [cljs.core.async :as async])
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
+            [fluree.db.index :as index]
             [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
@@ -16,7 +17,8 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.query.http-signatures :as http-signatures]
             #?(:clj [fluree.db.serde.avro :refer [avro-serde]])
-            [fluree.db.conn-events :as conn-events]))
+            [fluree.db.conn-events :as conn-events]
+            [fluree.db.storage.core :as storage]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -107,19 +109,38 @@
 ;; blocks, flushes, etc.
 
 (defrecord Connection [id servers state req-chan sub-chan pub-chan group
-                       storage-read storage-write object-cache parallelism
-                       serializer default-network
-                       transactor? publish transact-handler
-                       tx-private-key tx-key-id
-                       meta
-                       add-listener remove-listener
-                       close]
+                       storage-read storage-write storage-exists storage-rename
+                       object-cache parallelism serializer default-network
+                       transactor? publish transact-handler tx-private-key
+                       tx-key-id meta add-listener remove-listener close]
+
+  storage/Store
+  (read [_ k]
+    (storage-read k))
+  (write [_ k data]
+    (storage-write k data))
+  (exists? [_ k]
+    (storage-exists k))
+  (rename [_ old-key new-key]
+    (storage-rename old-key new-key))
+
+  index/Resolver
+  (resolve
+    [conn {:keys [id leaf tempid] :as node}]
+    (if (= :empty id)
+      (storage/resolve-empty-leaf node)
+      (object-cache
+       [id tempid]
+       (fn [_]
+         (storage/resolve-index-node conn node
+                                     (fn []
+                                       (object-cache [id tempid] nil)))))))
+
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [{:keys [storage-type] :as conn} network dbid lang]
                      (when-let [path (-> conn :meta :file-storage-path)]
                        (full-text/disk-index path network dbid lang)))]))
-
 
 (defn- normalize-servers
   "Split servers in a string into a vector.
@@ -221,49 +242,46 @@
 
 (defn msg-producer
   "Shuffles outgoing messages to the web socket in order."
-  [conn]
-  (let [state      (:state conn)
-        req-chan   (:req-chan conn)
-        publish-fn (or (:publish conn)
-                       default-publish-fn)]
-    (async/go-loop [i 0]
-      (let [msg (async/<! req-chan)]
-        (when msg
-          (try*
-            (let [_ (log/trace "Outgoing message to websocket: " msg)
-                  [operation data resp-chan opts] msg
-                  {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
-                                               timeout 60000}} opts]
-              (when resp-chan
-                (swap! state assoc-in [:pending-req req-id] resp-chan)
-                (async/go
-                  (let [[resp c] (async/alts! [resp-chan (async/timeout timeout)])]
-                    ;; clear request from state
-                    (swap! state update :pending-req #(dissoc % req-id))
-                    ;; return result
-                    (if (= c resp-chan)
-                      resp
-                      ;; if timeout channel comes back first, respond with timeout error
-                      (ex-info (str "Request " req-id " timed out.")
-                               {:status 408
-                                :error  :db/timeout})))))
-              (let [published? (async/<! (publish-fn conn [operation req-id data]))]
-                (when-not (true? published?)
-                  (cond
-                    (util/exception? published?)
-                    (log/error published? "Error processing message in producer.")
+  [{:keys [state req-chan publish]
+    :or   {publish default-publish-fn}
+    :as   conn}]
+  (async/go-loop [i 0]
+    (when-let [msg (async/<! req-chan)]
+      (try*
+       (let [_ (log/trace "Outgoing message to websocket: " msg)
+             [operation data resp-chan opts] msg
+             {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
+                                          timeout 60000}} opts]
+         (when resp-chan
+           (swap! state assoc-in [:pending-req req-id] resp-chan)
+           (async/go
+             (let [[resp c] (async/alts! [resp-chan (async/timeout timeout)])]
+               ;; clear request from state
+               (swap! state update :pending-req #(dissoc % req-id))
+               ;; return result
+               (if (= c resp-chan)
+                 resp
+                 ;; if timeout channel comes back first, respond with timeout error
+                 (ex-info (str "Request " req-id " timed out.")
+                          {:status 408
+                           :error  :db/timeout})))))
+         (let [published? (async/<! (publish conn [operation req-id data]))]
+           (when-not (true? published?)
+             (cond
+               (util/exception? published?)
+               (log/error published? "Error processing message in producer.")
 
-                    (nil? published?)
-                    (log/error "Error processing message in producer. Socket closed.")
+               (nil? published?)
+               (log/error "Error processing message in producer. Socket closed.")
 
-                    :else
-                    (log/error "Error processing message in producer. Socket closed. Published result" published?)))))
-            (catch* e
-                    (let [[_ _ resp-chan] (when (sequential? msg) msg)]
-                      (if (and resp-chan (channel? resp-chan))
-                        (async/put! resp-chan e)
-                        (log/error e (str "Error processing ledger request, no valid return channel: " (pr-str msg)))))))
-          (recur (inc i)))))))
+               :else
+               (log/error "Error processing message in producer. Socket closed. Published result" published?)))))
+       (catch* e
+               (let [[_ _ resp-chan] (when (sequential? msg) msg)]
+                 (if (and resp-chan (channel? resp-chan))
+                   (async/put! resp-chan e)
+                   (log/error e (str "Error processing ledger request, no valid return channel: " (pr-str msg)))))))
+      (recur (inc i)))))
 
 
 (defn ping-transactor
@@ -289,23 +307,24 @@
             ;; assume connection dropped, close!
             (do
               (log/warn "Connection has gone stale. Perhaps network conditions are poor. Disconnecting socket.")
-              #?(:cljs
-                 (let [cb (:keep-alive-fn conn)]
-                   (cond
+              (let [cb (:keep-alive-fn conn)]
+                (cond
 
-                     (nil? cb)
-                     (log/trace "No keep-alive callback is registered")
+                  (nil? cb)
+                  (log/trace "No keep-alive callback is registered")
 
-                     ;clojurescript-recognized function - yay!
-                     (fn? cb)
-                     (cb)
+                  (fn? cb)
+                  (cb)
 
-                     ;try javascript eval
-                     (string? cb)
+                  (string? cb)
+                  #?(:cljs
+                     ;; try javascript eval
                      (eval cb)
+                     :clj
+                     (log/warn "Unsupported clojure callback registered" {:keep-alive-fn cb}))
 
-                     :else
-                     (log/warn "Unsupported callback registered" {:keep-alive-fn cb}))))
+                  :else
+                  (log/warn "Unsupported callback registered" {:keep-alive-fn cb})))
               (close-websocket (:id conn))
               (session/close-all-sessions (:id conn)))
             (do
@@ -510,7 +529,7 @@
                              (reset! default-cache-atom (default-object-cache-factory memory-object-size))
                              ;; user-supplied close function
                              (when (fn? close-fn) (close-fn))
-                             (log/info :conn-closed))
+                             (log/info "connection closed"))
         servers*           (normalize-servers servers transactor?)
         storage-read*      (or storage-read (default-storage-read conn-id servers* opts))
         storage-exists*    (or storage-exists storage-read (default-storage-read conn-id servers* opts))
@@ -550,9 +569,8 @@
                             :tx-key-id        (when tx-private-key
                                                 #?(:clj  (crypto/account-id-from-private tx-private-key)
                                                    :cljs nil))
-                            :keep-alive-fn    (if (or (fn? keep-alive-fn) (string? keep-alive-fn))
-                                                #?(:clj  nil
-                                                   :cljs keep-alive-fn))
+                            :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
+                                                keep-alive-fn)
                             :add-listener     (partial add-listener* state-atom)
                             :remove-listener  (partial remove-listener* state-atom)}]
     (map->Connection settings)))
