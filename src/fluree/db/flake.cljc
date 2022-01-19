@@ -352,7 +352,7 @@
 (defn cmp-flakes-psot [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
-    (cmp-subj (s f2) (s f1))
+    (cmp-subj (s f1) (s f2))
     (cmp-obj (o f1) (o f2))
     (cmp-tx (t f1) (t f2))
     (cmp-bool (op f1) (op f2))
