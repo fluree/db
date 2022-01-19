@@ -1,6 +1,8 @@
 (ns fluree.db.serde.none
   (:require [fluree.db.serde.protocol :as serdeproto]))
 
+(set! *warn-on-reflection* true)
+
 
 ;; Identity serializer doens't serialize anything.
 

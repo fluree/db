@@ -6,15 +6,17 @@
             #?(:clj  [instaparse.core :as insta :refer [defparser]]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 #?(:cljs
    (def inline-grammar
      "SQL grammar in instaparse compatible BNF format loaded at compile time so it's
      available to cljs and js artifacts."
-     (inline-resource "sql-92.bnf")))
+     (inline-resource "fluree-sql.bnf")))
 
 #?(:clj
    (def sql
-     (-> "sql-92.bnf"
+     (-> "fluree-sql.bnf"
          io/resource
          (insta/parser :input-format :ebnf)))
 
@@ -35,9 +37,9 @@
   #{:all :and :as :asc :at :between :case :coalesce :collate :corresponding
     :cross :current-date :current-time :current-timestamp :desc :distinct :else
     :end :except :exists :false :from :full :group-by :having :in :inner
-    :intersect :is :join :left :local :natural :not :null :nullif :on :or
-    :order-by :right :select :some :table :then :trim :true :unique :unknown
-    :using :values :when :where})
+    :intersect :is :join :left :limit :local :natural :not :null :nullif :on
+    :or :offset :order-by :right :select :some :table :then :trim :true :unique
+    :unknown :using :values :when :where})
 
 
 (def rules
@@ -175,8 +177,8 @@
 
     (cond->> (or subject
                  {::subj template/collection-var, ::pred pred})
-      coll     (template/fill-in-collection coll)
-      :finally bounce)))
+      coll (template/fill-in-collection coll)
+      true bounce)))
 
 
 (defmethod rule-parser :set-quantifier
@@ -214,7 +216,7 @@
                       (= :selectDistinct))]
     (cond-> {::subj subj, ::pred pred, ::obj val}
       distinct? (update ::obj (partial template/build-fn-call "distinct"))
-      :finally  (-> (update ::obj (partial template/build-fn-call func))
+      true      (-> (update ::obj (partial template/build-fn-call func))
                     bounce))))
 
 
@@ -225,9 +227,9 @@
         pred-var                 (some-> pred template/build-var)
         selected                 (or obj pred-var)
         triple                   [subj pred pred-var]]
-    (cond->  {::select [selected]}
+    (cond-> {::select [selected]}
       (template/predicate? pred) (assoc ::where [triple])
-      :finally                   bounce)))
+      true                       bounce)))
 
 
 (defmethod rule-parser :select-list
@@ -393,7 +395,7 @@
              :where     (template/fill-in-collection from where)
              ::coll     coll}
       (seq group) (assoc :opts {:groupBy group})
-      :finally    bounce)))
+      true        bounce)))
 
 
 (defmethod rule-parser :join-condition
@@ -457,6 +459,13 @@
   [[_ _ & rst]]
   (->> rst parse-all bounce))
 
+(defmethod rule-parser :limit-clause
+  [[_ _ lim]]
+  (-> lim parse-rule bounce))
+
+(defmethod rule-parser :offset-clause
+  [[_ _ ofst]]
+  (-> ofst parse-rule bounce))
 
 (defmethod rule-parser :direct-select-statement
   [[_ & rst]]
@@ -465,10 +474,14 @@
         ordering                  (some->> parse-map
                                            :order-by-clause
                                            first
-                                           (template/fill-in-collection (first coll)))]
+                                           (template/fill-in-collection (first coll)))
+        limit                     (some->> parse-map :limit-clause first)
+        offset                    (some->> parse-map :offset-clause first)]
     (cond-> query
-      ordering  (update :opts assoc :orderBy ordering)
-      :finally  bounce)))
+      ordering (assoc-in [:opts :orderBy] ordering)
+      limit    (assoc-in [:opts :limit] limit)
+      offset   (assoc-in [:opts :offset] offset)
+      true     bounce)))
 
 
 (defn parse

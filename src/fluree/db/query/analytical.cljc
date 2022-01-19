@@ -10,10 +10,15 @@
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.query.analytical-wikidata :as wikidata]
             [fluree.db.query.analytical-filter :as filter]
+            [fluree.db.query.union :as union]
             [clojure.string :as str]
             [fluree.db.util.log :as log]
             #?(:cljs [cljs.reader])
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto])
+  #?(:clj (:import (java.io Closeable)
+                   (fluree.db.flake Flake))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn variable? [form]
   (when (and (or (string? form) (keyword? form) (symbol? form)) (= (first (name form)) \?))
@@ -383,16 +388,11 @@
              (throw (ex-info "Full text search is not supported in when running in-memory"
                              {:status 400
                               :error  :db/invalid-query}))
-             (let [[var search search-param]
-                   clause
-
-                   var   (variable? var)
-                   store (-> conn
-                             :meta
-                             :file-storage-path
-                             (full-text/storage-path db)
-                             full-text/storage)]
-               (full-text/search db store [var search search-param])))))
+             (let [lang (-> db :settings :language (or :default))
+                   [var search search-param] clause
+                   var  (variable? var)]
+               (with-open [^Closeable store (full-text/open-storage conn network dbid lang)]
+                 (full-text/search store db [var search search-param]))))))
 
 
 ;; Can be: ["?item" "rdf:type" "person"]
@@ -419,9 +419,11 @@
 
                     (let [partition (dbproto/-c-prop db :partition (last clause))
                           max-sid   (-> db :ecount (get partition))
-                          min-sid   (flake/min-subject-id partition)]
+                          min-sid   (flake/min-subject-id partition)
+                          flakes    (<? (query-range/index-range db :spot >= [max-sid] <= [min-sid]))
+                          xf        (comp (map (fn [^Flake f] [(.-s f)])) (distinct))]
                       {:headers [subject-var]
-                       :tuples  (map #(conj [] %) (range min-sid (inc max-sid)))
+                       :tuples  (sequence xf flakes)
                        :vars    {}}))
 
                   object-var
@@ -666,39 +668,6 @@
      :vars    (merge (:vars a-tuples) (:vars b-tuples))
      :tuples  c-tuples}))
 
-(defn outer-union
-  "UNION clause takes a left-hand side, which is inner-joined, and a right-hand side, which is inner-joined.
-  Any tuples unbound by the other set are included."
-  [a-tuples b-tuples]
-  (let [common-keys               (intersecting-keys-tuples a-tuples b-tuples)
-        a-idxs                    (map #(util/index-of (:headers a-tuples) %) common-keys)
-        b-idxs                    (map #(util/index-of (:headers b-tuples) %) common-keys)
-        b-not-idxs                (-> b-tuples :headers count (#(range 0 %))
-                                      set (set/difference (set b-idxs)) (#(apply vector %)))
-        ; We find all the rows where a-tuples are matched - or we nil them
-        ; we also return all the b-tuple row nums that were matched.
-        [c-tuples b-matched-rows] (reduce
-                                    (fn [[c-tuples b-matched-rows] a-tuple]
-                                      (let [[matches matched-rows] (find-match+row-nums a-tuple a-idxs (:tuples b-tuples) b-idxs b-not-idxs)
-                                            matches (or matches [(concat a-tuple (repeat (count b-not-idxs) nil))])]
-                                        ;; TODO - revise this fn - below was susceptible to stack overflows, quick fix to retain original ordering in case important
-                                        [(into (vec c-tuples) matches) #_(concat c-tuples matches)
-                                         (set/union b-matched-rows matched-rows)]))
-                                    [[] #{}] (:tuples a-tuples))
-        b-unmatched-rows          (remove b-matched-rows (range 0 (count (:tuples b-tuples))))
-        c-headers                 (concat (:headers a-tuples) (map #(nth (:headers b-tuples) %) b-not-idxs))
-        ;; For unmatched b-tuples, need to follow the pattern of c-headers, returning nil when there's no match
-        b-idxs->c-idxs            (map #(util/index-of (:headers b-tuples) %) c-headers)
-        c-from-unmatched-b-tuples (map (fn [b-row]
-                                         (let [b-tuple (into [] (nth (:tuples b-tuples) b-row))]
-                                           (map (fn [c-idx]
-                                                  (if (nil? c-idx) nil (get b-tuple c-idx)))
-                                                b-idxs->c-idxs)))
-                                       b-unmatched-rows)
-        c-tuples                  (concat c-tuples c-from-unmatched-b-tuples)]
-    {:headers c-headers
-     :vars    (merge (:vars a-tuples) (:vars b-tuples))
-     :tuples  c-tuples}))
 
 (declare resolve-where-clause)
 
@@ -819,7 +788,7 @@
                                           new-res (keys vars))
                         new-res** (res-absorb-vars new-res*)]
                     (if tuples
-                      (recur rest (outer-union tuples new-res**))
+                      (recur rest (union/results tuples new-res**))
                       (recur rest new-res**)))
                   [tuples r]))
 
@@ -843,6 +812,13 @@
 
           (= 2 (count clause))
           [(update res :vars merge (bind-clause->vars res clause)) r]
+
+          (= 1 (count clause))
+          (if (sequential? (first clause))
+            (throw (ex-info (str "Invalid where clause, it appears you have an extra nested vector here: " clause)
+                            {:status 400 :error :db/invalid-query}))
+            (throw (ex-info (str "Invalid where clause, it should have 2+ tuples but instead found: " clause)
+                            {:status 400 :error :db/invalid-query})))
 
           :else
           (let [[db clause] (<? (get-source-clause db clause prefixes opts))]
@@ -916,6 +892,4 @@
   (async/<!! (q {:select   ["?handle" "?num"]
                  :where    [["?person" "person/handle" "?handle"]]
                  :optional [["?person" "person/favNums" "?num"]]
-                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db))
-
-  )
+                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))

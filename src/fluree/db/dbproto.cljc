@@ -1,5 +1,4 @@
-(ns fluree.db.dbproto
-  (:refer-clojure :exclude [-lookup resolve]))
+(ns fluree.db.dbproto)
 
 (defprotocol IFlureeDb
   (-latest-db [db] "Updates a db to the most current version of the db known to this server. Maintains existing permissions")

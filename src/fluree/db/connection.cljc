@@ -10,6 +10,7 @@
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
             #?(:clj [fluree.crypto :as crypto])
+            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.xhttp :as xhttp]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try channel?]]
@@ -20,11 +21,12 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.storage.core :as storage]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; socket connections are keyed by connection-id and contain :socket - ws, :id - socket-id :health - status of health checks.
 (def server-connections-atom (atom {}))
 
 (def server-regex #"^(?:((?:https?):)//)([^:/\s#]+)(?::(\d*))?")
-
 
 
 (defn- acquire-healthy-server
@@ -104,22 +106,22 @@
 
 ;; all ledger messages are fire and forget
 
-;; we do need to establish an upstream connection from a ledger to us, so we can
-;; propogate blocks, flushes, etc.
+;; we do need to establish an upstream connection from a ledger to us, so we can propogate
+;; blocks, flushes, etc.
 
-(defrecord Connection [id servers state req-chan sub-chan pub-chan storage-read
-                       storage-write storage-exists storage-rename object-cache
-                       parallelism serializer default-network transactor?
-                       publish transact-handler tx-private-key tx-key-id meta
-                       add-listener remove-listener close]
+(defrecord Connection [id servers state req-chan sub-chan pub-chan group
+                       storage-read storage-write storage-exists storage-rename
+                       object-cache parallelism serializer default-network
+                       transactor? publish transact-handler tx-private-key
+                       tx-key-id meta add-listener remove-listener close]
 
   storage/Store
-  (exists? [_ key]
-    (storage-exists key))
-  (read [_ key]
-    (storage-read key))
-  (write [_ key data]
-    (storage-write key data))
+  (read [_ k]
+    (storage-read k))
+  (write [_ k data]
+    (storage-write k data))
+  (exists? [_ k]
+    (storage-exists k))
   (rename [_ old-key new-key]
     (storage-rename old-key new-key))
 
@@ -133,8 +135,13 @@
        (fn [_]
          (storage/resolve-index-node conn node
                                      (fn []
-                                       (object-cache [id tempid] nil))))))))
+                                       (object-cache [id tempid] nil)))))))
 
+  #?@(:clj
+      [full-text/IndexConnection
+       (open-storage [{:keys [storage-type] :as conn} network dbid lang]
+                     (when-let [path (-> conn :meta :file-storage-path)]
+                       (full-text/disk-index path network dbid lang)))]))
 
 (defn- normalize-servers
   "Split servers in a string into a vector.
@@ -210,7 +217,6 @@
     (or (get-in @server-connections-atom [(:id conn) :ws :socket])
         ;; attempt to connect
         (<? (establish-socket (:id conn) (:sub-chan conn) (:pub-chan conn) (:servers conn))))))
-
 
 
 (defn get-server
@@ -302,23 +308,24 @@
             ;; assume connection dropped, close!
             (do
               (log/warn "Connection has gone stale. Perhaps network conditions are poor. Disconnecting socket.")
-              #?(:cljs
-                 (let [cb (:keep-alive-fn conn)]
-                   (cond
+              (let [cb (:keep-alive-fn conn)]
+                (cond
 
-                     (nil? cb)
-                     (log/trace "No keep-alive callback is registered")
+                  (nil? cb)
+                  (log/trace "No keep-alive callback is registered")
 
-                     ;clojurescript-recognized function - yay!
-                     (fn? cb)
-                     (cb)
+                  (fn? cb)
+                  (cb)
 
-                     ;try javascript eval
-                     (string? cb)
+                  (string? cb)
+                  #?(:cljs
+                     ;; try javascript eval
                      (eval cb)
+                     :clj
+                     (log/warn "Unsupported clojure callback registered" {:keep-alive-fn cb}))
 
-                     :else
-                     (log/warn "Unsupported callback registered" {:keep-alive-fn cb}))))
+                  :else
+                  (log/warn "Unsupported callback registered" {:keep-alive-fn cb})))
               (close-websocket (:id conn))
               (session/close-all-sessions (:id conn)))
             (do
@@ -335,6 +342,7 @@
 
           :else
           (do
+            (log/trace "Received message:" (pr-str (json/parse msg)))
             (conn-events/process-events conn (json/parse msg))
             (recur 0)))))))
 
@@ -362,7 +370,7 @@
                res          (<? (xhttp/get url {:request-timeout 5000
                                                 :headers         headers*
                                                 :output-format   #?(:clj  :binary
-                                                                    :cljs :text)}))]
+                                                                    :cljs :json)}))]
 
            res))))))
 
@@ -455,7 +463,6 @@
   (remove-listener* (:state conn) network dbid key))
 
 
-
 (defn add-token
   "Adds token to connection information so it is available to submit storage read requests.
 
@@ -486,7 +493,7 @@
                                   ;; value is vector of single-argument callback functions that will receive [header data]
                                   :listeners    {}})
         {:keys [storage-read storage-exists storage-write storage-rename storage-list
-                parallelism req-chan sub-chan pub-chan default-network
+                parallelism req-chan sub-chan pub-chan default-network group
                 object-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
@@ -516,14 +523,14 @@
                              (close-websocket conn-id)
                              (swap! state-atom assoc :close? true)
                              ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
-                             #?(:clj (dbfunctions/clear-db-fn-cache)
+                             #?(:clj  (dbfunctions/clear-db-fn-cache)
                                 :cljs (when (identical? "nodejs" cljs.core/*target*)
                                         (dbfunctions/clear-db-fn-cache)))
                              (session/close-all-sessions conn-id)
                              (reset! default-cache-atom (default-object-cache-factory memory-object-size))
                              ;; user-supplied close function
                              (when (fn? close-fn) (close-fn))
-                             (log/info :conn-closed))
+                             (log/info "connection closed"))
         servers*           (normalize-servers servers transactor?)
         storage-read*      (or storage-read (default-storage-read conn-id servers* opts))
         storage-exists*    (or storage-exists storage-read (default-storage-read conn-id servers* opts))
@@ -545,6 +552,7 @@
                             :sub-chan         sub-chan
                             :pub-chan         pub-chan
                             :close            close
+                            :group            group
                             :storage-list     storage-list
                             :storage-read     storage-read*
                             :storage-exists   storage-exists*
@@ -562,9 +570,8 @@
                             :tx-key-id        (when tx-private-key
                                                 #?(:clj  (crypto/account-id-from-private tx-private-key)
                                                    :cljs nil))
-                            :keep-alive-fn    (if (or (fn? keep-alive-fn) (string? keep-alive-fn))
-                                                #?(:clj  nil
-                                                   :cljs keep-alive-fn))
+                            :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
+                                                keep-alive-fn)
                             :add-listener     (partial add-listener* state-atom)
                             :remove-listener  (partial remove-listener* state-atom)}]
     (map->Connection settings)))
@@ -585,15 +592,14 @@
   Provide servers in either a sequence or as a string that is comma-separated."
   [servers & [opts]]
   (let [conn        (generate-connection servers opts)
-        transactor? (:transactor? opts)
-        dev?        (-> conn :meta :dev?)]
+        transactor? (:transactor? opts)]
     (when-not transactor?
       (async/go
         (let [socket (async/<! (get-socket conn))]
           (if (or (nil? socket)
                   (util/exception? socket))
             (do
-              (log/warn "Cannot establish connection to a healthy server, disconnecting.")
+              (log/error socket "Cannot establish connection to a healthy server, disconnecting.")
               (async/close! conn))
             ;; kick off consumer
             (msg-consumer conn)))))

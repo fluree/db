@@ -9,6 +9,8 @@
             [fluree.db.util.schema :as schema-util])
   #?(:clj (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; goal is a quick check if we can not check every result. Many queries are small,
 ;; so an extended effort in here is not worth the time, we can just check each result
 (defn no-filter?
@@ -20,10 +22,10 @@
            (= 3 (flake/sid->cid s1) (flake/sid->cid s2)))))
 
 (defn process-functions
-  [^Flake flake functions db permissions]
+  [flake functions db permissions]
   (async/go
     (let [root-db (dbproto/-rootdb db)
-          sid     (.-s flake)
+          sid     (flake/s flake)
           ctx     {:sid     sid
                    :auth_id (or (:auth db) (:auth permissions))
                    :instant (util/current-time-millis)
@@ -60,7 +62,7 @@
 
 
 (defn check-explicit-functions
-  [^Flake flake db permissions fns-paths]
+  [flake db permissions fns-paths]
   (async/go
     (let [trace? (:trace? permissions)]
       (loop [[f & r] fns-paths
@@ -106,8 +108,8 @@
    (async/go
      (if (root-permission? permissions)
        true
-       (let [cid       (flake/sid->cid (.-s flake))
-             pid       (.-p flake)
+       (let [cid       (flake/sid->cid (flake/s flake))
+             pid       (flake/p flake)
              fns-paths [[:collection cid pid] [:collection cid :all] [:predicate pid]]
              check     (async/<! (check-explicit-functions flake db permissions fns-paths))]
          (if (util/exception? check)
@@ -138,4 +140,3 @@
                         (recur r (conj acc flake))
                         (recur r acc)))))
                 acc))))
-

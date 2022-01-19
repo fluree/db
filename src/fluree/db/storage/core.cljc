@@ -16,11 +16,13 @@
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
      :clj (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defprotocol Store
-  (exists? [s key] "Returns true when `key` exists in `s`")
-  (read [s key] "Reads raw bytes from `s` associated with `key`")
-  (write [s key data] "Writes `data` as raw bytes to `s` and associates it with `key`")
-  (rename [s old-key new-key] "Remove `old-key` and associates it's data to `new-key`"))
+  (exists? [s k] "Returns true when `k` exists in `s`")
+  (read [s k] "Reads raw bytes from `s` associated with `k`")
+  (write [s k data] "Writes `data` as raw bytes to `s` and associates it with `k`")
+  (rename [s old-key new-key] "Remove `old-key` and associate its data to `new-key`"))
 
 #?(:clj
    (defn block-storage-path
@@ -122,7 +124,7 @@
   "Given a child, unresolved node, extracts just the data that will go into
   storage."
   [child]
-  (select-keys child [:id :leaf :floor :ciel :size]))
+  (select-keys child [:id :leaf :first :rhs :size]))
 
 (defn write-leaf
   "Computes a new unique id for `leaf` and writes it to storage under that id.
@@ -154,8 +156,8 @@
          child-vals    (->> children
                             (map val)
                             (mapv child-data))
-         floor         (->> child-vals first :floor)
-         ciel          (->> child-vals rseq first :ciel)
+         first-flake         (->> child-vals first :first)
+         rhs          (->> child-vals rseq first :rhs)
          data          {:children child-vals}]
      (<? (write-branch-data conn branch-id data))
      (assoc branch :id branch-id))))
@@ -221,13 +223,15 @@
                                      (pr-str index))
                                 {:status 500
                                  :error  :db/unexpected-error})))]
-    (assoc index-data
-           :comparator cmp
-           :network network
-           :dbid dbid
-           :block block
-           :t t
-           :leftmost? true)))
+    (cond-> index-data
+      (:rhs index-data)   (update :rhs flake/parts->Flake)
+      (:first index-data) (update :first flake/parts->Flake)
+      true                (assoc :comparator cmp
+                                 :network network
+                                 :dbid dbid
+                                 :block block
+                                 :t t
+                                 :leftmost? true))))
 
 
 (defn reify-db-root
@@ -260,9 +264,9 @@
   [conn network dbid block]
   (go-try
     (let [key  (ledger-root-key network dbid block)
-          data (read conn key)]
+          data (<? (read conn key))]
       (when data
-        (serdeproto/-deserialize-db-root (serde conn) (<? data))))))
+        (serdeproto/-deserialize-db-root (serde conn) data)))))
 
 
 (defn reify-db
@@ -295,7 +299,7 @@
                                                                      (zero? i)))
                                               (merge child)))
                                         children)
-           child-entries   (mapcat (juxt :floor identity)
+           child-entries   (mapcat (juxt :first identity)
                                    child-attrs)]
        (apply avl/sorted-map-by comparator child-entries))
      (throw (ex-info (str "Unable to retrieve index branch with id "
@@ -325,6 +329,7 @@
           (async/put! return-ch
                       (assoc node k data)))
         (catch* e
+                (log/error e "Error resolving index node")
                 (when error-fn
                   (error-fn))
                 (async/put! return-ch e)

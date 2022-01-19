@@ -16,16 +16,10 @@
 #?(:clj
    (defn string->stream
      ([s] (string->stream s "UTF-8"))
-     ([s encoding]
+     ([^String s ^String encoding]
       (-> s
           (.getBytes encoding)
           (ByteArrayInputStream.)))))
-
-#?(:clj
-   (def float-conv-delta
-     (let [x-conv (-> Float/MAX_VALUE str (Double/parseDouble))
-           x-orig (double Float/MAX_VALUE)]
-       (float (- x-conv x-orig)))))
 
 
 ;; General Comments
@@ -74,13 +68,13 @@
              (is (instance? ByteArrayInputStream x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             (is (= (-> x :fv) (-> x* :fv float)) )
+             (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))
          (testing "maximum values"
            (let [x  {:_id "parser"
                      :name "test-03"
-                     :fv   (- Float/MAX_VALUE float-conv-delta)
+                     :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
                  x' (-> x (cjson/encode) (string->stream))
@@ -88,9 +82,7 @@
              (is (instance? ByteArrayInputStream x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             ; the value of Float/MAX_VALUE is actually allocated as a double
-             ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse json stringify"
@@ -131,7 +123,7 @@
          (testing "maximum values"
            (let [x  {:_id "parser"
                      :name "test-06"
-                     :fv   (- Float/MAX_VALUE float-conv-delta)
+                     :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
                  x' (json/stringify x)
@@ -139,9 +131,7 @@
              (is (string? x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             ; the value of Float/MAX_VALUE is actually allocated as a double
-             ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse byte-array"
@@ -182,7 +172,7 @@
          (testing "maximum values"
            (let [x  {:_id "parser"
                      :name "test-09"
-                     :fv   (- Float/MAX_VALUE float-conv-delta)
+                     :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
                  x' (-> x cjson/encode u-bytes/string->UTF8)
@@ -190,9 +180,7 @@
              (is (bytes? x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             ; the value of Float/MAX_VALUE is actually allocated as a double
-             ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))))
      (testing ":fdb-json-bigdec-string: false"
@@ -229,13 +217,13 @@
              (is (instance? ByteArrayInputStream x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             (is (= (-> x :fv) (-> x* :fv float)) )
+             (is (= (:fv x) (-> x* :fv float)))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))
          (testing "maximum values"
            (let [x  {:_id "parser"
                      :name "test-03"
-                     :fv   (- Float/MAX_VALUE float-conv-delta)
+                     :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
                  x' (-> x (cjson/encode) (string->stream))
@@ -243,9 +231,7 @@
              (is (instance? ByteArrayInputStream x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             ; the value of Float/MAX_VALUE is actually allocated as a double
-             ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse json stringify"
@@ -286,7 +272,7 @@
          (testing "maximum values"
            (let [x  {:_id "parser"
                      :name "test-06"
-                     :fv   (- Float/MAX_VALUE float-conv-delta)
+                     :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
                  x' (json/stringify x)
@@ -294,9 +280,7 @@
              (is (string? x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             ; the value of Float/MAX_VALUE is actually allocated as a double
-             ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*))))))
        (testing "parse byte-array"
@@ -337,7 +321,7 @@
          (testing "maximum values"
            (let [x  {:_id "parser"
                      :name "test-09"
-                     :fv   (- Float/MAX_VALUE float-conv-delta)
+                     :fv   Float/MAX_VALUE
                      :dv   Double/MAX_VALUE
                      :iv   Integer/MAX_VALUE}
                  x' (-> x cjson/encode u-bytes/string->UTF8)
@@ -345,9 +329,7 @@
              (is (bytes? x'))
              (is (instance? PersistentArrayMap x*))
              (is (= (:name x) (:name x*)))
-             ; the value of Float/MAX_VALUE is actually allocated as a double
-             ; using MAX_VALUE less conversion delta
-             (= (-> x :fv) (-> x* :fv float))
+             (is (= (:fv x) (.floatValue ^BigDecimal (:fv x*))))
              (is (= (:dv x) (-> x* :dv double)))
              (is (= (:iv x) (:iv x*)))))))))
 

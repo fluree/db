@@ -4,58 +4,57 @@
             [clojure.core.async :as async])
   (:import (fluree.db.flake Flake)))
 
+(set! *warn-on-reflection* true)
+
 
 (defn pprint-root
-  [index count-atom depth pos-idx]
-  (let [indent-floor 18
-        str-vec            (-> (repeat depth "-") vec (conj ">"))
-        str-vec            (if (index/branch? index)
-                             (conj str-vec " I")
-                             (conj str-vec " D"))
-        str-vec            (if (and (index/index-node? index) (not-empty (:buffer index)))
-                             (conj str-vec (str "*" (count (:buffer index))))
-                             str-vec)
-        str-vec            (if (index/leaf? index)
-                             (let [node-count (count (:flakes index))]
-                               (swap! count-atom + node-count)
-                               (conj str-vec (str ":" (.-block index) "-" node-count)))
-                             str-vec)
-        floor        ^Flake (:floor index)
-        main-str           (apply str str-vec)
-        addl-indent        (if (neg? (- indent-floor (count main-str)))
-                             " "
-                             (apply str (repeat (- indent-floor (count main-str)) " ")))
-        str-vec            [main-str addl-indent]
-        str-vec            (conj str-vec (str (.-s floor) "-" (.-p floor) " "))
-        str-vec            (conj str-vec (pr-str pos-idx))]
+  [conn index count-atom depth pos-idx]
+  (let [branch?      (index/branch? index)
+        indent-floor 18
+        str-vec      (-> (repeat depth "-") vec (conj ">"))
+        str-vec      (if branch?
+                       (conj str-vec " I")
+                       (conj str-vec " D"))
+        str-vec      (if (index/leaf? index)
+                       (let [node-count (count (:flakes index))]
+                         (swap! count-atom + node-count)
+                         (conj str-vec (str ":" (:block index) "-" node-count)))
+                       str-vec)
+        first-flake  ^Flake (:first index)
+        main-str     (apply str str-vec)
+        addl-indent  (if (neg? (- indent-floor (count main-str)))
+                       " "
+                       (apply str (repeat (- indent-floor (count main-str)) " ")))
+        str-vec      [main-str addl-indent]
+        str-vec      (conj str-vec (str (.-s first-flake) "-" (.-p first-flake) " "))
+        str-vec      (conj str-vec (pr-str pos-idx))]
     (println (apply str str-vec))
-    (when (index/index-node? index)
+    (when branch?
       (let [children-count (count (:children index))]
         (dotimes [i children-count]
-          (pprint-root (async/<!! (index/resolve (nth (:children index) i)))
-                       count-atom
-                       (inc depth)
-                       (conj pos-idx i)))))))
+          (let [child (-> index :children (nth i))]
+            (pprint-root conn
+                         (async/<!! (index/resolve conn child))
+                         count-atom
+                         (inc depth)
+                         (conj pos-idx i))))))))
 
 
 (defn pprint-index
-  [index]
+  [conn index]
   (let [count-atom (atom 0)]
-    (pprint-root (async/<!! (index/resolve index)) count-atom 0 [])
+    (pprint-root conn (async/<!! (index/resolve conn index)) count-atom 0 [])
     (println "Total count: " @count-atom)))
 
 
 (defn pprint-node
   [node & [prefix]]
-  (let [index-node?    (index/index-node? node)
+  (let [index-node?    (index/branch? node)
         node-type      (if index-node? "I" "D")
         children-count (if index-node?
                          (count (:children node))
                          (count (:flakes node)))
-        history-count  (if index-node?
-                         (count (:buffer node))
-                         (count (:history node)))
-        full-str       (str prefix node-type " c-" children-count " h-" history-count)]
+        full-str       (str prefix node-type " c-" children-count)]
     (println full-str)))
 
 
@@ -68,28 +67,28 @@
         (println (str dashes "> " p))
         (do
           (pprint-node p (str dashes "> "))
-          (when (and print-data? (index/data-node? p))
+          (when (and print-data? (index/leaf? p))
             (println (:flakes p))))))))
 
 
 (defn pprint-db
-  [db]
+  [{:keys [conn spot psot post opst tspo]}]
   (println "spot:")
   (println "-----------")
-  (pprint-index (:spot db))
+  (pprint-index conn spot)
   (println "")
   (println "psot:")
   (println "-----------")
-  (pprint-index (:psot db))
+  (pprint-index conn psot)
   (println "")
   (println "post:")
   (println "-----------")
-  (pprint-index (:post db))
+  (pprint-index conn post)
   (println "")
   (println "opst:")
   (println "-----------")
-  (pprint-index (:opst db))
+  (pprint-index conn opst)
   (println "")
   (println "tspo:")
   (println "-----------")
-  (pprint-index (:tspo db)))
+  (pprint-index conn tspo))

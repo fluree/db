@@ -8,6 +8,8 @@
             [fluree.db.util.core :as util])
   #?(:cljs (:require-macros [fluree.db.dbfunctions.fns :refer [extract]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defmacro extract
   "Resolves a value if a channel.
@@ -330,7 +332,6 @@
       res)))
 
 (defn get-in
-  [?ctx subject path]
   {:doc      "Returns the value of a nested structure"
    :fdb/spec nil
    :fdb/cost "Length of path"}
@@ -345,10 +346,10 @@
       res)))
 
 (defn contains?
-  [?ctx coll key]
   {:doc      "Returns true if key is present."
    :fdb/spec nil
    :fdb/cost 10}
+  [?ctx coll key]
   (go-try
     (let [coll  (extract coll)
           coll' (if (set? coll) coll (-> coll flatten set))
@@ -359,10 +360,10 @@
       res)))
 
 (defn hash-set
-  [?ctx & args]
   {:doc      "Returns a hash-set of values"
    :fdb/spec nil
    :fdb/cost "9 + count of items in hash-set"}
+  [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
           args' (if (clojure.core/and (= 1 (clojure.core/count args)) (coll? (first args))) (first args) args)

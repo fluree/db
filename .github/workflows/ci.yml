@@ -11,12 +11,15 @@ jobs:
     runs-on: [self-hosted, docker]
     steps:
       - uses: actions/checkout@v2
+      - uses: docker/setup-buildx-action@v1
+        with:
+          install: true
       - name: Run tests
-        run: script/run-in-docker.sh make test
+        run: script/run-in-docker.sh make ci
       - name: Build Docker image
         run: docker build -t fluree/db .
       - name: Notify Slack fail
-        if: failure()
+        if: github.ref == 'refs/heads/main' && failure()
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         uses: voxmedia/github-action-slack-notify-build@v1

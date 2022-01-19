@@ -8,6 +8,8 @@
                    (java.time.format DateTimeFormatter)
                    (java.net URL))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; signatures of http requests. see:
 ;; https://tools.ietf.org/id/draft-cavage-http-signatures-08.html
 
@@ -40,7 +42,7 @@
 
 (defn verify-signature-header*
   [req sig-header-str]
-  (let [{:keys [request-method uri headers server-name]} req
+  (let [{:keys [request-method uri headers]} req
         sig-map     (try*
                       (->> (str/split sig-header-str #"\",")
                            (map #(-> %
@@ -55,8 +57,7 @@
                                                :error  :db/invalid-auth}))))
         sig-parts   (str/split (get sig-map "headers" "") #" ")
         sign-string (generate-signing-string (assoc headers "method" request-method
-                                                            "path" uri
-                                                            "host" server-name)
+                                                            "path" uri)
                                              sig-parts)
         signature   (get sig-map "signature")
         authority   (crypto/account-id-from-message sign-string signature)
@@ -74,7 +75,7 @@
   with it. If it exists and is invalid, throws exception."
   [req]
   (when-let [sig-header-str (get (:headers req) "signature")]
-    (log/trace (str "Verifying http signature header: " sig-header-str))
+    (log/trace "Verifying http signature header:" sig-header-str)
     (verify-signature-header* req sig-header-str)))
 
 
@@ -106,9 +107,8 @@
    (sign-request req-method url request private-key nil))
   ([req-method url request private-key auth]
    (let [{:keys [headers body]} request
-         [host path] (let [match (re-find #"^(https?\:)//(([^:/?#]*)(?:\:([0-9]+))?)([/]{0,1}[^?#]*)$" url)]
-                       [(get match 2) (get match 5)])
-
+         path (let [match (re-find #"^(https?\:)//(([^:/?#]*)(?:\:([0-9]+))?)([/]{0,1}[^?#]*)$" url)]
+                (get match 5))
          date             (or (get headers "date")
                               #?(:clj  (-> (DateTimeFormatter/RFC_1123_DATE_TIME) (.format (ZonedDateTime/now (ZoneOffset/UTC))))
                                  :cljs (.toUTCString (js/Date.))))
@@ -134,24 +134,24 @@
 
 (defn verify-request*
   "Returns auth record from separated request parts."
-  ([req method action db-name host]
-   (verify-request* req method (str "/fdb/" (util/keyword->str db-name) "/" (util/keyword->str action))
-                    host))
-  ([req method uri host]
+  ([req method action db-name]
+   (verify-request* req method
+                    (str "/fdb/" (util/keyword->str db-name)
+                         "/" (util/keyword->str action))))
+  ([req method uri]
    (-> req
-       (verify-digest)
+       verify-digest
        (assoc :request-method method
-              :uri uri
-              :server-name host)
-       (verify-signature-header))))
+              :uri uri)
+       verify-signature-header)))
 
 
 (defn verify-request
   "Returns map of auth and authority from request."
   [request]
   (-> request
-      (verify-digest)
-      (verify-signature-header)))
+      verify-digest
+      verify-signature-header))
 
 
 
@@ -160,9 +160,8 @@
   (def sig-str (generate-signing-string {"date"   "Tue, 11 Mar 2019 19:20:12 GMT"
                                          "method" :post
                                          "path"   "/fdb/test/one/query"
-                                         "host"   "localhost"
                                          "digest" "SHA-256=7H1ZpcmGuWumeVlRzVWnfrYLfDyamUg5Y8Km49rb/c8="}
-                                        ["(request-target)" "host" "date" "digest"]))
+                                        ["(request-target)" "date" "digest"]))
 
   (def myrequest {:headers {"content-type" "application/json"}
                   :body    (fluree.db.util.json/stringify {:select ["*"] :from "_collection"})})

@@ -3,6 +3,8 @@
                :cljs [cljs.core.async :as async])
             [fluree.db.util.core :as util]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; handles a pub/sub mechanism for pushing out different events to external query peers or internal listeners
 ;; all events keyed by network + db
 (def sub-state (atom {}))

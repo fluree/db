@@ -1,7 +1,10 @@
 (ns fluree.db.spec
   (:require [fluree.db.util.json :as json]
             [alphabase.core :as alphabase]
-            [fluree.db.util.core :as util :refer [try* catch*]]))
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [clojure.string :as str]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (def ^:private EMAIL #"[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*@(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
 
@@ -13,7 +16,9 @@
             (str x))))
 
 (defn type-check
-  "(type-check type object) transforms a object to match the type. If it cannot be transformed, it throws an ex-info with a map from paths into the object to errors encountered at those paths."
+  "(type-check type object) transforms an object to match the type. If it
+  cannot be transformed, it throws an ex-info with a map from paths into the
+  object to errors encountered at those paths."
   ([object spec]
    (let [errors    (atom {})
          conformed (type-check object spec [] errors)
@@ -39,8 +44,10 @@
          (if (nil? object) object (error))
 
          (string? spec)
-         (let [optional  (.endsWith spec "?")
-               base-spec (if optional (subs spec 0 (dec (.length spec))) spec)]
+         (let [optional  (str/ends-with? spec "?")
+               base-spec (if optional
+                           (subs spec 0 (dec (count spec)))
+                           spec)]
            (cond
              (and optional (nil? object))
              nil
@@ -82,7 +89,16 @@
 
 
              (= base-spec "float")
-             (if (number? object) (float object) (error))
+             (cond
+               (number? object)
+               (float object)
+
+               (string? object)
+               #?(:clj  (Float/parseFloat object)
+                  :cljs (js/parseFloat object))
+
+               :else
+               (error))
 
              ;; Doubles can exceed what JavaScript/JSON supports, so we allow them to come over as a string.
              (= base-spec "double")
@@ -109,7 +125,7 @@
 
              (= base-spec "bytes")
              (cond
-               (string? object) (let [uc (.toLowerCase object)]
+               (string? object) (let [uc (.toLowerCase ^String object)]
                                   (if (re-matches #"^[0-9a-f]+$" uc)
                                     uc
                                     (error "Bytes type must be in hex string form.")))

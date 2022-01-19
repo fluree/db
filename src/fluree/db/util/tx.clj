@@ -4,7 +4,10 @@
             [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util])
+  (:import (fluree.db.flake Flake)))
+
+(set! *warn-on-reflection* true)
 
 ;; transaction utilities
 
@@ -13,34 +16,39 @@
   some additional checks. This can be done before putting the command into the queue for processing.
 
   Puts original :cmd string and :sig string into this one map for use downstream."
-  [{:keys [sig cmd]}]
-  ;; TODO - here again we calc the sha3 id, I think redundant at this point
-  (let [cmd-map       (-> (json/parse cmd)
-                          (assoc :txid (crypto/sha3-256 cmd) ;; don't trust their id if provided
+  [{:keys [command id] :as cmd-data}]
+  (let [{:keys [sig cmd]} command
+        cmd-map       (-> (try (json/parse cmd)
+                               (catch Exception _
+                                 (throw (ex-info (format "Transaction %s is not valid JSON, ignoring." id)
+                                                 {:status 400 :error :db/invalid-transaction}))))
+                          (assoc :txid id
                                  :cmd cmd
                                  :sig sig))
-
-        sig-authority (crypto/account-id-from-message cmd sig) ;; throws if invalid signature
+        sig-authority (try (crypto/account-id-from-message cmd sig)
+                           (catch Exception _
+                             (throw (ex-info (format "Transaction %s has an invalid signature." id)
+                                             {:status 400 :error :db/invalid-signature}))))
         ;; merge everything together into one map for transaction.
         current-time  (System/currentTimeMillis)
         {:keys [auth authority expire]} cmd-map
         expired?      (and expire (< expire current-time))
         _             (when expired?
-                        (throw (ex-info (format "Transaction is expired. Current time: %s expire time: %s." current-time expire)
-                                        {:status 400 :error :db/invalid-transaction})))
+                        (throw (ex-info (format "Transaction %s is expired. Current time: %s expire time: %s." id current-time expire)
+                                        {:status 400 :error :db/expired-transaction})))
         cmd-map*      (cond
                         (and (nil? auth) (nil? authority))
                         (assoc cmd-map :auth sig-authority)
 
                         (and (nil? auth) authority)
-                        (throw (ex-info (str "An authority without an auth is not allowed.")
-                                        {:status 400 :error :db/invalid-transaction}))
+                        (throw (ex-info (format "Transaction %s invalid. An authority without an auth is not allowed." id)
+                                        {:status 400 :error :db/missing-auth}))
 
                         (and auth authority)
                         (if (= authority sig-authority)
                           cmd-map
-                          (throw (ex-info (format "Signing authority: %s does not match command authority: %s." sig-authority authority)
-                                          {:status 400 :error :db/invalid-transaction})))
+                          (throw (ex-info (format "Transaction %s is invalid. Signing authority: %s does not match command authority: %s." id sig-authority authority)
+                                          {:status 400 :error :db/invalid-authority})))
 
                         (and auth (nil? authority))
                         (if (= auth sig-authority)
@@ -63,7 +71,8 @@
    (if-not sorted?
      (gen-tx-hash tx-flakes)
      (->> tx-flakes
-          (mapv #(vector (.-s %) (.-p %) (.-o %) (.-t %) (.-op %) (.-m %)))
+          (mapv #(let [^Flake f %]
+                   (vector (.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f))))
           (json/stringify)
           (crypto/sha3-256)))))
 
@@ -74,8 +83,9 @@
 
 (defn- exp [x n]
   (loop [acc 1 n n]
-    (if (zero? n) acc
-                  (recur (* x acc) (dec n)))))
+    (if (zero? n)
+      acc
+      (recur (long (* x acc)) (dec n))))) ; long keeps recur arg primitive
 
 (defn- find-closest-power-2
   [n]

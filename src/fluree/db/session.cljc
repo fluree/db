@@ -18,6 +18,8 @@
   #?(:clj
      (:import (fluree.db.flake Flake))))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (declare db current-db session)
 
 (defrecord DbSession [conn network dbid db-name update-chan transact-chan state schema-cache blank-db close id])
@@ -108,9 +110,11 @@
                                           (recur db* (inc next-block)))
                                         (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
                                                         {:status 500 :error :db/unexpected-error})))))))
-              db*             (assoc db :schema (<? (schema/schema-map db)))
-              db**            (assoc db* :settings (<? (schema/setting-map db*)))]
-          (async/put! pc db**))
+              db-schema       (schema/schema-map db)        ;; returns async chan
+              db-settings     (schema/setting-map db)       ;; returns async chan
+              db*             (assoc db :schema (<? db-schema)
+                                        :settings (<? db-settings))]
+          (async/put! pc db*))
         (catch* e
                 (async/put! pc e))))
     pc))
@@ -141,7 +145,7 @@
   (swap! (:state session) assoc :db/db (full-load-existing-db session)))
 
 
-(defn indexing?
+(defn indexing-promise-ch
   "Returns block currently being indexed (truthy), or nil (falsey) if not currently indexing."
   [session]
   (:db/indexing @(:state session)))
@@ -154,19 +158,27 @@
 
 
 (defn acquire-indexing-lock!
-  "Attempts to acquire indexing lock, and if successful returns true, else false."
-  [session block]
-  (swap! (:state session)
-         (fn [s]
-           (cond-> s
-                   (nil? (:db/indexing s)) (assoc :db/indexing block))))
-  ;; if we got the lock, indexing value will be same as block (true)
-  (= block (indexing? session)))
+  "Attempts to acquire indexing lock. Returns two-tuple of [lock? promise-chan]
+  where lock? indicates if the lock was successful, and promise-chan is whatever
+  promise-chan is registered for indexing."
+  [session pc]
+  (let [swap-res (swap! (:state session)
+                        (fn [s]
+                          (if (nil? (:db/indexing s))
+                            (assoc s :db/indexing pc)
+                            s)))
+        res-pc   (:db/indexing swap-res)
+        lock?    (= pc res-pc)]
+    ;; return two-tuple of if lock was acquired and whatever promise channel is registered.
+    [lock? res-pc]))
+
 
 (defn release-indexing-lock!
   "Releases indexing lock, and updates the last indexed value on the connection with provided block number."
   [session block]
-  (swap! (:state session) assoc :db/indexing nil :db/indexed block))
+  (swap! (:state session)
+         (fn [s]
+           (assoc s :db/indexing nil :db/indexed block))))
 
 
 (def alias->id-cache (atom #?(:clj  (cache/fifo-cache-factory {:threshold 100})
@@ -231,7 +243,8 @@
         ;; no-op
         ;; TODO - we can avoid logging here if we are the transactor
         (<= block current-block)
-        (log/info (str (:network session) "/$" (:dbid session) ": Received block " block ", but DB is already more current. No-op."))
+        (log/info (str (:network session) "/" (:dbid session) ": Received block: " block
+                       ", but DB is already more current at block: " current-block ". No-op."))
 
         ;; next block is correct, update cached db
         (= block (+ 1 current-block))
@@ -279,25 +292,23 @@
   then perform the shutdown on the cached session, else will return
   false."
   ([session]
-   (if (closed? session)
-     false
-     (let [{:keys [conn update-chan transact-chan state network dbid id]} session
-           closed? (closed? session)]
-       (if closed?
-         (do
-           (remove-cache! network dbid)
-           false)
-         (do
-           (swap! state assoc :closed? true)
-           ;; remove updates callback from connection
-           ((:remove-listener conn) network dbid id)
-           (async/close! update-chan)
-           (when transact-chan
-             (async/close! transact-chan))
-           (remove-cache! network dbid)
-           (when (fn? (:close session))
-             ((:close session)))
-           true)))))
+   (let [{:keys [conn update-chan transact-chan state network dbid id]} session
+         closed? (closed? session)]
+     (if closed?
+       (do
+         (remove-cache! network dbid)
+         false)
+       (do
+         (swap! state assoc :closed? true)
+         ;; remove updates callback from connection
+         ((:remove-listener conn) network dbid id)
+         (async/close! update-chan)
+         (when transact-chan
+           (async/close! transact-chan))
+         (remove-cache! network dbid)
+         (when (fn? (:close session))
+           ((:close session)))
+         true))))
   ([network dbid]
    (if-let [session (from-cache network dbid)]
      (close session)
@@ -312,21 +323,24 @@
     (let [msg     (<? update-chan)
           session (from-cache network ledger-id)]
       (cond
-        (nil? msg)                                          ;; channel closed, likely connection closed. If it wasn't force close just in case.
-        (log/info (str "Channel closed for session updates for: " network "/" ledger-id "."))
+        (nil? msg) ;; channel closed, likely connection closed. If it wasn't force close just in case.
+        (log/info "Channel closed for session updates for:" (str network "/" ledger-id))
 
-        (nil? session)                                      ;; unlikely to happen... if channel was closed previous condition would trigger
-        (log/warn (str "Ledger update received for session that is no longer open: " network "/" ledger-id ". Message: " (pr-str (first msg))))
+        (nil? session) ;; unlikely to happen... if channel was closed previous condition would trigger
+        (log/warn "Ledger update received for session that is no longer open:" (str network "/" ledger-id)
+                  "Message: " (first msg))
 
         :else
         (do
           (try*
             (let [[event-type event-data] msg]
-              (log/trace (str "[process-ledger-updates[" network "/$" ledger-id "]: ") (util/trunc (pr-str msg) 200))
+              (log/trace "[process-ledger-updates[" (str network "/" ledger-id) "]: "
+                         (util/trunc (pr-str msg) 200))
               (<? (process-ledger-update session event-type event-data)))
             (catch* e
-                    (log/error e "Exception processing ledger updates for message: " msg)))
+              (log/error e "Exception processing ledger updates for message:" msg)))
           (recur))))))
+
 
 (defn- session-factory
   "Creates a connection without first checking if db exists. Only useful if reloading
@@ -445,8 +459,7 @@
            (when new?
 
              (when connect?
-               ;; send a subscription request to this database. This is idempotent in the
-               ;; unlikely case of multiple sessions simultaneously being created (of which only one will 'win').
+               ;; send a subscription request to this database.
                (ops/subscribe session opts)
 
                ;; register a callback fn for this session to listen for updates and push onto update chan
@@ -478,7 +491,7 @@
                  (async/go-loop []
                    (let [req (async/<! (:transact-chan session))]
                      (if (nil? req)
-                       (log/info (str "Transactor session closing for db: " network "/$" ledger-id "[" ledger-alias "]"))
+                       (log/info "Transactor session closing for db:" (str network "/" ledger-id "[" ledger-alias "]"))
                        ;; do some initial validation, then send to handler for synchronous processing
                        (do (transact-handler conn req)
                            (recur))))))))
@@ -489,16 +502,17 @@
 (defn current-db
   "Gets the latest db from the central DB atom if available, or loads it from scratch.
   DB is returned as a core async promise channel."
-  [session]
-  (swap! (:state session) #(assoc % :req/last (util/current-time-millis)
-                                    :req/count (inc (:req/count %))))
-  (let [db (:db/db @(:state session))]
-    (if (nil? db)
-      (do
-        (swap! (:schema-cache session) empty)               ;; always clear schema cache on new load
-        (swap! (:state session) #(assoc % :db/db (full-load-existing-db session)))
-        (:db/db @(:state session)))
-      db)))
+  [{:keys [state] :as session}]
+  (swap! state #(assoc % :req/last (util/current-time-millis)
+                         :req/count (inc (:req/count %))))
+  (or (:db/db @state)
+      (let [_         (swap! (:schema-cache session) empty) ;; always clear schema cache on new load
+            new-state (swap! state
+                             (fn [st]
+                               (if (:db/db st)
+                                 st
+                                 (assoc st :db/db (full-load-existing-db session)))))]
+        (:db/db new-state))))
 
 
 (defn blank-db

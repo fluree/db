@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.core
   (:refer-clojure :exclude [read-string])
-  (:require [#?(:cljs cljs.reader :clj clojure.tools.reader.edn) :refer [read-string]]
+  (:require [#?(:cljs cljs.reader :clj clojure.edn) :refer [read-string]]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :refer [try* catch*]]
@@ -8,6 +8,8 @@
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.dbfunctions.fns :as fns]
             [clojure.string :as str]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (declare resolve-fn)
 

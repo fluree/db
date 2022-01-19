@@ -6,6 +6,8 @@
             #?(:clj [abracad.avro :as avro]))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; maximum number of collections. 19 bits - 524,287 - javascript 9 bits - 511
 (def ^:const MAX-COLLECTION-ID #?(:clj  2r1111111111111111111
                                   :cljs 2r111111111))
@@ -100,10 +102,9 @@
              (assocEx [f k v] (UnsupportedOperationException. "assocEx is not supported on Flake"))
              (without [f k] (UnsupportedOperationException. "without is not supported on Flake"))
 
-
              clojure.lang.Associative
              (entryAt [f k] (some->> (get f k nil) (clojure.lang.MapEntry k)))
-             (containsKey [_ k] (#{:s :p :o :t :op :m} k))
+             (containsKey [_ k] (boolean (#{:s :p :o :t :op :m} k)))
              (assoc [f k v] (assoc-flake f k v))
 
              Object
@@ -194,10 +195,10 @@
   (.-m f))
 
 (defn- equiv-flake
-  [f o]
-  (and (= (s f) (s o))
-       (= (p f) (p o))
-       (= (o f) (o o))))
+  [f other]
+  (and (= (s f) (s other))
+       (= (p f) (p other))
+       (= (o f) (o other))))
 
 (defn parts->Flake
   "Used primarily to generate flakes for comparator. If you wish to
@@ -248,16 +249,16 @@
 (defn- nth-flake
   "Gets position i in flake."
   [flake i not-found]
-  (case i 0 (s flake)
-          1 (p flake)
-          2 (o flake)
-          3 (t flake)
-          4 (op flake)
-          5 (m flake)
-          (or not-found
-              #?(:clj  (throw (IndexOutOfBoundsException.))
-                 :cljs (throw (js/Error. (str "Index " i " out of bounds for flake: " flake)))))))
-
+  (let [ii (int i)]
+    (case ii 0 (s flake)
+             1 (p flake)
+             2 (o flake)
+             3 (t flake)
+             4 (op flake)
+             5 (m flake)
+             (or not-found
+                 #?(:clj  (throw (IndexOutOfBoundsException.))
+                    :cljs (throw (js/Error. (str "Index " ii " out of bounds for flake: " flake))))))))
 
 #?(:clj
    (defmacro combine-cmp [& comps]
@@ -344,14 +345,17 @@
     (cmp-subj (s f1) (s f2))
     (cmp-pred (p f1) (p f2))
     (cmp-obj (o f1) (o f2))
+    (cmp-tx (t f1) (t f2))
+    (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
-
 
 (defn cmp-flakes-psot [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-subj (s f1) (s f2))
     (cmp-obj (o f1) (o f2))
+    (cmp-tx (t f1) (t f2))
+    (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
 
 
@@ -360,51 +364,12 @@
     (cmp-pred (p f1) (p f2))
     (cmp-obj (o f1) (o f2))
     (cmp-subj (s f1) (s f2))
-    (cmp-meta (m f1) (m f2))))
-
-(defn cmp-flakes-opst
-  "note that opst sorts values as subjects"
-  [f1 f2]
-  (combine-cmp
-    (cmp-subj (o f1) (o f2))
-    (cmp-pred (p f1) (p f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-meta (m f1) (m f2))))
-
-;; When we look up an item in history, we can quickly find the relevant items,
-;; then apply changes in reverse. The alternative would be to reverse an entire
-;; node, which might work better for generic caching purposes.
-
-(defn cmp-flakes-spot-novelty [f1 f2]
-  (combine-cmp
-    (cmp-subj (s f1) (s f2))
-    (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (o f2))
-    (cmp-tx (t f1) (t f2))
-    (cmp-bool (op f1) (op f2))
-    (cmp-meta (m f1) (m f2))))
-
-(defn cmp-flakes-psot-novelty [f1 f2]
-  (combine-cmp
-    (cmp-pred (p f1) (p f2))
-    (cmp-subj (s f2) (s f1))
-    (cmp-obj (o f1) (o f2))
     (cmp-tx (t f1) (t f2))
     (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
 
 
-(defn cmp-flakes-post-novelty [f1 f2]
-  (combine-cmp
-    (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (o f2))
-    (cmp-subj (s f1) (s f2))
-    (cmp-tx (t f1) (t f2))
-    (cmp-bool (op f1) (op f2))
-    (cmp-meta (m f1) (m f2))))
-
-
-(defn cmp-flakes-opst-novelty [f1 f2]
+(defn cmp-flakes-opst [f1 f2]
   (combine-cmp
     (cmp-subj (o f1) (o f2))
     (cmp-pred (p f1) (p f2))
@@ -415,7 +380,7 @@
 
 
 (defn cmp-flakes-block
-  "Comparison for flakes in blocks. Like cmp-flakes-spot-novelty, but with 't'
+  "Comparison for flakes in blocks. Like cmp-flakes-spot, but with 't'
   moved up front."
   [f1 f2]
   (combine-cmp
@@ -488,8 +453,10 @@
   (avl/subrange ss >= start-flake <= end-flake))
 
 (defn subrange
-  [ss start-test start-flake end-test end-flake]
-  (avl/subrange ss start-test start-flake end-test end-flake))
+  ([ss test flake]
+   (avl/subrange ss test flake))
+  ([ss start-test start-flake end-test end-flake]
+   (avl/subrange ss start-test start-flake end-test end-flake)))
 
 
 (defn split-at

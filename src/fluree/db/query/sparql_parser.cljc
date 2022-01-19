@@ -9,6 +9,8 @@
             [clojure.set :as set]
             #?(:cljs [cljs.tools.reader :refer [read-string]])))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 #?(:cljs (def inline-content (inline-resource "sparql-js.bnf")))
 
 #?(:clj  (def sparql (insta/parser (io/resource "sparql.bnf")))
@@ -167,9 +169,9 @@
     :InlineDataOneVar
     (handle-inline-data-one-var (rest values))
 
-    :else
+    :else))
     ;; TODO
-    ))
+
 
 
 (defn handle-modifiers
@@ -618,7 +620,7 @@
           (-> (set/rename-keys q {:select select-key})
               (dissoc :selectKey))
           q))
-      (let [[q r] (if (and (string? item))
+      (let [[q r] (if (string? item)
                     [(assoc query :selectKey (keyword (str "select" (str/capitalize item)))) r]
 
                     (condp = (first item)
@@ -750,9 +752,9 @@
 
   (def recur+depth "SELECT ?followHandle\nWHERE {\n  ?person fdb:person/handle \"anguyen\".\n  ?person fdb:person/follows+3 ?follows.\n  ?follows fdb:person/handle ?followHandle.\n}")
 
-  (def value-query "SELECT ?handle\nWHERE {\n  VALUES ?handle { \"dsanchez\" }\n  ?person fdb:person/handle ?handle.\n}")
+  (def value-query "SELECT ?handle\nWHERE {\n  VALUES ?handle { \"dsanchez\" }\n  ?person fdb:person/handle ?handle.\n}"))
 
-  )
+
 
 
 

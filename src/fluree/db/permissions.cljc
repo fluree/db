@@ -7,6 +7,8 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.log :as log]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 ;; permissions are placed on a collection or predicate
 ;;
 ;; Fns resolve to true or false

@@ -6,9 +6,9 @@
     [fluree.db.util.log :as log]
     #?(:clj  [clojure.core.async :as async]
        :cljs [cljs.core.async :as async])
-    #?(:cljs [goog.string :as gstring])
-    #?(:cljs [goog.string.format])
     [fluree.db.util.async :refer [<? go-try merge-into?]]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn variable? [form]
   (when (and (or (string? form) (symbol? form)) (= (first (name form)) \?))
@@ -65,26 +65,13 @@
         (recur r (conj res clause)))
       res)))
 
-(defn wikiDataVar?
-  [string]
-  (cond
-    (and (string? string) (re-matches #"^wd(t)*:(P|Q)\d+$" string))
-    (symbol string)
-
-    (string? string)
-    (str "\"" string "\""))
-
-  :else
-  string)
-
 (defn ad-hoc-clause-to-wikidata
   [clause optional?]
   (cond->> clause
            (= "$wd" (first clause)) (drop 1)
-           true                     (map wikiDataVar?)
            true                     (str/join " ")
-           true                     (#?(:clj format :cljs gstring/format) "%s .")
-           optional?                (#?(:clj format :cljs gstring/format) "OPTIONAL {%s}")))
+           true                     (#(str % " ."))
+           optional?                (#(str "OPTIONAL {" % "}"))))
 
 (defn parse-prefixes
   [prefixes]
@@ -113,6 +100,7 @@
         full-query   (str prefixes " " select-smt " WHERE { " value-clause " "
                           where-smt " " optional-smt " " serviceLabel " } " (if limit (str "
                           LIMIT " limit)) " OFFSET " offset)] full-query)) >
+
 (def wikidataURL "https://query.wikidata.org/bigdata/namespace/wdq/sparql?format=json&query=")
 
 (defn submit-wikidata-query
@@ -124,10 +112,10 @@
                    ;      (str "Java/" (System/getProperty "java.version"))
                             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36"
                    ;)
-                   "Accept" "application/sparql-results+json"}
-          res     (<? (xhttp/get url {:headers         headers
-                                      :request-timeout 30000
-                                      :output-format   :wikidata}))] res)))
+                   "Accept" "application/sparql-results+json"}]
+      (<? (xhttp/get url {:headers         headers
+                          :request-timeout 30000
+                          :output-format   :wikidata})))))
 
 (defn submit+parse-wikidata-query
   [query]

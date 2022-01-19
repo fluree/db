@@ -8,6 +8,8 @@
   (:import (java.net URI)
            (java.util UUID)))
 
+(set! *warn-on-reflection* true)
+
 ;;; -----------------------------------------
 ;;;
 ;;; Supporting avro records
@@ -113,8 +115,8 @@
      :namespace "fluree"
      :fields    [{:name "id", :type :string}
                  {:name "leaf" :type :boolean}              ;; is this a leaf (data) node?
-                 {:name "floor", :type "fluree.Flake"}
-                 {:name "ciel", :type [:null "fluree.Flake"]}
+                 {:name "first", :type "fluree.Flake"}
+                 {:name "rhs", :type [:null "fluree.Flake"]}
                  {:name "size", :type :int}]}))
 
 
@@ -132,7 +134,8 @@
      :name      "FdbBranchNode"
      :namespace "fluree"
      :fields    [{:name "children", :type {:type  :array
-                                           :items "fluree.FdbChildNode"}}]}))
+                                           :items "fluree.FdbChildNode"}}
+                 {:name "rhs", :type [:null "fluree.Flake"]}]}))
 
 (def FdbLeafNode-schema
   (avro/parse-schema
@@ -189,8 +192,8 @@
                  {:name "status", :type [:null :string]}    ;; status code
                  {:name "message", :type [:null :string]}   ;; status message
                  {:name "fork", :type [:null :string]}      ;; db-ident of db this was forked from
-                 {:name "forkBlock", :type [:null :long]}   ;; if forked, what block point is the fork at
-                 ]}))
+                 {:name "forkBlock", :type [:null :long]}]}))   ;; if forked, what block point is the fork at
+
 
 
 (def FdbBlock-schema
@@ -225,22 +228,27 @@
 ;;; -----------------------------------------
 
 
+(defn convert-keys
+  [m conv]
+  (reduce-kv (fn [m* k v]
+               (assoc m* (conv k) v))
+             {} m))
+
 (defn convert-ecount-integer-keys
   "Avro makes all map keys into strings. ecount usese integer keys,
   so they need to get converted back."
   [ecount]
-  (->> ecount
-       (map #(vector (Integer. ^String (key %)) (val %)))
-       (into {})))
-
+  (convert-keys ecount (fn [s]
+                         (Integer/parseInt s))))
 
 (defn convert-stats-keywords
   "Avro makes all map keys into strings. Stats use keywords as keys."
   [stats]
-  (reduce-kv
-    #(assoc %1 (keyword %2) %3)
-    {}
-    stats))
+  (convert-keys stats keyword))
+
+(defn convert-stats-strings
+  [stats]
+  (convert-keys stats util/keyword->str))
 
 (def ^:const bindings {'fluree/Flake #'flake/->Flake
                        'BigInteger   #'->BigInteger
@@ -289,6 +297,91 @@
     (str/ends-with? k "-l-his")
     (avro/decode FdbLeafNode-schema data)))
 
+(defn serialize-block
+  [block-data]
+  (try
+    (avro/binary-encoded FdbBlock-schema (select-keys block-data [:block :t :flakes]))
+    (catch Exception e (log/error e "Error serializing block data: " (pr-str (select-keys block-data [:block :t :flakes])))
+           (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
+                           {:status 500 :error :db/unexpected-error})))))
+
+(defn deserialize-block
+  [block]
+  (binding [avro/*avro-readers* bindings]
+    (avro/decode FdbBlock-schema block)))
+
+(defn serialize-db-root
+  [db-root]
+  ;; turn stats keys into proper strings
+  (->> (update db-root :stats convert-stats-strings)
+       (avro/binary-encoded FdbRootDb-schema)))
+
+(defn deserialize-db-root
+  [db-root]
+  ;; avro serializes all keys into strings, need to make ecount back into
+  ;; integer keys and stats into keyword keys
+  (let [db-root* (avro/decode FdbRootDb-schema db-root)]
+    (-> db-root*
+        (update :ecount convert-ecount-integer-keys)
+        (update :stats convert-stats-keywords))))
+
+(defn serialize-branch
+  [branch-data]
+  (try
+    (avro/binary-encoded FdbBranchNode-schema branch-data)
+    (catch Exception e
+      (log/error e "Error serializing index branch data:"
+                 (pr-str branch-data))
+      (throw (ex-info "Unexpected error serializing index branch."
+                      {:status 500 :error :db/unexpected-error})))))
+
+(defn deserialize-branch
+  [branch]
+  (binding [avro/*avro-readers* bindings]
+    (avro/decode FdbBranchNode-schema branch)))
+
+(defn serialize-leaf
+  [leaf-data]
+  (try
+    (avro/binary-encoded FdbLeafNode-schema leaf-data)
+    (catch Exception e
+      (log/error e "Error serializing index leaf data:"
+                 (pr-str leaf-data))
+      (throw (ex-info "Unexpected error serializing index leaf."
+                      {:status 500 :error :db/unexpected-error})))))
+
+(defn deserialize-leaf
+  [leaf]
+  (binding [avro/*avro-readers* bindings]
+    (avro/decode FdbLeafNode-schema leaf)))
+
+(defn serialize-garbage
+  [garbage-data]
+  (try
+    (avro/binary-encoded FdbGarbage-schema garbage-data)
+    (catch Exception e
+      (log/error e "Error serializing index garbage data:"
+                 (pr-str garbage-data))
+      (throw (ex-info "Unexpected error serializing index branch."
+                      {:status 500 :error :db/unexpected-error})))))
+
+(defn deserialize-garbage
+  [garbage]
+  (avro/decode FdbGarbage-schema garbage))
+
+(defn serialize-db-pointer
+  [pointer-data]
+  (try
+    (avro/binary-encoded FdbDbPointer-schema pointer-data)
+    (catch Exception e
+      (log/error e "Error serializing db index pointer:"
+                 (pr-str pointer-data))
+      (throw (ex-info "Unexpected error serializing index branch."
+                      {:status 500 :error :db/unexpected-error})))))
+
+(defn deserialize-db-pointer
+  [pointer]
+  (avro/decode FdbDbPointer-schema pointer))
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
@@ -300,54 +393,30 @@
   (-serialize-block [_ block]
     (serialize-block block))
   (-deserialize-block [_ block]
-    (binding [avro/*avro-readers* bindings]
-      (avro/decode FdbBlock-schema block)))
+    (deserialize-block block))
   (-serialize-db-root [_ db-root]
-    ;; turn stats keys into proper strings
-    (->> (assoc db-root :stats (reduce-kv #(assoc %1 (util/keyword->str %2) %3) {} (:stats db-root)))
-         (avro/binary-encoded FdbRootDb-schema)))
+    (serialize-db-root db-root))
   (-deserialize-db-root [_ db-root]
-    ;; avro serializes all keys into strings, need to make ecount back into integer keys and stats into keyword keys
-    (let [db-root* (avro/decode FdbRootDb-schema db-root)]
-      (assoc db-root* :ecount (convert-ecount-integer-keys (:ecount db-root*))
-                      :stats (convert-stats-keywords (:stats db-root*)))))
+    (deserialize-db-root db-root))
   (-serialize-branch [_ branch]
-    (try
-      (avro/binary-encoded FdbBranchNode-schema branch)
-      (catch Exception e (log/error e (str "Error serializing index branch data: " (pr-str branch)))
-                         (throw (ex-info "Unexpected error serializing index branch."
-                                         {:status 500 :error :db/unexpected-error})))))
+    (serialize-branch branch))
   (-deserialize-branch [_ branch]
-    (binding [avro/*avro-readers* bindings]
-      (avro/decode FdbBranchNode-schema branch)))
-  (-serialize-leaf [_ leaf]
-    (try
-      (avro/binary-encoded FdbLeafNode-schema leaf)
-      (catch Exception e (log/error e (str "Error serializing index leaf data: " (pr-str leaf)))
-                         (throw (ex-info "Unexpected error serializing index branch."
-                                         {:status 500 :error :db/unexpected-error})))))
+    (deserialize-branch branch))
+  (-serialize-leaf [_ leaf-data]
+    (serialize-leaf leaf-data))
   (-deserialize-leaf [_ leaf]
-    (binding [avro/*avro-readers* bindings]
-      (avro/decode FdbLeafNode-schema leaf)))
+    (deserialize-leaf leaf))
   (-serialize-garbage [_ garbage]
-    (try
-      (avro/binary-encoded FdbGarbage-schema garbage)
-      (catch Exception e (log/error e (str "Error serializing index garbage data: " (pr-str garbage)))
-                         (throw (ex-info "Unexpected error serializing index branch."
-                                         {:status 500 :error :db/unexpected-error})))))
+    (serialize-garbage garbage))
   (-deserialize-garbage [_ garbage]
-    (avro/decode FdbGarbage-schema garbage))
+    (deserialize-garbage garbage))
   (-serialize-db-pointer [_ pointer]
-    (try
-      (avro/binary-encoded FdbDbPointer-schema pointer)
-      (catch Exception e (log/error e (str "Error serializing db index pointer: " (pr-str pointer)))
-                         (throw (ex-info "Unexpected error serializing index branch."
-                                         {:status 500 :error :db/unexpected-error})))))
+    (serialize-db-pointer pointer))
   (-deserialize-db-pointer [_ pointer]
-    (avro/decode FdbDbPointer-schema pointer)))
+    (deserialize-db-pointer pointer)))
 
 
 (defn avro-serde
   "Returns an Avro serializer / deserializer."
-  []
+  ^Serializer []
   (->Serializer))

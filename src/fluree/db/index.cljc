@@ -4,15 +4,14 @@
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 (def default-comparators
   "Map of default index comparators for the five index types"
-  {:spot flake/cmp-flakes-spot-novelty
-   :psot flake/cmp-flakes-psot-novelty
-   :post flake/cmp-flakes-post-novelty
-   :opst flake/cmp-flakes-opst-novelty
+  {:spot flake/cmp-flakes-spot
+   :psot flake/cmp-flakes-psot
+   :post flake/cmp-flakes-post
+   :opst flake/cmp-flakes-opst
    :tspo flake/cmp-flakes-block})
 
 (def types
@@ -53,16 +52,6 @@
           (or (first children))
           val))))
 
-(defn lookup-after
-  [branch flake]
-  (when (and (branch? branch)
-             (resolved? branch))
-    (let [{:keys [children]} branch]
-      (-> children
-          (avl/nearest > flake)
-          (or (last children))
-          val))))
-
 (defn lookup-leaf
   [r branch flake]
   (go-try
@@ -73,18 +62,6 @@
          child
          (recur (<? (resolve r child))))))))
 
-(defn lookup-leaf-after
-  [r branch flake]
-  (go-try
-   (when (and (branch? branch)
-              (resolved? branch))
-     (loop [child (lookup-after branch flake)]
-       (if (leaf? child)
-         child
-         (recur (<? (resolve r child)))))
-     (ex-info (str "lookup-leaf is only supported for resolved branch nodes.")
-              {:status 500, :error :db/unexpected-error,
-               ::branch branch}))))
 
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `network`, `dbid`, and index
@@ -95,19 +72,19 @@
    :dbid dbid
    :id :empty
    :leaf true
-   :floor flake/maximum
-   :ciel nil
+   :first flake/maximum
+   :rhs nil
    :size 0
    :block 0
    :t 0
    :leftmost? true})
 
 (defn child-entry
-  [{:keys [floor] :as node}]
-  [floor node])
+  [{:keys [first] :as node}]
+  [first node])
 
 (defn child-map
-  "Returns avl sorted map whose keys are the floor flakes of the index node
+  "Returns avl sorted map whose keys are the first flakes of the index node
   sequence `child-nodes`, and whose values are the corresponding nodes from
   `child-nodes`."
   [cmp & child-nodes]
@@ -126,8 +103,8 @@
      :dbid dbid
      :id :empty
      :leaf false
-     :floor flake/maximum
-     :ciel nil
+     :first flake/maximum
+     :rhs nil
      :children children
      :size 0
      :block 0
@@ -176,46 +153,60 @@
   [from-t to-t flakes]
   (let [stale-flakes (stale-by from-t flakes)
         subsequent   (filter-after to-t flakes)
-        out-of-range (concat stale-flakes #_previous subsequent)]
+        out-of-range (concat stale-flakes subsequent)]
     (flake/disj-all flakes out-of-range)))
 
-(defn current-flakes
-  [{:keys [t flakes]}]
-  (t-range t t flakes))
-
 (defn novelty-subrange
-  [{:keys [floor ciel leftmost?] :as node} through-t novelty]
+  [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]
   (let [subrange (cond
                    ;; standard case.. both left and right boundaries
-                   (and ciel (not leftmost?))
-                   (avl/subrange novelty > floor <= ciel)
+                   (and rhs (not leftmost?))
+                   (avl/subrange novelty > first-flake <= rhs)
 
                    ;; right only boundary
-                   (and ciel leftmost?)
-                   (avl/subrange novelty <= ciel)
+                   (and rhs leftmost?)
+                   (avl/subrange novelty <= rhs)
 
                    ;; left only boundary
-                   (and (nil? ciel) (not leftmost?))
-                   (avl/subrange novelty > floor)
+                   (and (nil? rhs) (not leftmost?))
+                   (avl/subrange novelty > first-flake)
 
                    ;; no boundary
-                   (and (nil? ciel) leftmost?)
+                   (and (nil? rhs) leftmost?)
                    novelty)]
     (flakes-through through-t subrange)))
+
+(defn add-flakes
+  [leaf flakes]
+  (-> leaf
+      (update :flakes flake/conj-all flakes)
+      (update :size (fn [size]
+                      (->> flakes
+                           (map flake/size-flake)
+                           (reduce + size))))))
+
+(defn rem-flakes
+  [leaf flakes]
+  (-> leaf
+      (update :flakes flake/disj-all flakes)
+      (update :size (fn [size]
+                      (->> flakes
+                           (map flake/size-flake)
+                           (reduce - size))))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
   `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later
   than `t` from `leaf` if `t` is older than `leaf`."
-  [{:keys [ciel leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty]
+  [{:keys [rhs leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty]
   (if (= leaf-t t)
     leaf
     (cond-> leaf
       (> leaf-t t)
-      (update :flakes flake/conj-all (novelty-subrange leaf t idx-novelty))
+      (add-flakes (novelty-subrange leaf t idx-novelty))
 
       (< leaf-t t)
-      (update :flakes flake/disj-all (filter-after t flakes))
+      (rem-flakes (filter-after t flakes))
 
-      :finally
+      true
       (assoc :t t))))

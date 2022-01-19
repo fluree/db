@@ -1,6 +1,8 @@
 (ns fluree.db.util.cljs-exceptions
   (:require [fluree.db.util.exceptions :refer [find-clause]]))
 
+(set! *warn-on-reflection* true)
+
 (defmacro try* [& body]
   (let [try-body       (remove #(and
                                   (list? %)

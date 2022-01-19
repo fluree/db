@@ -1,5 +1,7 @@
 (ns fluree.db.serde.protocol)
 
+#?(:clj (set! *warn-on-reflection* true))
+
 
 (defprotocol StorageSerializer
   (-serialize-transaction [this tx] "Serializes transaction")

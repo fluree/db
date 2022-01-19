@@ -11,12 +11,11 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.query.block :as query-block]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [go-try <? into?]]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.query.http-signatures :as http-signatures]
-            [goog.string.format]
     ;shared clojurescript code
             [fluree.db.api-js :as fdb-js]
             [fluree.db.connection-js :as conn-handler]))

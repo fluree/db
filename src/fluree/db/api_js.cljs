@@ -9,11 +9,10 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.session :as session]
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [go-try <? into?]]
+            [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util]
-            [goog.string.format]
             [fluree.db.connection-js :as conn-handler]))
 
 ;; supporting code for JS APIS (webworker, flureedb (both browser and nodejs)
@@ -143,9 +142,7 @@
                 :result (if (sequential? result)
                           (doall result) result)
                 :fuel   @fuel
-                :time   (-> (- (util/current-time-millis) start-ms)
-                            (/ 1000000)
-                            (#(goog.string/format "%.2fms" (float %))))
+                :time   (util/response-time-formatted start-ms)
                 :block  (:block db*)}
 
                :else
@@ -435,9 +432,7 @@
                                   (doall result')
                                   result')
                         :fuel   100
-                        :time   (-> (- (util/current-time-millis) start)
-                                    (/ 1000000)
-                                    (#(goog.string/format "%.2fms" (float %))))}
+                        :time   (util/response-time-formatted start)}
                        result')]
          result*)
        (catch :default e

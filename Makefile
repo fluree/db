@@ -1,4 +1,4 @@
-.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljstest test clean
+.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -17,29 +17,26 @@ target/fluree-db.jar: out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
 
 jar: target/fluree-db.jar
 
-out:
-	mkdir out
-
 package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
-out/flureenjs.js: out package.json package-lock.json node_modules build-nodejs.edn deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
+out/flureenjs.js: package.json package-lock.json node_modules build-nodejs.edn deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
 	clojure -M:nodejs && cp out/nodejs/flureenjs.js out/flureenjs.js
 
 nodejs: out/flureenjs.js
 
-out/flureedb.js: out package.json package-lock.json node_modules build-browser.edn deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
+out/flureedb.js: package.json package-lock.json node_modules build-browser.edn deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
 	clojure -M:browser && cp out/browser/main.js out/flureedb.js
 
 browser: out/flureedb.js
 
-out/flureeworker.js: out package.json package-lock.json node_modules build-webworker.edn deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
+out/flureeworker.js: package.json package-lock.json node_modules build-webworker.edn deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
 	clojure -M:webworker && cp out/webworker/main.js out/flureeworker.js
 
 webworker: out/flureeworker.js
 
 deps:
-	clojure -A:cljtest:cljstest -P
+	clojure -A:cljtest:cljstest:eastwood:docs -P
 
 src/deps.cljs: package.json
 	clojure -M:js-deps
@@ -51,23 +48,36 @@ deploy: target/fluree-db.jar
 	clojure -M:deploy
 
 docs/fluree.db.api.html docs/index.html: src/fluree/db/api.clj
-	clojure -M:docs $(@D)
+	clojure -X:docs :output-path "\"$(@D)\""
 
 docs/%.html: docs/%.md
-	clojure -M:docs $(@D)
+	clojure -X:docs :output-path "\"$(@D)\""
 
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
-cljstest: node_modules package-lock.json
-	clojure -M:cljstest
+cljs-browser-test: node_modules package-lock.json
+	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
+	clojure -M:cljs-browser-test
+
+cljs-node-test: node_modules package-lock.json
+	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
+	clojure -M:cljs-node-test
+
+cljstest: cljs-browser-test cljs-node-test
 
 cljtest:
 	clojure -M:cljtest
 
 test: cljtest cljstest
 
+eastwood:
+	clojure -M:test:eastwood
+
+ci: test eastwood
+
 clean:
 	rm -rf target
-	rm -rf out
+	rm -rf out/*
 	rm -rf docs/*.html
 	rm -rf node_modules
+	rm -f pom.xml

@@ -2,6 +2,8 @@
   (:require [clojure.string :as str]
             [clojure.walk :refer [postwalk]]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn capitalize-first
   "Capitalizes the first letter (and only the first letter) of `s`"
   [s]
