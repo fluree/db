@@ -155,7 +155,7 @@
   [{:keys [novelty stats] :as db} t refs flakes]
   (let [bytes #?(:clj (future (flake/size-bytes flakes))    ;; calculate in separate thread for CLJ
                  :cljs (flake/size-bytes flakes))
-        {:keys [spot psot post opst size]} novelty
+        {:keys [spot psot post opst tspo size]} novelty
         flakes*       (sort-by #(.-p ^Flake %) flakes)
         vocab-change? (<= (.-s ^Flake (first flakes*)) max-vocab-sid) ;; flakes are sorted, so lowest sid of all flakes will be first
         db*           (assoc db :t t
@@ -172,6 +172,7 @@
                                                              (into opst* p-flakes)
                                                              opst*)))
                                                        opst))
+                                          :tspo (into tspo flakes)
                                           :size (+ size #?(:clj @bytes :cljs bytes))}
                                 :stats (-> stats
                                            (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
@@ -204,7 +205,9 @@
       (throw (ex-info (str "Unable to retrieve commit subject data from commit: " commit-key ".")
                       {:status      500
                        :error       :db/invalid-commit
-                       :commit-data (str (subs (str commit) 0 500) "...")})))
+                       :commit-data (if (> (count (str commit)) 500)
+                                      (str (subs (str commit) 0 500) "...")
+                                      (str commit))})))
     subject))
 
 
@@ -249,10 +252,3 @@
       (fn [db* commit]
         (merge-commit db* commit))
       db commits)))
-
-
-(comment
-
-  (load-db)
-
-  )

@@ -124,9 +124,10 @@
   [db cache context ^Flake flake]
   (let [type-sid (.-o flake)]
     (if-let [iri (get-in db [:schema :pred type-sid :iri])]
-      (let [compacted (json-ld/compact iri context)]
-        (vswap! cache assoc type-sid compacted)
-        compacted)
+      (or (get-in @cache [type-sid :compact])
+          (let [compacted (json-ld/compact iri context)]
+            (vswap! cache assoc-in [type-sid :compact] compacted)
+            compacted))
       {:_id type-sid})))
 
 (defn- add-pred

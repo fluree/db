@@ -7,7 +7,6 @@
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]
             [fluree.db.dbfunctions.core :as dbfunctions]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
             #?(:clj [fluree.crypto :as crypto])
             #?(:clj [fluree.db.full-text :as full-text])
@@ -18,7 +17,8 @@
             [fluree.db.query.http-signatures :as http-signatures]
             #?(:clj [fluree.db.serde.avro :refer [avro-serde]])
             [fluree.db.conn-events :as conn-events]
-            [fluree.db.storage.core :as storage]))
+            [fluree.db.storage.core :as storage]
+            [fluree.db.conn.object-cache :as oc]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -374,26 +374,6 @@
            res))))))
 
 
-(defn- default-object-cache-fn
-  "Default object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (if (nil? value-fn)
-      (swap! cache-atom cache/evict k)
-      (if-let [v (get @cache-atom k)]
-        (do (swap! cache-atom cache/hit k)
-            v)
-        (let [v (value-fn k)]
-          (swap! cache-atom cache/miss k v)
-          v)))))
-
-
-(defn- default-object-cache-factory
-  "Generates a default object cache."
-  [cache-size]
-  (cache/lru-cache-factory {} :threshold cache-size))
-
-
 (defn- from-environment
   "Gets a specific key from the environment, returns nil if doesn't exist."
   [key]
@@ -508,71 +488,70 @@
                                     :cljs (json-serde))
                 transactor?      false
                 private-key-file "default-private-key.txt"}} opts
-        memory-object-size (quot memory 100000)             ;; avg 100kb per cache object
-        _                  (when (< memory-object-size 10)
-                             (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
-        default-cache-atom (atom (default-object-cache-factory memory-object-size))
-        object-cache-fn    (or object-cache
-                               (default-object-cache-fn default-cache-atom))
-        conn-id            (str (util/random-uuid))
-        close              (fn []
-                             (async/close! req-chan)
-                             (async/close! sub-chan)
-                             (async/close! pub-chan)
-                             (close-websocket conn-id)
-                             (swap! state-atom assoc :close? true)
-                             ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
-                             #?(:clj  (dbfunctions/clear-db-fn-cache)
-                                :cljs (when (identical? "nodejs" cljs.core/*target*)
-                                        (dbfunctions/clear-db-fn-cache)))
-                             (session/close-all-sessions conn-id)
-                             (reset! default-cache-atom (default-object-cache-factory memory-object-size))
-                             ;; user-supplied close function
-                             (when (fn? close-fn) (close-fn))
-                             (log/info "connection closed"))
-        servers*           (normalize-servers servers transactor?)
-        storage-read*      (or storage-read (default-storage-read conn-id servers* opts))
-        storage-exists*    (or storage-exists storage-read (default-storage-read conn-id servers* opts))
-        _                  (when-not (fn? storage-read*)
-                             (throw (ex-info (str "Connection's storage-read must be a function. Provided: " (pr-str storage-read))
-                                             {:status 500 :error :db/unexpected-error})))
-        _                  (when-not (fn? storage-exists*)
-                             (throw (ex-info (str "Connection's storage-exists must be a function. Provided: " (pr-str storage-exists))
-                                             {:status 500 :error :db/unexpected-error})))
-        _                  (when (and storage-write (not (fn? storage-write)))
-                             (throw (ex-info (str "Connection's storage-write, if provided, must be a function. Provided: " (pr-str storage-write))
-                                             {:status 500 :error :db/unexpected-error})))
-        settings           {:meta             meta
-                            ;; supplied static metadata, used mostly by ledger to add additional info
-                            :id               conn-id
-                            :servers          servers*
-                            :state            state-atom
-                            :req-chan         req-chan
-                            :sub-chan         sub-chan
-                            :pub-chan         pub-chan
-                            :close            close
-                            :group            group
-                            :storage-list     storage-list
-                            :storage-read     storage-read*
-                            :storage-exists   storage-exists*
-                            :storage-write    storage-write
-                            :storage-rename   storage-rename
-                            :object-cache     object-cache-fn
-                            :parallelism      parallelism
-                            :serializer       serializer
-                            :default-network  default-network
-                            :transact-handler transact-handler ;; only used for transactors
-                            :transactor?      transactor?
-                            :memory           memory?
-                            :publish          publish       ;; publish function for transactors
-                            :tx-private-key   tx-private-key
-                            :tx-key-id        (when tx-private-key
-                                                #?(:clj  (crypto/account-id-from-private tx-private-key)
-                                                   :cljs nil))
-                            :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
-                                                keep-alive-fn)
-                            :add-listener     (partial add-listener* state-atom)
-                            :remove-listener  (partial remove-listener* state-atom)}]
+        object-cache-atom (when-not object-cache
+                            (oc/default-object-cache memory))
+        object-cache      (or object-cache
+                              (oc/default-object-cache-fn object-cache-atom))
+        conn-id           (str (util/random-uuid))
+        close             (fn []
+                            (async/close! req-chan)
+                            (async/close! sub-chan)
+                            (async/close! pub-chan)
+                            (close-websocket conn-id)
+                            (swap! state-atom assoc :close? true)
+                            ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
+                            #?(:clj  (dbfunctions/clear-db-fn-cache)
+                               :cljs (when (identical? "nodejs" cljs.core/*target*)
+                                       (dbfunctions/clear-db-fn-cache)))
+                            (session/close-all-sessions conn-id)
+                            ;; empty cache to clear memory in case ref to conn hangs around after close
+                            (when object-cache-atom (oc/clear-cache object-cache-atom))
+                            ;; user-supplied close function
+                            (when (fn? close-fn) (close-fn))
+                            (log/info "connection closed"))
+        servers*          (normalize-servers servers transactor?)
+        storage-read*     (or storage-read (default-storage-read conn-id servers* opts))
+        storage-exists*   (or storage-exists storage-read (default-storage-read conn-id servers* opts))
+        _                 (when-not (fn? storage-read*)
+                            (throw (ex-info (str "Connection's storage-read must be a function. Provided: " (pr-str storage-read))
+                                            {:status 500 :error :db/unexpected-error})))
+        _                 (when-not (fn? storage-exists*)
+                            (throw (ex-info (str "Connection's storage-exists must be a function. Provided: " (pr-str storage-exists))
+                                            {:status 500 :error :db/unexpected-error})))
+        _                 (when (and storage-write (not (fn? storage-write)))
+                            (throw (ex-info (str "Connection's storage-write, if provided, must be a function. Provided: " (pr-str storage-write))
+                                            {:status 500 :error :db/unexpected-error})))
+        settings          {:meta             meta
+                           ;; supplied static metadata, used mostly by ledger to add additional info
+                           :id               conn-id
+                           :servers          servers*
+                           :state            state-atom
+                           :req-chan         req-chan
+                           :sub-chan         sub-chan
+                           :pub-chan         pub-chan
+                           :close            close
+                           :group            group
+                           :storage-list     storage-list
+                           :storage-read     storage-read*
+                           :storage-exists   storage-exists*
+                           :storage-write    storage-write
+                           :storage-rename   storage-rename
+                           :object-cache     object-cache
+                           :parallelism      parallelism
+                           :serializer       serializer
+                           :default-network  default-network
+                           :transact-handler transact-handler ;; only used for transactors
+                           :transactor?      transactor?
+                           :memory           memory?
+                           :publish          publish        ;; publish function for transactors
+                           :tx-private-key   tx-private-key
+                           :tx-key-id        (when tx-private-key
+                                               #?(:clj  (crypto/account-id-from-private tx-private-key)
+                                                  :cljs nil))
+                           :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
+                                               keep-alive-fn)
+                           :add-listener     (partial add-listener* state-atom)
+                           :remove-listener  (partial remove-listener* state-atom)}]
     (map->Connection settings)))
 
 (defn close!

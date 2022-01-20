@@ -575,7 +575,6 @@
                              (str/starts-with? id "_:"))
                        []
                        [(flake/->Flake sid const/$iri id t true nil)])]
-    (fluree.db.util.log/warn "base-flakes: " id base-flakes)
     (reduce-kv
       (fn [flakes k v]
         (case k
@@ -608,14 +607,11 @@
          :t      t
          :flakes flakes}))))
 
-(defn with-json-ld
-  [db block flakes]
 
-  )
 
 (comment
 
-  (def conn (fluree.db.memorydb/fake-conn))
+  (def conn (fluree.db.conn.memory/connect))
   (def db (blank-db conn "blah" "hi" (atom {}) (fn [] (throw (Exception. "NO CURRENT DB FN YET")))))
 
   ;; database identifier

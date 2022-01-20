@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld-db
   (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.storage.core :as storage]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
@@ -15,9 +14,8 @@
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.memorydb :as memdb]
-            [alphabase.core :as alphabase]
-            [fluree.db.json-ld.reify :as jld-reify])
+            [fluree.db.json-ld.reify :as jld-reify]
+            [fluree.db.conn.memory :as memory-conn])
   #?(:clj (:import (fluree.db.flake Flake)
                    (java.io Writer))))
 
@@ -363,7 +361,7 @@
 ;; ================ end GraphDB record support fns ============================
 
 (defrecord JsonLdDb [conn network dbid block t tt-id stats spot psot post opst tsop
-                     schema settings index-configs schema-cache novelty
+                     schema settings comparators schema-cache novelty
                      permissions fork fork-block current-db-fn ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
@@ -407,13 +405,13 @@
             :t       (:t db) :stats (:stats db) :permissions (:permissions db)}))))
 
 (defn new-novelty-map
-  [index-configs]
-  (->> [:spot :psot :post :opst]
-       (reduce
-         (fn [m idx]
-           (let [ss (flake/sorted-set-by (get-in index-configs [idx :historyComparator]))]
-             (assoc m idx ss)))
-         {:size 0})))
+  [comparators]
+  (reduce
+    (fn [m idx]
+      (assoc m idx (-> comparators
+                       (get idx)
+                       flake/sorted-set-by)))
+    {:size 0} index/types))
 
 (def genesis-ecount {const/$_predicate  (flake/->sid const/$_predicate 1000)
                      const/$_collection (flake/->sid const/$_collection 19)
@@ -436,9 +434,10 @@
 (defn blank-db
   ([config]
    (let [{:keys [context did name push publish]} config
-         db-name       (or name (str (util/random-uuid)))
-         read-only? (nil? push)]
-     (-> (blank-db (memdb/fake-conn) "ipfs" db-name
+         db-name    (or name (str (util/random-uuid)))
+         read-only? (nil? push)
+         conn       (memory-conn/connect)]
+     (-> (blank-db conn "ipfs" db-name
                    (atom {}) (fn []
                                (throw
                                  (ex-info "This is the earliest version of DB, not way to retrieve newer"
@@ -448,15 +447,16 @@
                             (dissoc :context))
                 :context context))))
   ([method {:keys [context methods did opts iri] :as config}]
-   (let [method* (keyword method)
+   (let [method*       (keyword method)
          method-config (or (get methods method*)
                            (get-in default-config [:methods method])
                            (throw (ex-info (str "Ledger method identifier has not corresponding configuration: "
                                                 method* ". Configured methods include: "
                                                 (or (keys methods) (keys (:methods default-config))) ".")
                                            {:status 400 :error :db/invalid-ledger-method})))
-         db-name       (or iri (str (util/random-uuid)))]
-     (-> (blank-db (memdb/fake-conn) method db-name
+         db-name       (or iri (str (util/random-uuid)))
+         conn          (memory-conn/connect)]
+     (-> (blank-db conn method db-name
                    (atom {}) (fn []
                                (throw
                                  (ex-info "This is the earliest version of DB, not way to retrieve newer"
@@ -479,12 +479,12 @@
           opst-cmp :opst
           tspo-cmp :tspo} index/default-comparators
 
-         spot (index/empty-branch network dbid spot-cmp)
-         psot (index/empty-branch network dbid psot-cmp)
-         post (index/empty-branch network dbid post-cmp)
-         opst (index/empty-branch network dbid opst-cmp)
-         tspo (index/empty-branch network dbid tspo-cmp)
-         stats       {:flakes  0, :size    0, :indexed 0}
+         spot        (index/empty-branch network dbid spot-cmp)
+         psot        (index/empty-branch network dbid psot-cmp)
+         post        (index/empty-branch network dbid post-cmp)
+         opst        (index/empty-branch network dbid opst-cmp)
+         tspo        (index/empty-branch network dbid tspo-cmp)
+         stats       {:flakes 0, :size 0, :indexed 0}
          fork        nil
          fork-block  nil
          schema      {:refs #{}}
@@ -511,7 +511,7 @@
 
 (comment
 
-  (def conn (fluree.db.memorydb/fake-conn))
+  (def conn (memory-conn/connect))
 
   (def db (blank-db conn "blah" "hi" (atom {}) (fn [] (throw (Exception. "NO CURRENT DB FN YET")))))
 
