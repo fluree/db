@@ -4,7 +4,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.iri :as iri-util])
+            [fluree.db.util.iri :as iri-util]
+            [fluree.db.util.log :as log])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -153,6 +154,27 @@
      :fullText   #{}
      :subclasses (delay (calc-subclass property-maps))      ;; delay because might not be needed
      }))
+
+
+(defn update-with
+  "When creating a new db from a transaction, merge new schema changes
+  into existing schema of previous db."
+  [db-before db-t new-refs vocab-flakes]
+  (let [{:keys [schema]} db-before
+        {:keys [refs pred]} schema]
+    (if (empty? pred)
+      ;; new/blank db, create new base schema
+      (vocab-map* db-t refs vocab-flakes)
+      ;; schema exists, merge new vocab in
+      (let [refs*             (into refs new-refs)
+            new-property-maps (->> vocab-flakes
+                                   (partition-by #(.-s ^Flake %))
+                                   (map #(schema-details refs* %))
+                                   hash-map-both-id-iri)
+            property-maps     (merge pred new-property-maps)]
+        (assoc schema :t db-t
+                      :pred property-maps
+                      :subclasses (delay (calc-subclass property-maps)))))))
 
 
 (defn vocab-map

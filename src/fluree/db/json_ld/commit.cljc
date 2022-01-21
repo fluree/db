@@ -180,7 +180,7 @@
         ;; TODO - queue? is not yet implemented. Cannot form final commit until you have the previous object from publish so will need to modify commits
         id             (when-not queue?
                          (push commit-json))
-        publish-p      (when-not queue?
+        publish-p      (when (and (not queue?) publish)
                          (publish id))
         db*            (assoc db :t t
                                  :commit {:t      t

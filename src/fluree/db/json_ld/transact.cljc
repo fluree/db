@@ -148,7 +148,6 @@
         bytes #?(:clj (future (flake/size-bytes flakes))    ;; calculate in separate thread for CLJ
                  :cljs (flake/size-bytes flakes))
         vocab-flakes  (jld-reify/get-vocab-flakes flakes)
-        _ (log/warn "final-db db-before commit: " (:commit db-before))
         db            (assoc db-before :ecount (final-ecount tx-state)
                                        :t t
                                        :block block
@@ -168,7 +167,7 @@
                                        :stats (-> stats
                                                   (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
                                                   (update :flakes + (count flakes)))
-                                       :schema (vocab/vocab-map* t @refs vocab-flakes))]
+                                       :schema (vocab/update-with db-before t @refs vocab-flakes))]
     (assoc db :current-db-fn (fn [] (let [pc (async/promise-chan)]
                                       (async/put! pc db)
                                       pc)))))

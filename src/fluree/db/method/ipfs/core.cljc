@@ -25,11 +25,12 @@
 (defn get-json
   ([ipfs-id] (get-json @default-ipfs-server ipfs-id))
   ([server block-id]
-   (let [url (str server "api/v0/cat?arg=" block-id)]
-     (log/debug "Retrieving json from IPFS @:" url)
-     (-> @(client/post url {})
-         :body
-         (json/parse false)))))
+   (log/debug "Retrieving json from IPFS cid:" block-id)
+   (let [url (str server "api/v0/cat?arg=" block-id)
+         res @(client/post url {})]
+     (try* (json/parse (:body res) false)
+           (catch* e (log/error e "JSON parse error for data: " (:body res))
+                   (throw e))))))
 
 
 (defn add-json
