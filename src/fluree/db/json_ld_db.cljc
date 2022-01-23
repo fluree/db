@@ -487,7 +487,7 @@
          stats       {:flakes 0, :size 0, :indexed 0}
          fork        nil
          fork-block  nil
-         schema      {:refs #{}}
+         schema      (vocab/vocab-map* 0 #{} nil)
          settings    nil
          db          (->JsonLdDb conn network dbid 0 0 nil stats spot psot post opst tspo schema
                                  settings index/default-comparators schema-cache novelty

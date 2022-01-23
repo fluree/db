@@ -143,7 +143,7 @@
   [tx-state flakes]
   (let [{:keys [db-before t block refs]} tx-state
         {:keys [novelty schema stats]} db-before
-        {:keys [spot psot opst post size]} novelty
+        {:keys [spot psot opst post tspo size]} novelty
         pred-map      (:pred schema)
         bytes #?(:clj (future (flake/size-bytes flakes))    ;; calculate in separate thread for CLJ
                  :cljs (flake/size-bytes flakes))
@@ -163,6 +163,7 @@
                                                                   (into opst* p-flakes)
                                                                   opst*))
                                                               opst))
+                                                 :tspo (into tspo flakes)
                                                  :size (+ size #?(:clj @bytes :cljs bytes))}
                                        :stats (-> stats
                                                   (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size

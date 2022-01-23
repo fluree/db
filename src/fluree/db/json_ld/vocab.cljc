@@ -161,20 +161,17 @@
   into existing schema of previous db."
   [db-before db-t new-refs vocab-flakes]
   (let [{:keys [schema]} db-before
-        {:keys [refs pred]} schema]
-    (if (empty? pred)
-      ;; new/blank db, create new base schema
-      (vocab-map* db-t refs vocab-flakes)
-      ;; schema exists, merge new vocab in
-      (let [refs*             (into refs new-refs)
-            new-property-maps (->> vocab-flakes
-                                   (partition-by #(.-s ^Flake %))
-                                   (map #(schema-details refs* %))
-                                   hash-map-both-id-iri)
-            property-maps     (merge pred new-property-maps)]
-        (assoc schema :t db-t
-                      :pred property-maps
-                      :subclasses (delay (calc-subclass property-maps)))))))
+        {:keys [refs pred]} schema
+        refs*             (into refs new-refs)
+        new-property-maps (->> vocab-flakes
+                               (partition-by #(.-s ^Flake %))
+                               (map #(schema-details refs* %))
+                               hash-map-both-id-iri)
+        property-maps     (merge pred new-property-maps)]
+    (assoc schema :t db-t
+                  :refs refs*
+                  :pred property-maps
+                  :subclasses (delay (calc-subclass property-maps)))))
 
 
 (defn vocab-map
