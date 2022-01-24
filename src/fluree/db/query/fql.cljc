@@ -279,15 +279,6 @@
   (get-in select-spec [:select :ns-lookup]))
 
 
-(defn- s
-  [^Flake f]
-  (.-s f))
-
-(defn- o
-  [^Flake f]
-  (.-o f))
-
-
 (defn resolve-reverse-refs
   "Resolves all reverse references into a result map."
   [db cache fuel max-fuel subject-id reverse-refs-specs]
@@ -299,7 +290,7 @@
         (let [[pred-id pred-spec] n
               {:keys [offset limit as name p]} pred-spec
               sub-ids    (->> (<? (query-range/index-range db :opst = [subject-id pred-id]))
-                              (map s)
+                              (map flake/s)
                               (not-empty))
               _          (when (and sub-ids fuel)
                            (add-fuel fuel (count sub-ids) max-fuel))
@@ -409,7 +400,7 @@
   (go-try
     (when (not-empty flakes)
       (let [top-level-subject (try*
-                                (s (first flakes))
+                                (flake/s (first flakes))
                                 (catch* e
                                         (log/error e)
                                         (throw e)))
@@ -422,7 +413,7 @@
                                 :else {})
             acc+refs          (if (get-in select-spec [:select :reverse])
                                 (->> (select-spec->reverse-pred-specs select-spec)
-                                     (resolve-reverse-refs db cache fuel max-fuel (s (first flakes)))
+                                     (resolve-reverse-refs db cache fuel max-fuel (flake/s (first flakes)))
                                      (<?)
                                      (merge base-acc))
                                 base-acc)
@@ -477,7 +468,7 @@
    ;; for a flake select, we convert all the initial predicates
    ;; to their predicate id to allow for a quick lookup
    (go-try
-     (let [xf            (comp (cond-> (partition-by s)
+     (let [xf            (comp (cond-> (partition-by flake/s)
                                        fuel (comp (fuel-flakes-transducer fuel max-fuel))
                                        offset (comp (drop offset))
                                        limit (comp (take limit)))
@@ -554,7 +545,7 @@
                               < (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit*}))
                               <= (<? (query-range/index-range db :post >= [p] <= [p match] {:limit limit*}))
                               [])
-                            (map s))
+                            (map flake/s))
                   acc* (case op*
                          :or (into acc subs)
                          :and (if (empty? acc)
@@ -1110,7 +1101,7 @@
                                        (<? (flake-select db cache fuel max-fuel select-spec' flakes)))
                          :tx-collection (let [flakes (<? (query-range/_block-or_tx-collection db opts*))]
                                           (<? (flake-select db cache fuel max-fuel select-spec' flakes)))
-                         :predicate (let [xf       (cond-> (map s)
+                         :predicate (let [xf       (cond-> (map flake/s)
                                                            fuel (comp (fuel-flake-transducer fuel max-fuel))
                                                            true (comp (distinct)))
                                           subjects (->> (<? (query-range/index-range db :psot = [from] opts*))
