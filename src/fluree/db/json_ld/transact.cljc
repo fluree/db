@@ -7,7 +7,6 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld-db :as jlddb]
             [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.json-ld.commit :as jld-commit]
             [fluree.db.json-ld.reify :as jld-reify]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async]))
@@ -52,10 +51,8 @@
   [sid property {:keys [id value] :as v-map} {:keys [iris next-pid next-sid t refs db-before new-sids] :as tx-state}]
   (let [existing-pid   (jld-reify/get-iri-sid property db-before iris)
         pid            (or existing-pid
-                           (let [new-id (jld-ledger/generate-new-pid property iris next-pid)]
+                           (let [new-id (jld-ledger/generate-new-pid property iris next-pid id refs)]
                              (vswap! new-sids conj new-id)
-                             (when id                       ;; property is also a ref
-                               (vswap! refs conj new-id))
                              new-id))
         property-flake (when-not existing-pid
                          (flake/->Flake pid const/$iri property t true nil))

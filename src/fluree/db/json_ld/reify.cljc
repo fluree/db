@@ -32,35 +32,6 @@
                   <= (flake/->Flake 0 -1 nil nil nil nil)))
 
 
-(defn get-refs
-  "Finds all refs by looking at context. If a property is defined with @type: @id it is a ref.
-
-  Note: this assumes the properties are not compact IRIS - if that changes, they will have to be
-  expanded first.
-
-  This also leverages that assertions have been processed, and thus the 'iris' volatile! map will
-  contain mappings of new properties to their respective property-ids/sids... this will not work if
-  that step has not happened first."
-  [commit db iris]
-  (let [context  (get commit "@context")
-        ;; context* ends up being a list of context-maps (likely only one of them)
-        context* (->> (if (sequential? context) context [context])
-                      (filter map?))]
-    (reduce
-      (fn [acc ctx-node]
-        (reduce-kv
-          (fn [acc* k v]
-            (if (= "@id" (get v "@type"))
-              (if-let [pid (jld-ledger/get-iri-sid k db iris)]
-                (conj acc* pid)
-                acc*)
-              acc*))
-          acc
-          ctx-node))
-      #{}
-      context*)))
-
-
 (defn retract-node
   [db node t iris]
   (let [{:keys [id type]} node
@@ -97,7 +68,7 @@
 
 
 (defn assert-node
-  [db node t iris next-pid next-sid]
+  [db node t iris refs next-pid next-sid]
   (let [{:keys [id type]} node
         existing-sid    (get-iri-sid id db iris)
         sid             (or existing-sid
@@ -107,7 +78,7 @@
                                     (let [existing-id (or (get-iri-sid type-item db iris)
                                                           (get jld-ledger/predefined-properties type-item))
                                           type-id     (or existing-id
-                                                          (jld-ledger/generate-new-pid type-item iris next-pid))
+                                                          (jld-ledger/generate-new-pid type-item iris next-pid nil nil))
                                           type-flakes (when-not existing-id
                                                         [(flake/->Flake type-id const/$iri type-item t true nil)
                                                          (flake/->Flake type-id const/$rdf:type const/$rdfs:Class t true nil)])]
@@ -119,18 +90,18 @@
                           type-assertions
                           (conj type-assertions (flake/->Flake sid const/$iri id t true nil)))]
     (reduce-kv
-      (fn [acc k v-map]
+      (fn [acc k {:keys [id] :as v-map}]
         (if (keyword? k)
           acc
           (let [existing-pid (get-iri-sid k db iris)
                 pid          (or existing-pid
-                                 (jld-ledger/generate-new-pid k iris next-pid))]
-            (cond-> (if-let [ref-iri (:id v-map)]
-                      (let [existing-sid (get-iri-sid ref-iri db iris)
+                                 (jld-ledger/generate-new-pid k iris next-pid id refs))]
+            (cond-> (if id                                  ;; is a ref to another IRI
+                      (let [existing-sid (get-iri-sid id db iris)
                             ref-sid      (or existing-sid
                                              (jld-ledger/generate-new-sid v-map iris next-pid next-sid))]
                         (cond-> (conj acc (flake/->Flake sid pid ref-sid t true nil))
-                                (nil? existing-sid) (conj (flake/->Flake ref-sid const/$iri ref-iri t true nil))))
+                                (nil? existing-sid) (conj (flake/->Flake ref-sid const/$iri id t true nil))))
                       (conj acc (flake/->Flake sid pid (:value v-map) t true nil)))
                     (nil? existing-pid) (conj (flake/->Flake pid const/$iri k t true nil))))))
       base-flakes
@@ -138,7 +109,7 @@
 
 
 (defn assert-flakes
-  [db assertions t iris]
+  [db assertions t iris refs]
   (let [last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         next-pid (fn [] (vswap! last-pid inc))
@@ -146,7 +117,7 @@
     (reduce
       (fn [acc node]
         (into acc
-              (assert-node db node t iris next-pid next-sid)))
+              (assert-node db node t iris refs next-pid next-sid)))
       []
       assertions)))
 
@@ -187,42 +158,53 @@
 (defn merge-commit
   [db commit]
   (let [iris           (volatile! {})
+        refs           (volatile! (-> db :schema :refs))
         t              (- (get-in commit ["https://flur.ee/ns/block/t" :value]))
         assert         (get commit "https://flur.ee/ns/block/assert")
         retract        (get commit "https://flur.ee/ns/block/retract")
         retract-flakes (retract-flakes db retract t iris)
-        assert-flakes  (assert-flakes db assert t iris)
-        refs           (get-refs commit db iris)]
-    (merge-flakes db t refs (into assert-flakes retract-flakes))))
+        assert-flakes  (assert-flakes db assert t iris refs)]
+    (merge-flakes db t @refs (into assert-flakes retract-flakes))))
 
 
 (defn load-commit
-  [read-fn commit-key]
-  (let [commit  (read-fn commit-key)
-        commit* (json-ld/expand commit)
-        subject (get commit* "https://www.w3.org/2018/credentials#credentialSubject")]
-    (when-not subject
-      (throw (ex-info (str "Unable to retrieve commit subject data from commit: " commit-key ".")
-                      {:status      500
-                       :error       :db/invalid-commit
-                       :commit-data (if (> (count (str commit)) 500)
-                                      (str (subs (str commit) 0 500) "...")
-                                      (str commit))})))
-    subject))
+  "Returns two-tuple of [commit-data commit-wrapper/proof].
+  In the case that a Verifiable Credential or JOSE were not used for
+  a proof, the second tuple will be nil."
+  [read-fn file-id]
+  (let [file-data  (read-fn file-id)
+        file-data* (json-ld/expand file-data)
+        cred-subj  (get file-data* "https://www.w3.org/2018/credentials#credentialSubject")
+        commit     (or cred-subj file-data*)]
+    [commit (when cred-subj file-data*)]))
 
 
-;; TODO - validate commit signatures
-;; TODO - support both VC and basic commit reading
-;; TODO - Check next-commit t is one less than last-t
 (defn trace-commits
+  "Returns a list of two-tuples each containing [commit proof] as applicable.
+  First commit will be t value of '1' and increment from there."
   [read-fn starting-commit]
   (loop [next-commit starting-commit
          last-t      nil
          commits     (list)]
-    (let [commit       (load-commit read-fn next-commit)
+    (let [[commit proof] (load-commit read-fn next-commit)
           t            (get-in commit ["https://flur.ee/ns/block/t" :value])
           next-commit* (get-in commit ["https://flur.ee/ns/block/prev" :id])
-          commits*     (conj commits commit)]
+          commits*     (conj commits [commit proof])]
+      (when-not t
+        (throw (ex-info (str "Commit is not a properly formatted Fluree commit: " next-commit ".")
+                        {:status      500
+                         :error       :db/invalid-commit
+                         :commit-data (if (> (count (str commit)) 500)
+                                        (str (subs (str commit) 0 500) "...")
+                                        (str commit))})))
+      (when (and last-t (not= t (dec last-t)))
+        (throw (ex-info (str "Commit t values are not in sync. Expecting next t value of: " (dec last-t)
+                             "however instead got a commit with t value of: " t " @ commit: " next-commit)
+                        {:status      500
+                         :error       :db/invalid-commit
+                         :commit-data (if (> (count (str commit)) 500)
+                                        (str (subs (str commit) 0 500) "...")
+                                        (str commit))})))
       (if (= 1 t)
         commits*
         (recur next-commit* t commits*)))))
@@ -244,11 +226,22 @@
     doc))
 
 
+;; TODO - validate commit signatures
+(defn validate-commit
+  "Run proof validation, if exists.
+  Return actual commit data. In the case of a VerifiableCredential this is
+  the `credentialSubject`."
+  [db commit]
+  commit)
+
+
 (defn load-db
   [{:keys [config] :as db} db-key]
   (let [read-fn (:read config)
         commits (trace-commits read-fn db-key)]
     (reduce
-      (fn [db* commit]
+      (fn [db* [commit proof]]
+        (when proof
+          (validate-commit db* proof))
         (merge-commit db* commit))
       db commits)))

@@ -65,9 +65,15 @@
     new-sid))
 
 (defn generate-new-pid
-  [property-iri iris next-pid]
+  "Generates a new pid for a property that has not yet been used.
+  Optionally 'refs-v' is a volatile! set of refs that gets used in
+  the pre-computed :schema of a db, and 'ref?', if truthy, indicates
+  if this property should get added to the refs-v."
+  [property-iri iris next-pid ref? refs-v]
   (let [new-pid (next-pid)]
     (vswap! iris assoc property-iri new-pid)
+    (when ref?
+      (vswap! refs-v conj new-pid))
     new-pid))
 
 (defn get-iri-sid
