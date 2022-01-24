@@ -1150,7 +1150,9 @@
             fuel       (or (:fuel opts)                     ;; :fuel volatile! can be provided upstream
                            (when (or max-fuel (:meta opts))
                              (volatile! 0)))
-            db-context (get-in db [:schema :prefix])
+            db-context (or (:context db)
+                           ;; TODO - below (:prefix) will be deprecated after json-ld transition
+                           (get-in db [:schema :prefix]))
             query-map* (assoc query-map :context (json-ld/parse-context db-context context))]
         (if (sequential? where)
           ;; ad-hoc query

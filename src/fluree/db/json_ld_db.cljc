@@ -445,7 +445,7 @@
          (assoc :config (-> config
                             (assoc :read-only? read-only?)
                             (dissoc :context))
-                :context context))))
+                :context (when context (json-ld/parse-context context))))))
   ([method {:keys [context methods did opts iri] :as config}]
    (let [method*       (keyword method)
          method-config (or (get methods method*)
