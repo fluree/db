@@ -130,28 +130,45 @@
             compacted))
       {:_id type-sid})))
 
+;; TODO - below is a more generic function that should go in a utility and be utilized multiple places.
+(defn resolve-iri
+  "Resolves a subject-id to an iri, and caches."
+  [db context cache sid]
+  (go-try
+    (when-let [compacted (some-> (<? (query-range/index-range db :spot = [sid 0]))
+                                 first
+                                 flake/o
+                                 (json-ld/compact context))]
+      (vswap! cache assoc-in [sid :compact] compacted)
+      compacted)))
+
+(defn get-id-alias
+  "@id value may be mapped to a different key based on context.
+  Caches result for future lookups"
+  [db context cache]
+  (let [id-iri    (get-in db [:schema :pred const/$iri :iri]) ;; should be '@id'
+        compacted (json-ld/compact id-iri context)]
+    (vswap! cache assoc-in [const/$iri :compact] compacted)
+    compacted))
+
 (defn- display-ref-jsonld
   "Display basic ref/linked predicate values when not being crawled."
   [db cache context pred-spec flakes]
   (go-try
     (if (= const/$rdf:type (:p pred-spec))
       (mapv #(rdf-type->str db cache context %) flakes)
-      (loop [[flake & r] flakes
-             acc []]
-        (if flake
-          (let [sid (flake/o flake)
-                iri (or (get-in @cache [sid :compact])
-                        ;; below will obey permissions, and only return an IRI if one can see the value
-                        (when-let [iri (some-> (<? (query-range/index-range db :spot = [sid 0]))
-                                               first
-                                               flake/o)]
-                          (let [compacted (json-ld/compact iri context)]
-                            (vswap! cache assoc-in [sid :compact] compacted)
-                            compacted)))]
-            (if iri
-              (recur r (conj acc {"@id" iri}))
-              (recur r acc)))
-          acc)))))
+      (let [id-key (or (get-in @cache [const/$iri :compact]) ;; TODO - this can be done once for entire query upstream, duplicates effort here
+                       (get-id-alias db context cache))]
+        (loop [[flake & r] flakes
+               acc []]
+          (if flake
+            (let [sid (flake/o flake)
+                  iri (or (get-in @cache [sid :compact])
+                          (<? (resolve-iri db context cache sid)))]
+              (if iri
+                (recur r (conj acc {id-key iri}))
+                (recur r acc)))
+            acc))))))
 
 (defn- add-pred
   "Adds a predicate to a select spec graph crawl. flakes input is a list of flakes
