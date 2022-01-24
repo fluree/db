@@ -4,7 +4,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.iri :as iri-util]
             [fluree.db.util.log :as log])
   #?(:clj (:import (fluree.db.flake Flake))))
 

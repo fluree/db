@@ -121,14 +121,37 @@
 
 (defn rdf-type->str
   "When rendering rdf:type properties, this returns the appropriate string based on the query's context."
-  [db cache context ^Flake flake]
-  (let [type-sid (.-o flake)]
+  [db cache context flake]
+  (let [type-sid (flake/o flake)]
     (if-let [iri (get-in db [:schema :pred type-sid :iri])]
       (or (get-in @cache [type-sid :compact])
           (let [compacted (json-ld/compact iri context)]
             (vswap! cache assoc-in [type-sid :compact] compacted)
             compacted))
       {:_id type-sid})))
+
+(defn- display-ref-jsonld
+  "Display basic ref/linked predicate values when not being crawled."
+  [db cache context pred-spec flakes]
+  (go-try
+    (if (= const/$rdf:type (:p pred-spec))
+      (mapv #(rdf-type->str db cache context %) flakes)
+      (loop [[flake & r] flakes
+             acc []]
+        (if flake
+          (let [sid (flake/o flake)
+                iri (or (get-in @cache [sid :compact])
+                        ;; below will obey permissions, and only return an IRI if one can see the value
+                        (when-let [iri (some-> (<? (query-range/index-range db :spot = [sid 0]))
+                                               first
+                                               flake/o)]
+                          (let [compacted (json-ld/compact iri context)]
+                            (vswap! cache assoc-in [sid :compact] compacted)
+                            compacted)))]
+            (if iri
+              (recur r (conj acc {"@id" iri}))
+              (recur r acc)))
+          acc)))))
 
 (defn- add-pred
   "Adds a predicate to a select spec graph crawl. flakes input is a list of flakes
@@ -166,7 +189,7 @@
                                 ;; have a sub-selection
                                 (and (not recur?)
                                      (or (:select pred-spec') (:wildcard? pred-spec')))
-                                (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select])]
+                                (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select :context])]
                                   [(loop [[^Flake flake & r] flakes
                                           acc []]
                                      (if flake
@@ -200,7 +223,7 @@
                                    (if flake
                                      (let [children (<? (query-range/index-range db :spot = [(.-o flake)] {:limit (:limit pred-spec')}))
                                            acc*     (if (empty? children)
-                                                      (conj acc {:_id (.-o flake)})
+                                                      (conj acc {:_id (flake/o flake)})
                                                       (conj acc (<? (flakes->res db cache fuel max-fuel {:wildcard? true :compact? compact?} children))))]
                                        (when fuel (vswap! fuel + (count children)))
                                        (recur r acc*))
@@ -209,26 +232,26 @@
 
                                 ;; if a ref, put out an {:_id ...}, if @type expand into IRI
                                 ref?
-                                (if (= const/$rdf:type (:p pred-spec'))
-                                  [(mapv (partial rdf-type->str db cache context) flakes) offset-map]
+                                (if context                 ;; if JSON-LD db, this will be truthy
+                                  [(<? (display-ref-jsonld db cache context pred-spec' flakes)) offset-map]
                                   (if (true? (-> db :permissions :root?))
-                                    [(mapv #(hash-map :_id (.-o ^Flake %)) flakes) offset-map]
+                                    [(mapv #(hash-map :_id (flake/o %)) flakes) offset-map]
                                     (loop [[^Flake f & r] flakes
                                            acc []]
                                       (if f
                                         (if (seq (<? (query-range/index-range db :spot = [(.-o f)])))
-                                          (recur r (conj acc {:_id (.-o f)}))
+                                          (recur r (conj acc {:_id (flake/o f)}))
                                           (recur r acc))
                                         [acc offset-map]))))
 
                                 ;; @id value, so might need to shorten based on context
                                 (= const/$iri p)
-                                [(mapv #(json-ld/compact (.-o ^Flake %) context) flakes) offset-map]
+                                [(mapv #(json-ld/compact (flake/o %) context) flakes) offset-map]
 
 
                                 ;; else just output value
                                 :else
-                                [(mapv #(.-o ^Flake %) flakes) offset-map])]
+                                [(mapv #(flake/o %) flakes) offset-map])]
        (cond
          (empty? k-val) [acc offset-map]
          multi? [(assoc acc as k-val) offset-map]
@@ -393,9 +416,10 @@
             select-spec       (if (has-ns-lookups? base-select-spec)
                                 (full-select-spec db cache base-select-spec top-level-subject)
                                 base-select-spec)
-            base-acc          (if (or (:wildcard? select-spec) (:id? select-spec))
-                                {:_id top-level-subject}
-                                {})
+            base-acc          (cond
+                                (:context select-spec) {}   ;; for json-ld - :context will be truthy, else legacy
+                                (or (:wildcard? select-spec) (:id? select-spec)) {:_id top-level-subject}
+                                :else {})
             acc+refs          (if (get-in select-spec [:select :reverse])
                                 (->> (select-spec->reverse-pred-specs select-spec)
                                      (resolve-reverse-refs db cache fuel max-fuel (s (first flakes)))
@@ -410,7 +434,7 @@
                                   (let [flakes           (first p-flakes)
                                         pred-spec        (get-in select-spec [:select :pred-id (-> flakes first :p)])
                                         componentFollow? (component-follow? pred-spec select-spec)
-                                        [acc flakes' offset-map'] (cond
+                                        [acc* flakes' offset-map'] (cond
                                                                     (:recur pred-spec)
                                                                     [(<? (flake->recur db flakes pred-spec acc fuel max-fuel cache))
                                                                      (rest p-flakes) offset-map]
@@ -428,8 +452,7 @@
                                                                     [{:_id (-> flakes first :s)} (rest p-flakes) offset-map]
 
                                                                     :else
-                                                                    [acc (rest p-flakes) offset-map])
-                                        acc*             (assoc acc :_id (-> flakes first :s))]
+                                                                    [acc (rest p-flakes) offset-map])]
                                     (recur flakes' acc* offset-map'))))
             sort-preds        (reduce (fn [acc spec]
                                         (if (or (and (:multi? spec) (:orderBy spec))
@@ -522,7 +545,7 @@
                          (throw (ex-info (str "Non-indexed predicates are not valid in where clause statements. Provided: " (dbproto/-p-prop db :name p))
                                          {:status 400
                                           :error  :db/invalid-query})))
-                  subs (->> (condp identical? op           ;; TODO - apply .-s transducer to index-range once support is there
+                  subs (->> (condp identical? op            ;; TODO - apply .-s transducer to index-range once support is there
                               not= (concat (<? (query-range/index-range db :post > [p match] <= [p] {:limit limit*}))
                                            (<? (query-range/index-range db :post >= [p] < [p match] {:limit limit*})))
                               = (<? (query-range/index-range db :post = [p match] {:limit limit*}))
