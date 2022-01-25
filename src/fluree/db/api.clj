@@ -1,7 +1,7 @@
 (ns fluree.db.api
   (:gen-class)
   (:refer-clojure :exclude [range])
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [go go-loop <! <!!]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.api.auth :as auth-api]
@@ -1257,9 +1257,9 @@
    or if timeout in ms supplied expires, will close the channel (returning nil)."
   [conn ledger timeout]
   (let [timeout-at (+ (System/currentTimeMillis) timeout)]
-    (async/go-loop []
-      (let [db-status (-> (async/<! (ledger-info-async conn ledger)) :status)]
-        (if (= "ready" db-status)
+    (go-loop []
+      (let [db-status (:status (<! (ledger-info-async conn ledger)))]
+        (if (= :ready db-status)
           true
           (when (<= (System/currentTimeMillis) timeout-at)
             (async/<! (async/timeout 100))
@@ -1278,10 +1278,12 @@
 (defn ledger-ready?-async
   "Returns core async channel that will be true or false if ledger is in a 'ready' status."
   [conn ledger]
-  (async/go
-    (-> (async/<! (ledger-info-async conn ledger))
-        :status
-        (= "ready"))))
+  (go
+    (->> ledger
+         (ledger-info-async conn)
+         <!
+         :status
+         (= :ready))))
 
 
 (defn ledger-ready?
