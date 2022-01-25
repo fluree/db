@@ -101,13 +101,12 @@
   "Takes commit opts and merges in with defaults defined for the db."
   [db opts]
   (let [{:keys [context branch did private] :as opts*} (merge (:config db) opts)
-        context*      (or (some->> (or context (:context db)) ;; local context overrides db context
-                                   (conj base-context))
-                          base-context)
+        context*      (->> (if context
+                             (conj base-context context)
+                             base-context)
+                           (json-ld/parse-context (:context db)))
         ctx-used-atom (atom {})
-        compact-fn    (-> context*
-                          json-ld/parse-context
-                          (json-ld/compact-fn ctx-used-atom))
+        compact-fn    (json-ld/compact-fn context* ctx-used-atom)
         private*      (or private (:private did))
         did*          (or (:id did) (some-> private*
                                             did-from-private))]
