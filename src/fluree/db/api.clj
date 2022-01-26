@@ -267,7 +267,7 @@
                                        (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
                                                        {:status 400 :error :db/invalid-db}))))
               {:keys [alias auth doc fork forkBlock expire nonce private-key timeout
-                      snapshot snapshotBlock copy copyBlock]
+                      snapshot snapshotBlock copy copyBlock owners]
                :or   {timeout 60000}} opts
               [network ledger-id] (graphdb/validate-ledger-ident ledger)
               ledger-id            (if (str/starts-with? ledger-id "$")
@@ -294,7 +294,8 @@
                                     :snapshot      snapshot
                                     :snapshotBlock snapshotBlock
                                     :nonce         nonce
-                                    :expire        expire}]
+                                    :expire        expire
+                                    :owners        (not-empty owners)}]
           (if private-key
             (let [cmd (-> cmd-data
                           (util/without-nils)
@@ -302,7 +303,7 @@
                   sig (crypto/sign-message cmd private-key)]
               (submit-command-async conn {:cmd cmd, :sig sig}))
             (ops/unsigned-command-async conn cmd-data)))
-        (catch Exception e e))))
+        (catch Exception e (go e)))))
 
 
 (defn new-ledger
@@ -321,16 +322,14 @@
   ([conn ledger] (new-ledger conn ledger nil))
   ([conn ledger opts]
    (let [p (promise)]
-     (async/go
+     (go
        (let [res (new-ledger-async conn ledger opts)]
-         (if (channel? res)
-           (deliver p (async/<! res))
-           (deliver p res)))) p)))
+           (deliver p (<! res)))))))
 
 
 (defn delete-ledger-async
   "Completely deletes a ledger.
-  Returns a channel that will receive a boolean indicating success or failure.
+  Returns a channel with the deletion result or an exception.
 
   A 200 status indicates the deletion has been successfully initiated.
   The full deletion happens in the background on the respective ledger.
@@ -341,28 +340,28 @@
   Attempts to use a ledger in a deletion state will throw an exception."
   ([conn ledger] (delete-ledger-async conn ledger))
   ([conn ledger opts]
-   (try (let [{:keys [nonce expire timeout private-key] :or {timeout 60000}} opts
-              timestamp (System/currentTimeMillis)
-              nonce     (or nonce timestamp)
-              expire    (or expire (+ timestamp 30000))     ;; 5 min default
-              cmd-data  {:type   :delete-db
-                         :db     ledger
-                         :nonce  nonce
-                         :expire expire}]
-          (if private-key
-            (let [cmd          (-> cmd-data
-                                   (util/without-nils)
-                                   (json/stringify))
-                  sig          (crypto/sign-message cmd private-key)
-                  persisted-id (submit-command-async conn {:cmd cmd
-                                                           :sig sig})]
-              persisted-id)
-            (ops/unsigned-command-async conn cmd-data)))
-        (catch Exception e e))))
+   (try
+     (let [{:keys [nonce expire timeout private-key] :or {timeout 60000}} opts
+             timestamp (System/currentTimeMillis)
+             nonce     (or nonce timestamp)
+             expire    (or expire (+ timestamp 30000))     ;; 5 min default
+             cmd-data  {:type   :delete-db
+                        :db     ledger
+                        :nonce  nonce
+                        :expire expire}]
+         (if private-key
+           (let [cmd          (-> cmd-data
+                                  (util/without-nils)
+                                  (json/stringify))
+                 sig          (crypto/sign-message cmd private-key)]
+             (submit-command-async conn {:cmd cmd
+                                         :sig sig}))
+           (ops/unsigned-command-async conn cmd-data)))
+     (catch Exception e (go e)))))
 
 (defn delete-ledger
   "Completely deletes a ledger.
-  Returns a future that will have a boolean indicating success or failure.
+  Returns a promise that will have the deletion result or an exception.
 
   A 200 status indicates the deletion has been successfully initiated.
   The full deletion happens in the background on the respective ledger.
@@ -374,11 +373,10 @@
   ([conn ledger] (delete-ledger conn ledger nil))
   ([conn ledger opts]
    (let [p (promise)]
-     (async/go
+     (go
        (let [res (delete-ledger-async conn ledger opts)]
-         (if (channel? res)
-           (deliver p (async/<! res))
-           (deliver p res)))) p)))
+           (deliver p (<! res))))
+     p)))
 
 (defn multi-txns-async
   "Submits multiple transactions to a ledger, one after the other. If a transaction fails
