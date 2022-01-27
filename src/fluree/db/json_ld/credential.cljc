@@ -107,11 +107,15 @@
         derived-did   (str "did:fluree:" key-id)]
     (cond-> {:credential credential}
       (not= jws-header-json header)
-      (update :errors (fnil conj []) (str "Unsupported jws header in credential: " header))
+      (update :errors (fnil conj [])
+              {:error :credential/unknown-signing-algorithm
+               :message (str "Unsupported jws header in credential: " header)})
 
       (not= derived-did proof-did)
       (update :errors (fnil conj [])
-              (str "Derived did from signature does not match did in 'proof' of credential. Derived: " derived-did ", proof verificationMethod: " proof-did)))))
+              {:error :credential/invalid-signature
+               :message (str "Derived did from signature does not match did in 'proof' of credential. Derived: "
+                             derived-did ", proof verificationMethod: " proof-did)}))))
 
 (comment
   (def kp (crypto/generate-key-pair))
