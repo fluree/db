@@ -102,7 +102,7 @@
   (let [proof-did     (get-in credential ["proof" "verificationMethod"])
         jws           (get-in credential ["proof" "jws"])
         {:keys [header payload signature]} (deserialize-jws jws)
-        signing-input (jws-signing-input payload)
+        signing-input (signing-input payload)
         key-id        (crypto/account-id-from-message signing-input signature)
         derived-did   (str "did:fluree:" key-id)]
     (cond-> {:credential credential}
