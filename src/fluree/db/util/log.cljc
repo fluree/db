@@ -50,7 +50,7 @@
   {:arglists '([message & more] [throwable message & more])}
   [& args]
   `(if-cljs
-     (log logger :error ~(vec args))
+     (log logger :severe ~(vec args))
      (log/logp :error ~@args)))
 
 
