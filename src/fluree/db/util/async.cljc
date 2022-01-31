@@ -51,7 +51,7 @@
 
 #?(:clj
    (defmacro go-try
-     "Like go but catches the first thrown error and returns it."
+     "Like go but catches the first thrown error and puts it on the returned channel."
      [& body]
      `(if-cljs
         (cljs.core.async/go

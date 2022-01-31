@@ -50,23 +50,25 @@
                                      (str/split #"=")))
                            (into {}))
                       (catch* _
-                              (throw (ex-info (str "Invalid Signature header. Ensure you have "
-                                                   "key1=value1,key2=value2 format and all string "
-                                                   "values are inside double-quotes.")
-                                              {:status 400
-                                               :error  :db/invalid-auth}))))
+                        (throw (ex-info (str "Invalid Signature header. Ensure you have "
+                                             "key1=value1,key2=value2 format and all string "
+                                             "values are inside double-quotes.")
+                                        {:status 400
+                                         :error  :db/invalid-auth}))))
         sig-parts   (str/split (get sig-map "headers" "") #" ")
         sign-string (generate-signing-string (assoc headers "method" request-method
                                                             "path" uri)
                                              sig-parts)
         signature   (get sig-map "signature")
         authority   (crypto/account-id-from-message sign-string signature)
-        keyId       (get sig-map "keyId")
-        auth        (if (= "na" keyId) nil keyId)]
+        key-id      (get sig-map "keyId")
+        auth        (if (= "na" key-id) nil key-id)]
     (log/debug "Verifying signature. Sign string: " sign-string " Signature: " signature " Account Id: " auth)
     {:auth      (or auth authority)
      :authority authority
-     :type      :http-signature}))
+     :type      :http-signature
+     :signed    sign-string
+     :signature signature}))
 
 
 (defn verify-signature-header
