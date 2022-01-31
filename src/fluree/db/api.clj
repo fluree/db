@@ -193,6 +193,7 @@
              :message (str "Timeout of " timeout-ms " ms for reached without transaction being included in new block. Transaction is still being processed. To view transaction results, issue: {\"select\": [\"*\"], \"from\": [\"_tx/id\", \"" tid "\" ]}")})
           res)))))
 
+
 (defn submit-command-async
   "INTERNAL USE ONLY
 
@@ -267,7 +268,7 @@
                                        (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
                                                        {:status 400 :error :db/invalid-db}))))
               {:keys [alias auth doc fork forkBlock expire nonce private-key timeout
-                      snapshot snapshotBlock copy copyBlock]
+                      snapshot snapshotBlock copy copyBlock owners]
                :or   {timeout 60000}} opts
               [network ledger-id] (graphdb/validate-ledger-ident ledger)
               ledger-id            (if (str/starts-with? ledger-id "$")
@@ -294,7 +295,8 @@
                                     :snapshot      snapshot
                                     :snapshotBlock snapshotBlock
                                     :nonce         nonce
-                                    :expire        expire}]
+                                    :expire        expire
+                                    :owners        (not-empty owners)}]
           (if private-key
             (let [cmd (-> cmd-data
                           (util/without-nils)
@@ -302,7 +304,7 @@
                   sig (crypto/sign-message cmd private-key)]
               (submit-command-async conn {:cmd cmd, :sig sig}))
             (ops/unsigned-command-async conn cmd-data)))
-        (catch Exception e e))))
+        (catch Exception e (go e)))))
 
 
 (defn new-ledger
@@ -321,16 +323,14 @@
   ([conn ledger] (new-ledger conn ledger nil))
   ([conn ledger opts]
    (let [p (promise)]
-     (async/go
+     (go
        (let [res (new-ledger-async conn ledger opts)]
-         (if (channel? res)
-           (deliver p (async/<! res))
-           (deliver p res)))) p)))
+         (deliver p (<! res)))))))
 
 
 (defn delete-ledger-async
   "Completely deletes a ledger.
-  Returns a channel that will receive a boolean indicating success or failure.
+  Returns a channel with the deletion result or an exception.
 
   A 200 status indicates the deletion has been successfully initiated.
   The full deletion happens in the background on the respective ledger.
@@ -341,28 +341,31 @@
   Attempts to use a ledger in a deletion state will throw an exception."
   ([conn ledger] (delete-ledger-async conn ledger))
   ([conn ledger opts]
-   (try (let [{:keys [nonce expire timeout private-key] :or {timeout 60000}} opts
-              timestamp (System/currentTimeMillis)
-              nonce     (or nonce timestamp)
-              expire    (or expire (+ timestamp 30000))     ;; 5 min default
-              cmd-data  {:type   :delete-db
-                         :db     ledger
-                         :nonce  nonce
-                         :expire expire}]
-          (if private-key
-            (let [cmd          (-> cmd-data
-                                   (util/without-nils)
-                                   (json/stringify))
-                  sig          (crypto/sign-message cmd private-key)
-                  persisted-id (submit-command-async conn {:cmd cmd
-                                                           :sig sig})]
-              persisted-id)
-            (ops/unsigned-command-async conn cmd-data)))
-        (catch Exception e e))))
+   (try
+     (let [timestamp (System/currentTimeMillis)
+
+           {:keys [nonce expire timeout private-key]
+            :or   {timeout 60000, nonce timestamp}} opts
+
+           expire    (or expire (+ timestamp 30000)) ;; 5 min default
+           cmd-data  {:type   :delete-db
+                      :db     ledger
+                      :nonce  nonce
+                      :expire expire}]
+       (if private-key
+         (let [cmd (-> cmd-data
+                       (util/without-nils)
+                       (json/stringify))
+               sig (crypto/sign-message cmd private-key)]
+           (submit-command-async conn {:cmd cmd
+                                       :sig sig}))
+         (ops/unsigned-command-async conn cmd-data)))
+     (catch Exception e (go e)))))
+
 
 (defn delete-ledger
   "Completely deletes a ledger.
-  Returns a future that will have a boolean indicating success or failure.
+  Returns a promise that will have the deletion result or an exception.
 
   A 200 status indicates the deletion has been successfully initiated.
   The full deletion happens in the background on the respective ledger.
@@ -374,11 +377,10 @@
   ([conn ledger] (delete-ledger conn ledger nil))
   ([conn ledger opts]
    (let [p (promise)]
-     (async/go
+     (go
        (let [res (delete-ledger-async conn ledger opts)]
-         (if (channel? res)
-           (deliver p (async/<! res))
-           (deliver p res)))) p)))
+         (deliver p (<! res))))
+     p)))
 
 (defn multi-txns-async
   "Submits multiple transactions to a ledger, one after the other. If a transaction fails
@@ -469,7 +471,7 @@
                          :deps   deps
                          :expire expire})
                ;; will received txid once transaction is persisted, else an error
-               txid (<? (ops/transact-async conn tx-map))
+               txid   (<? (ops/transact-async conn tx-map))
                result (if txid-only
                         txid
                         (<? (monitor-tx-async conn ledger txid timeout)))]
@@ -662,35 +664,45 @@
 (defn format-block-resp-pretty
   "INTERNAL USE ONLY"
   [db curr-block cache fuel]
-  (go-try (let [[asserted-subjects
-                 retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
-                                            asserted-subjects  {}
-                                            retracted-subjects {}]
-                 (if-not flake
-                   [asserted-subjects retracted-subjects]
-                   (let [subject   (.-s flake)
-                         asserted? (true? (.-op flake))
-                         flake'    (if asserted? flake
-                                       (flake/flip-flake flake))]
-                     (if asserted?
-                       (recur r (update asserted-subjects subject #(vec (conj % flake')))
-                              retracted-subjects)
-                       (recur r asserted-subjects
-                              (update retracted-subjects subject #(vec (conj % flake'))))))))
-                retracted (loop [[subject & r] (vals retracted-subjects)
-                                 acc []]
-                            (if-not subject
-                              acc
-                              (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
-                asserted  (loop [[subject & r] (vals asserted-subjects)
-                                 acc []]
-                            (if-not subject
-                              acc
-                              (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
-            {:block     (:block curr-block)
-             :t         (:t curr-block)
-             :retracted retracted
-             :asserted  asserted})))
+  (go-try
+    (let [[asserted-subjects
+           retracted-subjects]
+          (loop [[^Flake flake & r] (:flakes curr-block)
+                 asserted-subjects  {}
+                 retracted-subjects {}]
+            (if-not flake
+              [asserted-subjects retracted-subjects]
+              (let [subject   (.-s flake)
+                    asserted? (true? (.-op flake))
+                    flake'    (if asserted? flake
+                                           (flake/flip-flake flake))]
+                (if asserted?
+                  (recur r (update asserted-subjects subject #(vec (conj % flake')))
+                         retracted-subjects)
+                  (recur r asserted-subjects
+                         (update retracted-subjects subject #(vec (conj % flake'))))))))
+          retracted (loop [[subject & r] (vals retracted-subjects)
+                           acc []]
+                      (if-not subject
+                        acc
+                        (recur r (conj acc
+                                       (<? (fql/flakes->res
+                                             db cache fuel 1000000
+                                             {:wildcard? true, :select {}}
+                                             subject))))))
+          asserted (loop [[subject & r] (vals asserted-subjects)
+                          acc []]
+                     (if-not subject
+                       acc
+                       (recur r (conj acc
+                                      (<? (fql/flakes->res
+                                            db cache fuel 1000000
+                                            {:wildcard? true, :select {}}
+                                            subject))))))]
+      {:block     (:block curr-block)
+       :t         (:t curr-block)
+       :retracted retracted
+       :asserted  asserted})))
 
 
 (defn format-blocks-resp-pretty
@@ -951,9 +963,9 @@
    (sql db sql-str {}))
   ([db sql-str opts]
    (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (sql-async db sql-str opts))))
-    p)))
+     (async/go
+       (deliver p (async/<! (sql-async db sql-str opts))))
+     p)))
 
 (defn sparql-async
   "Exceute a sparql query against a specified database. Returns a core async channel,
@@ -970,74 +982,15 @@
    (sparql db sparql-str {}))
   ([db sparql-str opts]
    (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (sparql-async db sparql-str opts))))
-    p)))
-
-#_(defn index
-  "INTERNAL USE ONLY
-
-  Returns a raw collection of flakes from the specified index as a lazy sequence.
-
-  Optionally specify a start and/or stop point to restrict the collection to a range
-  along with an operator of <, <=, >, >=. If you wish to restrict to a specific
-  subject, predicate, etc. the = operator can also be used, which is equivalent to the same
-  parts being specified with a >= and <= operators.
-
-  The start and stop point should be specified as a vector of the relevant part(s) of the
-  specified index. i.e. if using the :spo index, the parts are [s p o], an :pos index would
-  be [p o s]. If only some parts, i.e. [s] are provided, the other parts are assumed to
-  be the lowermost or uppermost bounds of the remaining parts depending on if it is the
-  start or stop respectively. Keep in mind subjects sort descending.
-
-  Entities can be specified as an _id long integer, any unique identity (pred / obj two-tuple),
-  or a collection name.
-
-  Predicates can b
-  "
-  [db index start stop]
-
-  nil)
-
-
-
+     (async/go
+       (deliver p (async/<! (sparql-async db sparql-str opts))))
+     p)))
 
 
 (defn collection-flakes
   "INTERNAL USE ONLY"
   [db collection]
   (query-range/collection db collection))
-
-
-(comment ;; TODO: Write me someday?
-  (defn flakes
-    "Returns a lazy sequence of raw flakes from the blockchain history from
-  start block/transaction (inclusive) to end block/transaction (exclusive).
-
-  A nil start defaults to the genesis block. A nil end includes the last block of the known database.
-  A positive integer for either start/end indicates a block number, a negative integer indicates a
-  transaction number.
-
-  Results can potentially include the entire database depending on your filtering criteria,
-  so be sure to only 'pull' items as you need them.
-
-  The optional map of filter criteria has the following keyed options:
-
-  :subject    - Limit results to only include history of this subject, specified as either an _id or identity.
-               Note the results are no longer lazy when using this option.
-  :predicate - Limit results to only include history for this predicate. Must be used in conjunction with subject.
-               If there is a need to get history of all subjects for a specific predicate, see 'range-history'.
-  :limit     - Limit results to this quantity of matching flakes
-  :offset    - Begin results after this number of matching flakes (for paging - use in conjunction with limit)
-  :chunk     - Results are fetched in chunks. Optionally specify the size of a chunk if optimization is needed."
-    ([conn] (flakes conn nil nil {}))
-    ([conn start] (flakes conn start nil {}))
-    ([conn start end] (flakes conn start end {}))
-    ([conn start end {:keys [subject predicate limit offset chunk]}])))
-
-
-
-
 
 
 (defn range
@@ -1131,23 +1084,6 @@
   (connection/close! conn))
 
 
-;(defn session
-;  "Create a session to a specific database. The session can be used to get a
-;  queryable database, submit a transaction, etc.
-;
-;  Utilize full database name: network-name/db-name.
-;
-;  A session object is returned if successful.  If the supplied connection is not
-;  participating in that network, or the connection itself is not currently active,
-;  an exception will be thrown.
-;
-;  While there is activity, the current version of the database will stay in-sync
-;  allowing for immediate access of the latest data. If idle for a period of time,
-;  the session will close, but automatically re-connect when next used."
-;  [connection db-name & [opts]]
-;  (session/session connection db-name opts)
-;  )
-
 (defn listen
   "Listens to all events of a given ledger. Supply a ledger identity,
   any key, and a two-argument function that will be called with each event.
@@ -1190,7 +1126,7 @@
                                               {"_id" sid} flakes)))
                               [] by-subj)))]
     (assoc block-event :added (to-map add)
-           :retracted (to-map retract))))
+                       :retracted (to-map retract))))
 
 (defn session
   "Returns actual session object for a given ledger."
