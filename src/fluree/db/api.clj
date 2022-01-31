@@ -325,7 +325,8 @@
    (let [p (promise)]
      (go
        (let [res (new-ledger-async conn ledger opts)]
-         (deliver p (<! res)))))))
+         (deliver p (<! res))))
+     p)))
 
 
 (defn delete-ledger-async
