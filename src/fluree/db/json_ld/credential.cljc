@@ -18,8 +18,8 @@
 
 (def jws-header-json (json-ld/normalize-data jws-header {:algorithm :basic
                                                          :format    :application/json}))
-;; TODO - below encoding should be :base64URL once supported
-(def jws-header-b64 (alphabase/base-to-base jws-header-json :string :base64))
+
+(def jws-header-b64 (alphabase/base-to-base jws-header-json :string :base64url))
 
 (defn credential-json
   "Takes final credential response object (as returned by sign-credential)
@@ -36,8 +36,7 @@
   "JOSE JWS signing input is b64URL of header, + '.' + b64URL of json to be signed.
   The resulting input is hashed with SHA-256, and that result is what is signed."
   [payload]
-  ;; TODO: below should be :base64URL once supported
-  (str jws-header-b64 "." (alphabase/base-to-base payload :string :base64)))
+  (str jws-header-b64 "." (alphabase/base-to-base payload :string :base64url)))
 
 (defn serialize-jws
   "Serialize a JWS according to the JOSE specification, compact form."
@@ -48,18 +47,16 @@
   "Deserialize a compact JWS into its component parts"
   [jws]
   (let [[header payload sig] (str/split jws #"\.")]
-    ;; TODO: convert from base64URL
-    {:header    (alphabase/base-to-base header :base64 :string)
-     :payload   (alphabase/base-to-base payload :base64 :string)
-     :signature (alphabase/base-to-base sig :base64 :hex)}))
+    {:header    (alphabase/base-to-base header :base64url :string)
+     :payload   (alphabase/base-to-base payload :base64url :string)
+     :signature (alphabase/base-to-base sig :base64url :hex)}))
 
 (defn sign
   "Given a payload and a signing key, returns a JOSE JSON Web Signature."
   [payload signing-key]
   (let [signing-input (signing-input payload)
         signature     (crypto/sign-message signing-input signing-key)
-        ;; TODO: use base64URL encoding
-        b64-signature (alphabase/base-to-base signature :hex :base64)]
+        b64-signature (alphabase/base-to-base signature :hex :base64url)]
     (serialize-jws signing-input b64-signature)))
 
 (defn add-proof
