@@ -31,7 +31,8 @@
          com.fluree/abracad              {:mvn/version "0.4.19"}
          com.taoensso/nippy              {:mvn/version "3.1.1"}
          org.xerial.snappy/snappy-java   {:mvn/version "1.1.8.4"}
-         com.fluree/alphabase            {:mvn/version "3.2.2"}
+         com.fluree/alphabase            {:git/url "https://github.com/fluree/alphabase.git"
+                                          :sha "1161efe7f5fd5abb066adf2283f5da3c7683a48f"}
 
          ;; cryptography
          com.fluree/crypto               {:mvn/version "0.3.7"}

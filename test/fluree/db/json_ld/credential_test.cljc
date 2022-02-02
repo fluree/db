@@ -60,7 +60,7 @@
              (cred/deserialize-jws jws)))))
 
   (testing "sign"
-    (is (= "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19.aGV5.GzBEAiBjDupMQ+RzCgsCLGI3izVqSbcYWhmM54P+c9noL6TsHgIgEHevXLy4zPcpRy2XFjeX36E7mZgmSxXMgCc/H9nRCVk="
+    (is (= "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19.aGV5.GzBEAiBjDupMQ-RzCgsCLGI3izVqSbcYWhmM54P-c9noL6TsHgIgEHevXLy4zPcpRy2XFjeX36E7mZgmSxXMgCc_H9nRCVk="
            (cred/sign "hey" (:private keypair)))))
 
   (testing "add-proof"
@@ -75,7 +75,7 @@
                                       "created" "2020-01-01T21:26:29.218179Z"
                                       "verificationMethod" "did:fluree:TfDHAtTYQMWN9fXiEHbyMGizL3hruGs9wuj"
                                       "proofPurpose" "assertionMethod"
-                                      "jws" "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19.eyJAY29udGV4dCI6WyJodHRwczovL3d3dy53My5vcmcvMjAxOC9jcmVkZW50aWFscy92MSIsImh0dHBzOi8vZmx1ci5lZS9ucy9ibG9jayJdLCJjcmVkZW50aWFsU3ViamVjdCI6eyJvdGhlciI6ImRhdGEiLCJzb21lIjoiZGF0YSJ9LCJpc3N1YW5jZURhdGUiOiIyMDIwLTAxLTAxVDIxOjI2OjI5LjIxODE3OVoiLCJpc3N1ZXIiOiJkaWQ6Zmx1cmVlOlRmREhBdFRZUU1XTjlmWGlFSGJ5TUdpekwzaHJ1R3M5d3VqIiwidHlwZSI6WyJWZXJpZmlhYmxlQ3JlZGVudGlhbCJdfQ==.GzBFAiEAnZhKotqoLaHTfJagZ+0JMfbh0M29yB9JP2BEEkLAhIsCIGecqP15NdpU92gd9+n3LLnauuexJeSVxk94NU1ZrRxA"}}
+                                      "jws" "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19.eyJAY29udGV4dCI6WyJodHRwczovL3d3dy53My5vcmcvMjAxOC9jcmVkZW50aWFscy92MSIsImh0dHBzOi8vZmx1ci5lZS9ucy9ibG9jayJdLCJjcmVkZW50aWFsU3ViamVjdCI6eyJvdGhlciI6ImRhdGEiLCJzb21lIjoiZGF0YSJ9LCJpc3N1YW5jZURhdGUiOiIyMDIwLTAxLTAxVDIxOjI2OjI5LjIxODE3OVoiLCJpc3N1ZXIiOiJkaWQ6Zmx1cmVlOlRmREhBdFRZUU1XTjlmWGlFSGJ5TUdpekwzaHJ1R3M5d3VqIiwidHlwZSI6WyJWZXJpZmlhYmxlQ3JlZGVudGlhbCJdfQ==.GzBFAiEAnZhKotqoLaHTfJagZ-0JMfbh0M29yB9JP2BEEkLAhIsCIGecqP15NdpU92gd9-n3LLnauuexJeSVxk94NU1ZrRxA"}}
                 :normalized "{\"@context\":[\"https://www.w3.org/2018/credentials/v1\",\"https://flur.ee/ns/block\"],\"credentialSubject\":{\"other\":\"data\",\"some\":\"data\"},\"issuanceDate\":\"2020-01-01T21:26:29.218179Z\",\"issuer\":\"did:fluree:TfDHAtTYQMWN9fXiEHbyMGizL3hruGs9wuj\",\"type\":[\"VerifiableCredential\"]}"}
                (cred/add-proof {"@context"          ["https://www.w3.org/2018/credentials/v1"
                                                      "https://flur.ee/ns/block"]
@@ -98,7 +98,7 @@
                                     "created" "2020-01-01T21:26:29.218179Z"
                                     "verificationMethod" "did:fluree:TfDHAtTYQMWN9fXiEHbyMGizL3hruGs9wuj"
                                     "proofPurpose" "assertionMethod"
-                                    "jws" "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19.eyJAY29udGV4dCI6WyJodHRwczovL3d3dy53My5vcmcvMjAxOC9jcmVkZW50aWFscy92MSIsImh0dHBzOi8vZmx1ci5lZS9ucy9ibG9jayJdLCJjcmVkZW50aWFsU3ViamVjdCI6eyJvdGhlciI6ImRhdGEiLCJzb21lIjoiZGF0YSJ9LCJpZCI6ImJsYWgiLCJpc3N1YW5jZURhdGUiOiIyMDIwLTAxLTAxVDIxOjI2OjI5LjIxODE3OVoiLCJpc3N1ZXIiOiJkaWQ6Zmx1cmVlOlRmREhBdFRZUU1XTjlmWGlFSGJ5TUdpekwzaHJ1R3M5d3VqIiwidHlwZSI6WyJWZXJpZmlhYmxlQ3JlZGVudGlhbCJdfQ==.HDBEAiBO+aK2XXhv768JStpcIC943PSLlFJXwMfJK9tU9fc3uQIgMB8oU446Uy4RMQz+uyh/sSMZdICIXn5R3wQX2OvGjkU="}}
+                                    "jws" "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19.eyJAY29udGV4dCI6WyJodHRwczovL3d3dy53My5vcmcvMjAxOC9jcmVkZW50aWFscy92MSIsImh0dHBzOi8vZmx1ci5lZS9ucy9ibG9jayJdLCJjcmVkZW50aWFsU3ViamVjdCI6eyJvdGhlciI6ImRhdGEiLCJzb21lIjoiZGF0YSJ9LCJpZCI6ImJsYWgiLCJpc3N1YW5jZURhdGUiOiIyMDIwLTAxLTAxVDIxOjI2OjI5LjIxODE3OVoiLCJpc3N1ZXIiOiJkaWQ6Zmx1cmVlOlRmREhBdFRZUU1XTjlmWGlFSGJ5TUdpekwzaHJ1R3M5d3VqIiwidHlwZSI6WyJWZXJpZmlhYmxlQ3JlZGVudGlhbCJdfQ==.HDBEAiBO-aK2XXhv768JStpcIC943PSLlFJXwMfJK9tU9fc3uQIgMB8oU446Uy4RMQz-uyh_sSMZdICIXn5R3wQX2OvGjkU="}}
               :normalized "{\"@context\":[\"https://www.w3.org/2018/credentials/v1\",\"https://flur.ee/ns/block\"],\"credentialSubject\":{\"other\":\"data\",\"some\":\"data\"},\"id\":\"blah\",\"issuanceDate\":\"2020-01-01T21:26:29.218179Z\",\"issuer\":\"did:fluree:TfDHAtTYQMWN9fXiEHbyMGizL3hruGs9wuj\",\"type\":[\"VerifiableCredential\"]}"}
              (cred/generate {"some" "data" "other" "data"} {:private (:private keypair)
                                                             :did {:id issuer}})))))
