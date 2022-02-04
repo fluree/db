@@ -9,6 +9,7 @@
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
+            [fluree.db.query.range :as query-range]
             #?(:cljs [fluree.db.flake :refer [Flake]]))
   #?(:clj (:import (fluree.db.flake Flake))))
 
@@ -318,6 +319,18 @@
   (try*
     (clojure.core/or (clojure.core/get m k) (clojure.core/get m (keyword k)))
     (catch* e (function-error e "get" m k))))
+
+(defn get-subj-pred
+  "Retrieve's a subject's predicate value by doing a lookup.
+  If multi returns a vector, else a single value."
+  [db sid pred]
+  (go-try
+    (let [multi? (dbproto/-p-prop db :multi pred)
+          res (<? (query-range/index-range db :spot = [sid pred]))]
+      (when (seq res)
+        (if multi?
+          (mapv #(.-o ^Flake %) res)
+          (.-o ^Flake (first res)))))))
 
 (defn now
   "Returns current epoch milliseconds."

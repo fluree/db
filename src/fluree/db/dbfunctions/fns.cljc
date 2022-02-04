@@ -273,7 +273,7 @@
   {:doc      "Gets a value from an subject."
    :fdb/spec nil
    :fdb/cost 10}
-  [?ctx subject pred]
+  [{:keys [cache db] :as ?ctx} subject pred]
   (go-try
     (let [subject  (extract subject)
           pred     (extract pred)
@@ -282,7 +282,20 @@
                        (first subject)
                        subject)
                      subject)
-          res      (fdb/get subject' pred)
+          res      (cond
+                     (and (int? subject') cache)
+                     (clojure.core/or
+                       (clojure.core/get-in @cache [:get subject' pred])
+                       (let [resp (<? (fdb/get-subj-pred db subject' pred))]
+                         (vswap! cache assoc-in [:get subject' pred] resp)
+                         resp))
+
+
+                     (int? subject')
+                     (<? (fdb/get-subj-pred db subject' pred))
+
+                     :else
+                     (fdb/get subject' pred))
           entry    [{:function "get" :arguments [subject pred] :result res} 10]]
       (add-stack ?ctx entry)
       res)))
