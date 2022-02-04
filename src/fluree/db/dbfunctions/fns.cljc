@@ -345,6 +345,15 @@
       (add-stack ?ctx entry)
       res)))
 
+(defn ctx
+  {:doc      "Returns a value from the user's context if set. Provide the key or key sequence."
+   :fdb/spec nil
+   :fdb/cost 1}
+  [{:keys [db] :as ?ctx} key-or-ks]
+  (if (sequential? key-or-ks)
+    (clojure.core/get-in (:ctx db) key-or-ks)
+    (clojure.core/get (:ctx db) key-or-ks)))
+
 (defn contains?
   {:doc      "Returns true if key is present."
    :fdb/spec nil

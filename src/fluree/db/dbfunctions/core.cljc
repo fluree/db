@@ -35,6 +35,7 @@
 (def default-fn-map {'get           (resolve 'fluree.db.dbfunctions.fns/get)
                      'get-all       (resolve 'fluree.db.dbfunctions.fns/get-all)
                      'get-in        (resolve 'fluree.db.dbfunctions.fns/get-in)
+                     'ctx           (resolve 'fluree.db.dbfunctions.fns/ctx)
                      'follow        (resolve 'fluree.db.dbfunctions.fns/get-all)
                      'contains?     (resolve 'fluree.db.dbfunctions.fns/contains?)
                      'relationship? (resolve 'fluree.db.dbfunctions.fns/relationship?)
