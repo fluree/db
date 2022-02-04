@@ -326,9 +326,9 @@
       (raise ?ctx "Cannot access ?pO from this function interface"))))
 
 (defn get-all
-  {:doc      "Follows an subject down the provided path and returns a set of all matching subjects."
+  {:doc      "Used to get-all values in a nested result set, or also can follow an subject down the provided path and returns a set of all matching subjects."
    :fdb/spec nil
-   :fdb/cost "9 + length of path"}
+   :fdb/cost "9 + length of path + query costs"}
   [?ctx subject path]
   (go-try
     (let [subject  (extract subject)
@@ -338,8 +338,10 @@
                        (first subject)
                        subject)
                      subject)
-          res      (fdb/get-all subject' path)
-          cost     (clojure.core/+ 9 (clojure.core/count path))
+          sid?     (int? subject')
+          [res cost] (if sid?
+                       (<? (fdb/follow-subject ?ctx subject' path))
+                       [(fdb/get-all subject' path) (clojure.core/+ 9 (clojure.core/count path))])
           entry    [{:function "get-all" :arguments [subject path] :result res} cost]]
       (add-stack ?ctx entry)
       res)))
