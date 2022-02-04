@@ -409,7 +409,7 @@
     (catch* e (function-error e "floor" num))))
 
 (defn get-all
-  "Follows an subject down the provided path and returns a set of all matching subjects."
+  "Follows a result set down the provided path and returns a set of all matching subjects."
   [start-subject path]
   (try*
     (loop [[pred & r] path
@@ -430,6 +430,36 @@
           (recur r next-subjects)
           (->> next-subjects (remove nil?) set))))
     (catch* e (function-error e "get-all" start-subject path))))
+
+(defn- select-from-path
+  "Takes a path in a vector format and returns a select statement to crawl those vars.
+  e.g. convert: ['_user/_auth', 'groupMembership/_user', 'group/_admins']
+            to: {'_user/_auth' [{'groupMembership/_user' ['group/_admins']}]}"
+  [path]
+  (if (= 1 (count path))
+    path
+    (let [r-path (reverse path)]
+      (reduce
+        (fn [acc p] {p [acc]})
+        (first r-path)
+        (rest r-path)))))
+
+(defn follow-subject
+  "Follows a subject down the provided path and returns a set of all matching subjects."
+  [?ctx sid path]
+  (async/go
+    (try*
+      (let [select (select-from-path path)
+            query' {:selectOne select
+                    :from   sid
+                    :opts   {}}
+            [res fuel] (<? (query (:db ?ctx) query'))
+            res* (get-all res (if (= "_id" (last path))
+                                path
+                                (conj path "_id")))]
+        [res* (+ fuel (count path) 9)])
+      (catch* e (function-error e "get-all" sid path)))))
+
 
 (defn get-in
   "Returns the value in a nested structure"
