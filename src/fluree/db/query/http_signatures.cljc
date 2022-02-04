@@ -63,7 +63,8 @@
         authority   (crypto/account-id-from-message sign-string signature)
         key-id      (get sig-map "keyId")
         auth        (if (= "na" key-id) nil key-id)]
-    (log/debug "Verifying signature. Sign string: " sign-string " Signature: " signature " Account Id: " auth)
+    (log/debug "Verifying signature. Sign string:"
+               sign-string "Signature:" signature "Account Id:" authority)
     {:auth      (or auth authority)
      :authority authority
      :type      :http-signature
