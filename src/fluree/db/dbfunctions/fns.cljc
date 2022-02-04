@@ -283,7 +283,7 @@
                        subject)
                      subject)
           res      (cond
-                     (and (int? subject') cache)
+                     (clojure.core/and (int? subject') cache)
                      (clojure.core/or
                        (clojure.core/get-in @cache [:get subject' pred])
                        (let [resp (<? (fdb/get-subj-pred db subject' pred))]
