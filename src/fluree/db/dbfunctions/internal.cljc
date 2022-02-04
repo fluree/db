@@ -561,7 +561,9 @@
 (defn ?auth_id
   [?ctx]
   (go-try (let [auth (:auth_id ?ctx)]
-            (<? (dbproto/-subid (:db ?ctx) auth)))))
+            (if (number? auth)
+              auth
+              (<? (dbproto/-subid (:db ?ctx) auth))))))
 
 (defn objT
   "Given an array of flakes, returns the sum of the objects of the true flakes"
