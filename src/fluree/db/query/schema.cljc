@@ -1,5 +1,5 @@
 (ns fluree.db.query.schema
-  (:require [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+  (:require [fluree.db.flake :as flake]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
@@ -8,8 +8,7 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.schema :as schema-util])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -33,7 +32,7 @@
   (go-try
     (let [os (->> (query-range/index-range db :psot = [pred-id])
                   (<?)
-                  (map #(.-o ^Flake %)))]
+                  (map #(flake/o %)))]
       (if (and os (not (empty? os)))
         (apply distinct? os) true))))
 
@@ -55,23 +54,23 @@
                         flakes)
           is-new?     (into #{} (vals tempids))             ;; a set of all the new tempid subids, to be used as a fn
           new-map     (reduce
-                        #(let [f ^Flake %2]
-                           (assoc-in %1 [(.-s f) :new?]
-                                     (boolean (is-new? (.-s f)))))
+                        #(let [f %2]
+                           (assoc-in %1 [(flake/s f) :new?]
+                                     (boolean (is-new? (flake/s f)))))
                         {} pred-flakes)]
-      (loop [[^Flake f & r] pred-flakes
+      (loop [[f & r] pred-flakes
              acc new-map]
         (if-not f
           acc
-          (let [pid         (.-p f)
+          (let [pid         (flake/p f)
                 pid-keyword (-> (dbproto/-p-prop db :name pid) (pred-name->keyword))
-                old-val?    (false? (.-op f))
+                old-val?    (false? (flake/op f))
                 v           (if (= :type pid-keyword)
-                              (<? (convert-type-to-kw (.-o f) db))
-                              (.-o f))]
+                              (<? (convert-type-to-kw (flake/o f) db))
+                              (flake/o f))]
             (recur r (if old-val?
-                       (assoc-in acc [(.-s f) pid-keyword :old] v)
-                       (assoc-in acc [(.-s f) pid-keyword :new] v)))))))))
+                       (assoc-in acc [(flake/s f) pid-keyword :old] v)
+                       (assoc-in acc [(flake/s f) pid-keyword :new] v)))))))))
 
 
 (defn type-error
@@ -280,9 +279,9 @@
 
 (defn flake->pred-map
   [flakes]
-  (reduce (fn [acc ^Flake flake]                                   ;; quick lookup map of predicate's predicate ids
-            (let [p         (.-p flake)
-                  o         (.-o flake)
+  (reduce (fn [acc flake]                                   ;; quick lookup map of predicate's predicate ids
+            (let [p         (flake/p flake)
+                  o         (flake/o flake)
                   existing? (get acc p)]
               (cond (and existing? (vector? existing?))
                     (update acc p conj o)
@@ -297,8 +296,8 @@
 (defn- extract-spec-ids
   [spec-pid schema-flakes]
   (->> schema-flakes
-       (keep #(let [f ^Flake %]
-                (when (= spec-pid (.-p f)) (.-o f))))
+       (keep #(let [f %]
+                (when (= spec-pid (flake/p f)) (flake/o f))))
        vec))
 
 (defn schema-map
@@ -313,18 +312,18 @@
   (go-try
     (let [schema-flakes (->> (query-range/index-range db :spot >= [(flake/max-subject-id const/$_collection)] <= [0])
                              (<?))
-          [collection-flakes predicate-flakes] (partition-by #(<= (.-s ^Flake %)
+          [collection-flakes predicate-flakes] (partition-by #(<= (flake/s %)
                                                                   flake/MAX-COLL-SUBJECTS)
                                                              schema-flakes)
           coll          (->> collection-flakes
-                             (partition-by #(.-s ^Flake %))
+                             (partition-by #(flake/s %))
                              (reduce (fn [acc coll-flakes]
-                                       (let [^Flake first-flake (first coll-flakes)
-                                             sid       (.-s first-flake)
+                                       (let [first-flake (first coll-flakes)
+                                             sid       (flake/s first-flake)
                                              p->v      (->> coll-flakes ;; quick lookup map of collection's predicate ids
                                                             (reduce
-                                                              #(let [f ^Flake %2]
-                                                                 (assoc %1 (.-p f) (.-o f)))
+                                                              #(let [f %2]
+                                                                 (assoc %1 (flake/p f) (flake/o f)))
                                                               {}))
                                              partition (or (get p->v const/$_collection:partition)
                                                            (flake/sid->i sid))
@@ -344,10 +343,10 @@
                                      {-1    {:name "_tx" :id -1 :sid -1 :partition -1 :spec nil :specDoc nil}
                                       "_tx" {:name "_tx" :id -1 :sid -1 :partition -1 :spec nil :specDoc nil}}))
           [pred fullText] (->> predicate-flakes
-                               (partition-by #(.-s ^Flake %))
+                               (partition-by #(flake/s %))
                                (reduce (fn [[pred fullText] pred-flakes]
-                                         (let [^Flake first-flake (first pred-flakes)
-                                               id        (.-s first-flake)
+                                         (let [first-flake (first pred-flakes)
+                                               id        (flake/s first-flake)
                                                p->v      (flake->pred-map pred-flakes)
                                                p-name    (get p->v const/$_predicate:name)
                                                p-type    (->> (get p->v const/$_predicate:type)

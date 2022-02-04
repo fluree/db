@@ -2,8 +2,7 @@
   (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.query.range :refer [index-range]]
-            [fluree.db.util.async :refer [<? go-try]])
-  (:import fluree.db.flake.Flake))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 (defn lookup-block-t
   [db block-num]
