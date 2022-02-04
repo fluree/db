@@ -1038,28 +1038,28 @@
                                                         fuel (comp (fuel-flake-transducer fuel max-fuel))
                                                         true (comp (distinct)))
                                        opts     (if orderBy {} {:limit limit :offset offset})
-                                       subjects (->> (<? (query-range/index-range db :psot = [from] opts))
+                                       subjects (->> (<? (query-range/index-range db* :psot = [from] opts))
                                                      (sequence xf))]
-                                   (<? (subject-select db cache fuel max-fuel select-spec' subjects limit)))
+                                   (<? (subject-select db* cache fuel max-fuel select-spec' subjects limit)))
 
 
                                  ;; collection-based query -> _block or _tx
                                  (and (string? from) (#{"_block" "_tx"} from))
                                  (let [opts   (if orderBy {} {:limit limit :offset offset})
-                                       flakes (<? (query-range/_block-or_tx-collection db opts))]
-                                   (<? (flake-select db cache fuel max-fuel select-spec' flakes)))
+                                       flakes (<? (query-range/_block-or_tx-collection db* opts))]
+                                   (<? (flake-select db* cache fuel max-fuel select-spec' flakes)))
 
                                  ;; collection-based query
                                  (string? from)
                                  (let [opts              (if orderBy {} {:limit limit :offset offset})
-                                       collection-flakes (<? (query-range/collection db from opts))]
-                                   (<? (flake-select db cache fuel max-fuel select-spec' collection-flakes)))
+                                       collection-flakes (<? (query-range/collection db* from opts))]
+                                   (<? (flake-select db* cache fuel max-fuel select-spec' collection-flakes)))
 
                                  ;; single subject _id provided
                                  (util/subj-ident? from)
-                                 (let [subjects (some-> (<? (dbproto/-subid db from false))
+                                 (let [subjects (some-> (<? (dbproto/-subid db* from false))
                                                         (vector))
-                                       res      (<? (subject-select db cache fuel max-fuel select-spec' subjects limit offset))]
+                                       res      (<? (subject-select db* cache fuel max-fuel select-spec' subjects limit offset))]
                                    (when fuel (vswap! fuel inc)) ;; charge 1 for the lookup
                                    res)
 
