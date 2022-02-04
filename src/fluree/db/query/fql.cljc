@@ -1007,16 +1007,17 @@
       (let [max-fuel (:max-fuel opts')
             fuel     (or (:fuel opts)                       ;; :fuel volatile! can be provided upstream
                          (when (or max-fuel (:meta opts))
-                           (volatile! 0)))]
+                           (volatile! 0)))
+            db*      (assoc db :ctx-cache (volatile! {}))]  ;; allow caching of some functions when available
         (if (sequential? where)
           ;; ad-hoc query
-          (ad-hoc-query db fuel max-fuel query-map opts')
+          (ad-hoc-query db* fuel max-fuel query-map opts')
           ;; all other queries
           (go-try
             (let [select-smt   (or select selectOne selectDistinct
                                    (throw (ex-info "Query missing :select or :selectOne." {:status 400 :error :db/invalid-query})))
                   {:keys [orderBy limit component offset]} opts'
-                  select-spec  (parse-db db select-smt opts')
+                  select-spec  (parse-db db* select-smt opts')
                   select-spec' (if (not (nil? component))
                                  (assoc select-spec :componentFollow? component)
                                  select-spec)
@@ -1028,8 +1029,8 @@
                   result       (cond
                                  (string? where)
                                  (let [default-collection (when (string? from) from)
-                                       subjects           (<? (where-filter db where default-collection {:limit limit :offset offset}))]
-                                   (<? (subject-select db cache fuel max-fuel select-spec'
+                                       subjects           (<? (where-filter db* where default-collection {:limit limit :offset offset}))]
+                                   (<? (subject-select db* cache fuel max-fuel select-spec'
                                                        subjects (if orderBy nil limit) (if orderBy nil offset))))
 
                                  ;; predicate-based query
@@ -1072,13 +1073,13 @@
                                                     (let [s    (if (int? n)
                                                                  n
                                                                  (do (when fuel (vswap! fuel inc))
-                                                                     (<? (dbproto/-subid db n false))))
+                                                                     (<? (dbproto/-subid db* n false))))
                                                           acc* (if s
                                                                  (conj acc s)
                                                                  acc)]
                                                       (recur r acc*))))
                                        subjects (into [] subjects)]
-                                   (<? (subject-select db cache fuel max-fuel select-spec' subjects (if orderBy nil limit) (if orderBy nil offset))))
+                                   (<? (subject-select db* cache fuel max-fuel select-spec' subjects (if orderBy nil limit) (if orderBy nil offset))))
 
                                  :else
                                  (ex-info (str "Invalid 'from' in query:" (pr-str query-map))
