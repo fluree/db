@@ -112,13 +112,16 @@
   [child]
   (select-keys child [:id :leaf :first :rhs :size]))
 
+(defn random-leaf-id
+  [network dbid idx]
+  (ledger-node-key network dbid idx (util/random-uuid) "l"))
+
 (defn write-leaf
   "Computes a new unique id for `leaf` and writes it to storage under that id.
   Returns the leaf map with the new id attached uner the `:id` key"
   [conn network dbid idx-type {:keys [flakes] :as leaf}]
   (go-try
-   (let [id-base (str (util/random-uuid))
-         leaf-id (ledger-node-key network dbid idx-type id-base "l")
+   (let [leaf-id (random-leaf-id network dbid idx-type)
          data    {:flakes flakes}
          ser     (serdeproto/-serialize-leaf (serde conn) data)]
      (<? (write conn leaf-id ser))
@@ -132,19 +135,22 @@
      (<? (write conn key ser))
      key)))
 
+(defn random-branch-id
+  [network dbid idx]
+  (ledger-node-key network dbid idx (util/random-uuid) "b"))
+
 (defn write-branch
   "Computes a new unique id for `branch` and writes it to storage under that id.
   Returns the branch map with the new id attached uner the `:id` key"
   [conn network dbid idx-type {:keys [children] :as branch}]
   (go-try
-   (let [id-base       (str (util/random-uuid))
-         branch-id     (ledger-node-key network dbid idx-type id-base "b")
-         child-vals    (->> children
-                            (map val)
-                            (mapv child-data))
-         first-flake         (->> child-vals first :first)
-         rhs          (->> child-vals rseq first :rhs)
-         data          {:children child-vals}]
+   (let [branch-id   (random-branch-id network dbid idx-type)
+         child-vals  (->> children
+                          (map val)
+                          (mapv child-data))
+         first-flake (->> child-vals first :first)
+         rhs         (->> child-vals rseq first :rhs)
+         data        {:children child-vals}]
      (<? (write-branch-data conn branch-id data))
      (assoc branch :id branch-id))))
 
