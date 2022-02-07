@@ -12,8 +12,7 @@
             #?(:clj [clojure.java.io :as io])
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.schema :as schema])
-  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
-     :clj (:import (fluree.db.flake Flake))))
+  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
 

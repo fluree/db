@@ -8,8 +8,7 @@
             [clucie.analysis :as lucene-analysis]
             [clucie.core :as lucene]
             [clucie.store :as lucene-store])
-  (:import (fluree.db.flake Flake)
-           (java.io Closeable)
+  (:import (java.io Closeable)
            (org.apache.lucene.analysis Analyzer)
            (org.apache.lucene.analysis.en EnglishAnalyzer)
            (org.apache.lucene.analysis.cn.smart SmartChineseAnalyzer)
@@ -83,9 +82,9 @@
   (open-storage [conn network dbid lang]))
 
 (defn predicate?
-  [^Flake f]
+  [f]
   (= const/$_predicate:fullText
-     (.-p f)))
+     (flake/p f)))
 
 (defn full-text-predicates
   [db coll-name]
