@@ -91,10 +91,10 @@
           idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
           ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
           flakes-bytes         (flake/size-bytes add-flakes)
-          schema-change?       (schema-util/schema-change? add-flakes)
+          system-chanage?      (schema-util/system-change? add-flakes)
           root-setting-change? (schema-util/setting-change? add-flakes)
           pred-ecount          (-> db :ecount (get const/$_predicate))
-          add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
+          add-pred-to-idx?     (if system-chanage? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
           db*                  (loop [[add-pred & r] add-pred-to-idx?
                                       db db]
                                  (if add-pred
@@ -120,7 +120,7 @@
                             :novelty {:spot spot, :psot psot, :post post,
                                       :opst opst, :tspo tspo, :size flake-size})]
             (cond-> db*
-              (or schema-change?
+              (or system-chanage?
                   (-> db* :schema nil?))
               (assoc :schema (<? (schema/schema-map db*)))
 

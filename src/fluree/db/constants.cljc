@@ -21,8 +21,9 @@
 (def ^:const $_role 7)
 (def ^:const $_rule 8)
 (def ^:const $_setting 9)
+(def ^:const $_ctx 10)
 
-(def ^:const $numSystemCollections 9)
+(def ^:const $numSystemCollections 19)                      ;; max number reserved for 'system'
 (def ^:const $maxSystemPredicates 999)
 
 ;; predicate id constants
@@ -85,6 +86,7 @@
 (def ^:const $_role:id 70)
 (def ^:const $_role:doc 71)
 (def ^:const $_role:rules 72)
+(def ^:const $_role:ctx 73)
 
 (def ^:const $_rule:id 80)
 (def ^:const $_rule:doc 81)
@@ -128,6 +130,11 @@
 (def ^:const $_shard:name 120)
 (def ^:const $_shard:miners 121)
 (def ^:const $_shard:mutable 122)
+
+(def ^:const $_ctx:name 130)
+(def ^:const $_ctx:key 131)
+(def ^:const $_ctx:fn 132)
+(def ^:const $_ctx:doc 133)
 
 ;; tags
 ;; _predicate/type tags
