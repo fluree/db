@@ -498,6 +498,16 @@
   [ss to-remove]
   (transient-reduce disj! ss to-remove))
 
+(defn assoc-all
+  [sm entries]
+  (transient-reduce (fn [m [k v]]
+                      (assoc! m k v))
+                    sm entries))
+
+(defn dissoc-all
+  [sm ks]
+  (transient-reduce dissoc! sm ks))
+
 (defn last
   "Returns the last item in `ss` in constant time as long as `ss` is a sorted
   set."
