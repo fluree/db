@@ -33,6 +33,8 @@
 (def ^:const tag-sid-start (flake/min-subject-id const/$_tag))
 (def ^:const tag-sid-end (flake/max-subject-id const/$_tag))
 
+(def ^:const sys-collection-end (flake/max-subject-id const/$numSystemCollections))
+
 (defn is-tx-meta-flake?
   "Returns true if this flake is for tx-meta"
   [^Flake f]
@@ -42,6 +44,11 @@
   "Returns true if flake is a schema flake."
   [^Flake f]
   (<= schema-sid-start (.-s f) schema-sid-end))
+
+(defn is-system-flake?
+  "Returns true if flake is a in a system collection."
+  [^Flake f]
+  (<= 0 (.-s f) sys-collection-end))
 
 (defn is-setting-flake?
   "Returns true if flake is a root setting flake."
@@ -98,6 +105,11 @@
 (defn setting-change?
   [flakes]
   (some is-setting-flake? flakes))
+
+(defn system-change?
+  "Returns true if any of the provided flakes are a in any system collection."
+  [flakes]
+  (some is-system-flake? flakes))
 
 
 (defn get-language-change

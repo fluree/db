@@ -377,9 +377,9 @@
   (go-try
     (let [coll  (extract coll)
           coll' (if (set? coll) coll (-> coll flatten set))
-          key   (extract key)
-          res   (fdb/contains? coll' key)
-          entry [{:function "contains?" :arguments [coll' key] :result res} 10]]
+          key'  (extract key)
+          res   (fdb/contains? coll' key')
+          entry [{:function "contains?" :arguments [coll' key'] :result res} 10]]
       (add-stack ?ctx entry)
       res)))
 

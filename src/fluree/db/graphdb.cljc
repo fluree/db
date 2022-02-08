@@ -81,7 +81,7 @@
            idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
            ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
            flakes-bytes         (flake/size-bytes add-flakes)
-           schema-change?       (schema-util/schema-change? add-flakes)
+           schema-change?       (schema-util/system-change? add-flakes)
            root-setting-change? (schema-util/setting-change? add-flakes)
            pred-ecount          (-> db :ecount (get const/$_predicate))
            add-pred-to-idx?     (if schema-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])

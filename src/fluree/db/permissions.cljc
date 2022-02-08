@@ -126,17 +126,18 @@
                  rules)
          rules)))))
 
-;; TODO - update cache on role, rule, fn update and close
-(def role-permission-cache (atom (cache/ttl-cache-factory {} :ttl (* 5 60 1000))))
+;; TODO - clear cache on close
+(def role-permission-cache (atom (cache/lru-cache-factory {} :threshold 500)))
 
 ;; TODO - can do parallelism below
 (defn role-permissions
   "Given a role identity (_id), returns a permission map for the given permission type.
   Permission types supported are either :query or :transact."
-  [db role-ident permission-type]
+  [{:keys [schema] :as db} role-ident permission-type]
   (go-try
     (or (when-not (:tt-id db)
-          (get @role-permission-cache [(:network db) (:dbid db) role-ident permission-type]))
+          ;; schema's :t value is updated every time there is a new schema/fn/role change
+          (get @role-permission-cache [(:t schema) (:network db) (:dbid db) role-ident permission-type]))
         (let [_              (when-not (#{:query :transact :token} permission-type)
                                (throw (ex-info (str "Invalid permission op type:" (pr-str permission-type))
                                                {:status 400
@@ -148,7 +149,7 @@
                                  acc
                                  (let [parsed-rules (<? (parse-rules db rule))]
                                    (recur r (into acc parsed-rules)))))]
-          (swap! role-permission-cache assoc [(:network db) (:dbid db) role-ident permission-type] parsed-ruleset)
+          (swap! role-permission-cache assoc [(:t schema) (:network db) (:dbid db) role-ident permission-type] parsed-ruleset)
           parsed-ruleset))))
 
 
