@@ -1,5 +1,5 @@
 (ns fluree.db.flake
-  (:refer-clojure :exclude [split-at sorted-set-by take last])
+  (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take last])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
@@ -475,6 +475,10 @@
 (defn sorted-set-by
   [comparator & flakes]
   (apply avl/sorted-set-by comparator flakes))
+
+(defn sorted-map-by
+  [comparator & entries]
+  (apply avl/sorted-map-by comparator entries))
 
 (defn transient-reduce
   [reducer ss coll]
