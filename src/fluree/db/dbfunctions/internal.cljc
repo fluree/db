@@ -325,12 +325,22 @@
   If multi returns a vector, else a single value."
   [db sid pred]
   (go-try
-    (let [multi? (dbproto/-p-prop db :multi pred)
-          res (<? (query-range/index-range db :spot = [sid pred]))]
+
+    (let [reverse?  (and (string? pred) (re-matches #".+/_.+" pred))
+          pred*     (if reverse?
+                      (str/replace pred "/_" "/")
+                      pred)
+          multi?    (dbproto/-p-prop db :multi pred*)
+          res       (if reverse?
+                      (<? (query-range/index-range db :opst = [sid pred*]))
+                      (<? (query-range/index-range db :spot = [sid pred*])))
+          flake-val (if reverse?
+                      #(.-s ^Flake %)
+                      #(.-o ^Flake %))]
       (when (seq res)
         (if multi?
-          (mapv #(.-o ^Flake %) res)
-          (.-o ^Flake (first res)))))))
+          (mapv flake-val res)
+          (flake-val (first res)))))))
 
 (defn now
   "Returns current epoch milliseconds."
