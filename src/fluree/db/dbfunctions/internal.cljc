@@ -461,12 +461,12 @@
     (try*
       (let [select (select-from-path path)
             query' {:selectOne select
-                    :from   sid
-                    :opts   {}}
+                    :from      sid
+                    :opts      {}}
             [res fuel] (<? (query (:db ?ctx) query'))
-            res* (get-all res (if (= "_id" (last path))
-                                path
-                                (conj path "_id")))]
+            res*   (get-all res (if (= "_id" (last path))
+                                  path
+                                  (conj path "_id")))]
         [res* (+ fuel (count path) 9)])
       (catch* e (function-error e "get-all" sid path)))))
 
@@ -482,7 +482,9 @@
   "Returns true if key is present."
   [coll key]
   (try*
-    (clojure.core/contains? coll key)
+    (if (sequential? key)
+      (some #(contains? coll %) key)
+      (clojure.core/contains? coll key))
     (catch* e (function-error e "contains?" coll key))))
 
 (defn hash-set
