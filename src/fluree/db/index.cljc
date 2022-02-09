@@ -153,11 +153,9 @@
      :t 0
      :leftmost? true}))
 
-(defn add-children
-  [{:keys [children size] :as branch} new-child-nodes]
-  (let [new-kids  (->> new-child-nodes
-                       (map child-entry)
-                       (flake/assoc-all children))
+(defn reset-children
+  [{:keys [comparator size] :as branch} new-child-nodes]
+  (let [new-kids  (apply child-map comparator new-child-nodes)
         new-first (or (some-> new-kids first key)
                       flake/maximum)
         new-size  (->> new-child-nodes
@@ -167,9 +165,8 @@
 
 (defn new-branch
   [network dbid cmp child-nodes]
-  (let [empty-map (flake/sorted-map-by cmp)]
-    (-> (empty-branch network dbid cmp)
-        (add-children child-nodes))))
+  (-> (empty-branch network dbid cmp)
+      (reset-children child-nodes)))
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
