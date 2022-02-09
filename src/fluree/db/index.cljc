@@ -65,21 +65,27 @@
 
 (defn add-flakes
   [leaf flakes]
-  (-> leaf
-      (update :flakes flake/conj-all flakes)
-      (update :size (fn [size]
-                      (->> flakes
-                           (map flake/size-flake)
-                           (reduce + size))))))
+  (let [new-leaf (-> leaf
+                     (update :flakes flake/conj-all flakes)
+                     (update :size (fn [size]
+                                     (->> flakes
+                                          (map flake/size-flake)
+                                          (reduce + size)))))
+        new-first (or (some-> new-leaf :flakes first)
+                      flake/maximum)]
+    (assoc new-leaf :first new-first)))
 
 (defn rem-flakes
   [leaf flakes]
-  (-> leaf
-      (update :flakes flake/disj-all flakes)
-      (update :size (fn [size]
-                      (->> flakes
-                           (map flake/size-flake)
-                           (reduce - size))))))
+  (let [new-leaf (-> leaf
+                     (update :flakes flake/disj-all flakes)
+                     (update :size (fn [size]
+                                     (->> flakes
+                                          (map flake/size-flake)
+                                          (reduce - size)))))
+        new-first (or (some-> new-leaf :flakes first)
+                      flake/maximum)]
+    (assoc new-leaf :first new-first)))
 
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `network`, `dbid`, and index
