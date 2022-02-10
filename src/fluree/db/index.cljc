@@ -111,6 +111,8 @@
         (add-flakes flakes))))
 
 (defn descendant?
+  "Checks if the `node` passed in the second argument is a descendant of the
+  `branch` passed in the first argument"
   [{:keys [rhs leftmost?], cmp :comparator, first-flake :first, :as branch}
    {node-first :first, node-rhs :rhs, :as node}]
   (if-not (branch? branch)
