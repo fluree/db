@@ -1,8 +1,7 @@
 (ns fluree.db.util.pprint
-  (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.index :as index]
-            [clojure.core.async :as async])
-  (:import (fluree.db.flake Flake)))
+  (:require [clojure.core.async :as async]
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]))
 
 (set! *warn-on-reflection* true)
 
@@ -20,13 +19,13 @@
                          (swap! count-atom + node-count)
                          (conj str-vec (str ":" (:block index) "-" node-count)))
                        str-vec)
-        first-flake  ^Flake (:first index)
+        first-flake  (:first index)
         main-str     (apply str str-vec)
         addl-indent  (if (neg? (- indent-floor (count main-str)))
                        " "
                        (apply str (repeat (- indent-floor (count main-str)) " ")))
         str-vec      [main-str addl-indent]
-        str-vec      (conj str-vec (str (.-s first-flake) "-" (.-p first-flake) " "))
+        str-vec      (conj str-vec (str (flake/s first-flake) "-" (flake/p first-flake) " "))
         str-vec      (conj str-vec (pr-str pos-idx))]
     (println (apply str str-vec))
     (when branch?

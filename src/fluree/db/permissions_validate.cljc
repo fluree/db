@@ -1,13 +1,12 @@
 (ns fluree.db.permissions-validate
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.schema :as schema-util])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

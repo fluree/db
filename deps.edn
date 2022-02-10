@@ -7,7 +7,7 @@
          org.clojure/data.xml            {:mvn/version "0.2.0-alpha6"}
          environ/environ                 {:mvn/version "1.2.0"}
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
-         cheshire/cheshire               {:mvn/version "5.10.1"}
+         cheshire/cheshire               {:mvn/version "5.10.2"}
          instaparse/instaparse           {:mvn/version "1.4.10"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
                                           :sha "22dc2ac76502d3dad3397f1ce651ea1afe433b51"}
@@ -15,7 +15,7 @@
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
          logback-bundle/core-bundle      {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api             {:mvn/version "1.7.32"}
+         org.slf4j/slf4j-api             {:mvn/version "1.7.35"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -124,7 +124,7 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.1.1"}}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.2.2"}}
    ;; Remove the exclude-linter for :def-in-def below
    ;; when the SCI smartfunctions runner lands. It's
    ;; only there for the `defn` inside
@@ -141,5 +141,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2021.12.19"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.01.15"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}

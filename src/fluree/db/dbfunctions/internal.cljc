@@ -9,8 +9,7 @@
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
-            #?(:cljs [fluree.db.flake :refer [Flake]]))
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.flake :as flake]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -475,7 +474,7 @@
               prev-vals (<? (dbproto/-search db' [(:sid ?ctx) (:pid ?ctx)])) ;; could be multi-cardinality, only take first one (consider throwing?)
               fuel      (count prev-vals)
               pO        (some-> (first prev-vals)
-                                (#(let [^Flake f %] (.-o f))))]
+                                (#(let [f %] (flake/o f))))]
           ;predName (dbproto/-p-prop db :name (:pid ?ctx))
           ;pOQuery  {:select [predName]
           ;          :from   sid}
@@ -568,8 +567,8 @@
   "Given an array of flakes, returns the sum of the objects of the true flakes"
   [flakes]
   (try*
-    (let [trueF (filterv #(true? (.-op ^Flake %)) flakes)
-          objs  (map #(.-o ^Flake %) trueF)
+    (let [trueF (filterv #(true? (flake/op %)) flakes)
+          objs  (map #(flake/o %) trueF)
           sum   (reduce clojure.core/+ objs)]
       sum)
     (catch* e (function-error e "objT" flakes))))
@@ -578,8 +577,8 @@
   "Given an array of flakes, returns the sum of the objects of the false flakes"
   [flakes]
   (try*
-    (let [falseF (filterv #(false? (.-op ^Flake %)) flakes)
-          objs   (map #(.-o ^Flake %) falseF)
+    (let [falseF (filterv #(false? (flake/op %)) flakes)
+          objs   (map #(flake/o %) falseF)
           sum    (reduce clojure.core/+ objs)]
       sum)
     (catch* e (function-error e "objF" flakes))))
@@ -619,4 +618,3 @@
         (throw (ex-info (clojure.core/str "The current value: " current-val " does not match the comparison value: " compare-val ".")
                         {:status 400
                          :error  :db/validation-error}))))))
-

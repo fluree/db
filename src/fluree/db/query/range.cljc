@@ -6,14 +6,13 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go go-loop <! >!] :as async]
                :cljs [cljs.core.async :refer [chan <! >!] :refer-macros [go go-loop] :as async])
             #?(:clj [fluree.db.permissions-validate :as perm-validate])
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.iri :as iri-util]
             [fluree.json-ld :as json-ld])
-  #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -381,7 +380,7 @@
 
 (defn is-tag-flake?
   "Returns true if flake is a root setting flake."
-  [^Flake f]
+  [f]
   (<= tag-sid-start (flake/o f) tag-sid-end))
 
 
@@ -389,7 +388,7 @@
   "Coerces a list of tag flakes into flakes that contain the tag name (not subj id) as the .-o value."
   [db flakes]
   (go-try
-    (loop [[^Flake flake & r] flakes
+    (loop [[flake & r] flakes
            acc []]
       (if flake
         (->> (<? (dbproto/-tag db (:o flake) (:p flake)))

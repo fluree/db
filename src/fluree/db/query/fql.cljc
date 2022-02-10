@@ -4,7 +4,7 @@
             [fluree.db.util.log :as log]
             [clojure.string :as str]
             [fluree.db.query.range :as query-range]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [clojure.set :as set]
             [fluree.db.query.analytical :as analytical]
@@ -14,7 +14,6 @@
             [fluree.db.constants :as const]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [vswap!])
-  #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [clojure.core])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -206,11 +205,11 @@
                                 ;; have a sub-selection
                                 (and (not recur?)
                                      (or (:select pred-spec') (:wildcard? pred-spec')))
-                                (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select :context])]
-                                  [(loop [[^Flake flake & r] flakes
+                                (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select])]
+                                  [(loop [[flake & r] flakes
                                           acc []]
                                      (if flake
-                                       (let [sub-sel (<? (query-range/index-range db :spot = [(.-o flake)]))
+                                       (let [sub-sel (<? (query-range/index-range db :spot = [(flake/o flake)]))
                                              res     (when (seq sub-sel)
                                                        (<? (flakes->res db cache fuel max-fuel nested-select-spec sub-sel)))]
                                          (when fuel (vswap! fuel + (count sub-sel)))
@@ -222,12 +221,12 @@
 
                                 ;; resolve tag
                                 (:tag? pred-spec')
-                                [(loop [[^Flake flake & r] flakes
+                                [(loop [[flake & r] flakes
                                         acc []]
                                    (if flake
-                                     (let [res (or (get @cache [(.-o flake) (:name pred-spec')])
-                                                   (let [res (<? (dbproto/-tag db (.-o flake) (:name pred-spec')))]
-                                                     (vswap! cache assoc [(.-o flake) (:name pred-spec')] res)
+                                     (let [res (or (get @cache [(flake/o flake) (:name pred-spec')])
+                                                   (let [res (<? (dbproto/-tag db (flake/o flake) (:name pred-spec')))]
+                                                     (vswap! cache assoc [(flake/o flake) (:name pred-spec')] res)
                                                      res))]
                                        (recur r (if res (conj acc res) acc)))
                                      acc))
@@ -235,10 +234,10 @@
 
                                 ; is a component, get children
                                 (and componentFollow? (:component? pred-spec'))
-                                [(loop [[^Flake flake & r] flakes
+                                [(loop [[flake & r] flakes
                                         acc []]
                                    (if flake
-                                     (let [children (<? (query-range/index-range db :spot = [(.-o flake)] {:limit (:limit pred-spec')}))
+                                     (let [children (<? (query-range/index-range db :spot = [(flake/o flake)] {:limit (:limit pred-spec')}))
                                            acc*     (if (empty? children)
                                                       (conj acc {:_id (flake/o flake)})
                                                       (conj acc (<? (flakes->res db cache fuel max-fuel {:wildcard? true :compact? compact?} children))))]
@@ -253,10 +252,10 @@
                                   [(<? (display-ref-jsonld db cache context pred-spec' flakes)) offset-map]
                                   (if (true? (-> db :permissions :root?))
                                     [(mapv #(hash-map :_id (flake/o %)) flakes) offset-map]
-                                    (loop [[^Flake f & r] flakes
+                                    (loop [[f & r] flakes
                                            acc []]
                                       (if f
-                                        (if (seq (<? (query-range/index-range db :spot = [(.-o f)])))
+                                        (if (seq (<? (query-range/index-range db :spot = [(flake/o f)])))
                                           (recur r (conj acc {:_id (flake/o f)}))
                                           (recur r acc))
                                         [acc offset-map]))))
@@ -264,7 +263,6 @@
                                 ;; @id value, so might need to shorten based on context
                                 (= const/$iri p)
                                 [(mapv #(json-ld/compact (flake/o %) context) flakes) offset-map]
-
 
                                 ;; else just output value
                                 :else
@@ -368,9 +366,9 @@
 (defn- recur-select-spec
   "For recursion, takes current select-spec and nests the recur predicate as a child, updating
   recur-depth and recur-seen values. Uses flake as the recursion flake being operated on."
-  [select-spec ^Flake flake]
-  (let [recur-subject (.-o flake)
-        recur-pred    (.-p flake)
+  [select-spec flake]
+  (let [recur-subject (flake/o flake)
+        recur-pred    (flake/p flake)
         {:keys [recur-seen recur-depth]} select-spec]
     (-> select-spec
         (assoc-in [:select :pred-id recur-pred] select-spec) ;; move current pred-spec to child in :select key for next recursion round
@@ -390,14 +388,14 @@
           max-depth? (> recur-depth (:recur select-spec))]
       (if max-depth?
         results
-        (loop [[^Flake flake & r] flakes
+        (loop [[flake & r] flakes
                i   0
                acc []]
           (if (or (not flake) (and limit (< i limit)))
             (cond (empty? acc) results
                   multi? (assoc results as acc)
                   :else (assoc results as (first acc)))
-            (let [recur-subject (.-o flake)                 ;; ref, so recur subject is the object of the incoming flake
+            (let [recur-subject (flake/o flake)                 ;; ref, so recur subject is the object of the incoming flake
                   seen?         (contains? recur-seen recur-subject) ;; subject has been seen before, stop recursion
 
                   sub-flakes    (cond->> (<? (query-range/index-range db :spot = [recur-subject]))

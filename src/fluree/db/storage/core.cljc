@@ -10,8 +10,7 @@
             #?(:clj [clojure.java.io :as io])
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.schema :as schema])
-  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])
-     :clj (:import (fluree.db.flake Flake))))
+  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -110,17 +109,24 @@
   [child]
   (select-keys child [:id :leaf :first :rhs :size]))
 
+(defn random-leaf-id
+  [network dbid idx]
+  (ledger-node-key network dbid idx (util/random-uuid) "l"))
+
 (defn write-leaf
-  "Computes a new unique id for `leaf` and writes it to storage under that id.
-  Returns the leaf map with the new id attached uner the `:id` key"
-  [conn network dbid idx-type {:keys [flakes] :as leaf}]
-  (go-try
-   (let [id-base (str (util/random-uuid))
-         leaf-id (ledger-node-key network dbid idx-type id-base "l")
-         data    {:flakes flakes}
-         ser     (serdeproto/-serialize-leaf (serde conn) data)]
-     (<? (write conn leaf-id ser))
-     (assoc leaf :id leaf-id))))
+  "Writes `leaf` to storage under the provided `leaf-id`, computing a new id if
+  one isn't provided. Returns the leaf map with the id used attached uner the
+  `:id` key"
+  ([conn network dbid idx-type leaf]
+   (let [leaf-id (random-leaf-id network dbid idx-type)]
+     (write-leaf conn network dbid idx-type leaf-id leaf)))
+
+  ([conn network dbid idx-type leaf-id {:keys [flakes] :as leaf}]
+   (go-try
+    (let [data {:flakes flakes}
+          ser  (serdeproto/-serialize-leaf (serde conn) data)]
+      (<? (write conn leaf-id ser))
+      (assoc leaf :id leaf-id)))))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key"
@@ -130,21 +136,28 @@
      (<? (write conn key ser))
      key)))
 
+(defn random-branch-id
+  [network dbid idx]
+  (ledger-node-key network dbid idx (util/random-uuid) "b"))
+
 (defn write-branch
-  "Computes a new unique id for `branch` and writes it to storage under that id.
-  Returns the branch map with the new id attached uner the `:id` key"
-  [conn network dbid idx-type {:keys [children] :as branch}]
-  (go-try
-   (let [id-base       (str (util/random-uuid))
-         branch-id     (ledger-node-key network dbid idx-type id-base "b")
-         child-vals    (->> children
-                            (map val)
-                            (mapv child-data))
-         first-flake         (->> child-vals first :first)
-         rhs          (->> child-vals rseq first :rhs)
-         data          {:children child-vals}]
-     (<? (write-branch-data conn branch-id data))
-     (assoc branch :id branch-id))))
+  "Writes `branch` to storage under the provided `branch-id`, computing a new id
+  if one isn't provided. Returns the branch map with the id used attached uner
+  the `:id` key"
+  ([conn network dbid idx-type branch]
+   (let [branch-id (random-branch-id network dbid idx-type)]
+     (write-branch conn network dbid idx-type branch-id branch)))
+
+  ([conn network dbid idx-type branch-id {:keys [children] :as branch}]
+   (go-try
+    (let [child-vals  (->> children
+                           (map val)
+                           (mapv child-data))
+          first-flake (->> child-vals first :first)
+          rhs         (->> child-vals rseq first :rhs)
+          data        {:children child-vals}]
+      (<? (write-branch-data conn branch-id data))
+      (assoc branch :id branch-id)))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."

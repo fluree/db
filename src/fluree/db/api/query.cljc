@@ -12,11 +12,9 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.permissions :as permissions]
             [fluree.db.auth :as auth]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.async :as async-util])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.util.async :refer [<? go-try channel?]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -157,13 +155,13 @@
 (defn- format-block-resp-pretty
   [db curr-block cache fuel]
   (go-try (let [[asserted-subjects
-                 retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
+                 retracted-subjects] (loop [[flake & r] (:flakes curr-block)
                                             asserted-subjects  {}
                                             retracted-subjects {}]
                                        (if-not flake
                                          [asserted-subjects retracted-subjects]
-                                         (let [subject   (.-s flake)
-                                               asserted? (true? (.-op flake))
+                                         (let [subject   (flake/s flake)
+                                               asserted? (true? (flake/op flake))
                                                flake'    (if asserted? flake
                                                                        (flake/flip-flake flake))]
                                            (if asserted?
@@ -276,8 +274,8 @@
 
 
 (defn- auth-match
-  [auth-set t-map ^Flake flake]
-  (let [[auth id] (get-in t-map [(.-t flake) :auth])]
+  [auth-set t-map flake]
+  (let [[auth id] (get-in t-map [(flake/t flake) :auth])]
     (or (auth-set auth)
         (auth-set id))))
 
@@ -290,7 +288,7 @@
 (defn- format-history-resp
   [db resp auth show-auth]
   (go-try
-    (let [ts    (set (map #(.-t ^Flake %) resp))
+    (let [ts    (set (map #(flake/t %) resp))
           t-map (<? (async/go-loop [[t & r] ts
                                     acc {}]
                       (if t
@@ -303,14 +301,14 @@
                                                                                  :where     [[t, "_tx/auth", "?auth"],
                                                                                              ["?auth", "_auth/id", "?id"]]}))))]
                           (recur r acc*)) acc)))
-          res   (loop [[^Flake flake & r] resp
+          res   (loop [[flake & r] resp
                        acc {}]
                   (cond (and flake auth
                              (not (auth-match auth t-map flake)))
                         (recur r acc)
 
                         flake
-                        (let [t   (.-t flake)
+                        (let [t   (flake/t flake)
                               {:keys [block auth]} (get t-map t)
                               acc (cond-> acc
                                           true (assoc-in [block :block] block)
@@ -380,7 +378,7 @@
                           (throw (ex-info (str "Only one type of select-key (select, selectOne, selectDistinct, selectReduced) allowed. Provided: " (pr-str flureeQL))
                                           {:status 400
                                            :error  :db/invalid-query})))
-          db            (if (async-util/channel? sources)   ;; only support 1 source currently
+          db            (if (channel? sources)   ;; only support 1 source currently
                           (<? sources)
                           sources)
           db*           (if block (<? (time-travel/as-of-block db block)) db)
