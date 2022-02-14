@@ -1021,70 +1021,11 @@
            (deliver p e))))
      p)))
 
-#_(defn index
-    "INTERNAL USE ONLY
-
-    Returns a raw collection of flakes from the specified index as a lazy sequence.
-
-    Optionally specify a start and/or stop point to restrict the collection to a range
-    along with an operator of <, <=, >, >=. If you wish to restrict to a specific
-    subject, predicate, etc. the = operator can also be used, which is equivalent to the same
-    parts being specified with a >= and <= operators.
-
-    The start and stop point should be specified as a vector of the relevant part(s) of the
-    specified index. i.e. if using the :spo index, the parts are [s p o], an :pos index would
-    be [p o s]. If only some parts, i.e. [s] are provided, the other parts are assumed to
-    be the lowermost or uppermost bounds of the remaining parts depending on if it is the
-    start or stop respectively. Keep in mind subjects sort descending.
-
-    Entities can be specified as an _id long integer, any unique identity (pred / obj two-tuple),
-    or a collection name.
-
-    Predicates can b
-    "
-    [db index start stop]
-
-    nil)
-
-
-
-
 
 (defn collection-flakes
   "INTERNAL USE ONLY"
   [db collection]
   (query-range/collection db collection))
-
-
-(comment                                                    ;; TODO: Write me someday?
-  (defn flakes
-    "Returns a lazy sequence of raw flakes from the blockchain history from
-  start block/transaction (inclusive) to end block/transaction (exclusive).
-
-  A nil start defaults to the genesis block. A nil end includes the last block of the known database.
-  A positive integer for either start/end indicates a block number, a negative integer indicates a
-  transaction number.
-
-  Results can potentially include the entire database depending on your filtering criteria,
-  so be sure to only 'pull' items as you need them.
-
-  The optional map of filter criteria has the following keyed options:
-
-  :subject    - Limit results to only include history of this subject, specified as either an _id or identity.
-               Note the results are no longer lazy when using this option.
-  :predicate - Limit results to only include history for this predicate. Must be used in conjunction with subject.
-               If there is a need to get history of all subjects for a specific predicate, see 'range-history'.
-  :limit     - Limit results to this quantity of matching flakes
-  :offset    - Begin results after this number of matching flakes (for paging - use in conjunction with limit)
-  :chunk     - Results are fetched in chunks. Optionally specify the size of a chunk if optimization is needed."
-    ([conn] (flakes conn nil nil {}))
-    ([conn start] (flakes conn start nil {}))
-    ([conn start end] (flakes conn start end {}))
-    ([conn start end {:keys [subject predicate limit offset chunk]}])))
-
-
-
-
 
 
 (defn range
