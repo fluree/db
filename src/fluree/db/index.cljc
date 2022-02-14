@@ -63,6 +63,30 @@
          (recur (<? (resolve r child))))))))
 
 
+(defn add-flakes
+  [leaf flakes]
+  (let [new-leaf (-> leaf
+                     (update :flakes flake/conj-all flakes)
+                     (update :size (fn [size]
+                                     (->> flakes
+                                          (map flake/size-flake)
+                                          (reduce + size)))))
+        new-first (or (some-> new-leaf :flakes first)
+                      flake/maximum)]
+    (assoc new-leaf :first new-first)))
+
+(defn rem-flakes
+  [leaf flakes]
+  (let [new-leaf (-> leaf
+                     (update :flakes flake/disj-all flakes)
+                     (update :size (fn [size]
+                                     (->> flakes
+                                          (map flake/size-flake)
+                                          (reduce - size)))))
+        new-first (or (some-> new-leaf :flakes first)
+                      flake/maximum)]
+    (assoc new-leaf :first new-first)))
+
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `network`, `dbid`, and index
   comparator `cmp`."
@@ -79,6 +103,26 @@
    :t 0
    :leftmost? true})
 
+(defn new-leaf
+  [network dbid cmp flakes]
+  (let [empty-set (flake/sorted-set-by cmp)]
+    (-> (empty-leaf network dbid cmp)
+        (assoc :flakes empty-set)
+        (add-flakes flakes))))
+
+(defn descendant?
+  "Checks if the `node` passed in the second argument is a descendant of the
+  `branch` passed in the first argument"
+  [{:keys [rhs leftmost?], cmp :comparator, first-flake :first, :as branch}
+   {node-first :first, node-rhs :rhs, :as node}]
+  (if-not (branch? branch)
+    false
+    (and (or leftmost?
+             (not (pos? (cmp first-flake node-first))))
+         (or (nil? rhs)
+             (and (not (nil? node-rhs))
+                  (not (pos? (cmp node-rhs rhs))))))))
+
 (defn child-entry
   [{:keys [first] :as node}]
   [first node])
@@ -90,7 +134,7 @@
   [cmp & child-nodes]
   (->> child-nodes
        (mapcat child-entry)
-       (apply avl/sorted-map-by cmp)))
+       (apply flake/sorted-map-by cmp)))
 
 (defn empty-branch
   "Returns a blank branch node which contains a single empty leaf node for the
@@ -110,6 +154,21 @@
      :block 0
      :t 0
      :leftmost? true}))
+
+(defn reset-children
+  [{:keys [comparator size] :as branch} new-child-nodes]
+  (let [new-kids  (apply child-map comparator new-child-nodes)
+        new-first (or (some-> new-kids first key)
+                      flake/maximum)
+        new-size  (->> new-child-nodes
+                       (map :size)
+                       (reduce + size))]
+    (assoc branch :first new-first, :size new-size, :children new-kids)))
+
+(defn new-branch
+  [network dbid cmp child-nodes]
+  (-> (empty-branch network dbid cmp)
+      (reset-children child-nodes)))
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
@@ -175,24 +234,6 @@
                    (and (nil? rhs) leftmost?)
                    novelty)]
     (flakes-through through-t subrange)))
-
-(defn add-flakes
-  [leaf flakes]
-  (-> leaf
-      (update :flakes flake/conj-all flakes)
-      (update :size (fn [size]
-                      (->> flakes
-                           (map flake/size-flake)
-                           (reduce + size))))))
-
-(defn rem-flakes
-  [leaf flakes]
-  (-> leaf
-      (update :flakes flake/disj-all flakes)
-      (update :size (fn [size]
-                      (->> flakes
-                           (map flake/size-flake)
-                           (reduce - size))))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from

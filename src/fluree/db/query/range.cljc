@@ -11,7 +11,6 @@
                :cljs [cljs.core.async :refer [chan <! >!] :refer-macros [go go-loop] :as async])
             #?(:clj [fluree.db.permissions-validate :as perm-validate])
             [fluree.db.util.async :refer [<? go-try]])
-  #?(:clj (:import (fluree.db.flake Flake)))
   #?(:cljs (:require-macros [fluree.db.util.async])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -377,7 +376,7 @@
 
 (defn is-tag-flake?
   "Returns true if flake is a root setting flake."
-  [^Flake f]
+  [f]
   (<= tag-sid-start (flake/o f) tag-sid-end))
 
 
