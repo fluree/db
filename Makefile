@@ -21,7 +21,7 @@ package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
 out/flureenjs.js: package.json package-lock.json node_modules build-nodejs.edn deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
-	clojure -M:nodejs && cp out/nodejs/flureenjs.js out/flureenjs.js
+	clojure -M:nodejs && ./script/create-node-package.sh
 
 nodejs: out/flureenjs.js
 
