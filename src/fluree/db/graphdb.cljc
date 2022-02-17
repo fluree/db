@@ -42,7 +42,7 @@
 
 (def ^:const exclude-predicates
   "Predicates to exclude from the database"
-  #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
+  #{const/$_tx:tx const/$_tx:sig const/$_tx:signed const/$_tx:tempids})
 
 (defn exclude-flake?
   [f]
