@@ -122,30 +122,41 @@
                     (>! error-ch e))))
     leaf-ch))
 
+(defn flake-filter-xf
+  [{:keys [subject-fn predicate-fn object-fn]}]
+  (let [filter-xfs (cond-> []
+                     subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
+                     predicate-fn (conj (filter (fn [f] (predicate-fn (flake/p f)))))
+                     object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
+    (apply comp filter-xfs)))
+
 (defn flake-range
   "Returns a channel that will eventually contain a stream of flakes from index
   `idx` within the database `db` between `start-flake` and `end-flake`,
   inclusive, one-by-one, and sorted by the order of `idx`. Any exceptions
   encountered while resolving index nodes will be placed on `error-ch`"
   [{:keys [conn] :as db}
-   idx
-   {:keys [from-t to-t start-test start-flake
-           end-test end-flake]}
+   {:keys [idx from-t to-t start-test start-flake end-test end-flake
+           subject-fn predicate-fn object-fn]
+    :as opts}
    error-ch]
-  (let [novelty  (get-in db [:novelty idx])]
+  (let [novelty      (get-in db [:novelty idx])
+        flake-filter (flake-filter-xf opts)]
     (-> db
         (leaf-range idx start-flake end-flake error-ch)
         (async/pipe (chan 1 (comp (map (fn [leaf]
                                          (index/at-t leaf to-t novelty)))
                                   (map :flakes)
                                   (map (partial index/t-range from-t to-t))
-                                  (mapcat (fn [flakes]
-                                            (flake/subrange flakes
-                                                            start-test start-flake
-                                                            end-test end-flake)))))))))
+                                  (map (fn [flakes]
+                                         (flake/subrange flakes
+                                                         start-test start-flake
+                                                         end-test end-flake)))
+                                  (map (fn [flakes]
+                                         (into [] flake-filter flakes)))))))))
 
 (defn authorize-flake
-  [db flake error-ch]
+  [db error-ch flake]
   (go
     (try* (when (or (schema-util/is-schema-flake? flake)
                     (<? (perm-validate/allow-flake? db flake)))
@@ -155,6 +166,16 @@
                              "Error authorizing flake in ledger"
                              (select-keys db [:network :dbid :t]))
                   (>! error-ch e)))))
+
+(defn authorize-flakes
+  [db error-ch flakes]
+  (go-loop [[f & rst]   flakes
+            auth-flakes []]
+    (if f
+      (if (<! (authorize-flake db error-ch f))
+        (recur rst (conj auth-flakes f))
+        (recur rst auth-flakes))
+      auth-flakes)))
 
 (defn filter-authorized
   "Returns a channel that will eventually contain only the schema flakes and the
@@ -171,28 +192,15 @@
            p2 (flake/p end)]
        (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
          flake-stream
-         (let [auth-fn (fn [flake ch]
+         (let [auth-fn (fn [flakes ch]
                          (go
-                           (when (<! (authorize-flake db flake error-ch))
-                             (>! ch flake))
-                           (async/close! ch)))
+                           (let [allowed-flakes (<! (authorize-flakes db error-ch flakes))]
+                             (when (seq allowed-flakes)
+                               (>! ch allowed-flakes))
+                             (async/close! ch))))
                out-ch  (chan)]
            (async/pipeline-async 5 out-ch auth-fn flake-stream)
            out-ch)))))
-
-(defn flake-filter-xf
-  [{:keys [subject-fn predicate-fn object-fn]}]
-  (let [filter-xfs (cond-> []
-                     subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
-                     predicate-fn (conj (filter (fn [f] (predicate-fn (flake/p f)))))
-                     object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
-    (apply comp filter-xfs)))
-
-(defn filter-index-flakes
-  [flake-ch filter-fns]
-  (let [filter-xf (flake-filter-xf filter-fns)]
-    (async/pipe flake-ch
-                (chan 1 filter-xf))))
 
 (defn take-only
   [ch limit]
@@ -206,7 +214,8 @@
   maximum of `subject-limit` subjects."
   [flake-ch {:keys [subject-limit offset]
              :or   {offset 0}}]
-  (let [subj-ch (chan 1 (comp (partition-by flake/s)
+  (let [subj-ch (chan 1 (comp cat
+                              (partition-by flake/s)
                               (drop offset)))
         out-ch  (chan 1 cat)]
     (-> flake-ch
@@ -225,17 +234,17 @@
 
   (let [novelty  (get-in db [:novelty idx])]
     (-> db
-        (flake-range idx
-                     {:from-t t
+        (flake-range {:idx idx
+                      :from-t t
                       :to-t t
                       :start-test start-test
                       :start-flake start-flake
                       :end-test end-test
-                      :end-flake end-flake}
+                      :end-flake end-flake
+                      :subject-fn subject-fn
+                      :predicate-fn predicate-fn
+                      :object-fn object-fn}
                      error-ch)
-        (filter-index-flakes {:subject-fn subject-fn
-                              :predicate-fn predicate-fn
-                              :object-fn object-fn})
         (filter-authorized db start-flake end-flake error-ch)
         (select-subject-window {:subject-limit subject-limit
                                 :flake-limit flake-limit
