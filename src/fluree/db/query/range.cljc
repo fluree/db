@@ -144,6 +144,18 @@
                                                             start-test start-flake
                                                             end-test end-flake)))))))))
 
+(defn authorize-flake
+  [db flake error-ch]
+  (go
+    (try* (when (or (schema-util/is-schema-flake? flake)
+                    (<? (perm-validate/allow-flake? db flake)))
+            flake)
+          (catch* e
+                  (log/error e
+                             "Error authorizing flake in ledger"
+                             (select-keys db [:network :dbid :t]))
+                  (>! error-ch e)))))
+
 (defn filter-authorized
   "Returns a channel that will eventually contain only the schema flakes and the
   flakes validated by fluree.db.permissions-validate/allow-flake? function for
@@ -161,18 +173,12 @@
          flake-stream
          (let [out-ch (chan)]
            (go
-             (try* (loop []
-                     (when-let [flake (<! flake-stream)]
-                       (when (or (schema-util/is-schema-flake? flake)
-                                 (<? (perm-validate/allow-flake? db flake)))
-                         (>! out-ch flake))
-                       (recur)))
-                   (async/close! out-ch)
-                   (catch* e
-                           (log/error e
-                                      "Error validating flake in ledger"
-                                      (select-keys db [:network :dbid :t]))
-                           (>! error-ch e))))
+             (loop []
+               (when-let [flake (<! flake-stream)]
+                 (when (<! (authorize-flake db flake error-ch))
+                   (>! out-ch flake))
+                 (recur)))
+             (async/close! out-ch))
            out-ch)))))
 
 (defn flake-filter-xf
