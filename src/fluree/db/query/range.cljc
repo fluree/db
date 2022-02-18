@@ -171,14 +171,13 @@
            p2 (flake/p end)]
        (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
          flake-stream
-         (let [out-ch (chan)]
-           (go
-             (loop []
-               (when-let [flake (<! flake-stream)]
-                 (when (<! (authorize-flake db flake error-ch))
-                   (>! out-ch flake))
-                 (recur)))
-             (async/close! out-ch))
+         (let [auth-fn (fn [flake ch]
+                         (go
+                           (when (<! (authorize-flake db flake error-ch))
+                             (>! ch flake))
+                           (async/close! ch)))
+               out-ch  (chan)]
+           (async/pipeline-async 5 out-ch auth-fn flake-stream)
            out-ch)))))
 
 (defn flake-filter-xf
