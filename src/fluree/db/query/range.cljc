@@ -136,12 +136,10 @@
   inclusive, one-by-one, and sorted by the order of `idx`. Any exceptions
   encountered while resolving index nodes will be placed on `error-ch`"
   [{:keys [conn] :as db}
-   {:keys [idx from-t to-t start-test start-flake end-test end-flake
-           subject-fn predicate-fn object-fn]
+   {:keys [idx from-t to-t start-test start-flake end-test end-flake]
     :as opts}
    error-ch]
-  (let [novelty      (get-in db [:novelty idx])
-        flake-filter (flake-filter-xf opts)]
+  (let [novelty (get-in db [:novelty idx])]
     (-> db
         (leaf-range idx start-flake end-flake error-ch)
         (async/pipe (chan 1 (comp (map (fn [leaf]
@@ -153,7 +151,7 @@
                                                          start-test start-flake
                                                          end-test end-flake)))
                                   (map (fn [flakes]
-                                         (into [] flake-filter flakes)))))))))
+                                         (into [] (flake-filter-xf opts) flakes)))))))))
 
 (defn authorize-flake
   [db error-ch flake]
@@ -232,24 +230,23 @@
     :or {offset 0}}
    error-ch]
 
-  (let [novelty  (get-in db [:novelty idx])]
-    (-> db
-        (flake-range {:idx idx
-                      :from-t t
-                      :to-t t
-                      :start-test start-test
-                      :start-flake start-flake
-                      :end-test end-test
-                      :end-flake end-flake
-                      :subject-fn subject-fn
-                      :predicate-fn predicate-fn
-                      :object-fn object-fn}
-                     error-ch)
-        (filter-authorized db start-flake end-flake error-ch)
-        (select-subject-window {:subject-limit subject-limit
-                                :flake-limit flake-limit
-                                :offset offset})
-        (take-only flake-limit))))
+  (-> db
+      (flake-range {:idx idx
+                    :from-t t
+                    :to-t t
+                    :start-test start-test
+                    :start-flake start-flake
+                    :end-test end-test
+                    :end-flake end-flake
+                    :subject-fn subject-fn
+                    :predicate-fn predicate-fn
+                    :object-fn object-fn}
+                   error-ch)
+      (filter-authorized db start-flake end-flake error-ch)
+      (select-subject-window {:subject-limit subject-limit
+                              :flake-limit flake-limit
+                              :offset offset})
+      (take-only flake-limit)))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
