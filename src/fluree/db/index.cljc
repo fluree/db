@@ -2,9 +2,11 @@
   (:refer-clojure :exclude [resolve])
   (:require [clojure.data.avl :as avl]
             [fluree.db.flake :as flake]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try]]))
+            #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
+               :cljs [cljs.core.async :refer [chan go <!] :as async])
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 (def default-comparators
   "Map of default index comparators for the five index types"
@@ -251,3 +253,58 @@
 
       true
       (assoc :t t))))
+
+(defn mark-expanded
+  [node]
+  (assoc node ::expanded true))
+
+(defn unmark-expanded
+  [node]
+  (dissoc node ::expanded))
+
+(defn expanded?
+  [node]
+  (-> node ::expanded true?))
+
+(defn resolve-when
+  [r resolve? error-ch node]
+  (go
+    (try* (if (resolve? node)
+            (<? (resolve r node))
+            node)
+          (catch* e
+                  (log/error e
+                             "Error resolving index node:"
+                             (select-keys node [:id :network :dbid]))
+                  (>! error-ch e)))))
+
+(defn resolve-children-when
+  [r resolve? error-ch branch]
+  (if (resolved? branch)
+    (->> branch
+         :children
+         (map (fn [[_ child]]
+                (resolve-when r resolve? error-ch child)))
+         (async/map vector))
+    (go [])))
+
+(defn tree-chan
+  [r root resolve? include? error-ch]
+  (let [out (chan)]
+    (go
+      (let [root-node (<! (resolve-when r resolve? error-ch root))]
+        (loop [stack [root-node]]
+          (when-let [node (peek stack)]
+            (let [stack* (pop stack)]
+              (if (or (leaf? node)
+                      (expanded? node))
+                (do (when (include? node)
+                      (>! out (unmark-expanded node)))
+                    (recur stack*))
+                (let [children (<! (resolve-children-when r resolve? error-ch node))
+                      stack**  (-> stack*
+                                   (conj (mark-expanded node))
+                                   (into (rseq children)))]
+                  (recur stack**))))))
+        (async/close! out)))
+    out))

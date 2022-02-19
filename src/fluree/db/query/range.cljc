@@ -88,40 +88,6 @@
          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
      (flake/->Flake s' p o' t op m'))))
 
-(defn resolve-leaf
-  [{:keys [conn] :as db} root-node flake]
-  (go-try
-   (let [next-leaf     (<? (index/lookup-leaf conn root-node flake))
-         resolved-leaf (<? (index/resolve conn next-leaf))]
-     resolved-leaf)))
-
-(defn leaf-range
-  "Returns a channel that will eventually contain a stream of index leaf nodes
-  from index `idx` within the database `db` starting with the node containing
-  `start-flake` and ending with the node containing `end-flake` one-by-one. Any
-  exceptions encountered while resolving index nodes will be placed on
-  `error-ch`"
-  [{:keys [conn] :as db} idx start-flake end-flake error-ch]
-  (let [idx-root    (get db idx)
-        idx-compare (get-in db [:comparators idx])
-        leaf-ch     (chan)]
-    (go
-      (try* (let [root-node (<? (index/resolve conn idx-root))]
-              (do (loop [next-flake start-flake]
-                    (when (and next-flake
-                               (not (pos? (idx-compare next-flake end-flake))))
-                      (when-let [next-leaf (<? (resolve-leaf db root-node next-flake))]
-                        (when (>! leaf-ch next-leaf)
-                          (recur (:rhs next-leaf))))))
-                  (async/close! leaf-ch)))
-            (catch* e
-                    (log/error e
-                               "Error resolving leaf range for index" idx
-                               "between flake" start-flake "and" end-flake
-                               "in ledger" (select-keys db [:network :dbid :t]))
-                    (>! error-ch e))))
-    leaf-ch))
-
 (defn flake-filter-xf
   [{:keys [subject-fn predicate-fn object-fn]}]
   (let [filter-xfs (cond-> []
@@ -129,6 +95,25 @@
                      predicate-fn (conj (filter (fn [f] (predicate-fn (flake/p f)))))
                      object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
     (apply comp filter-xfs)))
+
+(defn intersects-range?
+  [{node-rhs :rhs, node-first :first, node-leftmost? :leftmost?, idx-cmp :comparator}
+   lower upper]
+  (not (or (and node-rhs
+                (neg? (idx-cmp node-rhs lower)))
+           (and (not node-leftmost?)
+                (neg? (idx-cmp upper node-first))))))
+
+(defn leaf-range
+  [{:keys [conn] :as db} idx start-flake end-flake error-ch]
+  (let [idx-root (get db idx)
+        idx-cmp  (get-in db [:comparators idx])
+        resolve? (fn [node]
+                   (intersects-range? node start-flake end-flake))
+        include? (fn [node]
+                   (and (index/leaf? node)
+                        (index/resolved? node)))]
+    (index/tree-chan conn idx-root resolve? include? error-ch)))
 
 (defn flake-range
   "Returns a channel that will eventually contain a stream of flakes from index
