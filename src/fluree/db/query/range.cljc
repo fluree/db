@@ -217,10 +217,13 @@
         (take-only subject-limit))))
 
 (defn flake-window
-  [subj-ch {:keys [flake-limit comparator]}]
-  (-> subj-ch
-      (async/pipe (chan 1 cat))
-      (take-only flake-limit)))
+  [subj-ch {:keys [flake-limit]}]
+  (if flake-limit
+    (let [flake-ch (async/pipe subj-ch
+                               (chan 1 (comp cat
+                                             (partition-all flake-limit))))]
+      (async/take 1 flake-ch))
+    (async/reduce into [] subj-ch)))
 
 (defn index-range-stream
   [{:keys [permissions t], :as db}
@@ -295,25 +298,24 @@
          start-parts (match->flake-parts db idx start-match)
          end-parts   (match->flake-parts db idx end-match)]
      (go-try
-       (let [start-flake  (<? (resolve-match-flake db start-test start-parts))
-             end-flake    (<? (resolve-match-flake db end-test end-parts))
-             error-ch     (chan)
-             range-stream (index-range-stream db
-                                              idx
-                                              {:from-t from-t
-                                               :to-t to-t
-                                               :start-test start-test
-                                               :start-flake start-flake
-                                               :end-test end-test
-                                               :end-flake end-flake
-                                               :flake-limit limit}
-                                              error-ch)
-             range-vec-ch (async/into [] range-stream)]
-         (async/alt!
-           error-ch     ([e]
-                         (throw e))
-           range-vec-ch ([hist-range]
-                         (apply flake/sorted-set-by idx-compare hist-range))))))))
+      (let [start-flake (<? (resolve-match-flake db start-test start-parts))
+            end-flake   (<? (resolve-match-flake db end-test end-parts))
+            error-ch    (chan)
+            range-ch    (index-range-stream db
+                                            idx
+                                            {:from-t from-t
+                                             :to-t to-t
+                                             :start-test start-test
+                                             :start-flake start-flake
+                                             :end-test end-test
+                                             :end-flake end-flake
+                                             :flake-limit limit}
+                                            error-ch)]
+        (async/alt!
+          error-ch ([e]
+                    (throw e))
+          range-ch ([hist-range]
+                    (apply flake/sorted-set-by idx-compare hist-range))))))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
@@ -352,26 +354,25 @@
                                [[o1 o2] object-fn])]
 
      (go-try
-      (let [start-flake  (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
-            end-flake    (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))
-            error-ch     (chan)
-            range-stream (index-range-stream db
-                                             idx
-                                             (assoc opts
-                                                    :from-t      t
-                                                    :to-t        t
-                                                    :start-test  start-test
-                                                    :start-flake start-flake
-                                                    :end-test    end-test
-                                                    :end-flake   end-flake
-                                                    :object-fn   object-fn)
-                                             error-ch)
-            range-vec-ch (async/into [] range-stream)]
+      (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
+            end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))
+            error-ch    (chan)
+            range-ch    (index-range-stream db
+                                            idx
+                                            (assoc opts
+                                                   :from-t      t
+                                                   :to-t        t
+                                                   :start-test  start-test
+                                                   :start-flake start-flake
+                                                   :end-test    end-test
+                                                   :end-flake   end-flake
+                                                   :object-fn   object-fn)
+                                            error-ch)]
         (async/alt!
-           error-ch     ([e]
-                         (throw e))
-           range-vec-ch ([idx-range]
-                         (apply flake/sorted-set-by idx-compare idx-range))))))))
+          error-ch ([e]
+                    (throw e))
+          range-ch ([idx-range]
+                    (apply flake/sorted-set-by idx-compare idx-range))))))))
 
 (defn non-nil-non-boolean?
   [o]
