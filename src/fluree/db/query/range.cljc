@@ -141,24 +141,26 @@
 (defn authorize-flake
   [db error-ch flake]
   (go
-    (try* (when (or (schema-util/is-schema-flake? flake)
-                    (<? (perm-validate/allow-flake? db flake)))
-            flake)
+    (try* (if (or (schema-util/is-schema-flake? flake)
+                  (<? (perm-validate/allow-flake? db flake)))
+            flake
+            ::unauthorized)
           (catch* e
                   (log/error e
                              "Error authorizing flake in ledger"
                              (select-keys db [:network :dbid :t]))
                   (>! error-ch e)))))
 
+(defn unauthorized?
+  [f]
+  (= f ::unauthorized))
+
 (defn authorize-flakes
   [db error-ch flakes]
-  (go-loop [[f & rst]   flakes
-            auth-flakes []]
-    (if f
-      (if (<! (authorize-flake db error-ch f))
-        (recur rst (conj auth-flakes f))
-        (recur rst auth-flakes))
-      auth-flakes)))
+  (->> flakes
+       (map (partial authorize-flake db error-ch))
+       (async/map (fn [& fs]
+                    (into [] (remove unauthorized?) fs)))))
 
 (defn filter-authorized
   "Returns a channel that will eventually contain only the schema flakes and the
