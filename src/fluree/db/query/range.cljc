@@ -206,20 +206,21 @@
     (async/take limit ch)
     ch))
 
-(defn select-subject-window
-  "Returns a channel that contains the flakes from `flake-ch`, skipping the flakes
-  from the first `offset` subjects encountered and including the flakes from a
-  maximum of `subject-limit` subjects."
+(defn subject-window
   [flake-ch {:keys [subject-limit offset]
              :or   {offset 0}}]
   (let [subj-ch (chan 1 (comp cat
                               (partition-by flake/s)
-                              (drop offset)))
-        out-ch  (chan 1 cat)]
+                              (drop offset)))]
     (-> flake-ch
         (async/pipe subj-ch)
-        (take-only subject-limit)
-        (async/pipe out-ch))))
+        (take-only subject-limit))))
+
+(defn flake-window
+  [subj-ch {:keys [flake-limit comparator]}]
+  (-> subj-ch
+      (async/pipe (chan 1 cat))
+      (take-only flake-limit)))
 
 (defn index-range-stream
   [{:keys [permissions t], :as db}
@@ -243,10 +244,9 @@
                     :object-fn object-fn}
                    error-ch)
       (filter-authorized db start-flake end-flake error-ch)
-      (select-subject-window {:subject-limit subject-limit
-                              :flake-limit flake-limit
-                              :offset offset})
-      (take-only flake-limit)))
+      (subject-window {:subject-limit subject-limit
+                       :offset offset})
+      (flake-window {:flake-limit flake-limit})))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
