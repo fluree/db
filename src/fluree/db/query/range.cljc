@@ -197,7 +197,7 @@
                                (>! ch allowed-flakes))
                              (async/close! ch))))
                out-ch  (chan)]
-           (async/pipeline-async 5 out-ch auth-fn flake-stream)
+           (async/pipeline-async 2 out-ch auth-fn flake-stream)
            out-ch)))))
 
 (defn take-only
@@ -207,14 +207,16 @@
     ch))
 
 (defn subject-window
-  [flake-ch {:keys [subject-limit offset]
-             :or   {offset 0}}]
-  (let [subj-ch (chan 1 (comp cat
-                              (partition-by flake/s)
-                              (drop offset)))]
-    (-> flake-ch
-        (async/pipe subj-ch)
-        (take-only subject-limit))))
+  [flake-ch {:keys [subject-limit offset]}]
+  (if (or subject-limit offset)
+    (let [offset  (or offset 0)
+          subj-ch (chan 1 (comp cat
+                                (partition-by flake/s)
+                                (drop offset)))]
+      (-> flake-ch
+          (async/pipe subj-ch)
+          (take-only subject-limit)))
+    flake-ch))
 
 (defn flake-window
   [subj-ch {:keys [flake-limit]}]
