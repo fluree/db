@@ -4,7 +4,8 @@
             [clojure.string :as str]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]))
 
 (set! *warn-on-reflection* true)
 
@@ -16,15 +17,18 @@
 
   Puts original :cmd string and :sig string into this one map for use downstream."
   [{:keys [command id] :as cmd-data}]
-  (let [{:keys [sig cmd]} command
+  (let [{:keys [sig cmd signed]} command
         cmd-map       (-> (try (json/parse cmd)
                                (catch Exception _
                                  (throw (ex-info (format "Transaction %s is not valid JSON, ignoring." id)
                                                  {:status 400 :error :db/invalid-transaction}))))
                           (assoc :txid id
                                  :cmd cmd
-                                 :sig sig))
-        sig-authority (try (crypto/account-id-from-message cmd sig)
+                                 :sig sig
+                                 :signed signed)
+                          util/without-nils)
+        _             (log/trace "Validating command:" cmd-map)
+        sig-authority (try (crypto/account-id-from-message (or signed cmd) sig)
                            (catch Exception _
                              (throw (ex-info (format "Transaction %s has an invalid signature." id)
                                              {:status 400 :error :db/invalid-signature}))))
