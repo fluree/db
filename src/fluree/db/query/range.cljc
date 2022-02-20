@@ -108,29 +108,18 @@
   (and (index/leaf? node)
        (index/resolved? node)))
 
-(defn flake-slice-chan
-  "Returns a channel that will eventually contain a stream of flakes from index
-  `idx` within the database `db` between `start-flake` and `end-flake`,
-  inclusive, one-by-one, and sorted by the order of `idx`. Any exceptions
-  encountered while resolving index nodes will be placed on `error-ch`"
-  [{:keys [conn] :as db} error-ch
-   {:keys [idx from-t to-t start-test start-flake end-test end-flake]
-    :as opts}]
-  (let [idx-root  (get db idx)
-        novelty   (get-in db [:novelty idx])
-        query-xf  (comp (map (fn [leaf]
-                               (index/at-t leaf to-t novelty)))
-                        (map :flakes)
-                        (map (partial index/t-range from-t to-t))
-                        (map (fn [flakes]
-                               (flake/subrange flakes
-                                               start-test start-flake
-                                               end-test end-flake)))
-                        (map (fn [flakes]
-                               (into [] (query-filter-xf opts) flakes))))
-        in-range? (fn [node]
-                    (intersects-range? node start-flake end-flake))]
-    (index/tree-chan conn idx-root in-range? resolved-leaf? query-xf error-ch)))
+(defn query-flakes
+  [{:keys [from-t to-t novelty start-flake start-test end-flake end-test] :as opts}]
+  (comp (map (fn [leaf]
+               (index/at-t leaf to-t novelty)))
+        (map :flakes)
+        (map (partial index/t-range from-t to-t))
+        (map (fn [flakes]
+               (flake/subrange flakes
+                               start-test start-flake
+                               end-test end-flake)))
+        (map (fn [flakes]
+               (into [] (query-filter-xf opts) flakes)))))
 
 (defn unauthorized?
   [f]
@@ -215,12 +204,16 @@
                     (chan 1 flakeset-xf))))))
 
 (defn index-range*
-  [{:keys [permissions t], :as db} error-ch opts]
-  (let [{:keys [idx start-flake end-flake limit offset flake-limit]}
-        opts
-
-        idx-cmp (get-in db [:comparators idx])]
-    (->> (flake-slice-chan db error-ch opts)
+  [{:keys [conn] :as db}
+   error-ch
+   {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
+  (let [idx-root  (get db idx)
+        idx-cmp   (get-in db [:comparators idx])
+        novelty   (get-in db [:novelty idx])
+        in-range? (fn [node]
+                    (intersects-range? node start-flake end-flake))
+        query-xf  (query-flakes (assoc opts :novelty novelty))]
+    (->> (index/tree-chan conn idx-root in-range? resolved-leaf? query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
          (filter-subject-frame limit offset)
          (into-flake-set idx-cmp flake-limit))))
