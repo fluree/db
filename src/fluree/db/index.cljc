@@ -300,7 +300,7 @@
   ([r root resolve? include? error-ch]
    (tree-chan r root resolve? include? identity error-ch))
   ([r root resolve? include? xf error-ch]
-   (let [out (chan 4 xf)]
+   (let [out (chan 16 xf)]
      (go
        (let [root-node (<! (resolve-when r resolve? error-ch root))]
          (loop [stack [root-node]]
