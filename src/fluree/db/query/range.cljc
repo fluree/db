@@ -132,6 +132,10 @@
                     (intersects-range? node start-flake end-flake))]
     (index/tree-chan conn idx-root in-range? resolved-leaf? query-xf error-ch)))
 
+(defn unauthorized?
+  [f]
+  (= f ::unauthorized))
+
 (defn authorize-flake
   [db error-ch flake]
   (go
@@ -145,10 +149,6 @@
                              (select-keys db [:network :dbid :t]))
                   (>! error-ch e)))))
 
-(defn unauthorized?
-  [f]
-  (= f ::unauthorized))
-
 (defn authorize-flakes
   [db error-ch flakes]
   (->> flakes
@@ -157,9 +157,10 @@
                     (into [] (remove unauthorized?) fs)))))
 
 (defn filter-authorized
-  "Returns a channel that will eventually contain only the schema flakes and the
-  flakes validated by fluree.db.permissions-validate/allow-flake? function for
-  the database `db` from the `flake-slices` channel"
+  "Returns a channel that will eventually return a stream of flake slices
+  containing only the schema flakes and the flakes validated by
+  fluree.db.permissions-validate/allow-flake? function for the database `db`
+  from the `flake-slices` channel"
   [{:keys [permissions] :as db} start end error-ch flake-slices]
   #?(:cljs
      flake-slices ; Note this bypasses all permissions in CLJS for now!
