@@ -97,23 +97,23 @@
     (apply comp filter-xfs)))
 
 (defn intersects-range?
-  [{node-rhs :rhs, node-first :first, node-leftmost? :leftmost?, idx-cmp :comparator}
-   lower upper]
-  (not (or (and node-rhs
-                (neg? (idx-cmp node-rhs lower)))
-           (and (not node-leftmost?)
-                (neg? (idx-cmp upper node-first))))))
+  [{idx-cmp :comparator :as node} lower upper]
+  (not (or (and (:rhs node)
+                (neg? (idx-cmp (:rhs node) lower)))
+           (and (not (:leftmost? node))
+                (neg? (idx-cmp upper (:first node)))))))
+
+(defn resolved-leaf?
+  [node]
+  (and (index/leaf? node)
+       (index/resolved? node)))
 
 (defn leaf-range
   [{:keys [conn] :as db} idx start-flake end-flake error-ch]
-  (let [idx-root (get db idx)
-        idx-cmp  (get-in db [:comparators idx])
-        resolve? (fn [node]
-                   (intersects-range? node start-flake end-flake))
-        include? (fn [node]
-                   (and (index/leaf? node)
-                        (index/resolved? node)))]
-    (index/tree-chan conn idx-root resolve? include? error-ch)))
+  (let [idx-root  (get db idx)
+        in-range? (fn [node]
+                    (intersects-range? node start-flake end-flake))]
+    (index/tree-chan conn idx-root in-range? resolved-leaf? error-ch)))
 
 (defn flake-range
   "Returns a channel that will eventually contain a stream of flakes from index
@@ -222,7 +222,6 @@
     subject-limit :limit
     :or {offset 0}}
    error-ch]
-
   (-> db
       (flake-range {:idx idx
                     :from-t t
