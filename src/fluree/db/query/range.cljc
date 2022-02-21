@@ -88,7 +88,7 @@
          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
      (flake/->Flake s' p o' t op m'))))
 
-(defn query-filter-xf
+(defn query-filter
   [{:keys [subject-fn predicate-fn object-fn]}]
   (let [filter-xfs (cond-> []
                      subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
@@ -96,19 +96,7 @@
                      object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
     (apply comp filter-xfs)))
 
-(defn intersects-range?
-  [{idx-cmp :comparator :as node} lower upper]
-  (not (or (and (:rhs node)
-                (neg? (idx-cmp (:rhs node) lower)))
-           (and (not (:leftmost? node))
-                (neg? (idx-cmp upper (:first node)))))))
-
-(defn resolved-leaf?
-  [node]
-  (and (index/leaf? node)
-       (index/resolved? node)))
-
-(defn query-flakes
+(defn extract-query-flakes
   [{:keys [from-t to-t novelty start-flake start-test end-flake end-test] :as opts}]
   (comp (map (fn [leaf]
                (index/at-t leaf to-t novelty)))
@@ -119,7 +107,7 @@
                                start-test start-flake
                                end-test end-flake)))
         (map (fn [flakes]
-               (into [] (query-filter-xf opts) flakes)))))
+               (into [] (query-filter opts) flakes)))))
 
 (defn unauthorized?
   [f]
@@ -203,6 +191,18 @@
         (async/pipe flake-vec-ch
                     (chan 1 flakeset-xf))))))
 
+(defn resolved-leaf?
+  [node]
+  (and (index/leaf? node)
+       (index/resolved? node)))
+
+(defn intersects-range?
+  [{idx-cmp :comparator :as node} lower upper]
+  (not (or (and (:rhs node)
+                (neg? (idx-cmp (:rhs node) lower)))
+           (and (not (:leftmost? node))
+                (neg? (idx-cmp upper (:first node)))))))
+
 (defn index-range*
   [{:keys [conn] :as db}
    error-ch
@@ -212,7 +212,7 @@
         novelty   (get-in db [:novelty idx])
         in-range? (fn [node]
                     (intersects-range? node start-flake end-flake))
-        query-xf  (query-flakes (assoc opts :novelty novelty))]
+        query-xf  (extract-query-flakes (assoc opts :novelty novelty))]
     (->> (index/tree-chan conn idx-root in-range? resolved-leaf? query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
          (filter-subject-frame limit offset)
