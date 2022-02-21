@@ -89,6 +89,11 @@
      (flake/->Flake s' p o' t op m'))))
 
 (defn query-filter
+  "Returns a transducer to filter flakes according to the boolean function values
+  of the `:subject-fn`, `:predicate-fn`, and `:object-fn` keys from the supplied
+  options map. All three functions are optional, and each supplied function will
+  be applied to its corresponding flake component, and only flakes where each
+  function evaluates to a truthy value will be included."
   [{:keys [subject-fn predicate-fn object-fn]}]
   (let [filter-xfs (cond-> []
                      subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
@@ -97,6 +102,11 @@
     (apply comp filter-xfs)))
 
 (defn extract-query-flakes
+  "Returns a transducer to extract flakes from each leaf from a stream of index
+  leaf nodes that satisfy the bounds specified in the supplied query options
+  map. The result of the transformation will be a stream of collections of
+  flakes from both the leaves in the input stream and the supplied `:novelty`,
+  with one flake collection for each input leaf."
   [{:keys [from-t to-t novelty start-flake start-test end-flake end-test] :as opts}]
   (comp (map (fn [leaf]
                (index/at-t leaf to-t novelty)))
@@ -127,6 +137,9 @@
                   (>! error-ch e)))))
 
 (defn authorize-flakes
+  "Authorize each flake in the supplied `flakes` collection asynchronously,
+  returning a collection containing only allowed flakes according to the
+  permissions of the supplied `db`."
   [db error-ch flakes]
   (->> flakes
        (map (partial authorize-flake db error-ch))
@@ -166,6 +179,12 @@
     ch))
 
 (defn filter-subject-frame
+  "If either `limit` or `offset` is non-nil, regroup the flakes from the input
+  `flake-slices` channel from slices corresponding to index nodes into slices
+  corresponding to ledger subjects, then remove the first `offset` of the
+  subject slices (if `offset` is non-nil) and remove all but `limit` subject
+  slices after the offset (if `limit` is non-nil). The input channel is returned
+  unchanged if both `limit` and `offset` is nil."
   [limit offset flake-slices]
   (if (or limit offset)
     (let [offset  (or offset 0)
@@ -178,9 +197,13 @@
     flake-slices))
 
 (defn into-flake-set
-  [idx-cmp flake-limit flake-slices]
+  "Combines the collections of flakes from the input `flake-slices` channel into a
+  single sorted flake set, sorted by the supplied comparator `cmp`. The output
+  flake set will contain no more than `flake-limit` flakes if `flake-limit` is
+  not nil."
+  [cmp flake-limit flake-slices]
   (let [flakeset-xf (map (fn [flakes]
-                           (apply flake/sorted-set-by idx-cmp flakes)))]
+                           (apply flake/sorted-set-by cmp flakes)))]
     (if flake-limit
       (let [flake-ch (async/pipe flake-slices
                                  (chan 1 (comp cat
@@ -197,13 +220,17 @@
        (index/resolved? node)))
 
 (defn intersects-range?
-  [{idx-cmp :comparator :as node} lower upper]
+  "Returns true if the supplied `node` contains flakes between the `lower` and
+  `upper` flakes, according to the `node`'s comparator."
+  [{cmp :comparator, :as node} lower upper]
   (not (or (and (:rhs node)
-                (neg? (idx-cmp (:rhs node) lower)))
+                (neg? (cmp (:rhs node) lower)))
            (and (not (:leftmost? node))
-                (neg? (idx-cmp upper (:first node)))))))
+                (neg? (cmp upper (:first node)))))))
 
 (defn index-range*
+  "Return a channel that will eventually hold a single sorted set of the range of
+  flakes from `db` that meet the criteria specified in the `opts` map."
   [{:keys [conn] :as db}
    error-ch
    {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
