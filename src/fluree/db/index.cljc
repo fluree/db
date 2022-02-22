@@ -294,13 +294,14 @@
   that will be applied to each node to determine whether or not the data
   associated with that node will be resolved from disk using the supplied
   `Resolver` `r`. `include?` is a boolean function that will be applied to each
-  node to determine if it will be included in the final output node stream, and
-  `xf` is an optional transducer that will transform the output stream if
+  node to determine if it will be included in the final output node stream, `n`
+  is an optional parameter specifying the number of nodes to load concurrently,
+  and `xf` is an optional transducer that will transform the output stream if
   supplied."
   ([r root resolve? include? error-ch]
-   (tree-chan r root resolve? include? identity error-ch))
-  ([r root resolve? include? xf error-ch]
-   (let [out (chan 8 xf)]
+   (tree-chan r root resolve? include? 1 identity error-ch))
+  ([r root resolve? include? n xf error-ch]
+   (let [out (chan n xf)]
      (go
        (let [root-node (<! (resolve-when r resolve? error-ch root))]
          (loop [stack [root-node]]
