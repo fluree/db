@@ -210,9 +210,8 @@
                                                (partition-all flake-limit)
                                                flakeset-xf)))]
         (async/take 1 flake-ch))
-      (let [flake-vec-ch (async/reduce into [] flake-slices)]
-        (async/pipe flake-vec-ch
-                    (chan 1 flakeset-xf))))))
+      (let [empty-set (flake/sorted-set-by cmp)]
+        (async/reduce into empty-set flake-slices)))))
 
 (defn resolved-leaf?
   [node]
@@ -240,7 +239,7 @@
         in-range? (fn [node]
                     (intersects-range? node start-flake end-flake))
         query-xf  (extract-query-flakes (assoc opts :novelty novelty))]
-    (->> (index/tree-chan conn idx-root in-range? resolved-leaf? 8 query-xf error-ch)
+    (->> (index/tree-chan conn idx-root in-range? resolved-leaf? 1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
          (filter-subject-frame limit offset)
          (into-flake-set idx-cmp flake-limit))))
