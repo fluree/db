@@ -545,10 +545,7 @@
                              (async/close! pub-chan)
                              (close-websocket conn-id)
                              (swap! state-atom assoc :close? true)
-                             ;; NOTE - when we allow permissions back in CLJS (browser), remove conditional below
-                             #?(:clj  (dbfunctions/clear-db-fn-cache)
-                                :cljs (when (identical? "nodejs" cljs.core/*target*)
-                                        (dbfunctions/clear-db-fn-cache)))
+                             (dbfunctions/clear-db-fn-cache)
                              (session/close-all-sessions conn-id)
                              (reset! default-cache-atom (default-object-cache-factory memory-object-size))
                              ;; user-supplied close function

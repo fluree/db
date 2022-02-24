@@ -32,7 +32,7 @@
           (recur r (conj acc (<? arg)))
           (recur r (conj acc arg)))))))
 
-(defn stack
+(defn- stack
   "Returns the current stack."
   [?ctx]
   (-> @(:state ?ctx)
@@ -104,7 +104,7 @@
   [?ctx arg]
   (go-try (let [arg   (extract arg)
                 res   (fdb/not arg)
-                entry [{:function "not?" :arguments [arg] :result res} 10]]
+                entry [{:function "not" :arguments [arg] :result res} 10]]
             (add-stack ?ctx entry)
             res)))
 
