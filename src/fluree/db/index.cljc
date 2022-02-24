@@ -198,15 +198,13 @@
   before `t`."
   [t flakes]
   (->> flakes
-       (flakes-through t)
-       (group-by (juxt flake/s flake/p flake/o))
-       vals
+       (filter (complement (partial after-t? t)))
+       (partition-by (juxt flake/s flake/p flake/o))
        (mapcat (fn [flakes]
-                 (let [sorted-flakes (sort-by flake/t flakes)
-                       last-flake    (first sorted-flakes)]
+                 (let [last-flake (last flakes)]
                    (if (flake/op last-flake)
-                     (rest sorted-flakes)
-                     sorted-flakes))))))
+                     (butlast flakes)
+                     flakes))))))
 
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
