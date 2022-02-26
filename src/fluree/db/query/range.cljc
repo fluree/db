@@ -209,8 +209,8 @@
                                                (partition-all flake-limit)
                                                flakeset-xf)))]
         (async/take 1 flake-ch))
-      (let [empty-set (flake/sorted-set-by cmp)]
-        (async/reduce into empty-set flake-slices)))))
+      (-> (async/reduce into [] flake-slices)
+          (async/pipe (chan 1 flakeset-xf))))))
 
 (defn resolved-leaf?
   [node]
