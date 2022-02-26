@@ -107,11 +107,10 @@
   map. The result of the transformation will be a stream of collections of
   flakes from both the leaves in the input stream and the supplied `:novelty`,
   with one flake collection for each input leaf."
-  [{:keys [from-t to-t novelty start-flake start-test end-flake end-test] :as opts}]
+  [{:keys [from-t to-t novelty start-flake start-test end-flake end-test
+           object-cache] :as opts}]
   (comp (map (fn [leaf]
-               (index/at-t leaf to-t novelty)))
-        (map :flakes)
-        (map (partial index/t-range from-t to-t))
+               (index/t-range leaf novelty from-t to-t)))
         (map (fn [flakes]
                (flake/subrange flakes
                                start-test start-flake
@@ -238,7 +237,9 @@
         novelty   (get-in db [:novelty idx])
         in-range? (fn [node]
                     (intersects-range? node start-flake end-flake))
-        query-xf  (extract-query-flakes (assoc opts :novelty novelty))]
+        query-xf  (extract-query-flakes (assoc opts
+                                               :novelty novelty
+                                               :object-cache (:object-cache conn)))]
     (->> (index/tree-chan conn idx-root in-range? resolved-leaf? 1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
          (filter-subject-frame limit offset)
