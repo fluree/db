@@ -229,14 +229,21 @@
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
   transactions `from-t` and `to-t`."
-  [{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
-  (let [latest       (cond-> flakes
-                       (> leaf-t to-t)
-                       (flake/conj-all (novelty-subrange leaf to-t novelty)))
-        stale-flakes (stale-by from-t latest)
-        subsequent   (filter-after to-t latest)
-        out-of-range (concat stale-flakes subsequent)]
-    (flake/disj-all latest out-of-range)))
+  ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
+   (let [latest       (cond-> flakes
+                        (> leaf-t to-t)
+                        (flake/conj-all (novelty-subrange leaf to-t novelty)))
+         stale-flakes (stale-by from-t latest)
+         subsequent   (filter-after to-t latest)
+         out-of-range (concat stale-flakes subsequent)]
+     (flake/disj-all latest out-of-range)))
+  ([{:keys [id tempid tt-id] :as leaf} novelty from-t to-t object-cache]
+   (if object-cache
+     (object-cache
+      [::t-range id tempid tt-id from-t to-t]
+      (fn [_]
+        (t-range leaf novelty from-t to-t)))
+     (t-range leaf novelty from-t to-t))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from

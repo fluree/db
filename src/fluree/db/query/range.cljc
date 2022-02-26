@@ -110,7 +110,7 @@
   [{:keys [from-t to-t novelty start-flake start-test end-flake end-test
            object-cache] :as opts}]
   (comp (map (fn [leaf]
-               (index/t-range leaf novelty from-t to-t)))
+               (index/t-range leaf novelty from-t to-t object-cache)))
         (map (fn [flakes]
                (flake/subrange flakes
                                start-test start-flake
