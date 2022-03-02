@@ -271,10 +271,10 @@
   "
   ([conn ledger] (new-ledger-async conn ledger nil))
   ([conn ledger opts]
-   (try (let [invalid-ledger-name? (fn [ledger-id type]
-                                     (when-not (re-matches #"^[a-z0-9-]{1,100}" ledger-id)
-                                       (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
-                                                       {:status 400 :error :db/invalid-db}))))
+   (try (let [validate-ledger-name! (fn [ledger-id type]
+                                      (when-not (re-matches #"^[a-z0-9-]{1,100}" ledger-id)
+                                        (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
+                                                        {:status 400 :error :db/invalid-db}))))
               {:keys [alias auth doc fork forkBlock expire nonce private-key timeout
                       snapshot snapshotBlock copy copyBlock owners]
                :or   {timeout 60000}} opts
@@ -282,11 +282,11 @@
               ledger-id            (if (str/starts-with? ledger-id "$")
                                      (subs ledger-id 1)
                                      ledger-id)
-              _                    (invalid-ledger-name? ledger-id "ledger")
-              _                    (invalid-ledger-name? network "network")
+              _                    (validate-ledger-name! ledger-id "ledger")
+              _                    (validate-ledger-name! network "network")
               [network-alias ledger-alias] (when alias
                                              (graphdb/validate-ledger-ident ledger))
-              _                    (when alias (invalid-ledger-name? ledger-alias "alias"))
+              _                    (when alias (validate-ledger-name! ledger-alias "alias"))
               alias*               (when alias (str network-alias "/" ledger-alias))
               timestamp            (System/currentTimeMillis)
               nonce                (or nonce timestamp)
@@ -305,6 +305,7 @@
                                     :nonce         nonce
                                     :expire        expire
                                     :owners        (not-empty owners)}]
+          (log/debug "Creating new ledger" ledger "with owners:" owners)
           (if private-key
             (let [cmd (-> cmd-data
                           (util/without-nils)
