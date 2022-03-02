@@ -305,6 +305,7 @@
                                     :nonce         nonce
                                     :expire        expire
                                     :owners        (not-empty owners)}]
+          (log/debug "Creating new ledger" ledger "with owners:" owners)
           (if private-key
             (let [cmd (-> cmd-data
                           (util/without-nils)
