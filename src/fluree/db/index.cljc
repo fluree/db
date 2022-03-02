@@ -191,32 +191,6 @@
        (filter-after t)
        (flake/disj-all flakes)))
 
-(defn stale-by
-  "Returns a sequence of flakes from the sorted set `flakes` that are out of date
-  by the transaction `t` because `flakes` contains another flake with the same
-  subject and predicate and a transaction value later than that flake but on or
-  before `t`."
-  [t flakes]
-  (->> flakes
-       (flakes-through t)
-       (group-by (juxt flake/s flake/p flake/o))
-       vals
-       (mapcat (fn [flakes]
-                 (let [sorted-flakes (sort-by flake/t flakes)
-                       last-flake    (first sorted-flakes)]
-                   (if (flake/op last-flake)
-                     (rest sorted-flakes)
-                     sorted-flakes))))))
-
-(defn t-range
-  "Returns a sorted set of flakes that are not out of date between the
-  transactions `from-t` and `to-t`."
-  [from-t to-t flakes]
-  (let [stale-flakes (stale-by from-t flakes)
-        subsequent   (filter-after to-t flakes)
-        out-of-range (concat stale-flakes subsequent)]
-    (flake/disj-all flakes out-of-range)))
-
 (defn novelty-subrange
   [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]
   (let [subrange (cond
@@ -236,6 +210,40 @@
                    (and (nil? rhs) leftmost?)
                    novelty)]
     (flakes-through through-t subrange)))
+
+(defn stale-by
+  "Returns a sequence of flakes from the sorted set `flakes` that are out of date
+  by the transaction `t` because `flakes` contains another flake with the same
+  subject and predicate and a transaction value later than that flake but on or
+  before `t`."
+  [t flakes]
+  (->> flakes
+       (filter (complement (partial after-t? t)))
+       (partition-by (juxt flake/s flake/p flake/o))
+       (mapcat (fn [flakes]
+                 (let [last-flake (last flakes)]
+                   (if (flake/op last-flake)
+                     (butlast flakes)
+                     flakes))))))
+
+(defn t-range
+  "Returns a sorted set of flakes that are not out of date between the
+  transactions `from-t` and `to-t`."
+  ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
+   (let [latest       (cond-> flakes
+                        (> leaf-t to-t)
+                        (flake/conj-all (novelty-subrange leaf to-t novelty)))
+         stale-flakes (stale-by from-t latest)
+         subsequent   (filter-after to-t latest)
+         out-of-range (concat stale-flakes subsequent)]
+     (flake/disj-all latest out-of-range)))
+  ([{:keys [id tempid tt-id] :as leaf} novelty from-t to-t object-cache]
+   (if object-cache
+     (object-cache
+      [::t-range id tempid tt-id from-t to-t]
+      (fn [_]
+        (t-range leaf novelty from-t to-t)))
+     (t-range leaf novelty from-t to-t))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
