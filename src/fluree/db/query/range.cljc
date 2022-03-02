@@ -88,94 +88,12 @@
          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
      (flake/->Flake s' p o' t op m'))))
 
-(defn resolve-leaf
-  [{:keys [conn] :as db} root-node flake]
-  (go-try
-   (let [next-leaf     (<? (index/lookup-leaf conn root-node flake))
-         resolved-leaf (<? (index/resolve conn next-leaf))]
-     resolved-leaf)))
-
-(defn leaf-range
-  "Returns a channel that will eventually contain a stream of index leaf nodes
-  from index `idx` within the database `db` starting with the node containing
-  `start-flake` and ending with the node containing `end-flake` one-by-one. Any
-  exceptions encountered while resolving index nodes will be placed on
-  `error-ch`"
-  [{:keys [conn] :as db} idx start-flake end-flake error-ch]
-  (let [idx-root    (get db idx)
-        idx-compare (get-in db [:comparators idx])
-        leaf-ch     (chan)]
-    (go
-      (try* (let [root-node (<? (index/resolve conn idx-root))]
-              (do (loop [next-flake start-flake]
-                    (when (and next-flake
-                               (not (pos? (idx-compare next-flake end-flake))))
-                      (when-let [next-leaf (<? (resolve-leaf db root-node next-flake))]
-                        (when (>! leaf-ch next-leaf)
-                          (recur (:rhs next-leaf))))))
-                  (async/close! leaf-ch)))
-            (catch* e
-                    (log/error e
-                               "Error resolving leaf range for index" idx
-                               "between flake" start-flake "and" end-flake
-                               "in ledger" (select-keys db [:network :dbid :t]))
-                    (>! error-ch e))))
-    leaf-ch))
-
-(defn flake-range
-  "Returns a channel that will eventually contain a stream of flakes from index
-  `idx` within the database `db` between `start-flake` and `end-flake`,
-  inclusive, one-by-one, and sorted by the order of `idx`. Any exceptions
-  encountered while resolving index nodes will be placed on `error-ch`"
-  [{:keys [conn] :as db}
-   idx
-   {:keys [from-t to-t start-test start-flake
-           end-test end-flake]}
-   error-ch]
-  (let [novelty  (get-in db [:novelty idx])]
-    (-> db
-        (leaf-range idx start-flake end-flake error-ch)
-        (async/pipe (chan 1 (comp (map (fn [leaf]
-                                         (index/at-t leaf to-t novelty)))
-                                  (map :flakes)
-                                  (map (partial index/t-range from-t to-t))
-                                  (mapcat (fn [flakes]
-                                            (flake/subrange flakes
-                                                            start-test start-flake
-                                                            end-test end-flake)))))))))
-
-(defn filter-authorized
-  "Returns a channel that will eventually contain only the schema flakes and the
-  flakes validated by fluree.db.permissions-validate/allow-flake? function for
-  the database `db` from the `flake-stream` channel"
-  [flake-stream {:keys [permissions] :as db} start end error-ch]
-  #?(:cljs
-     flake-stream ; Note this bypasses all permissions in CLJS for now!
-
-     :clj
-     (let [s1 (flake/s start)
-           p1 (flake/p start)
-           s2 (flake/s end)
-           p2 (flake/p end)]
-       (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
-         flake-stream
-         (let [out-ch (chan)]
-           (go
-             (try* (loop []
-                     (when-let [flake (<! flake-stream)]
-                       (when (or (schema-util/is-schema-flake? flake)
-                                 (<? (perm-validate/allow-flake? db flake)))
-                         (>! out-ch flake))
-                       (recur)))
-                   (async/close! out-ch)
-                   (catch* e
-                           (log/error e
-                                      "Error validating flake in ledger"
-                                      (select-keys db [:network :dbid :t]))
-                           (>! error-ch e))))
-           out-ch)))))
-
-(defn flake-filter-xf
+(defn query-filter
+  "Returns a transducer to filter flakes according to the boolean function values
+  of the `:subject-fn`, `:predicate-fn`, and `:object-fn` keys from the supplied
+  options map. All three functions are optional, and each supplied function will
+  be applied to its corresponding flake component, and only flakes where each
+  function evaluates to a truthy value will be included."
   [{:keys [subject-fn predicate-fn object-fn]}]
   (let [filter-xfs (cond-> []
                      subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
@@ -183,11 +101,76 @@
                      object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
     (apply comp filter-xfs)))
 
-(defn filter-index-flakes
-  [flake-ch filter-fns]
-  (let [filter-xf (flake-filter-xf filter-fns)]
-    (async/pipe flake-ch
-                (chan 1 filter-xf))))
+(defn extract-query-flakes
+  "Returns a transducer to extract flakes from each leaf from a stream of index
+  leaf nodes that satisfy the bounds specified in the supplied query options
+  map. The result of the transformation will be a stream of collections of
+  flakes from both the leaves in the input stream and the supplied `:novelty`,
+  with one flake collection for each input leaf."
+  [{:keys [from-t to-t novelty start-flake start-test end-flake end-test] :as opts}]
+  (comp (map (fn [leaf]
+               (index/at-t leaf to-t novelty)))
+        (map :flakes)
+        (map (partial index/t-range from-t to-t))
+        (map (fn [flakes]
+               (flake/subrange flakes
+                               start-test start-flake
+                               end-test end-flake)))
+        (map (fn [flakes]
+               (into [] (query-filter opts) flakes)))))
+
+(defn unauthorized?
+  [f]
+  (= f ::unauthorized))
+
+(defn authorize-flake
+  [db error-ch flake]
+  (go
+    (try* (if (or (schema-util/is-schema-flake? flake)
+                  (<? (perm-validate/allow-flake? db flake)))
+            flake
+            ::unauthorized)
+          (catch* e
+                  (log/error e
+                             "Error authorizing flake in ledger"
+                             (select-keys db [:network :dbid :t]))
+                  (>! error-ch e)))))
+
+(defn authorize-flakes
+  "Authorize each flake in the supplied `flakes` collection asynchronously,
+  returning a collection containing only allowed flakes according to the
+  permissions of the supplied `db`."
+  [db error-ch flakes]
+  (->> flakes
+       (map (partial authorize-flake db error-ch))
+       (async/map (fn [& fs]
+                    (into [] (remove unauthorized?) fs)))))
+
+(defn filter-authorized
+  "Returns a channel that will eventually return a stream of flake slices
+  containing only the schema flakes and the flakes validated by
+  fluree.db.permissions-validate/allow-flake? function for the database `db`
+  from the `flake-slices` channel"
+  [{:keys [permissions] :as db} start end error-ch flake-slices]
+  #?(:cljs
+     flake-slices ; Note this bypasses all permissions in CLJS for now!
+
+     :clj
+     (let [s1 (flake/s start)
+           p1 (flake/p start)
+           s2 (flake/s end)
+           p2 (flake/p end)]
+       (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
+         flake-slices
+         (let [auth-fn (fn [flakes ch]
+                         (go
+                           (let [allowed-flakes (<! (authorize-flakes db error-ch flakes))]
+                             (when (seq allowed-flakes)
+                               (>! ch allowed-flakes))
+                             (async/close! ch))))
+               out-ch  (chan)]
+           (async/pipeline-async 2 out-ch auth-fn flake-slices)
+           out-ch)))))
 
 (defn take-only
   [ch limit]
@@ -195,47 +178,72 @@
     (async/take limit ch)
     ch))
 
-(defn select-subject-window
-  "Returns a channel that contains the flakes from `flake-ch`, skipping the flakes
-  from the first `offset` subjects encountered and including the flakes from a
-  maximum of `subject-limit` subjects."
-  [flake-ch {:keys [subject-limit offset]
-             :or   {offset 0}}]
-  (let [subj-ch (chan 1 (comp (partition-by flake/s)
-                              (drop offset)))
-        out-ch  (chan 1 cat)]
-    (-> flake-ch
-        (async/pipe subj-ch)
-        (take-only subject-limit)
-        (async/pipe out-ch))))
+(defn filter-subject-frame
+  "If either `limit` or `offset` is non-nil, regroup the flakes from the input
+  `flake-slices` channel from slices corresponding to index nodes into slices
+  corresponding to ledger subjects, then remove the first `offset` of the
+  subject slices (if `offset` is non-nil) and remove all but `limit` subject
+  slices after the offset (if `limit` is non-nil). The input channel is returned
+  unchanged if both `limit` and `offset` is nil."
+  [limit offset flake-slices]
+  (if (or limit offset)
+    (let [offset  (or offset 0)
+          subj-ch (chan 1 (comp cat
+                                (partition-by flake/s)
+                                (drop offset)))]
+      (-> flake-slices
+          (async/pipe subj-ch)
+          (take-only limit)))
+    flake-slices))
 
-(defn index-range-stream
-  [{:keys [permissions t], :as db}
-   idx
-   {:keys [from-t to-t start-test start-flake end-test end-flake
-           flake-limit offset subject-fn predicate-fn object-fn]
-    subject-limit :limit
-    :or {offset 0}}
-   error-ch]
+(defn into-flake-set
+  "Combines the collections of flakes from the input `flake-slices` channel into a
+  single sorted flake set, sorted by the supplied comparator `cmp`. The output
+  flake set will contain no more than `flake-limit` flakes if `flake-limit` is
+  not nil."
+  [cmp flake-limit flake-slices]
+  (let [flakeset-xf (map (fn [flakes]
+                           (apply flake/sorted-set-by cmp flakes)))]
+    (if flake-limit
+      (let [flake-ch (async/pipe flake-slices
+                                 (chan 1 (comp cat
+                                               (partition-all flake-limit)
+                                               flakeset-xf)))]
+        (async/take 1 flake-ch))
+      (let [flake-vec-ch (async/reduce into [] flake-slices)]
+        (async/pipe flake-vec-ch
+                    (chan 1 flakeset-xf))))))
 
-  (let [novelty  (get-in db [:novelty idx])]
-    (-> db
-        (flake-range idx
-                     {:from-t t
-                      :to-t t
-                      :start-test start-test
-                      :start-flake start-flake
-                      :end-test end-test
-                      :end-flake end-flake}
-                     error-ch)
-        (filter-index-flakes {:subject-fn subject-fn
-                              :predicate-fn predicate-fn
-                              :object-fn object-fn})
-        (filter-authorized db start-flake end-flake error-ch)
-        (select-subject-window {:subject-limit subject-limit
-                                :flake-limit flake-limit
-                                :offset offset})
-        (take-only flake-limit))))
+(defn resolved-leaf?
+  [node]
+  (and (index/leaf? node)
+       (index/resolved? node)))
+
+(defn intersects-range?
+  "Returns true if the supplied `node` contains flakes between the `lower` and
+  `upper` flakes, according to the `node`'s comparator."
+  [{cmp :comparator, :as node} lower upper]
+  (not (or (and (:rhs node)
+                (neg? (cmp (:rhs node) lower)))
+           (and (not (:leftmost? node))
+                (neg? (cmp upper (:first node)))))))
+
+(defn index-range*
+  "Return a channel that will eventually hold a single sorted set of the range of
+  flakes from `db` that meet the criteria specified in the `opts` map."
+  [{:keys [conn] :as db}
+   error-ch
+   {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
+  (let [idx-root  (get db idx)
+        idx-cmp   (get-in db [:comparators idx])
+        novelty   (get-in db [:novelty idx])
+        in-range? (fn [node]
+                    (intersects-range? node start-flake end-flake))
+        query-xf  (extract-query-flakes (assoc opts :novelty novelty))]
+    (->> (index/tree-chan conn idx-root in-range? resolved-leaf? 8 query-xf error-ch)
+         (filter-authorized db start-flake end-flake error-ch)
+         (filter-subject-frame limit offset)
+         (into-flake-set idx-cmp flake-limit))))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
@@ -284,25 +292,24 @@
          start-parts (match->flake-parts db idx start-match)
          end-parts   (match->flake-parts db idx end-match)]
      (go-try
-       (let [start-flake  (<? (resolve-match-flake db start-test start-parts))
-             end-flake    (<? (resolve-match-flake db end-test end-parts))
-             error-ch     (chan)
-             range-stream (index-range-stream db
-                                              idx
-                                              {:from-t from-t
-                                               :to-t to-t
-                                               :start-test start-test
-                                               :start-flake start-flake
-                                               :end-test end-test
-                                               :end-flake end-flake
-                                               :flake-limit limit}
-                                              error-ch)
-             range-vec-ch (async/into [] range-stream)]
-         (async/alt!
-           error-ch     ([e]
-                         (throw e))
-           range-vec-ch ([hist-range]
-                         (apply flake/sorted-set-by idx-compare hist-range))))))))
+      (let [start-flake (<? (resolve-match-flake db start-test start-parts))
+            end-flake   (<? (resolve-match-flake db end-test end-parts))
+            error-ch    (chan)
+            range-ch    (index-range* db
+                                      error-ch
+                                      {:idx idx
+                                       :from-t from-t
+                                       :to-t to-t
+                                       :start-test start-test
+                                       :start-flake start-flake
+                                       :end-test end-test
+                                       :end-flake end-flake
+                                       :flake-limit limit})]
+        (async/alt!
+          error-ch ([e]
+                    (throw e))
+          range-ch ([hist-range]
+                    hist-range)))))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
@@ -341,26 +348,25 @@
                                [[o1 o2] object-fn])]
 
      (go-try
-      (let [start-flake  (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
-            end-flake    (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))
-            error-ch     (chan)
-            range-stream (index-range-stream db
-                                             idx
-                                             (assoc opts
-                                                    :from-t      t
-                                                    :to-t        t
-                                                    :start-test  start-test
-                                                    :start-flake start-flake
-                                                    :end-test    end-test
-                                                    :end-flake   end-flake
-                                                    :object-fn   object-fn)
-                                             error-ch)
-            range-vec-ch (async/into [] range-stream)]
+      (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
+            end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))
+            error-ch    (chan)
+            range-ch    (index-range* db
+                                      error-ch
+                                      (assoc opts
+                                             :idx         idx
+                                             :from-t      t
+                                             :to-t        t
+                                             :start-test  start-test
+                                             :start-flake start-flake
+                                             :end-test    end-test
+                                             :end-flake   end-flake
+                                             :object-fn   object-fn))]
         (async/alt!
-           error-ch     ([e]
-                         (throw e))
-           range-vec-ch ([idx-range]
-                         (apply flake/sorted-set-by idx-compare idx-range))))))))
+          error-ch ([e]
+                    (throw e))
+          range-ch ([idx-range]
+                    idx-range)))))))
 
 (defn non-nil-non-boolean?
   [o]

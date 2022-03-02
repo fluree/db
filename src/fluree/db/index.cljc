@@ -2,9 +2,11 @@
   (:refer-clojure :exclude [resolve])
   (:require [clojure.data.avl :as avl]
             [fluree.db.flake :as flake]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try]]))
+            #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
+               :cljs [cljs.core.async :refer [chan go <!] :as async])
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 (def default-comparators
   "Map of default index comparators for the five index types"
@@ -251,3 +253,69 @@
 
       true
       (assoc :t t))))
+
+(defn- mark-expanded
+  [node]
+  (assoc node ::expanded true))
+
+(defn- unmark-expanded
+  [node]
+  (dissoc node ::expanded))
+
+(defn- expanded?
+  [node]
+  (-> node ::expanded true?))
+
+(defn resolve-when
+  [r resolve? error-ch node]
+  (go
+    (try* (if (resolve? node)
+            (<? (resolve r node))
+            node)
+          (catch* e
+                  (log/error e
+                             "Error resolving index node:"
+                             (select-keys node [:id :network :dbid]))
+                  (>! error-ch e)))))
+
+(defn resolve-children-when
+  [r resolve? error-ch branch]
+  (if (resolved? branch)
+    (->> branch
+         :children
+         (map (fn [[_ child]]
+                (resolve-when r resolve? error-ch child)))
+         (async/map vector))
+    (go [])))
+
+(defn tree-chan
+  "Returns a channel that will eventually contain the stream of index nodes
+  descended from `root` in depth-first order. `resolve?` is a boolean function
+  that will be applied to each node to determine whether or not the data
+  associated with that node will be resolved from disk using the supplied
+  `Resolver` `r`. `include?` is a boolean function that will be applied to each
+  node to determine if it will be included in the final output node stream, `n`
+  is an optional parameter specifying the number of nodes to load concurrently,
+  and `xf` is an optional transducer that will transform the output stream if
+  supplied."
+  ([r root resolve? include? error-ch]
+   (tree-chan r root resolve? include? 1 identity error-ch))
+  ([r root resolve? include? n xf error-ch]
+   (let [out (chan n xf)]
+     (go
+       (let [root-node (<! (resolve-when r resolve? error-ch root))]
+         (loop [stack [root-node]]
+           (when-let [node (peek stack)]
+             (let [stack* (pop stack)]
+               (if (or (leaf? node)
+                       (expanded? node))
+                 (do (when (include? node)
+                       (>! out (unmark-expanded node)))
+                     (recur stack*))
+                 (let [children (<! (resolve-children-when r resolve? error-ch node))
+                       stack**  (-> stack*
+                                    (conj (mark-expanded node))
+                                    (into (rseq children)))]
+                   (recur stack**))))))
+         (async/close! out)))
+     out)))
