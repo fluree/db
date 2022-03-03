@@ -360,7 +360,7 @@
                path         (str/replace k "_" "/")
                address      (async/<! (get-server conn-id servers))
                url          (str address "/fdb/storage/" path)
-               headers      (cond-> {"Accept" #?(:clj  "avro/binary"
+               headers      (cond-> {"Accept" #?(:clj  "application/json"
                                                  :cljs "application/json")}
                                     jwt' (assoc "Authorization" (str "Bearer " jwt')))
                headers*     (if private
@@ -369,7 +369,7 @@
                               headers)
                res          (<? (xhttp/get url {:request-timeout 5000
                                                 :headers         headers*
-                                                :output-format   #?(:clj  :binary
+                                                :output-format   #?(:clj  :text
                                                                     :cljs :json)}))]
 
            res))))))
@@ -505,7 +505,7 @@
                 pub-chan         (async/chan)
                 memory?          false
                 storage-write    (fn [k v] (throw (ex-info (str "Storage write was not implemented on connection, but was called to store key: " k) {})))
-                serializer       #?(:clj  (avro-serde)
+                serializer       #?(:clj  (json-serde)
                                     :cljs (json-serde))
                 transactor?      false
                 private-key-file "default-private-key.txt"}} opts
