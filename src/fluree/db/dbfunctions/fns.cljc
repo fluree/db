@@ -42,12 +42,12 @@
   "Adds an entry to the current stack."
   [?ctx entry]
   (let [[res cost] entry]
-    (do
-      (log/debug "Smart function stack: " res)
-      (swap! (:state ?ctx) (fn [s]
-                             (assoc s :stack (conj (:stack s) entry)
-                                      :credits (fdb/- (:credits s) cost)
-                                      :spent (fdb/+ (:spent s) cost)))))))
+    (log/debug "Smart function stack:" res)
+    (swap! (:state ?ctx)
+           #(-> %
+                (update :stack conj entry)
+                (update :credits fdb/- cost)
+                (update :spent fdb/+ cost)))))
 
 (defn- raise
   "Throws an exception with the provided message."
