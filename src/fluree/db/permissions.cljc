@@ -32,7 +32,7 @@
            false
 
            (re-matches #"^\(.+\)$" fn-str)
-           (let [f-meta (<? (dbfunctions/parse-fn db fn-str "functionDec" params))]
+           (let [f-meta (<? (dbfunctions/parse-and-wrap-fn db fn-str "functionDec" params))]
              (swap! rule-fn-cache assoc fn-str f-meta)
              f-meta)
 
