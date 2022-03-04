@@ -37,6 +37,7 @@
                       :ref?  true}
                      {:id                 sid
                       :class              true              ;; default
+                      :idx?               true
                       :ref?               ref?              ;; could go from false->true if defined in vocab but hasn't been use dyet
                       :subclassOf         []
                       :equivalentProperty []})]
@@ -50,10 +51,8 @@
                          (if (property-sids (.-o f))
                            (if (= const/$owl:ObjectProperty (.-o f))
                              (assoc details :class false
-                                            :idx? true
                                             :ref? true)
-                             (assoc details :class false
-                                            :idx? true))
+                             (assoc details :class false))
                            ;; it is a class, but we already did :class true as a default
                            details)
 
