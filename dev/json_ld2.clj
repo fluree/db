@@ -25,13 +25,13 @@
                :did     {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
                          :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
                          :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}
-               :name    "example"
-               :push    (ipfs/default-push-fn nil)
-               :publish (ipfs/default-publish-fn nil)
+               :name    "examples/movie"
+               :push    (ipfs/default-commit-fn nil)
+               :publish (ipfs/default-push-fn nil)
                :read    (ipfs/default-read-fn nil)})
 
   (def rdb (jld-db/load-db "fluree:ipns:k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" config))
-rdb
+
   @(fdb/query rdb {:context "https://schema.org"
                    :select ["*", {"author" ["*"]}]
                    :from "https://www.wikidata.org/wiki/Q3107329"})
@@ -42,7 +42,7 @@ rdb
   (-> mydb :config)
   (-> mydb :schema :pred vals set)
 
-  (def mydb2 (jld-tx/transact mydb {"@context"                  "https://schema.org",
+  (def mydb2 (jld-tx/stage mydb {"@context"                     "https://schema.org",
                                     "@id"                       "https://www.wikidata.org/wiki/Q836821",
                                     "@type"                     "Movie",
                                     "name"                      "The Hitchhiker's Guide to the Galaxy",
@@ -63,8 +63,8 @@ rdb
 
   (def mycommit (jld-commit/db mydb2 {:message "Initial commit"}))
 
-  (def mydb3 (jld-tx/transact (:db-after mycommit)
-                              {"@context" "https://schema.org",
+  (def mydb3 (jld-tx/stage (:db-after mycommit)
+                           {"@context" "https://schema.org",
                                "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
                                             "name"         "The Hitchhiker's Guide to the Galaxy (original)"
                                             "commentCount" 42}]}))
@@ -122,8 +122,8 @@ rdb
 
 
 
-  (def mydb3 (jld-tx/transact mydb2 {"@context" "https://schema.org",
-                                     "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+  (def mydb3 (jld-tx/stage mydb2 {"@context"  "https://schema.org",
+                                     "@graph" [{"@id"          "https://www.wikidata.org/wiki/Q836821"
                                                   "name"         "The Hitchhiker's Guide to the Galaxy (original)"
                                                   "commentCount" 42}]}))
 

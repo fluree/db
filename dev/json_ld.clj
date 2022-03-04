@@ -5,214 +5,112 @@
             [fluree.db.json-ld.flakes :as jld-flakes]
             [fluree.db.json-ld.transact :as jld-tx]
             [clojure.core.async :as async]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.util.async :refer [<?? go-try channel?]]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.constants :as const]))
 
 (comment
 
-  (def thedb (jld-db/blank-db "hello"))
+  (def ipfs-conn (fluree/connect-ipfs
+                   {:server  nil                            ;; use default
+                    :context {"schema" "http://schema.org/"
+                              "wiki"   "https://www.wikidata.org/wiki/"}
+                    :did     {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
+                              :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
+                              :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}}))
 
-  (def thedb2 (commit mydb "Added schema data"))
+  ipfs-conn
 
-  (push thedb2)                                            ;; immutably stored somewhere
-
-
-
-
-  (def mydb (jld-db/blank-db "hello"))
-  (def mydb (jld-tx/transact
-              thedb
-              {"@context"                  "https://schema.org",
-               "@id"                       "https://www.wikidata.org/wiki/Q836821",
-               "@type"                     "Movie",
-               "name"                      "The Hitchhiker's Guide to the Galaxy",
-               "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
-               "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-               "isBasedOn"                 {"@id"    "https://www.wikidata.org/wiki/Q3107329",
-                                            "@type"  "Book",
-                                            "name"   "The Hitchhiker's Guide to the Galaxy",
-                                            "isbn"   "0-330-25864-8",
-                                            "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
-                                                      "@type" "Person"
-                                                      "name"  "Douglas Adams"}}}))
+  (def ledger (fluree/create ipfs-conn "test/db1"))
 
 
-  @(fdb/query mydb {:context {"wiki" "https://www.wikidata.org/wiki/"
-                              "schema" "http://schema.org/"}
-                    :select  ["*", {"isBasedOn" ["*"]}]
-                    :from    "https://www.wikidata.org/wiki/Q836821"})
-
-  (def mydb2 (jld-tx/transact mydb {"@context" "https://schema.org",
-                                    "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
-                                                 "name"         "The Hitchhiker's Guide to the Galaxy (original)"
-                                                 "commentCount" 42}]}))
-
-  (jld-tx/commit mydb)
-  (jld-tx/commit mydb2)
-
-  @(fdb/query mydb2 {:select ["*"]
-                     :from   "https://www.wikidata.org/wiki/Q836821"
-                     })
-
-  (def updated-db (transact orig-db {}))
-  ;; publishing goes to (a) consensus for further publishing, (b) write to local system, (c)
-  (publish updated-db {:context         {:fluree "https://flur.ee/ns/block"}
-                       :id              "some-id-hash?"
-                       :type            [:fluree/FlureeBlock]
-                       :fluree/method   :ipfs
-                       :fluree/snapshot true
-                       :fluree/service  "https://yyyyy"
-                       :fluree/db       updated-db
-                       :ipfs/folder     "x"
-                       :ipfs/name       "mydb"})
-  ;; => cryptographically signing new block
-  ;; => publishing x new transactions
-  ;; => db saved: fluree:ipfs:lkjsdflkjdf/mydb
-  ;; => updated ledger record
-  ;; ===> Consensus multisig achieved
-  ;; ===> ipns/ens/cardano root updated
-  ;; ===> ledger saved: fluree:ipns:xyzlkjsdflkjsdf/mydb
-  ;; ===> Fluree Hub notified
+  ledger
 
 
-  (def conn (ipfs/connect "bafybeiakxvdwbawhfrus6io233dfqr2tkpzuuawi3yxbxbskqapn7zdt3m"))
+  ;; db will contain changes immutably, but link to the main ledger which won't
+  ;; be updated until there is a commit
+  (def db (fluree/stage
+            ledger
+            {"@context"                  "https://schema.org",
+             "@id"                       "https://www.wikidata.org/wiki/Q836821",
+             "@type"                     ["Movie"],
+             "name"                      "The Hitchhiker's Guide to the Galaxy",
+             "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
+             "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+             "isBasedOn"                 {"@id"    "https://www.wikidata.org/wiki/Q3107329",
+                                          "@type"  "Book",
+                                          "name"   "The Hitchhiker's Guide to the Galaxy",
+                                          "isbn"   "0-330-25864-8",
+                                          "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
+                                                    "@type" "Person"
+                                                    "name"  "Douglas Adams"}}}))
 
-  (def ledger (ipfs/new-ledger "ipns:<key>/myledger"))
+  db
 
+  (def db2 (fluree/stage
+             db
+             {"@context" "https://schema.org",
+              "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+                           "name"         "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
+                           "commentCount" 42}]}))
 
-  (def conn (ipfs/connect {}))
-  (def mydb (-> conn
-                (jld-db/blank-db "blah" "hi" (atom {}) (fn [] (throw (Exception. "NO CURRENT DB FN YET"))))
-                (assoc :t 0)))
+  db2
 
-  (def tx-res
-    (jld-tx/transact
-      mydb {"@context"                  "https://schema.org",
-            "@id"                       "https://www.wikidata.org/wiki/Q836821",
-            "@type"                     "Movie",
-            "name"                      "The Hitchhiker's Guide to the Galaxy",
-            "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
-            "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-            "isBasedOn"                 {"@id"    "https://www.wikidata.org/wiki/Q3107329",
-                                         "@type"  "Book",
-                                         "name"   "The Hitchhiker's Guide to the Galaxy",
-                                         "isbn"   "0-330-25864-8",
-                                         "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
-                                                   "@type" "Person"
-                                                   "name"  "Douglas Adams"}}}))
-  (-> tx-res :flakes)
+  (-> db2 )
 
-
-  (def mydb2 (:db-after tx-res))
-  @(fdb/query (async/go mydb2)
-              {:context "https://schema.org/"
-               :select  ["*" {"isBasedOn" ["*"]}]
-               :from    "https://www.wikidata.org/wiki/Q836821"})
-
-  (def tx-res2
-    (jld-tx/transact
-      mydb2 {"@context" "https://schema.org",
-             "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
-                          "name"         "The Hitchhiker's Guide to the Galaxy (original)"
-                          "commentCount" 42}]}))
-
-  (:flakes tx-res2)
-
-  (def mydb3 (:db-after tx-res2))
-  @(fdb/query (async/go mydb3)
-              {:context "https://schema.org/"
-               :select  ["*" {"isBasedOn" ["*"]}]
-               :from    "https://www.wikidata.org/wiki/Q836821"})
+  @(fluree/query db2 {:context {:id           "@id"
+                                :type         "@type"
+                                :schema       "http://schema.org/"
+                                :wiki         "https://www.wikidata.org/wiki/"
+                                :derivedFrom {"@reverse" "http://schema.org/isBasedOn"}}
+                      :select  ["*", {:derivedFrom ["*"]}]
+                      :from    "https://www.wikidata.org/wiki/Q3107329"})
 
 
 
-  (jld-tx/wrap-block tx-res)
 
-  (-> tx-res :db-after :schema :pred (get "https://schema.org/isBasedOn"))
-  (-> tx-res :db-after :novelty :spot)
+  ;; this will update 'ledger'
+  (fluree/commit db2 {:message "First commit contains two transactions!"
+                      :push?   false})
 
-  (get-in schema [:pred (.-p flake) :ref?])
 
-  (def mydb2 (:db-after tx-res))
 
-  (-> mydb2 :novelty :spot)
-  (flake/match-spot (-> mydb2 :novelty :spot)
-                    193514046488576 nil)
+  (def db3 (fluree/stage db2
+                         {"@context" "https://schema.org",
+                          "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+                                       "commentCount" 52}]}))
 
-  @(fdb/query (async/go mydb2)
-              {:context "https://schema.org/"
-               :select  ["*" {"isBasedOn" ["*"]}]
-               :from    "https://www.wikidata.org/wiki/Q836821"})
+  (def db4 (fluree/stage db3
+                         {"@context" "https://schema.org",
+                          "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+                                       "commentCount" 62}]}))
 
-  )
+  (-> db4 :novelty :tspo)
 
-(comment
-  ;; basic micro-ledger db
-  (def tx1 {"@context"                  "https://schema.org",
-            "@id"                       "https://www.wikidata.org/wiki/Q836821",
-            "@type"                     "Movie",
-            "name"                      "The Hitchhiker's Guide to the Galaxy",
-            "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
-            "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-            "isBasedOn"                 {"@id"    "https://www.wikidata.org/wiki/Q3107329",
-                                         "@type"  "Book",
-                                         "name"   "The Hitchhiker's Guide to the Galaxy",
-                                         "isbn"   "0-330-25864-8",
-                                         "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
-                                                   "@type" "Person"
-                                                   "name"  "Douglas Adams"}}})
+  ;; squash last two commits into a single commit
+  (def db4* (fluree/squash db4))
 
-  (def movie-db (ipfs/db "fluree:ipfs:QmWofgUFbvLyqwdmVVKE7K6SQNPrMcigy49cQXYBJm1f2H"))
 
-  (def tx2 {"@context" "https://schema.org",
-            "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
-                         "name"         "The Hitchhiker's Guide to the Galaxy (original)"
-                         "commentCount" 42}]})
+  ;; this will update 'ledger'
+  (fluree/commit db4* {:message "Second commit, should only have one transaction (squashed)"})
 
-  (jld-flakes/json-ld-graph->flakes tx2 {})
+  ;; get latest db, should be = to db4*
+  (def latest-db (fluree/db ledger))
 
-  (jld-db/with moviedb 2 (jld-flakes))
 
-  "owl:minQualifiedCardinality"
+  #_(def config {:context {"schema" "http://schema.org/"
+                           "wiki"   "https://www.wikidata.org/wiki/"}
+                 :did     {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
+                           :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
+                           :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}
+                 :name    "examples/movies"
+                 :write   (ipfs/default-commit-fn nil)      ;; when empty, don't write unless you commit
+                 :read    (ipfs/default-read-fn nil)
+                 :commit  (ipfs/default-push-fn nil)
+                 :push    [(ipfs/default-push-fn nil)]
 
-  "owl:qualifiedCardinality"
-
-  )
-
-(comment
-
-  ;; sample movie
-  (def movie-db (ipfs/db "fluree:ipfs:QmWofgUFbvLyqwdmVVKE7K6SQNPrMcigy49cQXYBJm1f2H"))
-  @(fdb/query movie-db
-              {:context "https://schema.org/"
-               :select  {"?s" ["*" {"isBasedOn" ["*"]}]}
-               :where   [["?s" "a" "Movie"]]})
-
-  )
-
-(comment
-  ;; BLOCK FORMATS
-
-  ;; subject only
-  {"id"      :TODO
-   "tx"      "<>"
-   "prev"    "<>"
-   "t"       1
-   "assert"  [{}]
-   "retract" [{}]}
-
-  {"@context"          ["https://www.w3.org/2018/credentials/v1"
-                        "https://flur.ee/ns/block/v1"]
-   "id"                "http://example.edu/credentials/3732"
-   "type"              ["VerifiableCredential", "FlureeBlock"]
-   "issuer"            {"id"   "did:example:76e12ec712ebc6f1c221ebfeb1f"
-                        "name" "Example Organization"}
-   "issuanceDate"      "2021-01-01T19:23:24Z"
-   "credentialSubject" {"id"      :TODO
-                        "tx"      "<>"
-                        "prev"    "<>"
-                        "t"       1
-                        "assert"  [{}]
-                        "retract" [{}]}
-   "proof"             {}}
+                 })
 
   )

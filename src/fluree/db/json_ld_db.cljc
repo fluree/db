@@ -15,7 +15,9 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.reify :as jld-reify]
-            [fluree.db.conn.memory :as memory-conn])
+            [fluree.db.conn.memory :as memory-conn]
+            [fluree.db.conn.json-ld-proto :as jld-proto]
+            [fluree.db.ledger :as ledger])
   #?(:clj (:import (fluree.db.flake Flake)
                    (java.io Writer))))
 
@@ -360,9 +362,12 @@
 
 ;; ================ end GraphDB record support fns ============================
 
-(defrecord JsonLdDb [conn network dbid block t tt-id stats spot psot post opst tsop
-                     schema settings comparators schema-cache novelty
-                     permissions fork fork-block current-db-fn ecount]
+;; TODO - conn is included here because current index-range query looks for conn on the db
+;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
+(defrecord JsonLdDb [ledger conn method name branch block t tt-id stats
+                     spot psot post opst tsop
+                     schema comparators novelty
+                     permissions ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
@@ -431,39 +436,75 @@
                                :s3   {:access-key ""
                                       :region     ""}}})
 
+(defn create
+  [{:keys [method name conn] :as ledger}]
+  (let [novelty     (new-novelty-map index/default-comparators)
+        permissions {:collection {:all? false}
+                     :predicate  {:all? true}
+                     :root?      true}
+
+        {spot-cmp :spot
+         psot-cmp :psot
+         post-cmp :post
+         opst-cmp :opst
+         tspo-cmp :tspo} index/default-comparators
+
+        spot        (index/empty-branch method name spot-cmp)
+        psot        (index/empty-branch method name psot-cmp)
+        post        (index/empty-branch method name post-cmp)
+        opst        (index/empty-branch method name opst-cmp)
+        tspo        (index/empty-branch method name tspo-cmp)
+        stats       {:flakes 0, :size 0, :indexed 0}
+        schema      (vocab/vocab-map* 0 #{} nil)
+        branch      (ledger/current-branch ledger)
+        db          (->JsonLdDb ledger conn method name branch 0 0 nil stats
+                                spot psot post opst tspo schema
+                                index/default-comparators novelty
+                                permissions genesis-ecount)]
+    db))
+
+
 (defn blank-db
-  ([config]
-   (let [{:keys [context did name push publish]} config
-         db-name    (or name (str (util/random-uuid)))
-         read-only? (nil? push)
-         conn       (memory-conn/connect)]
-     (-> (blank-db conn "ipfs" db-name
+  ([ledger]
+   (let [{:keys [conn name method]} ledger]
+     (create ledger)))
+  ([conn ledger-name]
+   (let [default-context (jld-proto/context conn)
+         default-did     (jld-proto/did conn)]
+     (blank-db conn ledger-name {:did     default-did
+                                 :context default-context})))
+  ([conn ledger-name opts]
+   (let [{:keys [did context]} opts
+         method     (jld-proto/method conn)
+         read-only? (jld-proto/read-only? conn)]
+     (-> (blank-db conn (util/keyword->str method) ledger-name
                    (atom {}) (fn []
                                (throw
                                  (ex-info "This is the earliest version of DB, not way to retrieve newer"
                                           {}))))
-         (assoc :config (-> config
+         (assoc :config (-> conn
                             (assoc :read-only? read-only?)
                             (dissoc :context))
-                :context (when context (json-ld/parse-context context))))))
-  ([method {:keys [context methods did opts iri] :as config}]
-   (let [method*       (keyword method)
-         method-config (or (get methods method*)
-                           (get-in default-config [:methods method])
-                           (throw (ex-info (str "Ledger method identifier has not corresponding configuration: "
-                                                method* ". Configured methods include: "
-                                                (or (keys methods) (keys (:methods default-config))) ".")
-                                           {:status 400 :error :db/invalid-ledger-method})))
-         db-name       (or iri (str (util/random-uuid)))
-         conn          (memory-conn/connect)]
-     (-> (blank-db conn method db-name
-                   (atom {}) (fn []
-                               (throw
-                                 (ex-info "This is the earliest version of DB, not way to retrieve newer"
-                                          {}))))
-         (assoc :method-config method-config
-                :context context
-                :opts (assoc opts :did did)))))
+                :context (when context (json-ld/parse-context context))))
+     ))
+  #_([method {:keys [context methods did opts iri] :as config}]
+     (let [method*       (keyword method)
+           method-config (or (get methods method*)
+                             (get-in default-config [:methods method])
+                             (throw (ex-info (str "Ledger method identifier has not corresponding configuration: "
+                                                  method* ". Configured methods include: "
+                                                  (or (keys methods) (keys (:methods default-config))) ".")
+                                             {:status 400 :error :db/invalid-ledger-method})))
+           db-name       (or iri (str (util/random-uuid)))
+           conn          (memory-conn/connect)]
+       (-> (blank-db conn method db-name
+                     (atom {}) (fn []
+                                 (throw
+                                   (ex-info "This is the earliest version of DB, not way to retrieve newer"
+                                            {}))))
+           (assoc :method-config method-config
+                  :context context
+                  :opts (assoc opts :did did)))))
   ([conn network dbid schema-cache current-db-fn]
    (assert conn "No conn provided when creating new db.")
    (assert network "No network provided when creating new db.")
@@ -500,7 +541,7 @@
 (defn load-db
   ([db-name] (load-db db-name nil))
   ([db-name config]
-   (let [blank-db (blank-db config)]
+   (let [blank-db (blank-db config db-name)]
      (jld-reify/load-db blank-db db-name))))
 
 

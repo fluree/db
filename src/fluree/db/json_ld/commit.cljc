@@ -9,7 +9,10 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.json-ld.normalize :as normalize])
+            [fluree.json-ld.normalize :as normalize]
+            [fluree.db.ledger :as ledger]
+            [fluree.db.conn.json-ld-proto :as jld-proto]
+            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -68,7 +71,15 @@
 
 
 (defn generate-commit
-  [db flakes {:keys [compact-fn id-key type-key context] :as opts}]
+  "Generates assertion and retraction flakes for a given set of flakes
+  which is assumed to be for a single (t) transaction.
+
+  Returns a map of
+  :assert - assertion flakes
+  :retract - retraction flakes
+  :ctx - context that must be included with final context, for refs (@id) values
+  "
+  [db flakes {:keys [compact-fn id-key type-key] :as opts}]
   (let [id->iri (volatile! (jld-ledger/predefined-sids-compact compact-fn))
         ctx     (volatile! {})]
     (loop [[s-flakes & r] (partition-by #(.-s ^Flake %) flakes)
@@ -86,9 +97,9 @@
                                (conj retract (assoc s-retract id-key s-iri))
                                retract)]
           (recur r assert* retract*))
-        {:ctx     (dissoc @ctx type-key)                    ;; @type will be marked as @type: @id, which is implied
-         :assert  assert
-         :retract retract}))))
+        {:refs-ctx (dissoc @ctx type-key)                   ;; @type will be marked as @type: @id, which is implied
+         :assert   assert
+         :retract  retract}))))
 
 
 (defn- did-from-private
@@ -100,25 +111,30 @@
 (defn- commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
   [db opts]
-  (let [{:keys [context branch did private] :as opts*} (merge (:config db) opts)
-        context*      (->> (if context
-                             (conj base-context context)
-                             base-context)
-                           (json-ld/parse-context (:context db)))
+  (let [{:keys [ledger branch]} db
+        {:keys [context did private message]} opts
+        context*      (if context
+                        (json-ld/parse-context (:context ledger) context)
+                        (:context ledger))
+        private*      (or private
+                          (:private did)
+                          (:private (ledger/did ledger)))
+        did*          (or (some-> private*
+                                  did-from-private)
+                          did
+                          (:did ledger))
         ctx-used-atom (atom {})
-        compact-fn    (json-ld/compact-fn context* ctx-used-atom)
-        private*      (or private (:private did))
-        did*          (or (:id did) (some-> private*
-                                            did-from-private))]
-    (assoc opts* :context context*
-                 :did did*
-                 :private private*
-                 :ctx-used-atom ctx-used-atom
-                 :compact-fn compact-fn
-                 :compact (fn [iri] (json-ld/compact iri compact-fn))
-                 :branch (or branch "main")
-                 :id-key (json-ld/compact "@id" compact-fn)
-                 :type-key (json-ld/compact "@type" compact-fn))))
+        compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
+    {:message       message
+     :context       context*
+     :private       private*
+     :did           did*
+     :ctx-used-atom ctx-used-atom
+     :compact-fn    compact-fn
+     :compact       (fn [iri] (json-ld/compact iri compact-fn))
+     :branch        branch
+     :id-key        (json-ld/compact "@id" compact-fn)
+     :type-key      (json-ld/compact "@type" compact-fn)}))
 
 
 (defn- add-commit-hash
@@ -142,6 +158,64 @@
          ",\"" hash-key "\":" hash "}")))
 
 
+
+(defn- tx-doc
+  "Generates a transaction JSON-LD doc for a given 't' value.
+  Does not include a context, a global context for all transactions
+  and commit metadata will be included at the top level of the commit.
+
+  Returns two-tuple of [tx-doc refs-ctx] where tx-doc is the json-ld
+  document (sans context) of the transaction and refs-ctx is context
+  that must be included in the final context which specifies which
+  properties/predicates are @id (ref) values"
+  [{:keys [novelty] :as db} t compact-fn ctx-used-atom]
+  (let [flakes   (->> (:spot novelty)
+                      (filter #(= t (.-t ^Flake %)))
+                      reverse)
+        id-key   (json-ld/compact "@id" compact-fn)
+        type-key (json-ld/compact "@type" compact-fn)
+        {:keys [assert retract refs-ctx]}
+        (generate-commit db flakes {:compact-fn    compact-fn
+                                    :id-key        id-key
+                                    :type-key      type-key
+                                    :ctx-used-atom ctx-used-atom})
+        tx-doc   (cond-> {(compact-fn "https://flur.ee/ns/block/t") (- t)}
+                         (seq assert) (assoc (compact-fn "https://flur.ee/ns/block/assert") assert)
+                         (seq retract) (assoc (compact-fn "https://flur.ee/ns/block/retract") retract))]
+    (when ctx-used-atom
+      (swap! ctx-used-atom (partial merge-with merge) refs-ctx))
+    tx-doc))
+
+(defn commit-doc
+  [{:keys [ledger t] :as db} {:keys [time message context]}]
+  (let [{branch-name   :name
+         branch-t      :t
+         branch-commit :commit} (ledger/branch-meta ledger)
+        ctx-used-atom (atom {})
+        context*      (if context
+                        (json-ld/parse-context (:context ledger) context)
+                        (:context ledger))
+        compact-fn    (json-ld/compact-fn context* ctx-used-atom)
+        t-range       (reverse (range t branch-t))
+        tx-docs       (mapv #(tx-doc db % compact-fn ctx-used-atom) t-range)
+        id-key        (json-ld/compact "@id" compact-fn)
+        type-key      (json-ld/compact "@type" compact-fn)
+        final-ctx     (conj base-context @ctx-used-atom)]
+    (cond-> {"@context"                                         final-ctx
+             type-key                                           [(compact-fn "https://flur.ee/ns/block/Commit")]
+             (compact-fn "https://flur.ee/ns/block/branchName") (util/keyword->str branch-name)
+             (compact-fn "https://flur.ee/ns/block/t")          (- t)
+             (compact-fn "https://flur.ee/ns/block/time")       (util/current-time-iso)
+             (compact-fn "https://flur.ee/ns/block/tx")         tx-docs}
+            ;branch-commit (assoc (compact-fn "https://flur.ee/ns/block/prev") branch-commit)
+            ;ledger-address (assoc (compact-fn "https://flur.ee/ns/block/ledger") ledger-address)
+            message (assoc (compact-fn "https://flur.ee/ns/block/message") message))
+
+    )
+
+  )
+
+
 (defn db
   "Commits a current DB's changes (since last commit) to the storage backend
   defined by the DB.
@@ -149,6 +223,7 @@
   Returns a modified DB with the last commit content-addressable storage location updates"
   [db opts]
   (let [{:keys [t novelty commit]} db
+        _              (log/warn "Commit opts: " (commit-opts db opts))
         {:keys [branch message type-key compact ctx-used-atom private return queue? push publish] :as opts*} (commit-opts db opts)
         ;; TODO - tsop index can get below flakes more efficiently once exists
         flakes         (filter #(= t (.-t ^Flake %)) (:spot novelty))
@@ -201,3 +276,57 @@
     (if return
       (get res return)
       res)))
+
+(defn db2
+  [db opts]
+  (let [{:keys [t novelty commit ledger]} db
+        conn           (:conn ledger)
+        {:keys [message ctx-used-atom type-key branch compact did] :as opts*} (commit-opts db opts)
+        ;; TODO - tsop index can get below flakes more efficiently once exists
+        flakes         (filter #(= t (.-t ^Flake %)) (:spot novelty))
+        {:keys [assert retract refs-ctx]} (generate-commit db (reverse flakes) opts*)
+        final-ctx      (conj base-context (merge-with merge @ctx-used-atom refs-ctx))
+
+        ;; TODO - commits move into ledger state
+        prev-commit    (:id commit)
+        branch-commit  (:branch commit)
+        ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
+                         @(:ledger commit))
+
+        doc            (cond-> {"@context"                                      final-ctx
+                                type-key                                        [(compact "https://flur.ee/ns/block/Commit")]
+                                (compact "https://flur.ee/ns/block/branchName") (util/keyword->str branch)
+                                (compact "https://flur.ee/ns/block/t")          (- t)
+                                (compact "https://flur.ee/ns/block/time")       (util/current-time-iso)}
+                               prev-commit (assoc (compact "https://flur.ee/ns/block/prev") prev-commit)
+                               branch-commit (assoc (compact "https://flur.ee/ns/block/branch") branch-commit)
+                               ledger-address (assoc (compact "https://flur.ee/ns/block/ledger") ledger-address)
+                               message (assoc (compact "https://flur.ee/ns/block/message") message)
+                               (seq assert) (assoc (compact "https://flur.ee/ns/block/assert") assert)
+                               (seq retract) (assoc (compact "https://flur.ee/ns/block/retract") retract))
+        hash-key       (compact "https://flur.ee/ns/block/hash")
+        {:keys [commit hash] :as commit-res} (add-commit-hash doc hash-key)
+        {:keys [credential] :as cred-res} (when did
+                                            (cred/generate commit opts*))
+        commit-json    (if credential
+                         (cred/credential-json cred-res)
+                         (commit-json commit-res hash-key))
+        id             (jld-proto/c-write conn commit-json)
+        publish-p      (jld-proto/push conn id)
+        db*            (assoc db :t t
+                                 :commit {:t      t
+                                          :hash   hash
+                                          :id     id
+                                          :branch (or (:branch commit) id)
+                                          :ledger publish-p})
+        res            {:credential credential
+                        :commit     commit
+                        :json       commit-json
+                        :id         id
+                        :publish    publish-p               ;; promise with eventual result once successful
+                        :hash       hash
+                        :db-before  db
+                        :db-after   db*}]
+    res)
+
+  )

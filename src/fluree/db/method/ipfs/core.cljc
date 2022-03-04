@@ -83,14 +83,14 @@
     @(client/post endpoint req)))
 
 
-(defn ipns-publish
+(defn ipns-push
   "Adds json from clojure data structure"
   [ipfs-server ipfs-cid]
   (let [endpoint (str ipfs-server "api/v0/name/publish?arg=" ipfs-cid)]
     @(client/post endpoint {})))
 
 
-(defn default-push-fn
+(defn default-commit-fn
   "Default push function for IPFS"
   [ipfs-server]
   (let [server (or ipfs-server @default-ipfs-server)]
@@ -104,7 +104,7 @@
         (str "fluree:ipfs:" name)))))
 
 
-(defn default-publish-fn
+(defn default-push-fn
   "Default publish function updates IPNS record based on a
   provided Fluree IPFS database ID, i.e.
   fluree:ipfs:<ipfs cid>
@@ -115,10 +115,10 @@
     (fn [fluree-dbid]
       (let [p (promise)]
         (future
-          (log/info (str "Publishing db " fluree-dbid " to IPNS. (IPNS is slow!)"))
+          (log/info (str "Pushing db " fluree-dbid " to IPNS. (IPNS is slow!)"))
           (let [start-time (System/currentTimeMillis)
                 [_ _ ipfs-cid] (str/split fluree-dbid #":")
-                res        (ipns-publish server ipfs-cid)
+                res        (ipns-push server ipfs-cid)
                 seconds    (quot (- (System/currentTimeMillis) start-time) 1000)
                 body       (json/parse (:body res))
                 name       (:Name body)]
@@ -181,7 +181,7 @@
                               (assoc :t 0))]
            (if (util/exception? block-data)
              (async/put! pc block-data)
-             (let [tx-res   (jld-transact/transact db block-data)
+             (let [tx-res   (jld-transact/stage db block-data)
                    db-after (:db-after tx-res)]
                (async/put! pc db-after))))
          (catch* e (async/put! pc e))))

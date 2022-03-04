@@ -15,8 +15,8 @@
                          :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
                          :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}
                :name    "example"
-               :push    (ipfs/default-push-fn nil)
-               :publish (ipfs/default-publish-fn nil)
+               :push    (ipfs/default-commit-fn nil)
+               :publish (ipfs/default-push-fn nil)
                :read    (ipfs/default-read-fn nil)})
 
   (def loaded-db (jld-db/load-db "fluree:ipns:k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" config))
@@ -29,7 +29,7 @@
   (-> demodb :novelty :spot)
 
   ;; transaction
-  (def demodb2 (jld-tx/transact demodb {"@context"                  "https://schema.org",
+  (def demodb2 (jld-tx/stage demodb {"@context"                     "https://schema.org",
                                         "@id"                       "https://www.wikidata.org/wiki/Q836821",
                                         "@type"                     "Movie",
                                         "name"                      "The Hitchhiker's Guide to the Galaxy",
@@ -54,8 +54,8 @@
       :commit)
 
   ;; another transaction
-  (def demodb3 (jld-tx/transact demodb2
-                                {"@context" "https://schema.org",
+  (def demodb3 (jld-tx/stage demodb2
+                             {"@context" "https://schema.org",
                                  "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
                                               "name"         "BRIAN WAS HERE"
                                               "commentCount" 42}]}))
@@ -79,7 +79,7 @@
                 (assoc :t 0)))
 
   (def tx-res
-    (jld-tx/transact
+    (jld-tx/stage
       mydb {"@context"                  "https://schema.org",
             "@id"                       "https://www.wikidata.org/wiki/Q836821",
             "@type"                     "Movie",
@@ -103,8 +103,8 @@
                :from    "https://www.wikidata.org/wiki/Q836821"})
 
   (def tx-res2
-    (jld-tx/transact (:db-after tx-res)
-                     {"@context" "https://schema.org",
+    (jld-tx/stage (:db-after tx-res)
+                  {"@context" "https://schema.org",
                       "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
                                    "name"         "The Hitchhiker's Guide to the Galaxy (original)"
                                    "commentCount" 42}]}))
@@ -123,7 +123,7 @@
   ;; load up any JSON-LD content into queryable DB
   (def mydb (ipfs/db "fluree:ipfs:QmXVzbXNAe7QZDCmiJXqKLjMq6Tu1rRrYgzGezvJ3qyEbH"))
 
-  (-> (async/<!! mydb) :schema :pred)
+  (-> (async/<!! mydb)  )
 
 
 

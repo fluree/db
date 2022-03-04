@@ -13,7 +13,7 @@
                        :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
                        :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}
              :name    "example"
-             :push    (ipfs/default-push-fn nil)
+             :push    (ipfs/default-commit-fn nil)
              ;:publish (ipfs/default-publish-fn nil)
              :read    (ipfs/default-read-fn nil)})
 
@@ -24,7 +24,7 @@
   (jld-db/blank-db config)
 
   (-> (jld-db/blank-db config)
-      (jld-tx/transact {"@context"                  "https://schema.org",
+      (jld-tx/stage {"@context"                     "https://schema.org",
                         "@id"                       "https://www.wikidata.org/wiki/Q836821",
                         "@type"                     "Movie",
                         "name"                      "HELLO The Hitchhiker's Guide to the Galaxy",
@@ -41,7 +41,7 @@
 
 
   (-> (jld-db/blank-db config)
-      (jld-tx/transact {"@context"                  "https://schema.org",
+      (jld-tx/stage {"@context"                     "https://schema.org",
                         "@id"                       "https://www.wikidata.org/wiki/Q836821",
                         "@type"                     "Movie",
                         "name"                      "HELLO The Hitchhiker's Guide to the Galaxy",

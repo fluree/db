@@ -171,7 +171,7 @@
                                       pc)))))
 
 
-(defn transact
+(defn stage
   [db json-ld]
   (let [db*         (if (string? db)
                       (jlddb/blank-db db)

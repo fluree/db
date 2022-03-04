@@ -4,7 +4,8 @@
             [alphabase.core :as alphabase]
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -78,6 +79,7 @@
 (defn sign
   [credential private-key]
   ;; TODO - this is using a custom proof @type, and it should use EcdsaSecp256k1RecoverySignature2020 which requires RDF normalization
+  (log/warn "SIGN - key, cred: " private-key credential)
   (let [payload-json  (json-ld/normalize-data credential)
         signing-input (signing-input payload-json)
         ;; TODO - we need :base64URL encoding for signature, could update crypto/sign-message to allow configurable return encoding. Currently only returns hex
@@ -98,16 +100,14 @@
 
 
 (defn generate
-  [credentialSubject opts]
-  (let [{:keys [did private]} opts
-        did* (or (:id did)
-                 (str "did:fluree:" (crypto/account-id-from-private private)))]
+  [credentialSubject {:keys [did private] :as opts}]
+  (let []
     (sign
       {"@context"          ["https://www.w3.org/2018/credentials/v1"
                             "https://flur.ee/ns/block"]
        "id"                "blah"
        "type"              ["VerifiableCredential"]
-       "issuer"            did*
+       "issuer"            did
        "issuanceDate"      (util/current-time-iso)
        "credentialSubject" credentialSubject}
       private)))
@@ -136,52 +136,3 @@
                            derived-did ", proof verificationMethod: " proof-did)
                       {:status 403 :error :json-ld/invalid-credential})))
     cred))
-
-
-
-(comment
-
-  (def kp (crypto/generate-key-pair))
-
-  (:private kp)
-
-  (def cred (sign payload (:private kp)))
-  cred
-  (json/parse cred false)
-  (verify cred)
-
-
-  (def payload {"@context"          ["https://www.w3.org/2018/credentials/v1" "https://flur.ee/ns/block"],
-                "id"                "blah",
-                "type"              ["VerifiableCredential" "Commit"],
-                "issuer"            "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
-                "issuanceDate"      "SOMEDATE",
-                "credentialSubject" {"@context" ["https://flur.ee/ns/block"
-                                                 {"id"               "@id",
-                                                  "type"             "@type",
-                                                  "rdfs"             "http://www.w3.org/2000/01/rdf-schema#",
-                                                  "schema"           "http://schema.org/",
-                                                  "wiki"             "https://www.wikidata.org/wiki/",
-                                                  "schema:isBasedOn" {"@type" "@id"},
-                                                  "schema:author"    {"@type" "@id"}}],
-                                     "type"     ["Commit"],
-                                     "branch"   "main",
-                                     "t"        1,
-                                     "message"  "Initial commit",
-                                     "assert"   [{"type" "rdfs:Class", "id" "schema:Movie"}
-                                                 {"type" "rdfs:Class", "id" "schema:Book"}
-                                                 {"type" "rdfs:Class", "id" "schema:Person"}
-                                                 {"schema:isBasedOn"                 "wiki:Q3107329",
-                                                  "schema:titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-                                                  "schema:disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
-                                                  "schema:name"                      "The Hitchhiker's Guide to the Galaxy",
-                                                  "type"                             "schema:Movie",
-                                                  "id"                               "wiki:Q836821"}
-                                                 {"schema:author" "wiki:Q42",
-                                                  "schema:isbn"   "0-330-25864-8",
-                                                  "schema:name"   "The Hitchhiker's Guide to the Galaxy",
-                                                  "type"          "schema:Book",
-                                                  "id"            "wiki:Q3107329"}
-                                                 {"schema:name" "Douglas Adams", "type" "schema:Person", "id" "wiki:Q42"}]},})
-
-  )
