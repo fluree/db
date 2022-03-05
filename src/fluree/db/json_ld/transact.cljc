@@ -152,11 +152,11 @@
                                                  :psot (into psot flakes)
                                                  :post (into post flakes)
                                                  :opst (->> flakes
-                                                            (sort-by #(.-p ^Flake %))
-                                                            (partition-by #(.-p ^Flake %))
+                                                            (sort-by flake/p )
+                                                            (partition-by flake/p)
                                                             (reduce
                                                               (fn [opst* p-flakes]
-                                                                (if (get-in pred-map [(.-p ^Flake (first p-flakes)) :ref?])
+                                                                (if (get-in pred-map [(flake/p (first p-flakes)) :ref?])
                                                                   (into opst* p-flakes)
                                                                   opst*))
                                                               opst))
@@ -189,4 +189,3 @@
         (recur r (into flakes (json-ld-node->flakes node tx-state)))
         (let [db-after (final-db tx-state flakes)]
           db-after)))))
-

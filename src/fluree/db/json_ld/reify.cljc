@@ -1,11 +1,10 @@
 (ns fluree.db.json-ld.reify
   (:require [fluree.json-ld :as json-ld]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.util.log :as log])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.util.log :as log]))
 
 ;; generates a db/ledger from persisted data
 #?(:clj (set! *warn-on-reflection* true))
@@ -127,17 +126,17 @@
   (let [bytes #?(:clj (future (flake/size-bytes flakes))    ;; calculate in separate thread for CLJ
                  :cljs (flake/size-bytes flakes))
         {:keys [spot psot post opst tspo size]} novelty
-        flakes*       (sort-by #(.-p ^Flake %) flakes)
-        vocab-change? (<= (.-s ^Flake (first flakes*)) max-vocab-sid) ;; flakes are sorted, so lowest sid of all flakes will be first
+        flakes*       (sort-by flake/p flakes)
+        vocab-change? (<= (flake/s (first flakes*)) max-vocab-sid) ;; flakes are sorted, so lowest sid of all flakes will be first
         db*           (assoc db :t t
                                 :novelty {:spot (into spot flakes)
                                           :psot (into psot flakes)
                                           :post (into post flakes)
                                           :opst (->> flakes*
-                                                     (partition-by #(.-p ^Flake %))
+                                                     (partition-by flake/p)
                                                      (reduce
                                                        (fn [opst* p-flakes]
-                                                         (let [pid (.-p ^Flake (first p-flakes))]
+                                                         (let [pid (flake/p (first p-flakes))]
                                                            (if (or (refs pid) ;; refs is a set of ref pids processed in this commit
                                                                    (get-in db [:schema :pred pid :ref?]))
                                                              (into opst* p-flakes)
