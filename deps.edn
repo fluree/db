@@ -1,5 +1,5 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.10.3"}
-         org.clojure/clojurescript       {:mvn/version "1.10.914"}
+         org.clojure/clojurescript       {:mvn/version "1.11.4"}
          org.clojure/core.async          {:mvn/version "1.5.648"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
@@ -15,7 +15,7 @@
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
          logback-bundle/core-bundle      {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api             {:mvn/version "1.7.35"}
+         org.slf4j/slf4j-api             {:mvn/version "1.7.36"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -34,7 +34,7 @@
          com.fluree/alphabase            {:mvn/version "3.2.2"}
 
          ;; cryptography
-         com.fluree/crypto               {:mvn/version "0.3.7"}
+         com.fluree/crypto               {:mvn/version "0.3.8"}
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}}
 
  :paths ["src" "resources"]
@@ -65,7 +65,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.60.977"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.63.998"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -124,7 +124,7 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.2.2"}}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.2.3"}}
    ;; Remove the exclude-linter for :def-in-def below
    ;; when the SCI smartfunctions runner lands. It's
    ;; only there for the `defn` inside
@@ -141,5 +141,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.01.15"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.02.09"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}

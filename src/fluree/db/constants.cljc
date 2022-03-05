@@ -131,6 +131,7 @@
 (def ^:const $_tx:sig 107)
 (def ^:const $_tx:tempids 108)
 (def ^:const $_tx:error 109)
+(def ^:const $_tx:signed 130)
 
 (def ^:const $_setting:anonymous 110)
 (def ^:const $_setting:ledgers 111)

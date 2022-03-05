@@ -50,35 +50,35 @@
 
 
 
-(defn sign
+(defn ^:deprecated sign
   "DEPRECATED: use fluree.db.api.auth/sign instead."
   [message private-key]
   (log/warn "sign DEPRECATED - use fluree.db.api.auth/sign instead")
   (auth-api/sign message private-key))
 
 
-(defn public-key-from-private
+(defn ^:deprecated public-key-from-private
   "DEPRECATED: use fluree.db.api.auth/public-key-from-private instead."
   [private-key]
   (log/warn "public-key-from-private DEPRECATED - use fluree.db.api.auth/public-key-from-private instead")
   (auth-api/public-key-from-private private-key))
 
 
-(defn public-key
+(defn ^:deprecated public-key
   "DEPRECATED: use fluree.db.api.auth/public-key instead."
   [message signature]
   (log/warn "public-key DEPRECATED - use fluree.db.api.auth/public-key instead")
   (auth-api/public-key message signature))
 
 
-(defn new-private-key
+(defn ^:deprecated new-private-key
   "DEPRECATED: use fluree.db.api.auth/new-private-key instead."
   []
   (log/warn "new-private-key DEPRECATED - use fluree.db.api.auth/new-private-key instead")
   (auth-api/new-private-key))
 
 
-(defn set-default-key-async
+(defn ^:deprecated set-default-key-async
   "DEPRECATED: use fluree.db.api.auth/set-default-key-async instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
@@ -87,7 +87,7 @@
    (log/warn "set-default-key-async DEPRECATED - use fluree.db.api.auth/set-default-key-async instead")
    (auth-api/set-default-key-async conn network dbid private-key opts)))
 
-(defn set-default-key
+(defn ^:deprecated set-default-key
   "DEPRECATED: use fluree.db.api.auth/set-default-key instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
@@ -131,9 +131,12 @@
    (let [db-name     (if (sequential? ledger)
                        (str (first ledger) "/" (second ledger))
                        ledger)
-         {:keys [auth expire nonce deps]} opts
-         _           (when deps (assert (sequential? deps) "Command/transaction 'deps', when provided, must be a sequential list/array."))
+         {:keys [auth verified-auth expire nonce deps]} opts
+         _           (when deps
+                       (assert (sequential? deps)
+                               "Command/transaction 'deps', when provided, must be a sequential list/array."))
          key-auth-id (crypto/account-id-from-private private-key)
+         _           (when verified-auth (log/debug "Using verified auth:" (:auth verified-auth)))
          [auth authority] (cond
                             (and auth (not= auth key-auth-id))
                             [auth key-auth-id]
@@ -145,13 +148,13 @@
                             [key-auth-id nil])
          timestamp   (System/currentTimeMillis)
          nonce       (or nonce timestamp)
-         expire      (or expire (+ timestamp 300000)) ;; 5 min default
+         expire      (or expire (+ timestamp 300000))       ; 5 min default
          cmd         (try (-> {:type      :tx
                                :db        db-name
                                :tx        txn
                                :nonce     nonce
-                               :auth      auth
-                               :authority authority
+                               :auth      (or (:auth verified-auth) auth)
+                               :authority (when-not verified-auth authority)
                                :expire    expire
                                :deps      deps}
                               (util/without-nils)
@@ -159,12 +162,17 @@
                           (catch Exception _
                             (throw (ex-info (str "Transaction contains data that cannot be serialized into JSON.")
                                             {:status 400 :error :db/invalid-tx}))))
-         sig         (crypto/sign-message cmd private-key)
-         id          (crypto/sha3-256 cmd)]
-     {:cmd cmd
-      :sig sig
-      :id  id
-      :db  ledger})))
+         sig         (if verified-auth
+                       (:signature verified-auth)
+                       (crypto/sign-message cmd private-key))
+         id          (crypto/sha3-256 cmd)
+         command     {:cmd    cmd
+                      :sig    sig
+                      :signed (:signed verified-auth)
+                      :id     id
+                      :db     ledger}]
+     (log/trace "tx->command result:" command)
+     command)))
 
 
 (defn monitor-tx-async
@@ -183,7 +191,7 @@
     ;; when we get a result, just put the result on the pending resp-chan
     (session/monitor-tx session tid key #(async/put! resp-chan %))
     ;; if timeout returns first, un-register the callback function to clean up and close channel by returning nil
-    (async/go
+    (go
       (let [[res chan] (async/alts! [resp-chan timeout-chan])]
         (if (= timeout-chan chan)
           (do
@@ -263,10 +271,10 @@
   "
   ([conn ledger] (new-ledger-async conn ledger nil))
   ([conn ledger opts]
-   (try (let [invalid-ledger-name? (fn [ledger-id type]
-                                     (when-not (re-matches #"^[a-z0-9-]{1,100}" ledger-id)
-                                       (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
-                                                       {:status 400 :error :db/invalid-db}))))
+   (try (let [validate-ledger-name! (fn [ledger-id type]
+                                      (when-not (re-matches #"^[a-z0-9-]{1,100}" ledger-id)
+                                        (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
+                                                        {:status 400 :error :db/invalid-db}))))
               {:keys [alias auth doc fork forkBlock expire nonce private-key timeout
                       snapshot snapshotBlock copy copyBlock owners]
                :or   {timeout 60000}} opts
@@ -274,11 +282,11 @@
               ledger-id            (if (str/starts-with? ledger-id "$")
                                      (subs ledger-id 1)
                                      ledger-id)
-              _                    (invalid-ledger-name? ledger-id "ledger")
-              _                    (invalid-ledger-name? network "network")
+              _                    (validate-ledger-name! ledger-id "ledger")
+              _                    (validate-ledger-name! network "network")
               [network-alias ledger-alias] (when alias
                                              (graphdb/validate-ledger-ident ledger))
-              _                    (when alias (invalid-ledger-name? ledger-alias "alias"))
+              _                    (when alias (validate-ledger-name! ledger-alias "alias"))
               alias*               (when alias (str network-alias "/" ledger-alias))
               timestamp            (System/currentTimeMillis)
               nonce                (or nonce timestamp)
@@ -297,6 +305,7 @@
                                     :nonce         nonce
                                     :expire        expire
                                     :owners        (not-empty owners)}]
+          (log/debug "Creating new ledger" ledger "with owners:" owners)
           (if private-key
             (let [cmd (-> cmd-data
                           (util/without-nils)
@@ -421,7 +430,7 @@
              [{:_id "_user" :username "2"}]
              [{:_id "_user" :username "3"}]])
 
-  (async/<!! (multi-txns-async conn ledger txns {:private-key pk})))
+  (<!! (multi-txns-async conn ledger txns {:private-key pk})))
 
 
 (defn transact-async
@@ -434,24 +443,29 @@
   provided the ledger group has a default private key available for signing.
 
   Options (opts) is a map with the following possible keys:
-  - private-key - The private key to use for signing. If not present, a default
-                  private key will attempt to be used from the connection, if available.
-  - auth        - The auth id for the auth record being used. The private key must
-                  correspond to this auth record, or an authority of this auth record.
-  - expire      - When this transaction should expire if not yet attempted.
-                  Defaults to 5 minutes.
-  - nonce       - Any long/64-bit integer value that will make this transaction unique.
-                  By default epoch milliseconds is used.
-  - deps        - List of one or more txids that must be successfully processed before
-                  this tx is processed. If any fail, this tx will fail. (not yet implemented)
-  - txid-only   - Boolean (default of false). If true, will not wait for a response to the tx,
-                  but instead return with the txid once it is successfully persisted by the
-                  transactors. The txid can be used to look up/monitor the response at a later time.
-  - timeout     - will respond with an exception if timeout reached before response available."
+  - private-key   - The private key to use for signing. If not present, a default
+                    private key will attempt to be used from the connection, if available.
+  - auth          - The auth id for the auth record being used. The private key must
+                    correspond to this auth record, or an authority of this auth record.
+  - verified-auth - A map of {:auth auth-id, :signed signed-string, :signature sig}
+                    for the auth record being used if it was derived from a signature on
+                    the original request signed with a valid private key that we don't
+                    have access to (e.g. a valid HTTP signature request).
+  - expire        - When this transaction should expire if not yet attempted.
+                    Defaults to 5 minutes.
+  - nonce         - Any long/64-bit integer value that will make this transaction unique.
+                    By default epoch milliseconds is used.
+  - deps          - List of one or more txids that must be successfully processed before
+                    this tx is processed. If any fail, this tx will fail. (not yet implemented)
+  - txid-only     - Boolean (default of false). If true, will not wait for a response to the tx,
+                    but instead return with the txid once it is successfully persisted by the
+                    transactors. The txid can be used to look up/monitor the response at a later time.
+  - timeout       - will respond with an exception if timeout reached before response available."
   ([conn ledger txn] (transact-async conn ledger txn nil))
   ([conn ledger txn opts]
    (go-try
-     (let [{:keys [private-key txid-only timeout auth nonce deps expire]
+     (let [{:keys [private-key txid-only timeout auth verified-auth nonce deps
+                   expire]
             :or   {timeout 60000
                    nonce   (System/currentTimeMillis)}} opts]
        (if private-key
@@ -465,12 +479,13 @@
            result)
          ;; no private key provided, request ledger to sign request
          (let [tx-map (util/without-nils
-                        {:db     ledger
-                         :tx     txn
-                         :auth   auth
-                         :nonce  nonce
-                         :deps   deps
-                         :expire expire})
+                        {:db            ledger
+                         :tx            txn
+                         :auth          auth
+                         :verified-auth verified-auth
+                         :nonce         nonce
+                         :deps          deps
+                         :expire        expire})
                ;; will received txid once transaction is persisted, else an error
                txid   (<? (ops/transact-async conn tx-map))
                result (if txid-only
@@ -484,8 +499,11 @@
   ([conn ledger txn] (transact conn ledger txn nil))
   ([conn ledger txn opts]
    (let [p (promise)]
-     (async/go
-       (deliver p (async/<! (transact-async conn ledger txn opts))))
+     (go
+       (try
+         (deliver p (<? (transact-async conn ledger txn opts)))
+         (catch Exception e
+           (deliver p e))))
      p)))
 
 
@@ -494,9 +512,9 @@
   Returns nil if collection doesn't exist."
   [db collection]
   (let [p (promise)]
-    (async/go
+    (go
       (try
-        (deliver p (dbproto/-c-prop (<? db) :partition collection))
+        (deliver p (dbproto/-c-prop (<! db) :partition collection))
         (catch Exception e
           (deliver p e))))
     p))
@@ -507,18 +525,19 @@
   If predicate doesn't exist, returns nil."
   [db predicate]
   (let [p (promise)]
-    (async/go
+    (go
       (try
-        (deliver p (dbproto/-p-prop (<? db) :id predicate))
+        (deliver p (dbproto/-p-prop (<! db) :id predicate))
         (catch Exception e
           (deliver p e))))
     p))
+
 
 (defn predicate-name
   "Returns promise containing predicate name given predicate id."
   [db predicate-name]
   (let [p (promise)]
-    (async/go
+    (go
       (try
         (deliver p (dbproto/-p-prop (<? db) :name predicate-name))
         (catch Exception e
@@ -530,7 +549,7 @@
   "Like subid, but returns a core async promise channel instead of a promise."
   [db ident]
   (let [pc (async/promise-chan)]
-    (async/go
+    (go
       (try
         (async/put! pc (<? (dbproto/-subid (<? db) ident false)))
         (catch Exception e
@@ -543,7 +562,7 @@
   If subject doesn't exist, returns nil."
   [db ident]
   (let [p (promise)]
-    (async/go
+    (go
       (try
         (deliver p (<? (dbproto/-subid (<? db) ident false)))
         (catch Exception e
@@ -555,7 +574,7 @@
   "Performs a search for matching flakes, returns a core async promise channel."
   [db flake-parts]
   (let [pc (async/promise-chan)]
-    (async/go
+    (go
       (try
         (async/put! pc (dbproto/-search (<? db) flake-parts))
         (catch Exception e
@@ -567,7 +586,7 @@
   "Returns a promise containing search results of flake parts (fparts)."
   [db flake-parts]
   (let [p (promise)]
-    (async/go
+    (go
       (try
         (deliver p (<? (dbproto/-search (<? db) flake-parts)))
         (catch Exception e
@@ -620,7 +639,7 @@
   "Returns a core async channel of blocks from start block (inclusive) to end if provided (exclusive).
    Each block is a separate map, containing keys :block, :t, :flakes and :txn"
   [conn ledger block-map]
-  (async/go
+  (go-try
     (let [[network ledger-id] (session/resolve-ledger conn ledger)
           {:keys [start end opts]} block-map
           auth-id   (:auth opts)
@@ -645,8 +664,11 @@
   Returns promise with result."
   [sources query-map]
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (query-api/query-async sources query-map))))
+    (go
+      (try
+        (deliver p (<? (query-api/query-async sources query-map)))
+        (catch Exception e
+          (deliver p e))))
     p))
 
 (defn query-with-async
@@ -657,9 +679,8 @@
     (let [{:keys [query flakes]} param
           flakes' (map flake/parts->Flake flakes)
           db      (<? sources)
-          db-with (dbproto/-forward-time-travel db flakes')
-          res     (<? (query-async db-with (assoc-in query [:opts :meta] true)))]
-      res)))
+          db-with (dbproto/-forward-time-travel db flakes')]
+      (<? (query-async db-with (assoc-in query [:opts :meta] true))))))
 
 
 (defn format-block-resp-pretty
@@ -667,39 +688,30 @@
   [db curr-block cache fuel]
   (go-try
     (let [[asserted-subjects
-           retracted-subjects]
-          (loop [[^Flake flake & r] (:flakes curr-block)
-                 asserted-subjects  {}
-                 retracted-subjects {}]
-            (if-not flake
-              [asserted-subjects retracted-subjects]
-              (let [subject   (.-s flake)
-                    asserted? (true? (.-op flake))
-                    flake'    (if asserted? flake
-                                           (flake/flip-flake flake))]
-                (if asserted?
-                  (recur r (update asserted-subjects subject #(vec (conj % flake')))
-                         retracted-subjects)
-                  (recur r asserted-subjects
-                         (update retracted-subjects subject #(vec (conj % flake'))))))))
+           retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
+                                      asserted-subjects  {}
+                                      retracted-subjects {}]
+                                 (if-not flake
+                                   [asserted-subjects retracted-subjects]
+                                   (let [subject   (.-s flake)
+                                         asserted? (true? (.-op flake))
+                                         flake'    (if asserted? flake
+                                                                 (flake/flip-flake flake))]
+                                     (if asserted?
+                                       (recur r (update asserted-subjects subject #(vec (conj % flake')))
+                                              retracted-subjects)
+                                       (recur r asserted-subjects
+                                              (update retracted-subjects subject #(vec (conj % flake'))))))))
           retracted (loop [[subject & r] (vals retracted-subjects)
                            acc []]
                       (if-not subject
                         acc
-                        (recur r (conj acc
-                                       (<? (fql/flakes->res
-                                             db cache fuel 1000000
-                                             {:wildcard? true, :select {}}
-                                             subject))))))
-          asserted (loop [[subject & r] (vals asserted-subjects)
-                          acc []]
-                     (if-not subject
-                       acc
-                       (recur r (conj acc
-                                      (<? (fql/flakes->res
-                                            db cache fuel 1000000
-                                            {:wildcard? true, :select {}}
-                                            subject))))))]
+                        (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
+          asserted  (loop [[subject & r] (vals asserted-subjects)
+                           acc []]
+                      (if-not subject
+                        acc
+                        (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
       {:block     (:block curr-block)
        :t         (:t curr-block)
        :retracted retracted
@@ -709,21 +721,22 @@
 (defn format-blocks-resp-pretty
   "INTERNAL USE ONLY"
   [db resp]
-  (async/go-loop [fuel (volatile! 0)
-                  cache (volatile! {})
-                  curr-block (first resp)
-                  rest-blocks (rest resp)
-                  acc []]
-    (let [curr-block' (<? (format-block-resp-pretty db curr-block cache fuel))
-          acc'        (concat acc [curr-block'])]
-      (if (first rest-blocks)
-        (recur fuel cache (first rest-blocks) (rest rest-blocks) acc')
-        acc'))))
+  (go-try
+    (loop [fuel        (volatile! 0)
+           cache       (volatile! {})
+           curr-block  (first resp)
+           rest-blocks (rest resp)
+           acc         []]
+      (let [curr-block' (<? (format-block-resp-pretty db curr-block cache fuel))
+            acc'        (concat acc [curr-block'])]
+        (if (first rest-blocks)
+          (recur fuel cache (first rest-blocks) (rest rest-blocks) acc')
+          acc')))))
 
 (defn min-safe
   "INTERNAL USE ONLY"
   [& args]
-  (->> (remove nil? args) (apply min)))
+  (->> args (remove nil?) (apply min)))
 
 (defn auth-match
   "INTERNAL USE ONLY"
@@ -735,37 +748,41 @@
 (defn format-history-resp
   "INTERNAL USE ONLY"
   [db resp auth show-auth]
-  (go-try (let [ts    (-> (map #(.-t ^Flake %) resp) set)
-                t-map (<? (async/go-loop [[t & r] ts
-                                          acc {}]
-                            (if t
-                              (let [block (<? (time-travel/non-border-t-to-block db t))
-                                    acc*  (cond-> (assoc-in acc [t :block] block)
-                                                  (or auth show-auth) (assoc-in [t :auth]
-                                                                                (<? (query-async
-                                                                                      (go-try db)
-                                                                                      {:selectOne ["?auth" "?id"],
-                                                                                       :where     [[t, "_tx/auth", "?auth"],
-                                                                                                   ["?auth", "_auth/id", "?id"]]}))))]
-                                (recur r acc*)) acc)))
-                resp  (-> (loop [[^Flake flake & r] resp
-                                 acc {}]
-                            (cond (and flake auth
-                                       (not (auth-match auth t-map flake)))
-                                  (recur r acc)
+  (go-try
+    (let [ts    (set (map #(.-t ^Flake %) resp))
+          t-map (<? (async/go-loop [[t & r] ts
+                                    acc {}]
+                      (if t
+                        (let [block (<? (time-travel/non-border-t-to-block db t))
+                              acc*  (cond-> (assoc-in acc [t :block] block)
 
-                                  flake
-                                  (let [t   (.-t flake)
-                                        {:keys [block auth]} (get t-map t)
-                                        acc (cond-> acc
-                                                    true (assoc-in [block :block] block)
-                                                    true (update-in [block :flakes] conj flake)
-                                                    true (update-in [block :t] min-safe t)
-                                                    show-auth (assoc-in [block :auth] auth))]
-                                    (recur r acc))
+                                            (or auth show-auth)
+                                            (assoc-in [t :auth]
+                                                      (<? (query-async
+                                                            (go-try db)
+                                                            {:selectOne ["?auth" "?id"],
+                                                             :where     [[t, "_tx/auth", "?auth"],
+                                                                         ["?auth", "_auth/id", "?id"]]}))))]
+                          (recur r acc*)) acc)))]
+      (vals (loop [[^Flake flake & r] resp
+                   acc {}]
+              (cond
+                (and flake auth
+                     (not (auth-match auth t-map flake)))
+                (recur r acc)
 
-                                  :else
-                                  acc)) vals)] resp)))
+                flake
+                (let [t   (.-t flake)
+                      {:keys [block auth]} (get t-map t)
+                      acc (cond-> acc
+                                  true (assoc-in [block :block] block)
+                                  true (update-in [block :flakes] conj flake)
+                                  true (update-in [block :t] min-safe t)
+                                  show-auth (assoc-in [block :auth] auth))]
+                  (recur r acc))
+
+                :else
+                acc))))))
 
 (defn resolve-block-range
   [db query-map]
@@ -784,8 +801,11 @@
   Can also specify `:pretty-print` `true` in the query map to receive the flakes as a map with predicate names."
   [conn ledger query-map]
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (block-query-async conn ledger query-map))))
+    (go
+      (try
+        (deliver p (<? (block-query-async conn ledger query-map)))
+        (catch Exception e
+          (deliver p e))))
     p))
 
 (defn get-history-pattern
@@ -835,8 +855,11 @@
   Can also specify `:pretty-print` `true` in the query map to receive the history as a map with predicate names instead of raw flakes."
   [sources query-map]
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (query-api/history-query-async sources query-map))))
+    (go
+      (try
+        (deliver p (<? (query-api/history-query-async sources query-map)))
+        (catch Exception e
+          (deliver p e))))
     p))
 
 
@@ -894,8 +917,11 @@
   Returns a promise of the result."
   [sources multi-query-map]
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (multi-query-async sources multi-query-map))))
+    (go
+      (try
+        (deliver p (<? (multi-query-async sources multi-query-map)))
+        (catch Exception e
+          (deliver p e))))
     p))
 
 (defn graphql-async
@@ -944,8 +970,11 @@
   - opts - optional map of options (same as flureeQL :opts map), however not all options would be relevant for graphql"
   [conn db-name query-map]
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (graphql-async conn db-name query-map))))
+    (go
+      (try
+        (deliver p (<? (graphql-async conn db-name query-map)))
+        (catch Exception e
+          (deliver p e))))
     p))
 
 (defn sql-async
@@ -956,7 +985,7 @@
    (-> sql-str
        sql/parse
        (update :opts merge opts)
-       (as-> q (query-async db q)))))
+       (->> (query-async db)))))
 
 (defn sql
   "Execute an SQL query against a specified database. Returns the a promise of the query results."
@@ -964,8 +993,11 @@
    (sql db sql-str {}))
   ([db sql-str opts]
    (let [p (promise)]
-     (async/go
-       (deliver p (async/<! (sql-async db sql-str opts))))
+     (go
+       (try
+         (deliver p (<? (sql-async db sql-str opts)))
+         (catch Exception e
+           (deliver p e))))
      p)))
 
 (defn sparql-async
@@ -983,8 +1015,11 @@
    (sparql db sparql-str {}))
   ([db sparql-str opts]
    (let [p (promise)]
-     (async/go
-       (deliver p (async/<! (sparql-async db sparql-str opts))))
+     (go
+       (try
+         (deliver p (<? (sparql-async db sparql-str opts)))
+         (catch Exception e
+           (deliver p e))))
      p)))
 
 
@@ -1037,14 +1072,15 @@
   "Returns a channel with queryable database value from the given block number."
   [conn ledger block every-n-sec]
   (let [db-chan (async/promise-chan)]
-    (go-try (loop [n 1]
-              (let [root-db  (<? (session/db conn ledger nil))
-                    db-block (:block root-db)
-                    done?    (>= db-block block)]
-                (if done?
-                  (async/put! db-chan root-db)
-                  (do (<? (async/timeout (* every-n-sec 1000)))
-                      (recur (inc n)))))))
+    (go-try
+      (loop [n 1]
+        (let [root-db  (<? (session/db conn ledger nil))
+              db-block (:block root-db)
+              done?    (>= db-block block)]
+          (if done?
+            (async/put! db-chan root-db)
+            (do (<? (async/timeout (* every-n-sec 1000)))
+                (recur (inc n)))))))
     db-chan))
 
 
@@ -1112,7 +1148,7 @@
   :retracted key containing maps of data organized by subject
   and containing full predicate names."
   [conn ledger block-event]
-  (let [db     (async/<!! (db conn ledger))
+  (let [db     (<!! (db conn ledger))
         {add true retract false} (group-by #(nth % 4) (:flakes block-event))
         to-map (fn [flakes]
                  (let [by-subj (group-by first flakes)]
@@ -1146,9 +1182,13 @@
   If ledger doesn't exist, will return an empty map."
   [conn ledger]
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (ops/ledger-info-async conn ledger))))
+    (go
+      (try
+        (deliver p (<? (ops/ledger-info-async conn ledger)))
+        (catch Exception e
+          (deliver p e))))
     p))
+
 
 (defn ledger-list-async
   "Returns a list of ledgers the connected server is currently serving.
@@ -1161,12 +1201,15 @@
   "Returns promise with a list of ledgers the connected server is currently serving."
   [conn]
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (ops/ledgers-async conn))))
+    (go
+      (try
+        (deliver p (<? (ops/ledgers-async conn)))
+        (catch Exception e
+          (deliver p e))))
     p))
 
 
-(defn ledger-stats-async
+(defn ^:deprecated ledger-stats-async
   "DEPRECATED: use `ledger-info-async` instead.
 
   Returns core async promise channel with ledger info, including db size and # of flakes.
@@ -1176,7 +1219,7 @@
   (ops/ledger-stats-async conn ledger))
 
 
-(defn ledger-stats
+(defn ^:deprecated ledger-stats
   "DEPRECATED: use `ledger-info` instead.
 
   Returns promise with ledger info, including db size and # of flakes.
@@ -1184,8 +1227,11 @@
   [conn ledger]
   (log/warn "ledger-stats DEPRECATED: use ledger-info instead.")
   (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (ops/ledger-stats-async conn ledger))))
+    (go
+      (try
+        (deliver p (<? (ops/ledger-stats-async conn ledger)))
+        (catch Exception e
+          (deliver p e))))
     p))
 
 
@@ -1246,10 +1292,12 @@
   already local."
   [conn ledger]
   (let [p (promise)]
-    (async/go
-      (let [latest-db (async/<! (db conn ledger))
-            t         (:t latest-db)]
-        (deliver p t)))
+    (go
+      (->> ledger
+           (db conn)
+           <!
+           :t
+           (deliver p)))
     p))
 
 
@@ -1258,8 +1306,9 @@
   will return the underlying ledger's t value as of that time value."
   [db block-or-t-or-time]
   (let [p (promise)]
-    (async/go
-      (->> (ledger-api/to-t db block-or-t-or-time)
-           async/<!
+    (go
+      (->> block-or-t-or-time
+           (ledger-api/to-t db)
+           <!
            (deliver p)))
     p))
