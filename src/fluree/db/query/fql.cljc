@@ -179,7 +179,7 @@
      (let [compact?   (:compact? pred-spec)                 ;retain original value
            pred-spec  (if (and (:wildcard? pred-spec) (nil? (:as pred-spec)))
                         ;; nested 'refs' can be wildcard, but also have a pred-spec... so only get a default wildcard spec if we have no other spec
-                        (wildcard-pred-spec db cache (-> flakes first :p) context compact?)
+                        (wildcard-pred-spec db cache (-> flakes first flake/p) context compact?)
                         pred-spec)
            pred-spec' (cond-> pred-spec
                               (not (contains? pred-spec :componentFollow?)) (assoc :componentFollow? componentFollow?)
@@ -205,7 +205,7 @@
                                 ;; have a sub-selection
                                 (and (not recur?)
                                      (or (:select pred-spec') (:wildcard? pred-spec')))
-                                (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select])]
+                                (let [nested-select-spec (select-keys pred-spec' [:wildcard? :compact? :select :context])]
                                   [(loop [[flake & r] flakes
                                           acc []]
                                      (if flake
@@ -321,7 +321,7 @@
 
                              :else
                              (let [sub-flakes    (<? (query-range/index-range db :spot = [sid]))
-                                   sub-pred-spec (select-keys pred-spec [:wildcard? :compact? :select :limit])
+                                   sub-pred-spec (select-keys pred-spec [:wildcard? :compact? :select :limit :context])
                                    acc'*         (if (empty? sub-flakes)
                                                    acc'
                                                    (do
@@ -342,16 +342,19 @@
         (or (:component? pred-spec) (:wildcard? select-spec))
         true))
 
-
+;; TODO - this looks like only purpose is to propogate :componentFollow? setting into nested selects
+;; TODO - not only do we not have :componentFollow? in JSON-LD (as of now), but this could be handled
+;; TODO - via parsing up-front
 (defn select-spec->reverse-pred-specs
-  [select-spec]
-  (reduce (fn [acc spec]
-            (let [key-spec (key spec)
-                  val-spec (if (nil? (:componentFollow? (val spec)))
-                             (assoc (val spec) :componentFollow? (:componentFollow? select-spec))
-                             (val spec))]
-              (assoc acc key-spec val-spec)))
-          {} (get-in select-spec [:select :reverse])))
+  [{:keys [componentFollow?] :as select-spec}]
+  (let [defaulted? (true? componentFollow?)]
+    (cond->> (get-in select-spec [:select :reverse])
+             defaulted? (reduce-kv (fn [acc pid {:keys [componentFollow?] :as pred-spec}]
+                                     (let [pred-spec* (if (nil? componentFollow?)
+                                                        (assoc pred-spec :componentFollow? (:componentFollow? select-spec))
+                                                        pred-spec)]
+                                       (assoc acc pid pred-spec*)))
+                                   {}))))
 
 
 (defn- conjv
@@ -395,7 +398,7 @@
             (cond (empty? acc) results
                   multi? (assoc results as acc)
                   :else (assoc results as (first acc)))
-            (let [recur-subject (flake/o flake)                 ;; ref, so recur subject is the object of the incoming flake
+            (let [recur-subject (flake/o flake)             ;; ref, so recur subject is the object of the incoming flake
                   seen?         (contains? recur-seen recur-subject) ;; subject has been seen before, stop recursion
 
                   sub-flakes    (cond->> (<? (query-range/index-range db :spot = [recur-subject]))
@@ -432,33 +435,33 @@
                                      (<?)
                                      (merge base-acc))
                                 base-acc)
-            result            (loop [p-flakes   (partition-by :p flakes)
+            result            (loop [p-flakes   (partition-by flake/p flakes)
                                      acc        acc+refs
                                      offset-map {}]
                                 (if (empty? p-flakes)
                                   acc
                                   (let [flakes           (first p-flakes)
-                                        pred-spec        (get-in select-spec [:select :pred-id (-> flakes first :p)])
+                                        pred-spec        (get-in select-spec [:select :pred-id (-> flakes first flake/p)])
                                         componentFollow? (component-follow? pred-spec select-spec)
                                         [acc* flakes' offset-map'] (cond
-                                                                    (:recur pred-spec)
-                                                                    [(<? (flake->recur db flakes pred-spec acc fuel max-fuel cache))
-                                                                     (rest p-flakes) offset-map]
+                                                                     (:recur pred-spec)
+                                                                     [(<? (flake->recur db flakes pred-spec acc fuel max-fuel cache))
+                                                                      (rest p-flakes) offset-map]
 
-                                                                    pred-spec
-                                                                    (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec flakes componentFollow? false offset-map))]
-                                                                      [acc (rest p-flakes) offset-map])
+                                                                     pred-spec
+                                                                     (let [[acc offset-map] (<? (add-pred db cache fuel max-fuel acc pred-spec flakes componentFollow? false offset-map))]
+                                                                       [acc (rest p-flakes) offset-map])
 
-                                                                    (:wildcard? select-spec)
-                                                                    [(first (<? (add-pred db cache fuel max-fuel acc select-spec flakes componentFollow? false)))
-                                                                     (rest p-flakes)
-                                                                     offset-map]
+                                                                     (:wildcard? select-spec)
+                                                                     [(first (<? (add-pred db cache fuel max-fuel acc select-spec flakes componentFollow? false)))
+                                                                      (rest p-flakes)
+                                                                      offset-map]
 
-                                                                    (and (empty? (:select select-spec)) (:id? select-spec))
-                                                                    [{:_id (-> flakes first :s)} (rest p-flakes) offset-map]
+                                                                     (and (empty? (:select select-spec)) (:id? select-spec))
+                                                                     [{:_id (-> flakes first flake/s)} (rest p-flakes) offset-map]
 
-                                                                    :else
-                                                                    [acc (rest p-flakes) offset-map])]
+                                                                     :else
+                                                                     [acc (rest p-flakes) offset-map])]
                                     (recur flakes' acc* offset-map'))))
             sort-preds        (reduce (fn [acc spec]
                                         (if (or (and (:multi? spec) (:orderBy spec))
@@ -589,9 +592,9 @@
 (defn parse-select
   [vars interim-vars select-smt]
   (when-not (every? #(or (string? %) (map? %)) select-smt)
-      (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: "
-                           select-smt)
-                      {:status 400 :error :db/invalid-query})))
+    (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: "
+                         select-smt)
+                    {:status 400 :error :db/invalid-query})))
   (let [vars* (set vars)]
     (map (fn [select]
            (let [var-symbol (if (map? select) nil (-> select symbol))]
@@ -1104,11 +1107,11 @@
   with a vector value."
   [db fuel max-fuel query-map opts]
   (go-try
-    (let [{:keys [select selectOne selectDistinct where from context]} query-map
+    (let [{:keys [select selectOne selectDistinct where from]} query-map
           select-smt   (or select selectOne selectDistinct
                            (throw (ex-info "Query missing select, selectOne or selectDistinct." {:status 400 :error :db/invalid-query})))
           {:keys [orderBy limit component offset]} opts
-          select-spec  (parse-db db select-smt context opts)
+          select-spec  (parse-db db select-smt opts)
           select-spec' (if (not (nil? component))
                          (assoc select-spec :componentFollow? component)
                          select-spec)
@@ -1158,18 +1161,15 @@
                   (let [res (async/<! (query db (assoc-in query-map [:opts :cache] false)))]
                     (async/put! pc res)))
                 pc))))
-      (let [max-fuel   (:max-fuel opts')
-            fuel       (or (:fuel opts)                     ;; :fuel volatile! can be provided upstream
-                           (when (or max-fuel (:meta opts))
-                             (volatile! 0)))
-            db-context (or (:context db)
-                           ;; TODO - below (:prefix) will be deprecated after json-ld transition
-                           (get-in db [:schema :prefix]))
-            context*   (json-ld/parse-context db-context context)
-            query-map* (assoc query-map :context context*)
-            db*        (assoc db :context context*)]
+      (let [max-fuel (:max-fuel opts')
+            fuel     (or (:fuel opts)                       ;; :fuel volatile! can be provided upstream
+                         (when (or max-fuel (:meta opts))
+                           (volatile! 0)))
+            db*      (if context
+                       (assoc db :context (json-ld/parse-context (:context db) context))
+                       db)]
         (if (sequential? where)
           ;; ad-hoc query
-          (ad-hoc-query db* fuel max-fuel query-map* opts')
+          (ad-hoc-query db* fuel max-fuel query-map opts')
           ;; all other queries
-          (basic-query db* fuel max-fuel query-map* opts'))))))
+          (basic-query db* fuel max-fuel query-map opts'))))))

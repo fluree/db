@@ -135,12 +135,8 @@
 
                  ;; must be a map within a sequence...
                  (map? x)
-                 (let [values (mapv (fn [x-item]
-                                      (let [key-x  (-> x-item
-                                                       key
-                                                       util/keyword->str)
-                                            val-x  (val x-item)
-                                            val-x' (cond
+                 (let [values (mapv (fn [[key-x val-x]]
+                                      (let [val-x' (cond
                                                      (= "_orderBy" key-x)
                                                      (if (coll? val-x)
                                                        {:order     (first val-x)
@@ -185,8 +181,10 @@
         default-compact? (:compact opts)]
     (reduce-kv
       (fn [acc k v]
-        (let [pred     (cond (keyword? k)
-                             (util/keyword->str k)
+        (let [pred     (cond (= :* k) "*"
+
+                             (keyword? k)
+                             k
 
                              (symbol? k)
                              (str k)
@@ -202,6 +200,7 @@
                                     :compact? compact?
                                     :context context)
             (= "_id" pred) (assoc acc :id? true)
+
             :else
             (let [_          (when (and v' (not (map? v)))
                                (throw (ex-info (str "Invalid select spec: " select)
@@ -211,12 +210,15 @@
                   sub-select (some-> (dissoc v' "_limit" "_offset" "_as" "_recur" "_component" "_orderBy" "_compact")
                                      (not-empty)
                                      (parse context opts))
-                  namespace? (str/includes? pred "/")
                   reversed   (or (get-in context [pred :reverse])
-                                 (when (str/includes? pred "/_")
+                                 ;; TODO - can deprecate below once json-ld complete
+                                 (when (and (string? pred) (str/includes? pred "/_"))
                                    (str/replace pred "/_" "/")))
-                  pred'      (or reversed
-                                 (json-ld/expand-iri pred context))
+                  pred'      (as-> (json-ld/expand-iri (or reversed pred) context) resolved-pred
+                                   (if (keyword? resolved-pred) ;; keywords that don't turn into resolved iris, change to string
+                                     (util/keyword->str resolved-pred)
+                                     resolved-pred))
+                  namespace? (str/includes? pred' "/")
                   as         (cond
                                (contains? v' "_as")
                                (get v' "_as")
@@ -362,7 +364,7 @@
    names that it can into more complete select statement maps.
 
    Caches results based on database version."
-  [db select context opts]
+  [{:keys [context] :as db} select opts]
   (let [schema-version (schema-util/version db)
         cache-key      [schema-version select context (dissoc opts :fuel)]]
     ;; when schema is at a newer version, reset cache (version is 't' and negative, so decreases with newer)

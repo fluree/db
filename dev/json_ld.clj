@@ -58,16 +58,23 @@
 
   db2
 
-  (-> db2 )
+  ;; query for Movie and crawl to book
+  @(fluree/query db2 {:context {:id     "@id"
+                                :type   "@type"
+                                :schema "http://schema.org/"
+                                :wiki   "https://www.wikidata.org/wiki/"}
+                      :select  [:* {:schema/isBasedOn [:*]}]
+                      :from    :wiki/Q836821})
 
-  @(fluree/query db2 {:context {:id           "@id"
-                                :type         "@type"
-                                :schema       "http://schema.org/"
-                                :wiki         "https://www.wikidata.org/wiki/"
+
+  ;; query for Book with reverse reference
+  @(fluree/query db2 {:context {:id          "@id"
+                                :type        "@type"
+                                :schema      "http://schema.org/"
+                                :wiki        "https://www.wikidata.org/wiki/"
                                 :derivedFrom {"@reverse" "http://schema.org/isBasedOn"}}
-                      :select  ["*", {:derivedFrom ["*"]}]
-                      :from    "https://www.wikidata.org/wiki/Q3107329"})
-
+                      :select  [:* {:derivedFrom [:*]}]
+                      :from    :wiki/Q3107329})
 
 
 
@@ -98,19 +105,5 @@
 
   ;; get latest db, should be = to db4*
   (def latest-db (fluree/db ledger))
-
-
-  #_(def config {:context {"schema" "http://schema.org/"
-                           "wiki"   "https://www.wikidata.org/wiki/"}
-                 :did     {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
-                           :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
-                           :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}
-                 :name    "examples/movies"
-                 :write   (ipfs/default-commit-fn nil)      ;; when empty, don't write unless you commit
-                 :read    (ipfs/default-read-fn nil)
-                 :commit  (ipfs/default-push-fn nil)
-                 :push    [(ipfs/default-push-fn nil)]
-
-                 })
 
   )

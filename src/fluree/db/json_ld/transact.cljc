@@ -141,10 +141,10 @@
   (let [{:keys [db-before t block refs]} tx-state
         {:keys [novelty schema stats]} db-before
         {:keys [spot psot opst post tspo size]} novelty
-        pred-map      (:pred schema)
         bytes #?(:clj (future (flake/size-bytes flakes))    ;; calculate in separate thread for CLJ
                  :cljs (flake/size-bytes flakes))
         vocab-flakes  (jld-reify/get-vocab-flakes flakes)
+        schema*       (vocab/update-with db-before t @refs vocab-flakes)
         db            (assoc db-before :ecount (final-ecount tx-state)
                                        :t t
                                        :block block
@@ -152,11 +152,11 @@
                                                  :psot (into psot flakes)
                                                  :post (into post flakes)
                                                  :opst (->> flakes
-                                                            (sort-by flake/p )
+                                                            (sort-by flake/p)
                                                             (partition-by flake/p)
                                                             (reduce
                                                               (fn [opst* p-flakes]
-                                                                (if (get-in pred-map [(flake/p (first p-flakes)) :ref?])
+                                                                (if (get-in schema* [:pred (flake/p (first p-flakes)) :ref?])
                                                                   (into opst* p-flakes)
                                                                   opst*))
                                                               opst))
