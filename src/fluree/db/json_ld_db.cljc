@@ -14,9 +14,6 @@
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.reify :as jld-reify]
-            [fluree.db.conn.memory :as memory-conn]
-            [fluree.db.conn.json-ld-proto :as jld-proto]
             [fluree.db.ledger :as ledger])
   #?(:clj (:import (fluree.db.flake Flake)
                    (java.io Writer))))
@@ -373,7 +370,7 @@
 ;; TODO - conn is included here because current index-range query looks for conn on the db
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
 (defrecord JsonLdDb [ledger conn method name branch block t tt-id stats
-                     spot psot post opst tsop
+                     spot psot post opst tspo
                      schema comparators novelty
                      permissions ecount]
   dbproto/IFlureeDb
@@ -438,11 +435,6 @@
                      const/$_prefix     (flake/->sid const/$_prefix 1000)
                      const/$_shard      (flake/->sid const/$_shard 1000)})
 
-(def default-config {:context {"schema" "http://schema.org/"
-                               "wiki"   "https://www.wikidata.org/wiki/"}
-                     :methods {:ipfs {:endpoint "http://127.0.0.1:5001/"}
-                               :s3   {:access-key ""
-                                      :region     ""}}})
 
 (defn create
   [{:keys [method name conn] :as ledger}]
@@ -464,180 +456,28 @@
         tspo        (index/empty-branch method name tspo-cmp)
         stats       {:flakes 0, :size 0, :indexed 0}
         schema      (vocab/vocab-map* 0 #{} nil)
-        branch      (ledger/current-branch ledger)
-        db          (->JsonLdDb ledger conn method name branch 0 0 nil stats
-                                spot psot post opst tspo schema
-                                index/default-comparators novelty
-                                permissions genesis-ecount)]
-    db))
-
-
-(defn blank-db
-  ([ledger]
-   (let [{:keys [conn name method]} ledger]
-     (create ledger)))
-  ([conn ledger-name]
-   (let [default-context (jld-proto/context conn)
-         default-did     (jld-proto/did conn)]
-     (blank-db conn ledger-name {:did     default-did
-                                 :context default-context})))
-  ([conn ledger-name opts]
-   (let [{:keys [did context]} opts
-         method     (jld-proto/method conn)
-         read-only? (jld-proto/read-only? conn)]
-     (-> (blank-db conn (util/keyword->str method) ledger-name
-                   (atom {}) (fn []
-                               (throw
-                                 (ex-info "This is the earliest version of DB, not way to retrieve newer"
-                                          {}))))
-         (assoc :config (-> conn
-                            (assoc :read-only? read-only?)
-                            (dissoc :context))
-                :context (when context (json-ld/parse-context context))))
-     ))
-  #_([method {:keys [context methods did opts iri] :as config}]
-     (let [method*       (keyword method)
-           method-config (or (get methods method*)
-                             (get-in default-config [:methods method])
-                             (throw (ex-info (str "Ledger method identifier has not corresponding configuration: "
-                                                  method* ". Configured methods include: "
-                                                  (or (keys methods) (keys (:methods default-config))) ".")
-                                             {:status 400 :error :db/invalid-ledger-method})))
-           db-name       (or iri (str (util/random-uuid)))
-           conn          (memory-conn/connect)]
-       (-> (blank-db conn method db-name
-                     (atom {}) (fn []
-                                 (throw
-                                   (ex-info "This is the earliest version of DB, not way to retrieve newer"
-                                            {}))))
-           (assoc :method-config method-config
-                  :context context
-                  :opts (assoc opts :did did)))))
-  ([conn network dbid schema-cache current-db-fn]
-   (assert conn "No conn provided when creating new db.")
-   (assert network "No network provided when creating new db.")
-   (assert dbid "No dbid provided when creating new db.")
-   (let [novelty     (new-novelty-map index/default-comparators)
-         permissions {:collection {:all? false}
-                      :predicate  {:all? true}
-                      :root?      true}
-
-         {spot-cmp :spot
-          psot-cmp :psot
-          post-cmp :post
-          opst-cmp :opst
-          tspo-cmp :tspo} index/default-comparators
-
-         spot        (index/empty-branch network dbid spot-cmp)
-         psot        (index/empty-branch network dbid psot-cmp)
-         post        (index/empty-branch network dbid post-cmp)
-         opst        (index/empty-branch network dbid opst-cmp)
-         tspo        (index/empty-branch network dbid tspo-cmp)
-         stats       {:flakes 0, :size 0, :indexed 0}
-         fork        nil
-         fork-block  nil
-         schema      (vocab/vocab-map* 0 #{} nil)
-         settings    nil
-         db          (->JsonLdDb conn network dbid 0 0 nil stats spot psot post opst tspo schema
-                                 settings index/default-comparators schema-cache novelty
-                                 permissions fork fork-block current-db-fn genesis-ecount)]
-     (if current-db-fn
-       db
-       (assoc db :current-db-fn (constantly db))))))
-
-
-(defn load-db
-  ([db-name] (load-db db-name nil))
-  ([db-name config]
-   (let [blank-db (blank-db config db-name)]
-     (jld-reify/load-db blank-db db-name))))
+        branch      (ledger/current-branch ledger)]
+    (map->JsonLdDb {:ledger      ledger
+                    :conn        conn
+                    :method      method
+                    :name        name
+                    :branch      branch
+                    :block       0
+                    :t           0
+                    :tt-id       nil
+                    :stats       stats
+                    :spot        spot
+                    :psot        psot
+                    :post        post
+                    :opst        opst
+                    :tspo        tspo
+                    :schema      schema
+                    :comparators index/default-comparators
+                    :novelty     novelty
+                    :permissions permissions
+                    :ecount      genesis-ecount})))
 
 
 (defn json-ld-db?
   [db]
   (instance? JsonLdDb db))
-
-
-(comment
-
-  (def conn (memory-conn/connect))
-
-  (def db (blank-db conn "blah" "hi" (atom {}) (fn [] (throw (Exception. "NO CURRENT DB FN YET")))))
-
-  db
-
-  (def flakes (fluree.db.json-ld.flakes/json-ld-graph->flakes
-                {"@context" {"owl" "http://www.w3.org/2002/07/owl#",
-                             "ex"  "http://example.org/ns#"},
-                 "@graph"   [{"@id"   "ex:ontology",
-                              "@type" "owl:Ontology"}
-                             {"@id"   "ex:Book",
-                              "@type" "owl:Class"}
-                             {"@id"   "ex:Person",
-                              "@type" "owl:Class"}
-                             {"@id"   "ex:author",
-                              "@type" "owl:ObjectProperty"}
-                             {"@id"   "ex:name",
-                              "@type" "owl:DatatypeProperty"}
-                             {"@type"     "ex:Book",
-                              "ex:author" {"@id" "_:b1"}}
-                             {"@id"     "_:b1",
-                              "@type"   "ex:Person",
-                              "ex:name" {"@value" "Fred"
-                                         "@type"  "xsd:string"}}
-                             {"@id"     "ex:someMember",
-                              "@type"   "ex:Person",
-                              "ex:name" {"@value" "Brian"
-                                         "@type"  "xsd:string"}}]}
-                {}))
-
-  flakes
-
-
-  (def db2 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes))))
-
-  (-> db2
-      :novelty)
-
-  @(fluree.db.api/query (async/go db2)
-                        {:context {"ex" "http://example.org/ns#"}
-                         :select  ["*"]
-                         :from    "http://example.org/ns#someMember"})
-
-  @(fluree.db.api/query (async/go db2)
-                        {:context {"ex" "http://example.org/ns#"}
-                         :select  ["?p" "?o"]
-                         :where   [["http://example.org/ns#someMember" "?p" "?o"]]})
-
-  (async/<!! (schema/schema-map db2))
-
-
-
-  (def flakes2 (fluree.db.json-ld.flakes/json-ld-graph->flakes
-                 {"@context" "https://schema.org/",
-                  "@graph"   [{"@id"             "http://worldcat.org/entity/work/id/2292573321",
-                               "@type"           "Book",
-                               "author"          {"@id" "http://viaf.org/viaf/17823"},
-                               "inLanguage"      "fr",
-                               "name"            "Rouge et le noir",
-                               "workTranslation" {"@type" "Book", "@id" "http://worldcat.org/entity/work/id/460647"}}
-                              {"@id"               "http://worldcat.org/entity/work/id/460647",
-                               "@type"             "Book",
-                               "about"             "Psychological fiction, French",
-                               "author"            {"@id" "http://viaf.org/viaf/17823"},
-                               "inLanguage"        "en",
-                               "name"              "Red and Black : A New Translation, Backgrounds and Sources, Criticism",
-                               "translationOfWork" {"@id" "http://worldcat.org/entity/work/id/2292573321"},
-                               "translator"        {"@id" "http://viaf.org/viaf/8453420"}}]}
-                 {}))
-  flakes2
-
-  (def db3 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes2))))
-
-  (-> db3 :schema :pred (get "https://schema.org/Book"))
-
-  @(fluree.db.api/query (async/go db3)
-                        {:context "https://schema.org/"
-                         :select  {"?s" ["*", {"workTranslation" ["*"]}]}
-                         :where   [["?s" "a" "Book"]]})
-  )

@@ -173,11 +173,8 @@
 
 (defn stage
   [db json-ld]
-  (let [db*         (if (string? db)
-                      (jlddb/blank-db db)
-                      db)
-        expanded    (json-ld/expand json-ld)
-        tx-state    (->tx-state db*)
+  (let [expanded    (json-ld/expand json-ld)
+        tx-state    (->tx-state db)
         base-flakes (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
                             (:new? tx-state) (into [(flake/->Flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (:t tx-state) true nil)
                                                     (flake/->Flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" (:t tx-state) true nil)]))]

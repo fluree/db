@@ -170,7 +170,9 @@
   "ipfs IRI looks like: fluree:ipfs:cid"
   ([db-iri] (db db-iri {}))
   ([db-iri opts]
-   (let [conn (connect opts)
+   (throw (ex-info "DEPRECATED call to: fluree.db.method.ipfs.core/db" {}))
+   ;; TODO - clean up this fn, not deleting yet as we still need the logic migrated
+   #_(let [conn (connect opts)
          [_ method cid] (str/split db-iri #":")
          pc   (async/promise-chan)]
      (async/go
@@ -187,124 +189,3 @@
          (catch* e (async/put! pc e))))
      pc)))
 
-
-
-(comment
-
-  (-> (get-json "/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2")
-      fluree.json-ld/expand)
-
-  (add-directory {"hi" "there you 5"})
-  (get-json "QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH/blah/here")
-  (get-json "QmZy5Me2DMHP7iYhdF5mWDkWZCfhzCXY9ouvnjWyq3VK3D/here")
-  (json/parse
-    "{\"Data\":{\"/\":{\"bytes\":\"CAE\"}},\"Links\":[{\"Hash\":{\"/\":\"QmWwDDrYuHqjZxDJtq9WAyT6tUUJwJdCYzrf4dBfCGaH7v\"},\"Name\":\"here\",\"Tsize\":28}]}"
-    false)
-  (generate-dag [{:name "filename-a" :hash "QmWwDDrYuHqjZxDJtq9WAyT6tUUJwJdCYzrf4dBfCGaH7v" :size 28}
-                 {:name "filename-b" :hash "Qme1QJSGRXCSPrHKXsX8gj77wVwVaNt3Xkmk6RzHPr9kFv" :size 28}])
-
-  )
-
-(comment
-
-  (def mydb (db "fluree:ipfs:QmYBHRyaTybGv2mUKCP5TxShh3rfPQfD1nEkFxRbXRzEVZ"))
-
-  (-> mydb async/<!!)
-
-  @(fluree.db.api/query mydb {:context "https://schema.org/"
-                              :select  {"?s" ["*"]}
-                              :where   [["?s" "a" "Book"]]})
-
-  (add {"blah" 987798})
-
-  (get-json "Qmc5f6ms6oXGhZLT3uEvg8b3es5yqM4y4vhC6hXNrbk7dj")
-
-  (add {"@context" {"owl" "http://www.w3.org/2002/07/owl#",
-                    "ex"  "http://example.org/ns#"},
-        "@graph"   [{"@id"   "ex:ontology",
-                     "@type" "owl:Ontology"}
-                    {"@id"   "ex:Book",
-                     "@type" "owl:Class"}
-                    {"@id"   "ex:Person",
-                     "@type" "owl:Class"}
-                    {"@id"   "ex:author",
-                     "@type" "owl:ObjectProperty"}
-                    {"@id"   "ex:name",
-                     "@type" "owl:DatatypeProperty"}
-                    {"@type"     "ex:Book",
-                     "ex:author" {"@id" "_:b1"}}
-                    {"@id"     "_:b1",
-                     "@type"   "ex:Person",
-                     "ex:name" {"@value" "Fred"
-                                "@type"  "xsd:string"}}
-                    {"@id"     "ex:someMember",
-                     "@type"   "ex:Person",
-                     "ex:name" {"@value" "Brian"
-                                "@type"  "xsd:string"}}]})
-
-  (get-json "QmYBHRyaTybGv2mUKCP5TxShh3rfPQfD1nEkFxRbXRzEVZ")
-
-  (add {"@context" "https://schema.org/",
-        "@graph"   [{"@id"             "http://worldcat.org/entity/work/id/2292573321",
-                     "@type"           "Book",
-                     "author"          {"@id" "http://viaf.org/viaf/17823"},
-                     "inLanguage"      "fr",
-                     "name"            "Rouge et le noir",
-                     "workTranslation" {"@type" "Book", "@id" "http://worldcat.org/entity/work/id/460647"}}
-                    {"@id"               "http://worldcat.org/entity/work/id/460647",
-                     "@type"             "Book",
-                     "about"             "Psychological fiction, French",
-                     "author"            {"@id" "http://viaf.org/viaf/17823"},
-                     "inLanguage"        "en",
-                     "name"              "Red and Black : A New Translation, Backgrounds and Sources, Criticism",
-                     "translationOfWork" {"@id" "http://worldcat.org/entity/work/id/2292573321"},
-                     "translator"        {"@id" "http://viaf.org/viaf/8453420"}}]})
-
-  (get-json "QmYBHRyaTybGv2mUKCP5TxShh3rfPQfD1nEkFxRbXRzEVZ")
-
-  (def book-db (db "fluree:ipfs:Qmc5f6ms6oXGhZLT3uEvg8b3es5yqM4y4vhC6hXNrbk7dj"))
-
-  (async/<!! mydb)
-
-  @(fluree.db.api/query book-db
-                        {:context "https://schema.org/"
-                         :select  {"?s" ["*", {"workTranslation" ["*"]}]}
-                         :where   [["?s" "a" "Book"]]})
-
-  (add {"accessibilityControl" ["fullKeyboardControl" "fullMouseControl"],
-        "bookFormat"           "EBook/DAISY3",
-        "@context"             "https://schema.org",
-        "aggregateRating"      {"@type" "AggregateRating", "reviewCount" "0"},
-        "numberOfPages"        "598",
-        "accessibilityHazard"  ["noFlashingHazard" "noMotionSimulationHazard" "noSoundHazard"],
-        "copyrightYear"        "2007",
-        "isFamilyFriendly"     "true",
-        "name"                 "Holt Physical Science",
-        "copyrightHolder"      {"@type" "Organization", "name" "Holt, Rinehart and Winston"},
-        "inLanguage"           "en-US",
-        "genre"                "Educational Materials",
-        "accessibilityFeature" ["largePrint/CSSEnabled"
-                                "highContrast/CSSEnabled"
-                                "resizeText/CSSEnabled"
-                                "displayTransformability"
-                                "longDescription"
-                                "alternativeText"],
-        "publisher"            {"@type" "Organization", "name" "Holt, Rinehart and Winston"},
-        "@type"                "Book",
-        "isbn"                 "9780030426599",
-        "description"          "NIMAC-sourced textbook",
-        "accessibilityAPI"     "ARIA"})
-
-  (def movie-db (db "fluree:ipfs:QmWofgUFbvLyqwdmVVKE7K6SQNPrMcigy49cQXYBJm1f2H"))
-
-  @(fluree.db.api/query movie-db
-                        {:context "https://schema.org/"
-                         :select  {"?s" ["*"]}
-                         :where   [["?s" "a" "Movie"]]})
-
-
-  (json/parse
-    "{\n  \"@context\": {\n    \"geojson\": \"https://purl.org/geojson/vocab#\",\n    \"Feature\": \"geojson:Feature\",\n    \"FeatureCollection\": \"geojson:FeatureCollection\",\n    \"GeometryCollection\": \"geojson:GeometryCollection\",\n    \"LineString\": \"geojson:LineString\",\n    \"MultiLineString\": \"geojson:MultiLineString\",\n    \"MultiPoint\": \"geojson:MultiPoint\",\n    \"MultiPolygon\": \"geojson:MultiPolygon\",\n    \"Point\": \"geojson:Point\",\n    \"Polygon\": \"geojson:Polygon\",\n    \"bbox\": {\n      \"@container\": \"@list\",\n      \"@id\": \"geojson:bbox\"\n    },\n    \"coordinates\": {\n      \"@container\": \"@list\",\n      \"@id\": \"geojson:coordinates\"\n    },\n    \"features\": {\n      \"@container\": \"@set\",\n      \"@id\": \"geojson:features\"\n    },\n    \"geometry\": \"geojson:geometry\",\n    \"id\": \"@id\",\n    \"properties\": \"geojson:properties\",\n    \"type\": \"@type\"\n  }\n}"
-    false)
-
-  )
