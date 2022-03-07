@@ -3,7 +3,7 @@
             [fluree.db.json-ld-db :as jld-db]
             [fluree.db.util.json :as json]
             [fluree.crypto :as crypto]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
@@ -12,8 +12,7 @@
             [fluree.json-ld.normalize :as normalize]
             [fluree.db.ledger :as ledger]
             [fluree.db.conn.json-ld-proto :as jld-proto]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -48,18 +47,18 @@
 
 (defn- subject-block
   [s-flakes {:keys [schema] :as db} iri-map ctx compact-fn]
-  (loop [[^Flake flake & r] s-flakes
+  (loop [[flake & r] s-flakes
          assert  nil
          retract nil]
     (if flake
-      (let [add?     (true? (.-op flake))
-            p-iri    (get-s-iri (.-p flake) db iri-map compact-fn)
-            ref?     (get-in schema [:pred (.-p flake) :ref?])
+      (let [add?     (true? (flake/op flake))
+            p-iri    (get-s-iri (flake/p flake) db iri-map compact-fn)
+            ref?     (get-in schema [:pred (flake/p flake) :ref?])
             o        (if ref?
                        (do
                          (vswap! ctx assoc-in [p-iri "@type"] "@id")
-                         (get-s-iri (.-o flake) db iri-map compact-fn))
-                       (.-o flake))
+                         (get-s-iri (flake/o flake) db iri-map compact-fn))
+                       (flake/o flake))
             assert*  (if add?
                        (update-subj-prop assert p-iri o)
                        assert)
@@ -82,13 +81,13 @@
   [db flakes {:keys [compact-fn id-key type-key] :as opts}]
   (let [id->iri (volatile! (jld-ledger/predefined-sids-compact compact-fn))
         ctx     (volatile! {})]
-    (loop [[s-flakes & r] (partition-by #(.-s ^Flake %) flakes)
+    (loop [[s-flakes & r] (partition-by flake/s flakes)
            assert  []
            retract []]
       (if s-flakes
-        (let [sid            (.-s ^Flake (first s-flakes))
+        (let [sid            (flake/s (first s-flakes))
               s-iri          (get-s-iri sid db id->iri compact-fn)
-              non-iri-flakes (remove #(= const/$iri (.-p ^Flake %)) s-flakes)
+              non-iri-flakes (remove #(= const/$iri (flake/p %)) s-flakes)
               [s-assert s-retract ctx] (subject-block non-iri-flakes db id->iri ctx compact-fn)
               assert*        (if s-assert
                                (conj assert (assoc s-assert id-key s-iri))
@@ -170,7 +169,7 @@
   properties/predicates are @id (ref) values"
   [{:keys [novelty] :as db} t compact-fn ctx-used-atom]
   (let [flakes   (->> (:spot novelty)
-                      (filter #(= t (.-t ^Flake %)))
+                      (filter #(= t (flake/t %)))
                       reverse)
         id-key   (json-ld/compact "@id" compact-fn)
         type-key (json-ld/compact "@type" compact-fn)
@@ -226,7 +225,7 @@
         _              (log/warn "Commit opts: " (commit-opts db opts))
         {:keys [branch message type-key compact ctx-used-atom private return queue? push publish] :as opts*} (commit-opts db opts)
         ;; TODO - tsop index can get below flakes more efficiently once exists
-        flakes         (filter #(= t (.-t ^Flake %)) (:spot novelty))
+        flakes         (filter #(= t (flake/t %)) (:spot novelty))
         {:keys [assert retract ctx]} (generate-commit db (reverse flakes) opts*)
         final-ctx      (conj base-context (merge-with merge @ctx-used-atom ctx))
         prev-commit    (:id commit)
@@ -283,10 +282,11 @@
         conn           (:conn ledger)
         {:keys [message ctx-used-atom type-key branch compact did] :as opts*} (commit-opts db opts)
         ;; TODO - tsop index can get below flakes more efficiently once exists
-        flakes         (filter #(= t (.-t ^Flake %)) (:spot novelty))
+        flakes         (filter #(= t (flake/t %)) (:spot novelty))
         {:keys [assert retract refs-ctx]} (generate-commit db (reverse flakes) opts*)
         final-ctx      (conj base-context (merge-with merge @ctx-used-atom refs-ctx))
 
+        ;; TODO - why is there no commit key after stage?
         ;; TODO - commits move into ledger state
         prev-commit    (:id commit)
         branch-commit  (:branch commit)

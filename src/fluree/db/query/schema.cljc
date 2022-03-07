@@ -6,8 +6,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.iri :as iri-util]
-            [fluree.db.util.schema :as schema-util])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -387,8 +386,7 @@
           prefix-flakes-ch (query-range/index-range db :spot
                                                     >= [(flake/max-subject-id const/$_prefix)]
                                                     <= [(flake/min-subject-id const/$_prefix)])
-          [collection-flakes predicate-flakes] (partition-by #(<= (flake/s ^Flake %)
-                                                                  flake/MAX-COLL-SUBJECTS)
+          [collection-flakes predicate-flakes] (partition-by #(<= (flake/s %) flake/MAX-COLL-SUBJECTS)
                                                              schema-flakes)
           coll             (->> collection-flakes
                                 (partition-by #(flake/s %))
@@ -497,4 +495,3 @@
   "Returns schema version from a db, which is the :t when the schema was last updated."
   [db]
   (get-in db [:schema :t]))
-

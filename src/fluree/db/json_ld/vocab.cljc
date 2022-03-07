@@ -1,11 +1,10 @@
 (ns fluree.db.json-ld.vocab
-  (:require [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+  (:require [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -20,17 +19,17 @@
   truthy if any of them are of rdf:type rdf:Property, or the
   owl-specific versions of properties as defined by property-sids."
   [s-flakes]
-  (some (fn [^Flake f]
-          (and (= const/$rdf:type (.-p f))
-               (property-sids (.-o f))))
+  (some (fn [f]
+          (and (= const/$rdf:type (flake/p f))
+               (property-sids (flake/o f))))
         s-flakes))
 
 
 (defn schema-details
   [refs s-flakes]
-  (let [sid  (.-s ^Flake (first s-flakes))
+  (let [sid  (flake/s (first s-flakes))
         ref? (boolean (refs sid))]
-    (loop [[^Flake f & r] s-flakes
+    (loop [[f & r] s-flakes
            details (if (= sid const/$rdf:type)
                      {:id    sid                            ;; rdf:type is predefined, so flakes to build map won't be present.
                       :class false
@@ -42,14 +41,14 @@
                       :subclassOf         []
                       :equivalentProperty []})]
       (if f
-        (let [pid      (.-p f)
+        (let [pid      (flake/p f)
               details* (cond
                          (= const/$iri pid)
-                         (assoc details :iri (.-o f))
+                         (assoc details :iri (flake/o f))
 
                          (= const/$rdf:type pid)
-                         (if (property-sids (.-o f))
-                           (if (= const/$owl:ObjectProperty (.-o f))
+                         (if (property-sids (flake/o f))
+                           (if (= const/$owl:ObjectProperty (flake/o f))
                              (assoc details :class false
                                             :ref? true)
                              (assoc details :class false))
@@ -57,10 +56,10 @@
                            details)
 
                          (= const/$rdfs:subClassOf pid)
-                         (update details :subclassOf conj (.-o f))
+                         (update details :subclassOf conj (flake/o f))
 
                          (= const/$_predicate:equivalentProperty)
-                         (update details :equivalentProperty conj (.-o f))
+                         (update details :equivalentProperty conj (flake/o f))
 
                          :else details)]
           (recur r details*))
@@ -136,7 +135,7 @@
                        11           {:name "_default" :id 11 :sid nil}
                        "_default"   {:name "_default" :id 11 :sid nil}}
         property-maps (->> vocab-flakes
-                           (partition-by #(.-s ^Flake %))
+                           (partition-by flake/s)
                            (map #(schema-details refs %)))]
     {:t          db-t                                       ;; record time of spec generation, can use to determine cache validity
      :coll       coll
@@ -162,7 +161,7 @@
         {:keys [refs pred]} schema
         refs*             (into refs new-refs)
         new-property-maps (->> vocab-flakes
-                               (partition-by #(.-s ^Flake %))
+                               (partition-by flake/s)
                                (map #(schema-details refs* %))
                                hash-map-both-id-iri)
         property-maps     (merge pred new-property-maps)]
