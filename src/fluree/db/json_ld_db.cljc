@@ -7,16 +7,16 @@
             [fluree.db.index :as index]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.ledger :as ledger])
-  #?(:clj (:import (fluree.db.flake Flake)
-                   (java.io Writer))))
+            [fluree.db.ledger :as ledger]
+            [fluree.db.conn.json-ld-proto :as jld-proto])
+  #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -82,11 +82,11 @@
                   :psot (into psot flakes)
                   :post (into post flakes)
                   :opst (->> flakes
-                             (sort-by #(.-p ^Flake %))
-                             (partition-by #(.-p ^Flake %))
+                             (sort-by flake/p)
+                             (partition-by flake/p)
                              (reduce
                                (fn [opst* p-flakes]
-                                 (if (get-in pred-map [(.-p ^Flake (first p-flakes)) :ref?])
+                                 (if (get-in pred-map [(-> p-flakes first flake/p) :ref?])
                                    (into opst* p-flakes)
                                    opst*))
                                opst))
@@ -98,12 +98,12 @@
   "Calculates updated ecount based on flakes for with-t. Also records if a schema or settings change
   occurred."
   [{:keys [ecount schema] :as db} flakes]
-  (loop [[flakes-s & r] (partition-by #(.-s ^Flake %) flakes)
+  (loop [[flakes-s & r] (partition-by flake/s flakes)
          schema-change?  (boolean (nil? schema))            ;; if no schema for any reason, make sure one is generated
          setting-change? false
          ecount          ecount]
     (if flakes-s
-      (let [sid (.-s ^Flake (first flakes-s))
+      (let [sid (-> flakes-s first flake/s)
             cid (flake/sid->cid sid)]
         (recur r
                (if (true? schema-change?)
@@ -144,7 +144,7 @@
   ([db flakes] (with-t db flakes nil))
   ([{:keys [stats t] :as db} flakes opts]
    (go-try
-     (let [new-t           (.-t ^Flake (first flakes))
+     (let [new-t           (-> flakes first flake/t)
            _               (when (not= new-t (dec t))
                              (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " t " is not beyond supplied transaction t: " new-t ".")
                                              {:status 500
@@ -234,6 +234,24 @@
           (recur (<? (with-t db flakes)) rest)
           db)))))
 
+(defn expand-iri
+  "Expands an IRI from the db's context."
+  [{:keys [context] :as db} iri]
+  (json-ld/expand-iri iri context))
+
+(defn iri->sid
+  "Returns subject id or nil if no match.
+
+  iri can be compact iri in string or keyword form."
+  [db iri]
+  (go-try
+    (let [iri* (expand-iri db iri)]
+      ;; string? necessary because expand-iri will return original iri if not matched, and could be a keyword
+      (when (string? iri*)
+        (some-> (<? (query-range/index-range db :post = [const/$iri iri*]))
+                first
+                flake/s)))))
+
 (defn subid
   "Returns subject ID of ident as async promise channel.
   Closes channel (nil) if doesn't exist, or if strict? is true, will return exception."
@@ -246,26 +264,15 @@
                           ident)
 
                         ;; assume iri
-                        (string? ident)
-                        (let [iri (json-ld/expand-iri ident (:context db))]
-                          (some-> (<? (query-range/index-range db :post = [const/$iri iri]))
-                                  ^Flake (first)
-                                  (.-s)))
-
-                        ;; assume iri
-                        (keyword? ident)
-                        (let [iri (json-ld/expand-iri ident (:context db))]
-                          (when (string? iri)
-                            (some-> (<? (query-range/index-range db :post = [const/$iri iri]))
-                                    ^Flake (first)
-                                    (.-s))))
+                        (or (string? ident) (keyword? ident))
+                        (<? (iri->sid db ident))
 
                         ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
                         (util/pred-ident? ident)
                         (if-let [pid (dbproto/-p-prop db :id (first ident))]
                           (some-> (<? (query-range/index-range db :post = [pid (second ident)]))
-                                  ^Flake (first)
-                                  (.-s))
+                                  first
+                                  flake/s)
                           (throw (ex-info (str "Subject ID lookup failed. The predicate " (pr-str (first ident)) " does not exist.")
                                           {:status 400
                                            :error  :db/invalid-ident})))
@@ -338,8 +345,8 @@
      (let [tag-pred-id 30]
        (some-> (<? (query-range/index-range (dbproto/-rootdb this)
                                             :spot = [tag-id tag-pred-id]))
-               ^Flake (first)
-               (.-o)))))
+               first
+               flake/o))))
   ([this tag-id pred]
    (go-try
      (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
@@ -354,8 +361,8 @@
    (go-try
      (let [tag-pred-id const/$_tag:id]
        (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
-               ^Flake (first)
-               (.-s)))))
+               first
+               flake/s))))
   ([this tag-name pred]
    (go-try
      (if (str/includes? tag-name "/")
@@ -371,7 +378,7 @@
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
 (defrecord JsonLdDb [ledger conn method name branch block t tt-id stats
                      spot psot post opst tspo
-                     schema comparators novelty
+                     context schema comparators novelty
                      permissions ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
@@ -456,7 +463,8 @@
         tspo        (index/empty-branch method name tspo-cmp)
         stats       {:flakes 0, :size 0, :indexed 0}
         schema      (vocab/vocab-map* 0 #{} nil)
-        branch      (ledger/current-branch ledger)]
+        branch      (ledger/current-branch ledger)
+        context     (jld-proto/context conn)]
     (map->JsonLdDb {:ledger      ledger
                     :conn        conn
                     :method      method
@@ -471,6 +479,7 @@
                     :post        post
                     :opst        opst
                     :tspo        tspo
+                    :context     context
                     :schema      schema
                     :comparators index/default-comparators
                     :novelty     novelty
