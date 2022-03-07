@@ -1051,7 +1051,7 @@
       (string? where)
       (let [default-collection (when (string? from) from)
             subjects           (<? (where-filter db where default-collection opts))]
-        (when fuel (vswap! fuel + (count subjects)))
+        (when fuel (vswap! fuel + (* 10 (count subjects))))
         [:multi-subject subjects])
 
       ;; string could be a predicate, collection, or @id subject
@@ -1064,23 +1064,29 @@
             [:predicate pid]
             ;; assume this is an @id iri, lookup
             (let [sid (<? (dbproto/-subid db from false))]
-              (when fuel (vswap! fuel + (count from)))
+              (when fuel (vswap! fuel + 10))
               [:subject sid]))))
+
+      (keyword? from)
+      (let [sid (<? (dbproto/-subid db from false))]
+        (when fuel (vswap! fuel + 10))
+        [:subject sid])
+
 
       ;; single subject ident
       (util/subj-ident? from)
       (let [sid (<? (dbproto/-subid db from false))]
-        (when fuel (vswap! fuel inc))
+        (when fuel (vswap! fuel + 10))
         [:subject sid])
 
       ;; multi-subject
       (and (sequential? from) (every? util/subj-ident? from))
       (let [subjects (<? (basic-query-multi-subject db from))]
-        (when fuel (vswap! fuel + (count from)))
+        (when fuel (vswap! fuel + (* 10 (count from))))
         [:multi-subject subjects])
 
       :else
-      (ex-info (str "Invalid 'from' or 'where' in query:" (or from where))
+      (ex-info (str "Invalid 'from' or 'where' in query: " (or from where))
                {:status 400 :error :db/invalid-query}))))
 
 
@@ -1159,9 +1165,11 @@
             db-context (or (:context db)
                            ;; TODO - below (:prefix) will be deprecated after json-ld transition
                            (get-in db [:schema :prefix]))
-            query-map* (assoc query-map :context (json-ld/parse-context db-context context))]
+            context*   (json-ld/parse-context db-context context)
+            query-map* (assoc query-map :context context*)
+            db*        (assoc db :context context*)]
         (if (sequential? where)
           ;; ad-hoc query
-          (ad-hoc-query db fuel max-fuel query-map* opts')
+          (ad-hoc-query db* fuel max-fuel query-map* opts')
           ;; all other queries
-          (basic-query db fuel max-fuel query-map* opts'))))))
+          (basic-query db* fuel max-fuel query-map* opts'))))))

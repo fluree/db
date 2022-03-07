@@ -250,10 +250,18 @@
 
                         ;; assume iri
                         (string? ident)
-                        (let [iri (json-ld/expand-iri ident (get-in db [:schema :prefix]))]
+                        (let [iri (json-ld/expand-iri ident (:context db))]
                           (some-> (<? (query-range/index-range db :post = [const/$iri iri]))
                                   ^Flake (first)
                                   (.-s)))
+
+                        ;; assume iri
+                        (keyword? ident)
+                        (let [iri (json-ld/expand-iri ident (:context db))]
+                          (when (string? iri)
+                            (some-> (<? (query-range/index-range db :post = [const/$iri iri]))
+                                    ^Flake (first)
+                                    (.-s))))
 
                         ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
                         (util/pred-ident? ident)
