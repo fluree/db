@@ -7,7 +7,8 @@
             [fluree.db.json-ld.commit :as jld-commit]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
-            [fluree.db.api.query :as query-api])
+            [fluree.db.api.query :as query-api]
+            [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [merge]))
 
 ;; ledger operations
@@ -27,9 +28,10 @@
     - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
     - push - (optional) Function(s) in a vector that will attempt to push the commit to naming service(s)
     "
-  [{:keys [method parallelism] :as opts}]
+  [{:keys [method parallelism context] :as opts}]
   ;; TODO - do some validation
-  (let [opts* (assoc opts :parallelism (or parallelism 4))]
+  (let [opts* (assoc opts :parallelism (or parallelism 4)
+                          :context (json-ld/parse-context context))]
     (case method
       :ipfs (ipfs-conn/connect opts*)
 
