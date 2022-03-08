@@ -23,13 +23,56 @@
                               :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
                               :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}}))
 
+  (def file-conn (fluree/connect {:method :file
+                                  :storage-path "data/storage"
+                                  :publish-path "data/publish"
+                                  :did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
+                                        :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
+                                        :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}}))
+
+
   ipfs-conn
 
   (def ledger (fluree/create ipfs-conn "test/db1"))
 
+  (def l1 (fluree/create file-conn "test/db1"))
+
 
   ledger
+  (def x0 (fluree/stage l1
+                        {"@context" {:id "@id"}
+                         :id (str (java.util.UUID/randomUUID))
+                         "book/title" "Anathem"
+                         "book/author" "Neal Stephenson"}))
+  (def x1 (fluree/stage x0 {"@context" {:id "@id"}
+                            :id (str (java.util.UUID/randomUUID))
+                            "book/title" "Cryptonomicon"
+                            "book/author" "Neal Stephenson"}))
+  (def x2 (fluree/stage x1
+                        {"@context" {:id "@id"}
+                         :id (str (java.util.UUID/randomUUID))
+                         "book/title" "mistborn"
+                         "book/author" "brandon sanderson"}))
+  (def x3 (fluree/commit x2 "Persist to disk!"))
+  x3
+  @(:publish x3)
+  "fluree:file:/home/dan/projects/db/data/publish/HEAD"
 
+  (def y0 (fluree/stage ledger
+                        {"@context" {:id "@id"}
+                         :id (str (java.util.UUID/randomUUID))
+                         "book/title" "Anathem"
+                         "book/author" "Neal Stephenson"}))
+  (def y1 (fluree/stage y0 {"@context" {:id "@id"}
+                            :id (str (java.util.UUID/randomUUID))
+                            "book/title" "Cryptonomicon"
+                            "book/author" "Neal Stephenson"}))
+  (def y2 (fluree/stage y1
+                        {"@context" {:id "@id"}
+                         :id (str (java.util.UUID/randomUUID))
+                         "book/title" "mistborn"
+                         "book/author" "brandon sanderson"}))
+  (def y3 (fluree/commit y2 "Persist to disk!"))
 
   ;; db will contain changes immutably, but link to the main ledger which won't
   ;; be updated until there is a commit

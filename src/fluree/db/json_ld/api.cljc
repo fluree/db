@@ -3,6 +3,7 @@
             [fluree.db.json-ld-db :as jdb]
             [fluree.db.ledger :as ledger]
             [fluree.db.conn.ipfs :as ipfs-conn]
+            [fluree.db.conn.file :as file-conn]
             [fluree.db.json-ld.transact :as jld-tx]
             [fluree.db.json-ld.commit :as jld-commit]
             #?(:clj  [clojure.core.async :as async]
@@ -34,7 +35,7 @@
                           :context (json-ld/parse-context context))]
     (case method
       :ipfs (ipfs-conn/connect opts*)
-
+      :file (file-conn/connect opts*)
       ))
 
   )
