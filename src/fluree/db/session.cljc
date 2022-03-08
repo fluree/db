@@ -9,14 +9,12 @@
             [fluree.db.storage.core :as storage]
             [fluree.db.util.log :as log]
             [fluree.db.operations :as ops]
-            [fluree.db.flake :as flake]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.schema :as schema]
             [fluree.db.conn-events :as conn-events])
-  #?(:clj
-     (:import (fluree.db.flake Flake))))
+  #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -390,7 +388,7 @@
                                     {:status 500 :error :db/unexpected-error :block (pr-str block-result)})))
         {:keys [t status]} tx-result
         t-filter  (if (instance? Flake (first flakes))
-                    #(= t (.-t ^Flake %))
+                    #(= t (flake/t %))
                     #(= t (nth % 3)))
         response  (-> tx-result
                       (assoc :block block

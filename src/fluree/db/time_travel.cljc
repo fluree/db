@@ -1,13 +1,12 @@
 (ns fluree.db.time-travel
-  (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.query.range :as query-range]
+  (:require #?(:clj  [clojure.core.async :as async]
+               :cljs [cljs.core.async :as async])
             [clojure.string :as string]
-            #?(:cljs [fluree.db.flake :refer [Flake]])
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try into?]]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async]))
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.util.core :as util :refer [try* catch*]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -48,8 +47,8 @@
                         (throw (ex-info (str "There is no data as of " epoch-as-of)
                                         {:status 400
                                          :error  :db/invalid-block})))
-          t           (apply min-key #(.-s ^Flake %) ts)]
-      (or (.-s ^Flake t) t (:t db)))))
+          t           (apply min-key #(flake/s %) ts)]
+      (or (flake/s t) t (:t db)))))
 
 (defn- t-to-block
   [db t]
@@ -58,7 +57,7 @@
                         (query-range/index-range :psot >= ["_block/number" t] <= ["_block/number"] {:limit 1})
                         (<?)
                         (first)
-                        (#(let [^Flake f %] (.-o f))))]
+                        (#(let [f %] (flake/o f))))]
       (if (> block 1)
         block 1))))
 
@@ -69,7 +68,7 @@
                                  (query-range/index-range :opst = [t "_block/transactions"])
                                  (<?)
                                  (first)
-                                 (#(let [^Flake f %] (.-s f))))
+                                 (#(let [f %] (flake/s f))))
                 block    (<? (t-to-block db border-t))]
             (if (> block 1)
               block 1))))
@@ -111,7 +110,7 @@
                     (query-range/index-range :post = ["_block/number" block])
                     (<?)
                     (first)
-                    (#(let [^Flake f %] (.-t f))))]
+                    (#(let [f %] (flake/t f))))]
       (when-not block-t
         (throw (ex-info (str "Invalid block key provided: " (pr-str block))
                         {:status 400

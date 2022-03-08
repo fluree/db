@@ -244,7 +244,6 @@
 (defn msg-producer
   "Shuffles outgoing messages to the web socket in order."
   [{:keys [state req-chan publish]
-    :or   {publish default-publish-fn}
     :as   conn}]
   (async/go-loop [i 0]
     (when-let [msg (async/<! req-chan)]
@@ -266,7 +265,8 @@
                  (ex-info (str "Request " req-id " timed out.")
                           {:status 408
                            :error  :db/timeout})))))
-         (let [published? (async/<! (publish conn [operation req-id data]))]
+         (let [publisher  (or publish default-publish-fn)
+               published? (async/<! (publisher conn [operation req-id data]))]
            (when-not (true? published?)
              (cond
                (util/exception? published?)
@@ -492,7 +492,7 @@
                                   ;; map of listener functions registered. key is two-tuple of [network dbid],
                                   ;; value is vector of single-argument callback functions that will receive [header data]
                                   :listeners    {}})
-        {:keys [storage-read storage-exists storage-write storage-rename storage-list
+        {:keys [storage-read storage-exists storage-write storage-rename storage-delete storage-list
                 parallelism req-chan sub-chan pub-chan default-network group
                 object-cache close-fn serializer
                 tx-private-key private-key-file memory
@@ -558,6 +558,7 @@
                             :storage-exists   storage-exists*
                             :storage-write    storage-write
                             :storage-rename   storage-rename
+                            :storage-delete   storage-delete
                             :object-cache     object-cache-fn
                             :parallelism      parallelism
                             :serializer       serializer

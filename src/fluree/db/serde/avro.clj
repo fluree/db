@@ -117,7 +117,7 @@
                  {:name "leaf" :type :boolean}              ;; is this a leaf (data) node?
                  {:name "first", :type "fluree.Flake"}
                  {:name "rhs", :type [:null "fluree.Flake"]}
-                 {:name "size", :type :int}]}))
+                 {:name "size", :type :long}]}))
 
 
 ;;; -----------------------------------------
