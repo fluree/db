@@ -15,10 +15,10 @@
 
   (def ipfs-conn (fluree/connect-ipfs
                    {:server  nil                            ;; use default
-                    :context {:id          "@id"
-                              :type        "@type"
-                              :schema      "http://schema.org/"
-                              :wiki        "https://www.wikidata.org/wiki/"}
+                    :context {:id     "@id"
+                              :type   "@type"
+                              :schema "http://schema.org/"
+                              :wiki   "https://www.wikidata.org/wiki/"}
                     :did     {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
                               :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
                               :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}}))
@@ -33,36 +33,36 @@
 
   ;; db will contain changes immutably, but link to the main ledger which won't
   ;; be updated until there is a commit
-  (def db (fluree/stage
-            ledger
-            {"@context"                  "https://schema.org",
-             "@id"                       "https://www.wikidata.org/wiki/Q836821",
-             "@type"                     ["Movie"],
-             "name"                      "The Hitchhiker's Guide to the Galaxy",
-             "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
-             "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-             "isBasedOn"                 {"@id"    "https://www.wikidata.org/wiki/Q3107329",
-                                          "@type"  "Book",
-                                          "name"   "The Hitchhiker's Guide to the Galaxy",
-                                          "isbn"   "0-330-25864-8",
-                                          "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
-                                                    "@type" "Person"
-                                                    "name"  "Douglas Adams"}}}))
+  (def db @(fluree/stage
+             ledger
+             {"@context"                  "https://schema.org",
+              "@id"                       "https://www.wikidata.org/wiki/Q836821",
+              "@type"                     ["Movie"],
+              "name"                      "The Hitchhiker's Guide to the Galaxy",
+              "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
+              "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+              "isBasedOn"                 {"@id"    "https://www.wikidata.org/wiki/Q3107329",
+                                           "@type"  "Book",
+                                           "name"   "The Hitchhiker's Guide to the Galaxy",
+                                           "isbn"   "0-330-25864-8",
+                                           "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
+                                                     "@type" "Person"
+                                                     "name"  "Douglas Adams"}}}))
 
   db
 
-  (def db2 (fluree/stage
-             db
-             {"@context" "https://schema.org",
-              "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
-                           "name"         "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
-                           "commentCount" 42}]}))
+  (def db2 @(fluree/stage
+              db
+              {"@context" "https://schema.org",
+               "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+                            "name"         "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
+                            "commentCount" 42}]}))
 
   db2
 
   ;; query for Movie and crawl to book
-  @(fluree/query db2 {:select  [:* {:schema/isBasedOn [:*]}]
-                      :from    :wiki/Q836821})
+  @(fluree/query db2 {:select [:* {:schema/isBasedOn [:*]}]
+                      :from   :wiki/Q836821})
 
 
   ;; query for Book with reverse reference
@@ -78,17 +78,21 @@
 
 
 
-  (def db3 (fluree/stage db2
-                         {"@context" "https://schema.org",
-                          "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
-                                       "commentCount" 52}]}))
+  (def db3 @(fluree/stage db2
+                          {"@context" "https://schema.org",
+                           "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+                                        "commentCount" 52}]}))
 
-  (def db4 (fluree/stage db3
-                         {"@context" "https://schema.org",
-                          "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
-                                       "commentCount" 62}]}))
 
-  (-> db4 :novelty :tspo)
+  (def db4 @(fluree/stage db3
+                          {"@context" "https://schema.org",
+                           "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+                                        "commentCount" 62}]}))
+
+
+  @(fluree/query db4 {:select [:*]
+                      :from   :wiki/Q836821})
+
 
   ;; squash last two commits into a single commit
   (def db4* (fluree/squash db4))

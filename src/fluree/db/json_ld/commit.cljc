@@ -12,7 +12,8 @@
             [fluree.json-ld.normalize :as normalize]
             [fluree.db.ledger :as ledger]
             [fluree.db.conn.json-ld-proto :as jld-proto]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]))
+            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
+            [clojure.walk :as walk]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -107,14 +108,26 @@
     (str "did:fluree:" acct-id)))
 
 
+(defn stringify-context
+  "Contexts that use clojure keywords will not translate into valid JSON for
+  serialization. Here we change any keywords to strings."
+  [context]
+  (if (sequential? context)
+    (mapv stringify-context context)
+    (if (map? context)
+      (walk/stringify-keys context)
+      context)))
+
+
 (defn- commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
   [db opts]
   (let [{:keys [ledger branch]} db
         {:keys [context did private message]} opts
-        context*      (if context
-                        (json-ld/parse-context (:context ledger) context)
-                        (:context ledger))
+        context*      (-> (if context
+                            (json-ld/parse-context (:context ledger) context)
+                            (:context ledger))
+                          stringify-context)
         private*      (or private
                           (:private did)
                           (:private (ledger/did ledger)))
