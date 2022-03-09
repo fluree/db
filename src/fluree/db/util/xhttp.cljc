@@ -133,7 +133,7 @@
   It is assumed body is already in a format that can be sent directly in request (already encoded).
 
   Options
-  - output-format - can be :text, :json or :binary (default text), or special format (wikidata) to handle wikidata errors, which come back as html.
+  - output-format - can be :text, :json, :edn or :binary (default :text), or special format (wikidata) to handle wikidata errors, which come back as html.
 
   "
   [url opts]
@@ -171,8 +171,8 @@
                              (throw-if-timeout response)
                              (async/put! response-chan
                                          (case output-format
-                                           :text (bs/to-string body)
-                                           (:json :wikidata) (-> body bs/to-string json/parse)
+                                           (:text :json) (bs/to-string body)
+                                           (:edn :wikidata) (-> body bs/to-string json/parse)
                                            ;; else
                                            (bs/to-byte-array body)))))))
        :cljs (-> axios

@@ -360,8 +360,7 @@
                path         (str/replace k "_" "/")
                address      (async/<! (get-server conn-id servers))
                url          (str address "/fdb/storage/" path)
-               headers      (cond-> {"Accept" #?(:clj  "application/json"
-                                                 :cljs "application/json")}
+               headers      (cond-> {"Accept" "application/json"}
                                     jwt' (assoc "Authorization" (str "Bearer " jwt')))
                headers*     (if private
                               (-> (http-signatures/sign-request "get" url {:headers headers} private)
@@ -369,8 +368,7 @@
                               headers)
                res          (<? (xhttp/get url {:request-timeout 5000
                                                 :headers         headers*
-                                                :output-format   #?(:clj  :text
-                                                                    :cljs :json)}))]
+                                                :output-format   :json}))]
 
            res))))))
 
@@ -505,8 +503,7 @@
                 pub-chan         (async/chan)
                 memory?          false
                 storage-write    (fn [k v] (throw (ex-info (str "Storage write was not implemented on connection, but was called to store key: " k) {})))
-                serializer       #?(:clj  (json-serde)
-                                    :cljs (json-serde))
+                serializer       (json-serde)
                 transactor?      false
                 private-key-file "default-private-key.txt"}} opts
         memory-object-size (quot memory 100000)             ;; avg 100kb per cache object
