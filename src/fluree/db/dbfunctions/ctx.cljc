@@ -35,6 +35,30 @@
             (recur r k v)))))))
 
 
+(defn resolve-ctx
+  "Resolves value for a single ctx for a given user."
+  [db-root ?ctx ctx-sid]
+  (go-try
+    (let [ctx-flakes (<? (query-range/index-range db-root :spot = [ctx-sid]))
+          [k fn-sid] (ctx-flakes->k+fn ctx-flakes)
+          ctx-fn-str (some-> (<? (query-range/index-range db-root :spot = [fn-sid const/$_fn:code]))
+                             first
+                             (#(.-o ^Flake %)))
+          f          (when ctx-fn-str
+                       (<? (dbfunctions/parse-fn db-root ctx-fn-str "functionDec")))
+          result     (when f (extract (f ?ctx)))
+          result*    (if (sequential? result)
+                       (set result)
+                       result)]
+      (if k
+        [k result*]
+        (do
+          (log/warn (str "Context being executed but no corresponding key to set value at for: "
+                         (:network db-root) "/" (:dbid db-root) " ctx-subject _id is: " ctx-sid
+                         " and function being executed is: " ctx-fn-str "."))
+          [])))))
+
+
 (defn build
   [db-root auth-id roles]
   (go-try
@@ -47,22 +71,15 @@
       (loop [[role & r] roles
              ctx {}]
         (if role
-          (let [ctx-sid    (some-> (<? (query-range/index-range db-root :spot = [role const/$_role:ctx]))
-                                   first
-                                   (#(.-o ^Flake %)))
-                ctx-flakes (when ctx-sid (<? (query-range/index-range db-root :spot = [ctx-sid])))
-                [k fn-sid] (ctx-flakes->k+fn ctx-flakes)
-                ctx-fn-str (some-> (<? (query-range/index-range db-root :spot = [fn-sid const/$_fn:code]))
-                                   first
-                                   (#(.-o ^Flake %)))
-                f          (when ctx-fn-str
-                             (<? (dbfunctions/parse-fn db-root ctx-fn-str "functionDec")))
-                result     (when f (extract (f ?ctx)))
-                result*    (if (sequential? result)
-                             (set result)
-                             result)
-                ctx*       (if k
-                             (assoc ctx k result*)
-                             ctx)]
-            (recur r ctx*))
+          (let [role-ctx-chs (some->> (<? (query-range/index-range db-root :spot = [role const/$_role:ctx]))
+                                      not-empty
+                                      (mapv #(resolve-ctx db-root ?ctx (.-o ^Flake %))))]
+            (if role-ctx-chs
+              (recur r (loop [[role-ctx-ch & r*] role-ctx-chs
+                              ctx* ctx]
+                         (if role-ctx-ch
+                           (let [[k v] (<? role-ctx-ch)]
+                             (recur r* (assoc ctx* k v)))
+                           ctx*)))
+              ctx))
           ctx)))))
