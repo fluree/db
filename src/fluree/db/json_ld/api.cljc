@@ -117,7 +117,7 @@
    (let [opts* (if (string? opts)
                  {:message opts}
                  opts)]
-     (jld-commit/db2 db opts*))))
+     (jld-commit/commit db opts*))))
 
 
 (defn push

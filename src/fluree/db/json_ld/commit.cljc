@@ -289,57 +289,63 @@
       (get res return)
       res)))
 
-(defn db2
+(defn commit
+  "Commits all uncommitted transactions, writing them to disk and updating the pointer to the most recent commit."
+  ;; TODO: error handling - if a commit fails we need to stop immediately
   [db opts]
-  (let [{:keys [t novelty commit ledger]} db
-        conn           (:conn ledger)
-        {:keys [message ctx-used-atom type-key branch compact did] :as opts*} (commit-opts db opts)
-        ;; TODO - tsop index can get below flakes more efficiently once exists
-        flakes         (filter #(= t (flake/t %)) (:spot novelty))
-        {:keys [assert retract refs-ctx]} (generate-commit db (reverse flakes) opts*)
-        final-ctx      (conj base-context (merge-with merge @ctx-used-atom refs-ctx))
+  (loop [{head-t :t :as db} db
+         commits []]
+    (let [{:keys [novelty commit ledger]} db
+          committed-t (:t commit 0)
+          t           (dec committed-t)
+          flakes      (filter #(= t (flake/t %)) (:tspo novelty))]
+      (cond (= committed-t head-t) commits
 
-        ;; TODO - why is there no commit key after stage?
-        ;; TODO - commits move into ledger state
-        prev-commit    (:id commit)
-        branch-commit  (:branch commit)
-        ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
-                         @(:ledger commit))
+            (empty? flakes) (recur (assoc-in db [:commit :t] t) commits)
 
-        doc            (cond-> {"@context"                                      final-ctx
-                                type-key                                        [(compact "https://flur.ee/ns/block/Commit")]
-                                (compact "https://flur.ee/ns/block/branchName") (util/keyword->str branch)
-                                (compact "https://flur.ee/ns/block/t")          (- t)
-                                (compact "https://flur.ee/ns/block/time")       (util/current-time-iso)}
-                               prev-commit (assoc (compact "https://flur.ee/ns/block/prev") prev-commit)
-                               branch-commit (assoc (compact "https://flur.ee/ns/block/branch") branch-commit)
-                               ledger-address (assoc (compact "https://flur.ee/ns/block/ledger") ledger-address)
-                               message (assoc (compact "https://flur.ee/ns/block/message") message)
-                               (seq assert) (assoc (compact "https://flur.ee/ns/block/assert") assert)
-                               (seq retract) (assoc (compact "https://flur.ee/ns/block/retract") retract))
-        hash-key       (compact "https://flur.ee/ns/block/hash")
-        {:keys [commit hash] :as commit-res} (add-commit-hash doc hash-key)
-        {:keys [credential] :as cred-res} (when did
-                                            (cred/generate commit opts*))
-        commit-json    (if credential
-                         (cred/credential-json cred-res)
-                         (commit-json commit-res hash-key))
-        id             (jld-proto/c-write conn commit-json)
-        publish-p      (jld-proto/push conn id)
-        db*            (assoc db :t t
-                                 :commit {:t      t
-                                          :hash   hash
-                                          :id     id
-                                          :branch (or (:branch commit) id)
-                                          :ledger publish-p})
-        res            {:credential credential
-                        :commit     commit
-                        :json       commit-json
-                        :id         id
-                        :publish    publish-p               ;; promise with eventual result once successful
-                        :hash       hash
-                        :db-before  db
-                        :db-after   db*}]
-    res)
+            :else
+            (let [{:keys [message ctx-used-atom type-key branch compact did] :as opts*} (commit-opts db opts)
+                  {:keys [assert retract refs-ctx]} (generate-commit db (reverse flakes) opts*)
+                  final-ctx      (conj base-context (merge-with merge @ctx-used-atom refs-ctx))
+                  prev-commit    (:id commit)
+                  branch-commit  (:branch commit)
+                  ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
+                                   @(:ledger commit))
 
-  )
+                  doc            (cond-> {"@context"                                      final-ctx
+                                          type-key                                        [(compact "https://flur.ee/ns/block/Commit")]
+                                          (compact "https://flur.ee/ns/block/branchName") (util/keyword->str branch)
+                                          (compact "https://flur.ee/ns/block/t")          (- t)
+                                          ;; TODO: this timestamp makes this function non-deterministic, should we allow passing in the time?
+                                          (compact "https://flur.ee/ns/block/time")       (util/current-time-iso)}
+                                   prev-commit (assoc (compact "https://flur.ee/ns/block/prev") prev-commit)
+                                   branch-commit (assoc (compact "https://flur.ee/ns/block/branch") branch-commit)
+                                   ledger-address (assoc (compact "https://flur.ee/ns/block/ledger") ledger-address)
+                                   message (assoc (compact "https://flur.ee/ns/block/message") message)
+                                   (seq assert) (assoc (compact "https://flur.ee/ns/block/assert") assert)
+                                   (seq retract) (assoc (compact "https://flur.ee/ns/block/retract") retract))
+                  hash-key       (compact "https://flur.ee/ns/block/hash")
+                  {:keys [commit hash] :as commit-res} (add-commit-hash doc hash-key)
+                  {:keys [credential] :as cred-res} (when did
+                                                      (cred/generate commit opts*))
+                  commit-json    (if credential
+                                   (cred/credential-json cred-res)
+                                   (commit-json commit-res hash-key))
+                  ;; TODO: can we move these side effects outside of commit? Hard to do that and keep writes atomic...
+                  conn           (:conn ledger)
+                  id             (jld-proto/c-write conn commit-json)
+                  publish-p      (jld-proto/push conn id)
+                  db*            (assoc db :commit {:t t
+                                                    :hash hash
+                                                    :id id
+                                                    :branch (or (:branch commit) id)
+                                                    :ledger publish-p})
+                  res            {:credential credential
+                                  :commit     commit
+                                  :json       commit-json
+                                  :id         id
+                                  :publish    publish-p ;; promise with eventual result once successful
+                                  :hash       hash
+                                  :db-before  db
+                                  :db-after   db*}]
+              (recur db* (conj commits res)))))))
