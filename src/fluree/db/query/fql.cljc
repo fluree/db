@@ -997,16 +997,17 @@
       (let [max-fuel (:max-fuel opts')
             fuel     (or (:fuel opts)                       ;; :fuel volatile! can be provided upstream
                          (when (or max-fuel (:meta opts))
-                           (volatile! 0)))]
+                           (volatile! 0)))
+            db*      (assoc db :ctx-cache (volatile! {}))]  ;; allow caching of some functions when available
         (if (sequential? where)
           ;; ad-hoc query
-          (ad-hoc-query db fuel max-fuel query-map opts')
+          (ad-hoc-query db* fuel max-fuel query-map opts')
           ;; all other queries
           (go-try
             (let [select-smt   (or select selectOne selectDistinct
                                    (throw (ex-info "Query missing :select or :selectOne." {:status 400 :error :db/invalid-query})))
                   {:keys [orderBy limit component offset]} opts'
-                  select-spec  (parse-db db select-smt opts')
+                  select-spec  (parse-db db* select-smt opts')
                   select-spec' (if (not (nil? component))
                                  (assoc select-spec :componentFollow? component)
                                  select-spec)
@@ -1018,8 +1019,8 @@
                   result       (cond
                                  (string? where)
                                  (let [default-collection (when (string? from) from)
-                                       subjects           (<? (where-filter db where default-collection {:limit limit :offset offset}))]
-                                   (<? (subject-select db cache fuel max-fuel select-spec'
+                                       subjects           (<? (where-filter db* where default-collection {:limit limit :offset offset}))]
+                                   (<? (subject-select db* cache fuel max-fuel select-spec'
                                                        subjects (if orderBy nil limit) (if orderBy nil offset))))
 
                                  ;; predicate-based query
@@ -1028,28 +1029,28 @@
                                                         fuel (comp (fuel-flake-transducer fuel max-fuel))
                                                         true (comp (distinct)))
                                        opts     (if orderBy {} {:limit limit :offset offset})
-                                       subjects (->> (<? (query-range/index-range db :psot = [from] opts))
+                                       subjects (->> (<? (query-range/index-range db* :psot = [from] opts))
                                                      (sequence xf))]
-                                   (<? (subject-select db cache fuel max-fuel select-spec' subjects limit)))
+                                   (<? (subject-select db* cache fuel max-fuel select-spec' subjects limit)))
 
 
                                  ;; collection-based query -> _block or _tx
                                  (and (string? from) (#{"_block" "_tx"} from))
                                  (let [opts   (if orderBy {} {:limit limit :offset offset})
-                                       flakes (<? (query-range/_block-or_tx-collection db opts))]
-                                   (<? (flake-select db cache fuel max-fuel select-spec' flakes)))
+                                       flakes (<? (query-range/_block-or_tx-collection db* opts))]
+                                   (<? (flake-select db* cache fuel max-fuel select-spec' flakes)))
 
                                  ;; collection-based query
                                  (string? from)
                                  (let [opts              (if orderBy {} {:limit limit :offset offset})
-                                       collection-flakes (<? (query-range/collection db from opts))]
-                                   (<? (flake-select db cache fuel max-fuel select-spec' collection-flakes)))
+                                       collection-flakes (<? (query-range/collection db* from opts))]
+                                   (<? (flake-select db* cache fuel max-fuel select-spec' collection-flakes)))
 
                                  ;; single subject _id provided
                                  (util/subj-ident? from)
-                                 (let [subjects (some-> (<? (dbproto/-subid db from false))
+                                 (let [subjects (some-> (<? (dbproto/-subid db* from false))
                                                         (vector))
-                                       res      (<? (subject-select db cache fuel max-fuel select-spec' subjects limit offset))]
+                                       res      (<? (subject-select db* cache fuel max-fuel select-spec' subjects limit offset))]
                                    (when fuel (vswap! fuel inc)) ;; charge 1 for the lookup
                                    res)
 
@@ -1062,13 +1063,13 @@
                                                     (let [s    (if (int? n)
                                                                  n
                                                                  (do (when fuel (vswap! fuel inc))
-                                                                     (<? (dbproto/-subid db n false))))
+                                                                     (<? (dbproto/-subid db* n false))))
                                                           acc* (if s
                                                                  (conj acc s)
                                                                  acc)]
                                                       (recur r acc*))))
                                        subjects (into [] subjects)]
-                                   (<? (subject-select db cache fuel max-fuel select-spec' subjects (if orderBy nil limit) (if orderBy nil offset))))
+                                   (<? (subject-select db* cache fuel max-fuel select-spec' subjects (if orderBy nil limit) (if orderBy nil offset))))
 
                                  :else
                                  (ex-info (str "Invalid 'from' in query:" (pr-str query-map))
