@@ -124,7 +124,7 @@
 
 (defn vocab-map*
   "Helper to vocab-map that does core vocab mapping logic with already resolved flakes
-  so does not return asyn chan.
+  so does not return async chan.
 
   refs is a set of predicate ids (pids) that are refs to other properties."
   [db-t refs vocab-flakes]

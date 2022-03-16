@@ -490,3 +490,87 @@
 (defn json-ld-db?
   [db]
   (instance? JsonLdDb db))
+
+(comment
+
+  (def conn (memory-conn/connect))
+
+  (def db (blank-db conn "blah" "hi" (atom {}) (fn [] (throw (Exception. "NO CURRENT DB FN YET")))))
+
+  db
+
+  (def flakes (fluree.db.json-ld.flakes/json-ld-graph->flakes
+                {"@context" {"owl" "http://www.w3.org/2002/07/owl#",
+                             "ex"  "http://example.org/ns#"},
+                 "@graph"   [{"@id"   "ex:ontology",
+                              "@type" "owl:Ontology"}
+                             {"@id"   "ex:Book",
+                              "@type" "owl:Class"}
+                             {"@id"   "ex:Person",
+                              "@type" "owl:Class"}
+                             {"@id"   "ex:author",
+                              "@type" "owl:ObjectProperty"}
+                             {"@id"   "ex:name",
+                              "@type" "owl:DatatypeProperty"}
+                             {"@type"     "ex:Book",
+                              "ex:author" {"@id" "_:b1"}}
+                             {"@id"     "_:b1",
+                              "@type"   "ex:Person",
+                              "ex:name" {"@value" "Fred"
+                                         "@type"  "xsd:string"}}
+                             {"@id"     "ex:someMember",
+                              "@type"   "ex:Person",
+                              "ex:name" {"@value" "Brian"
+                                         "@type"  "xsd:string"}}]}
+                {}))
+
+  flakes
+
+
+  (def db2 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes))))
+
+  (-> db2
+      :novelty)
+
+  @(fluree.db.api/query (async/go db2)
+                        {:context {"ex" "http://example.org/ns#"}
+                         :select  ["*"]
+                         :from    "http://example.org/ns#someMember"})
+
+  @(fluree.db.api/query (async/go db2)
+                        {:context {"ex" "http://example.org/ns#"}
+                         :select  ["?p" "?o"]
+                         :where   [["http://example.org/ns#someMember" "?p" "?o"]]})
+
+  (async/<!! (schema/schema-map db2))
+
+
+
+  (def flakes2 (fluree.db.json-ld.flakes/json-ld-graph->flakes
+                 {"@context" "https://schema.org/",
+                  "@graph"   [{"@id"             "http://worldcat.org/entity/work/id/2292573321",
+                               "@type"           "Book",
+                               "author"          {"@id" "http://viaf.org/viaf/17823"},
+                               "inLanguage"      "fr",
+                               "name"            "Rouge et le noir",
+                               "workTranslation" {"@type" "Book", "@id" "http://worldcat.org/entity/work/id/460647"}}
+                              {"@id"               "http://worldcat.org/entity/work/id/460647",
+                               "@type"             "Book",
+                               "about"             "Psychological fiction, French",
+                               "author"            {"@id" "http://viaf.org/viaf/17823"},
+                               "inLanguage"        "en",
+                               "name"              "Red and Black : A New Translation, Backgrounds and Sources, Criticism",
+                               "translationOfWork" {"@id" "http://worldcat.org/entity/work/id/2292573321"},
+                               "translator"        {"@id" "http://viaf.org/viaf/8453420"}}]}
+                 {}))
+  flakes2
+
+  (def db3 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes2))))
+
+  (-> db3 :schema :pred (get "https://schema.org/Book"))
+
+  @(fluree.db.api/query (async/go db3)
+                        {:context "https://schema.org/"
+                         :select  {"?s" ["*", {"workTranslation" ["*"]}]}
+                         :where   [["?s" "a" "Book"]]})
+  )

@@ -40,7 +40,7 @@
         uncommitted? (> t commit)]
     {:name      branch-name
      :t         t
-     :dbs       dbs                                         ;; copy any uncommitted dbs from prior branch
+     :dbs       dbs ; copy any uncommitted dbs from prior branch
      :commit    commit
      :idx       idx
      :latest-db nil
