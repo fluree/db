@@ -297,17 +297,18 @@
 
 (defn tx-data
   "Convert the novelty flakes into the json-ld shape."
-  [{:keys [novelty] :as db} {:keys [compact] :as opts}]
-  (let [txs (->> (:tspo novelty)
+  [{:keys [novelty ledger] :as db} {:keys [compact] :as opts}]
+  (let [[_ committed-t] (ledger/last-commit ledger)
+        txs (->> (:tspo novelty)
+                 (filter #(< (flake/t %) committed-t))
                  (group-by flake/t)
                  (map (fn [[t flakes]] (-> (generate-commit db (reverse flakes) opts)
                                            (assoc :t t))))
                  (map (fn [{:keys [assert retract t refs-ctx]}]
                         (cond-> {(compact "https://flur.ee/ns/tx#t") (- t)}
-                          ;; TODO:
                           (seq refs-ctx) (assoc "@context" refs-ctx)
-                          (seq assert) (assoc (compact "https://flur.ee/ns/tx#assert") assert)
-                          (seq retract) (assoc (compact "https://flur.ee/ns/tx#retract") retract)))))]
+                          (seq assert)   (assoc (compact "https://flur.ee/ns/tx#assert") assert)
+                          (seq retract)  (assoc (compact "https://flur.ee/ns/tx#retract") retract)))))]
     txs))
 
 
@@ -319,7 +320,6 @@
         ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
                          @(:ledger commit))
         tx-hash        (tx-hash (json-ld/normalize-data txs))]
-    ;; TODO: rename to /ns/commit to avoid overlap with current fluree blocks
     (cond-> {"@context" base-context
              type-key [(compact "https://flur.ee/ns/commit")]
              (compact "https://flur.ee/ns/commit#branchName") (util/keyword->str branch)
@@ -334,10 +334,9 @@
 
 (defn commit
   "Commits all uncommitted transactions, writing them to disk and updating the pointer to the most recent commit."
-  ;; TODO: figure out commit from ledger, not from db
   ;; TODO: error handling - if a commit fails we need to stop immediately
   [db opts]
-  (let [{:keys [commit ledger t]} db
+  (let [{:keys [branch commit ledger t]} db
         {:keys [did] :as opts*}   (commit-opts db opts)
 
         jld-txs    (tx-data db opts*)
@@ -355,8 +354,10 @@
         db*       (assoc db :commit {:t      t
                                      :hash   hash
                                      :id     id
-                                     :branch (or (:branch commit) id)
+                                     :branch branch
                                      :ledger publish-p})]
+    ;; TODO: properly update branch state
+    (swap! (:state ledger) #(update-in % [:branches branch] merge {:t t :commit hash}))
     {:credential credential
      :commit commit
      :json doc
