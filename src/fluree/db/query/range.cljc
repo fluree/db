@@ -171,46 +171,15 @@
            (async/pipeline-async 2 out-ch auth-fn flake-slices)
            out-ch)))))
 
-(defn take-only
-  [ch limit]
-  (if limit
-    (async/take limit ch)
-    ch))
-
-(defn filter-subject-frame
-  "If either `limit` or `offset` is non-nil, regroup the flakes from the input
-  `flake-slices` channel from slices corresponding to index nodes into slices
-  corresponding to ledger subjects, then remove the first `offset` of the
-  subject slices (if `offset` is non-nil) and remove all but `limit` subject
-  slices after the offset (if `limit` is non-nil). The input channel is returned
-  unchanged if both `limit` and `offset` is nil."
-  [limit offset flake-slices]
-  (if (or limit offset)
-    (let [offset  (or offset 0)
-          subj-ch (chan 1 (comp cat
-                                (partition-by flake/s)
-                                (drop offset)))]
-      (-> flake-slices
-          (async/pipe subj-ch)
-          (take-only limit)))
-    flake-slices))
-
-(defn into-flake-set
-  "Combines the collections of flakes from the input `flake-slices` channel into a
-  single sorted flake set, sorted by the supplied comparator `cmp`. The output
-  flake set will contain no more than `flake-limit` flakes if `flake-limit` is
-  not nil."
-  [cmp flake-limit flake-slices]
-  (let [flakeset-xf (map (fn [flakes]
-                           (apply flake/sorted-set-by cmp flakes)))]
-    (if flake-limit
-      (let [flake-ch (async/pipe flake-slices
-                                 (chan 1 (comp cat
-                                               (partition-all flake-limit)
-                                               flakeset-xf)))]
-        (async/take 1 flake-ch))
-      (-> (async/reduce into [] flake-slices)
-          (async/pipe (chan 1 flakeset-xf))))))
+(defn subject-page-filter
+  [limit offset flake-limit]
+  (let [page-xfs (cond-> [cat]
+                   (or limit offset) (conj (partition-by flake/s))
+                   offset            (conj (drop offset))
+                   limit             (conj (take limit))
+                   (or limit offset) (conj cat)
+                   flake-limit       (conj (take flake-limit)))]
+    (apply comp page-xfs)))
 
 (defn resolved-leaf?
   [node]
@@ -232,18 +201,18 @@
   [{:keys [conn] :as db}
    error-ch
    {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
-  (let [idx-root  (get db idx)
-        idx-cmp   (get-in db [:comparators idx])
-        novelty   (get-in db [:novelty idx])
-        in-range? (fn [node]
-                    (intersects-range? node start-flake end-flake))
-        query-xf  (extract-query-flakes (assoc opts
-                                               :novelty novelty
-                                               :object-cache (:object-cache conn)))]
+  (let [idx-root    (get db idx)
+        idx-cmp     (get-in db [:comparators idx])
+        novelty     (get-in db [:novelty idx])
+        in-range?   (fn [node]
+                      (intersects-range? node start-flake end-flake))
+        query-xf    (extract-query-flakes (assoc opts
+                                                 :novelty novelty
+                                                 :object-cache (:object-cache conn)))
+        page-filter (subject-page-filter limit offset flake-limit)]
     (->> (index/tree-chan conn idx-root in-range? resolved-leaf? 1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
-         (filter-subject-frame limit offset)
-         (into-flake-set idx-cmp flake-limit))))
+         (async/transduce page-filter conj (flake/sorted-set-by idx-cmp)))))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
