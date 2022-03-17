@@ -11,7 +11,8 @@
             [fluree.db.query.schema :as schema]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try merge-into?]])
+            [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [fluree.db.query.analytical-parse :as q-parse])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -519,32 +520,6 @@
                  (recur r acc*))))))))))
 
 
-(defn parse-map [x valid-var]
-  (let [_             (when-not (= 1 (count (keys x)))
-                        (throw (ex-info (str "Invalid aggregate selection, provided: " x)
-                                        {:status 400 :error :db/invalid-query})))
-        var-as-symbol (-> x keys first symbol)
-        _             (when-not (valid-var var-as-symbol)
-                        (throw (ex-info (str "Invalid select variable in aggregate select, provided: " x)
-                                        {:status 400 :error :db/invalid-query})))]
-    {:variable  var-as-symbol
-     :selection (-> x vals first)}))
-
-(defn parse-select
-  [vars interim-vars select-smt]
-  (let [_        (or (every? #(or (string? %) (map? %)) select-smt)
-                     (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt) {:status 400 :error :db/invalid-query})))
-        vars     (set vars)
-        all-vars (set (concat vars (keys interim-vars)))]
-    (map (fn [select]
-           (let [var-symbol (if (map? select) nil (-> select symbol))]
-             (cond (vars var-symbol) {:variable var-symbol}
-                   (analytical/aggregate? select) (analytical/parse-aggregate select vars)
-                   (map? select) (parse-map select all-vars)
-                   (get interim-vars var-symbol) {:value (get interim-vars var-symbol)}
-                   :else (throw (ex-info (str "Invalid select in statement, provided: " select)
-                                         {:status 400 :error :db/invalid-query}))))) select-smt)))
-
 (defn get-pretty-print-keys
   [select]
   (let [vars  (map (fn [select]
@@ -920,32 +895,6 @@
                     :else res)))))
 
 
-(defn get-ad-hoc-select-spec
-  [headers vars {:keys [selectOne select selectDistinct selectReduced]} opts]
-  (let [select-smt    (or selectOne select selectDistinct selectReduced)
-        inVector?     (vector? select-smt)
-        select-smt    (if inVector? select-smt [select-smt])
-        parsed-select (parse-select headers vars select-smt)
-        aggregates    (filter #(contains? % :code) parsed-select)
-        expandMap?    (some #(contains? % :selection) parsed-select)
-        aggregates    (if (empty? aggregates) nil aggregates)
-        orderBy       (when-let [orderBy (:orderBy opts)]
-                        (if (or (string? orderBy) (and (vector? orderBy) (#{"DESC" "ASC"} (first orderBy))))
-                          (if (vector? orderBy) orderBy ["ASC" orderBy])
-                          (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
-                                          {:status 400
-                                           :error  :db/invalid-query}))))]
-    {:select          parsed-select
-     :aggregates      aggregates
-     :expandMaps?     expandMap?
-     :orderBy         orderBy
-     :groupBy         (:groupBy opts)
-     :limit           (or (:limit opts) 100)
-     :offset          (or (:offset opts) 0)
-     :selectOne?      (boolean selectOne)
-     :selectDistinct? (boolean (or selectDistinct selectReduced))
-     :inVector?       inVector?
-     :prettyPrint     (or (:prettyPrint opts) false)}))
 
 (defn construct-triples
   [{:keys [construct] :as query-map} {:keys [headers tuples] :as where-result}]
@@ -961,7 +910,8 @@
 (defn- ad-hoc-query
   [db fuel max-fuel query-map opts]
   (go-try
-    (let [where-result (<? (analytical/q query-map fuel max-fuel db opts))]
+    (let [parsed-query (q-parse/parse query-map opts)
+          where-result (<? (analytical/q query-map fuel max-fuel db opts))]
       (cond (util/exception? where-result)
             where-result
 
@@ -969,8 +919,7 @@
             ;(construct-triples query-map where-result)
 
             :else
-            (let [select-spec (get-ad-hoc-select-spec (:headers where-result) (:vars where-result)
-                                                      query-map opts)]
+            (let [select-spec (:select parsed-query)]
               (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))))
 
 (defn query
