@@ -1,5 +1,7 @@
 (ns fluree.db.query.analytical-parse
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [fluree.db.full-text :as full-text]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -110,9 +112,16 @@
      :code     agg-fn}))
 
 (defn aggregate?
+  "Aggregate as positioned in a :select statement"
   [x]
   (and (string? x)
        (re-matches #"^\(.+\)$" x)))
+
+(defn query-fn?
+  "Query function as positioned in a :where statement"
+  [x]
+  (and (string? x)
+       (re-matches #"^#\(.+\)$" x)))
 
 (defn q-var->symbol
   "Returns a query variable as a symbol, else nil if not a query variable."

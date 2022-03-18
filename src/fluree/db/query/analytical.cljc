@@ -14,7 +14,8 @@
             [clojure.string :as str]
             [fluree.db.util.log :as log]
             #?(:cljs [cljs.reader])
-            [fluree.db.dbproto :as dbproto])
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.query.analytical-parse :as parse])
   #?(:clj (:import (java.io Closeable)
                    (fluree.db.flake Flake))))
 
@@ -22,10 +23,6 @@
 
 (defn variable? [form]
   (when (and (or (string? form) (keyword? form) (symbol? form)) (= (first (name form)) \?))
-    (symbol form)))
-
-(defn internal-filter? [form]
-  (when (and (or (string? form) (keyword? form) (symbol? form)) (= (first (name form)) \#) (= (second (name form)) \())
     (symbol form)))
 
 (defn escaped-string?
@@ -72,10 +69,11 @@
                            (update :search #(conj % nil))
                            (assoc-in [:rel key-as-var] idx))
 
-                       (and (internal-filter? key) (= idx 2))
+                       (and (= idx 2) (parse/query-fn? key))
                        (let [filter-code (#?(:clj read-string :cljs cljs.reader/read-string) (subs key 1))
                              var         (or (get-vars filter-code)
-                                             (throw (ex-info (str "Filter function must contain a valid variable. Provided: " key) {:status 400 :error :db/invalid-query})))
+                                             (throw (ex-info (str "Filter function must contain a valid variable. Provided: " key)
+                                                             {:status 400 :error :db/invalid-query})))
                              [fun _] (filter/valid-filter? filter-code #{var})
                              filter-fn   (filter/get-internal-filter-fn var fun)]
                          (-> acc
@@ -683,12 +681,11 @@
 (defn tuples->filter-optional
   [headers tuples valid-vars filter-code-opts]
   (reduce (fn [tuples filt]
-            (let [var-atom        (atom #{})
-                  [filt* filt-vars] (or (filter/valid-filter? filt valid-vars var-atom)
+            (let [[filt* filt-vars] (or (filter/valid-filter? filt valid-vars)
                                         (throw (ex-info (str "Invalid filter, provided: " filt)
                                                         {:status 400 :error :db/invalid-query})))
                   filt-str        (str filt*)
-                  filt-vars-idxs  (map #(util/index-of headers %) @filt-vars)
+                  filt-vars-idxs  (map #(util/index-of headers %) filt-vars)
                   filtered-tuples (reduce (fn [acc clause]
                                             (if (every? #(nth clause %) filt-vars-idxs)
                                               (if (filter/filter-row headers clause filt-str)
