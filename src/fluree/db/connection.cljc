@@ -1,7 +1,7 @@
 (ns fluree.db.connection
   (:require [clojure.string :as str]
             #?(:clj [environ.core :as environ])
-            #?(:clj  [clojure.core.async :as async]
+            #?(:clj  [clojure.core.async :as async :refer [go <!]]
                :cljs [cljs.core.async :as async])
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
@@ -111,9 +111,10 @@
 
 (defrecord Connection [id servers state req-chan sub-chan pub-chan group
                        storage-read storage-write storage-exists storage-rename
-                       object-cache parallelism serializer default-network
-                       transactor? publish transact-handler tx-private-key
-                       tx-key-id meta add-listener remove-listener close]
+                       object-cache async-cache parallelism serializer
+                       default-network transactor? publish transact-handler
+                       tx-private-key tx-key-id meta add-listener
+                       remove-listener close]
 
   storage/Store
   (read [_ k]
@@ -130,12 +131,12 @@
     [conn {:keys [id leaf tempid] :as node}]
     (if (= :empty id)
       (storage/resolve-empty-leaf node)
-      (object-cache
-       [id tempid]
+      (async-cache
+       [::resolve id tempid]
        (fn [_]
          (storage/resolve-index-node conn node
                                      (fn []
-                                       (object-cache [id tempid] nil)))))))
+                                       (async-cache [::resolve id tempid] nil)))))))
 
   #?@(:clj
       [full-text/IndexConnection
@@ -373,18 +374,36 @@
            res))))))
 
 
+(defn- lookup-cache
+  [cache-atom k value-fn]
+  (if (nil? value-fn)
+    (swap! cache-atom cache/evict k)
+    (when-let [v (get @cache-atom k)]
+      (do (swap! cache-atom cache/hit k)
+          v))))
+
 (defn- default-object-cache-fn
-  "Default object cache to use for ledger."
+  "Default synchronous object cache to use for ledger."
   [cache-atom]
   (fn [k value-fn]
-    (if (nil? value-fn)
-      (swap! cache-atom cache/evict k)
-      (if-let [v (get @cache-atom k)]
-        (do (swap! cache-atom cache/hit k)
-            v)
-        (let [v (value-fn k)]
-          (swap! cache-atom cache/miss k v)
-          v)))))
+    (if-let [v (lookup-cache cache-atom k value-fn)]
+      v
+      (let [v (value-fn k)]
+        (swap! cache-atom cache/miss k v)
+        v))))
+
+(defn- default-async-cache-fn
+  "Default asynchronous object cache to use for ledger."
+  [cache-atom]
+  (fn [k value-fn]
+    (let [out (async/chan)]
+      (if-let [v (lookup-cache cache-atom k value-fn)]
+        (async/put! out v)
+        (go
+          (let [v (<! (value-fn k))]
+            (swap! cache-atom cache/miss k v)
+            (async/put! out v))))
+      out)))
 
 
 (defn- default-object-cache-factory
@@ -492,7 +511,7 @@
                                   :listeners    {}})
         {:keys [storage-read storage-exists storage-write storage-rename storage-delete storage-list
                 parallelism req-chan sub-chan pub-chan default-network group
-                object-cache close-fn serializer
+                object-cache async-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
                 private keep-alive-fn]
@@ -512,6 +531,8 @@
         default-cache-atom (atom (default-object-cache-factory memory-object-size))
         object-cache-fn    (or object-cache
                                (default-object-cache-fn default-cache-atom))
+        async-cache-fn     (or async-cache
+                               (default-async-cache-fn default-cache-atom))
         conn-id            (str (util/random-uuid))
         close              (fn []
                              (async/close! req-chan)
@@ -557,6 +578,7 @@
                             :storage-rename   storage-rename
                             :storage-delete   storage-delete
                             :object-cache     object-cache-fn
+                            :async-cache      async-cache-fn
                             :parallelism      parallelism
                             :serializer       serializer
                             :default-network  default-network
