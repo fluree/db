@@ -231,7 +231,7 @@
         resolver    (index/wrap-t-range conn async-cache novelty from-t to-t)]
     (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
-         (async/transduce (comp filter-page into-set) conj []))))
+         (async/transduce filter-page conj []))))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
