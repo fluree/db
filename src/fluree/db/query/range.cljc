@@ -109,8 +109,7 @@
   with one flake collection for each input leaf."
   [{:keys [from-t to-t novelty start-flake start-test end-flake end-test
            object-cache] :as opts}]
-  (comp (map (fn [leaf]
-               (index/t-range leaf novelty from-t to-t object-cache)))
+  (comp (map :flakes)
         (map (fn [flakes]
                (flake/subrange flakes
                                start-test start-flake
@@ -200,17 +199,20 @@
   flakes from `db` that meet the criteria specified in the `opts` map."
   [{:keys [conn] :as db}
    error-ch
-   {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
-  (let [idx-root    (get db idx)
+   {:keys [idx start-flake end-flake limit offset flake-limit from-t to-t] :as opts}]
+  (let [{:keys [async-cache object-cache]} conn
+
+        idx-root    (get db idx)
         idx-cmp     (get-in db [:comparators idx])
         novelty     (get-in db [:novelty idx])
         in-range?   (fn [node]
                       (intersects-range? node start-flake end-flake))
         query-xf    (extract-query-flakes (assoc opts
                                                  :novelty novelty
-                                                 :object-cache (:object-cache conn)))
-        page-filter (subject-page-filter limit offset flake-limit)]
-    (->> (index/tree-chan conn idx-root in-range? resolved-leaf? 1 query-xf error-ch)
+                                                 :object-cache object-cache))
+        page-filter (subject-page-filter limit offset flake-limit)
+        resolver    (index/wrap-t-range conn async-cache novelty from-t to-t)]
+    (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
          (async/transduce page-filter conj (flake/sorted-set-by idx-cmp)))))
 

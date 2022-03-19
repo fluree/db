@@ -36,6 +36,16 @@
     "Populate index branch and leaf node maps with either their child node
      attributes or the flakes the store, respectively."))
 
+(defn try-resolve
+  [r error-ch node]
+  (go
+    (try* (<? (resolve r node))
+          (catch* e
+                  (log/error e
+                             "Error resolving index node:"
+                             (select-keys node [:id :network :dbid]))
+                  (>! error-ch e)))))
+
 (defn resolved?
   "Returns `true` if the data associated with the index node map `node` is fully
   resolved from storage"
@@ -245,6 +255,25 @@
         (t-range leaf novelty from-t to-t)))
      (t-range leaf novelty from-t to-t))))
 
+(defn wrap-t-range
+  [resolver async-cache novelty from-t to-t]
+  (reify
+    Resolver
+    (resolve [_ {:keys [id tempid tt-id] :as node}]
+      (if (branch? node)
+        (resolve resolver node)
+        (async-cache
+         [::t-range id tempid tt-id from-t to-t]
+         (fn [_]
+           (go-try
+            (let [resolved (<? (resolve resolver node))
+                  flakes   (t-range resolved novelty from-t to-t)]
+              (-> resolved
+                  (assoc ::from-t from-t
+                         ::to-t   to-t
+                         :flakes  flakes)
+                  (dissoc :t))))))))))
+
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
   `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later
@@ -276,15 +305,10 @@
 
 (defn resolve-when
   [r resolve? error-ch node]
-  (go
-    (try* (if (resolve? node)
-            (<? (resolve r node))
-            node)
-          (catch* e
-                  (log/error e
-                             "Error resolving index node:"
-                             (select-keys node [:id :network :dbid]))
-                  (>! error-ch e)))))
+  (if (resolve? node)
+    (try-resolve r error-ch node)
+    (doto (chan)
+      (async/put! node))))
 
 (defn resolve-children-when
   [r resolve? error-ch branch]

@@ -12,7 +12,7 @@
             #?(:clj [fluree.crypto :as crypto])
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.xhttp :as xhttp]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util :refer [try* catch* exception?]]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.query.http-signatures :as http-signatures]
@@ -401,7 +401,8 @@
         (async/put! out v)
         (go
           (let [v (<! (value-fn k))]
-            (swap! cache-atom cache/miss k v)
+            (when-not (exception? v)
+              (swap! cache-atom cache/miss k v))
             (async/put! out v))))
       out)))
 
