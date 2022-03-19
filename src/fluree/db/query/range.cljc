@@ -107,8 +107,7 @@
   map. The result of the transformation will be a stream of collections of
   flakes from both the leaves in the input stream and the supplied `:novelty`,
   with one flake collection for each input leaf."
-  [{:keys [from-t to-t novelty start-flake start-test end-flake end-test
-           object-cache] :as opts}]
+  [{:keys [from-t to-t novelty start-flake start-test end-flake end-test] :as opts}]
   (comp (map :flakes)
         (map (fn [flakes]
                (flake/subrange flakes
@@ -177,21 +176,6 @@
                    flake-limit       (conj (take flake-limit)))]
     (apply comp page-xfs)))
 
-(defn into-flake-set
-  [cmp]
-  (fn [xf]
-    (fn
-      ([]
-       (xf))
-
-      ([res nxt]
-       (xf res nxt))
-
-      ([res]
-       (->> res
-            xf
-            (apply flake/sorted-set-by cmp))))))
-
 (defn resolved-leaf?
   [node]
   (and (index/leaf? node)
@@ -212,7 +196,7 @@
   [{:keys [conn] :as db}
    error-ch
    {:keys [idx start-flake end-flake limit offset flake-limit from-t to-t] :as opts}]
-  (let [{:keys [async-cache object-cache]}
+  (let [{:keys [async-cache]}
         conn
 
         idx-root    (get db idx)
@@ -220,11 +204,8 @@
         novelty     (get-in db [:novelty idx])
         in-range?   (fn [node]
                       (intersects-range? node start-flake end-flake))
-        query-xf    (extract-query-flakes (assoc opts
-                                                 :novelty novelty
-                                                 :object-cache object-cache))
+        query-xf    (extract-query-flakes (assoc opts :novelty novelty))
         filter-page (filter-subject-page limit offset flake-limit)
-        into-set    (into-flake-set idx-cmp)
         resolver    (index/wrap-t-range conn async-cache novelty from-t to-t)]
     (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
