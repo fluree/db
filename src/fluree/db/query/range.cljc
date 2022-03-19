@@ -170,7 +170,7 @@
            (async/pipeline-async 2 out-ch auth-fn flake-slices)
            out-ch)))))
 
-(defn subject-page-filter
+(defn filter-subject-page
   [limit offset flake-limit]
   (let [page-xfs (cond-> [cat]
                    (or limit offset) (conj (partition-by flake/s))
@@ -179,6 +179,21 @@
                    (or limit offset) (conj cat)
                    flake-limit       (conj (take flake-limit)))]
     (apply comp page-xfs)))
+
+(defn into-flake-set
+  [cmp]
+  (fn [xf]
+    (fn
+      ([]
+       (xf))
+
+      ([res nxt]
+       (xf res nxt))
+
+      ([res]
+       (->> res
+            xf
+            (apply flake/sorted-set-by cmp))))))
 
 (defn resolved-leaf?
   [node]
@@ -200,7 +215,8 @@
   [{:keys [conn] :as db}
    error-ch
    {:keys [idx start-flake end-flake limit offset flake-limit from-t to-t] :as opts}]
-  (let [{:keys [async-cache object-cache]} conn
+  (let [{:keys [async-cache object-cache]}
+        conn
 
         idx-root    (get db idx)
         idx-cmp     (get-in db [:comparators idx])
@@ -210,11 +226,12 @@
         query-xf    (extract-query-flakes (assoc opts
                                                  :novelty novelty
                                                  :object-cache object-cache))
-        page-filter (subject-page-filter limit offset flake-limit)
+        filter-page (filter-subject-page limit offset flake-limit)
+        into-set    (into-flake-set idx-cmp)
         resolver    (index/wrap-t-range conn async-cache novelty from-t to-t)]
     (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
-         (async/transduce page-filter conj (flake/sorted-set-by idx-cmp)))))
+         (async/transduce (comp filter-page into-set) conj []))))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
