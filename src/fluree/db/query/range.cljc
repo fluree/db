@@ -161,11 +161,8 @@
        (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
          flake-slices
          (let [auth-fn (fn [flakes ch]
-                         (go
-                           (let [allowed-flakes (<! (authorize-flakes db error-ch flakes))]
-                             (when (seq allowed-flakes)
-                               (>! ch allowed-flakes))
-                             (async/close! ch))))
+                         (-> (authorize-flakes db error-ch flakes)
+                             (async/pipe ch)))
                out-ch  (chan)]
            (async/pipeline-async 2 out-ch auth-fn flake-slices)
            out-ch)))))
