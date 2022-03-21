@@ -167,14 +167,20 @@
            out-ch)))))
 
 (defn filter-subject-page
-  [limit offset flake-limit]
+  [limit offset]
+  (let [subject-page-xfs (cond-> [(partition-by flake/s)]
+                           offset (conj (drop offset))
+                           limit  (conj (take limit))
+                           true   (conj cat))]
+    (apply comp subject-page-xfs)))
+
+(defn into-page
+  [limit offset flake-limit flake-slices]
   (let [page-xfs (cond-> [cat]
-                   (or limit offset) (conj (partition-by flake/s))
-                   offset            (conj (drop offset))
-                   limit             (conj (take limit))
-                   (or limit offset) (conj cat)
-                   flake-limit       (conj (take flake-limit)))]
-    (apply comp page-xfs)))
+                   (or limit offset) (conj (filter-subject-page limit offset))
+                   flake-limit       (conj (take flake-limit)))
+        page-xf  (apply comp page-xfs)]
+    (async/transduce page-xf conj [] flake-slices)))
 
 (defn resolved-leaf?
   [node]
@@ -203,12 +209,11 @@
         resolver       (index/->CachedTRangeResolver conn novelty from-t to-t async-cache)
         in-range?      (fn [node]
                          (intersects-range? node start-flake end-flake))
-        query-xf       (extract-query-flakes opts)
-        filter-page-xf (filter-subject-page limit offset flake-limit)]
+        query-xf       (extract-query-flakes opts)]
     (->> (index/tree-chan resolver idx-root in-range? resolved-leaf?
                           1 query-xf error-ch)
          (filter-authorized db start-flake end-flake error-ch)
-         (async/transduce filter-page-xf conj []))))
+         (into-page limit offset flake-limit))))
 
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
