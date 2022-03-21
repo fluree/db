@@ -246,33 +246,24 @@
          stale-flakes (stale-by from-t latest)
          subsequent   (filter-after to-t latest)
          out-of-range (concat stale-flakes subsequent)]
-     (flake/disj-all latest out-of-range)))
-  ([{:keys [id tempid tt-id] :as leaf} novelty from-t to-t object-cache]
-   (if object-cache
-     (object-cache
-      [::t-range id tempid tt-id from-t to-t]
-      (fn [_]
-        (t-range leaf novelty from-t to-t)))
-     (t-range leaf novelty from-t to-t))))
+     (flake/disj-all latest out-of-range))))
 
-(defn wrap-t-range
-  [resolver async-cache novelty from-t to-t]
-  (reify
-    Resolver
-    (resolve [_ {:keys [id tempid tt-id] :as node}]
-      (if (branch? node)
-        (resolve resolver node)
-        (async-cache
-         [::t-range id tempid tt-id from-t to-t]
-         (fn [_]
-           (go-try
-            (let [resolved (<? (resolve resolver node))
-                  flakes   (t-range resolved novelty from-t to-t)]
-              (-> resolved
-                  (assoc ::from-t from-t
-                         ::to-t   to-t
-                         :flakes  flakes)
-                  (dissoc :t))))))))))
+(defrecord CachedTRangeResolver [node-resolver novelty from-t to-t async-cache]
+  Resolver
+  (resolve [_ {:keys [id tempid tt-id] :as node}]
+    (if (branch? node)
+      (resolve node-resolver node)
+      (async-cache
+       [::t-range id tempid tt-id from-t to-t]
+       (fn [_]
+         (go-try
+          (let [resolved (<? (resolve node-resolver node))
+                flakes   (t-range resolved novelty from-t to-t)]
+            (-> resolved
+                (dissoc :t)
+                (assoc :from-t from-t
+                       :to-t   to-t
+                       :flakes  flakes)))))))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
