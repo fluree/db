@@ -88,6 +88,20 @@
          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
      (flake/->Flake s' p o' t op m'))))
 
+(defn resolved-leaf?
+  [node]
+  (and (index/leaf? node)
+       (index/resolved? node)))
+
+(defn intersects-range?
+  "Returns true if the supplied `node` contains flakes between the `lower` and
+  `upper` flakes, according to the `node`'s comparator."
+  [{cmp :comparator, :as node} lower upper]
+  (not (or (and (:rhs node)
+                (neg? (cmp (:rhs node) lower)))
+           (and (not (:leftmost? node))
+                (neg? (cmp upper (:first node)))))))
+
 (defn query-filter
   "Returns a transducer to filter flakes according to the boolean function values
   of the `:subject-fn`, `:predicate-fn`, and `:object-fn` keys from the supplied
@@ -115,6 +129,15 @@
                                end-test end-flake)))
         (map (fn [flakes]
                (into [] (query-filter opts) flakes)))))
+
+(defn resolve-flake-slices
+  [{:keys [async-cache] :as conn} root novelty error-ch
+   {:keys [from-t to-t start-flake end-flake] :as opts}]
+  (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t async-cache)
+        in-range? (fn [node]
+                    (intersects-range? node start-flake end-flake))
+        query-xf  (extract-query-flakes opts)]
+    (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
 
 (defn unauthorized?
   [f]
@@ -182,36 +205,15 @@
         page-xf  (apply comp page-xfs)]
     (async/transduce page-xf conj [] flake-slices)))
 
-(defn resolved-leaf?
-  [node]
-  (and (index/leaf? node)
-       (index/resolved? node)))
-
-(defn intersects-range?
-  "Returns true if the supplied `node` contains flakes between the `lower` and
-  `upper` flakes, according to the `node`'s comparator."
-  [{cmp :comparator, :as node} lower upper]
-  (not (or (and (:rhs node)
-                (neg? (cmp (:rhs node) lower)))
-           (and (not (:leftmost? node))
-                (neg? (cmp upper (:first node)))))))
-
 (defn index-range*
-  "Return a channel that will eventually hold a single sorted set of the range of
+  "Return a channel that will eventually hold a sorted vector of the range of
   flakes from `db` that meet the criteria specified in the `opts` map."
   [{:keys [conn] :as db}
    error-ch
-   {:keys [idx start-flake end-flake limit offset flake-limit from-t to-t] :as opts}]
-  (let [idx-root       (get db idx)
-        idx-cmp        (get-in db [:comparators idx])
-        novelty        (get-in db [:novelty idx])
-        async-cache    (:async-cache conn)
-        resolver       (index/->CachedTRangeResolver conn novelty from-t to-t async-cache)
-        in-range?      (fn [node]
-                         (intersects-range? node start-flake end-flake))
-        query-xf       (extract-query-flakes opts)]
-    (->> (index/tree-chan resolver idx-root in-range? resolved-leaf?
-                          1 query-xf error-ch)
+   {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
+  (let [idx-root (get db idx)
+        novelty  (get-in db [:novelty idx])]
+    (->> (resolve-flake-slices conn idx-root novelty error-ch opts)
          (filter-authorized db start-flake end-flake error-ch)
          (into-page limit offset flake-limit))))
 
