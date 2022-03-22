@@ -565,9 +565,9 @@
 
 (defn calculate-aggregate
   [res agg]
-  (let [{:keys [variable as code]} agg
+  (let [{:keys [variable as function]} agg
         agg-params (flatten (select-from-tuples [variable] res))
-        agg-result (code agg-params)]
+        agg-result (function agg-params)]
     [as agg-result]))
 
 (defn add-aggregate-cols

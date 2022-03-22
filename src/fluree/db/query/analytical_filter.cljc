@@ -197,6 +197,12 @@
   (eval `(fn [~var]
            ~fun)))
 
+(defn make-executable
+  "Like the legacy get-internal-filter-fn, but allows for multiple vars."
+  [params fun]
+  (eval `(fn ~params
+           ~fun)))
+
 (comment
 
   (filter-row ['?nums '?fruit '?age] [1 "apple" 15] "(bound ?nums)"))
