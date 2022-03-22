@@ -910,7 +910,7 @@
 (defn- ad-hoc-query
   [db fuel max-fuel query-map opts]
   (go-try
-    (let [parsed-query (q-parse/parse query-map opts)
+    (let [parsed-query (q-parse/parse db query-map)
           where-result (<? (analytical/q query-map fuel max-fuel db opts))]
       (cond (util/exception? where-result)
             where-result

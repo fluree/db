@@ -305,7 +305,6 @@
   however there should be exactly one var in the filter fn that isn't in that map - which should be the
   var that will receive flake/o."
   [params supplied-vars]
-  (log/warn "get-obj-var: " [params supplied-vars])
   (let [non-assigned-vars (remove #(contains? supplied-vars %) params)]
     (case (count non-assigned-vars)
       1 (first non-assigned-vars)
