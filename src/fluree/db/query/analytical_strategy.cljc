@@ -21,7 +21,7 @@
 
 (defn- where-subj-xf
   "Transducing function to extract matching subjects from initial where clause."
-  [{:keys [novelty from-t to-t object-cache start-test start-flake end-test end-flake]}]
+  [{:keys [start-test start-flake end-test end-flake]}]
   (comp
     (map :flakes)
     (map (fn [flakes]
@@ -46,21 +46,16 @@
         start-flake (flake/->Flake nil p* o* nil nil -2147483647)
         end-flake   (flake/->Flake nil p* o* nil nil 2147483647)
         idx         :post
-        opts        {:object-fn   nil
-                     :idx         idx
-                     :from-t      t
-                     :to-t        t
-                     :start-test  >=
-                     :start-flake start-flake
-                     :end-test    <=
-                     :end-flake   end-flake}
         idx-root    (get db idx)
+        cmp         (:comparator idx-root)
+        range-set   (flake/sorted-set-by cmp start-flake end-flake)
         in-range?   (fn [node]
-                      (query-range/intersects-range? node start-flake end-flake))
-        query-xf    (where-subj-xf (assoc opts
-                                     :novelty novelty
-                                     :object-cache (:object-cache conn)))
-        resolver    (index/wrap-t-range conn (:async-cache conn) novelty t t)
+                      (query-range/intersects-range? node range-set))
+        query-xf    (where-subj-xf {:start-test  >=
+                                    :start-flake start-flake
+                                    :end-test    <=
+                                    :end-flake   end-flake})
+        resolver    (index/->CachedTRangeResolver conn novelty t t (:async-cache conn))
         tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
     tree-chan))
 
