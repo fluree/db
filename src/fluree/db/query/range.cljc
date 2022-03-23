@@ -119,7 +119,7 @@
   "Returns a transducer to extract flakes from each leaf from a stream of index
   leaf nodes that satisfy the bounds specified in the supplied query options
   map. The result of the transformation will be a stream of collections of
-  flakes from both the leaves in the input stream, with one flake collection for
+  flakes from the leaf nodes in the input stream, with one flake collection for
   each input leaf."
   [{:keys [start-flake start-test end-flake end-test] :as opts}]
   (comp (map :flakes)
@@ -131,6 +131,9 @@
                (into [] (query-filter opts) flakes)))))
 
 (defn resolve-flake-slices
+  "Returns a channel that will contain a stream of chunked flake collections that
+  contain the flakes between `start-flake` and `end-flake` and are within the
+  transaction range starting at `from-t` and ending at `to-t`."
   [{:keys [async-cache] :as conn} root novelty error-ch
    {:keys [from-t to-t start-flake end-flake] :as opts}]
   (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t async-cache)
@@ -192,6 +195,9 @@
            out-ch)))))
 
 (defn filter-subject-page
+  "Returns a transducer to filter a stream of flakes to only contain flakes from
+  at most `limit` subjects, skipping the flakes from the first `offset`
+  subjects."
   [limit offset]
   (let [subject-page-xfs (cond-> [(partition-by flake/s)]
                            offset (conj (drop offset))
@@ -200,6 +206,11 @@
     (apply comp subject-page-xfs)))
 
 (defn into-page
+  "Collects flakes from the stream of flake collections in the `flake-slices`
+  channel into a sorted vector according to the `limit`, `offset`, and
+  `flake-limit` parameters. The result will have flakes from at most `limit`
+  subjects, not including flakes from the first `offset` subjects, and having at
+  most `flake-limit` flakes in total."
   [limit offset flake-limit flake-slices]
   (let [page-xfs (cond-> [cat]
                    (or limit offset) (conj (filter-subject-page limit offset))
