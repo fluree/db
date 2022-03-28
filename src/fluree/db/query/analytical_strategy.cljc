@@ -8,7 +8,9 @@
             [fluree.db.flake :as flake]
             [fluree.db.query.fql-parser :refer [parse-db]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.schema :as schema-util]
+            [fluree.db.permissions-validate :as perm-validate]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -21,42 +23,47 @@
 
 (defn- where-subj-xf
   "Transducing function to extract matching subjects from initial where clause."
-  [{:keys [start-test start-flake end-test end-flake]}]
-  (comp
-    (map :flakes)
-    (map (fn [flakes]
-           (flake/subrange flakes
-                           start-test start-flake
-                           end-test end-flake)))
-    (map (fn [flakes]
-           (map flake/s flakes)))))
+  [{:keys [start-test start-flake end-test end-flake xf]}]
+  (apply comp (cond-> [(map :flakes)
+                       (map (fn [flakes]
+                              (flake/subrange flakes
+                                              start-test start-flake
+                                              end-test end-flake)))]
+                      xf (conj xf)
+                      true (conj (map (fn [flakes]
+                                        (map flake/s flakes)))))))
+
 
 ;; TODO - what if the first clause has a filter fn in the .-o location?
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
   [{:keys [conn novelty t] :as db} error-ch where-clause]
-  (let [{:keys [s p o]} where-clause
-        p*          (or (dbproto/-p-prop db :id p)
-                        (throw (ex-info (str "Invalid predicate in query: " p)
-                                        {:status 400 :error :db/invalid-query})))
-        o*          (if-let [val (:value o)]
-                      val
-                      (throw (ex-info (str "TODO: NOT YET IMPLEMENTED " o) o)))
-        start-flake (flake/->Flake nil p* o* nil nil -2147483647)
-        end-flake   (flake/->Flake nil p* o* nil nil 2147483647)
-        idx         :post
-        idx-root    (get db idx)
-        cmp         (:comparator idx-root)
-        range-set   (flake/sorted-set-by cmp start-flake end-flake)
-        in-range?   (fn [node]
-                      (query-range/intersects-range? node range-set))
-        query-xf    (where-subj-xf {:start-test  >=
-                                    :start-flake start-flake
-                                    :end-test    <=
-                                    :end-flake   end-flake})
-        resolver    (index/->CachedTRangeResolver conn novelty t t (:async-cache conn))
-        tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
+  (let [{:keys [s p o idx]} where-clause
+        o*        (cond
+                    (contains? o :value) (:value o)
+                    (nil? o) nil
+                    :else (throw (ex-info (str "TODO: NOT YET IMPLEMENTED " o) o)))
+        [fflake lflake] (case idx
+                          :post [(flake/->Flake nil p o* nil nil -2147483647)
+                                 (flake/->Flake nil p o* nil nil 2147483647)]
+                          :psot [(flake/->Flake nil p nil nil nil -2147483647)
+                                 (flake/->Flake nil p nil nil nil 2147483647)])
+        idx-root  (get db idx)
+        cmp       (:comparator idx-root)
+        range-set (flake/sorted-set-by cmp fflake lflake)
+        in-range? (fn [node]
+                    (query-range/intersects-range? node range-set))
+        query-xf  (where-subj-xf {:start-test  >=
+                                  :start-flake fflake
+                                  :end-test    <=
+                                  :end-flake   lflake
+                                  ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
+                                  :xf          (when (and (= :psot idx) o*)
+                                                 (map (fn [flakes]
+                                                        (filter #(= o* (flake/o %)) flakes))))})
+        resolver  (index/->CachedTRangeResolver conn novelty t t (:async-cache conn))
+        tree-chan (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
     tree-chan))
 
 
@@ -72,14 +79,14 @@
                        :selection)]
     (parse-db db select-smt opts)))
 
-(defn keep-subject?
+(defn filter-subject
   "Filters a set of flakes for a single subject and returns true if
   the subject meets the filter map.
 
   filter-map is a map where pred-ids are keys and values are a list of filtering functions
   where each flake of pred-id must return a truthy value if the subject is allowed.
   "
-  [flakes vars filter-map]
+  [vars filter-map flakes]
   ;; TODO - fns with multiple vars will have to re-calc vars every time, this could be done once for the entire query
   (loop [[f & r] flakes]
     (if f
@@ -87,31 +94,72 @@
         (when (every? (fn [func] (func f vars)) filter-fns)
           (recur r))
         (recur r))
-      true)))
+      flakes)))
 
+(defn subj-perm-filter-fn
+  "Returns a specific filtering function which takes all subject flakes and
+  returns the flakes allowed, or nil if none are allowed."
+  [{:keys [permissions] :as db}]
+  (let [pred-permissions?  (contains? permissions :predicate)
+        coll-permissions   (:collection permissions)
+        filter-cache       (atom {})
+        default-deny?      (if (true? (:default coll-permissions))
+                             false
+                             true)
+        filter-predicates? (fn [cid]
+                             (if-some [cached (get @filter-cache cid)]
+                               cached
+                               (let [coll-perm (get coll-permissions cid)
+                                     filter?   (cond
+                                                 (schema-util/is-schema-cid? cid)
+                                                 false
+
+                                                 pred-permissions?
+                                                 true
+
+                                                 (nil? coll-perm)
+                                                 default-deny?
+
+                                                 (and (contains? coll-perm :all)
+                                                      (= 1 (count coll-perm)))
+                                                 false
+
+                                                 :else true)]
+                                 (swap! filter-cache assoc cid filter?)
+                                 filter)))]
+    (fn [flakes]
+      (go-try
+        (let [fflake (first flakes)]
+          (if (-> fflake flake/s flake/sid->cid filter-predicates?)
+            (<? (perm-validate/allow-flakes? db flakes))
+            (when (<? (perm-validate/allow-flake? db fflake))
+              flakes)))))))
 
 (defn pipeline-select
   "Returns a channel that will eventually return a stream of flake slices
   containing only the schema flakes and the flakes validated by
   fluree.db.permissions-validate/allow-flake? function for the database `db`
   from the `flake-slices` channel"
-  [db cache max-n fuel max-fuel select-spec error-ch queue-ch vars filter-map]
-  (let [res-ch (async/chan)
-        stop!  (fn [e] (when e (async/put! error-ch e)) (async/close! queue-ch) nil)
-        af     (fn [sid port]
-                 (async/go
-                   (try*
-                     (let [flakes (<? (query-range/index-range db :spot = [sid]))
-                           keep?  (if filter-map
-                                    (keep-subject? flakes vars filter-map)
-                                    true)]
-                       (when keep?
-                         (->> (<? (fluree.db.query.fql/flakes->res db cache fuel max-fuel select-spec flakes))
-                              (async/put! port))))
-                     (async/close! port)
-                     (catch* e (stop! e) (async/close! port) nil))))]
+  [db cache max-n fuel-vol max-fuel select-spec error-ch queue-ch vars filter-map]
+  (let [res-ch        (async/chan)
+        permissioned? (not (get-in db [:permissions :root?]))
+        permissions   (when permissioned?
+                        (subj-perm-filter-fn db))
+        stop!         (fn [e] (when e (async/put! error-ch e)) (async/close! queue-ch) nil)
+        af            (fn [sid port]
+                        (async/go
+                          (try*
+                            (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
+                                                  filter-map (filter-subject vars filter-map)
+                                                  permissioned? permissions
+                                                  permissioned? <?)]
+                              (some->> (<? (fluree.db.query.fql/flakes->res db cache fuel-vol max-fuel select-spec flakes))
+                                      not-empty
+                                      (async/put! port))
+                              (async/close! port))
+                            (catch* e (stop! e) (async/close! port) nil))))]
 
-    (async/pipeline-async 3 res-ch af queue-ch)
+    (async/pipeline-async 2 res-ch af queue-ch)
 
     (async/go
       (loop [acc    []
@@ -130,7 +178,7 @@
 
             :else
             (let []
-              (if (> @fuel max-fuel)
+              (if (> @fuel-vol max-fuel)
                 (stop! (ex-info (str "Query exceeded max fuel while processing: " max-fuel
                                      ". If you have permission, you can set the max fuel for a query with: 'opts': {'fuel' 10000000}")
                                 {:error :db/insufficient-fuel :status 400}))
@@ -149,16 +197,13 @@
   "
   [db {:keys [vars where] :as parsed-query}]
   (go-try
-    (let [{:keys [limit max-fuel]
-           :or   {limit    util/max-integer
-                  max-fuel util/max-long}} parsed-query
+    (let [{:keys [limit fuel]} parsed-query
           error-ch    (async/chan)
           subj-chunks (subjects-chan db error-ch (first where))
           filter-map  (:s-filter (second where))
           cache       (volatile! {})
-          fuel        (volatile! 0)
-          select-spec (retrieve-select-spec db parsed-query)
-          subj-filter (constantly true)]
+          fuel-atom   (volatile! 0)
+          select-spec (retrieve-select-spec db parsed-query)]
       (loop [res []
              n   0]
         (let [[subj-chunk ch] (async/alts! [error-ch subj-chunks])]
@@ -172,7 +217,7 @@
             :else
             (let [queue-ch (async/chan)
                   _        (async/onto-chan! queue-ch subj-chunk)
-                  next-res (<? (pipeline-select db cache (- limit n) fuel max-fuel select-spec error-ch queue-ch vars filter-map))
+                  next-res (<? (pipeline-select db cache (- limit n) fuel-atom fuel select-spec error-ch queue-ch vars filter-map))
                   res*     (into res next-res)
                   n*       (count res*)]
               (if (= limit n*)

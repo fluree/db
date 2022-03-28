@@ -5,7 +5,8 @@
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]))
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.query.range :as query-range]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -438,28 +439,77 @@
   (let [fulltext? (str/starts-with? p "fullText:")
         rdf-type? (or (= "rdf:type" p)
                       (= "a" p))
+        _id?      (= "_id" p)
         s*        (or (q-var->symbol s) s)
         p*        (cond
                     fulltext? (full-text/parse-domain p)
                     rdf-type? :rdf/type
+                    _id? :_id
                     :else (if db
                             (or (dbproto/-p-prop db :id p)
                                 (throw (ex-info (str "Invalid predicate: " p)
                                                 {:status 400 :error :db/invalid-query})))
                             p))
-        o*        (if-let [var (q-var->symbol o)]
-                    {:variable var}
-                    (if (query-fn? o)
-                      (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
-                        {:variable (:variable parsed-filter-map)
-                         :filter   parsed-filter-map})
-                      (if (util/pred-ident? o)
-                        {:ident o}
-                        {:value o})))]
-    {:type (if fulltext? :full-text :tuple)
-     :s    s*
-     :p    p*
-     :o    o*}))
+        p-idx?    (when p* (dbproto/-p-prop db :idx? p*))   ;; is the predicate indexed?
+        p-tag?    (when p* (= :tag (dbproto/-p-prop db :type p)))
+        o*        (cond
+                    p-tag?
+                    {:tag o}
+
+                    (query-fn? o)
+                    (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
+                      {:variable (:variable parsed-filter-map)
+                       :filter   parsed-filter-map})
+
+                    (util/pred-ident? o)
+                    {:ident o}
+
+                    (q-var->symbol o)
+                    {:variable (q-var->symbol o)}
+
+                    (nil? o)
+                    nil
+
+                    :else
+                    {:value o})
+        idx       (cond
+                    fulltext?
+                    :full-text
+
+                    rdf-type?
+                    :spot
+
+                    (and s* (not (symbol? s*)))
+                    :spot
+
+                    (and p-idx? (:value o*))
+                    :post
+
+                    p
+                    (do (when (:value o*)
+                          (log/info (str "Searching for a property value on unindexed predicate: " p
+                                         ". Consider making property indexed for improved performance "
+                                         "and lower fuel consumption.")))
+                      :psot)
+
+                    o
+                    :opst
+
+                    :else
+                    (throw (ex-info (str "Unable to determine query type for where statement: "
+                                         [s p o] ".")
+                                    {:status 400 :error :db/invalid-query})))]
+    {:type   (cond
+               fulltext? :full-text
+               rdf-type? :rdf/type
+               _id? :_id
+               :else :tuple)
+     :idx    idx
+     :s      s*
+     :p      p*
+     :o      o*
+     :p-tag? p-tag?
+     :p-idx? p-idx?}))
 
 (defn parse-remote-tuple
   "When a specific DB is used (not default) for a where statement.
@@ -680,14 +730,50 @@
     (assoc parsed-query :group-by group-by*)))
 
 
+(defn get-limit
+  "Extracts limit, if available, and verifies it is a positive integer.
+  Uses Integer/max as default if not present."
+  [{:keys [limit opts] :as _query-map'}]
+  (let [limit* (or limit
+                   (:limit opts)
+                   util/max-integer)]
+    (when-not (pos-int? limit*)
+      (throw (ex-info (str "Invalid query limit specified: " limit*)
+                      {:status 400 :error :db/invalid-query})))
+    limit*))
+
+(defn get-offset
+  "Extracts offset, if specified, and verifies it is a positive integer.
+  Uses 0 as default if not present."
+  [{:keys [offset opts] :as _query-map'}]
+  (let [offset* (or offset
+                    (:offset opts)
+                    0)]
+    (when-not (>= offset* 0)
+      (throw (ex-info (str "Invalid query offset specified: " offset*)
+                      {:status 400 :error :db/invalid-query})))
+    offset*))
+
+(defn get-max-fuel
+  "Extracts max-fuel from query if specified, or uses Integer/max a default."
+  [{:keys [fuel] :as _query-map'}]
+  (let [fuel* (or fuel
+                  util/max-integer)]
+    (when-not (> fuel* 0)
+      (throw (ex-info (str "Invalid query fuel specified: " fuel*)
+                      {:status 400 :error :db/invalid-query})))
+    fuel*))
+
+
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [limit offset opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
+  [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
   (let [parsed (cond-> {:strategy     :legacy
                         :where        (parse-where db query-map' supplied-vars)
                         :opts         opts
-                        :limit        (or limit (:limit opts)) ;; limit can be a primary key, or within :opts
-                        :offset       (or offset (:offset opts)) ;; offset can be a primary key, or within :opts
+                        :limit        (get-limit query-map') ;; limit can be a primary key, or within :opts
+                        :offset       (get-offset query-map') ;; offset can be a primary key, or within :opts
+                        :fuel         (get-max-fuel query-map')
                         :pretty-print (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
                                         prettyPrint
                                         (:prettyPrint opts))}
