@@ -28,8 +28,10 @@
         (throw (ex-info (str "Invalid function: " str)
                         {:status 400 :error :db/invalid-query})))
       res)
-    (catch* _ (throw (ex-info (str "Invalid function: " str)
-                              {:status 400 :error :db/invalid-query})))))
+    (catch* e
+            (log/warn "Invalid query function attempted: " str " with error message: " (ex-message e))
+            (throw (ex-info (str "Invalid query function: " str)
+                            {:status 400 :error :db/invalid-query})))))
 
 (def built-in-aggregates
   (letfn [(sum [coll] (reduce + 0 coll))
@@ -490,7 +492,7 @@
                           (log/info (str "Searching for a property value on unindexed predicate: " p
                                          ". Consider making property indexed for improved performance "
                                          "and lower fuel consumption.")))
-                      :psot)
+                        :psot)
 
                     o
                     :opst
@@ -631,7 +633,8 @@
   so other strategies can be tried."
   [{:keys [where] :as parsed-query}]
   (let [first-where (first where)
-        first-s     (when (and (= :tuple (:type first-where))
+        first-type  (:type first-where)
+        first-s     (when (and (#{:rdf/type :tuple} first-type)
                                (symbol? (:s first-where)))
                       (:s first-where))]
     (when first-s
@@ -643,7 +646,7 @@
             (let [{:keys [value filter]} o
                   f (cond
                       value
-                      (fn [flake _] (= val (flake/o flake)))
+                      (fn [flake _] (= value (flake/o flake)))
 
                       filter
                       (let [{:keys [params variable function]} filter]
