@@ -434,6 +434,27 @@
        :variable var
        :value    binding-val})))
 
+(defn- value-type-map
+  "For both 's' and 'o', returns a map with respective value
+  that indicates the value's type and if needed other information.
+
+
+  'o' values have special handling before calling this function as they can
+  also have 'tag' values or query-functions."
+  [value]
+  (cond
+    (util/pred-ident? value)
+    {:ident value}
+
+    (q-var->symbol value)
+    {:variable (q-var->symbol value)}
+
+    (nil? value)
+    nil
+
+    :else
+    {:value value}))
+
 
 (defn parse-where-tuple
   "Parses where clause tuples (not maps)"
@@ -442,7 +463,7 @@
         rdf-type? (or (= "rdf:type" p)
                       (= "a" p))
         _id?      (= "_id" p)
-        s*        (or (q-var->symbol s) s)
+        s*        (value-type-map s)
         p*        (cond
                     fulltext? (full-text/parse-domain p)
                     rdf-type? :rdf/type
@@ -463,17 +484,8 @@
                       {:variable (:variable parsed-filter-map)
                        :filter   parsed-filter-map})
 
-                    (util/pred-ident? o)
-                    {:ident o}
-
-                    (q-var->symbol o)
-                    {:variable (q-var->symbol o)}
-
-                    (nil? o)
-                    nil
-
                     :else
-                    {:value o})
+                    (value-type-map o))
         idx       (cond
                     fulltext?
                     :full-text
@@ -481,7 +493,7 @@
                     rdf-type?
                     :spot
 
-                    (and s* (not (symbol? s*)))
+                    (and s* (not (:variable s*)))
                     :spot
 
                     (and p-idx? (:value o*))
@@ -588,7 +600,6 @@
           where+filters)))))
 
 
-
 (defn subject-crawl?
   "Returns true if, when given parsed query, the select statement is a
   subject crawl - meaning there is nothing else in the :select except a
@@ -597,20 +608,6 @@
   (and (:expandMaps? select)
        (not (:inVector? select))))
 
-
-(defn simple-where?
-  "Checks where clause to determine if we can execute a simple-subject-crawl?
-
-  A simple where is when each statement is a 3-tuple,"
-  [{:keys [where select] :as _parsed-query}]
-  (let [where-var (-> select :select first :variable)]
-    (loop [[{:keys [type s]} & r] where]
-      (if (nil? s)
-        true
-        (cond
-          (not= :tuple type) false
-          (not= s where-var) false
-          :else (recur r))))))
 
 (defn fill-fn-params
   "A filtering function in the :o space may utilize other supplied variables
@@ -635,14 +632,14 @@
   (let [first-where (first where)
         first-type  (:type first-where)
         first-s     (when (and (#{:rdf/type :tuple} first-type)
-                               (symbol? (:s first-where)))
-                      (:s first-where))]
+                               (-> first-where :s :variable))
+                      (-> first-where :s :variable))]
     (when first-s
       (loop [[{:keys [type s p o] :as where-smt} & r] (rest where)
              revised-where {}]
         (if where-smt
           (when (and (= :tuple type)
-                     (= first-s s))
+                     (= first-s (:variable s)))
             (let [{:keys [value filter]} o
                   f (cond
                       value
@@ -673,8 +670,7 @@
   {:select {?subjects ['*']
    :where [...]}"
   [parsed-query]
-  (when (and (subject-crawl? parsed-query)
-             (not (contains? parsed-query :filter)))
+  (when (subject-crawl? parsed-query)
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
 

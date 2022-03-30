@@ -53,10 +53,12 @@
                      :limit         limit
                      :offset        offset
                      :permissioned? (not (get-in db [:permissions :root?]))
-                     :parallelism   3}]
+                     :parallelism   3
+                     :f-where       f-where
+                     :query         parsed-query}]
     (if rdf-type?
-      (rdf-type-crawl f-where error-ch opts)
-      (subj-crawl f-where error-ch opts))))
+      (rdf-type-crawl opts)
+      (subj-crawl opts))))
 
 
 (comment

@@ -82,7 +82,7 @@
 
 
 (defn subj-crawl
-  [f-where error-ch {:keys [db limit offset parallelism] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism] :as opts}]
   (go-try
     (let [sid-ch    (subjects-chan db error-ch f-where)
           flakes-af (flakes-xf opts)
