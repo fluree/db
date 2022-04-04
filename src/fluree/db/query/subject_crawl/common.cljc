@@ -7,7 +7,8 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.util.schema :as schema-util]
-            [fluree.db.permissions-validate :as perm-validate]))
+            [fluree.db.permissions-validate :as perm-validate]
+            [fluree.db.query.fql-resp :refer [flakes->res]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -28,7 +29,7 @@
   (fn [flakes port]
     (go
       (try*
-        (some->> (<? (fluree.db.query.fql/flakes->res db cache fuel-vol max-fuel select-spec flakes))
+        (some->> (<? (flakes->res db cache fuel-vol max-fuel select-spec flakes))
                  not-empty
                  (async/put! port))
         (async/close! port)

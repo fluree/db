@@ -12,7 +12,9 @@
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try merge-into?]]
-            [fluree.db.query.analytical-parse :as q-parse])
+            [fluree.db.query.analytical-parse :as q-parse]
+            [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
+            [fluree.db.query.fql-resp :as fql-resp])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -910,17 +912,12 @@
 (defn- ad-hoc-query
   [db fuel max-fuel query-map opts]
   (go-try
-    (let [parsed-query (q-parse/parse db query-map)
-          where-result (<? (analytical/q query-map fuel max-fuel db opts))]
-      (cond (util/exception? where-result)
-            where-result
-
-            ;(:construct query-map)
-            ;(construct-triples query-map where-result)
-
-            :else
-            (let [select-spec (:select parsed-query)]
-              (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))))
+    (let [parsed-query (q-parse/parse db query-map)]
+      (if (= :simple-subject-crawl (:strategy parsed-query))
+        (<? (simple-subject-crawl db parsed-query))
+        (let [where-result (<? (analytical/q query-map fuel max-fuel db opts))
+              select-spec  (:select parsed-query)]
+          (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))))
 
 (defn query
   "Returns core async channel with results or exception"

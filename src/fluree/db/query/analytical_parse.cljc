@@ -6,7 +6,8 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.query.range :as query-range]))
+            [fluree.db.query.range :as query-range]
+            [clojure.set :as set]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -529,9 +530,17 @@
   "When a specific DB is used (not default) for a where statement.
   This is in the form of a 4-tuple where clause."
   [supplied-vars db s p o]
-  (-> (parse-where-tuple supplied-vars nil s p o)
-      (assoc :db db
-             :type :remote-tuple)))
+  {:db   db
+   :type :remote-tuple
+   :s    s
+   :p    p
+   :o    o}
+  ;; TODO - once we support multiple sources, below will attempt to resolve predicates into pids
+  ;; TODO - for now, we just let them all through.
+  #_(-> (parse-where-tuple supplied-vars nil s p o)
+        (assoc :db db
+               :type :remote-tuple
+               :s s :p p :o o)))
 
 (defn parse-where
   "Parses where clause"
@@ -566,23 +575,23 @@
             (recur r filters hoisted-bind supplied-vars* (conj where* where-map))))
 
         (sequential? where-smt)
-        (recur r
-               filters
-               hoisted-bind
-               supplied-vars*
-               (conj where*
-                     (let [tuple-count (count where-smt)]
-                       (case tuple-count
-                         3 (apply parse-where-tuple supplied-vars* db where-smt)
-                         4 (apply parse-remote-tuple supplied-vars* where-smt)
-                         2 (apply parse-binding-tuple where-smt)
-                         ;; else
-                         (if (sequential? (first where-smt))
-                           (throw (ex-info (str "Invalid where clause, it should contain 2, 3 or 4 tuples. "
-                                                "It appears you have an extra nested vector here: " where-smt)
-                                           {:status 400 :error :db/invalid-query}))
-                           (throw (ex-info (str "Invalid where clause, it should contain 2, 3 or 4 tuples but instead found: " where-smt)
-                                           {:status 400 :error :db/invalid-query})))))))
+        (let [tuple-count (count where-smt)
+              where-smt*  (case tuple-count
+                            3 (apply parse-where-tuple supplied-vars* db where-smt)
+                            4 (apply parse-remote-tuple supplied-vars* where-smt)
+                            2 (apply parse-binding-tuple where-smt)
+                            ;; else
+                            (if (sequential? (first where-smt))
+                              (throw (ex-info (str "Invalid where clause, it should contain 2, 3 or 4 tuples. "
+                                                   "It appears you have an extra nested vector here: " where-smt)
+                                              {:status 400 :error :db/invalid-query}))
+                              (throw (ex-info (str "Invalid where clause, it should contain 2, 3 or 4 tuples but instead found: " where-smt)
+                                              {:status 400 :error :db/invalid-query}))))]
+          (recur r
+                 filters
+                 hoisted-bind
+                 supplied-vars*
+                 (conj where* where-smt*)))
 
         :else
         (throw (ex-info (str "Invalid where clause, must be a vector of tuples and/or maps: " where)
@@ -607,6 +616,16 @@
   [{:keys [select] :as _parsed-query}]
   (and (:expandMaps? select)
        (not (:inVector? select))))
+
+(defn simple-subject-crawl?
+  "Simple subject crawl is where the same variable is used in the leading
+  position of each where statement."
+  [{:keys [where select] :as _parsed-query}]
+  (let [select-var  (-> select :select first :variable)
+        first-where (first where)]
+    (when (and select-var
+               (not (-> first-where :o :filter)))           ;; for now exclude any filters on the first where, not implemented
+      (every? #(= select-var (-> % :s :variable)) where))))
 
 
 (defn fill-fn-params
@@ -670,7 +689,10 @@
   {:select {?subjects ['*']
    :where [...]}"
   [parsed-query]
-  (when (subject-crawl? parsed-query)
+  (when (and (subject-crawl? parsed-query)
+             (simple-subject-crawl? parsed-query)
+             (not (:order-by parsed-query))
+             (not (:group-by parsed-query)))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
 
@@ -767,19 +789,20 @@
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
   [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
-  (let [parsed (cond-> {:strategy     :legacy
-                        :where        (parse-where db query-map' supplied-vars)
-                        :opts         opts
-                        :limit        (get-limit query-map') ;; limit can be a primary key, or within :opts
-                        :offset       (get-offset query-map') ;; offset can be a primary key, or within :opts
-                        :fuel         (get-max-fuel query-map')
-                        :pretty-print (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
-                                        prettyPrint
-                                        (:prettyPrint opts))}
-                       filter (add-filter filter supplied-vars) ;; note, filter maps can/should also be inside :where clause
-                       orderBy (add-order-by db orderBy)
-                       groupBy (add-group-by groupBy)
-                       true (add-select-spec query-map'))]
+  (let [supplied-vars (set (keys supplied-vars))
+        parsed        (cond-> {:strategy     :legacy
+                               :where        (parse-where db query-map' supplied-vars)
+                               :opts         opts
+                               :limit        (get-limit query-map') ;; limit can be a primary key, or within :opts
+                               :offset       (get-offset query-map') ;; offset can be a primary key, or within :opts
+                               :fuel         (get-max-fuel query-map')
+                               :pretty-print (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
+                                               prettyPrint
+                                               (:prettyPrint opts))}
+                              filter (add-filter filter supplied-vars) ;; note, filter maps can/should also be inside :where clause
+                              orderBy (add-order-by db orderBy)
+                              groupBy (add-group-by groupBy)
+                              true (add-select-spec query-map'))]
     (or (simple-subject-crawl parsed)
         parsed)))
 
