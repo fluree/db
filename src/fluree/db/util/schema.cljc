@@ -106,7 +106,7 @@
   (some is-setting-flake? flakes))
 
 (defn system-change?
-  "Returns true if any of the provided flakes are a in any system collection."
+  "Returns true if any of the provided flakes are in any system collection."
   [flakes]
   (some is-system-flake? flakes))
 

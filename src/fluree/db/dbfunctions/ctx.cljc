@@ -1,16 +1,14 @@
 (ns fluree.db.dbfunctions.ctx
-  (:require [fluree.db.util.json :as json]
-            [fluree.db.dbfunctions.core :as dbfunctions]
+  (:require [fluree.db.dbfunctions.core :as dbfunctions]
             [fluree.db.dbfunctions.fns :refer [extract]]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.util.core :as util]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
-            #?(:cljs [fluree.db.flake :refer [Flake]])
-            [fluree.db.dbproto :as dbproto])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.flake :as flake]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 ;; Handles context
 
@@ -18,18 +16,18 @@
   "Iterates over ctx-flakes to extract context key and context fn subject id as two-tuple"
   [ctx-flakes]
   (when (seq ctx-flakes)
-    (loop [[^Flake f & r] ctx-flakes
+    (loop [[f & r] ctx-flakes
            k nil
            v nil]
       (if (and k v)
         [k v]
         (when f
           (cond
-            (= const/$_ctx:key (.-p f))
-            (recur r (.-o f) v)
+            (= const/$_ctx:key (flake/p f))
+            (recur r (flake/o f) v)
 
-            (= const/$_ctx:fn (.-p f))
-            (recur r k (.-o f))
+            (= const/$_ctx:fn (flake/p f))
+            (recur r k (flake/o f))
 
             :else
             (recur r k v)))))))
@@ -43,7 +41,7 @@
           [k fn-sid] (ctx-flakes->k+fn ctx-flakes)
           ctx-fn-str (some-> (<? (query-range/index-range db-root :spot = [fn-sid const/$_fn:code]))
                              first
-                             (#(.-o ^Flake %)))
+                             flake/o)
           f          (when ctx-fn-str
                        (<? (dbfunctions/parse-fn db-root ctx-fn-str "functionDec")))
           result     (when f (extract (f ?ctx)))
@@ -73,7 +71,7 @@
         (if role
           (let [role-ctx-chs (some->> (<? (query-range/index-range db-root :spot = [role const/$_role:ctx]))
                                       not-empty
-                                      (mapv #(resolve-ctx db-root ?ctx (.-o ^Flake %))))]
+                                      (mapv #(resolve-ctx db-root ?ctx (flake/o %))))]
             (if role-ctx-chs
               (recur r (loop [[role-ctx-ch & r*] role-ctx-chs
                               ctx* ctx]

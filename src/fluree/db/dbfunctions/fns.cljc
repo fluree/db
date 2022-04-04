@@ -326,7 +326,7 @@
       (raise ?ctx "Cannot access ?pO from this function interface"))))
 
 (defn get-all
-  {:doc      "Used to get-all values in a nested result set, or also can follow an subject down the provided path and returns a set of all matching subjects."
+  {:doc      "Used to get-all values in a nested result set, or also can follow a subject down the provided path and return a set of all matching subjects."
    :fdb/spec nil
    :fdb/cost "9 + length of path + query costs"}
   [?ctx subject path]
