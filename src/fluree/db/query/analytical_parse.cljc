@@ -16,22 +16,22 @@
 (def read-str-fn #?(:clj read-string :cljs cljs.reader/read-string))
 
 (defn safe-read-fn
-  [str]
-  (when-not (string? str)
-    (throw (ex-info (str "Invalid function: " str)
+  [code-str]
+  (when-not (string? code-str)
+    (throw (ex-info (code-str "Invalid function: " code-str)
                     {:status 400 :error :db/invalid-query})))
   (try*
-    (let [str* (if (str/starts-with? str "#")
-                 (subs str 1)
-                 str)
-          res  (read-str-fn str*)]
+    (let [code-str* (if (str/starts-with? code-str "#")
+                      (subs code-str 1)
+                      code-str)
+          res       (read-str-fn code-str*)]
       (when-not (list? res)
-        (throw (ex-info (str "Invalid function: " str)
+        (throw (ex-info (code-str "Invalid function: " code-str)
                         {:status 400 :error :db/invalid-query})))
       res)
     (catch* e
-            (log/warn "Invalid query function attempted: " str " with error message: " (ex-message e))
-            (throw (ex-info (str "Invalid query function: " str)
+            (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
+            (throw (ex-info (code-str "Invalid query function: " code-str)
                             {:status 400 :error :db/invalid-query})))))
 
 (def built-in-aggregates

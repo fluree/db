@@ -16,7 +16,7 @@
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
   [{:keys [conn novelty t] :as db} error-ch where-clause]
-  (let [{:keys [s p o idx]} where-clause
+  (let [{:keys [p o idx]} where-clause
         o*          (cond
                       (contains? o :value) (:value o)
                       (nil? o) nil
@@ -109,44 +109,3 @@
 
             :else
             (recur (conj acc next-res))))))))
-
-(defn extract-vars
-  [rvars {:keys [s o idx] :as where-smt}]
-  (let [s-var (:variable s)
-        s-var-exists? (get rvars s-var)
-        o-var (:variable o)
-        o-var-exists? (get rvars o-var)]
-
-    (fn [input port]
-
-
-      )
-
-
-    ;; if s-var is same as prior, add filtering function to prior
-    ;; if o-var is same as prior, add
-
-
-    )
-  )
-
-(defn fill-vars
-  [rvars]
-  )
-
-(defn compound-subj-crawl
-  [{:keys [db error-ch f-where where limit offset parallelism query] :as opts}]
-  (go-try
-    (let [target-var (-> query :select :select first :variable)]
-
-      (loop [[where-smt & r] where
-             rvars []]
-        (let [rvars* (-> (extract-vars rvars where-smt)
-                         (fill-vars))])
-
-        )
-
-      )
-
-    )
-  )
