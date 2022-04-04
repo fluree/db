@@ -1,5 +1,5 @@
 (ns fluree.db.storage.core
-  (:refer-clojure :exclude [read])
+  (:refer-clojure :exclude [read exists?])
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [clojure.data.avl :as avl]

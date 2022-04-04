@@ -83,7 +83,8 @@
                 :cljs (let [i (if (string? object)
                                 (js/parseInt object)
                                 object)]
-                        (if (<= util/min-long i util/max-long)
+                        (if (and (number? i)
+                                 (<= util/min-long i util/max-long))
                           i
                           (error (str "Bigintegers are not supported in javascript. max integer size of 2^53 - 1, provided: " object)))))
 

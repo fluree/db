@@ -2,7 +2,7 @@
   (:require [clojure.string :as str]
             #?(:clj [environ.core :as environ])
             #?(:clj  [clojure.core.async :as async :refer [go <!]]
-               :cljs [cljs.core.async :as async])
+               :cljs [cljs.core.async :as async :refer [go <!]])
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]

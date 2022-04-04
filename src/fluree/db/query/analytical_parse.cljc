@@ -1,6 +1,6 @@
 (ns fluree.db.query.analytical-parse
   (:require [clojure.string :as str]
-            [fluree.db.full-text :as full-text]
+            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.dbproto :as dbproto]
@@ -466,7 +466,9 @@
         _id?      (= "_id" p)
         s*        (value-type-map s)
         p*        (cond
-                    fulltext? (full-text/parse-domain p)
+                    fulltext? #?(:clj  (full-text/parse-domain p)
+                                 :cljs (throw (ex-info "Full text queries not supported in JavaScript currently."
+                                                       {:status 400 :error :db/invalid-query})))
                     rdf-type? :rdf/type
                     _id? :_id
                     :else (if db
