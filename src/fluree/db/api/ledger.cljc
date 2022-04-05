@@ -5,6 +5,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.connection :as conn]
             [fluree.db.permissions :as permissions]
+            [fluree.db.dbfunctions.ctx :as ctx]
             [fluree.db.auth :as auth]
             [fluree.db.time-travel :as time-travel]
             #?(:clj  [clojure.core.async :as async]
@@ -64,7 +65,7 @@
                            :error  :db/invalid-auth})))))))
 
 
-(defn- add-db-permissions
+(defn add-db-permissions
   "Adds permissions to db. Permissions can either be explicitly stated with roles
   or it can be derived from an auth-id.
   This assumes the :auth on the db, if it was provided, is already resolved
@@ -82,11 +83,14 @@
                         roles roles
                         auth-sid (<? (auth/roles db auth-sid))
                         :else nil)
+          ctx         (when roles'
+                        (<? (ctx/build db auth-sid roles')))
           permissions (when roles'
                         (<? (permissions/permission-map db roles' :query)))]
       (assoc db :auth auth-sid
                 :roles roles'
-                :permissions permissions))))
+                :permissions permissions
+                :ctx ctx))))
 
 
 (defn- syncTo-wait
@@ -99,7 +103,6 @@
   (let [{:keys [conn network dbid]} db
         newer-block? (fn [block] (>= block syncTo))
         event-fn     (fn [evt data]
-                       (log/warn "NEW EVENT:" (pr-str evt) (pr-str data))
                        (when (and (= :local-ledger-update evt) (newer-block? (:block data)))
                          (conn/remove-listener conn network dbid listen-id)
                          (async/go                          ;; note: avoided async/pipe as I don't believe promise-chan from session/db technically 'closes'

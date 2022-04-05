@@ -35,6 +35,7 @@
 (def default-fn-map {'get           (resolve 'fluree.db.dbfunctions.fns/get)
                      'get-all       (resolve 'fluree.db.dbfunctions.fns/get-all)
                      'get-in        (resolve 'fluree.db.dbfunctions.fns/get-in)
+                     'ctx           (resolve 'fluree.db.dbfunctions.fns/ctx)
                      'follow        (resolve 'fluree.db.dbfunctions.fns/get-all)
                      'contains?     (resolve 'fluree.db.dbfunctions.fns/contains?)
                      'relationship? (resolve 'fluree.db.dbfunctions.fns/relationship?)
@@ -164,7 +165,7 @@
     (first fn-str-coll)))
 
 
-(def symbol-whitelist #{'?s '?user_id '?db '?o 'sid '?auth_id '?pid '?a '?pO})
+(def allowed-symbols #{'?s '?user_id '?db '?o 'sid '?auth_id '?pid '?a '?pO})
 
 (defn parse-vector
   "Ensures contents of vector are allowed"
@@ -183,7 +184,7 @@
                       (cond
                         (string? x) x
                         (number? x) x
-                        (symbol? x) (or (symbol-whitelist x) (some #{x} (mapv #(symbol %) params)) (= funType "functionDec")
+                        (symbol? x) (or (allowed-symbols x) (some #{x} (mapv #(symbol %) params)) (= funType "functionDec")
                                         (throw (ex-info (str "Invalid symbol: " x " used in function." (pr-str vec))
                                                         {:status 400
                                                          :error  :db/invalid-fn})))
@@ -228,7 +229,7 @@
                                     (list? arg) (<? (resolve-fn db arg type params))
                                     (string? arg) arg
                                     (number? arg) arg
-                                    (symbol? arg) (or (symbol-whitelist arg)
+                                    (symbol? arg) (or (allowed-symbols arg)
                                                       (some #{arg} (mapv #(symbol %) params))
                                                       (= type "functionDec")
                                                       (throw (ex-info (str "Invalid symbol: " arg

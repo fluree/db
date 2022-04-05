@@ -24,6 +24,16 @@
                         {:status 400, :error :db/invalid-predicate})))))
 
 
+(defn- coerce-predicate
+  "If a predicate is provided as a string value, coerce to pid"
+  [db pred]
+  (if (string? pred)
+    (or (dbproto/-p-prop db :id pred)
+        (throw (ex-info (str "Invalid predicate, does not exist: " pred)
+                        {:status 400, :error :db/invalid-predicate})))
+    pred))
+
+
 (defn- match->flake-parts
   "Takes a match from index-range, and based on the index
   returns flake-ordered components of [s p o t op m].
@@ -31,11 +41,11 @@
   [db idx match]
   (let [[p1 p2 p3 p4 op m] match]
     (case idx
-      :spot [p1 (dbproto/-p-prop db :id p2) p3 p4 op m]
-      :psot [p2 (dbproto/-p-prop db :id p1) p3 p4 op m]
-      :post [p3 (dbproto/-p-prop db :id p1) p2 p4 op m]
-      :opst [p3 (dbproto/-p-prop db :id p2) p1 p4 op m]
-      :tspo [p2 (dbproto/-p-prop db :id p3) p4 p1 op m])))
+      :spot [p1 (coerce-predicate db p2) p3 p4 op m]
+      :psot [p2 (coerce-predicate db p1) p3 p4 op m]
+      :post [p3 (coerce-predicate db p1) p2 p4 op m]
+      :opst [p3 (coerce-predicate db p2) p1 p4 op m]
+      :tspo [p2 (coerce-predicate db p3) p4 p1 op m])))
 
 
 (def ^{:private true :const true} subject-min-match [util/max-long])

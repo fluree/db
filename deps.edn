@@ -32,7 +32,7 @@
          com.fluree/alphabase            {:mvn/version "3.2.2"}
 
          ;; cryptography
-         com.fluree/crypto               {:mvn/version "0.3.8"}
+         com.fluree/crypto               {:mvn/version "0.3.9"}
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}}
 
  :paths ["src" "resources"]
