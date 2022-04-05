@@ -28,6 +28,7 @@
           ctx     {:sid     sid
                    :auth_id (or (:auth db) (:auth permissions))
                    :instant (util/current-time-millis)
+                   :cache   (:ctx-cache db)
                    :db      root-db
                    :state   (atom {:stack   []
                                    :credits 10000000

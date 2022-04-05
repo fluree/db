@@ -273,7 +273,7 @@
   {:doc      "Gets a value from an subject."
    :fdb/spec nil
    :fdb/cost 10}
-  [?ctx subject pred]
+  [{:keys [cache db] :as ?ctx} subject pred]
   (go-try
     (let [subject  (extract subject)
           pred     (extract pred)
@@ -282,7 +282,20 @@
                        (first subject)
                        subject)
                      subject)
-          res      (fdb/get subject' pred)
+          res      (cond
+                     (clojure.core/and (int? subject') cache)
+                     (clojure.core/or
+                       (clojure.core/get-in @cache [:get subject' pred])
+                       (let [resp (<? (fdb/get-subj-pred db subject' pred))]
+                         (vswap! cache assoc-in [:get subject' pred] resp)
+                         resp))
+
+
+                     (int? subject')
+                     (<? (fdb/get-subj-pred db subject' pred))
+
+                     :else
+                     (fdb/get subject' pred))
           entry    [{:function "get" :arguments [subject pred] :result res} 10]]
       (add-stack ?ctx entry)
       res)))
@@ -313,9 +326,9 @@
       (raise ?ctx "Cannot access ?pO from this function interface"))))
 
 (defn get-all
-  {:doc      "Follows an subject down the provided path and returns a set of all matching subjects."
+  {:doc      "Used to get-all values in a nested result set, or also can follow a subject down the provided path and return a set of all matching subjects."
    :fdb/spec nil
-   :fdb/cost "9 + length of path"}
+   :fdb/cost "9 + length of path + query costs"}
   [?ctx subject path]
   (go-try
     (let [subject  (extract subject)
@@ -325,8 +338,10 @@
                        (first subject)
                        subject)
                      subject)
-          res      (fdb/get-all subject' path)
-          cost     (clojure.core/+ 9 (clojure.core/count path))
+          sid?     (int? subject')
+          [res cost] (if sid?
+                       (<? (fdb/follow-subject ?ctx subject' path))
+                       [(fdb/get-all subject' path) (clojure.core/+ 9 (clojure.core/count path))])
           entry    [{:function "get-all" :arguments [subject path] :result res} cost]]
       (add-stack ?ctx entry)
       res)))
@@ -345,6 +360,15 @@
       (add-stack ?ctx entry)
       res)))
 
+(defn ctx
+  {:doc      "Returns a value from the user's context if set. Provide the key or key sequence."
+   :fdb/spec nil
+   :fdb/cost 1}
+  [{:keys [db] :as ?ctx} key-or-ks]
+  (if (sequential? key-or-ks)
+    (clojure.core/get-in (:ctx db) key-or-ks)
+    (clojure.core/get (:ctx db) key-or-ks)))
+
 (defn contains?
   {:doc      "Returns true if key is present."
    :fdb/spec nil
@@ -353,9 +377,9 @@
   (go-try
     (let [coll  (extract coll)
           coll' (if (set? coll) coll (-> coll flatten set))
-          key   (extract key)
-          res   (fdb/contains? coll' key)
-          entry [{:function "contains?" :arguments [coll' key] :result res} 10]]
+          key'  (extract key)
+          res   (fdb/contains? coll' key')
+          entry [{:function "contains?" :arguments [coll' key'] :result res} 10]]
       (add-stack ?ctx entry)
       res)))
 

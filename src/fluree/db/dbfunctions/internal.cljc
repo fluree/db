@@ -9,7 +9,8 @@
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.query.range :as query-range]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -318,6 +319,28 @@
     (clojure.core/or (clojure.core/get m k) (clojure.core/get m (keyword k)))
     (catch* e (function-error e "get" m k))))
 
+(defn get-subj-pred
+  "Retrieve's a subject's predicate value by doing a lookup.
+  If multi returns a vector, else a single value."
+  [db sid pred]
+  (go-try
+
+    (let [reverse?  (and (string? pred) (re-matches #".+/_.+" pred))
+          pred*     (if reverse?
+                      (str/replace pred "/_" "/")
+                      pred)
+          multi?    (dbproto/-p-prop db :multi pred*)
+          res       (if reverse?
+                      (<? (query-range/index-range db :opst = [sid pred*]))
+                      (<? (query-range/index-range db :spot = [sid pred*])))
+          flake-val (if reverse?
+                      flake/s
+                      flake/o)]
+      (when (seq res)
+        (if multi?
+          (mapv flake-val res)
+          (flake-val (first res)))))))
+
 (defn now
   "Returns current epoch milliseconds."
   []
@@ -395,7 +418,7 @@
     (catch* e (function-error e "floor" num))))
 
 (defn get-all
-  "Follows an subject down the provided path and returns a set of all matching subjects."
+  "Follows a result set down the provided path and returns a set of all matching subjects."
   [start-subject path]
   (try*
     (loop [[pred & r] path
@@ -417,6 +440,36 @@
           (->> next-subjects (remove nil?) set))))
     (catch* e (function-error e "get-all" start-subject path))))
 
+(defn- select-from-path
+  "Takes a path in a vector format and returns a select statement to crawl those vars.
+  e.g. convert: ['_user/_auth', 'groupMembership/_user', 'group/_admins']
+            to: {'_user/_auth' [{'groupMembership/_user' ['group/_admins']}]}"
+  [path]
+  (if (= 1 (count path))
+    path
+    (let [r-path (reverse path)]
+      (reduce
+        (fn [acc p] {p [acc]})
+        (first r-path)
+        (rest r-path)))))
+
+(defn follow-subject
+  "Follows a subject down the provided path and returns a set of all matching subjects."
+  [?ctx sid path]
+  (async/go
+    (try*
+      (let [select (select-from-path path)
+            query' {:selectOne select
+                    :from      sid
+                    :opts      {}}
+            [res fuel] (<? (query (:db ?ctx) query'))
+            res*   (get-all res (if (= "_id" (last path))
+                                  path
+                                  (conj path "_id")))]
+        [res* (+ fuel (count path) 9)])
+      (catch* e (function-error e "get-all" sid path)))))
+
+
 (defn get-in
   "Returns the value in a nested structure"
   [m ks]
@@ -428,7 +481,9 @@
   "Returns true if key is present."
   [coll key]
   (try*
-    (clojure.core/contains? coll key)
+    (if (sequential? key)
+      (some #(contains? coll %) key)
+      (clojure.core/contains? coll key))
     (catch* e (function-error e "contains?" coll key))))
 
 (defn hash-set
@@ -561,7 +616,9 @@
 (defn ?auth_id
   [?ctx]
   (go-try (let [auth (:auth_id ?ctx)]
-            (<? (dbproto/-subid (:db ?ctx) auth)))))
+            (if (number? auth)
+              auth
+              (<? (dbproto/-subid (:db ?ctx) auth))))))
 
 (defn objT
   "Given an array of flakes, returns the sum of the objects of the true flakes"
