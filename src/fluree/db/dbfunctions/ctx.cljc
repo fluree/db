@@ -43,7 +43,7 @@
                              first
                              flake/o)
           f          (when ctx-fn-str
-                       (<? (dbfunctions/parse-fn db-root ctx-fn-str "functionDec")))
+                       (<? (dbfunctions/parse-and-wrap-fn db-root ctx-fn-str "functionDec")))
           result     (when f (extract (f ?ctx)))
           result*    (if (sequential? result)
                        (set result)
