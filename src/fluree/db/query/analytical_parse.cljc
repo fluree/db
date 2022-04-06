@@ -398,11 +398,13 @@
        :where (parse-where db {:where clause-val} supplied-vars)}
 
       :union
-      (if (= 2 (count clause-val))
+      (if (and (= 2 (count clause-val))
+               (every? sequential? (first clause-val))
+               (every? sequential? (second clause-val)))
         {:type  :union
          :where (mapv #(parse-where db {:where %} supplied-vars) clause-val)}
-        (throw (ex-info (str "Invalid where clause, 'union' clause must have exactly two solutions. Instead, "
-                             (count clause-val) " were specified.")
+        (throw (ex-info (str "Invalid where clause, 'union' clause must have exactly two solutions. "
+                             "Each solution must be its own 'where' clause wrapped in a vector")
                         {:status 400 :error :db/invalid-query})))
 
       :bind
