@@ -499,7 +499,7 @@
                     fulltext?
                     :full-text
 
-                    rdf-type?
+                    (or _id? rdf-type?)
                     :spot
 
                     (and s* (not (:variable s*)))
