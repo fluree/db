@@ -234,6 +234,8 @@
   [{:keys [group-by order-by limit offset pretty-print] :as parsed-query}
    {:keys [selectOne select selectDistinct selectReduced opts orderBy groupBy] :as _query-map'}]
   (let [select-smt    (or selectOne select selectDistinct selectReduced)
+        selectOne?    (boolean selectOne)
+        limit*        (if selectOne? 1 limit)
         inVector?     (vector? select-smt)
         select-smt    (if inVector? select-smt [select-smt])
         parsed-select (parse-select select-smt)
@@ -248,18 +250,20 @@
                           (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
                                           {:status 400
                                            :error  :db/invalid-query}))))]
-    (assoc parsed-query :select
-                        {:select          parsed-select
-                         :aggregates      (not-empty aggregates)
-                         :expandMaps?     expandMap?
-                         :orderBy         orderBy*
-                         :groupBy         (or (:groupBy opts) groupBy)
-                         :limit           limit
-                         :offset          (or offset 0)
-                         :selectOne?      (boolean selectOne)
-                         :selectDistinct? (boolean (or selectDistinct selectReduced))
-                         :inVector?       inVector?
-                         :prettyPrint     pretty-print})))
+    (assoc parsed-query :limit limit*
+                        :select
+                        {:select           parsed-select
+                         :aggregates       (not-empty aggregates)
+                         :expandMaps?      expandMap?
+                         :orderBy          orderBy*
+                         :groupBy          (or (:groupBy opts) groupBy)
+                         :componentFollow? (:component opts)
+                         :limit            limit*
+                         :offset           (or offset 0)
+                         :selectOne?       selectOne?
+                         :selectDistinct?  (boolean (or selectDistinct selectReduced))
+                         :inVector?        inVector?
+                         :prettyPrint      pretty-print})))
 
 
 (defn symbolize-var-keys
