@@ -7,7 +7,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.range :as query-range]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -251,19 +252,19 @@
                                           {:status 400
                                            :error  :db/invalid-query}))))]
     (assoc parsed-query :limit limit*
-                        :select
-                        {:select           parsed-select
-                         :aggregates       (not-empty aggregates)
-                         :expandMaps?      expandMap?
-                         :orderBy          orderBy*
-                         :groupBy          (or (:groupBy opts) groupBy)
-                         :componentFollow? (:component opts)
-                         :limit            limit*
-                         :offset           (or offset 0)
-                         :selectOne?       selectOne?
-                         :selectDistinct?  (boolean (or selectDistinct selectReduced))
-                         :inVector?        inVector?
-                         :prettyPrint      pretty-print})))
+                        :selectOne? selectOne?
+                        :select {:select           parsed-select
+                                 :aggregates       (not-empty aggregates)
+                                 :expandMaps?      expandMap?
+                                 :orderBy          orderBy*
+                                 :groupBy          (or (:groupBy opts) groupBy)
+                                 :componentFollow? (:component opts)
+                                 :limit            limit*
+                                 :offset           (or offset 0)
+                                 :selectOne?       selectOne?
+                                 :selectDistinct?  (boolean (or selectDistinct selectReduced))
+                                 :inVector?        inVector?
+                                 :prettyPrint      pretty-print})))
 
 
 (defn symbolize-var-keys
@@ -398,9 +399,7 @@
        :where (parse-where db {:where clause-val} supplied-vars)}
 
       :union
-      (if (and (= 2 (count clause-val))
-               (every? sequential? (first clause-val))
-               (every? sequential? (second clause-val)))
+      (if (= 2 (count clause-val))
         {:type  :union
          :where (mapv #(parse-where db {:where %} supplied-vars) clause-val)}
         (throw (ex-info (str "Invalid where clause, 'union' clause must have exactly two solutions. "
@@ -629,10 +628,8 @@
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
   [{:keys [where select] :as _parsed-query}]
-  (let [select-var  (-> select :select first :variable)
-        first-where (first where)]
-    (when (and select-var
-               (not (-> first-where :o :filter)))           ;; for now exclude any filters on the first where, not implemented
+  (let [select-var (-> select :select first :variable)]
+    (when select-var                                        ;; for now exclude any filters on the first where, not implemented
       (every? #(= select-var (-> % :s :variable)) where))))
 
 
@@ -650,44 +647,76 @@
                                 {:status 400 :error :db/invalid-query})))))
           [] params))
 
+(defn merge-wheres-to-filter
+  "Merges all subsequent where clauses (rest where) for simple-subject-crawl
+  into a map containing predicate filters.
+
+  A simple-subject crawl will get a list of subjects and then pull all
+  flakes for that subject in one lookup, instead of traditionally with multiple
+  where clauses doing individual lookups per clauses.
+
+  Instead of a lookup for every where clause, we therefore filter the subject
+  flakes for the criteria of each where clause. This generates a single data
+  structure that allows that filtering to happen. It looks like:
+
+  {:required-p #{1001 1002 ...} - each where statement has a predicate that *must* be present
+   1001 [(> % 42) (< % 10)] - for predicate 1001, list of filtering fns for the .-o value of each flake
+   1002 [(= % hi)] }
+
+   Note that for multi-cardinality predicates, the prediate filters must pass for just one flake
+  "
+  [first-s rest-where supplied-vars]
+  (loop [[{:keys [type s p o] :as where-smt} & r] rest-where
+         required-p #{}                                     ;; set of 'p' values that are going to be required for a subject to have
+         filter-map {}]                                     ;; key 'p' value, val is list of filtering fns
+    (if where-smt
+      (when (and (= :tuple type)
+                 (= first-s (:variable s)))
+        (let [{:keys [value filter variable]} o
+              f (cond
+                  value
+                  (fn [flake _] (= value (flake/o flake)))
+
+                  filter
+                  (let [{:keys [params variable function]} filter]
+                    (if (= 1 (count params))
+                      (fn [flake _] (function (flake/o flake)))
+                      (fn [flake vars]
+                        (let [params (fill-fn-params params (flake/o flake) variable vars)]
+                          (log/debug (str "Calling query-filter fn: " (:fn-str filter)
+                                          "with params: " params "."))
+                          (apply function params)))))
+
+                  (and variable (supplied-vars variable))
+                  (fn [flake vars]
+                    (= (flake/o flake) (get vars variable))))]
+          (recur r
+                 (conj required-p p)
+                 (if f
+                   (update filter-map p (fn [p-fns] (if p-fns
+                                                      (conj p-fns f)
+                                                      [f])))
+                   filter-map))))
+      (assoc filter-map :required-p required-p))))
+
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
-  [{:keys [where] :as parsed-query}]
+  [{:keys [where supplied-vars] :as parsed-query}]
   (let [first-where (first where)
+        rest-where  (rest where)
         first-type  (:type first-where)
-        first-s     (when (and (#{:rdf/type :tuple} first-type)
+        first-s     (when (and (#{:rdf/type :_id :tuple} first-type)
                                (-> first-where :s :variable))
                       (-> first-where :s :variable))]
     (when first-s
-      (loop [[{:keys [type s p o] :as where-smt} & r] (rest where)
-             revised-where {}]
-        (if where-smt
-          (when (and (= :tuple type)
-                     (= first-s (:variable s)))
-            (let [{:keys [value filter]} o
-                  f (cond
-                      value
-                      (fn [flake _] (= value (flake/o flake)))
-
-                      filter
-                      (let [{:keys [params variable function]} filter]
-                        (if (= 1 (count params))
-                          (fn [flake _] (function (flake/o flake)))
-                          (fn [flake vars]
-                            (let [params (fill-fn-params params (flake/o flake) variable vars)]
-                              (log/debug (str "Calling query-filter fn: " (:fn-str filter)
-                                              "with params: " params "."))
-                              (apply function params)))))
-
-                      :else                                 ;; likely uses {:o {:variable ...} - exclude from ssc)]
-                      nil)]
-              (recur r (update revised-where p (fn [p-fns] (if p-fns
-                                                             (conj p-fns f)
-                                                             [f]))))))
-          (assoc parsed-query :where [first-where {:s-filter revised-where}]
+      (if (empty? rest-where)
+        (assoc parsed-query :strategy :simple-subject-crawl)
+        (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-where supplied-vars)]
+          (assoc parsed-query :where [first-where
+                                      {:s-filter subj-filter-map}]
                               :strategy :simple-subject-crawl))))))
 
 
@@ -699,7 +728,6 @@
   [parsed-query]
   (when (and (subject-crawl? parsed-query)
              (simple-subject-crawl? parsed-query)
-             (not (:order-by parsed-query))
              (not (:group-by parsed-query)))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
@@ -728,15 +756,23 @@
                    "DESC" :desc
                    ;; else
                    (throw! nil))
-        pred-var (q-var->symbol pred)
-        pid      (when-not pred-var
-                   (or (dbproto/-p-prop db :id pred)
-                       (throw! (str "Invalid predicate listed in orderBy clause: " pred))))]
-    {:predicate pid
-     :variable  pred-var
-     :order     order*}))
+        pred-var (q-var->symbol pred)]
+    (if pred-var
+      {:type     :variable
+       :order    order*
+       :variable pred-var}
+      {:type      :predicate
+       :order     order*
+       :predicate pred})))
+
 
 (defn add-order-by
+  "Parses order-by and returns a map with more details
+  Map contains keys:
+   :type      - contains :variable or :predicate for type
+   :order     - :asc or :desc
+   :predicate - predicate name, if :predicate type
+   :variable  - variable name, if :variable type"
   [{:keys [where] :as parsed-query} db order-by]
   (let [{:keys [variable] :as parsed-order-by} (parse-order-by db order-by)]
     (when (and variable (not (variable-in-where? variable where)))
@@ -785,38 +821,100 @@
 
 (defn get-max-fuel
   "Extracts max-fuel from query if specified, or uses Integer/max a default."
-  [{:keys [fuel] :as _query-map'}]
-  (let [fuel* (or fuel
-                  util/max-integer)]
-    (when-not (> fuel* 0)
-      (throw (ex-info (str "Invalid query fuel specified: " fuel*)
+  [{:keys [fuel max-fuel] :as query-map'}]
+  (when max-fuel
+    (log/info "Deprecated max-fuel used in query: " query-map'))
+  (let [max-fuel (cond
+                   (number? max-fuel)
+                   max-fuel
+
+                   (number? fuel)
+                   fuel
+
+                   :else util/max-integer)]
+    (when-not (> max-fuel 0)
+      (throw (ex-info (str "Invalid query fuel specified: " max-fuel)
                       {:status 400 :error :db/invalid-query})))
-    fuel*))
+    max-fuel))
+
+
+(defn expand-var-rel-binding
+  "Expands a relational bindings vars definition where it was not supplied
+  as a vector of maps, but instead a map with one or more vectors as vals.
+  e.g.
+  {?x [1 2 3 4]}
+  {?x [1 2 3 4]
+   ?y ['a' 'b' 'c' 'd']}
+  {?x [1 2 3 4]
+   ?y 'some-constant-var'}
+
+  Returns a vector of full vars maps."
+  [supplied-vars]
+  (let [ks (keys supplied-vars)]
+    (->> (vals supplied-vars)
+         (mapv #(if (sequential? %)                         ;; scalar values get turned into infite lazy seqs of value
+                  %
+                  (repeat %)))
+         (apply interleave)
+         (partition (count ks))
+         (mapv #(zipmap ks %)))))
+
+
+(defn coerce-vars
+  "Turns all var keys into symbols.
+  If multiple vars (relational bindings) then will
+  return a vector of vars maps."
+  [supplied-vars]
+  (when supplied-vars
+    (if (sequential? supplied-vars)
+      (mapv symbolize-var-keys supplied-vars)
+      (let [supplied-vars* (symbolize-var-keys supplied-vars)
+            rel-binding?   (some sequential? (vals supplied-vars*))]
+        (if rel-binding?
+          (expand-var-rel-binding supplied-vars*)
+          supplied-vars*)))))
+
+(defn basic-query?
+  "Returns true if the query is the legacy 'basic query' type.
+  e.g.:
+   {select [*], from: '_user'}
+   {select [*], from: ['_user/username' 'userid']}
+   {select [*], from: '_user', where: '_user/username = userid'}"
+  [{:keys [where] :as _query-map}]
+  (not (sequential? where)))
 
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
   [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
-  (let [supplied-vars (set (keys supplied-vars))
-        parsed        (cond-> {:strategy     :legacy
-                               :where        (parse-where db query-map' supplied-vars)
-                               :opts         opts
-                               :limit        (get-limit query-map') ;; limit can be a primary key, or within :opts
-                               :offset       (get-offset query-map') ;; offset can be a primary key, or within :opts
-                               :fuel         (get-max-fuel query-map')
-                               :pretty-print (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
-                                               prettyPrint
-                                               (:prettyPrint opts))}
-                              filter (add-filter filter supplied-vars) ;; note, filter maps can/should also be inside :where clause
-                              orderBy (add-order-by db orderBy)
-                              groupBy (add-group-by groupBy)
-                              true (add-select-spec query-map'))]
+  (let [rel-binding?      (sequential? supplied-vars)
+        supplied-var-keys (if rel-binding?
+                            (-> supplied-vars first keys set)
+                            (-> supplied-vars keys set))
+        parsed            (cond-> {:strategy      :legacy
+                                   :rel-binding?  rel-binding?
+                                   :where         (parse-where db query-map' supplied-var-keys)
+                                   :opts          opts
+                                   :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
+                                   :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts
+                                   :fuel          (get-max-fuel query-map')
+                                   :supplied-vars supplied-var-keys
+                                   :pretty-print  (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
+                                                    prettyPrint
+                                                    (:prettyPrint opts))}
+                                  filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
+                                  orderBy (add-order-by db orderBy)
+                                  groupBy (add-group-by groupBy)
+                                  true (add-select-spec query-map'))]
     (or (simple-subject-crawl parsed)
         parsed)))
 
 (defn parse
   [db query-map]
-  (let [{:keys [vars]} query-map
-        vars*        (symbolize-var-keys vars)
-        parsed-query (parse* db (dissoc query-map :vars) vars*)]
+  (let [query-map*   (if (basic-query? query-map)
+                       (basic-to-analytical-transpiler query-map)
+                       query-map)
+        {:keys [vars]} query-map*
+        vars*        (coerce-vars vars)
+        parsed-query (parse* db (dissoc query-map* :vars) vars*)]
     (assoc parsed-query :vars vars*)))

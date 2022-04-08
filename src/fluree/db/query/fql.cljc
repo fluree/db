@@ -896,19 +896,6 @@
                     selectOne? (first res)
                     :else res)))))
 
-
-
-(defn construct-triples
-  [{:keys [construct] :as query-map} {:keys [headers tuples] :as where-result}]
-  (let [[fn1 fn2 fn3] (map (fn [construct-item]
-                             (if-let [index-of (util/index-of headers (symbol construct-item))]
-                               (fn [row] (nth row index-of))
-                               (fn [row] construct-item))) construct)]
-    (map (fn [res]
-           [(fn1 res) (fn2 res) (fn3 res)])
-
-         tuples)))
-
 (defn- ad-hoc-query
   [db fuel max-fuel query-map opts]
   (go-try
@@ -919,110 +906,40 @@
               select-spec  (:select parsed-query)]
           (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))))
 
+(defn cache-query
+  "Returns already cached query from cache if available, else
+  executes and stores query into cache."
+  [{:keys [network dbid block auth conn] :as db} {:keys [opts] :as query-map}]
+  ;; TODO - if a cache value exists, should max-fuel still be checked and throw if not enough?
+  (let [oc        (:object-cache conn)
+        query*    (update query-map :opts dissoc :fuel :max-fuel)
+        cache-key [:query network dbid block auth query*]]
+    ;; object cache takes (a) key and (b) fn to retrieve value if null
+    (oc cache-key
+        (fn [_]
+          (let [pc (async/promise-chan)]
+            (async/go
+              (let [res (async/<! (query db (assoc-in query-map [:opts :cache] false)))]
+                (async/put! pc res)))
+            pc)))))
+
+
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
   (log/debug "Running query:" (pr-str query-map))
   (let [{:keys [select selectOne selectDistinct where from limit offset
                 component orderBy groupBy prettyPrint opts]} query-map
-        opts' (cond-> (merge {:limit   limit :offset (or offset 0) :component component
-                              :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
-                             opts)
-                      selectOne (assoc :limit 1))]
-    (if #?(:clj (:cache opts') :cljs false)
-      ;; handle caching - TODO - if a cache value exists, should max-fuel still be checked and throw if not enough?
-      (let [oc (get-in db [:conn :object-cache])]
-        ;; object cache takes (a) key and (b) fn to retrieve value if null
-        (oc [:query (:block db) (dissoc query-map :opts) (dissoc opts' :fuel :max-fuel) (:auth db)]
-            (fn [_]
-              (let [pc (async/promise-chan)]
-                (async/go
-                  (let [res (async/<! (query db (assoc-in query-map [:opts :cache] false)))]
-                    (async/put! pc res)))
-                pc))))
-      (let [max-fuel (:max-fuel opts')
-            fuel     (or (:fuel opts)                       ;; :fuel volatile! can be provided upstream
-                         (when (or max-fuel (:meta opts))
-                           (volatile! 0)))
-            db*      (assoc db :ctx-cache (volatile! {}))]  ;; allow caching of some functions when available
-        (if (sequential? where)
-          ;; ad-hoc query
-          (ad-hoc-query db* fuel max-fuel query-map opts')
-          ;; all other queries
-          (go-try
-            (let [select-smt   (or select selectOne selectDistinct
-                                   (throw (ex-info "Query missing :select or :selectOne." {:status 400 :error :db/invalid-query})))
-                  {:keys [orderBy limit component offset]} opts'
-                  select-spec  (parse-db db* select-smt opts')
-                  select-spec' (if (not (nil? component))
-                                 (assoc select-spec :componentFollow? component)
-                                 select-spec)
-                  cache        (volatile! {})
-                  [sortPred sortOrder] (if orderBy (cond (vector? orderBy) [(second orderBy) (first orderBy)]
-                                                         (string? orderBy) [orderBy "ASC"]
-                                                         :else [nil nil])
-                                                   [nil nil])
-                  result       (cond
-                                 (string? where)
-                                 (let [default-collection (when (string? from) from)
-                                       subjects           (<? (where-filter db* where default-collection {:limit limit :offset offset}))]
-                                   (<? (subject-select db* cache fuel max-fuel select-spec'
-                                                       subjects (if orderBy nil limit) (if orderBy nil offset))))
-
-                                 ;; predicate-based query
-                                 (and (string? from) (str/includes? #?(:clj from :cljs (str from)) "/"))
-                                 (let [xf       (cond-> (map flake/s)
-                                                        fuel (comp (fuel-flake-transducer fuel max-fuel))
-                                                        true (comp (distinct)))
-                                       opts     (if orderBy {} {:limit limit :offset offset})
-                                       subjects (->> (<? (query-range/index-range db* :psot = [from] opts))
-                                                     (sequence xf))]
-                                   (<? (subject-select db* cache fuel max-fuel select-spec' subjects limit)))
-
-
-                                 ;; collection-based query -> _block or _tx
-                                 (and (string? from) (#{"_block" "_tx"} from))
-                                 (let [opts   (if orderBy {} {:limit limit :offset offset})
-                                       flakes (<? (query-range/_block-or_tx-collection db* opts))]
-                                   (<? (flake-select db* cache fuel max-fuel select-spec' flakes)))
-
-                                 ;; collection-based query
-                                 (string? from)
-                                 (let [opts              (if orderBy {} {:limit limit :offset offset})
-                                       collection-flakes (<? (query-range/collection db* from opts))]
-                                   (<? (flake-select db* cache fuel max-fuel select-spec' collection-flakes)))
-
-                                 ;; single subject _id provided
-                                 (util/subj-ident? from)
-                                 (let [subjects (some-> (<? (dbproto/-subid db* from false))
-                                                        (vector))
-                                       res      (<? (subject-select db* cache fuel max-fuel select-spec' subjects limit offset))]
-                                   (when fuel (vswap! fuel inc)) ;; charge 1 for the lookup
-                                   res)
-
-                                 ;; multiple subject ids provided
-                                 (and (sequential? from) (every? util/subj-ident? from))
-                                 (let [subjects (loop [[n & r] from
-                                                       acc []]
-                                                  (if-not n
-                                                    acc
-                                                    (let [s    (if (int? n)
-                                                                 n
-                                                                 (do (when fuel (vswap! fuel inc))
-                                                                     (<? (dbproto/-subid db* n false))))
-                                                          acc* (if s
-                                                                 (conj acc s)
-                                                                 acc)]
-                                                      (recur r acc*))))
-                                       subjects (into [] subjects)]
-                                   (<? (subject-select db* cache fuel max-fuel select-spec' subjects (if orderBy nil limit) (if orderBy nil offset))))
-
-                                 :else
-                                 (ex-info (str "Invalid 'from' in query:" (pr-str query-map))
-                                          {:status 400 :error :db/invalid-query}))
-                  res          (if sortPred
-                                 (sort-offset-and-limit-res sortPred sortOrder offset limit result)
-                                 result)]
-              (if (and selectOne (coll? res) (not (util/exception? res)))
-                (first res)
-                res))))))))
+        cache? #?(:clj (:cache opts) :cljs false)
+        opts'          (cond-> (merge {:limit   limit :offset (or offset 0) :component component
+                                       :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
+                                      opts)
+                               selectOne (assoc :limit 1))]
+    (if cache?
+      (cache-query db query-map)
+      (let [max-fuel     (:max-fuel opts')
+            fuel         (or (:fuel opts)                   ;; :fuel volatile! can be provided upstream
+                             (when (or max-fuel (:meta opts))
+                               (volatile! 0)))
+            db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
+        (ad-hoc-query db* fuel max-fuel query-map opts')))))

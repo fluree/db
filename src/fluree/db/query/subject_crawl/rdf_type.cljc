@@ -10,7 +10,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject]]))
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject order-results]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -54,7 +54,7 @@
                                     :end-test    <=
                                     :end-flake   lflake
                                     :return-type :flake-by-sid})
-        resolver    (index/->CachedTRangeResolver conn novelty t t (:async-cache conn))
+        resolver    (index/->CachedTRangeResolver conn (:spot novelty) t t (:async-cache conn))
         tree-chan   (index/tree-chan resolver spot in-range? query-range/resolved-leaf? 1 query-xf error-ch)
         return-chan (async/chan 10 (partition-by flake/s))]
     (async/go-loop []
@@ -73,9 +73,8 @@
               (async/close! return-chan))))))
     return-chan))
 
-
 (defn rdf-type-crawl
-  [{:keys [db error-ch f-where limit offset parallelism] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism finish-fn] :as opts}]
   (go-try
     (let [subj-ch   (subj-flakes-chan db error-ch f-where)
           flakes-af (flakes-xf opts)
@@ -98,7 +97,7 @@
             (do (async/close! subj-ch)
                 (async/close! flakes-ch)
                 (async/close! result-ch)
-                acc)
+                (finish-fn acc))
 
 
             :else
