@@ -21,10 +21,10 @@
                       (:value o)
                       nil)
         [fflake lflake] (case idx
-                          :post [(flake/->Flake nil p o* nil nil -2147483647)
-                                 (flake/->Flake nil p o* nil nil 2147483647)]
-                          :psot [(flake/->Flake nil p nil nil nil -2147483647)
-                                 (flake/->Flake nil p nil nil nil 2147483647)])
+                          :post [(flake/->Flake nil p o* nil nil util/min-integer)
+                                 (flake/->Flake nil p o* nil nil util/max-integer)]
+                          :psot [(flake/->Flake nil p nil nil nil util/min-integer)
+                                 (flake/->Flake nil p nil nil nil util/max-integer)])
         filter-fn (cond
                     (and o* (= :psot idx))
                     #(= o* (flake/o %))

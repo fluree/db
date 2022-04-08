@@ -91,13 +91,15 @@
 ;; FILTER ( bound(?date)  )
 ;; FILTER ( !bound(?date) )
 
-(defn valid-filter?
+(defn extract-filter-fn
   "Takes a filter fn as a string and a set/fn of allowed symbols that can be used within the fn.
 
   Returns two-tuple of parsed function and variables (symbols) used within the function as a set."
   [func symbols-allowed]
-  (let [func'            (if (string? func) (#?(:cljs cljs.reader/read-string
-                                                :clj  read-string) func) func)
+  (let [func'            (if (string? func)
+                           (#?(:cljs cljs.reader/read-string
+                               :clj  read-string) func)
+                           func)
         symbols-allowed* (or symbols-allowed (fn [sym] (not= \? (first (name sym)))))
         fn-name          (first func')
         fn-w-ns          (or (and (set? fn-name)
@@ -111,7 +113,7 @@
         args             (rest func')
         [args* vars] (reduce (fn [[args* vars] arg]
                                (cond
-                                 (list? arg) (let [[args' vars'] (valid-filter? arg symbols-allowed*)]
+                                 (list? arg) (let [[args' vars'] (extract-filter-fn arg symbols-allowed*)]
                                                [(conj args* args') (into vars vars')])
                                  (symbol? arg) (if-not (symbols-allowed* arg)
                                                  (throw (ex-info (str "Invalid symbol: " arg

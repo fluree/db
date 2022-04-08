@@ -43,8 +43,8 @@
         cid         (or (dbproto/-c-prop db :id rdf-type)
                         (throw (ex-info (str "Invalid data type: " rdf-type)
                                         {:status 400 :error :db/invalid-query})))
-        fflake      (flake/->Flake (flake/max-subject-id cid) -1 nil nil nil -2147483647)
-        lflake      (flake/->Flake (flake/min-subject-id cid) util/max-integer nil nil nil 2147483647)
+        fflake      (flake/->Flake (flake/max-subject-id cid) -1 nil nil nil util/min-integer)
+        lflake      (flake/->Flake (flake/min-subject-id cid) util/max-integer nil nil nil util/max-integer)
         cmp         (:comparator spot)
         range-set   (flake/sorted-set-by cmp fflake lflake)
         in-range?   (fn [node]

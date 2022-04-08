@@ -74,7 +74,7 @@
                              var         (or (get-vars filter-code)
                                              (throw (ex-info (str "Filter function must contain a valid variable. Provided: " key)
                                                              {:status 400 :error :db/invalid-query})))
-                             [fun _] (filter/valid-filter? filter-code #{var})
+                             [fun _] (filter/extract-filter-fn filter-code #{var})
                              filter-fn   (filter/get-internal-filter-fn var fun)]
                          (-> acc
                              (update :search #(conj % nil))
@@ -672,7 +672,7 @@
 (defn tuples->filter-required
   [headers tuples valid-vars filter-code-req]
   (let [filter-code-req-str  (str "(and " (str/join " " filter-code-req) ")")
-        [filter-code-req* _] (or (filter/valid-filter? filter-code-req-str valid-vars)
+        [filter-code-req* _] (or (filter/extract-filter-fn filter-code-req-str valid-vars)
                                  (throw (ex-info (str "Invalid required filters, provided: " filter-code-req-str)
                                                  {:status 400 :error :db/invalid-query})))
         filter-code-req-str* (str filter-code-req*)]
@@ -681,7 +681,7 @@
 (defn tuples->filter-optional
   [headers tuples valid-vars filter-code-opts]
   (reduce (fn [tuples filt]
-            (let [[filt* filt-vars] (or (filter/valid-filter? filt valid-vars)
+            (let [[filt* filt-vars] (or (filter/extract-filter-fn filt valid-vars)
                                         (throw (ex-info (str "Invalid filter, provided: " filt)
                                                         {:status 400 :error :db/invalid-query})))
                   filt-str        (str filt*)
