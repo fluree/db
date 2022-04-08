@@ -15,23 +15,23 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch where-clause]
-  (let [{:keys [p o idx]} where-clause
-        o*          (if (contains? o :value)
-                      (:value o)
-                      nil)
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause}]
+  (let [o*          (if-some [v (:value o)]
+                      v
+                      (when-let [variable (:variable o)]
+                        (get vars variable)))
         [fflake lflake] (case idx
                           :post [(flake/->Flake nil p o* nil nil util/min-integer)
                                  (flake/->Flake nil p o* nil nil util/max-integer)]
                           :psot [(flake/->Flake nil p nil nil nil util/min-integer)
                                  (flake/->Flake nil p nil nil nil util/max-integer)])
-        filter-fn (cond
-                    (and o* (= :psot idx))
-                    #(= o* (flake/o %))
+        filter-fn   (cond
+                      (and o* (= :psot idx))
+                      #(= o* (flake/o %))
 
-                    (:filter o)
-                    (let [f (get-in o [:filter :function])]
-                      #(-> % flake/o f)))
+                      (:filter o)
+                      (let [f (get-in o [:filter :function])]
+                        #(-> % flake/o f)))
         idx-root    (get db idx)
         cmp         (:comparator idx-root)
         range-set   (flake/sorted-set-by cmp fflake lflake)
@@ -109,11 +109,11 @@
 
 
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism query vars finish-fn] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
   (go-try
     (let [sid-ch    (if (= :_id (:type f-where))
                       (subjects-id-chan db error-ch vars f-where)
-                      (subjects-chan db error-ch f-where))
+                      (subjects-chan db error-ch vars f-where))
           flakes-af (flakes-xf opts)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]
