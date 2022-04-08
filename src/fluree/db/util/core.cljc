@@ -248,3 +248,11 @@
     (if (< #?(:clj (.length s) :cljs (.-length s)) pad)
       (recur (str "0" s))
       s)))
+
+(defn conjv
+  "Like conj, but if collection is nil creates a new vector instead of list.
+  Not built to handle variable arity values"
+  [coll x]
+  (if (nil? coll)
+    (vector x)
+    (conj coll x)))

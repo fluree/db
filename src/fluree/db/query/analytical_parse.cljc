@@ -693,9 +693,7 @@
           (recur r
                  (conj required-p p)
                  (if f
-                   (update filter-map p (fn [p-fns] (if p-fns
-                                                      (conj p-fns f)
-                                                      [f])))
+                   (update filter-map p util/conjv f)
                    filter-map))))
       (assoc filter-map :required-p required-p))))
 
@@ -738,7 +736,7 @@
   (dissoc query-map :vars))
 
 (defn parse-order-by
-  [db order-by-clause]
+  [order-by-clause]
   (let [throw!   (fn [msg] (throw (ex-info (or msg
                                                (str "Invalid orderBy clause: " order-by-clause))
                                            {:status 400 :error :db/invalid-query})))
@@ -774,7 +772,7 @@
    :predicate - predicate name, if :predicate type
    :variable  - variable name, if :variable type"
   [{:keys [where] :as parsed-query} db order-by]
-  (let [{:keys [variable] :as parsed-order-by} (parse-order-by db order-by)]
+  (let [{:keys [variable] :as parsed-order-by} (parse-order-by order-by)]
     (when (and variable (not (variable-in-where? variable where)))
       (throw (ex-info (str "Order by specifies a variable, " variable
                            " that is used in a where statement.")

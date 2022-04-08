@@ -23,7 +23,8 @@
             [fluree.db.util.async :refer [<? channel? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.query.fql-resp :refer [flakes->res]])
   (:import (java.util UUID)
            (fluree.db.flake Flake)))
 
@@ -706,12 +707,12 @@
                            acc []]
                       (if-not subject
                         acc
-                        (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
+                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
           asserted  (loop [[subject & r] (vals asserted-subjects)
                            acc []]
                       (if-not subject
                         acc
-                        (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
+                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
       {:block     (:block curr-block)
        :t         (:t curr-block)
        :retracted retracted
