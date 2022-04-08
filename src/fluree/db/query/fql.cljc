@@ -444,14 +444,21 @@
                     :else res)))))
 
 (defn- ad-hoc-query
-  [db fuel max-fuel query-map opts]
+  "Legacy ad-hoc query processor"
+  [db parsed-query query-map]
   (go-try
-    (let [parsed-query (q-parse/parse db query-map)]
-      (if (= :simple-subject-crawl (:strategy parsed-query))
-        (<? (simple-subject-crawl db parsed-query))
-        (let [where-result (<? (analytical/q query-map fuel max-fuel db opts))
-              select-spec  (:select parsed-query)]
-          (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))))
+    (let [{:keys [selectOne limit offset component orderBy groupBy prettyPrint opts]} query-map
+          opts'        (cond-> (merge {:limit   limit :offset (or offset 0) :component component
+                                       :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
+                                      opts)
+                               selectOne (assoc :limit 1))
+          max-fuel     (:max-fuel opts')
+          fuel         (or (:fuel opts)                     ;; :fuel volatile! can be provided upstream
+                           (when (or max-fuel (:meta opts))
+                             (volatile! 0)))
+          where-result (<? (analytical/q query-map fuel max-fuel db opts'))
+          select-spec  (:select parsed-query)]
+      (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))
 
 (defn cache-query
   "Returns already cached query from cache if available, else
@@ -470,23 +477,19 @@
                 (async/put! pc res)))
             pc)))))
 
+(defn cache?
+  "Returns true if query was requested to run from the cache."
+  [{:keys [opts] :as _query-map}]
+  #?(:clj (:cache opts) :cljs false))
 
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
   (log/debug "Running query:" (pr-str query-map))
-  (let [{:keys [select selectOne selectDistinct where from limit offset
-                component orderBy groupBy prettyPrint opts]} query-map
-        cache? #?(:clj (:cache opts) :cljs false)
-        opts'          (cond-> (merge {:limit   limit :offset (or offset 0) :component component
-                                       :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
-                                      opts)
-                               selectOne (assoc :limit 1))]
-    (if cache?
-      (cache-query db query-map)
-      (let [max-fuel     (:max-fuel opts')
-            fuel         (or (:fuel opts)                   ;; :fuel volatile! can be provided upstream
-                             (when (or max-fuel (:meta opts))
-                               (volatile! 0)))
-            db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
-        (ad-hoc-query db* fuel max-fuel query-map opts')))))
+  (if (cache? query-map)
+    (cache-query db query-map)
+    (let [parsed-query (q-parse/parse db query-map)
+          db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
+      (if (= :simple-subject-crawl (:strategy parsed-query))
+        (simple-subject-crawl db* parsed-query)
+        (ad-hoc-query db* parsed-query query-map)))))
