@@ -13,12 +13,12 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 
-;; javascript is 2^53 - 1
 (def ^:const max-long #?(:clj  (Long/MAX_VALUE)
-                         :cljs (- 2r11111111111111111111111111111111111111111111111111111 1)))
-(def ^:const min-long (- max-long))
-(def ^:const max-integer 2r1111111111111111111111111111111)
-(def ^:const min-integer (- max-integer))
+                         :cljs 9007199254740991))           ;; 2^53-1 for javascript
+(def ^:const min-long #?(:clj  (Long/MIN_VALUE)
+                         :cljs -9007199254740991))
+(def ^:const max-integer 2147483647)
+(def ^:const min-integer -2147483647)
 
 (defn cljs-env?
   "Take the &env from a macro, and tell whether we are expanding into cljs."

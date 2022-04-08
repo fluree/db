@@ -36,6 +36,16 @@
     "Populate index branch and leaf node maps with either their child node
      attributes or the flakes the store, respectively."))
 
+(defn try-resolve
+  [r error-ch node]
+  (go
+    (try* (<? (resolve r node))
+          (catch* e
+                  (log/error e
+                             "Error resolving index node:"
+                             (select-keys node [:id :network :dbid]))
+                  (>! error-ch e)))))
+
 (defn resolved?
   "Returns `true` if the data associated with the index node map `node` is fully
   resolved from storage"
@@ -236,14 +246,24 @@
          stale-flakes (stale-by from-t latest)
          subsequent   (filter-after to-t latest)
          out-of-range (concat stale-flakes subsequent)]
-     (flake/disj-all latest out-of-range)))
-  ([{:keys [id tempid tt-id] :as leaf} novelty from-t to-t object-cache]
-   (if object-cache
-     (object-cache
-      [::t-range id tempid tt-id from-t to-t]
-      (fn [_]
-        (t-range leaf novelty from-t to-t)))
-     (t-range leaf novelty from-t to-t))))
+     (flake/disj-all latest out-of-range))))
+
+(defrecord CachedTRangeResolver [node-resolver novelty from-t to-t async-cache]
+  Resolver
+  (resolve [_ {:keys [id tempid tt-id] :as node}]
+    (if (branch? node)
+      (resolve node-resolver node)
+      (async-cache
+       [::t-range id tempid tt-id from-t to-t]
+       (fn [_]
+         (go-try
+          (let [resolved (<? (resolve node-resolver node))
+                flakes   (t-range resolved novelty from-t to-t)]
+            (-> resolved
+                (dissoc :t)
+                (assoc :from-t from-t
+                       :to-t   to-t
+                       :flakes  flakes)))))))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from
@@ -276,15 +296,10 @@
 
 (defn resolve-when
   [r resolve? error-ch node]
-  (go
-    (try* (if (resolve? node)
-            (<? (resolve r node))
-            node)
-          (catch* e
-                  (log/error e
-                             "Error resolving index node:"
-                             (select-keys node [:id :network :dbid]))
-                  (>! error-ch e)))))
+  (if (resolve? node)
+    (try-resolve r error-ch node)
+    (doto (chan)
+      (async/put! node))))
 
 (defn resolve-children-when
   [r resolve? error-ch branch]

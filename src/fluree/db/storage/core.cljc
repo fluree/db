@@ -1,5 +1,5 @@
 (ns fluree.db.storage.core
-  (:refer-clojure :exclude [read])
+  (:refer-clojure :exclude [read exists?])
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [clojure.data.avl :as avl]
@@ -327,7 +327,7 @@
    (resolve-index-node node nil))
   ([conn {:keys [comparator leaf] :as node} error-fn]
    (assert comparator "Cannot resolve index node; configuration does not have a comparator.")
-   (let [return-ch (async/promise-chan)]
+   (let [return-ch (async/chan)]
      (go
        (try*
         (let [[k data] (if leaf
@@ -345,8 +345,8 @@
 
 (defn resolve-empty-leaf
   [{:keys [comparator] :as node}]
-  (let [pc         (async/promise-chan)
+  (let [ch         (async/chan)
         empty-set  (flake/sorted-set-by comparator)
         empty-node (assoc node :flakes empty-set)]
-    (async/put! pc empty-node)
-    pc))
+    (async/put! ch empty-node)
+    ch))

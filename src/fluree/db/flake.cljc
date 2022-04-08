@@ -463,6 +463,17 @@
   [n ss]
   (avl/split-at n ss))
 
+(defn lower-than-all?
+  [f ss]
+  (let [[lower e _] (avl/split-key f ss)]
+    (and (nil? e)
+         (empty? lower))))
+
+(defn higher-than-all?
+  [f ss]
+  (let [[_ e upper] (avl/split-key f ss)]
+    (and (nil? e)
+         (empty? upper))))
 
 (defn split-by-flake
   "Splits a sorted set at a given flake. If there is an exact match for flake,

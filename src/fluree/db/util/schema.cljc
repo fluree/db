@@ -39,6 +39,12 @@
   [f]
   (< (flake/s f) 0))
 
+(defn is-schema-cid?
+  "Returns true if collection id is a schema flake."
+  [cid]
+  (or (= cid const/$_predicate)
+      (= cid const/$_collection)))
+
 (defn is-schema-flake?
   "Returns true if flake is a schema flake."
   [f]

@@ -92,36 +92,44 @@
 ;; FILTER ( !bound(?date) )
 
 (defn valid-filter?
-  ([func symbol-whitelist]
-   (valid-filter? func symbol-whitelist nil))
-  ([func symbol-whitelist var-atom]
-   (let [func'   (if (string? func) (#?(:cljs cljs.reader/read-string
-                                        :clj  read-string) func) func)
-         fn-name (first func')
-         fn-w-ns (or (and (set? fn-name) (every? #(or (number? %) (string? %)) fn-name) fn-name) (filter-fns-with-ns (str fn-name))
-                     (throw (ex-info (str "Invalid filter function: " fn-name " used in function argument: " (pr-str func))
-                                     {:status 400
-                                      :error  :db/invalid-fn})))
-         args    (rest func')
-         args*   (mapv (fn [arg] (cond
-                                   (list? arg) (first (valid-filter? arg symbol-whitelist var-atom))
-                                   (string? arg) arg
-                                   (number? arg) arg
-                                   (symbol? arg) (do (or (symbol-whitelist arg) (throw (ex-info (str "Invalid symbol: " arg " used in function argument: " (pr-str func))
-                                                                                                {:status 400
-                                                                                                 :error  :db/invalid-fn})))
-                                                     (if var-atom (swap! var-atom conj arg))
-                                                     arg)
-                                   (or (true? arg) (false? arg) (nil? arg)) arg
-                                   (= (type arg) java.util.regex.Pattern) arg
-                                   :else (throw
-                                           (-> (str "Illegal element " (pr-str arg) " of type: " (type arg)
-                                                    (= (type arg) "class java.util.regex.Pattern")
-                                                    ") in function argument: " (pr-str func) ".")
-                                               #?(:clj  (Exception.)
-                                                  :cljs (js/Error.)))))) args)
-         fn*     (cons fn-w-ns args*)]
-     [fn* (if var-atom var-atom true)])))
+  "Takes a filter fn as a string and a set/fn of allowed symbols that can be used within the fn.
+
+  Returns two-tuple of parsed function and variables (symbols) used within the function as a set."
+  [func symbols-allowed]
+  (let [func'            (if (string? func) (#?(:cljs cljs.reader/read-string
+                                                :clj  read-string) func) func)
+        symbols-allowed* (or symbols-allowed (fn [sym] (not= \? (first (name sym)))))
+        fn-name          (first func')
+        fn-w-ns          (or (and (set? fn-name)
+                                  (every? #(or (number? %) (string? %)) fn-name)
+                                  fn-name)
+                             (filter-fns-with-ns (str fn-name))
+                             (throw (ex-info (str "Invalid filter function: " fn-name
+                                                  " used in function argument: " (pr-str func))
+                                             {:status 400
+                                              :error  :db/invalid-fn})))
+        args             (rest func')
+        [args* vars] (reduce (fn [[args* vars] arg]
+                               (cond
+                                 (list? arg) (let [[args' vars'] (valid-filter? arg symbols-allowed*)]
+                                               [(conj args* args') (into vars vars')])
+                                 (symbol? arg) (if-not (symbols-allowed* arg)
+                                                 (throw (ex-info (str "Invalid symbol: " arg
+                                                                      " used in function argument: " (pr-str func))
+                                                                 {:status 400 :error :db/invalid-fn}))
+                                                 [(conj args* arg) (conj vars arg)])
+                                 (or (string? arg)
+                                     (number? arg)
+                                     (boolean? arg)
+                                     (nil? arg)
+                                     #?(:clj  (= (type arg) java.util.regex.Pattern)
+                                        :cljs (regexp? arg))) [(conj args* arg) vars]
+                                 :else (throw (ex-info (str "Illegal element " (pr-str arg) " of type: " (type arg)
+                                                            " in function argument: " (pr-str func) ".")
+                                                       {:status 400 :error :db/invalid-fn}))))
+                             [[] #{}] args)
+        fn*              (cons fn-w-ns args*)]
+    [fn* vars]))
 
 (defn SPARQL-filter-parser
   "Takes a SPARQL-formatted filer, and returns "
@@ -187,6 +195,12 @@
 (defn get-internal-filter-fn
   [var fun]
   (eval `(fn [~var]
+           ~fun)))
+
+(defn make-executable
+  "Like the legacy get-internal-filter-fn, but allows for multiple vars."
+  [params fun]
+  (eval `(fn ~params
            ~fun)))
 
 (comment
