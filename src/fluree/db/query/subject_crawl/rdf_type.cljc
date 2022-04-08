@@ -38,8 +38,9 @@
 (defn subj-flakes-chan
   "Returns a channel that has a stream of flakes grouped by subject id.
   Always uses :spot index."
-  [{:keys [conn novelty t spot] :as db} error-ch where-clause]
-  (let [rdf-type    (-> where-clause :o :value)
+  [{:keys [conn novelty t spot] :as db} error-ch vars {:keys [o] :as _where-clause}]
+  (let [rdf-type    (or (:value o)
+                        (get vars (:variable o)))
         cid         (or (dbproto/-c-prop db :id rdf-type)
                         (throw (ex-info (str "Invalid data type: " rdf-type)
                                         {:status 400 :error :db/invalid-query})))
@@ -74,9 +75,9 @@
     return-chan))
 
 (defn rdf-type-crawl
-  [{:keys [db error-ch f-where limit offset parallelism finish-fn] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism finish-fn vars] :as opts}]
   (go-try
-    (let [subj-ch   (subj-flakes-chan db error-ch f-where)
+    (let [subj-ch   (subj-flakes-chan db error-ch vars f-where)
           flakes-af (flakes-xf opts)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]
