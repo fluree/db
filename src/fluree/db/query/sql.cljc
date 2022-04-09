@@ -120,7 +120,7 @@
   (->> rst
        parse-all
        (apply str)
-       #?(:clj  Integer/parseInt
+       #?(:clj  Long/parseLong
           :cljs Number.parseInt)
        bounce))
 

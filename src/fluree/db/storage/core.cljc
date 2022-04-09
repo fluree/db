@@ -3,6 +3,7 @@
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [clojure.data.avl :as avl]
+            [clojure.string :as str]
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]
             [fluree.db.dbproto :as dbproto]
@@ -18,9 +19,11 @@
 
 (defprotocol Store
   (exists? [s k] "Returns true when `k` exists in `s`")
+  (list [s d] "Returns a collection containing the keys stored under the subdirectory/prefix `d` of `s`")
   (read [s k] "Reads raw bytes from `s` associated with `k`")
   (write [s k data] "Writes `data` as raw bytes to `s` and associates it with `k`")
-  (rename [s old-key new-key] "Remove `old-key` and associate its data to `new-key`"))
+  (rename [s old-key new-key] "Remove `old-key` and associate its data to `new-key`")
+  (delete [s k] "Delete data associated with key `k`"))
 
 #?(:clj
    (defn block-storage-path
@@ -37,9 +40,14 @@
   [network ledger-id block]
   (str network "_" ledger-id "_root_" (util/zero-pad block 15)))
 
+(defn ledger-garbage-prefix
+  [network ldgr-id]
+  (str/join "_" [network ldgr-id "garbage"]))
+
 (defn ledger-garbage-key
-  [network ledger-key block]
-  (str network "_" ledger-key "_garbage_" block))
+  [network ldgr-id block]
+  (let [pre (ledger-garbage-prefix network ldgr-id)]
+    (str/join "_" [pre block])))
 
 (defn ledger-node-key
   [network ledger-id idx-type base-id node-type]

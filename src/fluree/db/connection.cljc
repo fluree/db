@@ -110,11 +110,11 @@
 ;; blocks, flushes, etc.
 
 (defrecord Connection [id servers state req-chan sub-chan pub-chan group
-                       storage-read storage-write storage-exists storage-rename
-                       object-cache async-cache parallelism serializer
-                       default-network transactor? publish transact-handler
-                       tx-private-key tx-key-id meta add-listener
-                       remove-listener close]
+                       storage-read storage-list storage-write storage-exists
+                       storage-rename storage-delete object-cache async-cache
+                       parallelism serializer default-network transactor?
+                       publish transact-handler tx-private-key tx-key-id meta
+                       add-listener remove-listener close]
 
   storage/Store
   (read [_ k]
@@ -125,6 +125,10 @@
     (storage-exists k))
   (rename [_ old-key new-key]
     (storage-rename old-key new-key))
+  (list [_ d]
+    (storage-list d))
+  (delete [_ k]
+    (storage-delete k))
 
   index/Resolver
   (resolve
