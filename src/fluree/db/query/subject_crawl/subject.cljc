@@ -111,7 +111,7 @@
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
   (go-try
-    (let [sid-ch    (if (= :_id (:type f-where))
+    (let [sid-ch    (if (#{:_id :iri} (:type f-where))
                       (subjects-id-chan db error-ch vars f-where)
                       (subjects-chan db error-ch vars f-where))
           flakes-af (flakes-xf opts)

@@ -15,7 +15,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.fql-resp :refer [flakes->res]]))
+            [fluree.db.query.fql-resp :refer [flakes->res]]
+            [fluree.db.util.async :as async-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -379,8 +380,10 @@
                           (throw (ex-info (str "Only one type of select-key (select, selectOne, selectDistinct, selectReduced) allowed. Provided: " (pr-str flureeQL))
                                           {:status 400
                                            :error  :db/invalid-query})))
-          db            sources                             ;; only support 1 source currently
-          db*           (if block (<? (time-travel/as-of-block (<? db) block)) (<? db))
+          db            (if (async-util/channel? sources)   ;; only support 1 source currently
+                          (<? sources)
+                          sources)
+          db*           (if block (<? (time-travel/as-of-block db block)) db)
           source-opts   (if prefixes
                           (get-sources (:conn db*) (:network db*) (:auth db*) prefixes)
                           {})

@@ -448,6 +448,24 @@
                           {:status 500
                            :error  :db/unexpected-error}))))
 
+(defn match-spot
+  "Returns all matching flakes to a specific subject, and optionaly also a predicate if provided
+  Must be provided with subject/predicate integer ids, no lookups are performed."
+  [ss sid pid]
+  (if pid
+    (avl/subrange ss >= (->Flake sid pid nil nil nil nil)
+                  <= (->Flake sid (inc pid) "" nil nil nil))
+    (avl/subrange ss > (->Flake (inc sid) MAX-COLL-SUBJECTS nil nil nil nil)
+                  < (->Flake (dec sid) -1 nil nil nil nil))))
+
+
+(defn match-post
+  "Returns all matching flakes to a predicate + object match."
+  [ss pid o]
+  (avl/subrange ss
+                >= (->Flake util/max-long pid o nil nil nil)
+                <= (->Flake 0 pid o nil nil nil)))
+
 (defn lookup
   [ss start-flake end-flake]
   (avl/subrange ss >= start-flake <= end-flake))

@@ -97,6 +97,11 @@
   #?(:clj  (System/currentTimeMillis)
      :cljs (.getTime (js/Date.))))
 
+(defn current-time-iso
+  "Returns current time as string for ISO-8601 format"
+  []
+  #?(:clj  (str (Instant/now))
+     :cljs (.toISOString (js/Date.))))
 
 (defn response-time-formatted
   "Returns response time, formatted as string. Must provide start time of request

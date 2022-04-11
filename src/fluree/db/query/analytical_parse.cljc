@@ -6,7 +6,8 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
-            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]))
+            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -123,10 +124,9 @@
 (defn q-var->symbol
   "Returns a query variable as a symbol, else nil if not a query variable."
   [x]
-  (when (or (keyword? x)
-            (and (string? x)
+  (when (or (and (string? x)
                  (= \? (first x)))
-            (and (symbol? x)
+            (and (or (symbol? x) (keyword? x))
                  (= \? (first (name x)))))
     (symbol x)))
 
@@ -382,7 +382,7 @@
   updated where clause. Updates where clause because a filter function may impact
   a prior where statement.
   "
-  [db parsed-where map-clause supplied-vars]
+  [db parsed-where map-clause supplied-vars context]
   (when (not= 1 (count map-clause))
     (throw (ex-info (str "Where clause maps can only have one key/val, provided: " map-clause)
                     {:status 400 :error :db/invalid-query})))
@@ -394,12 +394,12 @@
 
       :optional
       {:type  :optional
-       :where (parse-where db {:where clause-val} supplied-vars)}
+       :where (parse-where db {:where clause-val} supplied-vars context)}
 
       :union
       (if (= 2 (count clause-val))
         {:type  :union
-         :where (mapv #(parse-where db {:where %} supplied-vars) clause-val)}
+         :where (mapv #(parse-where db {:where %} supplied-vars context) clause-val)}
         (throw (ex-info (str "Invalid where clause, 'union' clause must have exactly two solutions. "
                              "Each solution must be its own 'where' clause wrapped in a vector")
                         {:status 400 :error :db/invalid-query})))
@@ -445,7 +445,7 @@
 
   'o' values have special handling before calling this function as they can
   also have 'tag' values or query-functions."
-  [value]
+  [context value]
   (cond
     (util/pred-ident? value)
     {:ident value}
@@ -456,24 +456,30 @@
     (nil? value)
     nil
 
+    context
+    {:value (json-ld/expand-iri value context)}
+
     :else
     {:value value}))
 
 
 (defn parse-where-tuple
   "Parses where clause tuples (not maps)"
-  [supplied-vars db s p o]
-  (let [fulltext? (str/starts-with? p "fullText:")
+  [supplied-vars context db s p o]
+  (let [p         (json-ld/expand-iri p context)
+        fulltext? (str/starts-with? p "fullText:")
         rdf-type? (or (= "rdf:type" p)
                       (= "a" p))
         _id?      (= "_id" p)
-        s*        (value-type-map s)
+        iri?      (= "@id" p)
+        s*        (value-type-map context s)
         p*        (cond
                     fulltext? #?(:clj  (full-text/parse-domain p)
                                  :cljs (throw (ex-info "Full text queries not supported in JavaScript currently."
                                                        {:status 400 :error :db/invalid-query})))
                     rdf-type? :rdf/type
                     _id? :_id
+                    iri? :iri
                     :else (if db
                             (or (dbproto/-p-prop db :id p)
                                 (throw (ex-info (str "Invalid predicate: " p)
@@ -491,12 +497,12 @@
                        :filter   parsed-filter-map})
 
                     :else
-                    (value-type-map o))
+                    (value-type-map context o))
         idx       (cond
                     fulltext?
                     :full-text
 
-                    (or _id? rdf-type?)
+                    (or _id? iri? rdf-type?)
                     :spot
 
                     (and s* (not (:variable s*)))
@@ -522,6 +528,7 @@
     {:type   (cond
                fulltext? :full-text
                rdf-type? :rdf/type
+               iri? :iri
                _id? :_id
                :else :tuple)
      :idx    idx
@@ -534,7 +541,7 @@
 (defn parse-remote-tuple
   "When a specific DB is used (not default) for a where statement.
   This is in the form of a 4-tuple where clause."
-  [supplied-vars db s p o]
+  [supplied-vars context db s p o]
   {:db   db
    :type :remote-tuple
    :s    s
@@ -542,14 +549,14 @@
    :o    o}
   ;; TODO - once we support multiple sources, below will attempt to resolve predicates into pids
   ;; TODO - for now, we just let them all through.
-  #_(-> (parse-where-tuple supplied-vars nil s p o)
+  #_(-> (parse-where-tuple supplied-vars context nil s p o)
         (assoc :db db
                :type :remote-tuple
                :s s :p p :o o)))
 
 (defn parse-where
   "Parses where clause"
-  [db {:keys [where] :as _query-map'} supplied-vars]
+  [db {:keys [where] :as _query-map'} supplied-vars context]
   (when-not (sequential? where)
     (throw (ex-info (str "Invalid where clause, must be a vector of tuples and/or maps: " where)
                     {:status 400 :error :db/invalid-query})))
@@ -561,7 +568,7 @@
     (if where-smt
       (cond
         (map? where-smt)
-        (let [{:keys [type] :as where-map} (parse-where-map db where* where-smt supplied-vars*)]
+        (let [{:keys [type] :as where-map} (parse-where-map db where* where-smt supplied-vars* context)]
           (case type
             :bind
             (let [{:keys [aggregates scalars]} where-map]
@@ -582,8 +589,8 @@
         (sequential? where-smt)
         (let [tuple-count (count where-smt)
               where-smt*  (case tuple-count
-                            3 (apply parse-where-tuple supplied-vars* db where-smt)
-                            4 (apply parse-remote-tuple supplied-vars* where-smt)
+                            3 (apply parse-where-tuple supplied-vars* context db where-smt)
+                            4 (apply parse-remote-tuple supplied-vars* context where-smt)
                             2 (apply parse-binding-tuple where-smt)
                             ;; else
                             (if (sequential? (first where-smt))
@@ -768,14 +775,16 @@
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
+  [db {:keys [opts prettyPrint filter orderBy groupBy context] :as query-map'} supplied-vars]
   (let [rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
                             (-> supplied-vars keys set))
+        context*          (json-ld/parse-context (:context db) context)
         parsed            (cond-> {:strategy      :legacy
+                                   :context       context*
                                    :rel-binding?  rel-binding?
-                                   :where         (parse-where db query-map' supplied-var-keys)
+                                   :where         (parse-where db query-map' supplied-var-keys context*)
                                    :opts          opts
                                    :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
                                    :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts

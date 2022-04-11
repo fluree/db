@@ -9,6 +9,9 @@
 
 ;; system constants
 
+;; @id (unique subject identifier) in the form of IRI
+(def ^:const $iri 0)
+
 ;; system collection ids
 (def ^:const $_tx -1)                                       ;; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
 (def ^:const $_predicate 0)
@@ -22,6 +25,8 @@
 (def ^:const $_rule 8)
 (def ^:const $_setting 9)
 (def ^:const $_ctx 10)
+(def ^:const $_prefix 11)
+(def ^:const $_default 12)
 
 (def ^:const $numSystemCollections 19)                      ;; max number reserved for 'system'
 (def ^:const $maxSystemPredicates 999)
@@ -54,8 +59,18 @@
 (def ^:const $_predicate:txSpecDoc 25)
 (def ^:const $_predicate:restrictTag 26)
 (def ^:const $_predicate:fullText 27)
-;(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
+(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
 (def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
+;; TODO - jumping predicate ids - rethink ordering a bit
+(def ^:const $rdf:type 200)
+(def ^:const $rdfs:subClassOf 201)
+(def ^:const $rdfs:subPropertyOf 202)
+(def ^:const $rdfs:Class 203)
+(def ^:const $rdf:Property 204)
+;; owl
+(def ^:const $owl:Class 205)
+(def ^:const $owl:ObjectProperty 206)
+(def ^:const $owl:DatatypeProperty 207)
 
 (def ^:const $_tag:id 30)
 (def ^:const $_tag:doc 31)

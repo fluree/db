@@ -107,6 +107,7 @@
    :network network
    :dbid dbid
    :id :empty
+   :tempid (util/random-uuid)
    :leaf true
    :first flake/maximum
    :rhs nil
@@ -158,6 +159,7 @@
      :network network
      :dbid dbid
      :id :empty
+     :tempid (util/random-uuid)
      :leaf false
      :first flake/maximum
      :rhs nil

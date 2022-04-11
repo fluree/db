@@ -4,7 +4,8 @@
             [clojure.string :as str]
             [fluree.db.spec :as spec]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.schema :as schema]))
+            [fluree.db.query.schema :as schema]
+            [fluree.db.util.log :as log]))
 
 ;; handling for legacy Fluree 'basic queries'
 
@@ -106,7 +107,7 @@
 
 (defn basic-to-analytical-transpiler
   [query-map]
-  (let [{:keys [select selectOne selectDistinct where from limit offset component orderBy vars]} query-map
+  (let [{:keys [select selectOne selectDistinct where from vars]} query-map
         selectKey  (cond select :select
                          selectOne :selectOne
                          selectDistinct :selectDistinct)

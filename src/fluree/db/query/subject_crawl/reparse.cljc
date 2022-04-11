@@ -78,7 +78,7 @@
   (let [first-where (first where)
         rest-where  (rest where)
         first-type  (:type first-where)
-        first-s     (when (and (#{:rdf/type :_id :tuple} first-type)
+        first-s     (when (and (#{:rdf/type :_id :iri :tuple} first-type)
                                (-> first-where :s :variable))
                       (-> first-where :s :variable))]
     (when first-s
