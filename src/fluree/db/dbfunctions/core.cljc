@@ -9,10 +9,6 @@
 
 (def ^:const local-fns-ns 'fluree.db.dbfunctions.fns)
 
-(defn clear-db-fn-cache
-  [])
-;; TODO: Implement this if we end needing a db fn cache w/ SCI
-
 (defn tx-fn?
   "Returns true if the arg is a string containing a transaction function."
   [v]
