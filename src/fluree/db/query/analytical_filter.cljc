@@ -113,22 +113,30 @@
         args             (rest func')
         [args* vars] (reduce (fn [[args* vars] arg]
                                (cond
-                                 (list? arg) (let [[args' vars'] (extract-filter-fn arg symbols-allowed*)]
-                                               [(conj args* args') (into vars vars')])
-                                 (symbol? arg) (if-not (symbols-allowed* arg)
-                                                 (throw (ex-info (str "Invalid symbol: " arg
-                                                                      " used in function argument: " (pr-str func))
-                                                                 {:status 400 :error :db/invalid-fn}))
-                                                 [(conj args* arg) (conj vars arg)])
+                                 (list? arg)
+                                 (let [[args' vars'] (extract-filter-fn arg symbols-allowed*)]
+                                   [(conj args* args') (into vars vars')])
+
+                                 (symbol? arg)
+                                 (if-not (symbols-allowed* arg)
+                                   (throw (ex-info (str "Invalid symbol: " arg
+                                                        " used in function argument: " (pr-str func))
+                                                   {:status 400 :error :db/invalid-fn}))
+                                   [(conj args* arg)
+                                    (conj vars arg)])
+
                                  (or (string? arg)
                                      (number? arg)
                                      (boolean? arg)
                                      (nil? arg)
                                      #?(:clj  (= (type arg) java.util.regex.Pattern)
-                                        :cljs (regexp? arg))) [(conj args* arg) vars]
-                                 :else (throw (ex-info (str "Illegal element " (pr-str arg) " of type: " (type arg)
-                                                            " in function argument: " (pr-str func) ".")
-                                                       {:status 400 :error :db/invalid-fn}))))
+                                        :cljs (regexp? arg)))
+                                 [(conj args* arg) vars]
+
+                                 :else
+                                 (throw (ex-info (str "Illegal element " (pr-str arg) " of type: " (type arg)
+                                                      " in function argument: " (pr-str func) ".")
+                                                 {:status 400 :error :db/invalid-fn}))))
                              [[] #{}] args)
         fn*              (cons fn-w-ns args*)]
     [fn* vars]))
