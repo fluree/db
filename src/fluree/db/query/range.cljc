@@ -416,7 +416,9 @@
 
                  res            (cond
                                   s
-                                  (<? (index-range db :spot = [s p o t] opts))
+                                  (if (= "_id" p)
+                                    (<? (index-range db :spot = [s nil nil t] opts))
+                                    (<? (index-range db :spot = [s p o t] opts)))
 
                                   (and p (non-nil-non-boolean? o) idx-predicate? (not (fn? o)))
                                   (<? (index-range db :post = [p o s t] opts))

@@ -7,25 +7,31 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject]]))
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject order-results]]
+            [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-;; TODO - what if the first clause has a filter fn in the .-o location?
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch where-clause]
-  (let [{:keys [p o idx]} where-clause
-        o*          (cond
-                      (contains? o :value) (:value o)
-                      (nil? o) nil
-                      :else (throw (ex-info (str "TODO: NOT YET IMPLEMENTED " o) o)))
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause}]
+  (let [o*          (if-some [v (:value o)]
+                      v
+                      (when-let [variable (:variable o)]
+                        (get vars variable)))
         [fflake lflake] (case idx
-                          :post [(flake/->Flake nil p o* nil nil -2147483647)
-                                 (flake/->Flake nil p o* nil nil 2147483647)]
-                          :psot [(flake/->Flake nil p nil nil nil -2147483647)
-                                 (flake/->Flake nil p nil nil nil 2147483647)])
+                          :post [(flake/->Flake nil p o* nil nil util/min-integer)
+                                 (flake/->Flake nil p o* nil nil util/max-integer)]
+                          :psot [(flake/->Flake nil p nil nil nil util/min-integer)
+                                 (flake/->Flake nil p nil nil nil util/max-integer)])
+        filter-fn   (cond
+                      (and o* (= :psot idx))
+                      #(= o* (flake/o %))
+
+                      (:filter o)
+                      (let [f (get-in o [:filter :function])]
+                        #(-> % flake/o f)))
         idx-root    (get db idx)
         cmp         (:comparator idx-root)
         range-set   (flake/sorted-set-by cmp fflake lflake)
@@ -36,10 +42,10 @@
                                     :end-test    <=
                                     :end-flake   lflake
                                     ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
-                                    :xf          (when (and (= :psot idx) o*)
+                                    :xf          (when filter-fn
                                                    (map (fn [flakes]
-                                                          (filter #(= o* (flake/o %)) flakes))))})
-        resolver    (index/->CachedTRangeResolver conn novelty t t (:async-cache conn))
+                                                          (filter filter-fn flakes))))})
+        resolver    (index/->CachedTRangeResolver conn (get novelty idx) t t (:async-cache conn))
         tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)
         return-chan (async/chan 10 (comp (map flake/s)
                                          (dedupe)))]
@@ -81,10 +87,33 @@
           (catch* e (async/put! error-ch e) (async/close! port) nil))))))
 
 
+(defn subjects-id-chan
+  "For queries that specify _id as the predicate, we will have a
+  single subject as a value."
+  [db error-ch vars {:keys [o] :as f-where}]
+  (let [return-ch (async/chan)
+        _id-val   (or (:value o)
+                      (get vars (:variable o)))]
+    (when-not _id-val
+      (throw (ex-info (str "When using _id as the predicate, a value must be provided: " f-where)
+                      {:status 400 :error :db/invalid-query})))
+    (async/go
+      (if (number? _id-val)
+        (async/>! return-ch _id-val)
+        (let [sid (async/<! (dbproto/-subid db _id-val))]
+          (if (util/exception? sid)
+            (async/put! error-ch sid)
+            (async/put! return-ch sid))))
+      (async/close! return-ch))
+    return-ch))
+
+
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
   (go-try
-    (let [sid-ch    (subjects-chan db error-ch f-where)
+    (let [sid-ch    (if (= :_id (:type f-where))
+                      (subjects-id-chan db error-ch vars f-where)
+                      (subjects-chan db error-ch vars f-where))
           flakes-af (flakes-xf opts)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]
@@ -105,7 +134,7 @@
             (do (async/close! sid-ch)
                 (async/close! flakes-ch)
                 (async/close! result-ch)
-                acc)
+                (finish-fn acc))
 
             :else
             (recur (conj acc next-res))))))))

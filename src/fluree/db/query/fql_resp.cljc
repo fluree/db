@@ -1,5 +1,5 @@
 (ns fluree.db.query.fql-resp
-  (:require [fluree.db.query.fql-parser :refer [parse-db ns-lookup-pred-spec p->pred-config parse-where]]
+  (:require [fluree.db.query.fql-parser :refer [ns-lookup-pred-spec p->pred-config]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log]
             [clojure.string :as str]
