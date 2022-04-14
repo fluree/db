@@ -118,21 +118,21 @@
 
 ;; TODO - moved this from the original transact namespace. Need to look at how this special treatment is handled
 ;; and verify it is being done in a reasonable way.
-(defn create-new-db-tx
+(defn create-new-ledger-tx
   [tx-map]
-  (let [{:keys [db alias auth doc fork forkBlock]} tx-map
-        db-name (if (sequential? db)
-                  (str (first db) "/" (second db))
-                  (str/replace db "/$" "/"))
-        tx      (util/without-nils
-                  {:_id       "db$newdb"
-                   :_action   :insert
-                   :id        db-name
-                   :alias     (or alias db-name)
-                   :root      auth
-                   :doc       doc
-                   :fork      fork
-                   :forkBlock forkBlock})]
+  (let [{:keys [ledger alias auth doc fork forkBlock]} tx-map
+        ledger-name (if (sequential? ledger)
+                      (str (first ledger) "/" (second ledger))
+                      (str/replace ledger "/$" "/"))
+        tx          (util/without-nils
+                      {:_id       "db$newdb"
+                       :_action   :insert
+                       :id        ledger-name
+                       :alias     (or alias ledger-name)
+                       :root      auth
+                       :doc       doc
+                       :fork      fork
+                       :forkBlock forkBlock})]
     [tx]))
 
 

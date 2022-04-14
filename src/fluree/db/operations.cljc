@@ -49,7 +49,7 @@
              (async/put! (:req-chan conn) [operation data pc opts])
              (log/trace "Put operation on connection req-chan: " [operation data pc opts])))
          (catch* e
-                 (async/put! pc e))))
+           (async/put! pc e))))
      pc)))
 
 

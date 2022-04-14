@@ -38,17 +38,6 @@
 
 (declare db transact query)
 
-;(defn pred-from-results
-;  [db transaction-results pred-name]
-;  "Gets first value of an predicate from transaction results."
-;  (let [pred-id    (query db {:selectOne "?s" :where [["?s" "_predicate/name" pred-name]]})
-;        pred-value (->> transaction-results
-;                        :flakes (some #(when (= pred-id (:p %))
-;                                         (:o %))))]
-;    pred-value))
-
-
-
 
 (defn sign
   "DEPRECATED: use fluree.db.api.auth/sign instead."
@@ -119,16 +108,16 @@
   - deps        - Not yet implemented, list of dependent transactions.
 
   If successful, will return a map with four keys:
-    - cmd  - a map with the command/transaction data as a JSON string
-    - sig  - the signature of the above stringified map
-    - id   - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
-    - db   - the ledger for this transaction"
+    - cmd    - a map with the command/transaction data as a JSON string
+    - sig    - the signature of the above stringified map
+    - id     - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
+    - ledger - the ledger for this transaction"
   ([ledger txn private-key] (tx->command ledger txn private-key nil))
   ([ledger txn private-key opts]
    (when-not private-key
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-transaction})))
-   (let [db-name     (if (sequential? ledger)
+   (let [ledger      (if (sequential? ledger)
                        (str (first ledger) "/$" (second ledger))
                        ledger)
          {:keys [auth expire nonce deps]} opts
@@ -147,7 +136,7 @@
          nonce       (or nonce timestamp)
          expire      (or expire (+ timestamp 300000)) ;; 5 min default
          cmd         (try (-> {:type      :tx
-                               :db        db-name
+                               :ledger    ledger
                                :tx        txn
                                :nonce     nonce
                                :auth      auth
@@ -161,10 +150,10 @@
                                             {:status 400 :error :db/invalid-tx}))))
          sig         (crypto/sign-message cmd private-key)
          id          (crypto/sha3-256 cmd)]
-     {:cmd cmd
-      :sig sig
-      :id  id
-      :db  ledger})))
+     {:cmd    cmd
+      :sig    sig
+      :id     id
+      :ledger ledger})))
 
 
 (defn monitor-tx-async
@@ -206,15 +195,15 @@
 
   The stringified cmd contains a payload that is a map, a transaction example follows:
 
-  {:type   tx             - command type is required on all commands
-   :db     testnet/mydb   - db name, use testnet/$mydb to peg to a dbid
-   :tx     [{...}, {...}] - transactional data
-   :auth   ABC12345676    - only required if using an authority's signature, else inferred from signature
-   :fuel   10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
-   :nonce  1234           - nonce ensures uniqueness, making sure two identical transactions have different txids
-   :expire 1547049123614  - don't even attempt this transaction after this moment in time
-   :deps   []             - optional one or more txids that must execute successfully before this tx executes
-                            if any of the txs in deps fail, this tx will fail
+  {:type   tx               - command type is required on all commands
+   :ledger testnet/myledger - ledger name
+   :tx     [{...}, {...}]   - transactional data
+   :auth   ABC12345676      - only required if using an authority's signature, else inferred from signature
+   :fuel   10000            - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
+   :nonce  1234             - nonce ensures uniqueness, making sure two identical transactions have different txids
+   :expire 1547049123614    - don't even attempt this transaction after this moment in time
+   :deps   []               - optional one or more txids that must execute successfully before this tx executes
+                              if any of the txs in deps fail, this tx will fail
   }
 
   Attempting to cancel a transaction
@@ -225,15 +214,14 @@
 
   A new ledger command looks like:
   Note new ledgers are issued as a command, and auth/signature should have proper authority on ledger servers.
-  {:type      new-db         - command type is required on all commands
-   :db        testnet/mydb   - db name - as network/dbid
-   :alias     testnet/mydb   - optional alias, will default to 'db' if not specified.
-   :fork      testnet/forkdb - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a dbid
-   :forkBlock 42             - if forking a db, optionally provides a block to fork at, else will default to current block
-   :auth      ABC12345676    - only required if using an authority's signature
-   :fuel      10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
-   :nonce     1234           - nonce ensures uniqueness, making sure two identical transactions have different txids
-   :expire    1547049123614  - don't even attempt this transaction after this moment in time
+  {:type      new-ledger       - command type is required on all commands
+   :ledger    testnet/myledger - ledger name - as network/ledger
+   :fork      testnet/forkdb   - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a dbid
+   :forkBlock 42               - if forking a db, optionally provides a block to fork at, else will default to current block
+   :auth      ABC12345676      - only required if using an authority's signature
+   :fuel      10000            - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
+   :nonce     1234             - nonce ensures uniqueness, making sure two identical transactions have different txids
+   :expire    1547049123614    - don't even attempt this transaction after this moment in time
   }
 
   Returns an async channel that will receive the result.
@@ -282,8 +270,8 @@
               timestamp            (System/currentTimeMillis)
               nonce                (or nonce timestamp)
               expire               (or expire (+ timestamp 30000)) ;; 5 min default
-              cmd-data             {:type          :new-db
-                                    :db            (str network "/" ledger-id)
+              cmd-data             {:type          :new-ledger
+                                    :ledger        (str network "/" ledger-id)
                                     :alias         alias*
                                     :auth          auth
                                     :doc           doc
@@ -345,9 +333,9 @@
    (try (let [{:keys [nonce expire timeout private-key] :or {timeout 60000}} opts
               timestamp (System/currentTimeMillis)
               nonce     (or nonce timestamp)
-              expire    (or expire (+ timestamp 30000))     ;; 5 min default
+              expire    (or expire (+ timestamp 30000)) ;; 5 min default
               cmd-data  {:type   :delete-db
-                         :db     ledger
+                         :ledger ledger
                          :nonce  nonce
                          :expire expire}]
           (if private-key
@@ -463,14 +451,14 @@
            result)
          ;; no private key provided, request ledger to sign request
          (let [tx-map (util/without-nils
-                        {:db     ledger
+                        {:ledger ledger
                          :tx     txn
                          :auth   auth
                          :nonce  nonce
                          :deps   deps
                          :expire expire})
                ;; will received txid once transaction is persisted, else an error
-               txid (<? (ops/transact-async conn tx-map))
+               txid   (<? (ops/transact-async conn tx-map))
                result (if txid-only
                         txid
                         (<? (monitor-tx-async conn ledger txid timeout)))]
@@ -667,17 +655,17 @@
                  retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
                                             asserted-subjects  {}
                                             retracted-subjects {}]
-                 (if-not flake
-                   [asserted-subjects retracted-subjects]
-                   (let [subject   (.-s flake)
-                         asserted? (true? (.-op flake))
-                         flake'    (if asserted? flake
-                                       (flake/flip-flake flake))]
-                     (if asserted?
-                       (recur r (update asserted-subjects subject #(vec (conj % flake')))
-                              retracted-subjects)
-                       (recur r asserted-subjects
-                              (update retracted-subjects subject #(vec (conj % flake'))))))))
+                                       (if-not flake
+                                         [asserted-subjects retracted-subjects]
+                                         (let [subject   (.-s flake)
+                                               asserted? (true? (.-op flake))
+                                               flake'    (if asserted? flake
+                                                                       (flake/flip-flake flake))]
+                                           (if asserted?
+                                             (recur r (update asserted-subjects subject #(vec (conj % flake')))
+                                                    retracted-subjects)
+                                             (recur r asserted-subjects
+                                                    (update retracted-subjects subject #(vec (conj % flake'))))))))
                 retracted (loop [[subject & r] (vals retracted-subjects)
                                  acc []]
                             (if-not subject
@@ -762,7 +750,7 @@
                       (:block query-map)
                       [(:block query-map) (:block query-map)])
           [block-start block-end]
-          (if (some string? range)                          ;; do we need to convert any times to block integers?
+          (if (some string? range) ;; do we need to convert any times to block integers?
             [(<? (time-travel/block-to-int-format db (first range)))
              (when-let [end (second range)]
                (<? (time-travel/block-to-int-format db end)))] range)
@@ -977,9 +965,9 @@
    (sql db sql-str {}))
   ([db sql-str opts]
    (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (sql-async db sql-str opts))))
-    p)))
+     (async/go
+       (deliver p (async/<! (sql-async db sql-str opts))))
+     p)))
 
 (defn sparql-async
   "Exceute a sparql query against a specified database. Returns a core async channel,
@@ -996,37 +984,9 @@
    (sparql db sparql-str {}))
   ([db sparql-str opts]
    (let [p (promise)]
-    (async/go
-      (deliver p (async/<! (sparql-async db sparql-str opts))))
-    p)))
-
-#_(defn index
-  "INTERNAL USE ONLY
-
-  Returns a raw collection of flakes from the specified index as a lazy sequence.
-
-  Optionally specify a start and/or stop point to restrict the collection to a range
-  along with an operator of <, <=, >, >=. If you wish to restrict to a specific
-  subject, predicate, etc. the = operator can also be used, which is equivalent to the same
-  parts being specified with a >= and <= operators.
-
-  The start and stop point should be specified as a vector of the relevant part(s) of the
-  specified index. i.e. if using the :spo index, the parts are [s p o], an :pos index would
-  be [p o s]. If only some parts, i.e. [s] are provided, the other parts are assumed to
-  be the lowermost or uppermost bounds of the remaining parts depending on if it is the
-  start or stop respectively. Keep in mind subjects sort descending.
-
-  Entities can be specified as an _id long integer, any unique identity (pred / obj two-tuple),
-  or a collection name.
-
-  Predicates can b
-  "
-  [db index start stop]
-
-  nil)
-
-
-
+     (async/go
+       (deliver p (async/<! (sparql-async db sparql-str opts))))
+     p)))
 
 
 (defn collection-flakes
@@ -1060,10 +1020,6 @@
     ([conn start] (flakes conn start nil {}))
     ([conn start end] (flakes conn start end {}))
     ([conn start end {:keys [subject predicate limit offset chunk]}])))
-
-
-
-
 
 
 (defn range
@@ -1216,7 +1172,7 @@
                                               {"_id" sid} flakes)))
                               [] by-subj)))]
     (assoc block-event :added (to-map add)
-           :retracted (to-map retract))))
+                       :retracted (to-map retract))))
 
 (defn session
   "Returns actual session object for a given ledger."
