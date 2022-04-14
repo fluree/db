@@ -18,6 +18,7 @@
                     :context {:id     "@id"
                               :type   "@type"
                               :schema "http://schema.org/"
+                              :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
                               :wiki   "https://www.wikidata.org/wiki/"}
                     :did     {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
                               :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"

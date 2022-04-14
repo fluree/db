@@ -8,8 +8,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.util.schema :as schema-util]
-            [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject order-results]]))
 
 #?(:clj (set! *warn-on-reflection* true))

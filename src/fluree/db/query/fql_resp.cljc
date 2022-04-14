@@ -6,13 +6,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [clojure.set :as set]
-            [fluree.db.query.analytical :as analytical]
-            [fluree.db.query.schema :as schema]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
-            [fluree.db.query.analytical-parse :as q-parse])
+            [fluree.db.util.async :refer [<? go-try merge-into?]])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 

@@ -12,11 +12,13 @@
   (-tag [db tag-id] [db tag-id pred] "Returns resolved tag, shortens namespace if pred provided.")
   (-tag-id [db tag-name] [db tag-name pred] "Returns the tag sid. If pred provided will namespace tag if not already.")
   (-subid [db ident] [db ident strict?] "Returns subject ID if exists, else nil")
+  (-iri [db subject-id] [db ident compact-fn] "Returns the IRI for the requested subject ID (json-ld only)")
   (-search [db fparts] "Performs a slice, but determines best index to use.")
   (-query [db query] [db query opts] "Performs a query.")
   (-with [db block flakes] [db block flakes opts] "Applies flakes to this db as a new block with possibly multiple 't' transactions.")
   (-with-t [db flakes] [db flakes opts] "Applies flakes to this db as a new 't', but retains current block.")
-  (-add-predicate-to-idx [db pred-id] "Adds predicate to idx, return updated db."))
+  (-add-predicate-to-idx [db pred-id] "Adds predicate to idx, return updated db.")
+  (-db-type [db] "Returns db type, e.g. :json-ld, :json"))
 
 (defn db?
   [db]

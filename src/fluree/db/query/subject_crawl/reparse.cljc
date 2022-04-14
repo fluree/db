@@ -101,7 +101,8 @@
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
   [{:keys [where select] :as _parsed-query}]
-  (let [select-var (-> select :select first :variable)]
+  (let [select-var (or (-> select :select first :variable)  ;; legacy select spec
+                       (-> select :spec first :variable))]
     (when select-var                                        ;; for now exclude any filters on the first where, not implemented
       (every? #(= select-var (-> % :s :variable)) where))))
 

@@ -2,13 +2,11 @@
   (:require #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.util.schema :as schema-util]
-            [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.query.fql-resp :refer [flakes->res]]))
+            [fluree.db.permissions-validate :as perm-validate]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,11 +23,11 @@
 
 
 (defn result-af
-  [{:keys [db cache fuel-vol max-fuel select-spec error-ch] :as _opts}]
+  [{:keys [result-fn error-ch] :as _opts}]
   (fn [flakes port]
     (go
       (try*
-        (some->> (<? (flakes->res db cache fuel-vol max-fuel select-spec flakes))
+        (some->> (<? (result-fn flakes))
                  not-empty
                  (async/put! port))
         (async/close! port)

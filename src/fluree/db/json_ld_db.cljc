@@ -306,6 +306,13 @@
                                      e)))))
     return-chan))
 
+(defn iri
+  "Returns the iri for a given subject ID"
+  [db subject-id compact-fn]
+  (go-try
+    (when-let [flake (first (<? (query-range/index-range db :spot = [subject-id 0])))]
+      (-> flake flake/o compact-fn))))
+
 ;; ================ GraphDB record support fns ================================
 
 (defn- graphdb-latest-db [{:keys [current-db-fn permissions]}]
@@ -403,13 +410,16 @@
   (-tag-id [this tag-name pred] (graphdb-tag-id this tag-name pred))
   (-subid [this ident] (subid this ident false))
   (-subid [this ident strict?] (subid this ident strict?))
+  (-iri [this subject-id] (iri this subject-id identity))
+  (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-search [this fparts] (query-range/search this fparts))
   (-query [this query-map] (fql/query this query-map))
   (-with [this block flakes] (with this block flakes nil))
   (-with [this block flakes opts] (with this block flakes opts))
   (-with-t [this flakes] (with-t this flakes nil))
   (-with-t [this flakes opts] (with-t this flakes opts))
-  (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil)))
+  (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil))
+  (-db-type [_] :json-ld))
 
 #?(:cljs
    (extend-type JsonLdDb
