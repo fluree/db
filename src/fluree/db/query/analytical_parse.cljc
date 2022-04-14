@@ -72,7 +72,6 @@
              (cond var-symbol {:variable var-symbol}
                    (aggregate? select) (parse-aggregate select)
                    (map? select) (parse-map select)
-                   ;(get interim-vars var-symbol) {:value (get interim-vars var-symbol)}
                    :else (throw (ex-info (str "Invalid select in statement, provided: " select)
                                          {:status 400 :error :db/invalid-query})))))
          select-smt)))
