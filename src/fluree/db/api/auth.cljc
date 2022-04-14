@@ -33,22 +33,22 @@
 (defn set-default-key-async
   "Sets a new default private key for the entire tx-group, network or db level.
   This will only succeed if signed by the default private key for the tx-group,
-  or if setting for a dbid, either the tx-group or network.
+  or if setting for a ledger-id, either the tx-group or network.
 
   It will overwrite any existing default private key.
 
   Returns core async channel that will respond with true or false, indicating success."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
-  ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
-  ([conn network dbid private-key opts]
+  ([conn network ledger-id private-key] (set-default-key-async conn network ledger-id private-key nil))
+  ([conn network ledger-id private-key opts]
    (let [{:keys [nonce expire signing-key]} opts
          timestamp (System/currentTimeMillis)
          nonce     (or nonce timestamp)
          expire    (or expire (+ timestamp 30000)) ;; 5 min default
          cmd-map   {:type        :default-key
                     :network     network
-                    :dbid        dbid
+                    :ledger-id   ledger-id
                     :private-key private-key
                     :nonce       nonce
                     :expire      expire}
@@ -65,16 +65,16 @@
 (defn set-default-key
   "Sets a new default private key for the entire tx-group, network or db level.
   This will only succeed if signed by the default private key for the tx-group,
-  or if setting for a dbid, either the tx-group or network.
+  or if setting for a ledger-id, either the tx-group or network.
 
   It will overwrite any existing default private key.
 
   Returns a promise of true or false, indicating success."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
-  ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
-  ([conn network dbid private-key opts]
+  ([conn network ledger-id private-key] (set-default-key-async conn network ledger-id private-key nil))
+  ([conn network ledger-id private-key opts]
    (let [p (promise)]
      (async/go
-       (deliver p (async/<! (set-default-key-async conn network dbid private-key opts))))
+       (deliver p (async/<! (set-default-key-async conn network ledger-id private-key opts))))
      p)))
