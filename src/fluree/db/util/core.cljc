@@ -249,6 +249,7 @@
       (recur (str "0" s))
       s)))
 
+
 (defn conjv
   "Like conj, but if collection is nil creates a new vector instead of list.
   Not built to handle variable arity values"
@@ -256,3 +257,37 @@
   (if (nil? coll)
     (vector x)
     (conj coll x)))
+
+
+(defmacro condps
+  "Takes an expression and a set of clauses.
+  Each clause can take the form of either:
+
+  unary-predicate-fn? result-expr
+  (unary-predicate-fn?-1 ... unary-predicate-fn?-N) result-expr
+
+  For each clause, (unary-predicate-fn? expr) is evalated (for each
+  unary-predicate-fn? in the clause when >1 is given). If it returns logical
+  true, the clause is a match.
+
+  Similar to condp but takes unary predicates instead of binary and allows
+  multiple predicates to be supplied in a list similar to case."
+  [expr & clauses]
+  (let [gexpr (gensym "expr__")
+        emit  (fn emit [expr args]
+                (let [[[a b :as clause] more] (split-at 2 args)
+                      n (count clause)]
+                  (case n
+                    0 `(throw (IllegalArgumentException.
+                                (str "No matching clause: " ~expr)))
+                    1 a
+                    (let [preds (if (and (coll? a)
+                                         (not (= 'fn* (first a)))
+                                         (not (= 'fn (first a))))
+                                  (vec a)
+                                  [a])]
+                      `(if ((apply some-fn ~preds) ~expr)
+                         ~b
+                         ~(emit expr more))))))]
+    `(let [~gexpr ~expr]
+       ~(emit gexpr clauses))))

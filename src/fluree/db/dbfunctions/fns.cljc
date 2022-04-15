@@ -32,7 +32,7 @@
           (recur r (conj acc (<? arg)))
           (recur r (conj acc arg)))))))
 
-(defn stack
+(defn- stack
   "Returns the current stack."
   [?ctx]
   (-> @(:state ?ctx)
@@ -42,12 +42,12 @@
   "Adds an entry to the current stack."
   [?ctx entry]
   (let [[res cost] entry]
-    (do
-      (log/debug "Smart function stack: " res)
-      (swap! (:state ?ctx) (fn [s]
-                             (assoc s :stack (conj (:stack s) entry)
-                                      :credits (fdb/- (:credits s) cost)
-                                      :spent (fdb/+ (:spent s) cost)))))))
+    (log/debug "Smart function stack:" res)
+    (swap! (:state ?ctx)
+           #(-> %
+                (update :stack conj entry)
+                (update :credits fdb/- cost)
+                (update :spent fdb/+ cost)))))
 
 (defn- raise
   "Throws an exception with the provided message."
@@ -104,7 +104,7 @@
   [?ctx arg]
   (go-try (let [arg   (extract arg)
                 res   (fdb/not arg)
-                entry [{:function "not?" :arguments [arg] :result res} 10]]
+                entry [{:function "not" :arguments [arg] :result res} 10]]
             (add-stack ?ctx entry)
             res)))
 

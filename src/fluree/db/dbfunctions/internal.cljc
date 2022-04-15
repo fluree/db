@@ -223,7 +223,7 @@
          result
          [result @fuel])))))
 
-(def pred-reverse-ref-re #"(?:([^/]+)/)_([^/]+)")
+(def ^:private pred-reverse-ref-re #"(?:([^/]+)/)_([^/]+)")
 
 (defn reverse-ref?
   "Reverse refs must be strings that include a '/_' in them, which characters before and after."

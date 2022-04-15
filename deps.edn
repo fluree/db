@@ -33,7 +33,10 @@
 
          ;; cryptography
          com.fluree/crypto               {:mvn/version "0.3.9"}
-         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}}
+         org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
+
+         ;; smartfunctions
+         org.babashka/sci                {:mvn/version "0.3.1"}}
 
  :paths ["src" "resources"]
 

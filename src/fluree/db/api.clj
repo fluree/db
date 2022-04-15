@@ -264,7 +264,7 @@
 
   Options include:
   - :alias       - Alias, if different than db-ident.
-  - :root        - Root account id to bootstrap with (string). Defaults to connection default account id.
+  - :owners      - Root account id(s) to bootstrap with (string collection). Defaults to connection default account id.
   - :doc         - Optional doc string about this db.
   - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
   - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
