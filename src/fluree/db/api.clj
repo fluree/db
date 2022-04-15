@@ -39,35 +39,35 @@
 (declare db transact query)
 
 
-(defn sign
+(defn ^:deprecated sign
   "DEPRECATED: use fluree.db.api.auth/sign instead."
   [message private-key]
   (log/warn "sign DEPRECATED - use fluree.db.api.auth/sign instead")
   (auth-api/sign message private-key))
 
 
-(defn public-key-from-private
+(defn ^:deprecated public-key-from-private
   "DEPRECATED: use fluree.db.api.auth/public-key-from-private instead."
   [private-key]
   (log/warn "public-key-from-private DEPRECATED - use fluree.db.api.auth/public-key-from-private instead")
   (auth-api/public-key-from-private private-key))
 
 
-(defn public-key
+(defn ^:deprecated public-key
   "DEPRECATED: use fluree.db.api.auth/public-key instead."
   [message signature]
   (log/warn "public-key DEPRECATED - use fluree.db.api.auth/public-key instead")
   (auth-api/public-key message signature))
 
 
-(defn new-private-key
+(defn ^:deprecated new-private-key
   "DEPRECATED: use fluree.db.api.auth/new-private-key instead."
   []
   (log/warn "new-private-key DEPRECATED - use fluree.db.api.auth/new-private-key instead")
   (auth-api/new-private-key))
 
 
-(defn set-default-key-async
+(defn ^:deprecated set-default-key-async
   "DEPRECATED: use fluree.db.api.auth/set-default-key-async instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
@@ -76,7 +76,7 @@
    (log/warn "set-default-key-async DEPRECATED - use fluree.db.api.auth/set-default-key-async instead")
    (auth-api/set-default-key-async conn network dbid private-key opts)))
 
-(defn set-default-key
+(defn ^:deprecated set-default-key
   "DEPRECATED: use fluree.db.api.auth/set-default-key instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
@@ -1211,7 +1211,7 @@
     p))
 
 
-(defn ledger-stats-async
+(defn ^:deprecated ledger-stats-async
   "DEPRECATED: use `ledger-info-async` instead.
 
   Returns core async promise channel with ledger info, including db size and # of flakes.
@@ -1221,7 +1221,7 @@
   (ops/ledger-stats-async conn ledger))
 
 
-(defn ledger-stats
+(defn ^:deprecated ledger-stats
   "DEPRECATED: use `ledger-info` instead.
 
   Returns promise with ledger info, including db size and # of flakes.
