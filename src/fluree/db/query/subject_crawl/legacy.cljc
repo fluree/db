@@ -106,13 +106,15 @@
       (= :or where-type) [{:optional where*}])))
 
 (defn basic-to-analytical-transpiler
-  [query-map]
+  [db query-map]
   (let [{:keys [select selectOne selectDistinct where from vars]} query-map
         selectKey  (cond select :select
                          selectOne :selectOne
                          selectDistinct :selectDistinct)
         select-smt (or select selectOne selectDistinct)
-        multi-subj (when (and (sequential? from) (every? util/subj-ident? from))
+        json-ld?   (= :json-ld (dbproto/-db-type db))
+        multi-subj (when (and (sequential? from)
+                              (or json-ld? (every? util/subj-ident? from)))
                      from)
         vars*      (if multi-subj
                      (assoc vars "?__subj" from)
@@ -123,21 +125,26 @@
                      [["?s" "_id" "?__subj"]]
 
                      (string? where)
-                     (cond->> (into-where where)
-                              from (into [["?s" "rdf:type" from]]))
-
-                     ;; Predicate-based query
-                     (and (string? from) (str/includes? from "/"))
-                     [["?s" from "?o"]]
-
-                     ;; Collection-based query
-                     (string? from)
-                     [["?s" "rdf:type" from]]
+                     (if json-ld?
+                       (throw (ex-info "String where queries not allowed for json-ld databases."
+                                       {:status 400 :error :db/invalid-query}))
+                       (cond->> (into-where where)
+                                from (into [["?s" "rdf:type" from]])))
 
                      ; Single subject - subject _id
                      (number? from)
                      [["?s" "_id" from]]
 
+                     (and json-ld? (or (string? from) (keyword? from)))
+                     [["?s" "@id" from]]
+
+                     ;; Legacy predicate-based query
+                     (and (string? from) (str/includes? from "/"))
+                     [["?s" from "?o"]]
+
+                     ;; Legacy collection-based query
+                     (string? from)
+                     [["?s" "rdf:type" from]]
 
                      ; Single subject - two-tuple
                      (util/pred-ident? from)

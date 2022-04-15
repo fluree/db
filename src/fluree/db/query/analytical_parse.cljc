@@ -663,7 +663,7 @@
 (defn parse
   [db query-map]
   (let [query-map*   (if (basic-query? query-map)
-                       (basic-to-analytical-transpiler query-map)
+                       (basic-to-analytical-transpiler db query-map)
                        query-map)
         {:keys [vars]} query-map*
         vars*        (coerce-vars vars)
