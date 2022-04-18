@@ -51,29 +51,26 @@ deploy: target/fluree-db.jar
 
 js-packages/nodejs/flureenjs.js: out/flureenjs.js
 	cp $< $@
-	bb run sync-version $(@D)/package.json
+	bb run sync-package-json $(@D)/package.json --node
 
 js-packages/browser/flureedb.js: out/flureedb.js
 	cp $< $@
-	bb run sync-version $(@D)/package.json
+	bb run sync-package-json $(@D)/package.json
 
 js-packages/webworker/flureeworker.js: out/flureeworker.js
 	cp $< $@
-	bb run sync-version $(@D)/package.json
+	bb run sync-package-json $(@D)/package.json
 
 js-packages: js-packages/nodejs/flureenjs.js js-packages/browser/flureedb.js js-packages/webworker/flureeworker.js
 
 publish-nodejs: js-packages/nodejs/flureenjs.js
-	cd $(<D)
-	npm publish
+	cd $(<D) && npm publish
 
 publish-browser: js-packages/browser/flureedb.js
-	cd $(<D)
-	npm publish
+	cd $(<D) && npm publish
 
 publish-webworker: js-packages/webworker/flureeworker.js
-	cd $(<D)
-	npm publish
+	cd $(<D) && npm publish
 
 publish-js: publish-nodejs publish-browser publish-webworker
 
