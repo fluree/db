@@ -92,9 +92,11 @@
                           (throw (ex-info (str "Digest type of " hash-type " is not supported.")
                                           {:status 401 :error :db/invalid-auth})))
             body        (:body req)
-            body        (if (string? body) body (json/stringify body))
+            body        (if (or (nil? body) (string? body)) body (json/stringify body))
+            _           (log/debug "verify-digest request body:" body)
             calc-digest (case hash-type
                           "SHA-256" (crypto/sha2-256 body :base64))
+            _           (log/debug "request digest:" hash "computed digest:" calc-digest)
             valid?      (= hash calc-digest)]
         (if-not valid?
           (throw (ex-info (str "Invalid digest.")

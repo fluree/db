@@ -23,7 +23,8 @@
             [fluree.db.util.async :refer [<? channel? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.query.fql-resp :refer [flakes->res]])
   (:import (java.util UUID)
            (fluree.db.flake Flake)))
 
@@ -263,7 +264,7 @@
 
   Options include:
   - :alias       - Alias, if different than db-ident.
-  - :root        - Root account id to bootstrap with (string). Defaults to connection default account id.
+  - :owners      - Root account id(s) to bootstrap with (string collection). Defaults to connection default account id.
   - :doc         - Optional doc string about this db.
   - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
   - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
@@ -706,12 +707,12 @@
                            acc []]
                       (if-not subject
                         acc
-                        (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
+                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
           asserted  (loop [[subject & r] (vals asserted-subjects)
                            acc []]
                       (if-not subject
                         acc
-                        (recur r (conj acc (<? (fql/flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
+                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
       {:block     (:block curr-block)
        :t         (:t curr-block)
        :retracted retracted

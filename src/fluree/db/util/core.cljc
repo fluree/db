@@ -13,12 +13,12 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 
-;; javascript is 2^53 - 1
 (def ^:const max-long #?(:clj  (Long/MAX_VALUE)
-                         :cljs (- 2r11111111111111111111111111111111111111111111111111111 1)))
-(def ^:const min-long (- max-long))
-(def ^:const max-integer 2r1111111111111111111111111111111)
-(def ^:const min-integer (- max-integer))
+                         :cljs 9007199254740991))           ;; 2^53-1 for javascript
+(def ^:const min-long #?(:clj  (Long/MIN_VALUE)
+                         :cljs -9007199254740991))
+(def ^:const max-integer 2147483647)
+(def ^:const min-integer -2147483647)
 
 (defn cljs-env?
   "Take the &env from a macro, and tell whether we are expanding into cljs."
@@ -248,3 +248,46 @@
     (if (< #?(:clj (.length s) :cljs (.-length s)) pad)
       (recur (str "0" s))
       s)))
+
+
+(defn conjv
+  "Like conj, but if collection is nil creates a new vector instead of list.
+  Not built to handle variable arity values"
+  [coll x]
+  (if (nil? coll)
+    (vector x)
+    (conj coll x)))
+
+
+(defmacro condps
+  "Takes an expression and a set of clauses.
+  Each clause can take the form of either:
+
+  unary-predicate-fn? result-expr
+  (unary-predicate-fn?-1 ... unary-predicate-fn?-N) result-expr
+
+  For each clause, (unary-predicate-fn? expr) is evalated (for each
+  unary-predicate-fn? in the clause when >1 is given). If it returns logical
+  true, the clause is a match.
+
+  Similar to condp but takes unary predicates instead of binary and allows
+  multiple predicates to be supplied in a list similar to case."
+  [expr & clauses]
+  (let [gexpr (gensym "expr__")
+        emit  (fn emit [expr args]
+                (let [[[a b :as clause] more] (split-at 2 args)
+                      n (count clause)]
+                  (case n
+                    0 `(throw (IllegalArgumentException.
+                                (str "No matching clause: " ~expr)))
+                    1 a
+                    (let [preds (if (and (coll? a)
+                                         (not (= 'fn* (first a)))
+                                         (not (= 'fn (first a))))
+                                  (vec a)
+                                  [a])]
+                      `(if ((apply some-fn ~preds) ~expr)
+                         ~b
+                         ~(emit expr more))))))]
+    `(let [~gexpr ~expr]
+       ~(emit gexpr clauses))))
