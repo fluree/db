@@ -17,8 +17,8 @@
                          json/default-pretty-print-options)
         sync-js-deps? (= "--node" (second args))
         sync-js-deps #(if sync-js-deps?
-                        (assoc %1 :dependencies (js-deps))
-                        %1)]
+                        (assoc % :dependencies (js-deps))
+                        %)]
     (println "Syncing version" version "to" target-package-json-file)
     (-> target-package-json
         (assoc :version version)
