@@ -1,0 +1,4 @@
+{:paths ["script"]
+ :tasks {sync-version {:requires ([sync-version :as sv])
+                       :task (apply sv/run *command-line-args*)}}}
+
