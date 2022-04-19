@@ -39,17 +39,6 @@
 
 (declare db transact query)
 
-;(defn pred-from-results
-;  [db transaction-results pred-name]
-;  "Gets first value of an predicate from transaction results."
-;  (let [pred-id    (query db {:selectOne "?s" :where [["?s" "_predicate/name" pred-name]]})
-;        pred-value (->> transaction-results
-;                        :flakes (some #(when (= pred-id (:p %))
-;                                         (:o %))))]
-;    pred-value))
-
-
-
 
 (defn ^:deprecated sign
   "DEPRECATED: use fluree.db.api.auth/sign instead."
@@ -120,16 +109,16 @@
   - deps        - Not yet implemented, list of dependent transactions.
 
   If successful, will return a map with four keys:
-    - cmd  - a map with the command/transaction data as a JSON string
-    - sig  - the signature of the above stringified map
-    - id   - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
-    - db   - the ledger for this transaction"
+    - cmd    - a map with the command/transaction data as a JSON string
+    - sig    - the signature of the above stringified map
+    - id     - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
+    - ledger - the ledger for this transaction"
   ([ledger txn private-key] (tx->command ledger txn private-key nil))
   ([ledger txn private-key opts]
    (when-not private-key
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-transaction})))
-   (let [db-name     (if (sequential? ledger)
+   (let [ledger      (if (sequential? ledger)
                        (str (first ledger) "/$" (second ledger))
                        ledger)
          {:keys [auth verified-auth expire nonce deps]} opts
@@ -151,7 +140,7 @@
          nonce       (or nonce timestamp)
          expire      (or expire (+ timestamp 300000))       ; 5 min default
          cmd         (try (-> {:type      :tx
-                               :db        db-name
+                               :ledger    ledger
                                :tx        txn
                                :nonce     nonce
                                :auth      (or (:auth verified-auth) auth)
@@ -171,7 +160,7 @@
                       :sig    sig
                       :signed (:signed verified-auth)
                       :id     id
-                      :db     ledger}]
+                      :ledger ledger}]
      (log/trace "tx->command result:" command)
      command)))
 
@@ -216,15 +205,15 @@
 
   The stringified cmd contains a payload that is a map, a transaction example follows:
 
-  {:type   tx             - command type is required on all commands
-   :db     testnet/mydb   - db name, use testnet/$mydb to peg to a dbid
-   :tx     [{...}, {...}] - transactional data
-   :auth   ABC12345676    - only required if using an authority's signature, else inferred from signature
-   :fuel   10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
-   :nonce  1234           - nonce ensures uniqueness, making sure two identical transactions have different txids
-   :expire 1547049123614  - don't even attempt this transaction after this moment in time
-   :deps   []             - optional one or more txids that must execute successfully before this tx executes
-                            if any of the txs in deps fail, this tx will fail
+  {:type   tx               - command type is required on all commands
+   :ledger testnet/myledger - ledger name
+   :tx     [{...}, {...}]   - transactional data
+   :auth   ABC12345676      - only required if using an authority's signature, else inferred from signature
+   :fuel   10000            - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
+   :nonce  1234             - nonce ensures uniqueness, making sure two identical transactions have different txids
+   :expire 1547049123614    - don't even attempt this transaction after this moment in time
+   :deps   []               - optional one or more txids that must execute successfully before this tx executes
+                              if any of the txs in deps fail, this tx will fail
   }
 
   Attempting to cancel a transaction
@@ -235,15 +224,14 @@
 
   A new ledger command looks like:
   Note new ledgers are issued as a command, and auth/signature should have proper authority on ledger servers.
-  {:type      new-db         - command type is required on all commands
-   :db        testnet/mydb   - db name - as network/dbid
-   :alias     testnet/mydb   - optional alias, will default to 'db' if not specified.
-   :fork      testnet/forkdb - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a dbid
-   :forkBlock 42             - if forking a db, optionally provides a block to fork at, else will default to current block
-   :auth      ABC12345676    - only required if using an authority's signature
-   :fuel      10000          - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
-   :nonce     1234           - nonce ensures uniqueness, making sure two identical transactions have different txids
-   :expire    1547049123614  - don't even attempt this transaction after this moment in time
+  {:type      new-ledger       - command type is required on all commands
+   :ledger    testnet/myledger - ledger name - as network/ledger
+   :fork      testnet/forkdb   - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a dbid
+   :forkBlock 42               - if forking a db, optionally provides a block to fork at, else will default to current block
+   :auth      ABC12345676      - only required if using an authority's signature
+   :fuel      10000            - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
+   :nonce     1234             - nonce ensures uniqueness, making sure two identical transactions have different txids
+   :expire    1547049123614    - don't even attempt this transaction after this moment in time
   }
 
   Returns an async channel that will receive the result.
@@ -292,8 +280,8 @@
               timestamp            (System/currentTimeMillis)
               nonce                (or nonce timestamp)
               expire               (or expire (+ timestamp 30000)) ;; 5 min default
-              cmd-data             {:type          :new-db
-                                    :db            (str network "/" ledger-id)
+              cmd-data             {:type          :new-ledger
+                                    :ledger        (str network "/" ledger-id)
                                     :alias         alias*
                                     :auth          auth
                                     :doc           doc
@@ -359,8 +347,8 @@
             :or   {timeout 60000, nonce timestamp}} opts
 
            expire    (or expire (+ timestamp 30000)) ;; 5 min default
-           cmd-data  {:type   :delete-db
-                      :db     ledger
+           cmd-data  {:type   :delete-ledger
+                      :ledger ledger
                       :nonce  nonce
                       :expire expire}]
        (if private-key
@@ -480,7 +468,7 @@
            result)
          ;; no private key provided, request ledger to sign request
          (let [tx-map (util/without-nils
-                        {:db            ledger
+                        {:ledger        ledger
                          :tx            txn
                          :auth          auth
                          :verified-auth verified-auth
@@ -789,6 +777,7 @@
   [db query-map]
   (query-api/resolve-block-range db query-map))
 
+
 (defn block-query-async
   "Given a map with a `:block` with a block number value, return a channel that will receive the raw flakes contained in that block.
 
@@ -1000,6 +989,7 @@
          (catch Exception e
            (deliver p e))))
      p)))
+
 
 (defn sparql-async
   "Exceute a sparql query against a specified database. Returns a core async channel,

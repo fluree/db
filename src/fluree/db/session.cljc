@@ -214,8 +214,9 @@
           network     (namespace ledger)
           maybe-alias (name ledger)
 
-          _           (when-not (and network maybe-alias) (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
-                                                                          {:status 400 :error :db/invalid-db})))]
+          _           (when-not (and network maybe-alias)
+                        (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
+                                        {:status 400 :error :db/invalid-db})))]
       (if (str/starts-with? maybe-alias "$")
         [network (subs maybe-alias 1)]
         [network (ledger-alias->id network maybe-alias) maybe-alias]))))
