@@ -16,7 +16,7 @@
   "Creates the operation header."
   ([operation db] (formulate-op-header operation db 60000))
   ([operation db timeout]
-   (let [req-id (str (util/random-uuid))
+   (let [req-id (str (random-uuid))
          header {:db        db
                  :op        operation
                  :req-id    req-id

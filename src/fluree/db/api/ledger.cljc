@@ -122,7 +122,7 @@
   (assert (pos-int? syncTo) (str "syncTo must be a block number (positive integer), provided: " syncTo))
   (let [pc        (async/promise-chan)                      ;; final response channel - has db or timeout error
         {:keys [conn network dbid]} db
-        listen-id (util/random-uuid)
+        listen-id (random-uuid)
         timeout   (if (pos-int? syncTimeout)
                     (min syncTimeout 120000)                ;; max 2 minutes
                     60000)                                  ;; 1 minute default

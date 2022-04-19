@@ -143,7 +143,7 @@
   "Assigns a tempid to all index roots, which ensures caching for this candidate db
   is independent from any 'official' db with the same block."
   [db]
-  (let [tempid  (util/random-uuid)
+  (let [tempid  (random-uuid)
         indexes [:spot :psot :post :opst]]
     (reduce
       (fn [db idx]

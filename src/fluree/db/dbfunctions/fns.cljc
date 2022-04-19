@@ -805,7 +805,7 @@
    :fdb/spec nil
    :fdb/cost 10}
   [?ctx]
-  (go-try (let [res   (clojure.core/str (util/random-uuid))
+  (go-try (let [res   (clojure.core/str (random-uuid))
                 entry [{:function "uuid" :arguments [] :result res} 10]]
             (add-stack ?ctx entry)
             res)))

@@ -185,10 +185,6 @@
                                                   add-update-bench add-delete-bench))]
     res))
 
-(defn abs
-  [n]
-  (if (<= 0 n) n (* -1 n)))
-
 (defn compare-results
   ([res1 res2]
    (compare-results res1 res2 0.5))

@@ -205,7 +205,7 @@
   [db tt-id flakes]
   (go-try
    (let [tt-id       (if (nil? tt-id)
-                       (util/random-uuid)
+                       (random-uuid)
                        tt-id)
 
          ;; update each root index with the provided tt-id

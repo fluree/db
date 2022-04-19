@@ -60,7 +60,7 @@
 
   Use with a timeout to consume, as no healthy servers may be avail."
   [conn-id servers]
-  (let [lock-id      (util/random-uuid)
+  (let [lock-id      (random-uuid)
         new-state    (swap! server-connections-atom update-in [conn-id :server]
                             (fn [x]
                               (if x
@@ -77,7 +77,7 @@
 (defn establish-socket
   [conn-id sub-chan pub-chan servers]
   (go-try
-    (let [lock-id    (util/random-uuid)
+    (let [lock-id    (random-uuid)
           state      (swap! server-connections-atom update-in [conn-id :ws]
                             (fn [x]
                               (if x
@@ -255,7 +255,7 @@
       (try*
        (let [_ (log/trace "Outgoing message to websocket: " msg)
              [operation data resp-chan opts] msg
-             {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
+             {:keys [req-id timeout] :or {req-id  (str (random-uuid))
                                           timeout 60000}} opts]
          (when resp-chan
            (swap! state assoc-in [:pending-req req-id] resp-chan)
@@ -538,7 +538,7 @@
                                (default-object-cache-fn default-cache-atom))
         async-cache-fn     (or async-cache
                                (default-async-cache-fn default-cache-atom))
-        conn-id            (str (util/random-uuid))
+        conn-id            (str (random-uuid))
         close              (fn []
                              (async/close! req-chan)
                              (async/close! sub-chan)

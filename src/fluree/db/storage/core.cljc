@@ -1,5 +1,5 @@
 (ns fluree.db.storage.core
-  (:refer-clojure :exclude [read exists?])
+  (:refer-clojure :exclude [read exists? list])
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             [clojure.data.avl :as avl]
@@ -121,7 +121,7 @@
 
 (defn random-leaf-id
   [network dbid idx]
-  (ledger-node-key network dbid idx (util/random-uuid) "l"))
+  (ledger-node-key network dbid idx (random-uuid) "l"))
 
 (defn write-leaf
   "Writes `leaf` to storage under the provided `leaf-id`, computing a new id if
@@ -148,7 +148,7 @@
 
 (defn random-branch-id
   [network dbid idx]
-  (ledger-node-key network dbid idx (util/random-uuid) "b"))
+  (ledger-node-key network dbid idx (random-uuid) "b"))
 
 (defn write-branch
   "Writes `branch` to storage under the provided `branch-id`, computing a new id

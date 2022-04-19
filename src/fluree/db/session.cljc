@@ -417,7 +417,7 @@
   If another process created the session first, will return the other process' session."
   [opts]
   (let [_        (log/trace "Create and cache session. Opt keys: " (keys opts))
-        id       (keyword "session" (-> (util/random-uuid) str (subs 0 7)))
+        id       (keyword "session" (-> (random-uuid) str (subs 0 7)))
         session  (session-factory (assoc opts :id id))
         session* (cache! session)
         new?     (= id (:id session*))]
