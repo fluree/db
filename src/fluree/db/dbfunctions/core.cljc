@@ -17,7 +17,15 @@
 (defn load-local-fns-ns
   "Copies local fns ns public vars into SCI"
   []
-  (let [sci-ns (sci/create-ns 'fluree.db.dbfunctions.fns)]
+  ;; unfortunately this ns has to a quoted symbol here.
+  ;; if you can figure out how to make it anything else
+  ;; (e.g. a let var or an arg to this fn), please do.
+  ;; just make sure it works in both CLJ and CLJS.
+  ;; I went round and round with it for quite some time.
+  ;;   - WSM 2022-04-19
+  (let [ns-public-vars (ns-publics 'fluree.db.dbfunctions.fns)
+        _              (log/debug (str "Loading " (count ns-public-vars) " local fns"))
+        sci-ns         (sci/create-ns 'fluree.db.dbfunctions.fns)]
     (reduce
       (fn [ns-map [var-name var]]
         (let [m        (meta var)
@@ -35,16 +43,13 @@
                                    doc (assoc :doc doc)
                                    arglists (assoc :arglists arglists)))))))
       {}
-      ;; unfortunately this ns has to a quoted symbol here.
-      ;; if you can figure out how to make it anything else
-      ;; (e.g. a let var or an arg to this fn), please do.
-      ;; just make sure it works in both CLJ and CLJS.
-      ;; I went round and round with it for quite some time.
-      ;;   - WSM 2022-04-19
-      (ns-publics 'fluree.db.dbfunctions.fns))))
+      ns-public-vars)))
 
 (def sci-ctx
-  (delay (sci/init {:namespaces (load-local-fns-ns)})))
+  (delay
+    (let [cfg {:namespaces {'fluree.db.dbfunctions.fns (load-local-fns-ns)}}]
+      (log/debug "SCI config:" cfg)
+      (sci/init cfg))))
 
 (defn parse-string [s]
   (sci/parse-string @sci-ctx s))
@@ -55,7 +60,6 @@
 (defn eval-form [f]
   (sci/eval-form @sci-ctx f))
 
-
 (defn combine-fns
   "Given a collection of function strings, returns a combined function using
   the and function."
@@ -64,14 +68,13 @@
     (str "(and " (str/join " " fn-str-coll) ")")
     (first fn-str-coll)))
 
-
 (defn find-local-fn
   "Tries to resolve a local pre-defined fn with fn-name. Returns a fn-map if
   found, nil otherwise."
   [fn-name]
   (log/debug "Looking for local fn:" fn-name)
   (let [local-fns-ns 'fluree.db.dbfunctions.fns
-        sci-vars (eval-string (str "(ns-publics '" local-fns-ns ")"))]
+        sci-vars     (eval-string (str "(ns-publics '" local-fns-ns ")"))]
     (log/debug "SCI vars:" sci-vars)
     (when ((-> sci-vars keys set) (symbol fn-name))
       (log/debug "Found local fn:" fn-name)
@@ -186,7 +189,6 @@
          (do
            (log/debug "Validated non-fn form:" form)
            form))))))
-
 
 (defn parse-fn
   [db fn-str type params]
