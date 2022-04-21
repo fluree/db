@@ -213,11 +213,12 @@
    {:type      :record
     :name      "FdbTransaction"
     :namespace "fluree"
-    :fields    [{:name "t", :type :long}
-                {:name "block", :type :long}
+    :fields    [{:name "id", :type :string}
+                {:name "network", :type :string}
+                {:name "ledger-id", :type :string}
                 {:name "cmd", :type :string}
-                {:name "flakes", :type {:type  :array
-                                        :items "fluree.Flake"}}]}))
+                {:name "size", :type :long}
+                {:name "instant", :type :long}]}))
 
 
 
