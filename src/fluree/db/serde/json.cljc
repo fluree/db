@@ -6,9 +6,9 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn deserialize-transaction
-  [txn]
-  (update txn :flakes #(mapv flake/parts->Flake %)))
+(defn deserialize-command
+  [cmd]
+  (update cmd :flakes #(mapv flake/parts->Flake %)))
 
 (defn deserialize-block
   [block]
@@ -46,10 +46,10 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
-  (-serialize-transaction [_ txn]
-    (throw (ex-info "-serialize-transaction not supported for JSON." {})))
-  (-deserialize-transaction [_ txn]
-    (-> txn json/parse deserialize-transaction))
+  (-serialize-command [_ cmd]
+    (throw (ex-info "-serialize-command not supported for JSON." {})))
+  (-deserialize-command [_ cmd]
+    (-> cmd json/parse deserialize-command))
   (-serialize-block [_ block]
     (throw (ex-info "-serialize-block not supported for JSON." {})))
   (-deserialize-block [_ block]

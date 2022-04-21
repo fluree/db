@@ -207,11 +207,11 @@
                  {:name "flakes", :type {:type  :array
                                          :items "fluree.Flake"}}]}))
 
-(def FdbTransaction-schema
+(def FdbCommand-schema
   (avro/parse-schema
    avro-Flake
    {:type      :record
-    :name      "FdbTransaction"
+    :name      "FdbCommand"
     :namespace "fluree"
     :fields    [{:name "id", :type :string}
                 {:name "network", :type :string}
@@ -258,12 +258,12 @@
                        'UUID         #'->UUID})
 
 
-(defn serialize-transaction
-  [txn]
+(defn serialize-command
+  [cmd]
   (try
-    (let [tx-map (select-keys txn [:cmd :flakes :t :block])]
-      (avro/binary-encoded FdbTransaction-schema tx-map))
-    (catch Exception e (log/error e "Error serializing transaction: " (-> txn
+    (let [cmd-map (select-keys cmd [:cmd :flakes :t :block])]
+      (avro/binary-encoded FdbCommand-schema cmd-map))
+    (catch Exception e (log/error e "Error serializing transaction: " (-> cmd
                                                                           (select-keys [:block :t :flakes])
                                                                           pr-str))
            (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
@@ -386,11 +386,11 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
-  (-serialize-transaction [_ txn]
-    (serialize-transaction txn))
-  (-deserialize-transaction [_ txn]
+  (-serialize-command [_ cmd]
+    (serialize-command cmd))
+  (-deserialize-command [_ cmd]
     (binding [avro/*avro-readers* bindings]
-      (avro/decode FdbTransaction-schema txn)))
+      (avro/decode FdbCommand-schema cmd)))
   (-serialize-block [_ block]
     (serialize-block block))
   (-deserialize-block [_ block]

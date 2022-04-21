@@ -8,10 +8,10 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
-  (-serialize-transaction [_ tx-data]
-    tx-data)
-  (-deserialize-transaction [_ tx]
-    tx)
+  (-serialize-command [_ cmd-data]
+    cmd-data)
+  (-deserialize-command [_ cmd]
+    cmd)
   (-serialize-block [_ block-data]
     block-data)
   (-deserialize-block [_ block-key]

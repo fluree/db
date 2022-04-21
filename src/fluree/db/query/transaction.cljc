@@ -19,13 +19,13 @@
              []))))))
 
 (defn lookup
-  [{:keys [conn network dbid] :as db} txid]
+  [{:keys [conn network dbid] :as db} cmd-id]
   (go
-    (let [res (<! (storage/read-transaction conn network dbid txid))]
+    (let [res (<! (storage/read-command conn network dbid cmd-id))]
       (if-not (or (nil? res) (util/exception? res))
         (let [{:keys [flakes]} res
               allowed-flakes   (<! (authorize db flakes))
-              tx-map           (select-keys res [:t :block])]
-          (assoc tx-map :flakes allowed-flakes))
-        (log/error res "Error reading transaction" txid "from storage for"
+              cmd-map           (select-keys res [:t :block])]
+          (assoc cmd-map :flakes allowed-flakes))
+        (log/error res "Error reading transaction" cmd-id "from storage for"
                    network dbid)))))

@@ -54,17 +54,17 @@
   (str network "_" ledger-id "_" (name idx-type) "_" base-id "-" node-type))
 
 
-(defn ledger-transaction-key
-  [network ledger-id txid]
-  (str/join "_" [network ledger-id "transaction" txid]))
+(defn ledger-command-key
+  [network ledger-id cmd-id]
+  (str/join "_" [network ledger-id "transaction" cmd-id]))
 
-(defn read-transaction
-  [conn network ledger-id txid]
+(defn read-command
+  [conn network ledger-id cmd-id]
   (go-try
-    (let [tx-key  (ledger-transaction-key network ledger-id txid)
+    (let [tx-key  (ledger-command-key network ledger-id cmd-id)
           tx-data (<? (read conn tx-key))]
       (when tx-data
-        (serdeproto/-deserialize-transaction (serde conn) tx-data)))))
+        (serdeproto/-deserialize-command (serde conn) tx-data)))))
 
 (defn ledger-block-key
   [network ledger-id block]
