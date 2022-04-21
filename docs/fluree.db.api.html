@@ -157,7 +157,7 @@ Options include:
 - :doc         - Optional doc string about this db.
 - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
 - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-- :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+- :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
 </pre></div></div><div class="public anchor" id="var-new-ledger-async"><h3>new-ledger-async</h3><div class="usage"><code>(new-ledger-async conn ledger)</code><code>(new-ledger-async conn ledger opts)</code></div><div class="doc"><pre class="plaintext">Attempts to create new ledger with the given ledger name (ex. `fluree/example` or `:fluree/example`).
 
 A successful result will kick off a process on the ledger server(s) to bootstrap.
@@ -172,7 +172,7 @@ Options include:
 - :doc         - Optional doc string about this db.
 - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
 - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-- :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+- :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
 </pre></div></div><div class="public anchor" id="var-new-private-key"><h3>new-private-key</h3><h4 class="deprecated">deprecated</h4><div class="usage"><code>(new-private-key)</code></div><div class="doc"><pre class="plaintext">DEPRECATED: use fluree.db.api.auth/new-private-key instead.
 </pre></div></div><div class="public anchor" id="var-predicate-id"><h3>predicate-id</h3><div class="usage"><code>(predicate-id db predicate)</code></div><div class="doc"><pre class="plaintext">Returns promise containing predicate id given a predicate name, or predicate id.
 If predicate doesn't exist, returns nil.</pre></div></div><div class="public anchor" id="var-predicate-name"><h3>predicate-name</h3><div class="usage"><code>(predicate-name db predicate-name)</code></div><div class="doc"><pre class="plaintext">Returns promise containing predicate name given predicate id.
@@ -219,8 +219,8 @@ i.e.
 - testnet/$testledger - look for a ledger with id testledger on network testnet (skip alias lookup).</pre></div></div><div class="public anchor" id="var-search"><h3>search</h3><div class="usage"><code>(search db flake-parts)</code></div><div class="doc"><pre class="plaintext">Returns a promise containing search results of flake parts (fparts).
 </pre></div></div><div class="public anchor" id="var-search-async"><h3>search-async</h3><div class="usage"><code>(search-async db flake-parts)</code></div><div class="doc"><pre class="plaintext">Performs a search for matching flakes, returns a core async promise channel.
 </pre></div></div><div class="public anchor" id="var-session"><h3>session</h3><div class="usage"><code>(session conn ledger)</code></div><div class="doc"><pre class="plaintext">Returns actual session object for a given ledger.
-</pre></div></div><div class="public anchor" id="var-set-default-key"><h3>set-default-key</h3><h4 class="deprecated">deprecated</h4><div class="usage"><code>(set-default-key conn private-key)</code><code>(set-default-key conn network private-key)</code><code>(set-default-key conn network dbid private-key)</code><code>(set-default-key conn network dbid private-key opts)</code></div><div class="doc"><pre class="plaintext">DEPRECATED: use fluree.db.api.auth/set-default-key instead.
-</pre></div></div><div class="public anchor" id="var-set-default-key-async"><h3>set-default-key-async</h3><h4 class="deprecated">deprecated</h4><div class="usage"><code>(set-default-key-async conn private-key)</code><code>(set-default-key-async conn network private-key)</code><code>(set-default-key-async conn network dbid private-key)</code><code>(set-default-key-async conn network dbid private-key opts)</code></div><div class="doc"><pre class="plaintext">DEPRECATED: use fluree.db.api.auth/set-default-key-async instead.
+</pre></div></div><div class="public anchor" id="var-set-default-key"><h3>set-default-key</h3><h4 class="deprecated">deprecated</h4><div class="usage"><code>(set-default-key conn private-key)</code><code>(set-default-key conn network private-key)</code><code>(set-default-key conn network ledger-id private-key)</code><code>(set-default-key conn network ledger-id private-key opts)</code></div><div class="doc"><pre class="plaintext">DEPRECATED: use fluree.db.api.auth/set-default-key instead.
+</pre></div></div><div class="public anchor" id="var-set-default-key-async"><h3>set-default-key-async</h3><h4 class="deprecated">deprecated</h4><div class="usage"><code>(set-default-key-async conn private-key)</code><code>(set-default-key-async conn network private-key)</code><code>(set-default-key-async conn network ledger-id private-key)</code><code>(set-default-key-async conn network ledger-id private-key opts)</code></div><div class="doc"><pre class="plaintext">DEPRECATED: use fluree.db.api.auth/set-default-key-async instead.
 </pre></div></div><div class="public anchor" id="var-sign"><h3>sign</h3><h4 class="deprecated">deprecated</h4><div class="usage"><code>(sign message private-key)</code></div><div class="doc"><pre class="plaintext">DEPRECATED: use fluree.db.api.auth/sign instead.
 </pre></div></div><div class="public anchor" id="var-sparql"><h3>sparql</h3><div class="usage"><code>(sparql db sparql-str)</code><code>(sparql db sparql-str opts)</code></div><div class="doc"><pre class="plaintext">Execute an sparql query against a specified database. Returns a promise of the query results.
 </pre></div></div><div class="public anchor" id="var-sparql-async"><h3>sparql-async</h3><div class="usage"><code>(sparql-async db sparql-str)</code><code>(sparql-async db sparql-str opts)</code></div><div class="doc"><pre class="plaintext">Exceute a sparql query against a specified database. Returns a core async channel,
@@ -261,7 +261,7 @@ A new ledger command looks like:
 Note new ledgers are issued as a command, and auth/signature should have proper authority on ledger servers.
 {:type      new-ledger       - command type is required on all commands
  :ledger    testnet/myledger - ledger name - as network/ledger
- :fork      testnet/forkdb   - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a dbid
+ :fork      testnet/forkdb   - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a ledger-id
  :forkBlock 42               - if forking a db, optionally provides a block to fork at, else will default to current block
  :auth      ABC12345676      - only required if using an authority's signature
  :fuel      10000            - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.

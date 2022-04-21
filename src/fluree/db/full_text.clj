@@ -54,16 +54,16 @@
     (lucene-analysis/standard-analyzer)))
 
 (defn base-storage-path
-  [network dbid path]
-  (str/join "/" [path network dbid "full_text"]))
+  [network ledger-id path]
+  (str/join "/" [path network ledger-id "full_text"]))
 
 (defn subject-storage-path
   [base-path]
   (str/join "/" [base-path "lucene"]))
 
 (defn disk-index
-  [base-path network dbid lang]
-  (let [storage-path  (base-storage-path network dbid base-path)
+  [base-path network ledger-id lang]
+  (let [storage-path  (base-storage-path network ledger-id base-path)
         subject-store (-> storage-path
                           subject-storage-path
                           lucene-store/disk-store)
@@ -79,7 +79,7 @@
     (->Index subject-store analyzer registry)))
 
 (defprotocol IndexConnection
-  (open-storage [conn network dbid lang]))
+  (open-storage [conn network ledger-id lang]))
 
 (defn predicate?
   [f]

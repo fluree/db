@@ -37,7 +37,7 @@
               _       (conn-handler/check-connection conn opts)
               [network ledger-id] (session/resolve-ledger conn ledger)
               root-db (-> (<? (session/db conn ledger opts))
-                          (assoc :conn conn :network network :dbid ledger-id))
+                          (assoc :conn conn :network network :ledger-id ledger-id))
               dbt     (if block
                         (<? (time-travel/as-of-block root-db block))
                         root-db)]
@@ -54,8 +54,8 @@
   (= (-> source (str/split #"/") count) 2))
 
 (defn- isolate-ledger-id
-  [dbid]
-  (re-find #"[a-z0-9]+/[a-z0-9]+" dbid))
+  [ledger-id]
+  (re-find #"[a-z0-9]+/[a-z0-9]+" ledger-id))
 
 (defn- get-sources
   "Validates & returns the query sources.

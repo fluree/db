@@ -184,12 +184,12 @@
 
 
 (defn- isolate-source-name
-  [dbid]
-  (re-find #"[a-z]+" dbid))
+  [ledger-id]
+  (re-find #"[a-z]+" ledger-id))
 
 (defn- isolate-source-block
-  [dbid]
-  (re-find #"[A-Z0-9]+" dbid))
+  [ledger-id]
+  (re-find #"[A-Z0-9]+" ledger-id))
 
 
 (defn get-source-clause
@@ -378,7 +378,7 @@
 
 
 (defn full-text->tuples
-  [{:keys [conn network dbid] :as db} res clause]
+  [{:keys [conn network ledger-id] :as db} res clause]
   #?(:cljs (throw (ex-info "Full text search is not supported in JS"
                            {:status 400
                             :error  :db/invalid-query}))
@@ -389,7 +389,7 @@
              (let [lang (-> db :settings :language (or :default))
                    [var search search-param] clause
                    var  (variable? var)]
-               (with-open [^Closeable store (full-text/open-storage conn network dbid lang)]
+               (with-open [^Closeable store (full-text/open-storage conn network ledger-id lang)]
                  (full-text/search store db [var search search-param]))))))
 
 

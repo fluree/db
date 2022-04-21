@@ -278,19 +278,19 @@
 (def schema-cache (atom (cache/ttl-cache-factory {} :ttl (* 10 60 1000))))
 
 (defn- schema-lookup
-  [db dbid opts]
+  [db ledger-id opts]
   (go-try
-    (if-let [cached-schema (get @schema-cache dbid)]
+    (if-let [cached-schema (get @schema-cache ledger-id)]
       [0 cached-schema]
       (let [[fuel schema] (<? (pull-schema db opts))]
-        (swap! schema-cache assoc dbid schema)
+        (swap! schema-cache assoc ledger-id schema)
         [fuel schema]))))
 
 
 (defn format-schema
   [db opts]
   (go-try
-    (let [[fuel schema] (<? (schema-lookup db (:dbid db) opts))
+    (let [[fuel schema] (<? (schema-lookup db (:ledger-id db) opts))
           schema* (into [] (concat [input-object-keys]
                                    (mapv format-types base-types-formatted)
                                    [flake]

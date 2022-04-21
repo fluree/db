@@ -248,7 +248,7 @@
        - :doc         - Optional doc string about this db.
        - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
        - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-       - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+       - :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
        - :jwt         - token for Fluree On-Demand access
        "
       ([conn ledger] (new-ledger conn ledger nil))
