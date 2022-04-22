@@ -63,14 +63,16 @@ js-packages/webworker/flureeworker.js: out/flureeworker.js
 
 js-packages: js-packages/nodejs/flureenjs.js js-packages/browser/flureedb.js js-packages/webworker/flureeworker.js
 
+NPM_TAG ?= latest
+
 publish-nodejs: js-packages/nodejs/flureenjs.js
-	cd $(<D) && npm publish
+	cd $(<D) && npm publish --tag $(NPM_TAG)
 
 publish-browser: js-packages/browser/flureedb.js
-	cd $(<D) && npm publish
+	cd $(<D) && npm publish --tag $(NPM_TAG)
 
 publish-webworker: js-packages/webworker/flureeworker.js
-	cd $(<D) && npm publish
+	cd $(<D) && npm publish --tag $(NPM_TAG)
 
 publish-js: publish-nodejs publish-browser publish-webworker
 
