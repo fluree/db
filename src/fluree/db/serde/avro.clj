@@ -207,16 +207,25 @@
                  {:name "flakes", :type {:type  :array
                                          :items "fluree.Flake"}}]}))
 
-(def FdbCommand-schema
+(def FdbSignedCommand-schema
   (avro/parse-schema
-   avro-Flake
+   {:type           :record
+    :name           "FdbSignedCommand"
+    :namespace      "fluree"
+    :fields         [{:name "cmd", :type :string}
+                     {:name "sig", :type :string}
+                     {:name "signed", :type :string}]}))
+
+(def FdbCommandEnvelope-schema
+  (avro/parse-schema
+   FdbSignedCommand-schema
    {:type      :record
-    :name      "FdbCommand"
+    :name      "FdbCommandEnvelope"
     :namespace "fluree"
     :fields    [{:name "id", :type :string}
                 {:name "network", :type :string}
                 {:name "ledger-id", :type :string}
-                {:name "cmd", :type :string}
+                {:name "signed-cmd", :type "fluree.FdbSignedCommand"}
                 {:name "size", :type :long}
                 {:name "instant", :type :long}]}))
 
@@ -262,7 +271,7 @@
   [cmd]
   (try
     (let [cmd-map (select-keys cmd [:cmd :flakes :t :block])]
-      (avro/binary-encoded FdbCommand-schema cmd-map))
+      (avro/binary-encoded FdbCommandEnvelope-schema cmd-map))
     (catch Exception e (log/error e "Error serializing transaction: " (-> cmd
                                                                           (select-keys [:block :t :flakes])
                                                                           pr-str))
@@ -272,7 +281,7 @@
 (defn deserialize-command
   [cmd]
   (binding [avro/*avro-readers* bindings]
-    (avro/decode FdbCommand-schema cmd)))
+    (avro/decode FdbCommandEnvelope-schema cmd)))
 
 (defn serialize-block
   [block-data]

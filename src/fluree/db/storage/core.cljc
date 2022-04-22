@@ -66,6 +66,16 @@
       (when tx-data
         (serdeproto/-deserialize-command (serde conn) tx-data)))))
 
+(defn write-command
+  [conn network dbid cmd]
+  (go-try
+   (let [persisted-data (-> cmd
+                            (select-keys [:id :network :ledger-id :signed-cmd :size :istant])
+                            (update :signed-cmd select-keys [:cmd :sig :signed]))
+         key            (ledger-command-key network dbid (:id persisted-data))
+         ser            (serdeproto/-serialize-command (serde conn) persisted-data)]
+     (<? (write conn key ser)))))
+
 (defn ledger-block-key
   [network ledger-id block]
   (str network "_" ledger-id "_block_" (util/zero-pad block 15)))
