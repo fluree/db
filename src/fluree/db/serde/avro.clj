@@ -269,6 +269,11 @@
            (throw (ex-info (str "Unexpected error, unable to serialize block data due to error: " (.getMessage e))
                            {:status 500 :error :db/unexpected-error})))))
 
+(defn deserialize-command
+  [cmd]
+  (binding [avro/*avro-readers* bindings]
+    (avro/decode FdbCommand-schema cmd)))
+
 (defn serialize-block
   [block-data]
   (try
@@ -389,8 +394,7 @@
   (-serialize-command [_ cmd]
     (serialize-command cmd))
   (-deserialize-command [_ cmd]
-    (binding [avro/*avro-readers* bindings]
-      (avro/decode FdbCommand-schema cmd)))
+    (deserialize-command [_ cmd]))
   (-serialize-block [_ block]
     (serialize-block block))
   (-deserialize-block [_ block]
