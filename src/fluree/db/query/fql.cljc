@@ -463,11 +463,11 @@
 (defn cache-query
   "Returns already cached query from cache if available, else
   executes and stores query into cache."
-  [{:keys [network dbid block auth conn] :as db} {:keys [opts] :as query-map}]
+  [{:keys [network ledger-id block auth conn] :as db} {:keys [opts] :as query-map}]
   ;; TODO - if a cache value exists, should max-fuel still be checked and throw if not enough?
   (let [oc        (:object-cache conn)
         query*    (update query-map :opts dissoc :fuel :max-fuel)
-        cache-key [:query network dbid block auth query*]]
+        cache-key [:query network ledger-id block auth query*]]
     ;; object cache takes (a) key and (b) fn to retrieve value if null
     (oc cache-key
         (fn [_]

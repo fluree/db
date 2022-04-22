@@ -377,7 +377,7 @@
                                        ["_auth/id" (-> (conn-handler/validate-token conn jwt)
                                                        :sub)]))
                       perm-db (-> (<? (ledger/db conn ledger (assoc opts :auth auth')))
-                                  (assoc :conn conn :network network :dbid ledger-id))]
+                                  (assoc :conn conn :network network :ledger-id ledger-id))]
                      (async/put! pc perm-db))
                 (catch :default e
                   (log/error e)
@@ -566,7 +566,7 @@
        - :doc         - Optional doc string about this db.
        - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
        - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-       - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+       - :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
        "
       ([conn ledger] (newLedger conn ledger nil))
       ([conn ledger opts]

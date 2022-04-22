@@ -5,7 +5,6 @@
   "name" : "@fluree/flureenjs",
   "preferGlobal" : false,
   "keywords" : [ "fluree", "nodejs" ],
-  "types" : "flureenjs.d.ts",
   "author" : "Fluree PBC (https://flur.ee)",
   "requires" : true,
   "version" : "2.0.0-alpha1",

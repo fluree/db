@@ -72,19 +72,19 @@
   "DEPRECATED: use fluree.db.api.auth/set-default-key-async instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
-  ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
-  ([conn network dbid private-key opts]
+  ([conn network ledger-id private-key] (set-default-key-async conn network ledger-id private-key nil))
+  ([conn network ledger-id private-key opts]
    (log/warn "set-default-key-async DEPRECATED - use fluree.db.api.auth/set-default-key-async instead")
-   (auth-api/set-default-key-async conn network dbid private-key opts)))
+   (auth-api/set-default-key-async conn network ledger-id private-key opts)))
 
 (defn ^:deprecated set-default-key
   "DEPRECATED: use fluree.db.api.auth/set-default-key instead."
   ([conn private-key] (set-default-key-async conn nil nil private-key nil))
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
-  ([conn network dbid private-key] (set-default-key-async conn network dbid private-key nil))
-  ([conn network dbid private-key opts]
+  ([conn network ledger-id private-key] (set-default-key-async conn network ledger-id private-key nil))
+  ([conn network ledger-id private-key opts]
    (log/warn "set-default-key DEPRECATED - use fluree.db.api.auth/set-default-key instead")
-   (auth-api/set-default-key conn network dbid private-key opts)))
+   (auth-api/set-default-key conn network ledger-id private-key opts)))
 
 (defn account-id
   "INTERNAL USE ONLY
@@ -226,7 +226,7 @@
   Note new ledgers are issued as a command, and auth/signature should have proper authority on ledger servers.
   {:type      new-ledger       - command type is required on all commands
    :ledger    testnet/myledger - ledger name - as network/ledger
-   :fork      testnet/forkdb   - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a dbid
+   :fork      testnet/forkdb   - optional name of db to fork, if forking. Use testnet/$forkdb to peg to a ledger-id
    :forkBlock 42               - if forking a db, optionally provides a block to fork at, else will default to current block
    :auth      ABC12345676      - only required if using an authority's signature
    :fuel      10000            - max fuel to spend, only required if enforcing fuel limits. tx will fail if auth doesn't have this much fuel avail. Will fail if all fuel is consumed. Unused fuel will not be debited.
@@ -256,7 +256,7 @@
   - :doc         - Optional doc string about this db.
   - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
   - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-  - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+  - :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
   "
   ([conn ledger] (new-ledger-async conn ledger nil))
   ([conn ledger opts]
@@ -316,7 +316,7 @@
   - :doc         - Optional doc string about this db.
   - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
   - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-  - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+  - :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
   "
   ([conn ledger] (new-ledger conn ledger nil))
   ([conn ledger opts]
@@ -634,7 +634,7 @@
           auth-id   (:auth opts)
           db-chan   (->
                       (<? (db conn ledger {:auth (when auth-id ["_auth/id" auth-id])}))
-                      (assoc :conn conn :network network :dbid ledger-id))
+                      (assoc :conn conn :network network :ledger-id ledger-id))
           db-blocks (<? (query-block/block-range db-chan start end opts))
           result    (query-range/block-with-tx-data db-blocks)]
       result)))

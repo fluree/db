@@ -153,7 +153,7 @@
     {:type      :record
      :name      "FdbRoot"
      :namespace "fluree"
-     :fields    [{:name "dbid", :type :string}
+     :fields    [{:name "ledger-id", :type :string}
                  {:name "block", :type :long}
                  {:name "t", :type :long}
                  {:name "ecount", :type {:type "map", :values :long}}
@@ -174,7 +174,7 @@
     {:type      :record
      :name      "FdbGarbage"
      :namespace "fluree"
-     :fields    [{:name "dbid", :type :string}
+     :fields    [{:name "ledger-id", :type :string}
                  {:name "block", :type :long}
                  {:name "garbage", :type {:type  :array
                                           :items :string}}]}))
@@ -187,7 +187,7 @@
     {:type      :record
      :name      "FdbDbPointer"
      :namespace "fluree"
-     :fields    [{:name "dbid", :type :string}
+     :fields    [{:name "ledger-id", :type :string}
                  {:name "block", :type :long}
                  {:name "status", :type [:null :string]}    ;; status code
                  {:name "message", :type [:null :string]}   ;; status message
