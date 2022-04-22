@@ -17,11 +17,12 @@
 (defn load-local-fns-ns
   "Copies local fns ns public vars into SCI"
   []
-  ;; unfortunately this ns has to a quoted symbol here.
-  ;; if you can figure out how to make it anything else
-  ;; (e.g. a let var or an arg to this fn), please do.
-  ;; just make sure it works in both CLJ and CLJS.
-  ;; I went round and round with it for quite some time.
+  ;; Unfortunately the ns below has to be a quoted symbol. If you can figure out
+  ;; how to make it anything else (e.g. a let var or an arg to this fn), please
+  ;; do. Just make sure it works in both CLJ and CLJS. I went round and round
+  ;; with it for quite some time. This is due to the assert in the CLJS version
+  ;; of `ns-publics`. I tried making it work with a macro instead but couldn't
+  ;; figure it out.
   ;;   - WSM 2022-04-19
   (let [ns-public-vars (ns-publics 'fluree.db.dbfunctions.fns)
         _              (log/debug (str "Loading " (count ns-public-vars) " local fns"))
