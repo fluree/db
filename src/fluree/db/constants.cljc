@@ -7,6 +7,23 @@
 
 (def ^:const data_version 4)
 
+;; iri constants
+(def ^:const iri-t "https://ns.flur.ee/ledger#t")
+(def ^:const iri-assert "https://ns.flur.ee/ledger#assert")
+(def ^:const iri-retract "https://ns.flur.ee/ledger#retract")
+(def ^:const iri-prev "https://ns.flur.ee/ledger#prev")
+(def ^:const iri-Commit "https://ns.flur.ee/ledger#Commit")
+(def ^:const iri-ledger "https://ns.flur.ee/ledger#ledger")
+(def ^:const iri-branch "https://ns.flur.ee/ledger#branch")
+(def ^:const iri-time "https://ns.flur.ee/ledger#time")
+(def ^:const iri-message "https://ns.flur.ee/ledger#message")
+(def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
+(def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
+(def ^:const iri-hash "https://ns.flur.ee/ledger#hash")
+(def ^:const iri-context "https://ns.flur.ee/ledger#context")
+
+(def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
+
 ;; system constants
 
 ;; @id (unique subject identifier) in the form of IRI
@@ -71,6 +88,11 @@
 (def ^:const $owl:Class 205)
 (def ^:const $owl:ObjectProperty 206)
 (def ^:const $owl:DatatypeProperty 207)
+;; fluree-specific
+(def ^:const $fluree:context 208)
+
+(def ^:const $fluree:default-context 300)
+
 
 (def ^:const $_tag:id 30)
 (def ^:const $_tag:doc 31)

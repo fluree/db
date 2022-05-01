@@ -86,6 +86,7 @@
     (let [ref?           (boolean id)                       ;; either a ref or a value
           existing-pid   (jld-reify/get-iri-sid property db-before iris)
           pid            (or existing-pid
+                             (get jld-ledger/predefined-properties property)
                              (new-pid property ref? tx-state))
           property-flake (when-not existing-pid
                            (flake/->Flake pid const/$iri property t true nil))
@@ -206,7 +207,7 @@
                                        :stats (-> stats
                                                   (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
                                                   (update :flakes + (count flakes)))
-                                       :schema (vocab/update-with db-before t @refs vocab-flakes))]
+                                       :schema schema*)]
     (assoc db :current-db-fn (fn [] (let [pc (async/promise-chan)]
                                       (async/put! pc db)
                                       pc)))))
@@ -215,42 +216,20 @@
 (defn stage
   "Stages changes, but does not commit.
   Returns promise with new db."
-  [db json-ld]
-  #?(:clj
-     (let [p (promise)]
-       (async/go
-         (try*
-           (let [expanded    (json-ld/expand json-ld)
-                 tx-state    (->tx-state db)
-                 base-flakes (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                                     (:new? tx-state) (into [(flake/->Flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (:t tx-state) true nil)
-                                                             (flake/->Flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" (:t tx-state) true nil)]))]
-             (loop [[node & r] (if (sequential? expanded)
-                                 expanded
-                                 [expanded])
-                    flakes base-flakes]
-               (if node
-                 (recur r (into flakes (<? (json-ld-node->flakes node tx-state))))
-                 (let [db-after (final-db tx-state flakes)]
-                   (deliver p db-after)))))
-           (catch* e (deliver p e))))
-       p)
-     :cljs
-     (js/Promise.
-       (fn [resolve reject]
-         (async/go
-           (try*
-             (let [expanded (json-ld/expand json-ld)
-                   tx-state (->tx-state db)
-                   base-flakes (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                                       (:new? tx-state) (into [(flake/->Flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (:t tx-state) true nil)
-                                                               (flake/->Flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" (:t tx-state) true nil)]))]
-               (loop [[node & r] (if (sequential? expanded)
-                                   expanded
-                                   [expanded])
-                      flakes base-flakes]
-                 (if node
-                   (recur r (into flakes (<? (json-ld-node->flakes node tx-state))))
-                   (let [db-after (final-db tx-state flakes)]
-                     (resolve db-after)))))
-             (catch* e (reject e))))))))
+  [db json-ld opts]
+  (async/go
+    (try*
+      (let [expanded    (json-ld/expand json-ld)
+            tx-state    (->tx-state db)
+            base-flakes (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
+                                (:new? tx-state) (into [(flake/->Flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (:t tx-state) true nil)
+                                                        (flake/->Flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" (:t tx-state) true nil)]))]
+        (loop [[node & r] (if (sequential? expanded)
+                            expanded
+                            [expanded])
+               flakes base-flakes]
+          (if node
+            (recur r (into flakes (<? (json-ld-node->flakes node tx-state))))
+            (final-db tx-state flakes))))
+      (catch* e e))))
+

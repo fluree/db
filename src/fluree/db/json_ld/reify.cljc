@@ -158,9 +158,9 @@
   [db commit]
   (let [iris           (volatile! {})
         refs           (volatile! (-> db :schema :refs))
-        t              (- (get-in commit ["https://flur.ee/ns/block/t" :value]))
-        assert         (get commit "https://flur.ee/ns/block/assert")
-        retract        (get commit "https://flur.ee/ns/block/retract")
+        t              (- (get-in commit [const/iri-t :value]))
+        assert         (get commit const/iri-assert)
+        retract        (get commit const/iri-retract)
         retract-flakes (retract-flakes db retract t iris)
         assert-flakes  (assert-flakes db assert t iris refs)]
     (merge-flakes db t @refs (into assert-flakes retract-flakes))))
@@ -186,8 +186,8 @@
          last-t      nil
          commits     (list)]
     (let [[commit proof] (load-commit read-fn next-commit)
-          t            (get-in commit ["https://flur.ee/ns/block/t" :value])
-          next-commit* (get-in commit ["https://flur.ee/ns/block/prev" :id])
+          t            (get-in commit [const/iri-t :value])
+          next-commit* (get-in commit [const/iri-prev :id])
           commits*     (conj commits [commit proof])]
       (when-not t
         (throw (ex-info (str "Commit is not a properly formatted Fluree commit: " next-commit ".")
@@ -215,7 +215,7 @@
         doc     (-> db-key
                     read-fn
                     json-ld/expand)
-        t       (get-in doc ["https://flur.ee/ns/block/t" :value])]
+        t       (get-in doc [const/iri-t :value])]
     (if (= 1 t)
       doc
 

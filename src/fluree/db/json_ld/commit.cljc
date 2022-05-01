@@ -1,7 +1,5 @@
 (ns fluree.db.json-ld.commit
   (:require [fluree.json-ld :as json-ld]
-            [fluree.db.json-ld-db :as jld-db]
-            [fluree.db.util.json :as json]
             [fluree.crypto :as crypto]
             [fluree.db.flake :as flake]
             [fluree.db.util.log :as log]
@@ -9,15 +7,13 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.json-ld.normalize :as normalize]
-            [fluree.db.ledger :as ledger]
             [fluree.db.conn.json-ld-proto :as jld-proto]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
-            [clojure.walk :as walk]))
+            [clojure.walk :as walk]
+            [fluree.db.ledger.proto :as ledger-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:const base-context ["https://flur.ee/ns/block"])
+(def ^:const base-context ["https://ns.flur.ee/ledger/v1"])
 
 (defn get-s-iri
   "Returns an IRI from a subject id (sid).
@@ -97,7 +93,7 @@
                                (conj retract (assoc s-retract id-key s-iri))
                                retract)]
           (recur r assert* retract*))
-        {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
+        {:refs-ctx (dissoc @ctx type-key)                   ; @type will be marked as @type: @id, which is implied
          :assert   assert
          :retract  retract}))))
 
@@ -130,7 +126,7 @@
                           stringify-context)
         private*      (or private
                           (:private did)
-                          (:private (ledger/did ledger)))
+                          (:private (ledger-proto/-did ledger)))
         did*          (or (some-> private*
                                   did-from-private)
                           did
@@ -163,11 +159,11 @@
 #_(defn- tx-hash
     [txs]
     (let [normalized (normalize/normalize txs)
-          hash (->> normalized
-                    crypto/sha2-256
-                    (str "urn:sha256:"))]
+          hash       (->> normalized
+                          crypto/sha2-256
+                          (str "urn:sha256:"))]
       {:normalized normalized
-       :hash hash}))
+       :hash       hash}))
 
 #_(defn- tx-doc
     "Generates a transaction JSON-LD doc for a given 't' value.
@@ -189,9 +185,9 @@
                                       :id-key        id-key
                                       :type-key      type-key
                                       :ctx-used-atom ctx-used-atom})
-          tx-doc   (cond-> {(compact-fn "https://flur.ee/ns/block/t") (- t)}
-                           (seq assert) (assoc (compact-fn "https://flur.ee/ns/block/assert") assert)
-                           (seq retract) (assoc (compact-fn "https://flur.ee/ns/block/retract") retract))]
+          tx-doc   (cond-> {(compact-fn const/iri-t) (- t)}
+                           (seq assert) (assoc (compact-fn const/iri-assert) assert)
+                           (seq retract) (assoc (compact-fn const/iri-retract) retract))]
       (when ctx-used-atom
         (swap! ctx-used-atom (partial merge-with merge) refs-ctx))
       tx-doc))
@@ -200,7 +196,7 @@
     [{:keys [ledger t] :as db} {:keys [time message context]}]
     (let [{branch-name   :name
            branch-t      :t
-           branch-commit :commit} (ledger/branch-meta ledger)
+           branch-commit :commit} (branch/branch-meta ledger)
           ctx-used-atom (atom {})
           context*      (if context
                           (json-ld/parse-context (:context ledger) context)
@@ -217,7 +213,7 @@
                (compact-fn "https://flur.ee/ns/block/t")          (- t)
                (compact-fn "https://flur.ee/ns/block/time")       (util/current-time-iso)
                (compact-fn "https://flur.ee/ns/block/tx")         tx-docs}
-              ;branch-commit (assoc (compact-fn "https://flur.ee/ns/block/prev") branch-commit)
+              ;branch-commit (assoc (compact-fn const/iri-prev) branch-commit)
               ;ledger-address (assoc (compact-fn "https://flur.ee/ns/block/ledger") ledger-address)
               message (assoc (compact-fn "https://flur.ee/ns/block/message") message))
 
@@ -279,7 +275,7 @@
                           :commit     commit
                           :json       commit-json
                           :id         id
-                          :publish    publish-p               ;; promise with eventual result once successful
+                          :publish    publish-p             ;; promise with eventual result once successful
                           :hash       hash
                           :db-before  db
                           :db-after   db*}]
@@ -298,7 +294,7 @@
 (defn tx-data
   "Convert the novelty flakes into the json-ld shape."
   [{:keys [novelty ledger] :as db} {:keys [compact] :as opts}]
-  (let [[_ committed-t] (ledger/last-commit ledger)
+  (let [{:keys [committed-t]} (ledger-proto/-commit ledger)
         new-flakes (->> (:tspo novelty)
                         (filter #(< (flake/t %) committed-t))
                         (not-empty))]
@@ -308,30 +304,30 @@
            (map (fn [[t flakes]] (-> (generate-commit db (reverse flakes) opts)
                                      (assoc :t t))))
            (map (fn [{:keys [assert retract t refs-ctx]}]
-                  (cond-> {(compact "https://flur.ee/ns/tx#t") (- t)}
+                  (cond-> {(compact const/iri-t) (- t)}
                           (seq refs-ctx) (assoc "@context" refs-ctx)
-                          (seq assert)   (assoc (compact "https://flur.ee/ns/tx#assert") assert)
-                          (seq retract)  (assoc (compact "https://flur.ee/ns/tx#retract") retract))))))))
+                          (seq assert) (assoc (compact const/iri-assert) assert)
+                          (seq retract) (assoc (compact const/iri-retract) retract))))))))
 
 
 (defn commit-data
   "Create a json-ld commit shape using tx-data."
-  [txs {:keys [commit] :as db} {:keys [type-key compact branch message] :as opts}]
+  [updates {:keys [commit] :as db} {:keys [type-key compact branch message tag] :as opts}]
   (let [prev-commit    (:id commit)
-        branch-commit  (:branch commit)
         ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
                          @(:ledger commit))
-        tx-hash        (tx-hash (json-ld/normalize-data txs))]
-    (cond-> {"@context" base-context
-             type-key [(compact "https://flur.ee/ns/commit")]
-             (compact "https://flur.ee/ns/commit#branchName") (util/keyword->str branch)
-             (compact "https://flur.ee/ns/commit#time") (util/current-time-iso)
-             (compact "https://flur.ee/ns/commit#txs") txs
-             (compact "https://flur.ee/ns/commit#tx-hash") tx-hash}
-            prev-commit    (assoc (compact "https://flur.ee/ns/commit#prev") prev-commit)
-            branch-commit  (assoc (compact "https://flur.ee/ns/commit#branch") branch-commit)
-            ledger-address (assoc (compact "https://flur.ee/ns/commit#ledger") ledger-address)
-            message        (assoc (compact "https://flur.ee/ns/commit#message") message))))
+        hash           (tx-hash (json-ld/normalize-data updates))
+        commit-base    {"@context"                  base-context
+                        type-key                    [(compact const/iri-Commit)]
+                        (compact const/iri-branch)  (util/keyword->str branch)
+                        (compact const/iri-time)    (util/current-time-iso)
+                        (compact const/iri-updates) updates
+                        (compact const/iri-hash)    hash}]
+    (cond-> commit-base
+            prev-commit (assoc (compact const/iri-prev) prev-commit)
+            ledger-address (assoc (compact const/iri-ledger) ledger-address)
+            message (assoc (compact const/iri-message) message)
+            tag (assoc (compact const/iri-tag) tag))))
 
 
 (defn commit
@@ -341,20 +337,20 @@
   ;; TODO: error handling - if a commit fails we need to stop immediately
   [db opts]
   (let [{:keys [branch commit ledger t]} db
-        {:keys [did] :as opts*}          (commit-opts db opts)
-        jld-txs                          (tx-data db opts*)]
+        {:keys [did] :as opts*} (commit-opts db opts)
+        jld-txs (tx-data db opts*)]
     (if jld-txs
       (let [jld-commit (commit-data jld-txs db opts*)
             credential (when did (cred/generate jld-commit opts*))
 
-            doc       (json-ld/normalize-data (or credential commit))
+            doc        (json-ld/normalize-data (or credential commit))
             ;; TODO: can we move these side effects outside of commit?
             ;; TODO: suppose we fail while c-write? while push?
-            conn      (:conn ledger)
-            id        (jld-proto/c-write conn doc)
-            publish-p (jld-proto/push conn id)
+            conn       (:conn ledger)
+            id         (jld-proto/c-write conn doc)
+            publish-p  (jld-proto/push conn id)
             ;; TODO: should the hash be the tx-hash?
-            hash      (get jld-commit "https://flur.ee/ns/commit#tx-hash")]
+            hash       (get jld-commit const/iri-hash)]
         ;; TODO: properly update branch state
         (swap! (:state ledger) #(update-in % [:branches branch] merge {:t t :commit hash}))
         (assoc db :commit {:t      t

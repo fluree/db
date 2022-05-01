@@ -18,13 +18,17 @@
   [{:keys [type] :as node}]
   (some class+property-iris type))
 
-(def predefined-properties
+(def ^:const predefined-properties
   {"http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
    "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
    "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
    "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type})
+   "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type
+   "https://ns.flur.ee/ledger#context"                   const/$fluree:context})
+
+(def ^:const predefined-subjects
+  {const/iri-default-context const/$fluree:default-context})
 
 (defn flip-key-vals
   [map]
@@ -60,7 +64,9 @@
   [{:keys [id] :as node} iris next-pid next-sid]
   (let [new-sid (if (class-or-property? node)
                   (next-pid)
-                  (next-sid))]
+                  (or
+                    (get predefined-subjects id)
+                    (next-sid)))]
     (vswap! iris assoc id new-sid)
     new-sid))
 
@@ -87,3 +93,31 @@
                            :s)]
       (vswap! iris assoc iri sid)
       sid)))
+
+
+
+(defn ledger-root
+  "Returns a full ledger-root JSON-LD document for persistent storage."
+  [{:keys [conn context state name reindex-min reindex-max] :as ledger}]
+  (let [{:keys [branches branch]} @state
+        {:keys [t dbs commit idx latest-db from]} (get branches branch)
+        idx-map   {"reindexMin" reindex-min
+                   "reindexMax" reindex-max
+                   "t"          t
+                   "idx"        idx
+                   "schema"     nil
+                   "context"    nil}
+
+        branches* (not-empty
+                    (->> (dissoc branches branch)
+                         (map #(select-keys % [t commit idx]))))]
+    {"@context" "https://ns.flur.ee/ledger/v1"
+     "name"     name
+     "branch"   branch
+     "branches" branches*
+     "t"        t
+     "commit"   commit
+     "idx"      idx-map
+     "from"     from}))
+
+

@@ -269,6 +269,8 @@
   - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
   - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
   - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+  - :db-type - json (default), or json-ld
+  - :method - file (default), or ipfs
   "
   ([conn ledger] (new-ledger-async conn ledger nil))
   ([conn ledger opts]
@@ -277,35 +279,50 @@
                                         (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
                                                         {:status 400 :error :db/invalid-db}))))
               {:keys [alias auth doc fork forkBlock expire nonce private-key timeout
-                      snapshot snapshotBlock copy copyBlock owners]
-               :or   {timeout 60000}} opts
-              [network ledger-id] (graphdb/validate-ledger-ident ledger)
-              ledger-id            (if (str/starts-with? ledger-id "$")
-                                     (subs ledger-id 1)
-                                     ledger-id)
-              _                    (validate-ledger-name! ledger-id "ledger")
-              _                    (validate-ledger-name! network "network")
+                      snapshot snapshotBlock copy copyBlock owners db-type method]
+               :or   {timeout 60000 db-type :json method :file}} opts
+              db-type*              (keyword db-type)
+              method*               (keyword method)
+              _                     (when-not (#{:json :json-ld} db-type*)
+                                      (throw (ex-info (str "Invalid db-type for new ledger: " db-type ".")
+                                                      {:status 400 :error :db/invalid-db})))
+              _                     (when-not (#{:file :ipfs} method*)
+                                      (throw (ex-info (str "Invalid db-type for new ledger: " db-type ".")
+                                                      {:status 400 :error :db/invalid-db})))
+              [network ledger-id] (if (= :json db-type*)
+                                    (graphdb/validate-ledger-ident ledger)
+                                    [nil (util/keyword->str ledger)])
+              ledger-id             (if (str/starts-with? ledger-id "$")
+                                      (subs ledger-id 1)
+                                      ledger-id)
+              _                     (validate-ledger-name! ledger-id "ledger")
+              _                     (when (= :json db-type*)
+                                      (validate-ledger-name! network "network"))
               [network-alias ledger-alias] (when alias
                                              (graphdb/validate-ledger-ident ledger))
-              _                    (when alias (validate-ledger-name! ledger-alias "alias"))
-              alias*               (when alias (str network-alias "/" ledger-alias))
-              timestamp            (System/currentTimeMillis)
-              nonce                (or nonce timestamp)
-              expire               (or expire (+ timestamp 30000)) ;; 5 min default
-              cmd-data             {:type          :new-db
-                                    :db            (str network "/" ledger-id)
-                                    :alias         alias*
-                                    :auth          auth
-                                    :doc           doc
-                                    :fork          fork
-                                    :forkBlock     forkBlock
-                                    :copy          copy
-                                    :copyBlock     copyBlock
-                                    :snapshot      snapshot
-                                    :snapshotBlock snapshotBlock
-                                    :nonce         nonce
-                                    :expire        expire
-                                    :owners        (not-empty owners)}]
+              _                     (when alias (validate-ledger-name! ledger-alias "alias"))
+              alias*                (when alias (str network-alias "/" ledger-alias))
+              timestamp             (System/currentTimeMillis)
+              nonce                 (or nonce timestamp)
+              expire                (or expire (+ timestamp 30000)) ;; 5 min default
+              cmd-data              {:type          :new-db
+                                     :db-type       db-type*
+                                     :method        method*
+                                     :db            (if (= :json db-type*)
+                                                      (str network "/" ledger-id)
+                                                      ledger-id)
+                                     :alias         alias*
+                                     :auth          auth
+                                     :doc           doc
+                                     :fork          fork
+                                     :forkBlock     forkBlock
+                                     :copy          copy
+                                     :copyBlock     copyBlock
+                                     :snapshot      snapshot
+                                     :snapshotBlock snapshotBlock
+                                     :nonce         nonce
+                                     :expire        expire
+                                     :owners        (not-empty owners)}]
           (log/debug "Creating new ledger" ledger "with owners:" owners)
           (if private-key
             (let [cmd (-> cmd-data
@@ -358,7 +375,7 @@
            {:keys [nonce expire timeout private-key]
             :or   {timeout 60000, nonce timestamp}} opts
 
-           expire    (or expire (+ timestamp 30000)) ;; 5 min default
+           expire    (or expire (+ timestamp 30000))        ;; 5 min default
            cmd-data  {:type   :delete-db
                       :db     ledger
                       :nonce  nonce

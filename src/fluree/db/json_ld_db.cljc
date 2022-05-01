@@ -14,8 +14,7 @@
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.ledger :as ledger]
-            [fluree.db.conn.json-ld-proto :as jld-proto])
+            [fluree.db.json-ld.branch :as branch])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -269,7 +268,7 @@
                                 first
                                 flake/s)
 
-                        ;; assume iri that needs to be expanded (shoudl we allow this, or should it be expanded before getting this far?)
+                        ;; assume iri that needs to be expanded (should we allow this, or should it be expanded before getting this far?)
                         (keyword? ident)
                         (<? (iri->sid db ident))
 
@@ -391,7 +390,7 @@
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
 (defrecord JsonLdDb [ledger conn method name branch block t tt-id stats
                      spot psot post opst tspo
-                     context schema comparators novelty
+                     schema comparators novelty
                      permissions ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
@@ -479,8 +478,7 @@
         tspo        (index/empty-branch method name tspo-cmp)
         stats       {:flakes 0, :size 0, :indexed 0}
         schema      (vocab/vocab-map* 0 #{} nil)
-        branch      (ledger/current-branch ledger)
-        context     (jld-proto/context conn)]
+        branch      (branch/current-branch ledger)]
     (map->JsonLdDb {:ledger      ledger
                     :conn        conn
                     :method      method
@@ -495,7 +493,6 @@
                     :post        post
                     :opst        opst
                     :tspo        tspo
-                    :context     context
                     :schema      schema
                     :comparators index/default-comparators
                     :novelty     novelty

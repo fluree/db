@@ -261,3 +261,10 @@
   (if (nil? coll)
     (vector x)
     (conj coll x)))
+
+(defn sequential
+  "Returns input wrapped in a vector if not already sequential."
+  [x]
+  (if (sequential? x)
+    x
+    [x]))

@@ -637,7 +637,7 @@
                             (-> supplied-vars keys set))
         json-ld-db?       (= :json-ld (dbproto/-db-type db))
         context*          (when json-ld-db?
-                            (json-ld/parse-context (:context db) context))
+                            (json-ld/parse-context (get-in db [:schema :context]) context))
         parsed            (cond-> {:json-ld?      json-ld-db?
                                    :strategy      :legacy
                                    :context       context*

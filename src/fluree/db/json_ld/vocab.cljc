@@ -4,7 +4,9 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.util.json :as json]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -26,9 +28,8 @@
 
 
 (defn schema-details
-  [refs s-flakes]
-  (let [sid  (flake/s (first s-flakes))
-        ref? (boolean (refs sid))]
+  [sid refs s-flakes]
+  (let [ref? (boolean (refs sid))]
     (loop [[f & r] s-flakes
            details (if (= sid const/$rdf:type)
                      {:id    sid                            ;; rdf:type is predefined, so flakes to build map won't be present.
@@ -136,7 +137,7 @@
                        "_default"   {:name "_default" :id 11 :sid nil}}
         property-maps (->> vocab-flakes
                            (partition-by flake/s)
-                           (map #(schema-details refs %)))]
+                           (map #(schema-details (flake/s (first %)) refs %)))]
     {:t          db-t                                       ;; record time of spec generation, can use to determine cache validity
      :coll       coll
      :refs       refs                                       ;; Any properties defined (or inferred) as @id
@@ -152,23 +153,52 @@
      :subclasses (delay (calc-subclass property-maps))      ;; delay because might not be needed
      }))
 
+(defn parse-new-context
+  "Retrieve context json out of default context flakes, and returns a fully parsed context."
+  [context-flakes]
+  (let [context-json (some #(when (= const/$fluree:context (flake/p %))
+                              (flake/o %))
+                           context-flakes)]
+    (try*
+      (-> context-json
+          json/parse
+          json-ld/parse-context)
+      (catch* e (log/warn (str "Invalid db default context, unable to parse: " (pr-str context-json)))
+              nil))))
+
+(defn update-with*
+  [old-schema t refs vocab-flakes]
+  (loop [[s-flakes & r] (partition-by flake/s vocab-flakes)
+         pred*   (:pred old-schema)
+         context nil]
+    (if s-flakes
+      (let [sid (flake/s (first s-flakes))]
+        (cond
+          (= sid const/$fluree:default-context)
+          (recur r
+                 pred*
+                 (parse-new-context s-flakes))
+
+          :else
+          (let [prop-map (schema-details sid refs s-flakes)]
+            (recur r
+                   (assoc pred* (:id prop-map) prop-map
+                                (:iri prop-map) prop-map)
+                   context))))
+      (cond-> (assoc old-schema :t t
+                                :refs refs
+                                :pred pred*
+                                :subclasses (delay (calc-subclass pred*)))
+              context (assoc :context context)))))
+
 
 (defn update-with
   "When creating a new db from a transaction, merge new schema changes
   into existing schema of previous db."
-  [db-before db-t new-refs vocab-flakes]
-  (let [{:keys [schema]} db-before
-        {:keys [refs pred]} schema
-        refs*             (into refs new-refs)
-        new-property-maps (->> vocab-flakes
-                               (partition-by flake/s)
-                               (map #(schema-details refs* %))
-                               hash-map-both-id-iri)
-        property-maps     (merge pred new-property-maps)]
-    (assoc schema :t db-t
-                  :refs refs*
-                  :pred property-maps
-                  :subclasses (delay (calc-subclass property-maps)))))
+  [{:keys [schema] :as _db-before} db-t new-refs vocab-flakes]
+  (let [{:keys [refs]} schema
+        refs* (into refs new-refs)]
+    (update-with* schema db-t refs* vocab-flakes)))
 
 
 (defn vocab-map

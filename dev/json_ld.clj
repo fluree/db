@@ -19,22 +19,34 @@
                               :type   "@type"
                               :schema "http://schema.org/"
                               :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-                              :wiki   "https://www.wikidata.org/wiki/"}
+                              :wiki   "https://www.wikidata.org/wiki/"
+                              :skos   "http://www.w3.org/2008/05/skos#"
+                              :fluree "https://ns.flur.ee/ledger#"}
                     :did     {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
                               :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
                               :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}}))
 
-  (def file-conn (fluree/connect {:method :file
-                                  :storage-path "data/storage"
-                                  :publish-path "data/publish"
-                                  :did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
-                                        :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
-                                        :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}}))
+  (def file-conn (fluree/connect
+                   {:method       :file
+                    :storage-path "data/storage"
+                    :publish-path "data/publish"
+                    :did          {:id      "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
+                                   :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"
+                                   :public  "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca"}}))
 
 
   ipfs-conn
 
-  (def ledger (fluree/create ipfs-conn "test/db1"))
+  (def ledger @(fluree/create ipfs-conn "test/db1"))
+  (def latest-db (fluree/db ledger))
+
+  (-> latest-db
+      :schema)
+
+  (-> ledger)
+
+  @(fluree/query latest-db {:select [:* {:fluree/function [:*]}]
+                            :from   "fluree-root-rule"})
 
   ;(def l1 (fluree/create file-conn "test/db1"))
 
@@ -106,10 +118,14 @@
 
   ;; query for Movie and crawl to book
   @(fluree/query db2 {:select [:* {:schema/isBasedOn [:*]}]
-                      :from   :wiki/Q836821})
+                      :from   [:wiki/Q836821 :wiki/Q3107329]})
 
   @(fluree/query db2 {:select {'?s [:* {:schema/isBasedOn [:*]}]}
-                      :where [['?s :id :wiki/Q836821]]})
+                      :where  [['?s :id :wiki/Q836821]]})
+
+  (fluree.db.query.analytical-parse/parse
+    db2 {:select {'?s [:* {:schema/isBasedOn [:*]}]}
+         :where  [['?s :id :wiki/Q836821]]})
 
   (-> db :novelty :spot)
   (async/<!! (query-range/index-range db2 :spot = [211106232532992 1002]))

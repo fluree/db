@@ -1,16 +1,17 @@
 (ns fluree.db.json-ld.api
-  (:require [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.json-ld-db :as jdb]
-            [fluree.db.ledger :as ledger]
-            [fluree.db.conn.ipfs :as ipfs-conn]
+  (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
-            [fluree.db.json-ld.transact :as jld-tx]
             [fluree.db.json-ld.commit :as jld-commit]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
             [fluree.db.api.query :as query-api]
-            [fluree.json-ld :as json-ld])
+            [fluree.db.util.core :as util]
+            [fluree.db.ledger.json-ld :as jld-ledger]
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.util.log :as log])
   (:refer-clojure :exclude [merge]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 ;; ledger operations
 
@@ -29,10 +30,9 @@
     - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
     - push - (optional) Function(s) in a vector that will attempt to push the commit to naming service(s)
     "
-  [{:keys [method parallelism context] :as opts}]
+  [{:keys [method parallelism] :as opts}]
   ;; TODO - do some validation
-  (let [opts* (assoc opts :parallelism (or parallelism 4)
-                          :context (json-ld/parse-context context))]
+  (let [opts* (assoc opts :parallelism (or parallelism 4))]
     (case method
       :ipfs (ipfs-conn/connect opts*)
       :file (file-conn/connect opts*)
@@ -74,7 +74,23 @@
   ([conn] (create conn nil nil))
   ([conn ledger-name] (create conn ledger-name nil))
   ([conn ledger-name opts]
-   (ledger/create conn ledger-name opts)))
+   #?(:clj
+      (let [p (promise)]
+        (async/go
+          (let [res (async/<! (jld-ledger/create conn ledger-name opts))]
+            (when (util/exception? res)
+              (log/error res (str "Error created new ledger: " ledger-name)))
+            (deliver p res)))
+        p)
+      :cljs
+      (js/Promise.
+        (fn [resolve reject]
+          (async/go
+            (let [res (async/<! (jld-ledger/create conn ledger-name opts))]
+              (if (util/exception? res)
+                (reject res)
+                (resolve res))
+              )))))))
 
 (defn index
   "Performs indexing operation on the specified ledger"
@@ -100,14 +116,28 @@
   )
 
 
-;; transaction operations
+;; mutations
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
-  [db-before tx]
-  (if (ledger/is-ledger? db-before)
-    (-> (jdb/create db-before)
-        (jld-tx/stage tx))
-    (jld-tx/stage db-before tx)))
+  ([db-or-ledger json-ld] (stage db-or-ledger json-ld nil))
+  ([db-or-ledger json-ld opts]
+   (let [ledger*   (if (jld-ledger/is-ledger? db-or-ledger)
+                     db-or-ledger
+                     (:ledger db-or-ledger))
+         result-ch (ledger-proto/-stage ledger* json-ld opts)]
+     #?(:clj
+        (let [p (promise)]
+          (async/go
+            (deliver p (async/<! result-ch)))
+          p)
+        :cljs
+        (js/Promise.
+          (fn [resolve reject]
+            (async/go
+              (let [res (async/<! result-ch)]
+                (if (util/exception? res)
+                  (reject res)
+                  (resolve res))))))))))
 
 
 (defn commit
@@ -150,11 +180,12 @@
   "Retrieves latest db, or optionally a db at a moment in time
   potentially with permissions of a specific user."
   ([ledger] (db ledger nil))
-  ([ledger {:keys [] :as opts}]
+  ([ledger {:keys [t branch] :as opts}]
+   (if opts
+     (throw (ex-info "DB opts not yet implemented"
+                     {:status 500 :error :db/unexpected-error}))
+     (ledger-proto/-db-latest ledger branch))))
 
-   )
-
-  )
 
 (defn query
   [db query]
