@@ -7,7 +7,7 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.conn.json-ld-proto :as jld-proto]
+            [fluree.db.conn.proto :as conn-proto]
             [clojure.walk :as walk]
             [fluree.db.ledger.proto :as ledger-proto]))
 
@@ -347,8 +347,8 @@
             ;; TODO: can we move these side effects outside of commit?
             ;; TODO: suppose we fail while c-write? while push?
             conn       (:conn ledger)
-            id         (jld-proto/c-write conn doc)
-            publish-p  (jld-proto/push conn id)
+            id         (conn-proto/c-write conn doc)
+            publish-p  (conn-proto/push conn id)
             ;; TODO: should the hash be the tx-hash?
             hash       (get jld-commit const/iri-hash)]
         ;; TODO: properly update branch state

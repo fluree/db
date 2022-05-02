@@ -3,7 +3,7 @@
   (:require [fluree.db.util.core :as util]
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.util.log :as log]
-            [fluree.db.conn.json-ld-proto :as jld-proto]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
             #?(:clj [fluree.db.full-text :as full-text])
@@ -162,17 +162,17 @@
                            rename exists?
                            parallelism close-fn
                            msg-in-ch msg-out-ch]
-  jld-proto/Commit
+  conn-proto/Commit
   (c-read [_ commit-key] (read commit-key))
   (c-write [_ commit-data] (commit commit-data))
 
-  jld-proto/NameService
+  conn-proto/NameService
   (push [this commit-id] (push commit-id))
   (push [this commit-id ledger] (push commit-id ledger))
   (pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
 
-  jld-proto/ConnService
+  conn-proto/iConnection
   (close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
   (closed? [_] (boolean (:closed? @state)))
   (method [_] :file)

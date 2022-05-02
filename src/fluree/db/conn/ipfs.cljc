@@ -4,7 +4,7 @@
             [fluree.db.util.core :as util :refer [try* catch* exception?]]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log]
-            [fluree.db.conn.json-ld-proto :as jld-proto]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.util.async :refer [<? go-try channel?]]
             #?(:clj  [clojure.core.async :as async :refer [go <!]]
@@ -34,17 +34,17 @@
                            parallelism close-fn
                            msg-in-ch msg-out-ch]
 
-  jld-proto/Commit
+  conn-proto/Commit
   (c-read [_ commit-key] (read commit-key))
   (c-write [_ commit-data] (write commit-data))
 
-  jld-proto/NameService
+  conn-proto/NameService
   (push [this commit-id] (push commit-id))
   (push [this commit-id ledger] (push commit-id ledger))
   (pull [this ledger] :TODO)
   (subscribe [this ledger] :TODO)
 
-  jld-proto/ConnService
+  conn-proto/iConnection
   (close [_]
     (when (fn? close-fn)
       (close-fn))

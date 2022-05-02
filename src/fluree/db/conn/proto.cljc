@@ -1,8 +1,8 @@
-(ns fluree.db.conn.json-ld-proto)
+(ns fluree.db.conn.proto)
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defprotocol ConnService
+(defprotocol iConnection
   (close [conn] "Closes all resources for this connection")
   (closed? [conn] "Indicates if connection is open or closed")
   (method [conn] "Returns connection method type (as keyword)")

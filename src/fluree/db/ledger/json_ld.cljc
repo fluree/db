@@ -1,6 +1,6 @@
 (ns fluree.db.ledger.json-ld
   (:require [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.conn.json-ld-proto :as jld-proto]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.transact :as jld-transact]
@@ -91,9 +91,9 @@
                          (if (map? did)
                            did
                            {:id did})
-                         (jld-proto/did conn))
-          context*     (or context (jld-proto/context conn))
-          method-type  (jld-proto/method conn)
+                         (conn-proto/did conn))
+          context*     (or context (conn-proto/context conn))
+          method-type  (conn-proto/method conn)
           default-push (fn [])
           ;; map of all branches and where they are branched from
           branches     {branch (branch/new-branch-map nil branch)}
