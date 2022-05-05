@@ -1,4 +1,4 @@
-(ns fluree.db.json-ld-db
+(ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.schema :as schema]
@@ -14,7 +14,10 @@
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.branch :as branch])
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.json-ld.transact :as jld-transact]
+            [fluree.db.commit :as commit]
+            [fluree.db.ledger.proto :as ledger-proto])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -383,6 +386,12 @@
          (when pred-name
            (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
 
+(defn commit!
+  "Commits a db to ledger. Extracts ledger from db object"
+  [db opts]
+  (let [ledger (:ledger db)]
+    (commit/-commit! ledger db opts)))
+
 
 ;; ================ end GraphDB record support fns ============================
 
@@ -392,6 +401,10 @@
                      spot psot post opst tspo
                      schema comparators novelty
                      permissions ecount]
+  commit/iCommit
+  (-commit! [db] (commit! db nil))
+  (-commit! [db opts] (commit! db opts))
+
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
@@ -418,7 +431,9 @@
   (-with-t [this flakes] (with-t this flakes nil))
   (-with-t [this flakes opts] (with-t this flakes opts))
   (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil))
-  (-db-type [_] :json-ld))
+  (-db-type [_] :json-ld)
+  (-stage [db json-ld] (jld-transact/stage db json-ld nil))
+  (-stage [db json-ld opts] (jld-transact/stage db json-ld opts)))
 
 #?(:cljs
    (extend-type JsonLdDb
@@ -478,7 +493,7 @@
         tspo        (index/empty-branch method name tspo-cmp)
         stats       {:flakes 0, :size 0, :indexed 0}
         schema      (vocab/vocab-map* 0 #{} nil)
-        branch      (branch/current-branch ledger)]
+        branch      (branch/branch-meta ledger)]
     (map->JsonLdDb {:ledger      ledger
                     :conn        conn
                     :method      method
@@ -504,86 +519,3 @@
   [db]
   (instance? JsonLdDb db))
 
-(comment
-
-  (def conn (memory-conn/connect))
-
-  (def db (blank-db conn "blah" "hi" (atom {}) (fn [] (throw (Exception. "NO CURRENT DB FN YET")))))
-
-  db
-
-  (def flakes (fluree.db.json-ld.flakes/json-ld-graph->flakes
-                {"@context" {"owl" "http://www.w3.org/2002/07/owl#",
-                             "ex"  "http://example.org/ns#"},
-                 "@graph"   [{"@id"   "ex:ontology",
-                              "@type" "owl:Ontology"}
-                             {"@id"   "ex:Book",
-                              "@type" "owl:Class"}
-                             {"@id"   "ex:Person",
-                              "@type" "owl:Class"}
-                             {"@id"   "ex:author",
-                              "@type" "owl:ObjectProperty"}
-                             {"@id"   "ex:name",
-                              "@type" "owl:DatatypeProperty"}
-                             {"@type"     "ex:Book",
-                              "ex:author" {"@id" "_:b1"}}
-                             {"@id"     "_:b1",
-                              "@type"   "ex:Person",
-                              "ex:name" {"@value" "Fred"
-                                         "@type"  "xsd:string"}}
-                             {"@id"     "ex:someMember",
-                              "@type"   "ex:Person",
-                              "ex:name" {"@value" "Brian"
-                                         "@type"  "xsd:string"}}]}
-                {}))
-
-  flakes
-
-
-  (def db2 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes))))
-
-  (-> db2
-      :novelty)
-
-  @(fluree.db.api/query (async/go db2)
-                        {:context {"ex" "http://example.org/ns#"}
-                         :select  ["*"]
-                         :from    "http://example.org/ns#someMember"})
-
-  @(fluree.db.api/query (async/go db2)
-                        {:context {"ex" "http://example.org/ns#"}
-                         :select  ["?p" "?o"]
-                         :where   [["http://example.org/ns#someMember" "?p" "?o"]]})
-
-  (async/<!! (schema/schema-map db2))
-
-
-
-  (def flakes2 (fluree.db.json-ld.flakes/json-ld-graph->flakes
-                 {"@context" "https://schema.org/",
-                  "@graph"   [{"@id"             "http://worldcat.org/entity/work/id/2292573321",
-                               "@type"           "Book",
-                               "author"          {"@id" "http://viaf.org/viaf/17823"},
-                               "inLanguage"      "fr",
-                               "name"            "Rouge et le noir",
-                               "workTranslation" {"@type" "Book", "@id" "http://worldcat.org/entity/work/id/460647"}}
-                              {"@id"               "http://worldcat.org/entity/work/id/460647",
-                               "@type"             "Book",
-                               "about"             "Psychological fiction, French",
-                               "author"            {"@id" "http://viaf.org/viaf/17823"},
-                               "inLanguage"        "en",
-                               "name"              "Red and Black : A New Translation, Backgrounds and Sources, Criticism",
-                               "translationOfWork" {"@id" "http://worldcat.org/entity/work/id/2292573321"},
-                               "translator"        {"@id" "http://viaf.org/viaf/8453420"}}]}
-                 {}))
-  flakes2
-
-  (def db3 (async/<!! (with (assoc db :t 0) 1 (:flakes flakes2))))
-
-  (-> db3 :schema :pred (get "https://schema.org/Book"))
-
-  @(fluree.db.api/query (async/go db3)
-                        {:context "https://schema.org/"
-                         :select  {"?s" ["*", {"workTranslation" ["*"]}]}
-                         :where   [["?s" "a" "Book"]]})
-  )

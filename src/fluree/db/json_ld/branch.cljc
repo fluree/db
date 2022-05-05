@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.branch
   (:require [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log])
+  (:refer-clojure :exclude [name]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -63,6 +64,11 @@
   "Returns latest commit info from branch-data"
   [branch-data]
   (:commit branch-data))
+
+(defn name
+  "Returns branch name from branch metadata"
+  [branch-data]
+  (:name branch-data))
 
 
 ;; TODO

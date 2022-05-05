@@ -375,7 +375,9 @@
   (-with-t [this flakes] (with-t this flakes nil))
   (-with-t [this flakes opts] (with-t this flakes opts))
   (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil))
-  (-db-type [_] :json))
+  (-db-type [_] :json)
+  (-stage [db tx] (throw (ex-info "DB stage not supported on json database." {:status 500 :error :db/unexpected-error})))
+  (-stage [db tx opts] (throw (ex-info "DB stage not supported on json database." {:status 500 :error :db/unexpected-error}))))
 
 #?(:cljs
    (extend-type GraphDb

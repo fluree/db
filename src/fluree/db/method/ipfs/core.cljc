@@ -8,8 +8,6 @@
                :cljs [cljs.core.async :as async])
             [fluree.db.util.json :as json]
             [clojure.string :as str]
-            [fluree.db.json-ld-db :as json-ld-db]
-            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))

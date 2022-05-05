@@ -8,6 +8,8 @@
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.dbproto :as db-proto]
+            [fluree.db.commit :as commit]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [merge]))
 
@@ -120,11 +122,11 @@
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
   ([db-or-ledger json-ld] (stage db-or-ledger json-ld nil))
-  ([db-or-ledger json-ld opts]
-   (let [ledger*   (if (jld-ledger/is-ledger? db-or-ledger)
-                     db-or-ledger
-                     (:ledger db-or-ledger))
-         result-ch (ledger-proto/-stage ledger* json-ld opts)]
+  ([db-or-ledger json-ld {:keys [branch] :as opts}]
+   (let [db        (if (jld-ledger/is-ledger? db-or-ledger)
+                     (ledger-proto/-db db-or-ledger {:branch branch})
+                     db-or-ledger)
+         result-ch (db-proto/-stage db json-ld opts)]
      #?(:clj
         (let [p (promise)]
           (async/go
@@ -140,25 +142,40 @@
                   (resolve res))))))))))
 
 
-(defn commit
-  "Commits one or more transactions that are queued."
-  ([db] (commit db nil))
-  ([db opts]
-   (let [opts* (if (string? opts)
-                 {:message opts}
-                 opts)]
-     (jld-commit/commit db opts*))))
+(defn commit!
+  "Commits a staged database to the ledger with all changes since the last commit
+  aggregated together.
+
+  Commits are tracked in the local environment, but if the ledger is distributed
+  it will still need a 'push' to ensure it is published and verified as per the
+  distributed rules."
+  ([db] (commit/-commit! db))
+  ([ledger-or-db db-or-opts]
+   (let [[ledger db opts] (if (db-proto/db? ledger-or-db)
+                            [nil ledger-or-db db-or-opts]
+                            [ledger-or-db db-or-opts nil])]
+     (if ledger
+       (commit! ledger db opts)
+       (commit/-commit! db opts))))
+  ([ledger db opts]
+   (commit/-commit! ledger db opts)))
+
+
+(defn status
+  "Returns current status of ledger branch."
+  ([ledger] (ledger-proto/-status ledger))
+  ([ledger branch] (ledger-proto/-status ledger branch)))
 
 
 (defn push
-  "Pushes one or more commits to a naming service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
+  "Pushes all commits since last push to a naming service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
   Depending on consensus requirements for a Fluree Network, will accept or reject push as newest update."
   []
   )
 
 
 (defn squash
-  "Squashes multiple transactions into a single transaction"
+  "Squashes multiple unpublished commits into a single unpublished commit"
   []
   )
 
@@ -178,13 +195,13 @@
 
 (defn db
   "Retrieves latest db, or optionally a db at a moment in time
-  potentially with permissions of a specific user."
+  and/or permissioned to a specific identity."
   ([ledger] (db ledger nil))
   ([ledger {:keys [t branch] :as opts}]
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
-     (ledger-proto/-db-latest ledger branch))))
+     (ledger-proto/-db ledger opts))))
 
 
 (defn query

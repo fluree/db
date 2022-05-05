@@ -19,7 +19,9 @@
             #?(:clj [fluree.db.serde.avro :refer [avro-serde]])
             [fluree.db.conn-events :as conn-events]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.storage.core :as storage]))
+            [fluree.db.storage.core :as storage]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.did :as did]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -114,7 +116,8 @@
                        storage-rename storage-delete object-cache async-cache
                        parallelism serializer default-network transactor?
                        publish transact-handler tx-private-key tx-key-id meta
-                       add-listener remove-listener close]
+                       add-listener remove-listener close
+                       did context]
 
   storage/Store
   (read [_ k]
@@ -136,17 +139,23 @@
     (if (= :empty id)
       (storage/resolve-empty-leaf node)
       (async-cache
-       [::resolve id tempid]
-       (fn [_]
-         (storage/resolve-index-node conn node
-                                     (fn []
-                                       (async-cache [::resolve id tempid] nil)))))))
+        [::resolve id tempid]
+        (fn [_]
+          (storage/resolve-index-node conn node
+                                      (fn []
+                                        (async-cache [::resolve id tempid] nil)))))))
+
+  conn-proto/iConnection
+  (-did [conn] did)
+  (-context [conn] context)
+  (-method [conn] :file)
+
 
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [{:keys [storage-type] :as conn} network dbid lang]
-                     (when-let [path (-> conn :meta :file-storage-path)]
-                       (full-text/disk-index path network dbid lang)))]))
+         (when-let [path (-> conn :meta :file-storage-path)]
+           (full-text/disk-index path network dbid lang)))]))
 
 (defn- normalize-servers
   "Split servers in a string into a vector.
@@ -253,40 +262,40 @@
   (async/go-loop [i 0]
     (when-let [msg (async/<! req-chan)]
       (try*
-       (let [_ (log/trace "Outgoing message to websocket: " msg)
-             [operation data resp-chan opts] msg
-             {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
-                                          timeout 60000}} opts]
-         (when resp-chan
-           (swap! state assoc-in [:pending-req req-id] resp-chan)
-           (async/go
-             (let [[resp c] (async/alts! [resp-chan (async/timeout timeout)])]
-               ;; clear request from state
-               (swap! state update :pending-req #(dissoc % req-id))
-               ;; return result
-               (if (= c resp-chan)
-                 resp
-                 ;; if timeout channel comes back first, respond with timeout error
-                 (ex-info (str "Request " req-id " timed out.")
-                          {:status 408
-                           :error  :db/timeout})))))
-         (let [publisher  (or publish default-publish-fn)
-               published? (async/<! (publisher conn [operation req-id data]))]
-           (when-not (true? published?)
-             (cond
-               (util/exception? published?)
-               (log/error published? "Error processing message in producer.")
+        (let [_ (log/trace "Outgoing message to websocket: " msg)
+              [operation data resp-chan opts] msg
+              {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
+                                           timeout 60000}} opts]
+          (when resp-chan
+            (swap! state assoc-in [:pending-req req-id] resp-chan)
+            (async/go
+              (let [[resp c] (async/alts! [resp-chan (async/timeout timeout)])]
+                ;; clear request from state
+                (swap! state update :pending-req #(dissoc % req-id))
+                ;; return result
+                (if (= c resp-chan)
+                  resp
+                  ;; if timeout channel comes back first, respond with timeout error
+                  (ex-info (str "Request " req-id " timed out.")
+                           {:status 408
+                            :error  :db/timeout})))))
+          (let [publisher  (or publish default-publish-fn)
+                published? (async/<! (publisher conn [operation req-id data]))]
+            (when-not (true? published?)
+              (cond
+                (util/exception? published?)
+                (log/error published? "Error processing message in producer.")
 
-               (nil? published?)
-               (log/error "Error processing message in producer. Socket closed.")
+                (nil? published?)
+                (log/error "Error processing message in producer. Socket closed.")
 
-               :else
-               (log/error "Error processing message in producer. Socket closed. Published result" published?)))))
-       (catch* e
-               (let [[_ _ resp-chan] (when (sequential? msg) msg)]
-                 (if (and resp-chan (channel? resp-chan))
-                   (async/put! resp-chan e)
-                   (log/error e (str "Error processing ledger request, no valid return channel: " (pr-str msg)))))))
+                :else
+                (log/error "Error processing message in producer. Socket closed. Published result" published?)))))
+        (catch* e
+                (let [[_ _ resp-chan] (when (sequential? msg) msg)]
+                  (if (and resp-chan (channel? resp-chan))
+                    (async/put! resp-chan e)
+                    (log/error e (str "Error processing ledger request, no valid return channel: " (pr-str msg)))))))
       (recur (inc i)))))
 
 
@@ -495,7 +504,7 @@
       (swap! server-connections-atom update-in [conn-id :token] #(or % token))
       true
       (catch* e
-        false))))
+              false))))
 
 (defn- generate-connection
   "Generates connection object."
@@ -519,7 +528,7 @@
                 object-cache async-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
-                private keep-alive-fn]
+                private keep-alive-fn context]
          :or   {memory           1000000                    ;; default 1MB memory
                 parallelism      4
                 req-chan         (async/chan)
@@ -598,7 +607,10 @@
                             :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
                                                 keep-alive-fn)
                             :add-listener     (partial add-listener* state-atom)
-                            :remove-listener  (partial remove-listener* state-atom)}]
+                            :remove-listener  (partial remove-listener* state-atom)
+                            :did              (when tx-private-key
+                                                (did/private->did-map tx-private-key))
+                            :context          context}]
     (map->Connection settings)))
 
 (defn close!

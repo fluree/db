@@ -101,9 +101,11 @@
       (if (number? _id-val)
         (async/>! return-ch _id-val)
         (let [sid (async/<! (dbproto/-subid db _id-val))]
-          (if (util/exception? sid)
-            (async/put! error-ch sid)
-            (async/put! return-ch sid))))
+          (cond (util/exception? sid)
+                (async/put! error-ch sid)
+
+                (some? sid)
+                (async/put! return-ch sid))))
       (async/close! return-ch))
     return-ch))
 

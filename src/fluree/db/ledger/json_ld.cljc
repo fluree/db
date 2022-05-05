@@ -1,12 +1,15 @@
 (ns fluree.db.ledger.json-ld
   (:require [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.dbproto :as db-proto]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.json-ld-db :as jld-db]
-            [fluree.db.util.log :as log]))
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.commit :as commit]
+            [fluree.db.util.log :as log]
+            [fluree.db.json-ld.commit :as jld-commit]))
 
 (defn branch-meta
   "Retrieves branch metadata from ledger state"
@@ -17,8 +20,9 @@
       ;; default branch
       (get branches branch))))
 
-(defn db-latest
-  [ledger branch]
+;; TODO - no time travel, only latest db on a branch thus far
+(defn db
+  [ledger {:keys [branch]}]
   (let [branch-meta (ledger-proto/-branch ledger branch)]
     ;; if branch is nil, will return default
     (when-not branch-meta
@@ -26,18 +30,12 @@
                       {:status 400 :error :db/invalid-branch})))
     (branch/latest-db branch-meta)))
 
+
 (defn db-update
   "Updates db, will throw if not next 't' from current db."
   [{:keys [state] :as _ledger} {:keys [branch] :as db}]
-  (swap! state update-in [:branches branch] branch/update-db db))
-
-(defn stage
-  [ledger json-ld {:keys [branch] :as opts}]
-  (go-try
-    (let [latest-db (db-latest ledger branch)
-          opts      nil
-          new-db    (<? (jld-transact/stage latest-db json-ld opts))]
-      (db-update ledger new-db))))
+  (let [branch-name (branch/name branch)]
+    (swap! state update-in [:branches branch-name] branch/update-db db)))
 
 
 (defn commit-update
@@ -53,7 +51,7 @@
                                 :error  :db/ledger-order}))
                (assoc branch-map :commit commit-meta))))))
 
-(defn commit
+(defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
   [{:keys [state] :as _ledger} requested-branch]
   (let [{:keys [branch branches]} @state]
@@ -61,24 +59,29 @@
       (get branches requested-branch)
       (get branches branch))))
 
+(defn commit!
+  [ledger db opts]
+  (let [opts* (commit/normalize-opts opts)]
+    (jld-commit/commit ledger db opts*)))
+
 
 (defrecord JsonLDLedger [name context did
                          state cache conn
                          method reindex-min reindex-max]
+  commit/iCommit
+  (-commit! [ledger db] (commit! ledger db nil))
+  (-commit! [ledger db opts] (commit! ledger db opts))
+
   ledger-proto/iLedger
-  (-stage [ledger json-ld opts] (stage ledger json-ld opts))
-  (-db-latest [ledger] (db-latest ledger nil))
-  (-db-latest [ledger branch] (db-latest ledger branch))
+  (-db [ledger] (db ledger nil))
+  (-db [ledger opts] (db ledger opts))
   (-db-update [ledger db] (db-update ledger db))
   (-branch [ledger] (branch-meta ledger nil))
   (-branch [ledger branch] (branch-meta ledger branch))
-  (-commit! [ledger] :TODO)
-  (-commit! [ledger branch] :TODO)
-  (-commit! [ledger branch t] :TODO)
   (-commit-update [ledger branch commit-meta] (commit-update ledger branch commit-meta))
-  (-commit [ledger] (-> ledger (branch-meta nil) branch/latest-commit))
-  (-commit [ledger branch] (-> ledger (branch-meta branch) branch/latest-commit))
-  (-did [ledger] did))
+  (-status [ledger] (status ledger nil))
+  (-status [ledger branch] (status ledger branch))
+  (-did [_] did))
 
 
 (defn create
@@ -91,9 +94,9 @@
                          (if (map? did)
                            did
                            {:id did})
-                         (conn-proto/did conn))
-          context*     (or context (conn-proto/context conn))
-          method-type  (conn-proto/method conn)
+                         (conn-proto/-did conn))
+          context*     (or context (conn-proto/-context conn))
+          method-type  (conn-proto/-method conn)
           default-push (fn [])
           ;; map of all branches and where they are branched from
           branches     {branch (branch/new-branch-map nil branch)}
@@ -111,12 +114,14 @@
                           :reindex-min 100000
                           :reindex-max 1000000
                           :conn        conn})
-          blank-db     (jld-db/create ledger)]
+          blank-db     (jld-db/create ledger)
+          db           (if (or context* did*)
+                         (->> (bootstrap/bootstrap-tx context* (:id did*))
+                              (db-proto/-stage blank-db)
+                              <?)
+                         blank-db)]
       ;; place initial 'blank' DB into ledger.
-      (ledger-proto/-db-update ledger blank-db)
-      (when (or context* did*)
-        (let [bootstrap-tx (bootstrap/bootstrap-tx context* (:id did*))
-              new-db       (<? (ledger-proto/-stage ledger bootstrap-tx nil))]))
+      (ledger-proto/-db-update ledger db)
       ledger)))
 
 

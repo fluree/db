@@ -93,10 +93,10 @@
 (defn connection-commit
   [base-path]
   (fn [data]
-    (let [bytes (.getBytes data)
-          hash  (crypto/sha2-256 bytes :hex)
-          path  #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
-                   :cljs (throw (ex-info "TODO: implement for node" {})))]
+    (let [bytes        (.getBytes data)
+          hash         (crypto/sha2-256 bytes :hex)
+          path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
+                  :cljs (throw (ex-info "TODO: implement for node" {})))]
       (write-file bytes path)
       (str "fluree:file:" path))))
 
@@ -162,9 +162,9 @@
                            rename exists?
                            parallelism close-fn
                            msg-in-ch msg-out-ch]
-  conn-proto/Commit
-  (c-read [_ commit-key] (read commit-key))
-  (c-write [_ commit-data] (commit commit-data))
+  conn-proto/iCommit
+  (-c-read [_ commit-key] (read commit-key))
+  (-c-write [_ commit-data] (commit commit-data))
 
   conn-proto/NameService
   (push [this commit-id] (push commit-id))
@@ -173,19 +173,19 @@
   (subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
 
   conn-proto/iConnection
-  (close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
-  (closed? [_] (boolean (:closed? @state)))
-  (method [_] :file)
-  (parallelism [_] parallelism)
-  (transactor? [_] transactor?)
-  (id [_] id)
-  (read-only? [_] (not (fn? write)))
-  (context [_] context)
-  (did [_] did)
-  (msg-in [conn msg] (throw (ex-info "Unsupported FileConnection msg-in: pull" {})))
-  (msg-out [conn msg] (throw (ex-info "Unsupported FileConnection msg-out: pull" {})))
-  (state [_] @state)
-  (state [_ ledger] (get @state ledger))
+  (-close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
+  (-closed? [_] (boolean (:closed? @state)))
+  (-method [_] :file)
+  (-parallelism [_] parallelism)
+  (-transactor? [_] transactor?)
+  (-id [_] id)
+  (-read-only? [_] (not (fn? write)))
+  (-context [_] context)
+  (-did [_] did)
+  (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection msg-in: pull" {})))
+  (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection msg-out: pull" {})))
+  (-state [_] @state)
+  (-state [_ ledger] (get @state ledger))
 
   storage/Store
   ;; I've got this shadowing Commit, is that okay?

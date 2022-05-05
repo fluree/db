@@ -11,7 +11,8 @@
                :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.json-ld.branch :as branch])
   #?(:clj (:import (fluree.db.flake Flake))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -153,12 +154,13 @@
 
 (defn ->tx-state
   [db]
-  (let [{:keys [t block ecount schema]} db
+  (let [{:keys [t block ecount schema branch]} db
         last-pid (volatile! (jld-ledger/last-pid db))
-        last-sid (volatile! (jld-ledger/last-sid db))]
+        last-sid (volatile! (jld-ledger/last-sid db))
+        commit-t (branch/latest-commit branch)]
     {:db-before db
      :refs      (volatile! (or (:refs schema) #{const/$rdf:type}))
-     :t         (dec t)
+     :t         (dec commit-t)
      :new?      (zero? t)
      :block     block
      :last-pid  last-pid
@@ -176,38 +178,91 @@
     (assoc ecount const/$_predicate @last-pid
                   const/$_default @last-sid)))
 
+(defn update-index-tt-id
+  "Associates a unique tt-id for any in-memory staged db in their index roots.
+  tt-id is used as part of the caching key, by having this in place it means
+  that even though the 't' value hasn't changed it will cache each stage db
+  data as its own entity."
+  [db tt-id]
+  (let [indexes [:spot :psot :post :opst :tspo]]
+    (reduce
+      (fn [db* idx]
+        (let [{:keys [children] :as node} (get db* idx)
+              children* (reduce-kv
+                          (fn [children* k v]
+                            (assoc children* k (assoc v :tt-id tt-id)))
+                          {} children)]
+          (assoc db* idx (assoc node :tt-id tt-id
+                                     :children children*))))
+      db indexes)))
 
+(defn update-novelty-idx*
+  "Updates a specific index flakes with new flakes"
+  [existing-flakes new-flakes stage-update?]
+  (if stage-update?
+    (reduce
+      (fn [acc flake]
+        (if (false? (flake/op flake))
+          (disj acc (flake/flip-flake flake))
+          (conj acc flake)))
+      existing-flakes new-flakes)
+    (into existing-flakes new-flakes)))
+
+
+(defn update-novelty-idx
+  "Updates all novelty values.
+
+  If this is a staged update, it removes any assertions corresponding to retractions
+  that occured in the same 't' value (multiple stages between commits), effectively
+  'squashing' multiple stages.
+
+  opst flakes only are 'refs'."
+  [{:keys [spot psot opst post tspo size]} new-flakes schema stage-update?]
+  (let [spot*       (update-novelty-idx* spot new-flakes stage-update?)
+        bytes       (if stage-update?                       ;; for staged updates, need to re-calc novelty size
+                      #?(:clj  (future (flake/size-bytes spot*)) ;; calculate in separate thread for CLJ
+                         :cljs (flake/size-bytes spot*))
+                      #?(:clj  (future (flake/size-bytes new-flakes)) ;; calculate in separate thread for CLJ
+                         :cljs (flake/size-bytes new-flakes)))
+        opst-flakes (->> new-flakes
+                         (sort-by flake/p)
+                         (partition-by flake/p)
+                         (reduce
+                           (fn [acc p-flakes]
+                             (if (get-in schema [:pred (flake/p (first p-flakes)) :ref?])
+                               (into acc p-flakes)
+                               acc))
+                           []))]
+    {:spot spot*
+     :psot (update-novelty-idx* psot new-flakes stage-update?)
+     :opst (update-novelty-idx* opst opst-flakes stage-update?)
+     :post (update-novelty-idx* post new-flakes stage-update?)
+     :tspo (update-novelty-idx* tspo new-flakes stage-update?)
+     :size (if stage-update?
+             #?(:clj @bytes :cljs bytes)
+             (+ size #?(:clj @bytes :cljs bytes)))}))
 
 (defn final-db
   [tx-state flakes]
   (let [{:keys [db-before t block refs]} tx-state
-        {:keys [novelty schema stats]} db-before
-        {:keys [spot psot opst post tspo size]} novelty
-        bytes #?(:clj (future (flake/size-bytes flakes))    ;; calculate in separate thread for CLJ
-                 :cljs (flake/size-bytes flakes))
+        {:keys [novelty stats]} db-before
         vocab-flakes  (jld-reify/get-vocab-flakes flakes)
         schema*       (vocab/update-with db-before t @refs vocab-flakes)
-        db            (assoc db-before :ecount (final-ecount tx-state)
-                                       :t t
-                                       :block block
-                                       :novelty {:spot (into spot flakes)
-                                                 :psot (into psot flakes)
-                                                 :post (into post flakes)
-                                                 :opst (->> flakes
-                                                            (sort-by flake/p)
-                                                            (partition-by flake/p)
-                                                            (reduce
-                                                              (fn [opst* p-flakes]
-                                                                (if (get-in schema* [:pred (flake/p (first p-flakes)) :ref?])
-                                                                  (into opst* p-flakes)
-                                                                  opst*))
-                                                              opst))
-                                                 :tspo (into tspo flakes)
-                                                 :size (+ size #?(:clj @bytes :cljs bytes))}
-                                       :stats (-> stats
-                                                  (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
-                                                  (update :flakes + (count flakes)))
-                                       :schema schema*)]
+        tt-id         (util/random-uuid)
+        stage-update? (= t (:t db-before))                  ;; if a previously staged db is getting updated again before committed
+        novelty*      (update-novelty-idx novelty flakes schema* stage-update?)
+        db            (-> db-before
+                          (update-index-tt-id tt-id)
+                          (assoc :ecount (final-ecount tx-state)
+                                 :t t
+                                 :tt-id tt-id
+                                 :block block
+                                 :novelty novelty*
+                                 :stats (-> stats
+                                            (update :size + (- (:size novelty*) (:size novelty)))
+                                            (update :flakes + (- (count (:spot novelty*))
+                                                                 (count (:spot novelty)))))
+                                 :schema schema*))]
     (assoc db :current-db-fn (fn [] (let [pc (async/promise-chan)]
                                       (async/put! pc db)
                                       pc)))))

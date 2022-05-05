@@ -85,7 +85,7 @@
   (let [did* (or (:id did)
                  (str "did:fluree:" (crypto/account-id-from-private private)))]
     {"@context" ["https://www.w3.org/2018/credentials/v1"
-                 "https://flur.ee/ns/commit"]
+                 "https://ns.flur.ee/ledger/v1"]
      "id" "https://flur.ee/ns/credential"
      "type" ["VerifiableCredential"]
      "issuer" did*

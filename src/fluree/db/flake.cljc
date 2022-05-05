@@ -466,6 +466,13 @@
                 >= (->Flake util/max-long pid o nil nil nil)
                 <= (->Flake 0 pid o nil nil nil)))
 
+(defn match-tspo
+  "Returns all matching flakes to a specific 't' value."
+  [ss t]
+  (avl/subrange ss
+                >= (->Flake util/max-long nil nil t nil nil)
+                <= (->Flake util/min-long nil nil t nil nil)))
+
 (defn lookup
   [ss start-flake end-flake]
   (avl/subrange ss >= start-flake <= end-flake))

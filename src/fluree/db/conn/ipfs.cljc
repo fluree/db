@@ -34,9 +34,9 @@
                            parallelism close-fn
                            msg-in-ch msg-out-ch]
 
-  conn-proto/Commit
-  (c-read [_ commit-key] (read commit-key))
-  (c-write [_ commit-data] (write commit-data))
+  conn-proto/iCommit
+  (-c-read [_ commit-key] (read commit-key))
+  (-c-write [_ commit-data] (write commit-data))
 
   conn-proto/NameService
   (push [this commit-id] (push commit-id))
@@ -45,30 +45,30 @@
   (subscribe [this ledger] :TODO)
 
   conn-proto/iConnection
-  (close [_]
+  (-close [_]
     (when (fn? close-fn)
       (close-fn))
     (swap! state assoc :closed? true))
-  (closed? [_] (boolean (:closed? @state)))
-  (method [_] :ipfs)
-  (parallelism [_] parallelism)
-  (transactor? [_] transactor?)
-  (id [_] id)
-  (read-only? [_] (not (fn? write)))                        ;; if no commit fn, then read-only
-  (context [_] context)
-  (did [_] did)
-  (msg-in [_ msg] (go-try
-                    ;; TODO - push into state machine
-                    true
-
-                    ))
-  (msg-out [_ msg] (go-try
-                     ;; TODO - register/submit event
+  (-closed? [_] (boolean (:closed? @state)))
+  (-method [_] :ipfs)
+  (-parallelism [_] parallelism)
+  (-transactor? [_] transactor?)
+  (-id [_] id)
+  (-read-only? [_] (not (fn? write)))                       ;; if no commit fn, then read-only
+  (-context [_] context)
+  (-did [_] did)
+  (-msg-in [_ msg] (go-try
+                     ;; TODO - push into state machine
                      true
 
                      ))
-  (state [_] @state)
-  (state [_ ledger] (get @state ledger))
+  (-msg-out [_ msg] (go-try
+                      ;; TODO - register/submit event
+                      true
+
+                      ))
+  (-state [_] @state)
+  (-state [_ ledger] (get @state ledger))
 
   storage/Store
   (read [_ k]
