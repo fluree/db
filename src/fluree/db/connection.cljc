@@ -291,18 +291,34 @@
 
 
 (defn ping-transactor
-  [conn]
-  (let [req-chan (:req-chan conn)]
-    (async/put! req-chan [:ping true])))
+  [req-chan]
+  (async/put! req-chan [:ping true]))
 
+(defn reconnect-conn
+  "Returns a channel that will eventually have a websocket. Will exponentially backoff
+  until connection attempts happen every two minutes. Uses the existing conn and will
+  reuse the existing sub-chan and pub-chan so the msg-consumer/producer loops do not
+  need to be restarted."
+  [conn]
+  (close-websocket (:id conn))
+  (async/go-loop [backoff-seconds 1]
+    (async/<! (async/timeout (* backoff-seconds 1000)))
+    (let [socket (async/<! (get-socket conn))
+          socket (if (util/exception? socket)
+                   socket
+                   (async/<! socket))]
+      (if (or (nil? socket)
+              (util/exception? socket))
+        (do (log/error socket "Cannot establish connection to a healthy server, backing off:" backoff-seconds "s.")
+            (recur (min (* 2 backoff-seconds) (* 60 2))))
+        socket))))
 
 (defn msg-consumer
   "Takes messages from peer/ledger and processes them."
-  [conn]
-  (let [;; if we haven't received a message in at least this long, ping ledger.
+  [{:keys [sub-chan req-chan keep-alive-fn keep-alive] :as conn}]
+  (let [ ;; if we haven't received a message in at least this long, ping ledger.
         ;; after two pings, if still no response close connection (so connection closes before the 3rd ping, so 3x this time.)
-        ping-transactor-after 2500
-        {:keys [sub-chan]} conn]
+        ping-transactor-after 2500]
     (async/go-loop [no-response-pings 0]
       (let [timeout (async/timeout ping-transactor-after)
             [msg c] (async/alts! [sub-chan timeout])]
@@ -311,30 +327,32 @@
           (= c timeout)
           (if (= 2 no-response-pings)
             ;; assume connection dropped, close!
+            (if keep-alive
+              (do (async/<! (reconnect-conn conn))
+                  (recur 0))
+              (do
+                (log/warn "Connection has gone stale. Perhaps network conditions are poor. Disconnecting socket.")
+                (let [cb keep-alive-fn]
+                  (cond
+                    (nil? keep-alive-fn)
+                    (log/trace "No keep-alive callback is registered")
+
+                    (fn? keep-alive-fn)
+                    (keep-alive-fn)
+
+                    (string? keep-alive-fn)
+                    #?(:cljs
+                       ;; try javascript eval
+                       (eval keep-alive-fn)
+                       :clj
+                       (log/warn "Unsupported clojure callback registered" {:keep-alive-fn keep-alive-fn}))
+
+                    :else
+                    (log/warn "Unsupported callback registered" {:keep-alive-fn keep-alive-fn})))
+                (close-websocket (:id conn))
+                (session/close-all-sessions (:id conn))))
             (do
-              (log/warn "Connection has gone stale. Perhaps network conditions are poor. Disconnecting socket.")
-              (let [cb (:keep-alive-fn conn)]
-                (cond
-
-                  (nil? cb)
-                  (log/trace "No keep-alive callback is registered")
-
-                  (fn? cb)
-                  (cb)
-
-                  (string? cb)
-                  #?(:cljs
-                     ;; try javascript eval
-                     (eval cb)
-                     :clj
-                     (log/warn "Unsupported clojure callback registered" {:keep-alive-fn cb}))
-
-                  :else
-                  (log/warn "Unsupported callback registered" {:keep-alive-fn cb})))
-              (close-websocket (:id conn))
-              (session/close-all-sessions (:id conn)))
-            (do
-              (ping-transactor conn)
+              (ping-transactor req-chan)
               (recur (inc no-response-pings))))
 
           (nil? msg)
@@ -519,7 +537,7 @@
                 object-cache async-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
-                private keep-alive-fn]
+                private keep-alive-fn keep-alive]
          :or   {memory           1000000                    ;; default 1MB memory
                 parallelism      4
                 req-chan         (async/chan)
@@ -591,6 +609,7 @@
                             :tx-key-id        (when tx-private-key
                                                 #?(:clj  (crypto/account-id-from-private tx-private-key)
                                                    :cljs nil))
+                            :keep-alive       keep-alive
                             :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
                                                 keep-alive-fn)
                             :add-listener     (partial add-listener* state-atom)
