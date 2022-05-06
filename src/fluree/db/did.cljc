@@ -8,7 +8,7 @@
 (defn did-map
   "Returns Fluree standard did-map based on values."
   [did public private]
-  {:did     did
+  {:id      did
    :public  public
    :private private})
 
@@ -25,7 +25,7 @@
 (defn private->did-map
   "Returns a complete did map from a private key."
   [private-key]
-  (let [public (crypto/pub-key-from-private private-key)
+  (let [public  (crypto/pub-key-from-private private-key)
         auth-id (crypto/account-id-from-public public)
-        did-id (auth-id->did auth-id)]
+        did-id  (auth-id->did auth-id)]
     (did-map did-id public private-key)))
