@@ -15,7 +15,7 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause}]
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx p-ref?] :as _where-clause}]
   (let [o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
@@ -32,37 +32,39 @@
                       (:filter o)
                       (let [f (get-in o [:filter :function])]
                         #(-> % flake/o f)))
-        idx-root    (get db idx)
-        cmp         (:comparator idx-root)
-        range-set   (flake/sorted-set-by cmp fflake lflake)
-        in-range?   (fn [node]
-                      (query-range/intersects-range? node range-set))
-        query-xf    (where-subj-xf {:start-test  >=
-                                    :start-flake fflake
-                                    :end-test    <=
-                                    :end-flake   lflake
-                                    ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
-                                    :xf          (when filter-fn
-                                                   (map (fn [flakes]
-                                                          (filter filter-fn flakes))))})
-        resolver    (index/->CachedTRangeResolver conn (get novelty idx) t t (:async-cache conn))
-        tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)
         return-chan (async/chan 10 (comp (map flake/s)
                                          (dedupe)))]
-    (async/go-loop []
-      (let [next-chunk (<! tree-chan)]
-        (if (nil? next-chunk)
-          (async/close! return-chan)
-          (let [more? (loop [vs (seq next-chunk)
-                             i  0]
-                        (if vs
-                          (if (>! return-chan (first vs))
-                            (recur (next vs) (inc i))
-                            false)
-                          true))]
-            (if more?
-              (recur)
-              (async/close! return-chan))))))
+    (if (and (= :post idx) (nil? o*))
+      (async/close! return-chan)
+      (let [idx-root    (get db idx)
+            cmp         (:comparator idx-root)
+            range-set   (flake/sorted-set-by cmp fflake lflake)
+            in-range?   (fn [node]
+                          (query-range/intersects-range? node range-set))
+            query-xf    (where-subj-xf {:start-test  >=
+                                        :start-flake fflake
+                                        :end-test    <=
+                                        :end-flake   lflake
+                                        ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
+                                        :xf          (when filter-fn
+                                                       (map (fn [flakes]
+                                                              (filter filter-fn flakes))))})
+            resolver    (index/->CachedTRangeResolver conn (get novelty idx) t t (:async-cache conn))
+            tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
+        (async/go-loop []
+          (let [next-chunk (<! tree-chan)]
+            (if (nil? next-chunk)
+              (async/close! return-chan)
+              (let [more? (loop [vs (seq next-chunk)
+                                 i  0]
+                            (if vs
+                              (if (>! return-chan (first vs))
+                                (recur (next vs) (inc i))
+                                false)
+                              true))]
+                (if more?
+                  (recur)
+                  (async/close! return-chan))))))))
     return-chan))
 
 
@@ -109,13 +111,31 @@
       (async/close! return-ch))
     return-ch))
 
+(defn resolve-refs
+  "If the where clause has a ref, we need to resolve it to a subject id."
+  [db vars {:keys [p-ref? o] :as where-clause}]
+  (go-try
+    (if p-ref?
+      (let [v (if-some [v (:value o)]
+                v
+                (when-let [variable (:variable o)]
+                  (get vars variable)))
+            sid (when v
+                  (<? (dbproto/-subid db v)))]
+        (if sid
+          (assoc where-clause :o {:value sid})
+          (assoc where-clause :o {:value nil})))
+      where-clause)))
 
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
   (go-try
     (let [sid-ch    (if (#{:_id :iri} (:type f-where))
                       (subjects-id-chan db error-ch vars f-where)
-                      (subjects-chan db error-ch vars f-where))
+                      (->> f-where
+                           (resolve-refs db vars)
+                           <?
+                           (subjects-chan db error-ch vars)))
           flakes-af (flakes-xf opts)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]

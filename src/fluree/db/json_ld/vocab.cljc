@@ -34,6 +34,7 @@
            details (if (= sid const/$rdf:type)
                      {:id    sid                            ;; rdf:type is predefined, so flakes to build map won't be present.
                       :class false
+                      :idx?  true
                       :ref?  true}
                      {:id                 sid
                       :class              true              ;; default
@@ -142,10 +143,12 @@
      :coll       coll
      :refs       refs                                       ;; Any properties defined (or inferred) as @id
      :pred       (-> property-maps
-                     (conj {:iri "@id"
-                            :id  0}
+                     (conj {:iri  "@id"
+                            :idx? true
+                            :id   0}
                            {:iri  "@type"
                             :ref? true
+                            :idx? true
                             :id   200})
                      hash-map-both-id-iri)
      :prefix     {}

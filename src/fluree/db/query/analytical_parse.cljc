@@ -321,68 +321,73 @@
 (defn parse-where-tuple
   "Parses where clause tuples (not maps)"
   [supplied-vars context db s p o]
-  (let [p         (json-ld/expand-iri p context)
-        fulltext? (str/starts-with? p "fullText:")
-        rdf-type? (or (= "rdf:type" p)
-                      (= "a" p))
-        _id?      (= "_id" p)
-        iri?      (= "@id" p)
-        s*        (value-type-map context s)
-        p*        (cond
-                    fulltext? #?(:clj  (full-text/parse-domain p)
-                                 :cljs (throw (ex-info "Full text queries not supported in JavaScript currently."
-                                                       {:status 400 :error :db/invalid-query})))
-                    rdf-type? :rdf/type
-                    _id? :_id
-                    iri? :iri
-                    :else (if db
-                            (or (dbproto/-p-prop db :id p)
-                                (throw (ex-info (str "Invalid predicate: " p)
-                                                {:status 400 :error :db/invalid-query})))
-                            p))
-        p-idx?    (when p* (dbproto/-p-prop db :idx? p*))   ;; is the predicate indexed?
-        p-tag?    (when p* (= :tag (dbproto/-p-prop db :type p)))
-        o*        (cond
-                    p-tag?
-                    {:tag o}
+  (let [p           (json-ld/expand-iri p context)
+        _           (log/warn "p parsed: " p)
+        fulltext?   (str/starts-with? p "fullText:")
+        rdf-type?   (#{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type} p)
+        collection? (and rdf-type? (= :json (dbproto/-db-type db))) ;; legacy fluree json DB
+        _id?        (= "_id" p)
+        iri?        (= "@id" p)
+        s*          (value-type-map context s)
+        p*          (cond
+                      fulltext? #?(:clj  (full-text/parse-domain p)
+                                   :cljs (throw (ex-info "Full text queries not supported in JavaScript currently."
+                                                         {:status 400 :error :db/invalid-query})))
+                      collection? :rdf/type
+                      _id? :_id
+                      iri? :iri
+                      :else (if db
+                              (or (dbproto/-p-prop db :id p)
+                                  (throw (ex-info (str "Invalid predicate: " p)
+                                                  {:status 400 :error :db/invalid-query})))
+                              p))
+        p-idx?      (when p* (dbproto/-p-prop db :idx? p*)) ;; is the predicate indexed?
+        p-tag?      (when p* (= :tag (dbproto/-p-prop db :type p)))
+        p-ref?      (when p* (true? (dbproto/-p-prop db :ref? p)))
+        o*          (cond
+                      p-tag?
+                      {:tag o}
 
-                    (query-fn? o)
-                    (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
-                      {:variable (:variable parsed-filter-map)
-                       :filter   parsed-filter-map})
+                      (query-fn? o)
+                      (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
+                        {:variable (:variable parsed-filter-map)
+                         :filter   parsed-filter-map})
 
-                    :else
-                    (value-type-map context o))
-        idx       (cond
-                    fulltext?
-                    :full-text
+                      :else
+                      (value-type-map context o))
+        idx         (cond
+                      fulltext?
+                      :full-text
 
-                    (or _id? iri? rdf-type?)
-                    :spot
+                      collection?
+                      :spot
 
-                    (and s* (not (:variable s*)))
-                    :spot
+                      (or _id? iri?)
+                      :spot
 
-                    (and p-idx? (:value o*))
-                    :post
+                      (and s* (not (:variable s*)))
+                      :spot
 
-                    p
-                    (do (when (:value o*)
-                          (log/info (str "Searching for a property value on unindexed predicate: " p
-                                         ". Consider making property indexed for improved performance "
-                                         "and lower fuel consumption.")))
-                        :psot)
+                      (and p-idx? (:value o*))
+                      :post
 
-                    o
-                    :opst
+                      p
+                      (do (when (:value o*)
+                            (log/info (str "Searching for a property value on unindexed predicate: " p
+                                           ". Consider making property indexed for improved performance "
+                                           "and lower fuel consumption.")))
+                          :psot)
 
-                    :else
-                    (throw (ex-info (str "Unable to determine query type for where statement: "
-                                         [s p o] ".")
-                                    {:status 400 :error :db/invalid-query})))]
+                      o
+                      :opst
+
+                      :else
+                      (throw (ex-info (str "Unable to determine query type for where statement: "
+                                           [s p o] ".")
+                                      {:status 400 :error :db/invalid-query})))]
     {:type   (cond
                fulltext? :full-text
-               rdf-type? :rdf/type
+               collection? :collection
                iri? :iri
                _id? :_id
                :else :tuple)
@@ -391,7 +396,8 @@
      :p      p*
      :o      o*
      :p-tag? p-tag?
-     :p-idx? p-idx?}))
+     :p-idx? p-idx?
+     :p-ref? p-ref?}))
 
 (defn parse-remote-tuple
   "When a specific DB is used (not default) for a where statement.

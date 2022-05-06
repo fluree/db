@@ -72,7 +72,7 @@
               (async/close! return-chan))))))
     return-chan))
 
-(defn rdf-type-crawl
+(defn collection-crawl
   [{:keys [db error-ch f-where limit offset parallelism finish-fn vars] :as opts}]
   (go-try
     (let [subj-ch   (subj-flakes-chan db error-ch vars f-where)
