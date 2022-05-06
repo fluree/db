@@ -20,15 +20,20 @@
   [conn event-type subject event-data]
   ;; any event not explicitly captured above is assumed to be a 'global' event.
   ;; send to any registered callback functions
-  (log/trace "process event:" event-type event-data)
-  (let [callbacks (get-in @(:state conn) [:listeners subject])]
+  (log/debug "process event:" event-type event-data)
+  (let [callbacks (concat (get-in @(:state conn) [:listeners subject])
+                          (-> conn :state deref (get :listeners)
+                              (->> (filter (fn [[_ v]] (fn? v))))))]
+    (log/debug "got event callbacks:" callbacks)
     (doseq [[k f] callbacks]
       (#?(:clj future :cljs do)
         (try* (f event-type event-data)
               (catch* e
-                      (log/error e
-                                 (str "Error calling registered callback: " (pr-str k) " for db: " subject
-                                      ". Event: " event-type " Data: " (pr-str event-data) "."))))))))
+                (log/error
+                  e
+                  (str "Error calling registered callback: " (pr-str k)
+                       " for db: " subject ". Event: " event-type " Data: "
+                       (pr-str event-data) "."))))))))
 
 
 (defn process-events
@@ -40,13 +45,13 @@
   Otherwise looks for database events and updates local state accordingly."
   [conn msg]
   (try*
-    (let [_          (log/trace "Process events: " msg)
+    (let [_          (log/debug "Process events: " msg)
           [event-type subject event-data error-data] msg
           event-type (keyword event-type)
           {:keys [state]} conn]
       (case event-type
         :response (when-let [res-chan (get-in @state [:pending-req subject])]
-                    (log/trace "Found response channel for subject" subject)
+                    (log/debug "Found response channel for subject" subject)
                     (swap! state update :pending-req #(dissoc % subject))
                     (cond
                       error-data

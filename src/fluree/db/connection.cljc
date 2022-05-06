@@ -1,7 +1,7 @@
 (ns fluree.db.connection
   (:require [clojure.string :as str]
             #?(:clj [environ.core :as environ])
-            #?(:clj  [clojure.core.async :as async :refer [go <!]]
+            #?(:clj  [clojure.core.async :as async :refer [go <! <!!]]
                :cljs [cljs.core.async :as async :refer [go <!]])
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
@@ -433,20 +433,24 @@
 
 (defn- add-listener*
   "Internal call to add-listener that uses the state atom directly."
-  [conn-state network ledger-id key fn]
-  (when-not (fn? fn)
-    (throw (ex-info "add-listener fn paramer not a function."
-                    {:status 400 :error :db/invalid-listener})))
-  (when (nil? key)
-    (throw (ex-info "add-listener key must not be nil."
-                    {:status 400 :error :db/invalid-listener})))
-  (swap! conn-state update-in
-         [:listeners [network ledger-id] key]
-         #(if %
-            (throw (ex-info (str "add-listener key already in use: " (pr-str key))
-                            {:status 400 :error :db/invalid-listener}))
-            fn))
-  true)
+  ([conn-state key fn]
+   (add-listener* conn-state nil nil key fn))
+  ([conn-state network ledger-id key fn]
+   (when-not (fn? fn)
+     (throw (ex-info "add-listener fn param not a function."
+                     {:status 400 :error :db/invalid-listener})))
+   (when (nil? key)
+     (throw (ex-info "add-listener key must not be nil."
+                     {:status 400 :error :db/invalid-listener})))
+   (let [key-path (if (and network ledger-id)
+                    [:listeners [network ledger-id] key]
+                    [:listeners key])]
+     (swap! conn-state update-in key-path
+            #(if %
+               (throw (ex-info (str "add-listener key already in use: " (pr-str key))
+                               {:status 400 :error :db/invalid-listener}))
+               fn)))
+   true))
 
 
 (defn- remove-listener*
@@ -460,19 +464,22 @@
 
 
 (defn add-listener
-  "Registers a new listener function, fn,  on connection.
+  "Registers a new listener function, fn, on connection.
 
   Each listener must have an associated key, which is used to remove the listener
   when needed but is otherwise opaque to the function. Each key must be unique for the
   given network + ledger-id."
-  [conn network ledger-id key fn]
-  ;; load db to make sure ledger events subscription initiated
-  (let [ledger (str network "/" ledger-id)
-        db     (session/db conn ledger nil)]
-    ;; check that db exists, else throw
-    #?(:clj (when (util/exception? (async/<!! db))
-              (throw (async/<!! db))))
-    (add-listener* (:state conn) network ledger-id key fn)))
+  ([conn key fn]
+   (add-listener* (:state conn) key fn))
+  ([conn network ledger-id key fn]
+   ;; load db to make sure ledger events subscription initiated
+   (let [ledger (str network "/" ledger-id)
+         db     (session/db conn ledger nil)]
+     ;; check that db exists, else throw
+     #?(:clj (let [db* (<!! db)]
+               (when (util/exception? db*)
+                 (throw db*))))
+     (add-listener* (:state conn) network ledger-id key fn))))
 
 
 (defn remove-listener
