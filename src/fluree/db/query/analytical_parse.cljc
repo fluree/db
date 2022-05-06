@@ -322,7 +322,6 @@
   "Parses where clause tuples (not maps)"
   [supplied-vars context db s p o]
   (let [p           (json-ld/expand-iri p context)
-        _           (log/warn "p parsed: " p)
         fulltext?   (str/starts-with? p "fullText:")
         rdf-type?   (#{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type} p)
         collection? (and rdf-type? (= :json (dbproto/-db-type db))) ;; legacy fluree json DB
