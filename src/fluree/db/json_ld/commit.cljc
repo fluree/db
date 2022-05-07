@@ -151,7 +151,8 @@
      :compact       (fn [iri] (json-ld/compact iri compact-fn))
      :branch        branch
      :id-key        (json-ld/compact "@id" compact-fn)
-     :type-key      (json-ld/compact "@type" compact-fn)}))
+     :type-key      (json-ld/compact "@type" compact-fn)
+     :hash-key      (json-ld/compact const/iri-hash compact-fn)}))
 
 
 #_(defn- add-commit-hash
@@ -329,7 +330,7 @@
 
 (defn commit-data
   "Create a json-ld commit shape using tx-data."
-  [{:keys [commit t] :as db} {:keys [type-key compact branch message tag ctx-used-atom] :as opts}]
+  [{:keys [commit t] :as db} {:keys [type-key hash-key compact branch message tag ctx-used-atom] :as opts}]
   (let [prev-commit    (:id commit)
         ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
                          @(:ledger commit))
@@ -338,7 +339,6 @@
                         (compact const/iri-t)      (- t)
                         (compact const/iri-branch) (util/keyword->str (branch/name branch))
                         (compact const/iri-time)   (util/current-time-iso)}
-        hash-key       (compact const/iri-hash)
         commit         (cond-> commit-base
                                (seq assert) (assoc (compact const/iri-assert) assert)
                                (seq retract) (assoc (compact const/iri-retract) retract)

@@ -79,19 +79,27 @@
    "jws"                (sign credential-subject signing-key)})
 
 
+(defn cred-id
+  "Generates credential id from hash within credential subject."
+  [credential-subject hash-key]
+  (let [hash-iri (get credential-subject hash-key)
+        [_ hash] (re-find #"^urn:sha256:(.+)$" hash-iri)]
+    (str "fluree:sha256:" hash)))
+
+
 (defn generate
   "Generate a VerifiableCredential given a subject and some issuer opts."
-  [credential-subject {:keys [did private] :as opts}]
+  [credential-subject {:keys [did private hash-key] :as opts}]
   (let [did* (or (:id did)
-                 (str "did:fluree:" (crypto/account-id-from-private private)))]
-    {"@context" ["https://www.w3.org/2018/credentials/v1"
-                 "https://ns.flur.ee/ledger/v1"]
-     "id" "https://flur.ee/ns/credential"
-     "type" ["VerifiableCredential"]
-     "issuer" did*
-     "issuanceDate" (util/current-time-iso)
+                 (str "did:fluree:" (crypto/account-id-from-private private)))
+        id   (cred-id credential-subject hash-key)]
+    {"@context"          "https://www.w3.org/2018/credentials/v1"
+     "id"                id
+     "type"              ["VerifiableCredential"]
+     "issuer"            did*
+     "issuanceDate"      (util/current-time-iso)
      "credentialSubject" credential-subject
-     "proof" (create-proof (json-ld/normalize-data credential-subject) did* private)}))
+     "proof"             (create-proof (json-ld/normalize-data credential-subject) did* private)}))
 
 
 (defn verify
