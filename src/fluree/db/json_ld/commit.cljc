@@ -76,7 +76,6 @@
   :refs-ctx - context that must be included with final context, for refs (@id) values
   "
   [flakes db {:keys [compact-fn id-key type-key] :as _opts}]
-  (log/warn "Commit flakes: " flakes)
   (let [id->iri (volatile! (jld-ledger/predefined-sids-compact compact-fn))
         ctx     (volatile! {})]
     (loop [[s-flakes & r] (partition-by flake/s flakes)
@@ -355,24 +354,24 @@
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
   ;; TODO: error handling - if a commit fails we need to stop immediately
-  [ledger db opts]
-  (let [{:keys [branch commit ledger t]} db
+  [{:keys [state conn] :as _ledger} db opts]
+  (let [{:keys [branch commit t]} db
         {:keys [did] :as opts*} (commit-opts db opts)]
-    (let [jld-commit (commit-data db opts*)
-          credential (when did (cred/generate jld-commit opts*))
+    (let [jld-commit  (commit-data db opts*)
+          credential  (when did (cred/generate jld-commit opts*))
 
-          doc        (json-ld/normalize-data (or credential commit))
+          doc         (json-ld/normalize-data (or credential commit))
           ;; TODO: can we move these side effects outside of commit?
           ;; TODO: suppose we fail while c-write? while push?
-          conn       (:conn ledger)
-          id         (conn-proto/-c-write conn doc)
-          publish-p  (conn-proto/push conn id)
+          id          (conn-proto/-c-write conn doc)
+          publish-p   (conn-proto/push conn id)
           ;; TODO: should the hash be the tx-hash?
-          hash       (get jld-commit const/iri-hash)]
-      ;; TODO: properly update branch state
-      (swap! (:state ledger) #(update-in % [:branches branch] merge {:t t :commit hash}))
-      (assoc db :commit {:t      t
-                         :hash   hash
-                         :id     id
-                         :branch branch
-                         :ledger publish-p}))))
+          hash        (get jld-commit const/iri-hash)
+          branch-name (branch/name branch)
+          db*         (assoc db :commit {:t      t
+                                         :hash   hash
+                                         :id     id
+                                         :branch branch-name
+                                         :ledger publish-p})]
+      (swap! state update-in [:branches branch-name] branch/update-commit db*)
+      db*)))

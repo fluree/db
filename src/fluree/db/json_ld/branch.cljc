@@ -31,7 +31,7 @@
   supplied current-branch."
   [current-branch branch-name]
   (let [{:keys [t commit idx dbs]
-         :or   {commit 0, dbs (list)}} current-branch
+         :or   {commit 0, t 0, dbs (list)}} current-branch
         ;; is current branch uncommitted? If so, when committing new branch we must commit current-branch too
         uncommitted? (and t (> t commit))]
     {:name      branch-name
@@ -47,13 +47,28 @@
   "Updates the latest staged db and returns new branch data."
   [{:keys [t] :as branch-data} db]
   (let [{db-t :t} db]
-    (when (and t (not= db-t (dec t)))
-      (throw (ex-info (str "Unable to create new DB version on ledger, latest 't' value is: "
-                           t " however new db t value is: " db-t ".")
-                      {:status 500 :error :db/invalid-time})))
+    (let [next-t (dec t)]
+      (if (or (= next-t db-t)
+              (= t db-t))
+        (-> branch-data
+            (assoc :t db-t
+                   :latest-db db))
+        (throw (ex-info (str "Unable to create new DB version on ledger, latest 't' value is: "
+                             t " however new db t value is: " db-t ".")
+                        {:status 500 :error :db/invalid-time}))))))
+
+(defn update-commit
+  [{:keys [commit] :as branch-data} db]
+  (let [{db-t :t} db]
+    (when-not (= db-t (dec commit))
+      (throw (ex-info (str "Commit failed, latest committed db is " commit
+                           "and you are trying to commit at db at t value of: "
+                           db-t ". These should be one apart. Likely db was "
+                           "updated by another user or process.")
+                      {:status 400 :error :db/invalid-commit})))
     (-> branch-data
-        (assoc :t db-t
-               :latest-db db))))
+        (update-db db)
+        (assoc :commit db-t))))
 
 (defn latest-db
   "Returns latest db from branch data"
