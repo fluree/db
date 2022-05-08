@@ -36,9 +36,10 @@
         uncommitted? (and t (> t commit))]
     {:name      branch-name
      :t         t
-     :commit    commit
+     :commit    commit                                      ;;  't' value of latest commit
      :idx       idx
-     :latest-db nil
+     :latest-db nil                                         ;; latest staged db (if different from commit-db)
+     :commit-db nil                                         ;; latest committed db
      :from      (-> current-branch
                     (select-keys [:name :t])
                     (assoc :uncommitted? uncommitted?))}))
@@ -74,6 +75,11 @@
   "Returns latest db from branch data"
   [branch-data]
   (:latest-db branch-data))
+
+(defn latest-commit-db
+  "Returns latest committed db"
+  [branch-data]
+  (:commit-db branch-data))
 
 (defn latest-commit
   "Returns latest commit info from branch-data"

@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.api
   (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
-            [fluree.db.json-ld.commit :as jld-commit]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
             [fluree.db.api.query :as query-api]
@@ -14,6 +13,23 @@
   (:refer-clojure :exclude [merge]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(defn- promise-wrap
+  "Wraps an async channel that will contain a response in a promise."
+  [port]
+  #?(:clj
+     (let [p (promise)]
+       (async/go
+         (deliver p (async/<! port)))
+       p)
+     :cljs
+     (js/Promise.
+       (fn [resolve reject]
+         (async/go
+           (let [res (async/<! port)]
+             (if (util/exception? res)
+               (reject res)
+               (resolve res))))))))
 
 ;; ledger operations
 
@@ -76,23 +92,8 @@
   ([conn] (create conn nil nil))
   ([conn ledger-name] (create conn ledger-name nil))
   ([conn ledger-name opts]
-   #?(:clj
-      (let [p (promise)]
-        (async/go
-          (let [res (async/<! (jld-ledger/create conn ledger-name opts))]
-            (when (util/exception? res)
-              (log/error res (str "Error created new ledger: " ledger-name)))
-            (deliver p res)))
-        p)
-      :cljs
-      (js/Promise.
-        (fn [resolve reject]
-          (async/go
-            (let [res (async/<! (jld-ledger/create conn ledger-name opts))]
-              (if (util/exception? res)
-                (reject res)
-                (resolve res))
-              )))))))
+   (let [res-ch (jld-ledger/create conn ledger-name opts)]
+     (promise-wrap res-ch))))
 
 (defn index
   "Performs indexing operation on the specified ledger"
@@ -127,19 +128,7 @@
                      (ledger-proto/-db db-or-ledger {:branch branch})
                      db-or-ledger)
          result-ch (db-proto/-stage db json-ld opts)]
-     #?(:clj
-        (let [p (promise)]
-          (async/go
-            (deliver p (async/<! result-ch)))
-          p)
-        :cljs
-        (js/Promise.
-          (fn [resolve reject]
-            (async/go
-              (let [res (async/<! result-ch)]
-                (if (util/exception? res)
-                  (reject res)
-                  (resolve res))))))))))
+     (promise-wrap result-ch))))
 
 
 (defn commit!
@@ -149,16 +138,20 @@
   Commits are tracked in the local environment, but if the ledger is distributed
   it will still need a 'push' to ensure it is published and verified as per the
   distributed rules."
-  ([db] (commit/-commit! db))
+  ([db]
+   (promise-wrap
+     (commit/-commit! db)))
   ([ledger-or-db db-or-opts]
    (let [[ledger db opts] (if (db-proto/db? ledger-or-db)
                             [nil ledger-or-db db-or-opts]
-                            [ledger-or-db db-or-opts nil])]
-     (if ledger
-       (commit! ledger db opts)
-       (commit/-commit! db opts))))
+                            [ledger-or-db db-or-opts nil])
+         res-ch (if ledger
+                  (commit! ledger db opts)
+                  (commit/-commit! db opts))]
+     (promise-wrap res-ch)))
   ([ledger db opts]
-   (commit/-commit! ledger db opts)))
+   (promise-wrap
+     (commit/-commit! ledger db opts))))
 
 
 (defn status
@@ -206,13 +199,5 @@
 
 (defn query
   [db query]
-  #?(:clj
-     (let [p (promise)]
-       (async/go
-         (deliver p (async/<! (query-api/query-async db query))))
-       p)
-     :cljs
-     (js/Promise.
-       (fn [resolve reject]
-         (async/go
-           (resolve (async/<! (query-api/query-async db query))))))))
+  (let [res-chan (query-api/query-async db query)]
+    (promise-wrap res-chan)))

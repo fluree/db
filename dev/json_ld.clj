@@ -72,7 +72,8 @@
                   :from   :wiki/Q836821})
 
 
-  (fluree/commit! db2 {:message "First commit contains two transactions!"
+
+  @(fluree/commit! db2 {:message "First commit contains two transactions!"
                        :push?   false})
 
   (fluree/status ledger)

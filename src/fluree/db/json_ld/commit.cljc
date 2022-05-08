@@ -9,7 +9,8 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.json-ld.branch :as branch]))
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.util.async :refer [<? go-try channel?]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -95,7 +96,8 @@
           (recur r assert* retract*))
         {:refs-ctx (dissoc @ctx type-key)                   ; @type will be marked as @type: @id, which is implied
          :assert   assert
-         :retract  retract}))))
+         :retract  retract
+         :flakes   flakes}))))
 
 
 (defn- did-from-private
@@ -124,10 +126,9 @@
         {} context)
       context)))
 
-
 (defn- commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
-  [{:keys [ledger branch schema] :as _db} {:keys [context did private message] :as _opts}]
+  [{:keys [ledger branch schema t commit] :as _db} {:keys [context did private message tag] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
                             (:context schema))
@@ -141,156 +142,23 @@
                           (:did ledger))
         ctx-used-atom (atom {})
         compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
-    {:message       message
-     :context       context*
-     :private       private*
-     :did           did*
-     :ctx-used-atom ctx-used-atom
-     :compact-fn    compact-fn
-     :compact       (fn [iri] (json-ld/compact iri compact-fn))
-     :branch        branch
-     :id-key        (json-ld/compact "@id" compact-fn)
-     :type-key      (json-ld/compact "@type" compact-fn)
-     :hash-key      (json-ld/compact const/iri-hash compact-fn)}))
-
-
-#_(defn- add-commit-hash
-    "Adds hash key to commit document"
-    [doc hash-key]
-    (let [normalized (normalize/normalize doc)
-          hash       (->> (->> normalized
-                               crypto/sha2-256
-                               (str "urn:sha256:")))]
-      {:normalized normalized
-       :hash       hash
-       :commit     (assoc doc hash-key hash)}))
-
-#_(defn- tx-hash
-    [txs]
-    (let [normalized (normalize/normalize txs)
-          hash       (->> normalized
-                          crypto/sha2-256
-                          (str "urn:sha256:"))]
-      {:normalized normalized
-       :hash       hash}))
-
-#_(defn- tx-doc
-    "Generates a transaction JSON-LD doc for a given 't' value.
-    Does not include a context, a global context for all transactions
-    and commit metadata will be included at the top level of the commit.
-
-    Returns two-tuple of [tx-doc refs-ctx] where tx-doc is the json-ld
-    document (sans context) of the transaction and refs-ctx is context
-    that must be included in the final context which specifies which
-    properties/predicates are @id (ref) values"
-    [{:keys [novelty] :as db} t compact-fn ctx-used-atom]
-    (let [flakes   (->> (:spot novelty)
-                        (filter #(= t (flake/t %)))
-                        reverse)
-          id-key   (json-ld/compact "@id" compact-fn)
-          type-key (json-ld/compact "@type" compact-fn)
-          {:keys [assert retract refs-ctx]}
-          (generate-commit db flakes {:compact-fn    compact-fn
-                                      :id-key        id-key
-                                      :type-key      type-key
-                                      :ctx-used-atom ctx-used-atom})
-          tx-doc   (cond-> {(compact-fn const/iri-t) (- t)}
-                           (seq assert) (assoc (compact-fn const/iri-assert) assert)
-                           (seq retract) (assoc (compact-fn const/iri-retract) retract))]
-      (when ctx-used-atom
-        (swap! ctx-used-atom (partial merge-with merge) refs-ctx))
-      tx-doc))
-
-#_(defn commit-doc
-    [{:keys [ledger t] :as db} {:keys [time message context]}]
-    (let [{branch-name   :name
-           branch-t      :t
-           branch-commit :commit} (branch/branch-meta ledger)
-          ctx-used-atom (atom {})
-          context*      (if context
-                          (json-ld/parse-context (:context ledger) context)
-                          (:context ledger))
-          compact-fn    (json-ld/compact-fn context* ctx-used-atom)
-          t-range       (reverse (range t branch-t))
-          tx-docs       (mapv #(tx-doc db % compact-fn ctx-used-atom) t-range)
-          id-key        (json-ld/compact "@id" compact-fn)
-          type-key      (json-ld/compact "@type" compact-fn)
-          final-ctx     (conj base-context @ctx-used-atom)]
-      (cond-> {"@context"                                         final-ctx
-               type-key                                           [(compact-fn "https://flur.ee/ns/block/Commit")]
-               (compact-fn "https://flur.ee/ns/block/branchName") (util/keyword->str branch-name)
-               (compact-fn "https://flur.ee/ns/block/t")          (- t)
-               (compact-fn "https://flur.ee/ns/block/time")       (util/current-time-iso)
-               (compact-fn "https://flur.ee/ns/block/tx")         tx-docs}
-              ;branch-commit (assoc (compact-fn const/iri-prev) branch-commit)
-              ;ledger-address (assoc (compact-fn "https://flur.ee/ns/block/ledger") ledger-address)
-              message (assoc (compact-fn "https://flur.ee/ns/block/message") message))
-
-      )
-
-    )
-
-
-#_(defn db
-    "Commits a current DB's changes (since last commit) to the storage backend
-    defined by the DB.
-
-    Returns a modified DB with the last commit content-addressable storage location updates"
-    [db opts]
-    (let [{:keys [t novelty commit]} db
-          _              (log/warn "Commit opts: " (commit-opts db opts))
-          {:keys [branch message type-key compact ctx-used-atom private return queue? push publish] :as opts*} (commit-opts db opts)
-          ;; TODO - tsop index can get below flakes more efficiently once exists
-          flakes         (filter #(= t (flake/t %)) (:spot novelty))
-          {:keys [assert retract ctx]} (generate-commit db (reverse flakes) opts*)
-          final-ctx      (conj base-context (merge-with merge @ctx-used-atom ctx))
-          prev-commit    (:id commit)
-          branch-commit  (:branch commit)
-          ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
-                           @(:ledger commit))
-          doc            (cond-> {"@context"                                      final-ctx
-                                  type-key                                        [(compact "https://flur.ee/ns/block/Commit")]
-                                  (compact "https://flur.ee/ns/block/branchName") branch
-                                  (compact "https://flur.ee/ns/block/t")          (- t)
-                                  (compact "https://flur.ee/ns/block/time")       (util/current-time-iso)}
-                                 prev-commit (assoc (compact "https://flur.ee/ns/block/prev") prev-commit)
-                                 branch-commit (assoc (compact "https://flur.ee/ns/block/branch") branch-commit)
-                                 ledger-address (assoc (compact "https://flur.ee/ns/block/ledger") ledger-address)
-                                 message (assoc (compact "https://flur.ee/ns/block/message") message)
-                                 (seq assert) (assoc (compact "https://flur.ee/ns/block/assert") assert)
-                                 (seq retract) (assoc (compact "https://flur.ee/ns/block/retract") retract))
-          hash-key       (compact "https://flur.ee/ns/block/hash")
-          {:keys [commit hash] :as commit-res} (add-commit-hash doc hash-key)
-          {:keys [credential] :as cred-res} (when private
-                                              (cred/generate commit opts*))
-          commit-json    (if credential
-                           (cred/credential-json cred-res)
-                           (commit-json commit-res hash-key))
-          ;; TODO - queue? is not yet implemented. Cannot form final commit until you have the previous object from publish so will need to modify commits
-          id             (when-not queue?
-                           (push commit-json))
-          publish-p      (when (and (not queue?) publish)
-                           (publish id))
-          db*            (assoc db :t t
-                                   :commit {:t      t
-                                            :hash   hash
-                                            :queue  (if queue? ;; queue is for offline changes until ready to publish
-                                                      (conj (or (:queue commit) []) commit)
-                                                      (:queue commit))
-                                            :id     id
-                                            :branch (or (:branch commit) id)
-                                            :ledger publish-p})
-          res            {:credential credential
-                          :commit     commit
-                          :json       commit-json
-                          :id         id
-                          :publish    publish-p             ;; promise with eventual result once successful
-                          :hash       hash
-                          :db-before  db
-                          :db-after   db*}]
-      (if return
-        (get res return)
-        res)))
+    {:message        message
+     :tag            tag
+     :t              (- t)
+     :prev-commit    (:id commit)
+     :ledger-address nil                                    ;; TODO
+     :time           (util/current-time-iso)
+     :context        context*
+     :private        private*
+     :did            did*
+     :ctx-used-atom  ctx-used-atom
+     :compact-fn     compact-fn
+     :compact        (fn [iri] (json-ld/compact iri compact-fn))
+     :branch         branch
+     :branch-name    (util/keyword->str (branch/name branch))
+     :id-key         (json-ld/compact "@id" compact-fn)
+     :type-key       (json-ld/compact "@type" compact-fn)
+     :hash-key       (json-ld/compact const/iri-hash compact-fn)}))
 
 
 (defn tx-hash
@@ -314,38 +182,36 @@
 (defn tx-data
   "Convert the novelty flakes into the json-ld shape."
   [{:keys [ledger branch t] :as db} opts]
-  (let [branch-name (branch/name branch)
-        committed-t (-> ledger
-                        (ledger-proto/-status branch-name)
+  (let [committed-t (-> ledger
+                        (ledger-proto/-status (branch/name branch))
                         branch/latest-commit)
         new-flakes  (commit-flakes db)]
     (when (not= t (dec committed-t))
       (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t
-                           "is no longer consistent with staged db 't' value of: " t ".")
+                           " is no longer consistent with staged db 't' value of: " t ".")
                       {:status 400 :error :db/invalid-commit})))
     (when new-flakes
       (generate-commit new-flakes db opts))))
 
 
-(defn commit-data
+(defn commit->json-ld
   "Create a json-ld commit shape using tx-data."
-  [{:keys [commit t] :as db} {:keys [type-key hash-key compact branch message tag ctx-used-atom] :as opts}]
-  (let [prev-commit    (:id commit)
-        ledger-address (when (and (:ledger commit) (realized? (:ledger commit)))
-                         @(:ledger commit))
-        {:keys [assert retract refs-ctx]} (tx-data db opts)
-        commit-base    {type-key                   [(compact const/iri-Commit)]
-                        (compact const/iri-t)      (- t)
-                        (compact const/iri-branch) (util/keyword->str (branch/name branch))
-                        (compact const/iri-time)   (util/current-time-iso)}
-        commit         (cond-> commit-base
-                               (seq assert) (assoc (compact const/iri-assert) assert)
-                               (seq retract) (assoc (compact const/iri-retract) retract)
-                               prev-commit (assoc (compact const/iri-prev) prev-commit)
-                               ledger-address (assoc (compact const/iri-ledger) ledger-address)
-                               message (assoc (compact const/iri-message) message)
-                               tag (assoc (compact const/iri-tag) tag)
-                               true (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx)))]
+  [commit-data opts]
+  (let [{:keys [type-key hash-key compact message tag ctx-used-atom t
+                branch-name time prev-commit ledger-address]} opts
+        {:keys [assert retract refs-ctx]} commit-data
+        commit-base {type-key                   [(compact const/iri-Commit)]
+                     (compact const/iri-t)      t
+                     (compact const/iri-branch) branch-name
+                     (compact const/iri-time)   time}
+        commit      (cond-> commit-base
+                            (seq assert) (assoc (compact const/iri-assert) assert)
+                            (seq retract) (assoc (compact const/iri-retract) retract)
+                            prev-commit (assoc (compact const/iri-prev) prev-commit)
+                            ledger-address (assoc (compact const/iri-ledger) ledger-address)
+                            message (assoc (compact const/iri-message) message)
+                            tag (assoc (compact const/iri-tag) tag)
+                            true (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx)))]
     (assoc commit hash-key (tx-hash (json-ld/normalize-data commit)))))
 
 
@@ -355,23 +221,25 @@
   returns a db with an updated :commit."
   ;; TODO: error handling - if a commit fails we need to stop immediately
   [{:keys [state conn] :as _ledger} db opts]
-  (let [{:keys [branch commit t]} db
-        {:keys [did] :as opts*} (commit-opts db opts)]
-    (let [jld-commit  (commit-data db opts*)
-          credential  (when did (cred/generate jld-commit opts*))
+  (go-try
+    (let [{:keys [branch commit t]} db
+          {:keys [did] :as opts*} (commit-opts db opts)]
+      (let [{:keys [flakes] :as commit-data} (tx-data db opts*)
+            jld-commit  (commit->json-ld commit-data opts*)
+            credential  (when did (cred/generate jld-commit opts*))
 
-          doc         (json-ld/normalize-data (or credential commit))
-          ;; TODO: can we move these side effects outside of commit?
-          ;; TODO: suppose we fail while c-write? while push?
-          id          (conn-proto/-c-write conn doc)
-          publish-p   (conn-proto/push conn id)
-          ;; TODO: should the hash be the tx-hash?
-          hash        (get jld-commit const/iri-hash)
-          branch-name (branch/name branch)
-          db*         (assoc db :commit {:t      t
-                                         :hash   hash
-                                         :id     id
-                                         :branch branch-name
-                                         :ledger publish-p})]
-      (swap! state update-in [:branches branch-name] branch/update-commit db*)
-      db*)))
+            doc         (json-ld/normalize-data (or credential commit))
+            ;; TODO: can we move these side effects outside of commit?
+            ;; TODO: suppose we fail while c-write? while push?
+            id          (conn-proto/-c-write conn doc)
+            publish-p   (conn-proto/push conn id)
+            ;; TODO: should the hash be the tx-hash?
+            hash        (get jld-commit const/iri-hash)
+            branch-name (branch/name branch)
+            db*         (assoc db :commit {:t      t
+                                           :hash   hash
+                                           :id     id
+                                           :branch branch-name
+                                           :ledger publish-p})]
+        (swap! state update-in [:branches branch-name] branch/update-commit db*)
+        db*))))
