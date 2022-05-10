@@ -30,26 +30,15 @@
                       {:status 400 :error :db/invalid-branch})))
     (branch/latest-db branch-meta)))
 
-
 (defn db-update
   "Updates db, will throw if not next 't' from current db."
   [{:keys [state] :as _ledger} {:keys [branch] :as db}]
   (let [branch-name (branch/name branch)]
     (swap! state update-in [:branches branch-name] branch/update-db db)))
 
-
 (defn commit-update
-  [{:keys [state] :as _ledger} branch {:keys [t] :as commit-meta}]
-  (let []
-    (swap! state update-in [:branches branch]
-           (fn [branch-map]
-             (if (<= t (:t branch-map))
-               (throw (ex-info (str "Error updating commit state. Db's t value is not beyond the "
-                                    "latest recorded t value. db's t: " t
-                                    " latest registered t: " (:t branch-map))
-                               {:status 500
-                                :error  :db/ledger-order}))
-               (assoc branch-map :commit commit-meta))))))
+  [{:keys [state] :as _ledger} branch db]
+  (swap! state update-in [:branches branch] branch/update-commit db))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -121,7 +110,7 @@
                               <?)
                          blank-db)]
       ;; place initial 'blank' DB into ledger.
-      (ledger-proto/-db-update ledger db)
+      (ledger-proto/-commit-update ledger branch db)
       ledger)))
 
 

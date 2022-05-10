@@ -14,7 +14,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def ^:const base-context ["https://ns.flur.ee/ledger/v1"])
 
 (defn get-s-iri
   "Returns an IRI from a subject id (sid).
@@ -220,26 +219,25 @@
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
   ;; TODO: error handling - if a commit fails we need to stop immediately
-  [{:keys [state conn] :as _ledger} db opts]
+  [{:keys [conn] :as ledger} db opts]
   (go-try
     (let [{:keys [branch commit t]} db
-          {:keys [did] :as opts*} (commit-opts db opts)]
+          {:keys [did hash-key] :as opts*} (commit-opts db opts)]
       (let [{:keys [flakes] :as commit-data} (tx-data db opts*)
             jld-commit  (commit->json-ld commit-data opts*)
             credential  (when did (cred/generate jld-commit opts*))
-
             doc         (json-ld/normalize-data (or credential commit))
             ;; TODO: can we move these side effects outside of commit?
             ;; TODO: suppose we fail while c-write? while push?
             id          (conn-proto/-c-write conn doc)
             publish-p   (conn-proto/push conn id)
             ;; TODO: should the hash be the tx-hash?
-            hash        (get jld-commit const/iri-hash)
+            hash        (get jld-commit hash-key)
             branch-name (branch/name branch)
             db*         (assoc db :commit {:t      t
                                            :hash   hash
                                            :id     id
                                            :branch branch-name
                                            :ledger publish-p})]
-        (swap! state update-in [:branches branch-name] branch/update-commit db*)
+        (ledger-proto/-commit-update ledger branch-name db*)
         db*))))

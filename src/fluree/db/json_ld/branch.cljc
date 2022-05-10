@@ -69,7 +69,8 @@
                       {:status 400 :error :db/invalid-commit})))
     (-> branch-data
         (update-db db)
-        (assoc :commit db-t))))
+        (assoc :commit db-t)
+        (assoc :commit-db db))))
 
 (defn latest-db
   "Returns latest db from branch data"
