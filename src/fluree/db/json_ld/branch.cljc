@@ -60,10 +60,12 @@
 
 (defn update-commit
   [{:keys [commit] :as branch-data} db]
-  (let [{db-t :t} db]
-    (when-not (= db-t (dec commit))
+  (let [{db-t :t} db
+        next-t? (= db-t (dec commit))]
+    (when-not (or next-t?
+                  (zero? db-t))                             ;; zero db-t is bootstrapping, which we allow bootstrap tx at zero
       (throw (ex-info (str "Commit failed, latest committed db is " commit
-                           "and you are trying to commit at db at t value of: "
+                           " and you are trying to commit at db at t value of: "
                            db-t ". These should be one apart. Likely db was "
                            "updated by another user or process.")
                       {:status 400 :error :db/invalid-commit})))

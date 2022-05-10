@@ -104,10 +104,9 @@
                           :reindex-max 1000000
                           :conn        conn})
           blank-db     (jld-db/create ledger)
-          db           (if (or context* did*)
-                         (->> (bootstrap/bootstrap-tx context* (:id did*))
-                              (db-proto/-stage blank-db)
-                              <?)
+          bootstrap?   (or context* did*)
+          db           (if bootstrap?
+                         (<? (bootstrap/bootstrap blank-db context* (:id did*)))
                          blank-db)]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-commit-update ledger branch db)

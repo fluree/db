@@ -17,6 +17,8 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(declare json-ld-node->flakes)
+
 (defn node?
   "Returns true if a nested value is itself another node in the graph.
   Only need to test maps that have :id - and if they have other properties they
@@ -48,8 +50,6 @@
                         (flake/->Flake type-sid const/$rdf:type const/$rdfs:Class t true nil)]))))
       [class-sids class-flakes])))
 
-(declare json-ld-node->flakes)
-
 (defn process-retractions
   "Processes all retractions at once from set of [sid pid] registered
   in retractions volatile! while creating new flakes."
@@ -70,7 +70,6 @@
   Takes sid to check, and @new-sids volatile used in the tx-state."
   [sid new-sids]
   (contains? @new-sids sid))
-
 
 (defn- new-pid
   "Generates a new property id (pid)"
@@ -115,8 +114,6 @@
       (cond-> (into flakes retractions)
               property-flake (conj property-flake)))))
 
-
-
 (defn json-ld-node->flakes
   [{:keys [id] :as node}
    {:keys [t next-pid next-sid iris db-before new-sids] :as tx-state}]
@@ -151,25 +148,31 @@
                        flakes*))))
           flakes)))))
 
-
 (defn ->tx-state
-  [db]
-  (let [{:keys [t block ecount schema branch]} db
+  [db {:keys [bootstrap?] :as _opts}]
+  (let [{:keys [block ecount schema branch]} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
-        commit-t (branch/latest-commit branch)]
-    {:db-before db
-     :refs      (volatile! (or (:refs schema) #{const/$rdf:type}))
-     :t         (dec commit-t)
-     :new?      (zero? t)
-     :block     block
-     :last-pid  last-pid
-     :last-sid  last-sid
-     :new-sids  (volatile! #{})
-     :next-pid  (fn [] (vswap! last-pid inc))
-     :next-sid  (fn [] (vswap! last-sid inc))
-     :iris      (volatile! {})}))
-
+        commit-t (branch/latest-commit branch)
+        t        (if bootstrap?
+                   (if (not (zero? commit-t))
+                     (throw (ex-info (str "Bootstrap? option only available for db-t value of 0, t is: " commit-t ".")
+                                     {:status 500 :error :db/invalid-commit}))
+                     0)
+                   (dec commit-t))]
+    {:db-before     db
+     :bootstrap?    bootstrap?
+     :stage-update? (= t (:t db))                           ;; if a previously staged db is getting updated again before committed
+     :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
+     :t             t
+     :new?          (zero? t)
+     :block         block
+     :last-pid      last-pid
+     :last-sid      last-sid
+     :new-sids      (volatile! #{})
+     :next-pid      (fn [] (vswap! last-pid inc))
+     :next-sid      (fn [] (vswap! last-sid inc))
+     :iris          (volatile! {})}))
 
 (defn final-ecount
   [tx-state]
@@ -178,113 +181,146 @@
     (assoc ecount const/$_predicate @last-pid
                   const/$_default @last-sid)))
 
-(defn update-index-tt-id
+(defn add-tt-id
   "Associates a unique tt-id for any in-memory staged db in their index roots.
   tt-id is used as part of the caching key, by having this in place it means
   that even though the 't' value hasn't changed it will cache each stage db
   data as its own entity."
-  [db tt-id]
+  [db]
+  (let [tt-id   (util/random-uuid)
+        indexes [:spot :psot :post :opst :tspo]]
+    (-> (reduce
+          (fn [db* idx]
+            (let [{:keys [children] :as node} (get db* idx)
+                  children* (reduce-kv
+                              (fn [children* k v]
+                                (assoc children* k (assoc v :tt-id tt-id)))
+                              {} children)]
+              (assoc db* idx (assoc node :tt-id tt-id
+                                         :children children*))))
+          db indexes)
+        (assoc :tt-id tt-id))))
+
+(defn remove-tt-id
+  "Removes a tt-id placed on indexes (opposite of add-tt-id)."
+  [db]
   (let [indexes [:spot :psot :post :opst :tspo]]
     (reduce
       (fn [db* idx]
         (let [{:keys [children] :as node} (get db* idx)
               children* (reduce-kv
                           (fn [children* k v]
-                            (assoc children* k (assoc v :tt-id tt-id)))
+                            (assoc children* k (dissoc v :tt-id)))
                           {} children)]
-          (assoc db* idx (assoc node :tt-id tt-id
-                                     :children children*))))
-      db indexes)))
-
-(defn update-novelty-idx*
-  "Updates a specific index flakes with new flakes"
-  [existing-flakes new-flakes stage-update?]
-  (if stage-update?
-    (reduce
-      (fn [acc flake]
-        (if (false? (flake/op flake))
-          (disj acc (flake/flip-flake flake))
-          (conj acc flake)))
-      existing-flakes new-flakes)
-    (into existing-flakes new-flakes)))
-
+          (assoc db* idx (-> node
+                             (dissoc :tt-id)
+                             (assoc :children children*)))))
+      (dissoc db :tt-id) indexes)))
 
 (defn update-novelty-idx
-  "Updates all novelty values.
-
-  If this is a staged update, it removes any assertions corresponding to retractions
-  that occured in the same 't' value (multiple stages between commits), effectively
-  'squashing' multiple stages.
-
-  opst flakes only are 'refs'."
-  [{:keys [spot psot opst post tspo size]} new-flakes schema stage-update?]
-  (let [spot*       (update-novelty-idx* spot new-flakes stage-update?)
-        bytes       (if stage-update?                       ;; for staged updates, need to re-calc novelty size
-                      #?(:clj  (future (flake/size-bytes spot*)) ;; calculate in separate thread for CLJ
-                         :cljs (flake/size-bytes spot*))
-                      #?(:clj  (future (flake/size-bytes new-flakes)) ;; calculate in separate thread for CLJ
-                         :cljs (flake/size-bytes new-flakes)))
-        opst-flakes (->> new-flakes
-                         (sort-by flake/p)
-                         (partition-by flake/p)
-                         (reduce
-                           (fn [acc p-flakes]
-                             (if (get-in schema [:pred (flake/p (first p-flakes)) :ref?])
-                               (into acc p-flakes)
-                               acc))
-                           []))]
-    {:spot spot*
-     :psot (update-novelty-idx* psot new-flakes stage-update?)
-     :opst (update-novelty-idx* opst opst-flakes stage-update?)
-     :post (update-novelty-idx* post new-flakes stage-update?)
-     :tspo (update-novelty-idx* tspo new-flakes stage-update?)
-     :size (if stage-update?
-             #?(:clj @bytes :cljs bytes)
-             (+ size #?(:clj @bytes :cljs bytes)))}))
+  [novelty-idx add remove]
+  (-> (reduce disj novelty-idx remove)
+      (into add)))
 
 (defn final-db
-  [tx-state flakes]
-  (let [{:keys [db-before t block refs]} tx-state
-        {:keys [novelty stats]} db-before
-        vocab-flakes  (jld-reify/get-vocab-flakes flakes)
-        schema*       (vocab/update-with db-before t @refs vocab-flakes)
-        tt-id         (util/random-uuid)
-        stage-update? (= t (:t db-before))                  ;; if a previously staged db is getting updated again before committed
-        novelty*      (update-novelty-idx novelty flakes schema* stage-update?)
-        db            (-> db-before
-                          (update-index-tt-id tt-id)
-                          (assoc :ecount (final-ecount tx-state)
-                                 :t t
-                                 :tt-id tt-id
-                                 :block block
-                                 :novelty novelty*
-                                 :stats (-> stats
-                                            (update :size + (- (:size novelty*) (:size novelty)))
-                                            (update :flakes + (- (count (:spot novelty*))
-                                                                 (count (:spot novelty)))))
-                                 :schema schema*))]
-    (assoc db :current-db-fn (fn [] (let [pc (async/promise-chan)]
-                                      (async/put! pc db)
-                                      pc)))))
+  [{:keys [add remove ref-add ref-remove size count schema] :as staged} {:keys [db-before bootstrap? t block] :as tx-state}]
+  (let [{:keys [novelty]} db-before
+        {:keys [spot psot post opst tspo]} novelty
+        new-db (assoc db-before :ecount (final-ecount tx-state)
+                                :t t
+                                :block block
+                                :novelty {:spot (update-novelty-idx spot add remove)
+                                          :psot (update-novelty-idx psot add remove)
+                                          :post (update-novelty-idx post add remove)
+                                          :opst (update-novelty-idx opst ref-add ref-remove)
+                                          :tspo (update-novelty-idx tspo add remove)
+                                          :size (+ (:size novelty) size)}
+                                :stats (-> (:stats db-before)
+                                           (update :size + size)
+                                           (update :flakes + count))
+                                :schema schema)]
+    (if bootstrap?
+      new-db
+      (add-tt-id new-db))))
 
+(defn base-flakes
+  "Returns base set of flakes needed in any new ledger."
+  [t]
+  [(flake/->Flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" t true nil)
+   (flake/->Flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" t true nil)])
+
+(defn ref-flakes
+  "Returns ref flakes from set of all flakes"
+  [flakes schema]
+  (->> flakes
+       (sort-by flake/p)
+       (partition-by flake/p)
+       (reduce
+         (fn [acc p-flakes]
+           (if (get-in schema [:pred (flake/p (first p-flakes)) :ref?])
+             (into acc p-flakes)
+             acc))
+         [])))
+
+;; TODO - can use transient! below
+(defn stage-update-novelty
+  "If a db is staged more than once, any retractions in a previous stage will
+  get completely removed from novelty. This returns flakes that must be added and removed
+  from novelty."
+  [novelty-flakes new-flakes]
+  (loop [[f & r] new-flakes
+         adds    new-flakes
+         removes (empty new-flakes)]
+    (if f
+      (if (true? (flake/op f))
+        (recur r adds removes)
+        (let [flipped (flake/flip-flake f)]
+          (if (contains? novelty-flakes flipped)
+            (recur r (disj adds f) (conj removes flipped))
+            (recur r adds removes))))
+      [(not-empty adds) (not-empty removes)])))
+
+(defn stage*
+  "Returns map of all elements for a stage transaction required to create an updated db."
+  [new-flakes {:keys [t stage-update? db-before refs] :as _tx-state}]
+  (let [[add remove] (if stage-update?
+                       (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
+                       [new-flakes nil])
+        vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
+        schema       (vocab/update-with db-before t @refs vocab-flakes)]
+    {:add        add
+     :remove     remove
+     :ref-add    (ref-flakes add schema)
+     :ref-remove (ref-flakes remove schema)
+     :count      (cond-> (when add (count add))
+                         remove (- (count remove)))
+     :size       (cond-> (flake/size-bytes add)
+                         remove (- (flake/size-bytes remove)))
+     :schema     schema}))
+
+(defn stage-flakes
+  [json-ld {:keys [new? t] :as tx-state}]
+  (go-try
+    (let [ss (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
+                     new? (into (base-flakes t)))]
+      (loop [[node & r] (if (sequential? json-ld)
+                          json-ld
+                          [json-ld])
+             flakes* ss]
+        (if node
+          (recur r (into flakes* (<? (json-ld-node->flakes node tx-state))))
+          flakes*)))))
 
 (defn stage
   "Stages changes, but does not commit.
-  Returns promise with new db."
+  Returns async channel that will contain updated db or exception."
   [db json-ld opts]
-  (async/go
-    (try*
-      (let [expanded    (json-ld/expand json-ld)
-            tx-state    (->tx-state db)
-            base-flakes (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                                (:new? tx-state) (into [(flake/->Flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" (:t tx-state) true nil)
-                                                        (flake/->Flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" (:t tx-state) true nil)]))]
-        (loop [[node & r] (if (sequential? expanded)
-                            expanded
-                            [expanded])
-               flakes base-flakes]
-          (if node
-            (recur r (into flakes (<? (json-ld-node->flakes node tx-state))))
-            (final-db tx-state flakes))))
-      (catch* e e))))
+  (go-try
+    (let [tx-state (->tx-state db opts)]
+      (-> json-ld
+          json-ld/expand
+          (stage-flakes tx-state)
+          <?
+          (stage* tx-state)
+          (final-db tx-state)))))
 

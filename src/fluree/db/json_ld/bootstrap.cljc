@@ -5,7 +5,8 @@
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            [fluree.db.dbproto :as db-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -147,14 +148,10 @@
                         did-tx (into did-tx))}))
 
 (defn bootstrap
-  "Bootstraps a permissioned JSON-LD db"
-  [ledger default-ctx dids]
-
+  "Bootstraps a permissioned JSON-LD db. Returns async channel."
+  [blank-db default-ctx dids]
   (let [tx (bootstrap-tx default-ctx dids)]
-    #_(fluree/stage ledger tx)
-
-    )
-  )
+    (db-proto/-stage blank-db tx {:bootstrap? true})))
 
 
 (comment
