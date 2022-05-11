@@ -414,9 +414,10 @@
 
 
 (defn new-flake
-  [& parts]
-  (let [[s p o t op m] parts]
-    (->Flake s p o t op m)))
+  ([s p o t op]
+   (->Flake s p o t op nil))
+  ([s p o t op m]
+   (->Flake s p o t op m)))
 
 
 (defn flip-flake
