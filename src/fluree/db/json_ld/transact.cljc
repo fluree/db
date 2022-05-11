@@ -10,7 +10,8 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
-            [fluree.db.json-ld.branch :as branch]))
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.ledger.proto :as ledger-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -147,10 +148,10 @@
 
 (defn ->tx-state
   [db {:keys [bootstrap?] :as _opts}]
-  (let [{:keys [block ecount schema branch], db-t :t} db
+  (let [{:keys [block ecount schema branch ledger], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
-        commit-t (branch/latest-commit branch)
+        commit-t (branch/latest-commit (ledger-proto/-status ledger (branch/name branch)))
         t        (dec commit-t)]
     {:db-before     db
      :bootstrap?    bootstrap?
