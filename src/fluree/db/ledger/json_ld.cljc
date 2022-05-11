@@ -109,7 +109,7 @@
                          (<? (bootstrap/bootstrap blank-db context* (:id did*)))
                          blank-db)]
       ;; place initial 'blank' DB into ledger.
-      (ledger-proto/-commit-update ledger branch db)
+      (ledger-proto/-db-update ledger db)
       ledger)))
 
 

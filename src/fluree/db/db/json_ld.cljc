@@ -16,8 +16,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.commit :as commit]
-            [fluree.db.ledger.proto :as ledger-proto])
+            [fluree.db.commit :as commit])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))

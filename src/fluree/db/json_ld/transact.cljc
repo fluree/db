@@ -150,22 +150,17 @@
 
 (defn ->tx-state
   [db {:keys [bootstrap?] :as _opts}]
-  (let [{:keys [block ecount schema branch]} db
+  (let [{:keys [block ecount schema branch], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (branch/latest-commit branch)
-        t        (if bootstrap?
-                   (if (not (zero? commit-t))
-                     (throw (ex-info (str "Bootstrap? option only available for db-t value of 0, t is: " commit-t ".")
-                                     {:status 500 :error :db/invalid-commit}))
-                     0)
-                   (dec commit-t))]
+        t        (dec commit-t)]
     {:db-before     db
      :bootstrap?    bootstrap?
-     :stage-update? (= t (:t db))                           ;; if a previously staged db is getting updated again before committed
+     :stage-update? (= t db-t)                              ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
-     :new?          (zero? t)
+     :new?          (zero? db-t)
      :block         block
      :last-pid      last-pid
      :last-sid      last-sid
