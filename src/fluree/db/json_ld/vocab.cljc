@@ -60,7 +60,7 @@
                          (= const/$rdfs:subClassOf pid)
                          (update details :subclassOf conj (flake/o f))
 
-                         (= const/$_predicate:equivalentProperty)
+                         (= const/$_predicate:equivalentProperty pid)
                          (update details :equivalentProperty conj (flake/o f))
 
                          :else details)]

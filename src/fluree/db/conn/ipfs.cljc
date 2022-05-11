@@ -16,17 +16,6 @@
 
 ;; IPFS Connection object
 
-;; message format
-(comment
-  {:type   nil                                              ;; message type
-   :ledger nil
-   :res-ch nil                                              ;; optional response/result channel
-   ;; body/contents of message
-   :body   nil}
-
-  )
-
-
 (defrecord IPFSConnection [id transactor? memory state
                            context did async-cache
                            local-read local-write
@@ -59,14 +48,12 @@
   (-did [_] did)
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine
-                     true
-
-                     ))
+                     (log/warn "-msg-out: " msg)
+                     :TODO))
   (-msg-out [_ msg] (go-try
                       ;; TODO - register/submit event
-                      true
-
-                      ))
+                      (log/warn "-msg-out: " msg)
+                      :TODO))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
@@ -86,7 +73,7 @@
 
   index/Resolver
   (resolve
-    [conn node]
+    [_ node]
     ;; all root index nodes will be empty
 
     (storage/resolve-empty-leaf node))
@@ -97,13 +84,6 @@
          (throw (ex-info "Memory connection does not support full text operations."
                          {:status 500 :error :db/unexpected-error})))]))
 
-#_{:did     did
-   :method  :ipfs
-   :context context
-   :write   nil                                             ;; when empty, don't write unless you commit
-   :read    (ipfs/default-read-fn server)
-   :commit  (ipfs/default-commit-fn server)
-   :push    [(ipfs/default-push-fn server)]}
 
 ;; TODO - the following few functions are duplicated from fluree.db.connection
 ;; TODO - should move to a common space
@@ -180,4 +160,3 @@
                           :memory      true
                           :state       state
                           :async-cache async-cache-fn})))
-

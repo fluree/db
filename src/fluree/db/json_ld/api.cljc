@@ -10,7 +10,7 @@
             [fluree.db.dbproto :as db-proto]
             [fluree.db.commit :as commit]
             [fluree.db.util.log :as log])
-  (:refer-clojure :exclude [merge]))
+  (:refer-clojure :exclude [merge load]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -94,6 +94,23 @@
   ([conn ledger-name opts]
    (let [res-ch (jld-ledger/create conn ledger-name opts)]
      (promise-wrap res-ch))))
+
+(defn load
+  "Loads a ledger defined with a Fluree address, e.g.:
+  fluree:ipfs:Qmaq4ip1bJq6255S5PhU8veo6gxaq2yyucKZmJkV1WW8YG
+  fluree:ipns:k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2
+  fluree:ipns:my.dns.com/movies/top-rated
+  fluree:local:my/db
+  fluree:s3:...."
+  ([address]
+   ;; TODO - when given an address only, can create or retrieve from cache a conn
+   ;; TODO - for that particular method
+   (throw (ex-info "Not yet implemented" {:status 500 :error :db/unexpected-error})))
+  ([conn address]
+
+   :TODO
+
+   ))
 
 (defn index
   "Performs indexing operation on the specified ledger"
