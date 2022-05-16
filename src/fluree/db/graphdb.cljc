@@ -431,4 +431,3 @@
 (defn graphdb?
   [db]
   (instance? GraphDb db))
-

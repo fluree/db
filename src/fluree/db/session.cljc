@@ -504,13 +504,13 @@
   (swap! state #(assoc % :req/last (util/current-time-millis)
                          :req/count (inc (:req/count %))))
   (or (:db/db @state)
-      (let [_         (swap! (:schema-cache session) empty) ;; always clear schema cache on new load
-            new-state (swap! state
-                             (fn [st]
-                               (if (:db/db st)
-                                 st
-                                 (assoc st :db/db (full-load-existing-db session)))))]
-        (:db/db new-state))))
+      (do (swap! (:schema-cache session) empty)
+          (-> state
+              (swap! (fn [st]
+                       (if (:db/db st)
+                         st
+                         (assoc st :db/db (full-load-existing-db session)))))
+              :db/db))))
 
 
 (defn blank-db
