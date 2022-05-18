@@ -459,6 +459,24 @@
     :else
     {:value value}))
 
+(defn recursion-predicate
+  "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
+  predicate. e.g.: person/follows+3
+
+  Returns a two-tuple of predicate followed by # of times to recur.
+
+  If not a recursion predicate, returns nil."
+  [predicate]
+  (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" predicate)]
+    [pred (or (util/str->int recur-n) util/max-integer)]))
+
+(defn pred-id-strict
+  "Returns predicate ID for a given predicate, else will throw with an invalid
+  predicate error."
+  [db predicate]
+  (or (dbproto/-p-prop db :id predicate)
+      (throw (ex-info (str "Invalid predicate: " predicate)
+                      {:status 400 :error :db/invalid-query}))))
 
 (defn parse-where-tuple
   "Parses where clause tuples (not maps)"
@@ -467,6 +485,7 @@
         rdf-type? (or (= "rdf:type" p)
                       (= "a" p))
         _id?      (= "_id" p)
+        [recur-pred recur-n] (recursion-predicate p)
         s*        (value-type-map s)
         p*        (cond
                     fulltext? #?(:clj  (full-text/parse-domain p)
@@ -474,11 +493,10 @@
                                                        {:status 400 :error :db/invalid-query})))
                     rdf-type? :rdf/type
                     _id? :_id
-                    :else (if db
-                            (or (dbproto/-p-prop db :id p)
-                                (throw (ex-info (str "Invalid predicate: " p)
-                                                {:status 400 :error :db/invalid-query})))
-                            p))
+                    recur-pred (cond->> recur-pred
+                                        db (pred-id-strict db))
+                    :else (cond->> p
+                                   db (pred-id-strict db)))
         p-idx?    (when p* (dbproto/-p-prop db :idx? p*))   ;; is the predicate indexed?
         p-tag?    (when p* (= :tag (dbproto/-p-prop db :type p)))
         o*        (cond
@@ -528,6 +546,7 @@
      :s      s*
      :p      p*
      :o      o*
+     :recur  recur-n                                        ;; will only show up if recursion specified.
      :p-tag? p-tag?
      :p-idx? p-idx?}))
 

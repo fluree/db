@@ -103,7 +103,10 @@
   [{:keys [where select] :as _parsed-query}]
   (let [select-var (-> select :select first :variable)]
     (when select-var                                        ;; for now exclude any filters on the first where, not implemented
-      (every? #(= select-var (-> % :s :variable)) where))))
+      (every? #(and (= select-var (-> % :s :variable))
+                    ;; exclude if any recursion specified in where statement (e.g. person/follows+3)
+                    (not (:recur %)))
+              where))))
 
 (defn re-parse-as-simple-subj-crawl
   "Returns true if query contains a single subject crawl.
