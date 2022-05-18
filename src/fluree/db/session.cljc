@@ -1,8 +1,8 @@
 (ns fluree.db.session
   (:require [fluree.db.graphdb :as graphdb]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            #?(:clj  [clojure.core.async :as async :refer [go go-loop]]
+               :cljs [cljs.core.async :as async :refer-macros [go go-loop]])
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
@@ -82,41 +82,41 @@
 (defn- full-load-existing-db
   [session]
   (let [pc (async/promise-chan)]
-    (async/go
+    (go
       (try*
-        (let [blank-db        (:blank-db session)
-              {:keys [conn network dbid]} session
-              db-info         (<? (ops/ledger-info-async conn [network dbid]))
-              _               (when (not= :ready (keyword (:status db-info)))
-                                (throw (ex-info (if (empty? db-info)
-                                                  (str "Ledger " network "/" dbid
-                                                       " is not found on this ledger group.")
-                                                  (str "Ledger " network "/" dbid
-                                                       " is not currently available. Status is: "
-                                                       (:status db-info) "."))
-                                                {:status 400
-                                                 :error  :db/unavailable})))
-              last-indexed-db (<? (storage/reify-db conn network dbid blank-db (:index db-info)))
-              latest-block    (:block db-info)
-              db              (when last-indexed-db
-                                (loop [db         last-indexed-db
-                                       next-block (-> last-indexed-db :block inc)]
-                                  (if (> next-block latest-block)
-                                    db
-                                    (let [block-data (<? (storage/read-block conn network dbid next-block))]
-                                      (if block-data
-                                        (let [{:keys [flakes block t]} block-data
-                                              db* (<? (dbproto/-with db block flakes))]
-                                          (recur db* (inc next-block)))
-                                        (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
-                                                        {:status 500 :error :db/unexpected-error})))))))
-              db-schema       (schema/schema-map db)        ;; returns async chan
-              db-settings     (schema/setting-map db)       ;; returns async chan
-              db*             (assoc db :schema (<? db-schema)
-                                        :settings (<? db-settings))]
-          (async/put! pc db*))
-        (catch* e
-                (async/put! pc e))))
+       (let [blank-db        (:blank-db session)
+             {:keys [conn network dbid]} session
+             db-info         (<? (ops/ledger-info-async conn [network dbid]))
+             _               (when (not= :ready (keyword (:status db-info)))
+                               (throw (ex-info (if (empty? db-info)
+                                                 (str "Ledger " network "/" dbid
+                                                      " is not found on this ledger group.")
+                                                 (str "Ledger " network "/" dbid
+                                                      " is not currently available. Status is: "
+                                                      (:status db-info) "."))
+                                               {:status 400
+                                                :error  :db/unavailable})))
+             last-indexed-db (<? (storage/reify-db conn network dbid blank-db (:index db-info)))
+             latest-block    (:block db-info)
+             db              (when last-indexed-db
+                               (loop [db         last-indexed-db
+                                      next-block (-> last-indexed-db :block inc)]
+                                 (if (> next-block latest-block)
+                                   db
+                                   (let [block-data (<? (storage/read-block conn network dbid next-block))]
+                                     (if block-data
+                                       (let [{:keys [flakes block t]} block-data
+                                             db* (<? (dbproto/-with db block flakes))]
+                                         (recur db* (inc next-block)))
+                                       (throw (ex-info (str "Error reading block " next-block " for db: " network "/" dbid ".")
+                                                       {:status 500 :error :db/unexpected-error})))))))
+             db-schema       (schema/schema-map db)        ;; returns async chan
+             db-settings     (schema/setting-map db)       ;; returns async chan
+             db*             (assoc db :schema (<? db-schema)
+                                    :settings (<? db-settings))]
+         (async/put! pc db*))
+       (catch* e
+               (async/put! pc e))))
     pc))
 
 (defn cas-db!
@@ -231,48 +231,48 @@
   [_ _ _]
   ;; no-op, local event to trigger any connection listeners (i.e. syncTo or other user (fdb/listen ...) fns)
   ;; see :block update/event type below where this event gets originated from
-  (async/go
+  (go
     ::no-op))
 
 (defmethod process-ledger-update :block
   [session event-type {:keys [block t flakes] :as data}]
   (go-try
-    (let [current-db-ch (current-db session)
-          current-db    (<? current-db-ch)
-          current-block (:block current-db)]
-      (cond
-        ;; no-op
-        ;; TODO - we can avoid logging here if we are the transactor
-        (<= block current-block)
-        (log/info (str (:network session) "/" (:dbid session) ": Received block: " block
-                       ", but DB is already more current at block: " current-block ". No-op."))
+   (let [current-db-ch (current-db session)
+         current-db    (<? current-db-ch)
+         current-block (:block current-db)]
+     (cond
+       ;; no-op
+       ;; TODO - we can avoid logging here if we are the transactor
+       (<= block current-block)
+       (log/info (str (:network session) "/" (:dbid session) ": Received block: " block
+                      ", but DB is already more current at block: " current-block ". No-op."))
 
-        ;; next block is correct, update cached db
-        (= block (+ 1 current-block))
-        (do
-          (log/trace (str (:network session) "/$" (:dbid session) ": Received block " block ", DB at that block, update cached db with flakes."))
-          (let [flakes* (map #(if (instance? Flake %) % (flake/parts->Flake %)) flakes)
-                new-db  (dbproto/-with current-db block flakes*)]
-            ;; update-local-db, returns true if successful
-            (when (cas-db! session current-db-ch new-db)
-              ;; place a local notification of updated db on *connection* sub-chan, which is what
-              ;; receives all events from ledger server - this allows any (fdb/listen...) listeners to listen
-              ;; for a :local-ledger-update event. :block events from ledger server will trigger listeners
-              ;; but if they rely on the block having updated the local ledger first they will instead want
-              ;; to filter for :local-ledger-update event instead of :block events (i.e. syncTo requires this)
-              (conn-events/process-event (:conn session) :local-ledger-update [(:network session) (:dbid session)] data))))
+       ;; next block is correct, update cached db
+       (= block (+ 1 current-block))
+       (do
+         (log/trace (str (:network session) "/$" (:dbid session) ": Received block " block ", DB at that block, update cached db with flakes."))
+         (let [flakes* (map #(if (instance? Flake %) % (flake/parts->Flake %)) flakes)
+               new-db  (dbproto/-with current-db block flakes*)]
+           ;; update-local-db, returns true if successful
+           (when (cas-db! session current-db-ch new-db)
+             ;; place a local notification of updated db on *connection* sub-chan, which is what
+             ;; receives all events from ledger server - this allows any (fdb/listen...) listeners to listen
+             ;; for a :local-ledger-update event. :block events from ledger server will trigger listeners
+             ;; but if they rely on the block having updated the local ledger first they will instead want
+             ;; to filter for :local-ledger-update event instead of :block events (i.e. syncTo requires this)
+             (conn-events/process-event (:conn session) :local-ledger-update [(:network session) (:dbid session)] data))))
 
-        ;; missing blocks, reload entire db
-        :else
-        (do
-          (log/info (str "Missing block(s): " (:network session) "/" (:dbid session) ". Received block " block
-                         ", but latest local block is: " current-block ". Forcing a db reload."))
-          (reload-db! session))))))
+       ;; missing blocks, reload entire db
+       :else
+       (do
+         (log/info (str "Missing block(s): " (:network session) "/" (:dbid session) ". Received block " block
+                        ", but latest local block is: " current-block ". Forcing a db reload."))
+         (reload-db! session))))))
 
 
 (defmethod process-ledger-update :new-index
   [session header block]
-  (async/go
+  (go
     ;; reindex, reload at next request
     (clear-db! session)
     (log/debug (str "Ledger " (:network session) "/" (:dbid session) " re-indexed as of block: " block "."))
@@ -320,7 +320,7 @@
   "Creates loop that takes new blocks / index commands and processes them in order
   ensuring the consistency of the database."
   [conn network ledger-id update-chan]
-  (async/go-loop []
+  (go-loop []
     (let [msg     (<? update-chan)
           session (from-cache network ledger-id)]
       (cond
@@ -333,11 +333,11 @@
         :else
         (do
           (try*
-            (let [[event-type event-data] msg]
-              (log/trace (str "[process-ledger-updates[" network "/$" ledger-id "]: ") (util/trunc (pr-str msg) 200))
-              (<? (process-ledger-update session event-type event-data)))
-            (catch* e
-                    (log/error e "Exception processing ledger updates for message: " msg)))
+           (let [[event-type event-data] msg]
+             (log/trace (str "[process-ledger-updates[" network "/$" ledger-id "]: ") (util/trunc (pr-str msg) 200))
+             (<? (process-ledger-update session event-type event-data)))
+           (catch* e
+                   (log/error e "Exception processing ledger updates for message: " msg)))
           (recur))))))
 
 (defn- session-factory
@@ -348,15 +348,15 @@
         update-chan   (async/chan)
         transact-chan (when transactor? (async/chan))       ;; transactors only
         state         (atom (merge
-                              state
-                              {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
-                               :req/count     0             ;; count of db requests on this connection
-                               :req/last      nil           ;; epoch millis of last db request on this connection
-                               :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
-                               :db/db         (when db
-                                                (assoc db :schema-cache schema-cache)) ;; current cached DB - make sure we use the latest (new) schema cache in it
-                               :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
-                               :closed?       false}))
+                             state
+                             {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
+                              :req/count     0             ;; count of db requests on this connection
+                              :req/last      nil           ;; epoch millis of last db request on this connection
+                              :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
+                              :db/db         (when db
+                                               (assoc db :schema-cache schema-cache)) ;; current cached DB - make sure we use the latest (new) schema cache in it
+                              :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
+                              :closed?       false}))
         session       (map->DbSession {:conn          conn
                                        :network       network
                                        :dbid          dbid
@@ -475,9 +475,9 @@
                             (let [tx-response (block-response->tx-response event-data tid)]
                               (doseq [[k f] keyed-callbacks]
                                 (try*
-                                  (f tx-response)
-                                  (catch* e
-                                          (log/error e (str "Error processing transaction callback for tid: " tid ".")))))))))))))
+                                 (f tx-response)
+                                 (catch* e
+                                         (log/error e (str "Error processing transaction callback for tid: " tid ".")))))))))))))
 
                ;; launch a go-loop to monitor the update-chan and process updates
                (process-ledger-updates conn network ledger-id (:update-chan session)))
@@ -486,7 +486,7 @@
              ;; Currently, (as of 7/12) the only use for transact-chan is to close the session after db creation
              (when transactor?
                (let [transact-handler (:transact-handler conn)]
-                 (async/go-loop []
+                 (go-loop []
                    (let [req (async/<! (:transact-chan session))]
                      (if (nil? req)
                        (log/info (str "Transactor session closing for db: " network "/$" ledger-id "[" ledger-alias "]"))
@@ -502,7 +502,7 @@
   DB is returned as a core async promise channel."
   [{:keys [state] :as session}]
   (swap! state #(assoc % :req/last (util/current-time-millis)
-                         :req/count (inc (:req/count %))))
+                       :req/count (inc (:req/count %))))
   (or (:db/db @state)
       (do (swap! (:schema-cache session) empty)
           (-> state
@@ -533,7 +533,7 @@
   ([] (close-all-sessions nil))
   ([conn-id]
    (let [sessions (cond->> (vals @session-cache)
-                           conn-id (filter #(= conn-id (get-in % [:conn :id]))))]
+                    conn-id (filter #(= conn-id (get-in % [:conn :id]))))]
      (doseq [session sessions]
        (close session)))))
 
