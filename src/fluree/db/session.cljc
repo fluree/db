@@ -1,8 +1,8 @@
 (ns fluree.db.session
   (:require [fluree.db.graphdb :as graphdb]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async :refer [go go-loop]]
-               :cljs [cljs.core.async :as async :refer-macros [go go-loop]])
+            #?(:clj  [clojure.core.async :as async :refer [chan go go-loop]]
+               :cljs [cljs.core.async :as async :refer [chan] :refer-macros [go go-loop]])
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
@@ -22,7 +22,8 @@
 
 (declare db current-db session)
 
-(defrecord DbSession [conn network dbid db-name update-chan transact-chan state schema-cache blank-db close id])
+(defrecord DbSession [conn network dbid db-name current-db-chan update-chan
+                      transact-chan state schema-cache blank-db close id])
 
 
 ;;; ----------------------------------------
@@ -302,24 +303,23 @@
   two arity network + dbid will see if a session is in cache and
   then perform the shutdown on the cached session, else will return
   false."
-  ([session]
-   (let [{:keys [conn update-chan transact-chan state network dbid id]} session
-         closed? (closed? session)]
-     (if closed?
-       (do
-         (remove-cache! network dbid)
-         false)
-       (do
-         (swap! state assoc :closed? true)
-         ;; remove updates callback from connection
-         ((:remove-listener conn) network dbid id)
-         (async/close! update-chan)
-         (when transact-chan
-           (async/close! transact-chan))
-         (remove-cache! network dbid)
-         (when (fn? (:close session))
-           ((:close session)))
-         true))))
+  ([{:keys [conn current-db-chan update-chan transact-chan state network
+            dbid id] :as session}]
+   (if (closed? session)
+     (do
+       (remove-cache! network dbid)
+       false)
+     (do
+       (swap! state assoc :closed? true)
+       ((:remove-listener conn) network dbid id)
+       (async/close! current-db-chan)
+       (async/close! update-chan)
+       (when transact-chan
+         (async/close! transact-chan))
+       (remove-cache! network dbid)
+       (when (fn? (:close session))
+         ((:close session)))
+       true)))
   ([network dbid]
    (if-let [session (from-cache network dbid)]
      (close session)
@@ -351,28 +351,27 @@
           (recur))))))
 
 (defn- session-factory
-  "Creates a connection without first checking if db exists. Only useful if reloading
-  and replacing an existing DB."
+  "Creates a connection without first checking if one already exists. Only useful
+  if reloading and replacing an existing session."
   [{:keys [conn network dbid db-name db state close transactor? id]}]
   (let [schema-cache  (atom {})
-        update-chan   (async/chan)
-        transact-chan (when transactor? (async/chan))       ;; transactors only
-        state         (atom (merge
-                             state
-                             {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
-                              :req/count     0             ;; count of db requests on this connection
-                              :req/last      nil           ;; epoch millis of last db request on this connection
-                              :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
-                              :db/db         (when db
-                                               (assoc db :schema-cache schema-cache)) ;; current cached DB - make sure we use the latest (new) schema cache in it
-                              :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
-                              :closed?       false}))
+        state         (atom (merge state
+                                   {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
+                                    :req/count     0             ;; count of db requests on this connection
+                                    :req/last      nil           ;; epoch millis of last db request on this connection
+                                    :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
+                                    :db/db         (when db
+                                                     (assoc db :schema-cache schema-cache)) ;; current cached DB - make sure we use the latest (new) schema cache in it
+                                    :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
+                                    :closed?       false}))
         session       (map->DbSession {:conn          conn
                                        :network       network
                                        :dbid          dbid
                                        :db-name       db-name
-                                       :update-chan   update-chan
-                                       :transact-chan transact-chan
+                                       :current-db-chan (chan)
+                                       :update-chan     (chan)
+                                       :transact-chan   (when transactor?
+                                                          (chan))
                                        :state         state
                                        :schema-cache  schema-cache
                                        :blank-db      nil
