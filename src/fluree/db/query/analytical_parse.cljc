@@ -459,6 +459,10 @@
     :else
     {:value value}))
 
+;; The docs say the default depth is 100
+;; here: https://developers.flur.ee/docs/concepts/analytical-queries/inner-joins-in-fluree/#recursion
+(def ^:const default-recursion-depth 100)
+
 (defn recursion-predicate
   "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
   predicate. e.g.: person/follows+3
@@ -468,7 +472,7 @@
   If not a recursion predicate, returns nil."
   [predicate]
   (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" predicate)]
-    [pred (if recur-n (util/str->int recur-n) util/max-integer)]))
+    [pred (if recur-n (util/str->int recur-n) default-recursion-depth)]))
 
 (defn pred-id-strict
   "Returns predicate ID for a given predicate, else will throw with an invalid
