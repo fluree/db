@@ -468,7 +468,7 @@
   If not a recursion predicate, returns nil."
   [predicate]
   (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" predicate)]
-    [pred (or (util/str->int recur-n) util/max-integer)]))
+    [pred (if recur-n (util/str->int recur-n) util/max-integer)]))
 
 (defn pred-id-strict
   "Returns predicate ID for a given predicate, else will throw with an invalid
