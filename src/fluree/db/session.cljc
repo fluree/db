@@ -20,7 +20,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(declare db current-db session)
+(declare db session)
 
 (defrecord DbSession [conn network dbid db-name current-db-chan update-chan
                       transact-chan state schema-cache blank-db close id])
@@ -140,6 +140,20 @@
   [{:keys [conn blank-db] :as session}]
   (swap! (:state session) assoc :db/db (full-load-existing-db conn blank-db)))
 
+(defn current-db
+  "Gets the latest db from the central DB atom if available, or loads it from scratch.
+  DB is returned as a core async promise channel."
+  [{:keys [conn blank-db state] :as session}]
+  (swap! state #(assoc % :req/last (util/current-time-millis)
+                       :req/count (inc (:req/count %))))
+  (or (:db/db @state)
+      (do (swap! (:schema-cache session) empty)
+          (-> state
+              (swap! (fn [st]
+                       (if (:db/db st)
+                         st
+                         (assoc st :db/db (full-load-existing-db conn blank-db)))))
+              :db/db))))
 
 (defn indexing-promise-ch
   "Returns block currently being indexed (truthy), or nil (falsey) if not currently indexing."
@@ -489,23 +503,6 @@
                            (recur))))))))
 
            session)))))
-
-
-(defn current-db
-  "Gets the latest db from the central DB atom if available, or loads it from scratch.
-  DB is returned as a core async promise channel."
-  [{:keys [conn blank-db state] :as session}]
-  (swap! state #(assoc % :req/last (util/current-time-millis)
-                       :req/count (inc (:req/count %))))
-  (or (:db/db @state)
-      (do (swap! (:schema-cache session) empty)
-          (-> state
-              (swap! (fn [st]
-                       (if (:db/db st)
-                         st
-                         (assoc st :db/db (full-load-existing-db conn blank-db)))))
-              :db/db))))
-
 
 (defn blank-db
   "Creates a session and returns a blank db."
