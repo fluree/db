@@ -2,7 +2,7 @@
   (:require [fluree.db.graphdb :as graphdb]
             [fluree.db.util.core :as util :refer [try* catch*]]
             #?(:clj  [clojure.core.async :as async :refer [<! chan go go-loop]]
-               :cljs [cljs.core.async :as async :refer [chan] :refer-macros [<! go go-loop]])
+               :cljs [cljs.core.async :as async :refer [<! chan] :refer-macros [go go-loop]])
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
@@ -22,7 +22,7 @@
 
 (declare db session)
 
-(defrecord DbSession [conn network dbid db-name current-db-chan update-chan
+(defrecord DbSession [conn network dbid db-name db-cache update-chan
                       transact-chan state schema-cache blank-db close id])
 
 
@@ -114,6 +114,47 @@
          (async/put! pc (<? (load-current-db conn blank-db)))
          (catch* e (async/put! pc e))))
     pc))
+
+(defn reload-and-respond
+  [conn {:keys [network dbid] :as blank-db} resp-ch]
+  (go
+    (try*
+     (let [latest-db (<? (load-current-db conn blank-db))]
+       (async/put! resp-ch latest-db)
+       latest-db)
+     (catch* e
+             (log/error e
+                        "Error loading latest database for ledger" network dbid
+                        "in session")
+             (async/put! resp-ch e)
+             nil))))
+
+(defn new-db-cache
+  [conn network dbid]
+  (let [msg-ch (chan)]
+    (go-loop [db nil]
+      (when-let [{:keys [req] :as msg} (<! msg-ch)]
+        (case req
+          :current (let [{:keys [blank-db resp-ch]} msg]
+                     (if-not (nil? db)
+                       (do (async/put! resp-ch db)
+                           (recur db))
+                       (recur (<! (reload-and-respond conn blank-db resp-ch)))))
+          :cas     (let [{:keys [old-db new-db resp-ch]} msg]
+                     (if (= db old-db)
+                       (do (async/put! resp-ch true)
+                           (recur new-db))
+                       (do (async/put! resp-ch false)
+                           (recur db))))
+          :clear   (recur nil)
+          :reload  (let [{:keys [blank-db resp-ch]} msg]
+                     (recur (<! (reload-and-respond conn blank-db resp-ch)))))))
+    msg-ch))
+
+(defn stop-db-cache!
+  [db-cache]
+  (async/close! db-cache))
+
 
 (defn cas-db!
   "Performs a compare and set! to update db, but only does so if
@@ -302,7 +343,7 @@
   two arity network + dbid will see if a session is in cache and
   then perform the shutdown on the cached session, else will return
   false."
-  ([{:keys [conn current-db-chan update-chan transact-chan state network
+  ([{:keys [conn db-cache update-chan transact-chan state network
             dbid id] :as session}]
    (if (closed? session)
      (do
@@ -311,7 +352,7 @@
      (do
        (swap! state assoc :closed? true)
        ((:remove-listener conn) network dbid id)
-       (async/close! current-db-chan)
+       (stop-db-cache! db-cache)
        (async/close! update-chan)
        (when transact-chan
          (async/close! transact-chan))
@@ -367,10 +408,10 @@
                                        :network       network
                                        :dbid          dbid
                                        :db-name       db-name
-                                       :current-db-chan (chan)
-                                       :update-chan     (chan)
-                                       :transact-chan   (when transactor?
-                                                          (chan))
+                                       :db-cache      (new-db-cache conn network dbid)
+                                       :update-chan   (chan)
+                                       :transact-chan (when transactor?
+                                                        (chan))
                                        :state         state
                                        :schema-cache  schema-cache
                                        :blank-db      nil
