@@ -1,8 +1,8 @@
 (ns fluree.db.session
   (:require [fluree.db.graphdb :as graphdb]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async :refer [chan go go-loop]]
-               :cljs [cljs.core.async :as async :refer [chan] :refer-macros [go go-loop]])
+            #?(:clj  [clojure.core.async :as async :refer [<! chan go go-loop]]
+               :cljs [cljs.core.async :as async :refer [chan] :refer-macros [<! go go-loop]])
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
@@ -37,21 +37,6 @@
   {})
 
 (def ^:private session-cache (atom (cache-factory)))
-
-
-(comment
-
-  (-> @session-cache)
-
-  (reset! session-cache {})
-
-  (-> @session-cache
-      (first)
-      (val)
-      :state
-      deref
-      :db/db
-      (async/poll!)))
 
 (defn- cache!
   "Only replaces cache if an existing conn is not already present.
@@ -103,7 +88,7 @@
          ledger-info)))))
 
 (defn load-current-db
-  [{:keys [blank-db conn network dbid] :as session}]
+  [conn {:keys [network dbid] :as blank-db}]
   (go-try
    (let [{:keys [index], latest-block :block, :as ledger-info}
          (<? (load-ledger-info conn network dbid))]
@@ -120,13 +105,13 @@
                     (inc next-block))
              (throw (ex-info (str "Error reading block " next-block " for ledger: "
                                   network "/" dbid ".")
-                             {:status 500 :error :db/unexpected-error})))))))))
+                             {:status 500, :error :db/unexpected-error})))))))))
 
 (defn- full-load-existing-db
-  [{:keys [blank-db conn network dbid] :as session}]
+  [conn blank-db]
   (let [pc (async/promise-chan)]
     (go (try*
-         (async/put! pc (<? (load-current-db session)))
+         (async/put! pc (<? (load-current-db conn blank-db)))
          (catch* e (async/put! pc e))))
     pc))
 
@@ -152,8 +137,8 @@
 
 (defn reload-db!
   "Clears any current db that is cached and forces a db reload."
-  [session]
-  (swap! (:state session) assoc :db/db (full-load-existing-db session)))
+  [{:keys [conn blank-db] :as session}]
+  (swap! (:state session) assoc :db/db (full-load-existing-db conn blank-db)))
 
 
 (defn indexing-promise-ch
@@ -509,7 +494,7 @@
 (defn current-db
   "Gets the latest db from the central DB atom if available, or loads it from scratch.
   DB is returned as a core async promise channel."
-  [{:keys [state] :as session}]
+  [{:keys [conn blank-db state] :as session}]
   (swap! state #(assoc % :req/last (util/current-time-millis)
                        :req/count (inc (:req/count %))))
   (or (:db/db @state)
@@ -518,7 +503,7 @@
               (swap! (fn [st]
                        (if (:db/db st)
                          st
-                         (assoc st :db/db (full-load-existing-db session)))))
+                         (assoc st :db/db (full-load-existing-db conn blank-db)))))
               :db/db))))
 
 
