@@ -107,14 +107,6 @@
                                   network "/" dbid ".")
                              {:status 500, :error :db/unexpected-error})))))))))
 
-(defn- full-load-existing-db
-  [conn blank-db]
-  (let [pc (async/promise-chan)]
-    (go (try*
-         (async/put! pc (<? (load-current-db conn blank-db)))
-         (catch* e (async/put! pc e))))
-    pc))
-
 (defn reload-and-respond
   [conn {:keys [network dbid] :as blank-db} resp-ch]
   (go
@@ -130,9 +122,9 @@
              nil))))
 
 (defn new-db-cache
-  [conn network dbid]
+  [conn network dbid cur-db]
   (let [msg-ch (chan)]
-    (go-loop [db nil]
+    (go-loop [db cur-db]
       (when-let [{:keys [req] :as msg} (<! msg-ch)]
         (case req
           :current (let [{:keys [blank-db resp-ch]} msg]
@@ -157,44 +149,51 @@
 
 
 (defn cas-db!
-  "Performs a compare and set! to update db, but only does so if
-  existing db promise-chan is the same as old-db-ch.
+  "Perform a compare and set operation to update the db stored in the session
+  argument's db cache. Update the cache to `new-db`, but only if the previously
+  stored db is the same as the `old-db` .
 
-  Returns true if successful, false if it did not replace."
-  [session old-db-ch new-db-ch]
-  (let [new-state (swap! (:state session)
-                         (fn [state]
-                           (if (= old-db-ch (:db/db state))
-                             (assoc state :db/db new-db-ch)
-                             state)))]
-    (= new-db-ch (:db/db new-state))))
+  Returns a channel that will contain a boolean indicating whether the cache was
+  updated."
+  [{:keys [db-cache]} old-db new-db]
+  (let [resp-ch (chan)]
+    (async/put! db-cache {:req     :cas
+                          :old-db  old-db
+                          :new-db  new-db
+                          :resp-ch resp-ch})
+    resp-ch))
 
 
 (defn clear-db!
   "Clears db from cache, forcing a new full load next time db is requested."
-  [session]
-  (swap! (:state session) assoc :db/db nil))
+  [{:keys [db-cache]}]
+  (async/put! db-cache {:req :clear}))
 
 
 (defn reload-db!
-  "Clears any current db that is cached and forces a db reload."
-  [{:keys [conn blank-db] :as session}]
-  (swap! (:state session) assoc :db/db (full-load-existing-db conn blank-db)))
+  "Clears any cached databases and forces an immediate reload. Returns a channel
+  that will contain the newly loaded database"
+  [{:keys [conn blank-db db-cache]}]
+  (let [resp-ch (chan)]
+    (async/put! db-cache {:req      :reload
+                          :blank-db blank-db
+                          :resp-ch  resp-ch})
+    resp-ch))
 
 (defn current-db
-  "Gets the latest db from the central DB atom if available, or loads it from scratch.
-  DB is returned as a core async promise channel."
-  [{:keys [conn blank-db state] :as session}]
-  (swap! state #(assoc % :req/last (util/current-time-millis)
-                       :req/count (inc (:req/count %))))
-  (or (:db/db @state)
-      (do (swap! (:schema-cache session) empty)
-          (-> state
-              (swap! (fn [st]
-                       (if (:db/db st)
-                         st
-                         (assoc st :db/db (full-load-existing-db conn blank-db)))))
-              :db/db))))
+  "Gets the current database from the session's database cache. If no database is
+  cached then the current database is loaded form storage and cached. Returns a
+  channel that will contain the current database"
+  [{:keys [conn blank-db db-cache state] :as session}]
+  (swap! state (fn [s]
+                 (-> s
+                     (assoc :req/last (util/current-time-millis))
+                     (update :req/count inc))))
+  (let [resp-ch (chan)]
+    (async/put! db-cache {:req      :current
+                          :blank-db blank-db
+                          :resp-ch  resp-ch})
+    resp-ch))
 
 (defn indexing-promise-ch
   "Returns block currently being indexed (truthy), or nil (falsey) if not currently indexing."
@@ -288,24 +287,31 @@
 (defmethod process-ledger-update :block
   [session event-type {:keys [block t flakes] :as data}]
   (go-try
-   (let [current-db-ch (current-db session)
-         current-db    (<? current-db-ch)
+   (let [current-db    (<? (current-db session))
          current-block (:block current-db)]
      (cond
        ;; no-op
        ;; TODO - we can avoid logging here if we are the transactor
        (<= block current-block)
-       (log/info (str (:network session) "/" (:dbid session) ": Received block: " block
-                      ", but DB is already more current at block: " current-block ". No-op."))
+       (log/info (str (:network session) "/" (:dbid session)
+                      ": Received block: " block
+                      ", but DB is already more current at block: " current-block
+                      ". No-op."))
 
        ;; next block is correct, update cached db
        (= block (+ 1 current-block))
        (do
-         (log/trace (str (:network session) "/$" (:dbid session) ": Received block " block ", DB at that block, update cached db with flakes."))
-         (let [flakes* (map #(if (instance? Flake %) % (flake/parts->Flake %)) flakes)
-               new-db  (dbproto/-with current-db block flakes*)]
+         (log/trace (str (:network session) "/$" (:dbid session)
+                         ": Received block " block
+                         ", DB at that block, update cached db with flakes."))
+         (let [flakes* (map (fn [f]
+                              (if (instance? Flake f)
+                                 f
+                                 (flake/parts->Flake f)))
+                            flakes)
+               new-db  (<? (dbproto/-with current-db block flakes*))]
            ;; update-local-db, returns true if successful
-           (when (cas-db! session current-db-ch new-db)
+           (when (<? (cas-db! session current-db new-db))
              ;; place a local notification of updated db on *connection* sub-chan, which is what
              ;; receives all events from ledger server - this allows any (fdb/listen...) listeners to listen
              ;; for a :local-ledger-update event. :block events from ledger server will trigger listeners
@@ -395,20 +401,20 @@
   if reloading and replacing an existing session."
   [{:keys [conn network dbid db-name db state close transactor? id]}]
   (let [schema-cache  (atom {})
+        cur-db        (when db
+                        (assoc db :schema-cache schema-cache))
         state         (atom (merge state
                                    {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
                                     :req/count     0             ;; count of db requests on this connection
                                     :req/last      nil           ;; epoch millis of last db request on this connection
                                     :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
-                                    :db/db         (when db
-                                                     (assoc db :schema-cache schema-cache)) ;; current cached DB - make sure we use the latest (new) schema cache in it
                                     :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
                                     :closed?       false}))
         session       (map->DbSession {:conn          conn
                                        :network       network
                                        :dbid          dbid
                                        :db-name       db-name
-                                       :db-cache      (new-db-cache conn network dbid)
+                                       :db-cache      (new-db-cache conn network dbid cur-db)
                                        :update-chan   (chan)
                                        :transact-chan (when transactor?
                                                         (chan))
