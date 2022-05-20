@@ -98,6 +98,7 @@
          (if (> next-block latest-block)
            (let [schema   (<? (schema/schema-map db))
                  settings (<? (schema/setting-map db))]
+             (swap! (:schema-cache db) empty)
              (assoc db :schema schema, :settings settings))
            (if-let [{:keys [flakes block t]}
                     (<? (storage/read-block conn network dbid next-block))]
