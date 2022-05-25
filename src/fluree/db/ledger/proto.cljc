@@ -12,7 +12,7 @@
   (-branch-create [ledger branch opts]  "Creates a new branch with specified options map.")
   (-branch-delete [ledger branch]  "Deletes specified branch.")
   ;; committing
-  (-commit-update [ledger branch commit-meta] "Once a commit completes, update ledger state to reflect")
+  (-commit-update [ledger branch db] [ledger branch db force?] "Once a commit completes, update ledger state to reflect. If optional force? flag present, don't validate consistent t sequence")
   (-status [ledger] [ledger branch] "Returns status for branch (default branch if nil)" )
   ;; ledger data across time
   (-t-range [ledger from-t to-t] [ledger branch from-t to-t] "Returns list of ledger entries from/to t")
@@ -21,4 +21,6 @@
   (-tag->t [ledger time]  "Returns t value at specified ledger tag value.")
   ;; default did
   (-did [ledger] "Returns default did configuration map")
-  )
+  ;; alias name for graph
+  (-alias [ledger] "Returns the graph alias/IRI")
+  (-id [ledger] "Returns the permanent ledger id"))

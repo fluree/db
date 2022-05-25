@@ -85,13 +85,27 @@
         (let [sid            (flake/s (first s-flakes))
               s-iri          (get-s-iri sid db id->iri compact-fn)
               non-iri-flakes (remove #(= const/$iri (flake/p %)) s-flakes)
-              [s-assert s-retract ctx] (subject-block non-iri-flakes db id->iri ctx compact-fn)
-              assert*        (if s-assert
-                               (conj assert (assoc s-assert id-key s-iri))
-                               assert)
-              retract*       (if s-retract
-                               (conj retract (assoc s-retract id-key s-iri))
-                               retract)]
+              [assert* retract*]
+              (cond
+                ;; just an IRI declaration, used internally - nothing to output
+                (empty? non-iri-flakes)
+                [assert retract]
+
+                ;; we don't output auto-generated rdfs:Class definitions for classes
+                ;; (they are implied when used in rdf:type statements)
+                (and (= 1 (count non-iri-flakes))
+                     (= const/$rdfs:Class (-> non-iri-flakes first flake/o))
+                     (= const/$rdf:type (-> non-iri-flakes first flake/p)))
+                [assert retract]
+
+                :else
+                (let [[s-assert s-retract ctx] (subject-block non-iri-flakes db id->iri ctx compact-fn)]
+                  [(if s-assert
+                     (conj assert (assoc s-assert id-key s-iri))
+                     assert)
+                   (if s-retract
+                     (conj retract (assoc s-retract id-key s-iri))
+                     retract)]))]
           (recur r assert* retract*))
         {:refs-ctx (dissoc @ctx type-key)                   ; @type will be marked as @type: @id, which is implied
          :assert   assert
@@ -127,10 +141,11 @@
 
 (defn- commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
-  [{:keys [ledger branch schema t commit] :as _db} {:keys [context did private message tag] :as _opts}]
+  [{:keys [ledger branch schema t commit] :as _db} {:keys [context did private message tag push?] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
                             (:context schema))
+                          (json-ld/parse-context {"f" "https://ns.flur.ee/ledger#"})
                           stringify-context)
         private*      (or private
                           (:private did)
@@ -138,13 +153,17 @@
         did*          (or (some-> private*
                                   did-from-private)
                           did
-                          (:did ledger))
+                          (ledger-proto/-did ledger))
         ctx-used-atom (atom {})
         compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
-    {:message        message
+    {:alias          (ledger-proto/-alias ledger)
+     :push?          (not (false? push?))
+     :message        message
      :tag            tag
      :t              (- t)
-     :prev-commit    (:id commit)
+     :v              1.0
+     :prev-commit    (:commit commit)
+     :prev-dbid      (:dbid commit)
      :ledger-address nil                                    ;; TODO
      :time           (util/current-time-iso)
      :context        context*
@@ -157,14 +176,20 @@
      :branch-name    (util/keyword->str (branch/name branch))
      :id-key         (json-ld/compact "@id" compact-fn)
      :type-key       (json-ld/compact "@type" compact-fn)
-     :hash-key       (json-ld/compact const/iri-hash compact-fn)}))
+     :db-key         (json-ld/compact const/iri-db compact-fn)}))
 
 
-(defn tx-hash
+(defn db-json->db-id
   [payload]
   (->> payload
        crypto/sha2-256
-       (str "urn:sha256:")))
+       (str "fluree:db:sha256:")))
+
+(defn commit-json->commit-id
+  [payload]
+  (->> payload
+       crypto/sha2-256
+       (str "fluree:commit:sha256:")))
 
 
 (defn commit-flakes
@@ -178,7 +203,7 @@
       not-empty))
 
 
-(defn tx-data
+(defn commit-meta
   "Convert the novelty flakes into the json-ld shape."
   [{:keys [ledger branch t] :as db} opts]
   (let [committed-t (-> ledger
@@ -196,22 +221,43 @@
 (defn commit->json-ld
   "Create a json-ld commit shape using tx-data."
   [commit-data opts]
-  (let [{:keys [type-key hash-key compact message tag ctx-used-atom t
-                branch-name time prev-commit ledger-address]} opts
+  (let [{:keys [type-key compact message tag ctx-used-atom t v
+                branch-name time prev-dbid prev-commit ledger-address alias id-key]} opts
         {:keys [assert retract refs-ctx]} commit-data
-        commit-base {type-key                   [(compact const/iri-Commit)]
-                     (compact const/iri-t)      t
-                     (compact const/iri-branch) branch-name
-                     (compact const/iri-time)   time}
-        commit      (cond-> commit-base
-                            (seq assert) (assoc (compact const/iri-assert) assert)
-                            (seq retract) (assoc (compact const/iri-retract) retract)
-                            prev-commit (assoc (compact const/iri-prev) prev-commit)
-                            ledger-address (assoc (compact const/iri-ledger) ledger-address)
-                            message (assoc (compact const/iri-message) message)
-                            tag (assoc (compact const/iri-tag) tag)
-                            true (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx)))]
-    (assoc commit hash-key (tx-hash (json-ld/normalize-data commit)))))
+        prev-db-key        (compact const/iri-prevDB)
+        prev-commit-key    (compact const/iri-prevCommit)
+        ledger-address-key (compact const/iri-ledger)
+        tag-key            (compact const/iri-tag)
+        assert-key         (compact const/iri-assert)
+        retract-key        (compact const/iri-retract)
+        refs-ctx*          (cond-> refs-ctx
+                                   prev-dbid (assoc-in [prev-db-key "@type"] "@id")
+                                   prev-commit (assoc-in [prev-commit-key "@type"] "@id")
+                                   ledger-address (assoc-in [ledger-address-key "@type"] "@id")
+                                   tag (assoc-in [tag-key "@type"] "@id")
+                                   (seq assert) (assoc-in [assert-key "@container"] "@graph")
+                                   (seq retract) (assoc-in [retract-key "@container"] "@graph"))
+        db-json            (cond-> {type-key              [(compact const/iri-DB)]
+                                    (compact const/iri-t) t
+                                    (compact const/iri-v) v}
+                                   prev-dbid (assoc prev-db-key prev-dbid)
+                                   (seq assert) (assoc assert-key assert)
+                                   (seq retract) (assoc retract-key retract))
+        db-id              (db-json->db-id (json-ld/normalize-data db-json))
+        db-json*           (assoc db-json id-key db-id)
+        commit-base        {id-key                     "#commit"
+                            type-key                   [(compact const/iri-Commit)]
+                            (compact const/iri-db)     db-json*
+                            (compact const/iri-branch) branch-name
+                            (compact const/iri-time)   time}
+        commit             (cond-> commit-base
+                                   alias (assoc (compact const/iri-alias) alias)
+                                   prev-commit (assoc prev-commit-key prev-commit)
+                                   ledger-address (assoc ledger-address-key {id-key ledger-address})
+                                   message (assoc (compact const/iri-message) message)
+                                   tag (assoc (compact const/iri-tag) tag)
+                                   true (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
+    commit))
 
 
 (defn commit
@@ -222,21 +268,22 @@
   [{:keys [conn] :as ledger} db opts]
   (go-try
     (let [{:keys [branch commit t]} db
-          {:keys [did hash-key] :as opts*} (commit-opts db opts)]
-      (let [{:keys [flakes] :as commit-data} (tx-data db opts*)
+          {:keys [did id-key db-key push?] :as opts*} (commit-opts db opts)]
+      (let [{:keys [flakes] :as commit-data} (commit-meta db opts*)
             jld-commit  (commit->json-ld commit-data opts*)
             credential  (when did (cred/generate jld-commit opts*))
-            doc         (json-ld/normalize-data (or credential commit))
+            doc         (json-ld/normalize-data (or credential jld-commit))
             ;; TODO: can we move these side effects outside of commit?
             ;; TODO: suppose we fail while c-write? while push?
             id          (conn-proto/-c-write conn doc)
-            publish-p   (conn-proto/push conn id)
+            _           (log/info (str "DB commit address: " id))
+            publish-p   (when push?
+                          (conn-proto/push conn id))
             ;; TODO: should the hash be the tx-hash?
-            hash        (get jld-commit hash-key)
             branch-name (branch/name branch)
             db*         (assoc db :commit {:t      t
-                                           :hash   hash
-                                           :id     id
+                                           :dbid   (get-in jld-commit [db-key id-key])
+                                           :commit id
                                            :branch branch-name
                                            :ledger publish-p})]
         (ledger-proto/-commit-update ledger branch-name db*)

@@ -6,7 +6,9 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as db-proto]))
+            [fluree.db.dbproto :as db-proto]
+            [fluree.db.json-ld.transact :as jld-transact]
+            [fluree.db.flake :as flake]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -152,6 +154,21 @@
   [blank-db default-ctx dids]
   (let [tx (bootstrap-tx default-ctx dids)]
     (db-proto/-stage blank-db tx {:bootstrap? true})))
+
+(defn blank-db
+  "When not bootstrapping with a transaction, bootstraps initial base set of flakes required for a db."
+  [blank-db]
+  (let [t           -1
+        base-flakes (jld-transact/base-flakes t)
+        size (flake/size-bytes base-flakes)]
+    (-> blank-db
+        (update-in [:novelty :spot] into base-flakes)
+        (update-in [:novelty :psot] into base-flakes)
+        (update-in [:novelty :post] into base-flakes)
+        (update-in [:novelty :tspo] into base-flakes)
+        (update-in [:novelty :size] + size)
+        (update-in [:stats :size] + size)
+        (update-in [:stats :flakes] + (count base-flakes)))))
 
 
 (comment

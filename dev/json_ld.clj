@@ -10,7 +10,11 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.did :as did]))
+            [fluree.db.did :as did]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.util.json :as json]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.util.log :as log]))
 
 (comment
 
@@ -23,21 +27,17 @@
                               :rdfs   "http://www.w3.org/2000/01/rdf-schema#"
                               :wiki   "https://www.wikidata.org/wiki/"
                               :skos   "http://www.w3.org/2008/05/skos#"
-                              :fluree "https://ns.flur.ee/ledger#"}
+                              :f      "https://ns.flur.ee/ledger#"}
                     :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}))
 
-  (def file-conn (fluree/connect
-                   {:method       :file
-                    :storage-path "data/storage"
-                    :publish-path "data/publish"
-                    :did          (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}))
+
+  (def ledger @(fluree/create ipfs-conn "test/db1"
+                              {:id "fluree:ipns:k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"}))
 
 
-  (def ledger @(fluree/create ipfs-conn "test/db1"))
-  (def latest-db (fluree/db ledger))
-
-  @(fluree/query latest-db {:select [:* {:fluree/function [:*]}]
-                            :from   "fluree-root-rule"})
+  @(fluree/query (fluree/db ledger)
+                 {:select {'?s [:* {:f/role [:*]}]}
+                  :where  [['?s :rdf/type :f/DID]]})
 
   (def newdb
     @(fluree/stage
@@ -56,9 +56,11 @@
                                                "@type" "Person"
                                                "name"  "Douglas Adams"}}}))
 
+
   @(fluree/query newdb
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
+
 
   (def db2 @(fluree/stage
               newdb
@@ -71,13 +73,52 @@
                  {:select [:* {:schema/isBasedOn [:*]}]
                   :from   :wiki/Q836821})
 
+  ;; commit metadata will show IPFS address
+  (-> @(fluree/commit! db2 {:message "First commit contains two transactions!"
+                            :push?   false})
+      :commit)
+
+  (def db3 @(fluree/stage
+              ledger
+              {"@context" "https://schema.org",
+               "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+                            "commentCount" 52}]}))
+
+  @(fluree/commit! db3 {:message "Another commit!!"
+                        :push?   false})
+
+  (-> ledger
+      fluree/db
+      :commit)
+
+  ;; load ledger from disk
+  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipfs:QmeqwDf5KvqbsiceujuWypVJeb8zXL3251grEczcSDw82D"))
+
+  @(fluree/query (fluree/db loaded-ledger)
+                 {:select [:* {:schema/isBasedOn [:*]}]
+                  :from   :wiki/Q836821})
 
 
-  @(fluree/commit! db2 {:message "First commit contains two transactions!"
-                       :push?   false})
+  (def file-conn (fluree/connect
+                   {:method       :file
+                    :storage-path "data/storage"
+                    :publish-path "data/publish"
+                    :did          (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}))
+
+
+  (def ledger @(fluree/create ipfs-conn "test/db1"
+                              {:id "fluree:ipns:k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"}))
+  (def latest-db (fluree/db ledger))
+
 
   (fluree/status ledger)
 
+
+  @(fluree/query latest-db {:select [:* {:f/function [:*]}]
+                            :from   :f/Rule})
+
+  @(fluree/query latest-db {:select {'?s [:* {:f/role [:*]}]}
+                            :where  [['?s :rdf/type :f/DID]]})
 
 
 

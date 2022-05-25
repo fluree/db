@@ -50,7 +50,8 @@
   (let [{db-t :t} db]
     (let [next-t (dec t)]
       (if (or (= next-t db-t)
-              (= t db-t))
+              (= t db-t)
+              (zero? t))                                    ;; if zero, means we are placing in new db - likely loaded from disk
         (-> branch-data
             (assoc :t db-t
                    :latest-db db))
@@ -59,7 +60,7 @@
                         {:status 500 :error :db/invalid-time}))))))
 
 (defn update-commit
-  [{:keys [commit] :as branch-data} db]
+  [{:keys [commit] :as branch-data} db force?]
   (let [{db-t :t} db
         next-t? (= db-t (dec commit))]
     (when-not (or next-t?

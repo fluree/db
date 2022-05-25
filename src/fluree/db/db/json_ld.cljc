@@ -396,7 +396,7 @@
 
 ;; TODO - conn is included here because current index-range query looks for conn on the db
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
-(defrecord JsonLdDb [ledger conn method name branch block t tt-id stats
+(defrecord JsonLdDb [ledger conn method alias branch block t tt-id stats
                      spot psot post opst tspo
                      schema comparators novelty
                      permissions ecount]
@@ -439,7 +439,7 @@
      IPrintWithWriter
      (-pr-writer [db w opts]
        (-write w "#FlureeJsonLdDb ")
-       (-write w (pr {:network     (:network db) :dbid (:dbid db) :block (:block db)
+       (-write w (pr {:method      (:method db) :alias (:alias db) :block (:block db)
                       :t           (:t db) :stats (:stats db)
                       :permissions (:permissions db)})))))
 
@@ -447,8 +447,8 @@
    (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
      (.write w (str "#FlureeJsonLdDb "))
      (binding [*out* w]
-       (pr {:network (:network db) :dbid (:dbid db) :block (:block db)
-            :t       (:t db) :stats (:stats db) :permissions (:permissions db)}))))
+       (pr {:method (:method db) :alias (:alias db) :block (:block db)
+            :t      (:t db) :stats (:stats db) :permissions (:permissions db)}))))
 
 (defn new-novelty-map
   [comparators]
@@ -473,7 +473,7 @@
 
 
 (defn create
-  [{:keys [method name conn] :as ledger}]
+  [{:keys [method alias conn] :as ledger}]
   (let [novelty     (new-novelty-map index/default-comparators)
         permissions {:collection {:all? false}
                      :predicate  {:all? true}
@@ -485,18 +485,18 @@
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot        (index/empty-branch method name spot-cmp)
-        psot        (index/empty-branch method name psot-cmp)
-        post        (index/empty-branch method name post-cmp)
-        opst        (index/empty-branch method name opst-cmp)
-        tspo        (index/empty-branch method name tspo-cmp)
+        spot        (index/empty-branch method alias spot-cmp)
+        psot        (index/empty-branch method alias psot-cmp)
+        post        (index/empty-branch method alias post-cmp)
+        opst        (index/empty-branch method alias opst-cmp)
+        tspo        (index/empty-branch method alias tspo-cmp)
         stats       {:flakes 0, :size 0, :indexed 0}
         schema      (vocab/vocab-map* 0 #{} nil)
         branch      (branch/branch-meta ledger)]
     (map->JsonLdDb {:ledger      ledger
                     :conn        conn
                     :method      method
-                    :name        name
+                    :alias       alias
                     :branch      branch
                     :block       0
                     :t           0

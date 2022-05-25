@@ -1,15 +1,19 @@
 (ns fluree.db.ledger.json-ld
   (:require [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.dbproto :as db-proto]
-            [fluree.db.util.async :refer [<? go-try channel?]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.bootstrap :as bootstrap]
-            [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.commit :as commit]
             [fluree.db.util.log :as log]
-            [fluree.db.json-ld.commit :as jld-commit]))
+            [fluree.db.json-ld.commit :as jld-commit]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]
+            [fluree.db.json-ld.reify :as jld-reify])
+  (:refer-clojure :exclude [load]))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn branch-meta
   "Retrieves branch metadata from ledger state"
@@ -37,8 +41,9 @@
     (swap! state update-in [:branches branch-name] branch/update-db db)))
 
 (defn commit-update
-  [{:keys [state] :as _ledger} branch db]
-  (swap! state update-in [:branches branch] branch/update-commit db))
+  "Updates both latest db and commit db."
+  [{:keys [state] :as _ledger} branch db force?]
+  (swap! state update-in [:branches branch] branch/update-commit db force?))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -54,7 +59,7 @@
     (jld-commit/commit ledger db opts*)))
 
 
-(defrecord JsonLDLedger [name context did
+(defrecord JsonLDLedger [id alias context did
                          state cache conn
                          method reindex-min reindex-max]
   commit/iCommit
@@ -67,17 +72,20 @@
   (-db-update [ledger db] (db-update ledger db))
   (-branch [ledger] (branch-meta ledger nil))
   (-branch [ledger branch] (branch-meta ledger branch))
-  (-commit-update [ledger branch commit-meta] (commit-update ledger branch commit-meta))
+  (-commit-update [ledger branch db] (commit-update ledger branch db false))
+  (-commit-update [ledger branch db force?] (commit-update ledger branch db force?))
   (-status [ledger] (status ledger nil))
   (-status [ledger branch] (status ledger branch))
-  (-did [_] did))
+  (-did [_] did)
+  (-alias [_] alias)
+  (-id [_] id))
 
 
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
-  [conn name opts]
+  [conn ledger-alias opts]
   (go-try
-    (let [{:keys [context did branch pub-fn]
+    (let [{:keys [context did branch pub-fn id blank?]
            :or   {branch :main}} opts
           did*         (if did
                          (if (map? did)
@@ -97,19 +105,40 @@
                                               :pub-fn   nil
                                               ;; pub-locs is map of locations to state-map (like latest committed 't' val)
                                               :pub-locs {}})
-                          :name        name
+                          :alias       ledger-alias
+                          :id          id
                           :method      method-type
                           :cache       (atom {})
                           :reindex-min 100000
                           :reindex-max 1000000
                           :conn        conn})
           blank-db     (jld-db/create ledger)
-          bootstrap?   (or context* did*)
+          bootstrap?   (and (not blank?)
+                            (or context* did*))
           db           (if bootstrap?
                          (<? (bootstrap/bootstrap blank-db context* (:id did*)))
-                         blank-db)]
+                         (bootstrap/blank-db blank-db))]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
+      ledger)))
+
+(defn load
+  [conn commit-address]
+  (go-try
+    (let [base-context {:base commit-address}
+          commit-data  (-> (conn-proto/-c-read conn commit-address)
+                           (json-ld/expand base-context))
+          [commit proof] (jld-reify/parse-commit commit-data)
+          alias        (or (get-in commit [const/iri-alias :value])
+                           commit-address)
+          branch       (get-in commit [const/iri-branch :value])
+          ledger       (<? (create conn alias {:branch branch
+                                               :id     commit-address
+                                               :blank? true}))
+          db           (ledger-proto/-db ledger)
+          db*          (<? (jld-reify/load-db db commit-data))]
+      (ledger-proto/-db-update ledger db*)
+
       ledger)))
 
 

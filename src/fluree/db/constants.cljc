@@ -8,18 +8,23 @@
 (def ^:const data_version 4)
 
 ;; iri constants
+(def ^:const iri-CommitProof "https://ns.flur.ee/ledger#CommitProof")
+(def ^:const iri-Commit "https://ns.flur.ee/ledger#Commit")
+(def ^:const iri-DB "https://ns.flur.ee/ledger#DB")
+(def ^:const iri-db "https://ns.flur.ee/ledger#db")
 (def ^:const iri-t "https://ns.flur.ee/ledger#t")
+(def ^:const iri-v "https://ns.flur.ee/ledger#v")
 (def ^:const iri-assert "https://ns.flur.ee/ledger#assert")
 (def ^:const iri-retract "https://ns.flur.ee/ledger#retract")
-(def ^:const iri-prev "https://ns.flur.ee/ledger#prev")
-(def ^:const iri-Commit "https://ns.flur.ee/ledger#Commit")
+(def ^:const iri-prevCommit "https://ns.flur.ee/ledger#prevCommit")
+(def ^:const iri-prevDB "https://ns.flur.ee/ledger#prevDB")
+(def ^:const iri-alias "https://ns.flur.ee/ledger#alias")
 (def ^:const iri-ledger "https://ns.flur.ee/ledger#ledger")
 (def ^:const iri-branch "https://ns.flur.ee/ledger#branch")
 (def ^:const iri-time "https://ns.flur.ee/ledger#time")
 (def ^:const iri-message "https://ns.flur.ee/ledger#message")
 (def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
 (def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
-(def ^:const iri-hash "https://ns.flur.ee/ledger#hash")
 (def ^:const iri-context "https://ns.flur.ee/ledger#context")
 
 (def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting

@@ -9,7 +9,8 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.commit :as commit]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.json-ld.reify :as jld-reify])
   (:refer-clojure :exclude [merge load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -20,7 +21,10 @@
   #?(:clj
      (let [p (promise)]
        (async/go
-         (deliver p (async/<! port)))
+         (let [res (async/<! port)]
+           (when (util/exception? res)
+             (log/error res))
+           (deliver p res)))
        p)
      :cljs
      (js/Promise.
@@ -90,9 +94,9 @@
   - context - Default @context map to use for ledgers formed with this connection
     "
   ([conn] (create conn nil nil))
-  ([conn ledger-name] (create conn ledger-name nil))
-  ([conn ledger-name opts]
-   (let [res-ch (jld-ledger/create conn ledger-name opts)]
+  ([conn ledger-alias] (create conn ledger-alias nil))
+  ([conn ledger-alias opts]
+   (let [res-ch (jld-ledger/create conn ledger-alias opts)]
      (promise-wrap res-ch))))
 
 (defn load
@@ -107,10 +111,8 @@
    ;; TODO - for that particular method
    (throw (ex-info "Not yet implemented" {:status 500 :error :db/unexpected-error})))
   ([conn address]
-
-   :TODO
-
-   ))
+   (promise-wrap
+     (jld-ledger/load conn address))))
 
 (defn index
   "Performs indexing operation on the specified ledger"

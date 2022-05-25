@@ -48,7 +48,7 @@
   (-did [_] did)
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine
-                     (log/warn "-msg-out: " msg)
+                     (log/warn "-msg-in: " msg)
                      :TODO))
   (-msg-out [_ msg] (go-try
                       ;; TODO - register/submit event

@@ -6,7 +6,8 @@
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -79,26 +80,22 @@
    "jws"                (sign credential-subject signing-key)})
 
 
-(defn cred-id
-  "Generates credential id from hash within credential subject."
-  [credential-subject hash-key]
-  (let [hash-iri (get credential-subject hash-key)
-        [_ hash] (re-find #"^urn:sha256:(.+)$" hash-iri)]
-    (str "fluree:sha256:" hash)))
-
-
 (defn generate
   "Generate a VerifiableCredential given a subject and some issuer opts."
-  [credential-subject {:keys [did private hash-key] :as opts}]
-  (let [did* (or (:id did)
-                 (str "did:fluree:" (crypto/account-id-from-private private)))
-        id   (cred-id credential-subject hash-key)]
-    {"@context"          "https://www.w3.org/2018/credentials/v1"
-     "id"                id
-     "type"              ["VerifiableCredential"]
+  [credential-subject {:keys [did private compact] :as opts}]
+  (let [[c-subj ctx] (if-let [ctx (get credential-subject "@context")]
+                       [(dissoc credential-subject "@context") ctx]
+                       [credential-subject nil])
+        did* (or (:id did)
+                 (str "did:fluree:" (crypto/account-id-from-private private)))]
+    {"@context"          (if ctx
+                           ["https://www.w3.org/2018/credentials/v1" ctx]
+                           "https://www.w3.org/2018/credentials/v1")
+     "id"                ""
+     "type"              ["VerifiableCredential" (compact const/iri-CommitProof)]
      "issuer"            did*
      "issuanceDate"      (util/current-time-iso)
-     "credentialSubject" credential-subject
+     "credentialSubject" c-subj
      "proof"             (create-proof (json-ld/normalize-data credential-subject) did* private)}))
 
 
