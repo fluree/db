@@ -185,16 +185,18 @@
   "Gets the current database from the session's database cache. If no database is
   cached then the current database is loaded form storage and cached. Returns a
   channel that will contain the current database"
-  [{:keys [conn blank-db db-cache state] :as session}]
-  (swap! state (fn [s]
-                 (-> s
-                     (assoc :req/last (util/current-time-millis))
-                     (update :req/count inc))))
-  (let [resp-ch (chan)]
-    (async/put! db-cache {:req      :current
-                          :blank-db blank-db
-                          :resp-ch  resp-ch})
-    resp-ch))
+  ([{:keys [conn blank-db db-cache state] :as session} db]
+   (swap! state (fn [s]
+                  (-> s
+                      (assoc :req/last (util/current-time-millis))
+                      (update :req/count inc))))
+   (let [resp-ch (chan)]
+     (async/put! db-cache {:req      :current
+                           :blank-db blank-db
+                           :resp-ch  resp-ch})
+     resp-ch))
+  ([{:keys [blank-db] :as session}]
+   (current-db session blank-db)))
 
 (defn indexing-promise-ch
   "Returns block currently being indexed (truthy), or nil (falsey) if not currently indexing."
@@ -424,7 +426,7 @@
                                        :blank-db      nil
                                        :close         close
                                        :id            id})
-        current-db-fn (fn [] (current-db session))          ;; allows any 'db' to update itself to the latest db
+        current-db-fn (partial current-db session) ;; allows any 'db' to update itself to the latest db
         blank-db      (graphdb/blank-db conn network dbid schema-cache current-db-fn)]
     (assoc session :blank-db blank-db)))
 
