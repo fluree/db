@@ -194,13 +194,14 @@
   "Returns true if provided variable exists as a variable
   somewhere within the where clause."
   [variable where]
-  (some (fn [{:keys [o optional bind union] :as _where-smt}]
-          (cond
-            o (= variable (:variable o))
-            optional (map #(variable-in-where? variable %) optional)
-            bind (contains? (-> bind keys set) variable)
-            union (or (variable-in-where? variable (first union))
-                      (variable-in-where? variable (second union)))))
+  (some (fn [{:keys [s o optional bind union] :as _where-smt}]
+          (or (= (:variable o) variable)
+              (= (:variable s) variable)
+              (cond
+                optional (map #(variable-in-where? variable %) optional)
+                bind (contains? (-> bind keys set) variable)
+                union (or (variable-in-where? variable (first union))
+                          (variable-in-where? variable (second union))))))
         where))
 
 (defn parse-map
@@ -808,8 +809,8 @@
                                                     prettyPrint
                                                     (:prettyPrint opts))}
                                   filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
-                                  orderBy (add-order-by db orderBy)
-                                  groupBy (add-group-by groupBy)
+                                  orderBy (add-order-by db (or orderBy (:orderBy opts)))
+                                  groupBy (add-group-by (or groupBy (:groupBy opts)))
                                   true (add-select-spec query-map'))]
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
