@@ -307,12 +307,12 @@
          (log/trace (str (:network session) "/$" (:dbid session)
                          ": Received block " block
                          ", DB at that block, update cached db with flakes."))
-         (let [flakes* (map (fn [f]
-                              (if (instance? Flake f)
-                                 f
-                                 (flake/parts->Flake f)))
-                            flakes)
-               new-db  (<? (dbproto/-with current-db block flakes*))]
+         (let [new-db  (<? (->> flakes
+                                (map (fn [f]
+                                       (if (instance? Flake f)
+                                         f
+                                         (flake/parts->Flake f))))
+                                (dbproto/-with current-db block)))]
            ;; update-local-db, returns true if successful
            (when (<? (cas-db! session current-db new-db))
              ;; place a local notification of updated db on *connection* sub-chan, which is what
