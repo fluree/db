@@ -583,31 +583,32 @@
                                 agg-fn    (if distinct? (fn [coll] (-> coll distinct agg-fn))
                                                         agg-fn)]
                             [agg-fn variable])
-        _          (when-not (valid-var variable)
-                     (throw (ex-info (str "Invalid select variable in aggregate select, provided: " (pr-str parsed-code))
-                                     {:status 400 :error :db/invalid-query})))]
+        fn-str     (str "(fn [" variable "] " (pr-str parsed-code) ")")]
+    (when-not (valid-var variable)
+      (throw (ex-info (str "Invalid select variable in aggregate select, provided: " (pr-str parsed-code))
+                      {:status 400 :error :db/invalid-query})))
     {:variable variable
      :as       as
-     :fn-str   x
+     :fn-str   fn-str
      :function agg-fn}))
 
 
 (defn parse-aggregate
   "Parses string aggregate function and returns execution map if valid."
-  [x valid-var]
-  (let [list-agg  (#?(:clj read-string :cljs cljs.reader/read-string) x)
-        as?       (= 'as (first list-agg))
-        as        (if as?
-                    (-> (str "?" (last list-agg)) symbol)
-                    (->> list-agg (str "?") symbol))
-        func-list (if as?
-                    (let [func-list (second list-agg)]
-                      (if (coll? func-list)
-                        func-list
-                        (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " x)
-                                        {:status 400 :error :db/invalid-query}))))
-                    list-agg)]
-    (parse-aggregate* func-list as valid-var)))
+  [code-str valid-var]
+  (let [list-agg    (#?(:clj read-string :cljs cljs.reader/read-string) code-str)
+        as?         (= 'as (first list-agg))
+        as          (if as?
+                      (-> (str "?" (last list-agg)) symbol)
+                      (->> list-agg (str "?") symbol))
+        code-parsed (if as?
+                      (let [func-list (second list-agg)]
+                        (if (coll? func-list)
+                          func-list
+                          (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " code-str)
+                                          {:status 400 :error :db/invalid-query}))))
+                      list-agg)]
+    (parse-aggregate* code-parsed as valid-var)))
 
 
 (defn calculate-aggregate
