@@ -274,9 +274,9 @@
 
 ;; ================ GraphDB record support fns ================================
 
-(defn- graphdb-latest-db [{:keys [current-db-fn permissions]}]
+(defn- graphdb-latest-db [{:keys [current-db-fn permissions] :as db}]
   (go-try
-    (let [current-db (<? (current-db-fn))]
+    (let [current-db (<? (current-db-fn db))]
       (assoc current-db :permissions permissions))))
 
 (defn- graphdb-root-db [this]
