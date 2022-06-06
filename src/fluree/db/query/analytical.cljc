@@ -136,7 +136,6 @@
   ['?email '?name '?x '?e]
   The return value would be: [3 1]"
   [vars headers]
-  (log/warn "get-tuple-indexes: [vars headers]" [vars headers])
   (reduce (fn [acc var-smt]
             (if-let [var (or (variable? var-smt)
                              (:variable var-smt))]
