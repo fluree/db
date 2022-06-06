@@ -124,29 +124,44 @@
 
 (defn new-db-cache
   [conn network dbid cur-db]
-  (let [msg-ch (chan)]
+  (let [cur-ch (chan)
+        cas-ch (chan)
+        clr-ch (chan)
+        rel-ch (chan)]
     (go-loop [db cur-db]
-      (when-let [{:keys [req] :as msg} (<! msg-ch)]
-        (case req
-          :current (let [{:keys [blank-db resp-ch]} msg]
-                     (if-not (nil? db)
-                       (do (async/put! resp-ch db)
-                           (recur db))
-                       (recur (<! (reload-and-respond conn blank-db resp-ch)))))
-          :cas     (let [{:keys [old-db new-db resp-ch]} msg]
+      (async/alt!
+        :priority true
+
+        clr-ch    ([msg]
+                   (when msg
+                     (recur nil)))
+
+        cas-ch    ([msg]
+                   (when-let [{:keys [old-db new-db resp-ch]} msg]
                      (if (= db old-db)
                        (do (async/put! resp-ch true)
                            (recur new-db))
                        (do (async/put! resp-ch false)
-                           (recur db))))
-          :clear   (recur nil)
-          :reload  (let [{:keys [blank-db resp-ch]} msg]
-                     (recur (<! (reload-and-respond conn blank-db resp-ch)))))))
-    msg-ch))
+                           (recur db)))))
+
+        rel-ch    ([msg]
+                   (when-let [{:keys [blank-db resp-ch]} msg]
+                     (recur (<! (reload-and-respond conn blank-db resp-ch)))))
+
+        cur-ch    ([msg]
+                   (when-let [{:keys [blank-db resp-ch]} msg]
+                     (if-not (nil? db)
+                       (do (async/put! resp-ch db)
+                           (recur db))
+                       (recur (<! (reload-and-respond conn blank-db resp-ch))))))))
+
+    {:current cur-ch, :cas cas-ch, :clear clr-ch, :reload rel-ch}))
 
 (defn stop-db-cache!
   [db-cache]
-  (async/close! db-cache))
+  (reduce-kv (fn [m k v]
+               (assoc m k (async/close! v)))
+             {} db-cache))
 
 
 (defn cas-db!
@@ -156,44 +171,41 @@
 
   Returns a channel that will contain a boolean indicating whether the cache was
   updated."
-  [{:keys [db-cache]} old-db new-db]
+  [{{:keys [cas]} :db-cache} old-db new-db]
   (let [resp-ch (chan)]
-    (async/put! db-cache {:req     :cas
-                          :old-db  old-db
-                          :new-db  new-db
-                          :resp-ch resp-ch})
+    (async/put! cas {:old-db  old-db
+                     :new-db  new-db
+                     :resp-ch resp-ch})
     resp-ch))
 
 
 (defn clear-db!
   "Clears db from cache, forcing a new full load next time db is requested."
-  [{:keys [db-cache]}]
-  (async/put! db-cache {:req :clear}))
+  [{{:keys [clear]} :db-cache}]
+  (async/put! clear {}))
 
 
 (defn reload-db!
   "Clears any cached databases and forces an immediate reload. Returns a channel
   that will contain the newly loaded database"
-  [{:keys [conn blank-db db-cache]}]
+  [{:keys [conn blank-db], {:keys [reload]} :db-cache}]
   (let [resp-ch (chan)]
-    (async/put! db-cache {:req      :reload
-                          :blank-db blank-db
-                          :resp-ch  resp-ch})
+    (async/put! reload {:blank-db blank-db
+                        :resp-ch  resp-ch})
     resp-ch))
 
 (defn current-db
   "Gets the current database from the session's database cache. If no database is
   cached then the current database is loaded form storage and cached. Returns a
   channel that will contain the current database"
-  ([{:keys [conn blank-db db-cache state] :as session} db]
+  ([{:keys [conn state], {:keys [current]} :db-cache, :as session} blank-db]
    (swap! state (fn [s]
                   (-> s
                       (assoc :req/last (util/current-time-millis))
                       (update :req/count inc))))
    (let [resp-ch (chan)]
-     (async/put! db-cache {:req      :current
-                           :blank-db blank-db
-                           :resp-ch  resp-ch})
+     (async/put! current {:blank-db blank-db
+                          :resp-ch  resp-ch})
      resp-ch))
   ([{:keys [blank-db] :as session}]
    (current-db session blank-db)))
