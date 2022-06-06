@@ -368,15 +368,39 @@
 
       :else nil)))
 
+(defn filter-having
+  "groupBy statements can optionally have a 'having' statement which filters
+  items within the group."
+  [{:keys [params function] :as having} headers group-map]
+  (let [idxs     (analytical/get-tuple-indexes params headers)
+        filtered (loop [[[k tuples] & r] group-map
+                        acc {}]
+                   (if k
+                     (let [argument (flatten (analytical/transform-tuples-to-idxs idxs tuples))
+                           res      (try*
+                                      (function argument)
+                                      (catch* e
+                                              (log/error e (str "Error procesing fn: " (:fn-str having)
+                                                                " with argument: " argument))
+                                              (throw (ex-info (str "Error executing having function: " (:fn-str having)
+                                                                   " with error message: " (ex-message e))
+                                                              {:status 400 :error :db/invalid-query}))))]
+                       (if res
+                         (recur r (assoc acc k tuples))
+                         (recur r acc)))
+                     acc))]
+    filtered))
+
 (defn process-ad-hoc-res
   [db fuel max-fuel
    {:keys [headers vars] :as res}
-   {:keys [groupBy orderBy limit selectOne? selectDistinct? inVector? offset] :as select-spec}
+   {:keys [groupBy orderBy limit selectOne? selectDistinct? inVector? offset having] :as select-spec}
    opts]
   (go-try (if groupBy
             (let [order-fn  (build-order-fn orderBy groupBy)
                   group-map (cond->> (ad-hoc-group-by res groupBy)
                                      order-fn (into (sorted-map-by order-fn))
+                                     having (filter-having having headers)
                                      offset (drop offset)
                                      limit (take limit)
                                      selectOne? (take 1))]
