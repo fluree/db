@@ -667,7 +667,9 @@
         (let [tuple-count (count where-smt)
               where-smt*  (case tuple-count
                             3 (apply parse-where-tuple supplied-vars* db where-smt)
-                            4 (apply parse-remote-tuple supplied-vars* where-smt)
+                            4 (if (= "$fdb" (first where-smt)) ;; $fdb refers to default/main db, parse as 3-tuple
+                                (apply parse-where-tuple supplied-vars* db (rest where-smt))
+                                (apply parse-remote-tuple supplied-vars* where-smt))
                             2 (apply parse-binding-tuple where-smt)
                             ;; else
                             (if (sequential? (first where-smt))
