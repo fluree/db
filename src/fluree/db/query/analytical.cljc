@@ -560,7 +560,8 @@
                                      {:status 400 :error :db/invalid-query})))]
     {:variable variable
      :as       as
-     :code     agg-fn}))
+     :fn-str   x
+     :function agg-fn}))
 
 
 (defn calculate-aggregate
