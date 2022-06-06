@@ -376,66 +376,20 @@
   (go-try (if groupBy
             (let [order-fn  (build-order-fn orderBy groupBy)
                   group-map (cond->> (ad-hoc-group-by res groupBy)
-                                     order-fn (into (sorted-map-by order-fn)))]
-              (if selectOne?
-                (let [k (first (keys group-map))
-                      v (<? (process-ad-hoc-group db fuel max-fuel
-                                                  {:headers headers
-                                                   :vars    vars
-                                                   :tuples  (first (vals group-map))} select-spec limit opts))]
-                  {k v})
-                ; loop through map of groups
-                (loop [[group-key & rest-keys] (keys group-map)
-                       [group & rest-groups] (vals group-map)
-                       limit  (if (= 0 limit) nil limit)    ; limit of 0 is ALL
-                       offset (or offset 0)
-                       acc    {}]
-                  (let [group-count  (count group)
-                        group-as-res {:headers headers :vars vars :tuples group}]
-                    (cond
-                      ;? processed all groups
-                      (nil? group) acc
-
-                      ;? exceeded limit
-                      (and limit (< limit 1)) acc
-
-                      ;? last item in this group is BEFORE offset - skip
-                      (>= offset group-count)
-                      (recur rest-keys
-                             rest-groups
-                             limit
-                             (if selectDistinct? (- offset 1) (- offset group-count))
-                             acc)
-
-                      :else
-                      ; 1) set orderBy to nil so order-offset-and-limit-results is not executed
-                      ; 2) set offset to 0 so a drop is not performed
-                      ; 3) then call process-ad-hoc-group
-                      ; 4) May return a singleton aggregate
-                      (let [res (<? (process-ad-hoc-group
-                                      db fuel max-fuel
-                                      group-as-res
-                                      (assoc select-spec :orderBy nil :offset 0 :limit nil)
-                                      (assoc opts :offset 0 :limit nil)))]
-                        (if (and (coll? res) (seq res))
-                          ; non-empty collection
-                          (-> (cond->> res
-                                       (< 0 offset) (drop offset)
-                                       (and limit (< 0 limit)) (take limit))
-                              (as-> res' (recur rest-keys
-                                                rest-groups
-                                                (when-not (nil? limit) (- limit (count res')))
-                                                (cond
-                                                  (<= offset 0) 0
-                                                  selectDistinct? (- offset 1)
-                                                  :else (- offset (- group-count (count res'))))
-                                                (if (or (nil? res') (empty? res')) acc (assoc acc group-key res')))))
-                          ; empty collection (?) or singleton aggregate
-                          (recur rest-keys
-                                 rest-groups
-                                 (when-not (nil? limit) (- limit 1))
-                                 (if (<= offset 0) 0 (- offset 1))
-                                 (assoc acc group-key res)))))))))
+                                     order-fn (into (sorted-map-by order-fn))
+                                     offset (drop offset)
+                                     limit (take limit)
+                                     selectOne? (take 1))]
+              (loop [[[k tuples] & r] group-map
+                     acc {}]
+                (if k
+                  (let [group-as-res {:headers headers :vars vars :tuples tuples}
+                        v            (<? (process-ad-hoc-group db fuel max-fuel
+                                                               group-as-res
+                                                               (assoc select-spec :orderBy nil :offset 0 :limit nil)
+                                                               (assoc opts :offset 0 :limit nil)))]
+                    (recur r (assoc acc k v)))
+                  acc)))
             ; no group by
             (let [limit (if selectOne? 1 limit)
                   res   (<? (process-ad-hoc-group db fuel max-fuel res select-spec limit opts))]
