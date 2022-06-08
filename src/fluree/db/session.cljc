@@ -132,10 +132,6 @@
       (async/alt!
         :priority true
 
-        clr-ch    ([msg]
-                   (when msg
-                     (recur nil)))
-
         cas-ch    ([msg]
                    (when-let [{:keys [old-db new-db resp-ch]} msg]
                      (if (= db old-db)
@@ -143,6 +139,10 @@
                            (recur new-db))
                        (do (async/put! resp-ch false)
                            (recur db)))))
+
+        clr-ch    ([msg]
+                   (when msg
+                     (recur nil)))
 
         rel-ch    ([msg]
                    (when-let [{:keys [blank-db resp-ch]} msg]
