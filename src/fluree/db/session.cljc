@@ -171,28 +171,30 @@
 
   Returns a channel that will contain a boolean indicating whether the cache was
   updated."
-  [{{:keys [cas]} :db-cache} old-db new-db]
-  (let [resp-ch (chan)]
-    (async/put! cas {:old-db  old-db
-                     :new-db  new-db
-                     :resp-ch resp-ch})
-    resp-ch))
+  [{{:keys [cas]} :db-cache, :keys [state]} old-db new-db]
+  (-> state
+      (swap! (fn [{:db/keys [current] :as s}]
+               (if (= current old-db)
+                 (assoc s :db/current new-db)
+                 s)))
+      :db/current
+      (= new-db)))
 
 
 (defn clear-db!
   "Clears db from cache, forcing a new full load next time db is requested."
-  [{{:keys [clear]} :db-cache}]
-  (async/put! clear {}))
+  [{{:keys [clear]} :db-cache, :keys [state]}]
+  (swap! state assoc :db/current nil))
 
 
 (defn reload-db!
   "Clears any cached databases and forces an immediate reload. Returns a channel
   that will contain the newly loaded database"
-  [{:keys [conn blank-db], {:keys [reload]} :db-cache}]
-  (let [resp-ch (chan)]
-    (async/put! reload {:blank-db blank-db
-                        :resp-ch  resp-ch})
-    resp-ch))
+  [{:keys [conn blank-db state], {:keys [reload]} :db-cache}]
+  (go-try
+   (let [latest-db (<? (load-current-db conn blank-db))]
+     (swap! state assoc :db/current latest-db)
+     latest-db)))
 
 (defn current-db
   "Gets the current database from the session's database cache. If no database is
@@ -203,10 +205,16 @@
                   (-> s
                       (assoc :req/last (util/current-time-millis))
                       (update :req/count inc))))
-   (let [resp-ch (chan)]
-     (async/put! current {:blank-db blank-db
-                          :resp-ch  resp-ch})
-     resp-ch))
+   (go-try
+    (if-let [current (:db/current @state)]
+      current
+      (let [latest-db (<? (load-current-db conn blank-db))]
+        (-> state
+            (swap! (fn [s]
+                     (if-not (:db/current s)
+                       (assoc s :db/current latest-db)
+                       s)))
+            :db/current)))))
   ([{:keys [blank-db] :as session}]
    (current-db session blank-db)))
 
@@ -326,7 +334,7 @@
                                          (flake/parts->Flake f))))
                                 (dbproto/-with current-db block)))]
            ;; update-local-db, returns true if successful
-           (when (<? (cas-db! session current-db new-db))
+           (when (cas-db! session current-db new-db)
              ;; place a local notification of updated db on *connection* sub-chan, which is what
              ;; receives all events from ledger server - this allows any (fdb/listen...) listeners to listen
              ;; for a :local-ledger-update event. :block events from ledger server will trigger listeners
@@ -422,6 +430,7 @@
                                    {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
                                     :req/count     0             ;; count of db requests on this connection
                                     :req/last      nil           ;; epoch millis of last db request on this connection
+                                    :db/current    nil
                                     :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
                                     :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
                                     :closed?       false}))
@@ -485,8 +494,8 @@
 
   If another process created the session first, will return the other process' session."
   [opts]
-  (let [_        (log/trace "Create and cache session. Opt keys: " (keys opts))
-        id       (keyword "session" (-> (util/random-uuid) str (subs 0 7)))
+  (log/trace "Create and cache session. Opt keys: " (keys opts))
+  (let [id       (keyword "session" (-> (util/random-uuid) str (subs 0 7)))
         session  (session-factory (assoc opts :id id))
         session* (cache! session)
         new?     (= id (:id session*))]
