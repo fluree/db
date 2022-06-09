@@ -1,7 +1,7 @@
 (ns fluree.db.session
   (:require [fluree.db.graphdb :as graphdb]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async :refer [<! chan go go-loop]]
+            #?(:clj  [clojure.core.async :as async :refer [<! >! chan go go-loop]]
                :cljs [cljs.core.async :as async :refer [<! chan] :refer-macros [go go-loop]])
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.string :as str]
@@ -171,14 +171,14 @@
 
   Returns a channel that will contain a boolean indicating whether the cache was
   updated."
-  [{{:keys [cas]} :db-cache, :keys [state]} old-db new-db]
+  [{{:keys [cas]} :db-cache, :keys [state]} old-db-ch new-db-ch]
   (-> state
       (swap! (fn [{:db/keys [current] :as s}]
-               (if (= current old-db)
-                 (assoc s :db/current new-db)
+               (if (= current old-db-ch)
+                 (assoc s :db/current new-db-ch)
                  s)))
       :db/current
-      (= new-db)))
+      (= new-db-ch)))
 
 
 (defn clear-db!
@@ -191,32 +191,47 @@
   "Clears any cached databases and forces an immediate reload. Returns a channel
   that will contain the newly loaded database"
   [{:keys [conn blank-db state], {:keys [reload]} :db-cache}]
-  (go-try
-   (let [latest-db (<? (load-current-db conn blank-db))]
-     (swap! state assoc :db/current latest-db)
-     latest-db)))
+  (let [db-ch (async/promise-chan)]
+    (swap! state assoc :db/current db-ch)
+    (go
+      (try*
+        (let [latest-db (<? (load-current-db conn blank-db))]
+          (>! db-ch latest-db))
+        (catch* e
+                (log/error e "Error reloading db")
+                (swap! state assoc :db/current nil))))
+    db-ch))
 
 (defn current-db
   "Gets the current database from the session's database cache. If no database is
   cached then the current database is loaded form storage and cached. Returns a
   channel that will contain the current database"
+  ([{:keys [blank-db] :as session}]
+   (current-db session blank-db))
   ([{:keys [conn state], {:keys [current]} :db-cache, :as session} blank-db]
    (swap! state (fn [s]
                   (-> s
                       (assoc :req/last (util/current-time-millis))
                       (update :req/count inc))))
-   (go-try
-    (if-let [current (:db/current @state)]
-      current
-      (let [latest-db (<? (load-current-db conn blank-db))]
-        (-> state
-            (swap! (fn [s]
-                     (if-not (:db/current s)
-                       (assoc s :db/current latest-db)
-                       s)))
-            :db/current)))))
-  ([{:keys [blank-db] :as session}]
-   (current-db session blank-db)))
+   (or (:db/current @state)
+       (let [cur-ch   (async/promise-chan)
+             state-ch (-> state
+                          (swap! (fn [s]
+                                   (if-not (:db/current s)
+                                     (assoc s :db/current cur-ch)
+                                     s)))
+                          :db/current)]
+         (if (= cur-ch state-ch)
+           (do (go
+                 (try*
+                  (let [latest-db (<? (load-current-db conn blank-db))]
+                    (>! cur-ch latest-db))
+                  (catch* e
+                          (swap! state assoc :db/current nil)
+                          (log/error e "Error loading current db")
+                          (async/put! cur-ch e))))
+               cur-ch)
+           state-ch)))))
 
 (defn indexing-promise-ch
   "Returns block currently being indexed (truthy), or nil (falsey) if not currently indexing."
@@ -310,7 +325,8 @@
 (defmethod process-ledger-update :block
   [session event-type {:keys [block t flakes] :as data}]
   (go-try
-   (let [current-db    (<? (current-db session))
+   (let [current-db-ch (current-db session)
+         current-db    (<? current-db-ch)
          current-block (:block current-db)]
      (cond
        ;; no-op
@@ -327,14 +343,14 @@
          (log/trace (str (:network session) "/$" (:dbid session)
                          ": Received block " block
                          ", DB at that block, update cached db with flakes."))
-         (let [new-db  (<? (->> flakes
-                                (map (fn [f]
-                                       (if (instance? Flake f)
-                                         f
-                                         (flake/parts->Flake f))))
-                                (dbproto/-with current-db block)))]
+         (let [new-db-ch (->> flakes
+                              (map (fn [f]
+                                     (if (instance? Flake f)
+                                       f
+                                       (flake/parts->Flake f))))
+                              (dbproto/-with current-db block))]
            ;; update-local-db, returns true if successful
-           (when (cas-db! session current-db new-db)
+           (when (cas-db! session current-db-ch new-db-ch)
              ;; place a local notification of updated db on *connection* sub-chan, which is what
              ;; receives all events from ledger server - this allows any (fdb/listen...) listeners to listen
              ;; for a :local-ledger-update event. :block events from ledger server will trigger listeners
