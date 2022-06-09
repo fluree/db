@@ -22,8 +22,8 @@
 
 (declare db session)
 
-(defrecord DbSession [conn network dbid db-name db-cache update-chan
-                      transact-chan state schema-cache blank-db close id])
+(defrecord DbSession [conn network dbid db-name update-chan transact-chan state
+                      schema-cache blank-db close id])
 
 
 ;;; ----------------------------------------
@@ -122,47 +122,6 @@
              (async/put! resp-ch e)
              nil))))
 
-(defn new-db-cache
-  [conn network dbid cur-db]
-  (let [cur-ch (chan)
-        cas-ch (chan)
-        clr-ch (chan)
-        rel-ch (chan)]
-    (go-loop [db cur-db]
-      (async/alt!
-        :priority true
-
-        cas-ch    ([msg]
-                   (when-let [{:keys [old-db new-db resp-ch]} msg]
-                     (if (= db old-db)
-                       (do (async/put! resp-ch true)
-                           (recur new-db))
-                       (do (async/put! resp-ch false)
-                           (recur db)))))
-
-        clr-ch    ([msg]
-                   (when msg
-                     (recur nil)))
-
-        rel-ch    ([msg]
-                   (when-let [{:keys [blank-db resp-ch]} msg]
-                     (recur (<! (reload-and-respond conn blank-db resp-ch)))))
-
-        cur-ch    ([msg]
-                   (when-let [{:keys [blank-db resp-ch]} msg]
-                     (if-not (nil? db)
-                       (do (async/put! resp-ch db)
-                           (recur db))
-                       (recur (<! (reload-and-respond conn blank-db resp-ch))))))))
-
-    {:current cur-ch, :cas cas-ch, :clear clr-ch, :reload rel-ch}))
-
-(defn stop-db-cache!
-  [db-cache]
-  (reduce-kv (fn [m k v]
-               (assoc m k (async/close! v)))
-             {} db-cache))
-
 
 (defn cas-db!
   "Perform a compare and set operation to update the db stored in the session
@@ -171,7 +130,7 @@
 
   Returns a channel that will contain a boolean indicating whether the cache was
   updated."
-  [{{:keys [cas]} :db-cache, :keys [state]} old-db-ch new-db-ch]
+  [{:keys [state]} old-db-ch new-db-ch]
   (-> state
       (swap! (fn [{:db/keys [current] :as s}]
                (if (= current old-db-ch)
@@ -183,14 +142,14 @@
 
 (defn clear-db!
   "Clears db from cache, forcing a new full load next time db is requested."
-  [{{:keys [clear]} :db-cache, :keys [state]}]
+  [{:keys [state]}]
   (swap! state assoc :db/current nil))
 
 
 (defn reload-db!
   "Clears any cached databases and forces an immediate reload. Returns a channel
   that will contain the newly loaded database"
-  [{:keys [conn blank-db state], {:keys [reload]} :db-cache}]
+  [{:keys [conn blank-db state]}]
   (let [db-ch (async/promise-chan)]
     (swap! state assoc :db/current db-ch)
     (go
@@ -198,8 +157,9 @@
         (let [latest-db (<? (load-current-db conn blank-db))]
           (>! db-ch latest-db))
         (catch* e
+                (swap! state assoc :db/current nil)
                 (log/error e "Error reloading db")
-                (swap! state assoc :db/current nil))))
+                (async/put! db-ch e))))
     db-ch))
 
 (defn current-db
@@ -208,7 +168,7 @@
   channel that will contain the current database"
   ([{:keys [blank-db] :as session}]
    (current-db session blank-db))
-  ([{:keys [conn state], {:keys [current]} :db-cache, :as session} blank-db]
+  ([{:keys [conn state] :as session} blank-db]
    (swap! state (fn [s]
                   (-> s
                       (assoc :req/last (util/current-time-millis))
@@ -388,8 +348,7 @@
   two arity network + dbid will see if a session is in cache and
   then perform the shutdown on the cached session, else will return
   false."
-  ([{:keys [conn db-cache update-chan transact-chan state network
-            dbid id] :as session}]
+  ([{:keys [conn update-chan transact-chan state network dbid id] :as session}]
    (if (closed? session)
      (do
        (remove-cache! network dbid)
@@ -397,7 +356,6 @@
      (do
        (swap! state assoc :closed? true)
        ((:remove-listener conn) network dbid id)
-       (stop-db-cache! db-cache)
        (async/close! update-chan)
        (when transact-chan
          (async/close! transact-chan))
@@ -454,7 +412,6 @@
                                        :network       network
                                        :dbid          dbid
                                        :db-name       db-name
-                                       :db-cache      (new-db-cache conn network dbid cur-db)
                                        :update-chan   (chan)
                                        :transact-chan (when transactor?
                                                         (chan))
