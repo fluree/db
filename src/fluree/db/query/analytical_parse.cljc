@@ -181,8 +181,8 @@
 
 
 (defn parse-aggregate
-  "Parses an aggreage function string and returns map with keys:
-  :variable - oinput variable sysmbol
+  "Parses an aggregate function string and returns map with keys:
+  :variable - input variable symbol
   :as - return variable/binding name
   :fn-str - original function string, for use in reporting errors
   :function - executable function."
