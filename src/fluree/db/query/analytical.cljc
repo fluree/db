@@ -96,8 +96,13 @@
                        :else
                        (update acc :search #(conj % key))))) {:search [] :rel {} :opts {}} clause))
 
-(defn get-ns-arrays [ns arrays]
-  (map (fn [array] (map #(nth array %) ns)) arrays))
+(defn transform-tuples-to-idxs
+  "Returns an updated list of tuples that only contains tuple indexes from idx.
+  e.g.:
+  idx is a list of indexes, eg. [2 0 4]
+  Thus, the return will be 3-tuples of nth 2, 0, 4 respectively."
+  [idxs tuples]
+  (map (fn [tuple] (map #(nth tuple %) idxs)) tuples))
 
 (defn clause->keys
   [clause]
@@ -122,14 +127,30 @@
               (if (a-keys key)
                 (conj acc key) acc)) [] b-keys)))
 
+
+(defn get-tuple-indexes
+  "Returns index positions of vars within headers.
+  e.g. if vars were:
+  ['?e '?name]
+  and headers were:
+  ['?email '?name '?x '?e]
+  The return value would be: [3 1]"
+  [vars headers]
+  (reduce (fn [acc var-smt]
+            (if-let [var (or (variable? var-smt)
+                             (:variable var-smt))]
+              (conj acc (util/index-of headers var))
+              (throw
+                (ex-info (str var-smt " cannot be retrieved from the results. "
+                              "Check that it is declared in your where clause.")
+                         {:status 400 :error :db/invalid-query}))))
+          [] vars))
+
+
 (defn select-from-tuples
   [vars tuples]
-  (let [ns (reduce (fn [acc var-smt]
-                     (if-let [var (or (variable? var-smt)
-                                      (:variable var-smt))]
-                       (conj acc (util/index-of (:headers tuples) var))
-                       (throw (ex-info (str var-smt " cannot be retrieved from the results. Check that it is declared in your where clause.") {:status 400 :error :db/invalid-query})))) [] vars)]
-    (get-ns-arrays ns (:tuples tuples))))
+  (let [idxs (get-tuple-indexes vars (:headers tuples))]
+    (transform-tuples-to-idxs idxs (:tuples tuples))))
 
 (defn add-fuel
   [add-amount fuel max-fuel]
@@ -305,7 +326,7 @@
                                                  (if search-val
                                                    (recur (concat acc (<? (query-range/index-range db :spot = [search-val predicate]))) r)
                                                    acc))
-                                        tuples (get-ns-arrays [0 2] res)
+                                        tuples (transform-tuples-to-idxs [0 2] res)
                                         acc*   (tuples->map acc tuples)]
                                     (recur acc* (inc depth)))))))
 
@@ -324,7 +345,7 @@
                                          (let [idx-of    (util/index-of clause (str common-key))
                                                k         (condp = idx-of 0 :subject-fn 1 :predicate-fn 2 :object-fn)
                                                res-idx   (util/index-of headers common-key)
-                                               v         (into #{} (map first (get-ns-arrays [res-idx] tuples)))
+                                               v         (into #{} (map first (transform-tuples-to-idxs [res-idx] tuples)))
                                                single-v? (= 1 (count v))
                                                v         (if (and (not single-v?) object-fn (= k object-fn))
                                                            (comp v object-fn)
@@ -344,7 +365,7 @@
                 ;                     subject-fn    (filter #(subject-fn (.-s %)))
                 ;                     predicate-fn  (filter #(predicate-fn (.-p %))))
                 _           (add-fuel (count res) fuel max-fuel)
-                tuples      (get-ns-arrays (vals rel) res)
+                tuples      (transform-tuples-to-idxs (vals rel) res)
                 tuples'     (if recur-depth
                               (let [clause-1st (first clause')
                                     var-first? (variable? (first clause))
@@ -524,50 +545,75 @@
      'variance       variance}))
 
 
-(defn aggregate? [x] (and (string? x)
-                          (re-matches #"^\(.+\)$" x)))
+(defn aggregate?
+  [x]
+  (and (string? x)
+       (re-matches #"^\(.+\)$" x)))
 
-(defn interm-aggregate? [x] (and (string? x)
-                                 (re-matches #"^#\(.+\)$" x)))
+(defn interm-aggregate?
+  [x]
+  (and (string? x)
+       (re-matches #"^#\(.+\)$" x)))
 
-(defn parse-aggregate [x valid-var]
-  (let [list-agg   (#?(:clj read-string :cljs cljs.reader/read-string) x)
-        as?        (= 'as (first list-agg))
-        as         (if as? (-> (str "?" (last list-agg)) symbol) (->> list-agg (str "?") symbol))
-        func-list  (if as? (let [func-list (second list-agg)]
-                             (if (coll? func-list) func-list
-                                                   (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " x)
-                                                                   {:status 400 :error :db/invalid-query})))) list-agg)
-        list-count (count func-list)
-        [fun arg var] (cond (= 3 list-count) [(first func-list) (second func-list) (last func-list)]
-                            (and (= 2 list-count) (= 'sample (first func-list)))
-                            (throw (ex-info (str "The sample aggregate function takes two arguments: n and a variable, provided: " x)
-                                            {:status 400 :error :db/invalid-query}))
-                            (= 2 list-count) [(first func-list) nil (last func-list)]
-                            :else (throw (ex-info (str "Invalid aggregate selection, provided: " x)
-                                                  {:status 400 :error :db/invalid-query})))
+(defn parse-aggregate*
+  "Returns map of aggregate function executable code or error if invalid aggregate function."
+  [parsed-code as valid-var]
+  (let [list-count (count parsed-code)
+        [fun arg var] (cond
+                        (= 3 list-count)
+                        [(first parsed-code) (second parsed-code) (last parsed-code)]
+
+                        (= 2 list-count)
+                        (if (= 'sample (first parsed-code))
+                          (throw (ex-info (str "The sample aggregate function takes two arguments: n and a variable, provided: "
+                                               (pr-str parsed-code))
+                                          {:status 400 :error :db/invalid-query}))
+                          [(first parsed-code) nil (last parsed-code)])
+
+                        :else
+                        (throw (ex-info (str "Invalid aggregate selection, provided: " (pr-str parsed-code))
+                                        {:status 400 :error :db/invalid-query})))
         agg-fn     (if-let [agg-fn (built-in-aggregates fun)]
                      (if arg (fn [coll] (agg-fn arg coll)) agg-fn)
-                     (throw (ex-info (str "Invalid aggregate selection function, provided: " x)
+                     (throw (ex-info (str "Invalid aggregate selection function, provided: " (pr-str parsed-code))
                                      {:status 400 :error :db/invalid-query})))
         [agg-fn variable] (let [distinct? (and (coll? var) (= (first var) 'distinct))
                                 variable  (if distinct? (second var) var)
                                 agg-fn    (if distinct? (fn [coll] (-> coll distinct agg-fn))
                                                         agg-fn)]
                             [agg-fn variable])
-        _          (when-not (valid-var variable)
-                     (throw (ex-info (str "Invalid select variable in aggregate select, provided: " x)
-                                     {:status 400 :error :db/invalid-query})))]
+        fn-str     (str "(fn [" variable "] " (pr-str parsed-code) ")")]
+    (when-not (valid-var variable)
+      (throw (ex-info (str "Invalid select variable in aggregate select, provided: " (pr-str parsed-code))
+                      {:status 400 :error :db/invalid-query})))
     {:variable variable
      :as       as
-     :fn-str   x
+     :fn-str   fn-str
      :function agg-fn}))
 
 
+(defn parse-aggregate
+  "Parses string aggregate function and returns execution map if valid."
+  [code-str valid-var]
+  (let [list-agg    (#?(:clj read-string :cljs cljs.reader/read-string) code-str)
+        as?         (= 'as (first list-agg))
+        as          (if as?
+                      (-> (str "?" (last list-agg)) symbol)
+                      (->> list-agg (str "?") symbol))
+        code-parsed (if as?
+                      (let [func-list (second list-agg)]
+                        (if (coll? func-list)
+                          func-list
+                          (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " code-str)
+                                          {:status 400 :error :db/invalid-query}))))
+                      list-agg)]
+    (parse-aggregate* code-parsed as valid-var)))
+
+
 (defn calculate-aggregate
-  [res agg]
-  (let [{:keys [variable as function]} agg
-        agg-params (flatten (select-from-tuples [variable] res))
+  [tuples aggregate-fn-map]
+  (let [{:keys [variable as function]} aggregate-fn-map
+        agg-params (flatten (select-from-tuples [variable] tuples))
         agg-result (function agg-params)]
     [as agg-result]))
 

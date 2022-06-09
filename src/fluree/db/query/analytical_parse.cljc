@@ -144,50 +144,60 @@
   (last as-fn-parsed))
 
 
-(defn parse-aggregate
-  [aggregate-fn-str]
-  (let [list-agg   (safe-read-fn aggregate-fn-str)
-        as?        (= 'as (first list-agg))
-        func-list  (if as?
-                     (second list-agg)
-                     list-agg)
-        _          (when-not (coll? func-list)
-                     (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " aggregate-fn-str)
-                                     {:status 400 :error :db/invalid-query})))
-        list-count (count func-list)
+(defn parse-aggregate*
+  [fn-parsed fn-str as]
+  (let [list-count (count fn-parsed)
         [fun arg var] (cond (= 3 list-count)
-                            [(first func-list) (second func-list) (last func-list)]
+                            [(first fn-parsed) (second fn-parsed) (last fn-parsed)]
 
-                            (and (= 2 list-count) (= 'sample (first func-list)))
-                            (throw (ex-info (str "The sample aggregate function takes two arguments: n and a variable, provided: " aggregate-fn-str)
+                            (and (= 2 list-count) (= 'sample (first fn-parsed)))
+                            (throw (ex-info (str "The sample aggregate function takes two arguments: n and a variable, provided: " fn-str)
                                             {:status 400 :error :db/invalid-query}))
 
                             (= 2 list-count)
-                            [(first func-list) nil (last func-list)]
+                            [(first fn-parsed) nil (last fn-parsed)]
 
                             :else
-                            (throw (ex-info (str "Invalid aggregate selection, provided: " aggregate-fn-str)
+                            (throw (ex-info (str "Invalid aggregate selection, provided: " fn-str)
                                             {:status 400 :error :db/invalid-query})))
         agg-fn     (if-let [agg-fn (built-in-aggregates fun)]
                      (if arg (fn [coll] (agg-fn arg coll)) agg-fn)
-                     (throw (ex-info (str "Invalid aggregate selection function, provided: " aggregate-fn-str)
+                     (throw (ex-info (str "Invalid aggregate selection function, provided: " fn-str)
                                      {:status 400 :error :db/invalid-query})))
         [agg-fn variable] (let [distinct? (and (coll? var) (= (first var) 'distinct))
                                 variable  (if distinct? (second var) var)
                                 agg-fn    (if distinct? (fn [coll] (-> coll distinct agg-fn))
                                                         agg-fn)]
                             [agg-fn variable])
-        as         (if as?
-                     (extract-aggregate-as list-agg)
-                     (symbol (str variable "-" fun)))]
+        as'        (or as (symbol (str variable "-" fun)))]
     (when-not (and (symbol? variable)
                    (= \? (first (name variable))))
-      (throw (ex-info (str "Variables used in aggregate functions must start with a '?'. Provided: " aggregate-fn-str)
+      (throw (ex-info (str "Variables used in aggregate functions must start with a '?'. Provided: " fn-str)
                       {:status 400 :error :db/invalid-query})))
     {:variable variable
-     :as       as
-     :fn-str   aggregate-fn-str
+     :as       as'
+     :fn-str   fn-str
      :function agg-fn}))
+
+
+(defn parse-aggregate
+  "Parses an aggregate function string and returns map with keys:
+  :variable - input variable symbol
+  :as - return variable/binding name
+  :fn-str - original function string, for use in reporting errors
+  :function - executable function."
+  [aggregate-fn-str]
+  (let [list-agg  (safe-read-fn aggregate-fn-str)
+        as?       (= 'as (first list-agg))
+        func-list (if as?
+                    (second list-agg)
+                    list-agg)
+        _         (when-not (coll? func-list)
+                    (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " aggregate-fn-str)
+                                    {:status 400 :error :db/invalid-query})))
+        as        (when as?
+                    (extract-aggregate-as list-agg))]
+    (parse-aggregate* func-list aggregate-fn-str as)))
 
 
 (defn variable-in-where?
@@ -215,6 +225,53 @@
     {:variable  var-as-symbol
      :selection selection}))
 
+(defn parse-having-code
+  "Returns two-tuple of [params updated-code]
+  where params are the function parameters and updated-code is a revised version of
+  code-parsed where all functions within the code are mapped to actual executable functions."
+  [code-parsed code-string]
+  (let [[form-f & form-r] code-parsed
+        form-f' (or (get built-in-aggregates form-f)
+                    (get filter/filter-fns-with-ns (str form-f)))
+        vars    (into #{} (filter symbol? form-r))]
+    (loop [[form-next & form-rest] form-r
+           vars* vars
+           acc   []]
+      (if form-next
+        (let [[params item] (if (list? form-next)
+                              (parse-having-code form-next code-string)
+                              [nil (cond
+                                     (symbol? form-next) (if-not (str/starts-with? (str form-next) "?")
+                                                           (throw (ex-info (str "Invalid variable name '" form-next
+                                                                                "' in having function: " code-string
+                                                                                ". All vars must start with '?'.")
+                                                                           {:status 400 :error :db/invalid-query}))
+                                                           form-next)
+                                     (string? form-next) form-next
+                                     (boolean? form-next) form-next
+                                     (number? form-next) form-next
+                                     :else (throw (ex-info (str "Invalid having function: " code-string
+                                                                ". Only scalar types allowed besides functions: " form-next ".")
+                                                           {:status 400 :error :db/invalid-query})))])
+              vars** (if params
+                       (into vars* params)
+                       vars*)]
+          (recur form-rest vars** (conj acc item)))
+        [(vec vars*) (cons form-f' acc)]))))
+
+
+(defn parse-having
+  [having]
+  (when-not (aggregate? having)
+    (throw (ex-info (str "Invalid 'having' statement aggregate: " having)
+                    {:status 400 :error :db/invalid-query})))
+  (let [code (safe-read-fn having)
+        [params code*] (parse-having-code code having)]
+    {:variable nil                                          ;; not used for 'having' fn execution
+     :params   params
+     :fn-str   (str "(fn " params " " code)
+     :function (filter/make-executable params code*)}))
+
 
 (defn parse-select
   [select-smt]
@@ -232,7 +289,7 @@
 
 (defn add-select-spec
   [{:keys [group-by order-by limit offset pretty-print] :as parsed-query}
-   {:keys [selectOne select selectDistinct selectReduced opts orderBy groupBy] :as _query-map'}]
+   {:keys [selectOne select selectDistinct selectReduced opts orderBy groupBy having] :as _query-map'}]
   (let [select-smt    (or selectOne select selectDistinct selectReduced)
         selectOne?    (boolean selectOne)
         limit*        (if selectOne? 1 limit)
@@ -249,13 +306,16 @@
                           (if (vector? orderBy) orderBy ["ASC" orderBy])
                           (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
                                           {:status 400
-                                           :error  :db/invalid-query}))))]
+                                           :error  :db/invalid-query}))))
+        having*       (or having (:having opts))
+        having-parsed (when having* (parse-having having*))]
     (assoc parsed-query :limit limit*
                         :selectOne? selectOne?
                         :select {:select           parsed-select
                                  :aggregates       (not-empty aggregates)
                                  :expandMaps?      expandMap?
                                  :orderBy          orderBy*
+                                 :having           having-parsed
                                  :groupBy          (or (:groupBy opts) groupBy)
                                  :componentFollow? (:component opts)
                                  :limit            limit*
@@ -607,7 +667,9 @@
         (let [tuple-count (count where-smt)
               where-smt*  (case tuple-count
                             3 (apply parse-where-tuple supplied-vars* db where-smt)
-                            4 (apply parse-remote-tuple supplied-vars* where-smt)
+                            4 (if (= "$fdb" (first where-smt)) ;; $fdb refers to default/main db, parse as 3-tuple
+                                (apply parse-where-tuple supplied-vars* db (rest where-smt))
+                                (apply parse-remote-tuple supplied-vars* where-smt))
                             2 (apply parse-binding-tuple where-smt)
                             ;; else
                             (if (sequential? (first where-smt))
