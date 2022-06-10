@@ -96,10 +96,10 @@
        (loop [db         indexed-db
               next-block (-> indexed-db :block inc)]
          (if (> next-block latest-block)
-           (let [schema   (<? (schema/schema-map db))
-                 settings (<? (schema/setting-map db))]
+           (let [schema-ch   (schema/schema-map db)
+                 settings-ch (schema/setting-map db)]
              (swap! (:schema-cache db) empty)
-             (assoc db :schema schema, :settings settings))
+             (assoc db :schema (<? schema-ch), :settings (<? settings-ch)))
            (if-let [{:keys [flakes block t]}
                     (<? (storage/read-block conn network dbid next-block))]
              (recur (<? (dbproto/-with db block flakes))
@@ -404,7 +404,7 @@
                                    {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
                                     :req/count     0             ;; count of db requests on this connection
                                     :req/last      nil           ;; epoch millis of last db request on this connection
-                                    :db/current    nil
+                                    :db/current    cur-db        ;; current cached DB - make sure we use the latest (new) schema cache in it
                                     :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
                                     :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
                                     :closed?       false}))
