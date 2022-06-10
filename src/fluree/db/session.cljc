@@ -20,8 +20,8 @@
 
 (declare db session)
 
-(defrecord DbSession [conn network ledger-id db-name db-cache update-chan
-                      transact-chan state schema-cache blank-db close id])
+(defrecord DbSession [conn network ledger-id db-name update-chan transact-chan state
+                      schema-cache blank-db close id])
 
 
 ;;; ----------------------------------------
@@ -94,10 +94,10 @@
        (loop [db         indexed-db
               next-block (-> indexed-db :block inc)]
          (if (> next-block latest-block)
-           (let [schema   (<? (schema/schema-map db))
-                 settings (<? (schema/setting-map db))]
+           (let [schema-ch   (schema/schema-map db)
+                 settings-ch (schema/setting-map db)]
              (swap! (:schema-cache db) empty)
-             (assoc db :schema schema, :settings settings))
+             (assoc db :schema (<? schema-ch), :settings (<? settings-ch)))
            (if-let [{:keys [flakes block t]}
                     (<? (storage/read-block conn network ledger-id next-block))]
              (recur (<? (dbproto/-with db block flakes))
@@ -106,70 +106,13 @@
                                   network "/" ledger-id ".")
                              {:status 500, :error :db/unexpected-error})))))))))
 
-(defn reload-and-respond
-  [conn {:keys [network ledger-id] :as blank-db} resp-ch]
-  (go
-    (try*
-     (let [latest-db (<? (load-current-db conn blank-db))]
-       (async/put! resp-ch latest-db)
-       latest-db)
-     (catch* e
-             (log/error e
-                        "Error loading latest database for ledger" network ledger-id
-                        "in session")
-             (async/put! resp-ch e)
-             nil))))
-
-(defn new-db-cache
-  [conn network ledger-id cur-db]
-  (let [cur-ch (chan)
-        cas-ch (chan)
-        clr-ch (chan)
-        rel-ch (chan)]
-    (go-loop [db cur-db]
-      (async/alt!
-        :priority true
-
-        cas-ch    ([msg]
-                   (when-let [{:keys [old-db new-db resp-ch]} msg]
-                     (if (= db old-db)
-                       (do (async/put! resp-ch true)
-                           (recur new-db))
-                       (do (async/put! resp-ch false)
-                           (recur db)))))
-
-        clr-ch    ([msg]
-                   (when msg
-                     (recur nil)))
-
-        rel-ch    ([msg]
-                   (when-let [{:keys [blank-db resp-ch]} msg]
-                     (recur (<! (reload-and-respond conn blank-db resp-ch)))))
-
-        cur-ch    ([msg]
-                   (when-let [{:keys [blank-db resp-ch]} msg]
-                     (if-not (nil? db)
-                       (do (async/put! resp-ch db)
-                           (recur db))
-                       (recur (<! (reload-and-respond conn blank-db resp-ch))))))))
-
-    {:current cur-ch, :cas cas-ch, :clear clr-ch, :reload rel-ch}))
-
-(defn stop-db-cache!
-  [db-cache]
-  (reduce-kv (fn [m k v]
-               (assoc m k (async/close! v)))
-             {} db-cache))
-
 
 (defn cas-db!
   "Perform a compare and set operation to update the db stored in the session
-  argument's db cache. Update the cache to `new-db`, but only if the previously
-  stored db is the same as the `old-db` .
-
-  Returns a channel that will contain a boolean indicating whether the cache was
-  updated."
-  [{{:keys [cas]} :db-cache, :keys [state]} old-db-ch new-db-ch]
+  argument's state atom. Update the cache to `new-db-ch`, but only if the
+  previously stored db channel is the same as the `old-db-ch`. Returns a boolean
+  indicating whether the cache was updated."
+  [{:keys [state]} old-db-ch new-db-ch]
   (-> state
       (swap! (fn [{:db/keys [current] :as s}]
                (if (= current old-db-ch)
@@ -180,15 +123,16 @@
 
 
 (defn clear-db!
-  "Clears db from cache, forcing a new full load next time db is requested."
-  [{{:keys [clear]} :db-cache, :keys [state]}]
+  "Clears db channel from session state, forcing a new full load next time db
+  channel is requested."
+  [{:keys [state]}]
   (swap! state assoc :db/current nil))
 
 
 (defn reload-db!
-  "Clears any cached databases and forces an immediate reload. Returns a channel
-  that will contain the newly loaded database"
-  [{:keys [conn blank-db state], {:keys [reload]} :db-cache}]
+  "Clears any cached database channels and forces an immediate reload. Returns a
+  channel that will contain the newly loaded database"
+  [{:keys [conn blank-db state]}]
   (let [db-ch (async/promise-chan)]
     (swap! state assoc :db/current db-ch)
     (go
@@ -196,18 +140,20 @@
         (let [latest-db (<? (load-current-db conn blank-db))]
           (>! db-ch latest-db))
         (catch* e
+                (swap! state assoc :db/current nil)
                 (log/error e "Error reloading db")
-                (swap! state assoc :db/current nil))))
+                (async/put! db-ch e))))
     db-ch))
 
 
 (defn current-db
-  "Gets the current database from the session's database cache. If no database is
-  cached then the current database is loaded form storage and cached. Returns a
-  channel that will contain the current database"
+  "Gets the channel containing the current database from the session's state. If
+  no database channel is cached then the current database is loaded form storage
+  and a new channel containing it is cached. Returns the cached channel that
+  will contain the current database"
   ([{:keys [blank-db] :as session}]
    (current-db session blank-db))
-  ([{:keys [conn state], {:keys [current]} :db-cache, :as session} blank-db]
+  ([{:keys [conn state] :as session} blank-db]
    (swap! state (fn [s]
                   (-> s
                       (assoc :req/last (util/current-time-millis))
@@ -387,8 +333,7 @@
   two arity network + ledger-id will see if a session is in cache and
   then perform the shutdown on the cached session, else will return
   false."
-  ([{:keys [conn db-cache update-chan transact-chan state network
-            ledger-id id] :as session}]
+  ([{:keys [conn update-chan transact-chan state network ledger-id id] :as session}]
    (if (closed? session)
      (do
        (remove-cache! network ledger-id)
@@ -396,7 +341,6 @@
      (do
        (swap! state assoc :closed? true)
        ((:remove-listener conn) network ledger-id id)
-       (stop-db-cache! db-cache)
        (async/close! update-chan)
        (when transact-chan
          (async/close! transact-chan))
@@ -447,7 +391,7 @@
                                    {:req/sync      {}            ;; holds map of block -> [update-chans ...] to pass DB to once block is fully updated
                                     :req/count     0             ;; count of db requests on this connection
                                     :req/last      nil           ;; epoch millis of last db request on this connection
-                                    :db/current    nil
+                                    :db/current    cur-db        ;; current cached DB - make sure we use the latest (new) schema cache in it
                                     :db/pending-tx {}            ;; map of pending transaction ids to a callback that we will monitor for
                                     :db/indexing   nil           ;; a flag holding the block (a truthy value) we are currently in process of indexing.
                                     :closed?       false}))
@@ -455,7 +399,6 @@
                                        :network       network
                                        :ledger-id     ledger-id
                                        :db-name       db-name
-                                       :db-cache      (new-db-cache conn network ledger-id cur-db)
                                        :update-chan   (chan)
                                        :transact-chan (when transactor?
                                                         (chan))
