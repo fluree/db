@@ -111,11 +111,9 @@
 
 (defn cas-db!
   "Perform a compare and set operation to update the db stored in the session
-  argument's db cache. Update the cache to `new-db`, but only if the previously
-  stored db is the same as the `old-db` .
-
-  Returns a channel that will contain a boolean indicating whether the cache was
-  updated."
+  argument's state atom. Update the cache to `new-db-ch`, but only if the
+  previously stored db channel is the same as the `old-db-ch`. Returns a boolean
+  indicating whether the cache was updated."
   [{:keys [state]} old-db-ch new-db-ch]
   (-> state
       (swap! (fn [{:db/keys [current] :as s}]
@@ -127,14 +125,15 @@
 
 
 (defn clear-db!
-  "Clears db from cache, forcing a new full load next time db is requested."
+  "Clears db channel from session state, forcing a new full load next time db
+  channel is requested."
   [{:keys [state]}]
   (swap! state assoc :db/current nil))
 
 
 (defn reload-db!
-  "Clears any cached databases and forces an immediate reload. Returns a channel
-  that will contain the newly loaded database"
+  "Clears any cached database channels and forces an immediate reload. Returns a
+  channel that will contain the newly loaded database"
   [{:keys [conn blank-db state]}]
   (let [db-ch (async/promise-chan)]
     (swap! state assoc :db/current db-ch)
@@ -149,9 +148,10 @@
     db-ch))
 
 (defn current-db
-  "Gets the current database from the session's database cache. If no database is
-  cached then the current database is loaded form storage and cached. Returns a
-  channel that will contain the current database"
+  "Gets the channel containing the current database from the session's state. If
+  no database channel is cached then the current database is loaded form storage
+  and a new channel containing it is cached. Returns the cached channel that
+  will contain the current database"
   ([{:keys [blank-db] :as session}]
    (current-db session blank-db))
   ([{:keys [conn state] :as session} blank-db]
