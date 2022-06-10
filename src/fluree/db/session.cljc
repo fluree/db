@@ -108,20 +108,6 @@
                                   network "/" dbid ".")
                              {:status 500, :error :db/unexpected-error})))))))))
 
-(defn reload-and-respond
-  [conn {:keys [network dbid] :as blank-db} resp-ch]
-  (go
-    (try*
-     (let [latest-db (<? (load-current-db conn blank-db))]
-       (async/put! resp-ch latest-db)
-       latest-db)
-     (catch* e
-             (log/error e
-                        "Error loading latest database for ledger" network dbid
-                        "in session")
-             (async/put! resp-ch e)
-             nil))))
-
 
 (defn cas-db!
   "Perform a compare and set operation to update the db stored in the session
