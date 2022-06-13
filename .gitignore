@@ -16,7 +16,7 @@ default-private-key.txt
 /dev/build
 figwheel_server.log
 .cpcache
-/node_modules
+**node_modules
 package-lock.json
 /out/*
 !/out/.gitkeep
