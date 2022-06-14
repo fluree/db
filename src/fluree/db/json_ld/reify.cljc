@@ -5,10 +5,8 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.json-ld.commit :as jld-commit]
-            [fluree.db.ledger.proto :as ledger-proto]))
+            [fluree.db.util.log :as log]))
 
 ;; generates a db/ledger from persisted data
 #?(:clj (set! *warn-on-reflection* true))
@@ -186,6 +184,7 @@
     commit-retract))
 
 (defn parse-commit
+  "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
   (let [cred-subj (get commit-data "https://www.w3.org/2018/credentials#credentialSubject")
         commit    (or cred-subj commit-data)]
@@ -193,95 +192,56 @@
 
 (defn read-commit
   [conn commit-address]
-  (let [file-data (conn-proto/-c-read conn commit-address)]
-    (json-ld/expand file-data)))
+  (go-try
+    (let [file-data (<? (conn-proto/-c-read conn commit-address))]
+      (json-ld/expand file-data))))
 
 (defn merge-commit
   [conn db commit]
-  (let [iris           (volatile! {})
-        refs           (volatile! (-> db :schema :refs))
-        db-id          (get-in commit [const/iri-db :id])
-        db-data        (read-commit conn db-id)
-        t              (- (db-t db-data))
-        assert         (db-assert db-data)
-        retract        (db-retract db-data)
-        retract-flakes (retract-flakes db retract t iris)
-        assert-flakes  (assert-flakes db assert t iris refs)
-        all-flakes     (-> (empty (get-in db [:novelty :spot]))
-                           (into retract-flakes)
-                           (into assert-flakes))]
-    (when-not (= t (dec (:t db)))
-      (commit-error (str "Commit 't' values for referenced dbs out of sync. "
-                         "Expected t: " (- (dec (:t db))) " but found t: " (db-t db-data)
-                         " in referenced db: " db-id ".") commit))
-    (when (empty? all-flakes)
-      (commit-error "Commit has neither assertions or retractions!" commit))
-    (merge-flakes db t @refs all-flakes)))
-
-
-(defn load-commit
-  "Returns two-tuple of [commit-data commit-wrapper/proof].
-  In the case that a Verifiable Credential or JOSE were not used for
-  a proof, the second tuple will be nil."
-  [conn commit-address]
-  (let [file-data  (conn-proto/-c-read conn commit-address)
-        file-data* (json-ld/expand file-data)
-        cred-subj  (get file-data* "https://www.w3.org/2018/credentials#credentialSubject")
-        commit     (or cred-subj file-data*)]
-    [commit (when cred-subj file-data*)]))
+  (go-try
+    (let [iris           (volatile! {})
+          refs           (volatile! (-> db :schema :refs))
+          db-id          (get-in commit [const/iri-db :id])
+          db-data        (<? (read-commit conn db-id))
+          t              (- (db-t db-data))
+          assert         (db-assert db-data)
+          retract        (db-retract db-data)
+          retract-flakes (retract-flakes db retract t iris)
+          assert-flakes  (assert-flakes db assert t iris refs)
+          all-flakes     (-> (empty (get-in db [:novelty :spot]))
+                             (into retract-flakes)
+                             (into assert-flakes))]
+      (when-not (= t (dec (:t db)))
+        (commit-error (str "Commit 't' values for referenced dbs out of sync. "
+                           "Expected t: " (- (dec (:t db))) " but found t: " (db-t db-data)
+                           " in referenced db: " db-id ".") commit))
+      (when (empty? all-flakes)
+        (commit-error "Commit has neither assertions or retractions!" commit))
+      (merge-flakes db t @refs all-flakes))))
 
 
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of '1' and increment from there."
   [conn latest-commit]
-  (loop [next-commit latest-commit
-         ;last-t      nil
-         commits     (list)]
-    (let [[commit proof] (parse-commit next-commit)
-          _           (log/warn "commit: " (pr-str commit))
-          db          (get-in commit [const/iri-db :id])
-          _           (log/warn "DB:::::: " db)
-          ;t           (get-in commit [const/iri-db const/iri-t :value])
-          prev-commit (get-in commit [const/iri-prevCommit :id])
-          commits*    (conj commits [commit proof])]
-      (when-not db
-        (throw (ex-info (str "Commit is not a properly formatted Fluree commit: " next-commit ".")
-                        {:status      500
-                         :error       :db/invalid-commit
-                         :commit-data (if (> (count (str commit)) 500)
-                                        (str (subs (str commit) 0 500) "...")
-                                        (str commit))})))
-      #_(when (and last-t
-                   (not= t (dec last-t)))
-          (throw (ex-info (str "Commit t values are inconsistent. Next expect t value is : "
-                               (dec last-t) " but instead found t value: " t ".")
+  (go-try
+    (loop [next-commit latest-commit
+           commits     (list)]
+      (let [[commit proof] (parse-commit next-commit)
+            db          (get-in commit [const/iri-db :id])
+            prev-commit (get-in commit [const/iri-prevCommit :id])
+            commits*    (conj commits [commit proof])]
+        (when-not db
+          (throw (ex-info (str "Commit is not a properly formatted Fluree commit: " next-commit ".")
                           {:status      500
                            :error       :db/invalid-commit
                            :commit-data (if (> (count (str commit)) 500)
                                           (str (subs (str commit) 0 500) "...")
                                           (str commit))})))
-
-      (if prev-commit
-        (let [commit-data (read-commit conn prev-commit)]
-          (recur commit-data commits*))
-        commits*))))
-
-
-(defn retrieve-genesis
-  [{:keys [config] :as db} db-key]
-  (let [read-fn (:read config)
-        doc     (-> db-key
-                    read-fn
-                    json-ld/expand)
-        t       (get-in doc [const/iri-t :value])]
-    (if (= 1 t)
-      doc
-
-      (do
-        (log/info "DB has no index service, retrieving blockchain of:" t "commits.")
-        ))
-    doc))
+        (if prev-commit
+          (let [commit-data (<? (read-commit conn prev-commit))]
+            (recur commit-data commits*))
+          commits*)))))
 
 
 ;; TODO - validate commit signatures
@@ -289,18 +249,20 @@
   "Run proof validation, if exists.
   Return actual commit data. In the case of a VerifiableCredential this is
   the `credentialSubject`."
-  [db commit]
-  commit)
+  [db commit proof]
+  ;; TODO - returning true for now
+  true)
 
 
 (defn load-db
   [{:keys [ledger] :as db} latest-commit]
   (go-try
     (let [{:keys [conn]} ledger
-          commits (trace-commits conn latest-commit)]
-      (reduce
-        (fn [db* [commit proof]]
-          (when proof
-            (validate-commit db* proof))
-          (merge-commit conn db* commit))
-        db commits))))
+          commits (<? (trace-commits conn latest-commit))]
+      (loop [[[commit proof] & r] commits
+             db* db]
+        (when proof
+          (validate-commit db* commit proof))
+        (if commit
+          (recur r (<? (merge-commit conn db* commit)))
+          db*)))))

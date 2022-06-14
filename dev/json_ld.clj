@@ -20,7 +20,7 @@
 
   (def ipfs-conn @(fluree/connect-ipfs
                     {:server  nil                           ;; use default
-                     :ipns    {:key "Fluree1"}              ;; publish to ipns by default using the provided key/profile
+                     :ipns    {:key "self"}                 ;; publish to ipns by default using the provided key/profile
                      :context {:id     "@id"
                                :type   "@type"
                                :schema "http://schema.org/"
@@ -32,8 +32,22 @@
                      :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}))
 
 
-  (def ledger @(fluree/create ipfs-conn "test/db1"
-                              {:id "fluree:ipns:k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"}))
+  (def ledger @(fluree/create ipfs-conn "test/db1" {:ipns {:key "self"}}))
+
+
+
+  ;; load ledger from disk
+  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipfs://QmXYRZbvaUMLycTtx7pNQVucvx9NsD1fAupGwG6uRt7PfL"))
+
+
+
+  @(fluree/query (fluree/db loaded-ledger)
+                 {:select {'?s [:* {:f/role [:*]}]}
+                  :where  [['?s :rdf/type :f/DID]]})
+
+
+
+  (def ledger @(fluree/create ipfs-conn "test/db1" {:ipns {:key "self"}}))
 
 
   @(fluree/query (fluree/db ledger)

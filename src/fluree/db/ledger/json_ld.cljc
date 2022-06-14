@@ -6,13 +6,12 @@
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.commit :as commit]
-            [fluree.db.util.log :as log]
             [fluree.db.json-ld.commit :as jld-commit]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
-            [fluree.db.method.ipfs.keys :as ipfs-keys]
-            [clojure.string :as str])
+            [clojure.string :as str]
+            [fluree.db.util.log :as log])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -125,7 +124,7 @@
                            :did         did*
                            :state       (atom {:branches branches
                                                :branch   branch
-                                               :graphs {}})
+                                               :graphs   {}})
                            :alias       ledger-alias
                            :address     address
                            :method      method-type
@@ -147,7 +146,7 @@
   [conn commit-address]
   (go-try
     (let [base-context {:base commit-address}
-          commit-data  (-> (conn-proto/-c-read conn commit-address)
+          commit-data  (-> (<? (conn-proto/-c-read conn commit-address))
                            (json-ld/expand base-context))
           [commit proof] (jld-reify/parse-commit commit-data)
           alias        (or (get-in commit [const/iri-alias :value])
@@ -159,7 +158,6 @@
           db           (ledger-proto/-db ledger)
           db*          (<? (jld-reify/load-db db commit-data))]
       (ledger-proto/-db-update ledger db*)
-
       ledger)))
 
 

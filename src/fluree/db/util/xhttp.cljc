@@ -86,22 +86,20 @@
        (throw (TimeoutException. (-> response :error :error/cause)))
        response)))
 
-
-(defn post-json
-  "Posts JSON content.
-  opts is a map with following optional keys:
-  :request-timeout - how many milliseconds until we throw an exception without a response (default 5000)"
+(defn post
+  "Posts pre-formatted message (e.g. already stringified JSON)."
   [url message opts]
-  (let [{:keys [request-timeout token headers keywordize-keys] :or {request-timeout 5000 keywordize-keys true}} opts
+  (let [{:keys [request-timeout token headers keywordize-keys json?]
+         :or   {request-timeout 5000
+                keywordize-keys true}} opts
         response-chan (async/chan)
-        headers       (cond-> {"Content-Type" "application/json"}
-                              headers (merge headers)
+        headers*      (cond-> headers
+                              json? (assoc "Content-Type" "application/json")
                               token (assoc "Authorization" (str "Bearer " token)))
-        multipart?    (contains? message :multipart)
-        base-req      (if multipart?
-                        (assoc message :multipart (mapv #(assoc % :content (json/stringify (:content %))) (:multipart message)))
-                        {:body (json/stringify message)})]
-    #?(:clj (http/post url (assoc base-req :headers headers
+        base-req      (if (contains? message :multipart)    ;; multipart requests need to be sent in special map structure
+                        message
+                        {:body message})]
+    #?(:clj (http/post url (assoc base-req :headers headers*
                                            :timeout request-timeout)
                        (fn [{:keys [error status body] :as response}]
                          (if (or error (< 299 status))
@@ -113,20 +111,36 @@
                                  url
                                  (or error (ex-info "error response"
                                                     response)))))
-                           (let [body (-> body bs/to-string (json/parse keywordize-keys))]
-                             (async/put! response-chan body)))))
+                           (let [data (cond-> (bs/to-string body)
+                                              json? (json/parse keywordize-keys))]
+                             (async/put! response-chan data)))))
        :cljs
             (-> axios
                 (.request (clj->js {:url     url
                                     :method  "post"
                                     :timeout request-timeout
-                                    :headers headers
+                                    :headers headers*
                                     :data    message}))
                 (.then (fn [resp]
-                         (async/put! response-chan (:data (js->clj resp :keywordize-keys keywordize-keys)))))
+                         (async/put! response-chan (if json?
+                                                     (:data (js->clj resp :keywordize-keys keywordize-keys))
+                                                     resp))))
                 (.catch (fn [err]
                           (async/put! response-chan (format-error-response url err))))))
     response-chan))
+
+
+(defn post-json
+  "Posts JSON content, returns parsed JSON response as core async channel.
+  opts is a map with following optional keys:
+  :request-timeout - how many milliseconds until we throw an exception without a response (default 5000)"
+  [url message opts]
+  (let [base-req (if (contains? message :multipart)
+                   (->> (:multipart message)                ;; stringify each :content key of multipart message
+                        (mapv #(assoc % :content (json/stringify (:content %))))
+                        (assoc message :multipart))
+                   {:body (json/stringify message)})]
+    (post url base-req (assoc opts :json? true))))
 
 
 (defn get

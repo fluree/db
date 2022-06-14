@@ -9,8 +9,7 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.commit :as commit]
-            [fluree.db.util.log :as log]
-            [fluree.db.json-ld.reify :as jld-reify])
+            [fluree.db.util.log :as log])
   (:refer-clojure :exclude [merge load]))
 
 #?(:clj (set! *warn-on-reflection* true))

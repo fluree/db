@@ -1,5 +1,6 @@
 (ns fluree.db.method.ipfs.core
   (:require [fluree.db.util.xhttp :as xhttp]
+            [fluree.db.method.ipfs.xhttp :as ipfs]
             #?(:clj  [org.httpkit.client :as client]
                :cljs ["axios" :as axios])
             [fluree.db.util.async :refer [<? go-try channel?]]
@@ -11,49 +12,6 @@
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-
-(defn get-json
-  [server block-id]
-  (log/debug "Retrieving json from IPFS cid:" block-id)
-  (let [url         (str server "api/v0/cat?arg=" block-id)
-        res #?(:clj @(client/post url {})
-               :cljs (let [res (atom nil)]
-                       (-> axios
-                           (.request (clj->js {:url  url
-                                               :post "post"
-                                               :data {}}))
-                           (.then (fn [resp] (reset! res resp)))
-                           (.catch (fn [err] (reset! res err))))
-                       @res))]
-    (try* (json/parse (:body res) false)
-          (catch* e (log/error e "JSON parse error for data: " (:body res))
-                  (throw e)))))
-
-
-(defn add-json
-  "Adds json from clojure data structure"
-  [ipfs-server json]
-  (let [endpoint (str ipfs-server "api/v0/add")
-        req      {:multipart [{:name        "json-ld"
-                               :content     json
-                               :contentType "application/ld+json"}]}]
-    #?(:clj  @(client/post endpoint req)
-       :cljs (let [res (atom nil)]
-               (-> axios
-                   (.request (clj->js {:url  endpoint
-                                       :post "post"
-                                       :data req}))
-                   (.then (fn [resp] (reset! res resp)))
-                   (.catch (fn [err] (reset! res err))))
-               @res))))
-
-
-(defn add
-  "Adds clojure data structure to IPFS by serializing first into JSON"
-  [ipfs-server data]
-  (let [json (json/stringify data)]
-    (add-json ipfs-server json)))
 
 (defn ipns-push
   "Adds json from clojure data structure"
@@ -69,23 +27,18 @@
                    (.catch (fn [err] (reset! res err))))
                @res))))
 
-
 (defn default-commit-fn
   "Default push function for IPFS"
   [ipfs-endpoint]
-  (fn
-    ([json]
-     (let [res  (add-json ipfs-endpoint json)
-           body (json/parse (:body res))
-           name (:Name body)]
-       (when-not name
-         (throw (ex-info (str "IPFS publish error, unable to retrieve IPFS name. Response object: " res)
-                         {:status 500 :error :db/push-ipfs})))
-       (str "fluree:ipfs://" name)))
-    ([json opts]
-     (throw (ex-info (str "IPFS commit does not support a second argument: opts.")
-                     {:status 500 :error :db/commit-ipfs-2})))))
-
+  (fn [json]
+    (log/warn "WRITING JSON: " (type json) json)
+    (go-try
+      (let [res (<? (ipfs/add ipfs-endpoint json))
+            {:keys [name]} res]
+        (when-not name
+          (throw (ex-info (str "IPFS publish error, unable to retrieve IPFS name. Response object: " res)
+                          {:status 500 :error :db/push-ipfs})))
+        (str "fluree:ipfs://" name)))))
 
 (defn default-push-fn
   "Default publish function updates IPNS record based on a
@@ -144,7 +97,4 @@
                      (#{"ipfs" "ipns"} method))
         (throw (ex-info (str "Invalid file type or method: " file-key)
                         {:status 500 :error :db/invalid-commit})))
-
-      (get-json ipfs-endpoint ipfs-cid))))
-
-
+      (ipfs/cat ipfs-endpoint ipfs-cid))))

@@ -292,15 +292,15 @@
           {:keys [did id-key db-key push?] :as opts*} (commit-opts db opts)]
       (let [{:keys [flakes] :as commit-data} (commit-meta db opts*)
             jld-graphs  (commit->graphs commit-data opts*)
-            graph-id    (conn-proto/-c-write conn (json-ld/normalize-data jld-graphs))
-            _           (log/warn "GRAPH ID:" graph-id)
+            graph-id    (<? (conn-proto/-c-write conn (json-ld/normalize-data jld-graphs)))
+            _           (log/info "New DB address:" graph-id)
             jld-commit  (commit->json-ld graph-id opts*)
             credential  (when did (cred/generate jld-commit opts*))
             doc         (json-ld/normalize-data (or credential jld-commit))
             ;; TODO: can we move these side effects outside of commit?
             ;; TODO: suppose we fail while c-write? while push?
-            id          (conn-proto/-c-write conn doc)
-            _           (log/info (str "DB commit address: " id))
+            id          (<? (conn-proto/-c-write conn doc))
+            _           (log/info (str "New Commit address: " id))
             publish-p   (when push?
                           (conn-proto/-push conn id))
             ;; TODO: should the hash be the tx-hash?
