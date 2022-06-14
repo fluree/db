@@ -54,13 +54,11 @@
     "
   [{:keys [method parallelism] :as opts}]
   ;; TODO - do some validation
-  (let [opts* (assoc opts :parallelism (or parallelism 4))]
-    (case method
-      :ipfs (ipfs-conn/connect opts*)
-      :file (file-conn/connect opts*)
-      ))
-
-  )
+  (promise-wrap
+    (let [opts* (assoc opts :parallelism (or parallelism 4))]
+      (case method
+        :ipfs (ipfs-conn/connect opts*)
+        :file (file-conn/connect opts*)))))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
@@ -83,9 +81,9 @@
     For multple directories deep, use '/' for a
     e.g. the ledgers movies/popular, books/authors, books/best-sellers could
     use the same IPNS id (in this example using IPNS DNSLink):
-    fluree:ipns:my.dns.com/books/authors
-    fluree:ipns:my.dns.com/books/best-sellers
-    fluree:ipns:my.dns.com/movies/top-rated
+    fluree:ipns://my.dns.com/books/authors
+    fluree:ipns://my.dns.com/books/best-sellers
+    fluree:ipns://my.dns.com/movies/top-rated
   - When combining multiple ledgers, each ledger becomes an individual named
     graph which can be referenced by name.
 
@@ -101,10 +99,10 @@
 
 (defn load
   "Loads a ledger defined with a Fluree address, e.g.:
-  fluree:ipfs:Qmaq4ip1bJq6255S5PhU8veo6gxaq2yyucKZmJkV1WW8YG
-  fluree:ipns:k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2
-  fluree:ipns:my.dns.com/movies/top-rated
-  fluree:local:my/db
+  fluree:ipfs://Qmaq4ip1bJq6255S5PhU8veo6gxaq2yyucKZmJkV1WW8YG
+  fluree:ipns://k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2
+  fluree:ipns://my.dns.com/movies/top-rated
+  fluree:local://my/db
   fluree:s3:...."
   ([address]
    ;; TODO - when given an address only, can create or retrieve from cache a conn

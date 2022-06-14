@@ -166,11 +166,10 @@
   (-c-read [_ commit-key] (read commit-key))
   (-c-write [_ commit-data] (commit commit-data))
 
-  conn-proto/NameService
-  (push [this commit-id] (push commit-id))
-  (push [this commit-id ledger] (push commit-id ledger))
-  (pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
-  (subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
+  conn-proto/iNameService
+  (-push [this ledger-data] (push ledger-data))
+  (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
+  (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
 
   conn-proto/iConnection
   (-close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))

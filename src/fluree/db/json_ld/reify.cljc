@@ -7,6 +7,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.json-ld.commit :as jld-commit]
             [fluree.db.ledger.proto :as ledger-proto]))
 
 ;; generates a db/ledger from persisted data
@@ -164,39 +165,55 @@
   [message commit-data]
   (throw (ex-info message {:status 400 :error :db/invalid-commit :commit commit-data})))
 
-(defn commit-t
+(defn db-t
   "Returns 't' value from commit data."
-  [commit-data]
-  (let [commit-t (get-in commit-data [const/iri-db const/iri-t :value])]
-    (when-not (pos-int? commit-t)
-      (commit-error (str "Invalid, or non existent 't' value inside commit: " commit-t) commit-data))
-    commit-t))
+  [db-data]
+  (let [db-t (get-in db-data [const/iri-t :value])]
+    (when-not (pos-int? db-t)
+      (commit-error (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
+    db-t))
 
-(defn commit-assert
-  [commit-data]
-  (let [commit-assert (get-in commit-data [const/iri-db const/iri-assert])]
+(defn db-assert
+  [db-data]
+  (let [commit-assert (get-in db-data [const/iri-assert])]
     ;; TODO - any basic validation required
     commit-assert))
 
-(defn commit-retract
-  [commit-data]
-  (let [commit-retract (get-in commit-data [const/iri-db const/iri-retract])]
+(defn db-retract
+  [db-data]
+  (let [commit-retract (get-in db-data [const/iri-retract])]
     ;; TODO - any basic validation required
     commit-retract))
 
+(defn parse-commit
+  [commit-data]
+  (let [cred-subj (get commit-data "https://www.w3.org/2018/credentials#credentialSubject")
+        commit    (or cred-subj commit-data)]
+    [commit (when cred-subj commit-data)]))
+
+(defn read-commit
+  [conn commit-address]
+  (let [file-data (conn-proto/-c-read conn commit-address)]
+    (json-ld/expand file-data)))
 
 (defn merge-commit
-  [db commit]
+  [conn db commit]
   (let [iris           (volatile! {})
         refs           (volatile! (-> db :schema :refs))
-        t              (- (commit-t commit))
-        assert         (commit-assert commit)
-        retract        (commit-retract commit)
+        db-id          (get-in commit [const/iri-db :id])
+        db-data        (read-commit conn db-id)
+        t              (- (db-t db-data))
+        assert         (db-assert db-data)
+        retract        (db-retract db-data)
         retract-flakes (retract-flakes db retract t iris)
         assert-flakes  (assert-flakes db assert t iris refs)
         all-flakes     (-> (empty (get-in db [:novelty :spot]))
                            (into retract-flakes)
                            (into assert-flakes))]
+    (when-not (= t (dec (:t db)))
+      (commit-error (str "Commit 't' values for referenced dbs out of sync. "
+                         "Expected t: " (- (dec (:t db))) " but found t: " (db-t db-data)
+                         " in referenced db: " db-id ".") commit))
     (when (empty? all-flakes)
       (commit-error "Commit has neither assertions or retractions!" commit))
     (merge-flakes db t @refs all-flakes)))
@@ -213,57 +230,42 @@
         commit     (or cred-subj file-data*)]
     [commit (when cred-subj file-data*)]))
 
-(defn parse-commit
-  [commit-data]
-  (let [cred-subj (get commit-data "https://www.w3.org/2018/credentials#credentialSubject")
-        commit    (or cred-subj commit-data)]
-    [commit (when cred-subj commit-data)]))
-
-(defn read-commit
-  [conn commit-address]
-  (let [file-data (conn-proto/-c-read conn commit-address)]
-    (json-ld/expand file-data)))
 
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of '1' and increment from there."
   [conn latest-commit]
   (loop [next-commit latest-commit
-         last-t      nil
+         ;last-t      nil
          commits     (list)]
     (let [[commit proof] (parse-commit next-commit)
-          t           (get-in commit [const/iri-db const/iri-t :value])
+          _           (log/warn "commit: " (pr-str commit))
+          db          (get-in commit [const/iri-db :id])
+          _           (log/warn "DB:::::: " db)
+          ;t           (get-in commit [const/iri-db const/iri-t :value])
           prev-commit (get-in commit [const/iri-prevCommit :id])
           commits*    (conj commits [commit proof])]
-      (when-not (int? t)
+      (when-not db
         (throw (ex-info (str "Commit is not a properly formatted Fluree commit: " next-commit ".")
                         {:status      500
                          :error       :db/invalid-commit
                          :commit-data (if (> (count (str commit)) 500)
                                         (str (subs (str commit) 0 500) "...")
                                         (str commit))})))
-      (when (and last-t
-                 (not= t (dec last-t)))
-        (throw (ex-info (str "Commit t values are inconsistent. Next expect t value is : "
-                             (dec last-t) " but instead found t value: " t ".")
-                        {:status      500
-                         :error       :db/invalid-commit
-                         :commit-data (if (> (count (str commit)) 500)
-                                        (str (subs (str commit) 0 500) "...")
-                                        (str commit))})))
-
-      (if prev-commit
-        (let [commit-data (read-commit conn prev-commit)]
-          (recur commit-data t commits*))
-        (if (= 1 t)
-          commits*
-          (throw (ex-info (str "Commit t values are inconsistent. Unable to get to t=1, instead "
-                               "only could get to t value:" t ".")
+      #_(when (and last-t
+                   (not= t (dec last-t)))
+          (throw (ex-info (str "Commit t values are inconsistent. Next expect t value is : "
+                               (dec last-t) " but instead found t value: " t ".")
                           {:status      500
                            :error       :db/invalid-commit
                            :commit-data (if (> (count (str commit)) 500)
                                           (str (subs (str commit) 0 500) "...")
-                                          (str commit))})))))))
+                                          (str commit))})))
+
+      (if prev-commit
+        (let [commit-data (read-commit conn prev-commit)]
+          (recur commit-data commits*))
+        commits*))))
 
 
 (defn retrieve-genesis
@@ -300,5 +302,5 @@
         (fn [db* [commit proof]]
           (when proof
             (validate-commit db* proof))
-          (merge-commit db* commit))
+          (merge-commit conn db* commit))
         db commits))))

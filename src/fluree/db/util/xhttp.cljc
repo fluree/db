@@ -92,14 +92,17 @@
   opts is a map with following optional keys:
   :request-timeout - how many milliseconds until we throw an exception without a response (default 5000)"
   [url message opts]
-  (let [{:keys [request-timeout token headers] :or {request-timeout 5000}} opts
+  (let [{:keys [request-timeout token headers keywordize-keys] :or {request-timeout 5000 keywordize-keys true}} opts
         response-chan (async/chan)
         headers       (cond-> {"Content-Type" "application/json"}
                               headers (merge headers)
-                              token (assoc "Authorization" (str "Bearer " token)))]
-    #?(:clj (http/post url {:headers headers
-                            :timeout request-timeout
-                            :body    (json/stringify message)}
+                              token (assoc "Authorization" (str "Bearer " token)))
+        multipart?    (contains? message :multipart)
+        base-req      (if multipart?
+                        (assoc message :multipart (mapv #(assoc % :content (json/stringify (:content %))) (:multipart message)))
+                        {:body (json/stringify message)})]
+    #?(:clj (http/post url (assoc base-req :headers headers
+                                           :timeout request-timeout)
                        (fn [{:keys [error status body] :as response}]
                          (if (or error (< 299 status))
                            (do
@@ -110,19 +113,19 @@
                                  url
                                  (or error (ex-info "error response"
                                                     response)))))
-                           (let [body (-> body bs/to-string json/parse)]
+                           (let [body (-> body bs/to-string (json/parse keywordize-keys))]
                              (async/put! response-chan body)))))
        :cljs
-       (-> axios
-           (.request (clj->js {:url     url
-                               :method  "post"
-                               :timeout request-timeout
-                               :headers headers
-                               :data    message}))
-           (.then (fn [resp]
-                    (async/put! response-chan (:data (js->clj resp :keywordize-keys true)))))
-           (.catch (fn [err]
-                     (async/put! response-chan (format-error-response url err))))))
+            (-> axios
+                (.request (clj->js {:url     url
+                                    :method  "post"
+                                    :timeout request-timeout
+                                    :headers headers
+                                    :data    message}))
+                (.then (fn [resp]
+                         (async/put! response-chan (:data (js->clj resp :keywordize-keys keywordize-keys)))))
+                (.catch (fn [err]
+                          (async/put! response-chan (format-error-response url err))))))
     response-chan))
 
 
@@ -218,8 +221,8 @@
                :cljs (.send ws msg))
             (async/put! resp-chan true)
             (catch* e
-              (log/error e "Error sending websocket message:" msg)
-              (async/put! resp-chan false)))
+                    (log/error e "Error sending websocket message:" msg)
+                    (async/put! resp-chan false)))
           (recur))))))
 
 

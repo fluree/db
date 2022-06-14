@@ -4,11 +4,10 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
-            [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.flake :as flake]))
+            [fluree.db.flake :as flake]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -169,30 +168,3 @@
         (update-in [:novelty :size] + size)
         (update-in [:stats :size] + size)
         (update-in [:stats :flakes] + (count base-flakes)))))
-
-
-(comment
-
-  (fluree-account-id?
-    (-> (crypto/generate-key-pair)
-        :public
-        (crypto/account-id-from-public)))
-
-  (-> (crypto/generate-key-pair)
-      :public)
-
-  (public-key? "0262143b68820f04ba0aba3dcbe473600f513170af6dac63138362a40b9518d0a")
-
-  (reduce
-    (fn [acc i]
-      (let [id      (-> (crypto/generate-key-pair)
-                        :public
-                        (crypto/account-id-from-public))
-            n       (count id)
-            first-c (subs id 0 1)]
-        (-> acc
-            (update :starts conj first-c)
-            (update n (fn [n*] (if (nil? n*) 1 (inc n*)))))))
-    {:starts #{}} (range 100000))
-
-  )

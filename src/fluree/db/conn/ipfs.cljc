@@ -10,28 +10,39 @@
             #?(:clj  [clojure.core.async :as async :refer [go <!]]
                :cljs [cljs.core.async :as async :refer [go <!]])
             [fluree.db.conn.state-machine :as state-machine]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]))
+            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
+            [fluree.db.method.ipfs.keys :as ipfs-keys]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; IPFS Connection object
+
+(defn lookup-address
+  "Returns IPNS address for a given key."
+  [{:keys [ipfs-endpoint ipns-default-address] :as _conn} key]
+  (if key
+    (ipfs-keys/address ipfs-endpoint key)
+    (async/go ipns-default-address)))
 
 (defrecord IPFSConnection [id transactor? memory state
                            context did async-cache
                            local-read local-write
                            read write push
                            parallelism close-fn
-                           msg-in-ch msg-out-ch]
+                           msg-in-ch msg-out-ch
+                           ipfs-endpoint
+                           ipns-default-key ipns-default-address]
 
   conn-proto/iCommit
   (-c-read [_ commit-key] (read commit-key))
   (-c-write [_ commit-data] (write commit-data))
 
-  conn-proto/NameService
-  (push [this commit-id] (push commit-id))
-  (push [this commit-id ledger] (push commit-id ledger))
-  (pull [this ledger] :TODO)
-  (subscribe [this ledger] :TODO)
+  conn-proto/iNameService
+  (-push [this ledger-data] (push ledger-data))
+  (-pull [this ledger] :TODO)
+  (-subscribe [this ledger] :TODO)
+  (-address [this] (lookup-address this nil))
+  (-address [this key] (lookup-address this key))
 
   conn-proto/iConnection
   (-close [_]
@@ -128,35 +139,48 @@
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [server context did local-read local-write parallelism async-cache memory] :as opts}]
-  (let [memory             (or memory 1000000)              ;; default 1MB memory
-        conn-id            (str (util/random-uuid))
-        read               (ipfs/default-read-fn server)
-        write              (ipfs/default-commit-fn server)
-        push               (ipfs/default-push-fn server)
-        state              (state-machine/blank-state)
-        memory-object-size (quot memory 100000)             ;; avg 100kb per cache object
-        _                  (when (< memory-object-size 10)
-                             (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
+  [{:keys [server context did local-read local-write parallelism async-cache memory ipns]
+    :or   {server "http://127.0.0.1:5001/"}
+    :as   opts}]
+  (go-try
+    (let [ipfs-endpoint        (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
+          ipns-default-key     (or (:key ipns) "self")
+          ipns-default-address (<? (ipfs-keys/address ipfs-endpoint ipns-default-key))
+          _                    (when-not ipns-default-address
+                                 (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
+                                                      ipns-default-key)
+                                                 {:status 400 :error :db/ipfs-keys})))
+          memory               (or memory 1000000)          ;; default 1MB memory
+          conn-id              (str (util/random-uuid))
+          read                 (ipfs/default-read-fn ipfs-endpoint)
+          write                (ipfs/default-commit-fn ipfs-endpoint)
+          push                 (ipfs/default-push-fn ipfs-endpoint)
+          state                (state-machine/blank-state)
+          memory-object-size   (quot memory 100000)         ;; avg 100kb per cache object
+          _                    (when (< memory-object-size 10)
+                                 (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
 
-        default-cache-atom (atom (default-object-cache-factory memory-object-size))
-        async-cache-fn     (or async-cache
-                               (default-async-cache-fn default-cache-atom))
-        close-fn           (constantly (log/info (str "Memory Connection " conn-id " Closed")))]
-    ;; TODO - need to set up monitor loops for async chans
-    (map->IPFSConnection {:id          conn-id
-                          :transactor? false
-                          :context     context
-                          :did         did
-                          :local-read  local-read
-                          :local-write local-write
-                          :read        read
-                          :write       write
-                          :push        push
-                          :parallelism parallelism
-                          :msg-in-ch   (async/chan)
-                          :msg-out-ch  (async/chan)
-                          :close       close-fn
-                          :memory      true
-                          :state       state
-                          :async-cache async-cache-fn})))
+          default-cache-atom   (atom (default-object-cache-factory memory-object-size))
+          async-cache-fn       (or async-cache
+                                   (default-async-cache-fn default-cache-atom))
+          close-fn             (constantly (log/info (str "Memory Connection " conn-id " Closed")))]
+      ;; TODO - need to set up monitor loops for async chans
+      (map->IPFSConnection {:id                   conn-id
+                            :ipfs-endpoint        ipfs-endpoint
+                            :ipns-default-key     ipns-default-key
+                            :ipns-default-address ipns-default-address
+                            :transactor?          false
+                            :context              context
+                            :did                  did
+                            :local-read           local-read
+                            :local-write          local-write
+                            :read                 read
+                            :write                write
+                            :push                 push
+                            :parallelism          parallelism
+                            :msg-in-ch            (async/chan)
+                            :msg-out-ch           (async/chan)
+                            :close                close-fn
+                            :memory               true
+                            :state                state
+                            :async-cache          async-cache-fn}))))

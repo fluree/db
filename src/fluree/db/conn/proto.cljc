@@ -22,8 +22,9 @@
   (-c-write [conn commit-data] "Writes a commit to storage")
   )
 
-(defprotocol NameService
-  (push [conn commit-id] [conn commit-id ledger] "Pushes commit reference to all name service destinations")
-  (pull [conn ledger] "Performs a pull operation from all name service destinations")
-  (subscribe [conn ledger] "Creates a subscription to nameservice(s) for ledger events")
+(defprotocol iNameService
+  (-push [conn ledger-data] "Pushes ledger metadata to all name service destinations")
+  (-pull [conn ledger-address] "Performs a pull operation from all name service destinations")
+  (-subscribe [conn ledger] "Creates a subscription to nameservice(s) for ledger events")
+  (-address [conn] [conn key] "Returns base address/iri for a ledger given a key for lookup. If no key provided, returns defult if exists.")
   )

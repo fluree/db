@@ -149,6 +149,10 @@
                            {:iri  "@type"
                             :ref? true
                             :idx? true
+                            :id   200}
+                           {:iri  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                            :ref? true
+                            :idx? true
                             :id   200})
                      hash-map-both-id-iri)
      :prefix     {}

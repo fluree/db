@@ -10,7 +10,9 @@
             [fluree.db.json-ld.commit :as jld-commit]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
-            [fluree.db.json-ld.reify :as jld-reify])
+            [fluree.db.json-ld.reify :as jld-reify]
+            [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [clojure.string :as str])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -59,7 +61,7 @@
     (jld-commit/commit ledger db opts*)))
 
 
-(defrecord JsonLDLedger [id alias context did
+(defrecord JsonLDLedger [address alias context did
                          state cache conn
                          method reindex-min reindex-max]
   commit/iCommit
@@ -78,46 +80,65 @@
   (-status [ledger branch] (status ledger branch))
   (-did [_] did)
   (-alias [_] alias)
-  (-id [_] id))
+  (-address [_] address))
 
+(defn normalize-address
+  "Creates a full IRI from a base-address and ledger alias.
+  Assumes ledger-alias is already normalized via 'normalize-alias'"
+  [base-address ledger-alias]
+  (let [base-address* (if (str/ends-with? base-address "/")
+                        base-address
+                        (str base-address "/"))]
+    (str "fluree:ipns://" base-address* ledger-alias)))
+
+(defn normalize-alias
+  "For a ledger alias, removes any preceding '/' or '#' if exists."
+  [ledger-alias]
+  (if (or (str/starts-with? ledger-alias "/")
+          (str/starts-with? ledger-alias "#"))
+    (subs ledger-alias 1)
+    ledger-alias))
 
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [context did branch pub-fn id blank?]
+    (let [{:keys [context did branch pub-fn blank? ipns]
            :or   {branch :main}} opts
-          did*         (if did
-                         (if (map? did)
-                           did
-                           {:id did})
-                         (conn-proto/-did conn))
-          context*     (or context (conn-proto/-context conn))
-          method-type  (conn-proto/-method conn)
-          default-push (fn [])
+          did*          (if did
+                          (if (map? did)
+                            did
+                            {:id did})
+                          (conn-proto/-did conn))
+          ledger-alias* (normalize-alias ledger-alias)
+          base-address  (if-let [ipns-key (:key ipns)]
+                          (<? (conn-proto/-address conn ipns-key))
+                          (<? (conn-proto/-address conn)))
+          address       (normalize-address base-address ledger-alias*)
+          context*      (or context (conn-proto/-context conn))
+          method-type   (conn-proto/-method conn)
+          default-push  (fn [])
           ;; map of all branches and where they are branched from
-          branches     {branch (branch/new-branch-map nil branch)}
-          ledger       (map->JsonLDLedger
-                         {:context     context*
-                          :did         did*
-                          :state       (atom {:branches branches
-                                              :branch   branch
-                                              :pub-fn   nil
-                                              ;; pub-locs is map of locations to state-map (like latest committed 't' val)
-                                              :pub-locs {}})
-                          :alias       ledger-alias
-                          :id          id
-                          :method      method-type
-                          :cache       (atom {})
-                          :reindex-min 100000
-                          :reindex-max 1000000
-                          :conn        conn})
-          blank-db     (jld-db/create ledger)
-          bootstrap?   (and (not blank?)
-                            (or context* did*))
-          db           (if bootstrap?
-                         (<? (bootstrap/bootstrap blank-db context* (:id did*)))
-                         (bootstrap/blank-db blank-db))]
+          branches      {branch (branch/new-branch-map nil branch)}
+          ledger        (map->JsonLDLedger
+                          {:context     context*
+                           :did         did*
+                           :state       (atom {:branches branches
+                                               :branch   branch
+                                               :graphs {}})
+                           :alias       ledger-alias
+                           :address     address
+                           :method      method-type
+                           :cache       (atom {})
+                           :reindex-min 100000
+                           :reindex-max 1000000
+                           :conn        conn})
+          blank-db      (jld-db/create ledger)
+          bootstrap?    (and (not blank?)
+                             (or context* did*))
+          db            (if bootstrap?
+                          (<? (bootstrap/bootstrap blank-db context* (:id did*)))
+                          (bootstrap/blank-db blank-db))]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
       ledger)))

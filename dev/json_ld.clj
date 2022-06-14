@@ -18,17 +18,18 @@
 
 (comment
 
-  (def ipfs-conn (fluree/connect-ipfs
-                   {:server  nil                            ;; use default
-                    :context {:id     "@id"
-                              :type   "@type"
-                              :schema "http://schema.org/"
-                              :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-                              :rdfs   "http://www.w3.org/2000/01/rdf-schema#"
-                              :wiki   "https://www.wikidata.org/wiki/"
-                              :skos   "http://www.w3.org/2008/05/skos#"
-                              :f      "https://ns.flur.ee/ledger#"}
-                    :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}))
+  (def ipfs-conn @(fluree/connect-ipfs
+                    {:server  nil                           ;; use default
+                     :ipns    {:key "Fluree1"}              ;; publish to ipns by default using the provided key/profile
+                     :context {:id     "@id"
+                               :type   "@type"
+                               :schema "http://schema.org/"
+                               :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                               :rdfs   "http://www.w3.org/2000/01/rdf-schema#"
+                               :wiki   "https://www.wikidata.org/wiki/"
+                               :skos   "http://www.w3.org/2008/05/skos#"
+                               :f      "https://ns.flur.ee/ledger#"}
+                     :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}))
 
 
   (def ledger @(fluree/create ipfs-conn "test/db1"
@@ -92,7 +93,7 @@
       :commit)
 
   ;; load ledger from disk
-  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipfs:QmeqwDf5KvqbsiceujuWypVJeb8zXL3251grEczcSDw82D"))
+  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipfs://QmSkVU9qDqVkXrCF9FAHCw8ywNqHmu1nCNLJpHHr8GPniE"))
 
   @(fluree/query (fluree/db loaded-ledger)
                  {:select [:* {:schema/isBasedOn [:*]}]
