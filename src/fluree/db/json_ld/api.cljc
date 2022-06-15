@@ -8,7 +8,6 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.dbproto :as db-proto]
-            [fluree.db.commit :as commit]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [merge load]))
 
@@ -156,18 +155,18 @@
   distributed rules."
   ([db]
    (promise-wrap
-     (commit/-commit! db)))
+     (ledger-proto/-commit! db)))
   ([ledger-or-db db-or-opts]
    (let [[ledger db opts] (if (db-proto/db? ledger-or-db)
                             [nil ledger-or-db db-or-opts]
                             [ledger-or-db db-or-opts nil])
          res-ch (if ledger
                   (commit! ledger db opts)
-                  (commit/-commit! db opts))]
+                  (ledger-proto/-commit! db opts))]
      (promise-wrap res-ch)))
   ([ledger db opts]
    (promise-wrap
-     (commit/-commit! ledger db opts))))
+     (ledger-proto/-commit! ledger db opts))))
 
 
 (defn status

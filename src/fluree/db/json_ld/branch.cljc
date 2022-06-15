@@ -34,15 +34,16 @@
          :or   {commit 0, t 0, dbs (list)}} current-branch
         ;; is current branch uncommitted? If so, when committing new branch we must commit current-branch too
         uncommitted? (and t (> t commit))]
-    {:name      branch-name
-     :t         t
-     :commit    commit                                      ;;  't' value of latest commit
-     :idx       idx
-     :latest-db nil                                         ;; latest staged db (if different from commit-db)
-     :commit-db nil                                         ;; latest committed db
-     :from      (-> current-branch
-                    (select-keys [:name :t])
-                    (assoc :uncommitted? uncommitted?))}))
+    {:name        branch-name
+     :t           t
+     :commit      commit                                    ;;  't' value of latest commit
+     :commit-meta nil                                       ;; commit metadata used by ledger method (e.g. ipfs) to store relevant metadata specific to the method
+     :idx         idx
+     :latest-db   nil                                       ;; latest staged db (if different from commit-db)
+     :commit-db   nil                                       ;; latest committed db
+     :from        (-> current-branch
+                      (select-keys [:name :t])
+                      (assoc :uncommitted? uncommitted?))}))
 
 (defn update-db
   "Updates the latest staged db and returns new branch data."
@@ -60,12 +61,13 @@
                         {:status 500 :error :db/invalid-time}))))))
 
 (defn update-commit
-  [{:keys [commit] :as branch-data} db force?]
+  [branch-data {:keys [commit] :as db} force?]
   (let [{db-t :t} db
-        next-t? (= db-t (dec commit))]
+        next-t? (= db-t (dec (:commit branch-data)))
+        {:keys [meta]} commit]
     (when-not (or next-t?
                   (zero? db-t))                             ;; zero db-t is bootstrapping, which we allow bootstrap tx at zero
-      (throw (ex-info (str "Commit failed, latest committed db is " commit
+      (throw (ex-info (str "Commit failed, latest committed db is " (:commit branch-data)
                            " and you are trying to commit at db at t value of: "
                            db-t ". These should be one apart. Likely db was "
                            "updated by another user or process.")
@@ -73,6 +75,7 @@
     (-> branch-data
         (update-db db)
         (assoc :commit db-t)
+        (assoc :commit-meta meta)
         (assoc :commit-db db))))
 
 (defn latest-db

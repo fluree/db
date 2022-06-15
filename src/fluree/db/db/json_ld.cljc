@@ -1,5 +1,6 @@
 (ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
@@ -15,8 +16,7 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.json-ld.transact :as jld-transact]
-            [fluree.db.commit :as commit])
+            [fluree.db.json-ld.transact :as jld-transact])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -389,7 +389,12 @@
   "Commits a db to ledger. Extracts ledger from db object"
   [db opts]
   (let [ledger (:ledger db)]
-    (commit/-commit! ledger db opts)))
+    (ledger-proto/-commit! ledger db opts)))
+
+(defn push!
+  [db commit-meta]
+  (let [ledger (:ledger db)]
+    (ledger-proto/-push! ledger commit-meta)))
 
 
 ;; ================ end GraphDB record support fns ============================
@@ -400,9 +405,10 @@
                      spot psot post opst tspo
                      schema comparators novelty
                      permissions ecount]
-  commit/iCommit
+  ledger-proto/iCommit
   (-commit! [db] (commit! db nil))
   (-commit! [db opts] (commit! db opts))
+  (-push! [db commit-meta] (push! db commit-meta))
 
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))

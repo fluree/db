@@ -33,7 +33,7 @@
                            ipfs-endpoint
                            ipns-default-key ipns-default-address]
 
-  conn-proto/iCommit
+  conn-proto/iStorage
   (-c-read [_ commit-key] (read commit-key))
   (-c-write [_ commit-data] (write commit-data))
 

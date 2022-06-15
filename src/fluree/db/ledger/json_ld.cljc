@@ -5,12 +5,12 @@
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.commit :as commit]
             [fluree.db.json-ld.commit :as jld-commit]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
+            [fluree.db.method.ipfs.push :as ipfs-push]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [load]))
 
@@ -43,8 +43,12 @@
 
 (defn commit-update
   "Updates both latest db and commit db."
-  [{:keys [state] :as _ledger} branch db force?]
-  (swap! state update-in [:branches branch] branch/update-commit db force?))
+  [{:keys [state] :as _ledger} branch-name db force?]
+  (when-not (get-in @state [:branches branch-name])
+    (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
+                         "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
+                    {:status 400 :error :db/invalid-branch})))
+  (swap! state update-in [:branches branch-name] branch/update-commit db force?))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -54,18 +58,30 @@
       (get branches requested-branch)
       (get branches branch))))
 
+(defn normalize-opts
+  "Normalizes commit options"
+  [opts]
+  (if (string? opts)
+    {:message opts}
+    opts))
+
 (defn commit!
   [ledger db opts]
-  (let [opts* (commit/normalize-opts opts)]
+  (let [opts* (normalize-opts opts)]
     (jld-commit/commit ledger db opts*)))
+
+(defn push!
+  [ledger commit-meta]
+  (ipfs-push/push! ledger commit-meta))
 
 
 (defrecord JsonLDLedger [address alias context did
                          state cache conn
                          method reindex-min reindex-max]
-  commit/iCommit
+  ledger-proto/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
+  (-push! [ledger commit-meta] (push! ledger commit-meta))
 
   ledger-proto/iLedger
   (-db [ledger] (db ledger nil))
@@ -116,7 +132,6 @@
           address       (normalize-address base-address ledger-alias*)
           context*      (or context (conn-proto/-context conn))
           method-type   (conn-proto/-method conn)
-          default-push  (fn [])
           ;; map of all branches and where they are branched from
           branches      {branch (branch/new-branch-map nil branch)}
           ledger        (map->JsonLDLedger
@@ -124,7 +139,11 @@
                            :did         did*
                            :state       (atom {:branches branches
                                                :branch   branch
-                                               :graphs   {}})
+                                               :graphs   {}
+                                               :push     {:complete {:t   0
+                                                                     :dag nil}
+                                                          :pending  {:t   0
+                                                                     :dag nil}}})
                            :alias       ledger-alias
                            :address     address
                            :method      method-type

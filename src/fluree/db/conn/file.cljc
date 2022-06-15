@@ -162,7 +162,7 @@
                            rename exists?
                            parallelism close-fn
                            msg-in-ch msg-out-ch]
-  conn-proto/iCommit
+  conn-proto/iStorage
   (-c-read [_ commit-key] (read commit-key))
   (-c-write [_ commit-data] (commit commit-data))
 

@@ -192,8 +192,7 @@
      :branch         branch
      :branch-name    (util/keyword->str (branch/name branch))
      :id-key         (json-ld/compact "@id" compact-fn)
-     :type-key       (json-ld/compact "@type" compact-fn)
-     :db-key         (json-ld/compact const/iri-db compact-fn)}))
+     :type-key       (json-ld/compact "@type" compact-fn)}))
 
 
 (defn db-json->db-id
@@ -285,30 +284,26 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  ;; TODO: error handling - if a commit fails we need to stop immediately
-  [{:keys [conn] :as ledger} db opts]
+  [{:keys [conn state] :as ledger} db opts]
   (go-try
     (let [{:keys [branch commit t]} db
-          {:keys [did id-key db-key push?] :as opts*} (commit-opts db opts)]
+          {:keys [did id-key push? branch-name] :as opts*} (commit-opts db opts)]
       (let [{:keys [flakes] :as commit-data} (commit-meta db opts*)
             jld-graphs  (commit->graphs commit-data opts*)
-            graph-id    (<? (conn-proto/-c-write conn (json-ld/normalize-data jld-graphs)))
-            _           (log/info "New DB address:" graph-id)
-            jld-commit  (commit->json-ld graph-id opts*)
+            graph-res   (<? (conn-proto/-c-write conn (json-ld/normalize-data jld-graphs)))
+            _           (log/info "New DB address:" (:address graph-res))
+            jld-commit  (commit->json-ld (:address graph-res) opts*)
             credential  (when did (cred/generate jld-commit opts*))
             doc         (json-ld/normalize-data (or credential jld-commit))
-            ;; TODO: can we move these side effects outside of commit?
-            ;; TODO: suppose we fail while c-write? while push?
-            id          (<? (conn-proto/-c-write conn doc))
-            _           (log/info (str "New Commit address: " id))
-            publish-p   (when push?
-                          (conn-proto/-push conn id))
-            ;; TODO: should the hash be the tx-hash?
-            branch-name (branch/name branch)
-            db*         (assoc db :commit {:t      t
-                                           :dbid   (get-in jld-commit [db-key id-key])
-                                           :commit id
-                                           :branch branch-name
-                                           :ledger publish-p})]
-        (ledger-proto/-commit-update ledger branch-name db*)
+            commit-res  (<? (conn-proto/-c-write conn doc))
+            _           (log/info (str "New Commit address: " (:address commit-res)))
+            commit-data {:t       t
+                         :dbid    (get jld-graphs id-key)   ;; sha address for database
+                         :address (:address commit-res)     ;; full address for commit (e.g. fluree:ipfs://...)
+                         :meta    (assoc commit-res :db graph-res) ;; additional metadata for ledger method (e.g. ipfs)
+                         :branch  branch-name}
+            db*         (assoc db :commit commit-data)]     ;; branch published to
+        (ledger-proto/-commit-update ledger (keyword branch-name) db*)
+        (when push?
+          (ledger-proto/-push! ledger (assoc commit-data :ledger-state state)))
         db*))))

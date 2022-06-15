@@ -2,7 +2,7 @@
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.xhttp :as xhttp]
             [fluree.db.util.log :as log])
-  (:refer-clojure :exclude [list]))
+  (:refer-clojure :exclude [list key]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -33,7 +33,15 @@
     (let [key-map (<? (list ipfs-endpoint))]
       (address* key-map key))))
 
+(defn key
+  "Returns the IPNS key for a specific address (opposite of address)"
+  [ipfs-endpoint address]
+  (go-try
+    (let [key-map (<? (list ipfs-endpoint))]
+      (some (fn [[key addr]] (when (= address addr) key)) key-map))))
+
 (comment
   (clojure.core.async/<!! (list "http://127.0.0.1:5001/"))
+  (clojure.core.async/<!! (key "http://127.0.0.1:5001/" "k51qzi5uqu5dllaos3uy3sx0o8gw221tyaiu2qwmgdzy5lofij0us0h4ai41az"))
 
   )

@@ -17,7 +17,7 @@
   (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger")
   )
 
-(defprotocol iCommit
+(defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
   (-c-write [conn commit-data] "Writes a commit to storage")
   )

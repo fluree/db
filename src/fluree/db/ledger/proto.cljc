@@ -2,6 +2,11 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defprotocol iCommit
+  ;; retrieving/updating DBs
+  (-commit! [db] [ledger-or-db db-or-opts] [ledger db opts] "Commits a db to a ledger.")
+  (-push! [ledger-or-db commit-meta] "Pushes updates to namespace"))
+
 (defprotocol iLedger
   ;; retrieving/updating DBs
   (-db [ledger] [ledger opts] "Returns queryable db with specified options")

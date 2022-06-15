@@ -66,35 +66,27 @@
     (xhttp/post-json url nil {:keywordize-keys false})))
 
 
-#_(defn add-directory
-    [ipfs-endpoint data]
-    (let [endpoint   (str ipfs-endpoint "api/v0/add")
-          directory  "blah"
-          ledgername "here"
-          json       (json/stringify data)
-          req        {:multipart [{:name        "file"
-                                   :content     json
-                                   :filename    (str directory "%2F" ledgername)
-                                   :contentType "application/ld+json"}
-                                  {:name        "file"
-                                   :content     ""
-                                   :filename    directory
-                                   :contentType "application/x-directory"}]}]
-      #?(:clj  @(client/post endpoint req)
-         :cljs (let [res (atom nil)]
-                 (-> axios
-                     (.request (clj->js {:url  endpoint
-                                         :post "post"
-                                         :data req}))
-                     (.then (fn [resp] (reset! res resp)))
-                     (.catch (fn [err] (reset! res err))))
-                 @res))))
+(defn publish
+  "Publishes ipfs-cid to IPNS server using specified IPNS address key.
+  Returns core async channel with response."
+  [ipfs-endpoint ipfs-cid key]
+  (log/debug "Publishing IPNS update for key:" key "with IPFS CID:" ipfs-cid)
+  (go-try
+    (let [endpoint (cond-> (str ipfs-endpoint "api/v0/name/publish?")
+                           key (str "key=" key "&")
+                           true (str "arg=" ipfs-cid))
+          {:keys [Name Value]} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
+      {:name  Name
+       :value Value})))
 
 
 (comment
 
   (clojure.core.async/<!!
     (cat "http://127.0.0.1:5001/" "/ipfs/QmXh2W5GPnocpiyFYtQKu4cPLDSwdDELYRTyZkhMSKx7vj"))
+
+  (clojure.core.async/<!!
+    (publish "http://127.0.0.1:5001/" "/ipfs/QmPTXAvmWrmcbqAPxY82N6nRcLUyEWP51UZVtq15CDMVYs" "Fluree1"))
 
   (clojure.core.async/<!!
     (xhttp/post-json "http://127.0.0.1:5001/api/v0/cat?arg=/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2" nil {:keywordize-keys false}))
