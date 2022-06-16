@@ -1,4 +1,4 @@
-{:deps  {org.clojure/clojure             {:mvn/version "1.10.3"}
+{:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
          org.clojure/clojurescript       {:mvn/version "1.11.4"}
          org.clojure/core.async          {:mvn/version "1.5.648"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
@@ -8,7 +8,7 @@
          environ/environ                 {:mvn/version "1.2.0"}
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.10.2"}
-         instaparse/instaparse           {:mvn/version "1.4.10"}
+         instaparse/instaparse           {:mvn/version "1.4.12"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
@@ -36,14 +36,14 @@
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
-         org.babashka/sci                {:mvn/version "0.3.1"}}
+         org.babashka/sci                {:mvn/version "0.3.4"}}
 
  :paths ["src" "resources"]
 
  :aliases
  {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version     "1.0.0-rc34" ; Change this down in the docs alias too!
+  :mvn/version     "2.0.0-alpha2" ; Change this down in the docs alias too!
 
   :dev
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
@@ -66,7 +66,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.63.998"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.66.1034"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -108,7 +108,7 @@
                 :name        com.fluree/db
                 ;; TODO: Eliminate this copy of the version string
                 ;; I think that tools.build might be the best way to do that
-                :version     "1.0.0-rc34"
+                :version     "2.0.0-alpha2"
                 :output-path "docs"}}
 
   :deploy
@@ -121,7 +121,7 @@
 
   :coverage
   {:extra-paths ["test"]
-   :extra-deps  {cloverage/cloverage {:mvn/version "1.2.2"}}
+   :extra-deps  {cloverage/cloverage {:mvn/version "1.2.3"}}
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
@@ -135,5 +135,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.02.09"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.04.25"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}

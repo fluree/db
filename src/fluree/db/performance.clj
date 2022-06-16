@@ -98,21 +98,21 @@
    "SELECT DISTINCT ?horse ?horseLabel ?mother \n{\n    ?horse wdt:P31/wdt:P279* wd:Q726 .    \n    OPTIONAL{?horse wdt:P25 ?mother .}\n}"])
 
 (defn add-and-delete-data
-  [conn dbid]
+  [conn ledger-id]
   (let [txn       [{:_id "person" :favNums [1]}]
-        res       (fdb/transact conn dbid txn)
+        res       (fdb/transact conn ledger-id txn)
         _id       (-> res :tempids (get "person$1"))
         deleteTxn [{:_id _id :_action "delete"}]
-        deleteRes (fdb/transact conn dbid deleteTxn)]
+        deleteRes (fdb/transact conn ledger-id deleteTxn)]
     deleteRes))
 
 (defn add-and-update-data
-  [conn dbid]
+  [conn ledger-id]
   (let [txn       [{:_id "person" :favNums [1]}]
-        res       (fdb/transact conn dbid txn)
+        res       (fdb/transact conn ledger-id txn)
         _id       (-> res :tempids (get "person$1"))
         updateTxn [{:_id _id :favNums [2]}]
-        updateRes (fdb/transact conn dbid updateTxn)]
+        updateRes (fdb/transact conn ledger-id updateTxn)]
     updateRes))
 
 (defn time-return-data
@@ -140,19 +140,19 @@
        coll))
 
 (defn add-schema-performance-check
-  [conn dbid]
+  [conn ledger-id]
   (let [collections (-> "basicschema/collections.edn" io/resource slurp read-string)
-        coll-txn    (time-return-data fdb/transact conn dbid collections)
+        coll-txn    (time-return-data fdb/transact conn ledger-id collections)
         predicates  (-> "basicschema/predicates.edn" io/resource slurp read-string)
-        pred-txn    (time-return-data fdb/transact conn dbid predicates)
+        pred-txn    (time-return-data fdb/transact conn ledger-id predicates)
         data        (-> "basicschema/data.edn" io/resource slurp read-string)
-        data-txn    (time-return-data fdb/transact conn dbid data)]
+        data-txn    (time-return-data fdb/transact conn ledger-id data)]
     (concat [coll-txn] pred-txn data-txn)))
 
 (defn performance-check
   "NOTE: This performance check will take more than an hour."
-  [conn dbid]
-  (let [myDb                   (fdb/db conn dbid)
+  [conn ledger-id]
+  (let [myDb                   (fdb/db conn ledger-id)
         query-bench            (test-queries myDb fdb/query query-coll)
         _                      (log/info "Query bench results: " query-bench)
         analytical-query-bench (test-queries myDb fdb/query analytical-query-coll)
@@ -163,17 +163,17 @@
         _                      (log/info "History query bench results" history-query-bench)
         sparql-query-bench     (test-queries myDb fdb/sparql-async sparql-query-coll)
         _                      (log/info "SPARQL query bench results: " sparql-query-bench)
-        graphql-query-bench    (test-queries myDb (fn [db q] (fdb/graphql-async conn dbid q)) graphql-query-coll)
+        graphql-query-bench    (test-queries myDb (fn [db q] (fdb/graphql-async conn ledger-id q)) graphql-query-coll)
         _                      (log/info "GraphQL query bench results:" graphql-query-bench)
         multi-query-bench      (test-queries myDb fdb/multi-query-async multi-query-coll)
         _                      (log/info "Multi-query bench results: " multi-query-bench)
-        add-data-bench         (->> (criterium/benchmark (fdb/transact conn dbid [{:_id "person" :favNums [1]}]) nil)
+        add-data-bench         (->> (criterium/benchmark (fdb/transact conn ledger-id [{:_id "person" :favNums [1]}]) nil)
                                     (format-res :addData))
         _                      (log/info "Add data bench: " add-data-bench)
-        add-update-bench       (->> (criterium/benchmark (add-and-update-data conn dbid) nil)
+        add-update-bench       (->> (criterium/benchmark (add-and-update-data conn ledger-id) nil)
                                     (format-res :addUpdateData))
         _                      (log/info "Add and update data bench: " add-update-bench)
-        add-delete-bench       (->> (criterium/benchmark (add-and-delete-data conn dbid) nil)
+        add-delete-bench       (->> (criterium/benchmark (add-and-delete-data conn ledger-id) nil)
                                     (format-res :addDeleteData))
         _                      (log/info "Add and delete data bench: " add-delete-bench)
         res                    (reduce (fn [acc res] (assoc acc (-> (:issued res)
@@ -184,10 +184,6 @@
                                                   multi-query-bench add-data-bench
                                                   add-update-bench add-delete-bench))]
     res))
-
-(defn abs
-  [n]
-  (if (<= 0 n) n (* -1 n)))
 
 (defn compare-results
   ([res1 res2]

@@ -60,7 +60,7 @@
 
   Use with a timeout to consume, as no healthy servers may be avail."
   [conn-id servers]
-  (let [lock-id      (util/random-uuid)
+  (let [lock-id      (random-uuid)
         new-state    (swap! server-connections-atom update-in [conn-id :server]
                             (fn [x]
                               (if x
@@ -77,7 +77,7 @@
 (defn establish-socket
   [conn-id sub-chan pub-chan servers]
   (go-try
-    (let [lock-id    (util/random-uuid)
+    (let [lock-id    (random-uuid)
           state      (swap! server-connections-atom update-in [conn-id :ws]
                             (fn [x]
                               (if x
@@ -144,9 +144,9 @@
 
   #?@(:clj
       [full-text/IndexConnection
-       (open-storage [{:keys [storage-type] :as conn} network dbid lang]
+       (open-storage [{:keys [storage-type] :as conn} network ledger-id lang]
                      (when-let [path (-> conn :meta :file-storage-path)]
-                       (full-text/disk-index path network dbid lang)))]))
+                       (full-text/disk-index path network ledger-id lang)))]))
 
 (defn- normalize-servers
   "Split servers in a string into a vector.
@@ -255,7 +255,7 @@
       (try*
        (let [_ (log/trace "Outgoing message to websocket: " msg)
              [operation data resp-chan opts] msg
-             {:keys [req-id timeout] :or {req-id  (str (util/random-uuid))
+             {:keys [req-id timeout] :or {req-id  (str (random-uuid))
                                           timeout 60000}} opts]
          (when resp-chan
            (swap! state assoc-in [:pending-req req-id] resp-chan)
@@ -291,18 +291,34 @@
 
 
 (defn ping-transactor
-  [conn]
-  (let [req-chan (:req-chan conn)]
-    (async/put! req-chan [:ping true])))
+  [req-chan]
+  (async/put! req-chan [:ping true]))
 
+(defn reconnect-conn
+  "Returns a channel that will eventually have a websocket. Will exponentially backoff
+  until connection attempts happen every two minutes. Uses the existing conn and will
+  reuse the existing sub-chan and pub-chan so the msg-consumer/producer loops do not
+  need to be restarted."
+  [conn]
+  (close-websocket (:id conn))
+  (async/go-loop [backoff-seconds 1]
+    (async/<! (async/timeout (* backoff-seconds 1000)))
+    (let [socket (async/<! (get-socket conn))
+          socket (if (util/exception? socket)
+                   socket
+                   (async/<! socket))]
+      (if (or (nil? socket)
+              (util/exception? socket))
+        (do (log/error socket "Cannot establish connection to a healthy server, backing off:" backoff-seconds "s.")
+            (recur (min (* 2 backoff-seconds) (* 60 2))))
+        socket))))
 
 (defn msg-consumer
   "Takes messages from peer/ledger and processes them."
-  [conn]
-  (let [;; if we haven't received a message in at least this long, ping ledger.
+  [{:keys [sub-chan req-chan keep-alive-fn keep-alive] :as conn}]
+  (let [ ;; if we haven't received a message in at least this long, ping ledger.
         ;; after two pings, if still no response close connection (so connection closes before the 3rd ping, so 3x this time.)
-        ping-transactor-after 2500
-        {:keys [sub-chan]} conn]
+        ping-transactor-after 2500]
     (async/go-loop [no-response-pings 0]
       (let [timeout (async/timeout ping-transactor-after)
             [msg c] (async/alts! [sub-chan timeout])]
@@ -311,30 +327,32 @@
           (= c timeout)
           (if (= 2 no-response-pings)
             ;; assume connection dropped, close!
+            (if keep-alive
+              (do (async/<! (reconnect-conn conn))
+                  (recur 0))
+              (do
+                (log/warn "Connection has gone stale. Perhaps network conditions are poor. Disconnecting socket.")
+                (let [cb keep-alive-fn]
+                  (cond
+                    (nil? keep-alive-fn)
+                    (log/trace "No keep-alive callback is registered")
+
+                    (fn? keep-alive-fn)
+                    (keep-alive-fn)
+
+                    (string? keep-alive-fn)
+                    #?(:cljs
+                       ;; try javascript eval
+                       (eval keep-alive-fn)
+                       :clj
+                       (log/warn "Unsupported clojure callback registered" {:keep-alive-fn keep-alive-fn}))
+
+                    :else
+                    (log/warn "Unsupported callback registered" {:keep-alive-fn keep-alive-fn})))
+                (close-websocket (:id conn))
+                (session/close-all-sessions (:id conn))))
             (do
-              (log/warn "Connection has gone stale. Perhaps network conditions are poor. Disconnecting socket.")
-              (let [cb (:keep-alive-fn conn)]
-                (cond
-
-                  (nil? cb)
-                  (log/trace "No keep-alive callback is registered")
-
-                  (fn? cb)
-                  (cb)
-
-                  (string? cb)
-                  #?(:cljs
-                     ;; try javascript eval
-                     (eval cb)
-                     :clj
-                     (log/warn "Unsupported clojure callback registered" {:keep-alive-fn cb}))
-
-                  :else
-                  (log/warn "Unsupported callback registered" {:keep-alive-fn cb})))
-              (close-websocket (:id conn))
-              (session/close-all-sessions (:id conn)))
-            (do
-              (ping-transactor conn)
+              (ping-transactor req-chan)
               (recur (inc no-response-pings))))
 
           (nil? msg)
@@ -433,7 +451,7 @@
 
 (defn- add-listener*
   "Internal call to add-listener that uses the state atom directly."
-  [conn-state network dbid key fn]
+  [conn-state network ledger-id key fn]
   (when-not (fn? fn)
     (throw (ex-info "add-listener fn paramer not a function."
                     {:status 400 :error :db/invalid-listener})))
@@ -441,7 +459,7 @@
     (throw (ex-info "add-listener key must not be nil."
                     {:status 400 :error :db/invalid-listener})))
   (swap! conn-state update-in
-         [:listeners [network dbid] key]
+         [:listeners [network ledger-id] key]
          #(if %
             (throw (ex-info (str "add-listener key already in use: " (pr-str key))
                             {:status 400 :error :db/invalid-listener}))
@@ -451,10 +469,10 @@
 
 (defn- remove-listener*
   "Internal call to remove-listener that uses the state atom directly."
-  [conn-state network dbid key]
-  (if (get-in @conn-state [:listeners [network dbid] key])
+  [conn-state network ledger-id key]
+  (if (get-in @conn-state [:listeners [network ledger-id] key])
     (do
-      (swap! conn-state update-in [:listeners [network dbid]] dissoc key)
+      (swap! conn-state update-in [:listeners [network ledger-id]] dissoc key)
       true)
     false))
 
@@ -464,25 +482,25 @@
 
   Each listener must have an associated key, which is used to remove the listener
   when needed but is otherwise opaque to the function. Each key must be unique for the
-  given network + dbid."
-  [conn network dbid key fn]
+  given network + ledger-id."
+  [conn network ledger-id key fn]
   ;; load db to make sure ledger events subscription initiated
-  (let [ledger (str network "/" dbid)
+  (let [ledger (str network "/" ledger-id)
         db     (session/db conn ledger nil)]
     ;; check that db exists, else throw
     #?(:clj (when (util/exception? (async/<!! db))
               (throw (async/<!! db))))
-    (add-listener* (:state conn) network dbid key fn)))
+    (add-listener* (:state conn) network ledger-id key fn)))
 
 
 (defn remove-listener
-  "Removes listener on given network + dbid for the provided key.
+  "Removes listener on given network + ledger-id for the provided key.
 
   The key is the same provided for add-listener when registering.
 
   Will return true if a function exists for that key and it was removed."
-  [conn network dbid key]
-  (remove-listener* (:state conn) network dbid key))
+  [conn network ledger-id key]
+  (remove-listener* (:state conn) network ledger-id key))
 
 
 (defn add-token
@@ -511,7 +529,7 @@
                                   :socket-id    nil
                                   ;; map of pending request ids to async response channels
                                   :pending-req  {}
-                                  ;; map of listener functions registered. key is two-tuple of [network dbid],
+                                  ;; map of listener functions registered. key is two-tuple of [network ledger-id],
                                   ;; value is vector of single-argument callback functions that will receive [header data]
                                   :listeners    {}})
         {:keys [storage-read storage-exists storage-write storage-rename storage-delete storage-list
@@ -519,7 +537,7 @@
                 object-cache async-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
-                private keep-alive-fn]
+                private keep-alive-fn keep-alive]
          :or   {memory           1000000                    ;; default 1MB memory
                 parallelism      4
                 req-chan         (async/chan)
@@ -538,7 +556,7 @@
                                (default-object-cache-fn default-cache-atom))
         async-cache-fn     (or async-cache
                                (default-async-cache-fn default-cache-atom))
-        conn-id            (str (util/random-uuid))
+        conn-id            (str (random-uuid))
         close              (fn []
                              (async/close! req-chan)
                              (async/close! sub-chan)
@@ -591,6 +609,7 @@
                             :tx-key-id        (when tx-private-key
                                                 #?(:clj  (crypto/account-id-from-private tx-private-key)
                                                    :cljs nil))
+                            :keep-alive       keep-alive
                             :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
                                                 keep-alive-fn)
                             :add-listener     (partial add-listener* state-atom)

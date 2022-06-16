@@ -52,7 +52,7 @@
         [k result*]
         (do
           (log/warn (str "Context being executed but no corresponding key to set value at for: "
-                         (:network db-root) "/" (:dbid db-root) " ctx-subject _id is: " ctx-sid
+                         (:network db-root) "/" (:ledger-id db-root) " ctx-subject _id is: " ctx-sid
                          " and function being executed is: " ctx-fn-str "."))
           [])))))
 

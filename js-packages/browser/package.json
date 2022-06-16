@@ -1,0 +1,16 @@
+{
+  "description" : "JavaScript library facilitating access to a Fluree instance",
+  "repository" : {
+    "type" : "git",
+    "url" : "git+https://github.com/fluree/flureejs.git"
+  },
+  "license" : "SEE LICENSE IN LICENSE",
+  "name" : "@fluree/flureedb",
+  "scripts" : {
+    "test" : "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords" : [ "fluree", "javascript", "database", "ledger" ],
+  "author" : "Fluree PBC (https://flur.ee)",
+  "version" : "2.0.0-alpha2",
+  "main" : "flureedb.js"
+}

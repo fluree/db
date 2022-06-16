@@ -1,0 +1,23 @@
+{
+  "description" : "Node.js Library facilitating access to a Fluree instance",
+  "license" : "SEE LICENSE IN LICENSE",
+  "homepage" : "https://docs.flur.ee/tools/1.0.0/nodejs/overview",
+  "name" : "@fluree/flureenjs",
+  "preferGlobal" : false,
+  "keywords" : [ "fluree", "nodejs" ],
+  "author" : "Fluree PBC (https://flur.ee)",
+  "requires" : true,
+  "version" : "2.0.0-alpha2",
+  "main" : "flureenjs.js",
+  "dependencies" : {
+    "source-map-support" : "^0.5.21",
+    "axios" : "^0.24.0",
+    "ws" : "^8.6.0",
+    "js-sha3" : "^0.8.0",
+    "scrypt-js" : "^3.0.1",
+    "@fluree/sjcl" : "^1.0.8-3",
+    "bufferutil" : "^4.0.6",
+    "utf-8-validate" : "^5.0.9",
+    "@cljs-oss/module-deps" : "^1.1.1"
+  }
+}

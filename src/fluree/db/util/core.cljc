@@ -7,8 +7,7 @@
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
   #?(:clj  (:import (java.util UUID Date)
                     (java.time Instant)
-                    (java.net URLEncoder URLDecoder))
-     :cljs (:refer-clojure :exclude [random-uuid])))
+                    (java.net URLEncoder URLDecoder))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -58,12 +57,6 @@
 (defn index-of [coll value]
   (some (fn [[item idx]] (when (= value item) idx))
         (partition 2 (interleave coll (range)))))
-
-(defn random-uuid
-  "Generates random UUID in both clojure/script"
-  []
-  #?(:clj  (UUID/randomUUID)
-     :cljs (clojure.core/random-uuid)))
 
 (defn date->millis
   "Given a date, returns epoch millis if possible."

@@ -137,7 +137,7 @@
   (go-try
     (or (when-not (:tt-id db)
           ;; schema's :t value is updated every time there is a new schema/fn/role change
-          (get @role-permission-cache [(:t schema) (:network db) (:dbid db) role-ident permission-type]))
+          (get @role-permission-cache [(:t schema) (:network db) (:ledger-id db) role-ident permission-type]))
         (let [_              (when-not (#{:query :transact :token} permission-type)
                                (throw (ex-info (str "Invalid permission op type:" (pr-str permission-type))
                                                {:status 400
@@ -149,7 +149,7 @@
                                  acc
                                  (let [parsed-rules (<? (parse-rules db rule))]
                                    (recur r (into acc parsed-rules)))))]
-          (swap! role-permission-cache assoc [(:t schema) (:network db) (:dbid db) role-ident permission-type] parsed-ruleset)
+          (swap! role-permission-cache assoc [(:t schema) (:network db) (:ledger-id db) role-ident permission-type] parsed-ruleset)
           parsed-ruleset))))
 
 
