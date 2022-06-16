@@ -307,13 +307,15 @@
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
-  [db json-ld opts]
+  [{:keys [ledger] :as db} json-ld opts]
   (go-try
-    (let [tx-state (->tx-state db opts)]
-      (-> json-ld
-          json-ld/expand
-          (stage-flakes tx-state)
-          <?
-          (stage* tx-state)
-          (final-db tx-state)))))
+    (let [tx-state (->tx-state db opts)
+          db*      (-> json-ld
+                       json-ld/expand
+                       (stage-flakes tx-state)
+                       <?
+                       (stage* tx-state)
+                       (final-db tx-state))]
+      (ledger-proto/-db-update ledger db*)
+      db*)))
 

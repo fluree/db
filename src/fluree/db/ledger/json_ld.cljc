@@ -67,8 +67,9 @@
 
 (defn commit!
   [ledger db opts]
-  (let [opts* (normalize-opts opts)]
-    (jld-commit/commit ledger db opts*)))
+  (let [opts* (normalize-opts opts)
+        db*   (or db (ledger-proto/-db ledger (:branch opts*)))]
+    (jld-commit/commit ledger db* opts*)))
 
 (defn push!
   [ledger commit-meta]
@@ -79,7 +80,10 @@
                          state cache conn
                          method reindex-min reindex-max]
   ledger-proto/iCommit
-  (-commit! [ledger db] (commit! ledger db nil))
+  (-commit! [ledger] (commit! ledger nil nil))
+  (-commit! [ledger db-or-opts] (if (jld-db/json-ld-db? db-or-opts)
+                                  (commit! ledger db-or-opts nil)
+                                  (commit! ledger nil db-or-opts)))
   (-commit! [ledger db opts] (commit! ledger db opts))
   (-push! [ledger commit-meta] (push! ledger commit-meta))
 
