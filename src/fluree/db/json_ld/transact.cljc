@@ -151,8 +151,7 @@
   (let [{:keys [block ecount schema branch ledger], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
-        commit-t (branch/latest-commit (ledger-proto/-status ledger (branch/name branch)))
-        t        (dec commit-t)]
+        t        (- (inc (:t (:commit (ledger-proto/-status ledger (branch/name branch))))))]
     {:db-before     db
      :bootstrap?    bootstrap?
      :stage-update? (= t db-t)                              ;; if a previously staged db is getting updated again before committed

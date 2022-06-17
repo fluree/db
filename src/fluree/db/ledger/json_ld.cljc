@@ -62,10 +62,10 @@
         {:keys [size flakes]} stats]
     {:address address
      :branch  branch
-     :t       (- t)
+     :t       (when t (- t))
      :size    size
      :flakes  flakes
-     :commit  {:t       (- commit)
+     :commit  {:t       (when commit (- commit))
                :address (:address commit-meta)
                :db      (:address (:db commit-meta))}}))
 
