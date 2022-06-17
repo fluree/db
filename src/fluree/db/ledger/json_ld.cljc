@@ -52,11 +52,22 @@
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
-  [{:keys [state] :as _ledger} requested-branch]
-  (let [{:keys [branch branches]} @state]
-    (if requested-branch
-      (get branches requested-branch)
-      (get branches branch))))
+  [{:keys [state address] :as _ledger} requested-branch]
+  (let [{:keys [branch branches]} @state
+        branch-data (if requested-branch
+                      (get branches requested-branch)
+                      (get branches branch))
+        {:keys [latest-db commit commit-meta]} branch-data
+        {:keys [stats t]} latest-db
+        {:keys [size flakes]} stats]
+    {:address address
+     :branch  branch
+     :t       (- t)
+     :size    size
+     :flakes  flakes
+     :commit  {:t       (- commit)
+               :address (:address commit-meta)
+               :db      (:address (:db commit-meta))}}))
 
 (defn normalize-opts
   "Normalizes commit options"
