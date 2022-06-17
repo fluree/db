@@ -228,7 +228,6 @@
                         :commit
                         :t
                         -)
-        _           (log/warn "committed-t: " committed-t)
         new-flakes  (commit-flakes db)]
     (when (not= t (dec committed-t))
       (throw (ex-info (str "Cannot commit db, as committed 't' value of: " committed-t

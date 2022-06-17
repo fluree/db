@@ -30,7 +30,7 @@
           {:keys [hash size]} meta
           {:keys [ipns-address relative-address]} (address-parts address)
           ipfs-endpoint    (:ipfs-endpoint conn)
-          current-dag-map  (async/<! (ipfs-dir/refresh-state ipfs-endpoint ipns-address))
+          current-dag-map  (async/<! (ipfs-dir/refresh-state ipfs-endpoint (str "/ipns/" ipns-address)))
           updated-dir-map  (<? (ipfs-dir/update-directory! current-dag-map ipfs-endpoint relative-address hash size))
           _                (swap! ledger-state update-in [:push :pending] (fn [m] (assoc m :t t :dag updated-dir-map)))
           ipns-key         (<? (ipfs-key/key ipfs-endpoint ipns-address))
