@@ -76,7 +76,7 @@
 
   ;; commit metadata will show IPFS address
   (-> @(fluree/commit! db2 {:message "First commit contains two transactions!"
-                            :push?   false})
+                            :push?   true})
       :commit)
 
   (def db3 @(fluree/stage

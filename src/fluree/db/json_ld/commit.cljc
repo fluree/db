@@ -91,7 +91,7 @@
   :assert - assertion flakes
   :retract - retraction flakes
   :refs-ctx - context that must be included with final context, for refs (@id) values
-  "
+  :flakes - all considered flakes, for any downstream processes that need it"
   [flakes db {:keys [compact-fn id-key type-key] :as _opts}]
   (let [id->iri (volatile! (jld-ledger/predefined-sids-compact compact-fn))
         ctx     (volatile! {})]
@@ -158,7 +158,7 @@
 
 (defn- commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
-  [{:keys [ledger branch schema t commit] :as _db} {:keys [context did private message tag push?] :as _opts}]
+  [{:keys [ledger branch schema t commit stats] :as _db} {:keys [context did private message tag push?] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
                             (:context schema))
@@ -192,7 +192,8 @@
      :branch         branch
      :branch-name    (util/keyword->str (branch/name branch))
      :id-key         (json-ld/compact "@id" compact-fn)
-     :type-key       (json-ld/compact "@type" compact-fn)}))
+     :type-key       (json-ld/compact "@type" compact-fn)
+     :stats          stats}))
 
 
 (defn db-json->db-id
@@ -255,7 +256,7 @@
 
 (defn commit->graphs
   [commit-data opts]
-  (let [{:keys [type-key compact ctx-used-atom t v prev-dbid id-key]} opts
+  (let [{:keys [type-key compact ctx-used-atom t v prev-dbid id-key stats]} opts
         {:keys [assert retract refs-ctx]} commit-data
         prev-db-key (compact const/iri-prevDB)
         assert-key  (compact const/iri-assert)
@@ -270,7 +271,9 @@
                              (compact const/iri-v) v}
                             prev-dbid (assoc prev-db-key prev-dbid)
                             (seq assert) (assoc assert-key assert)
-                            (seq retract) (assoc retract-key retract))
+                            (seq retract) (assoc retract-key retract)
+                            (:flakes stats) (assoc (compact const/iri-flakes) (:flakes stats))
+                            (:size stats) (assoc (compact const/iri-size) (:size stats)))
         ;; TODO - this is re-normalized below, can try to do it just once
         db-id       (db-json->db-id (json-ld/normalize-data db-json))
         db-json*    (-> db-json
@@ -288,7 +291,7 @@
   (go-try
     (let [{:keys [branch commit t]} db
           {:keys [did id-key push? branch-name] :as opts*} (commit-opts db opts)]
-      (let [{:keys [flakes] :as commit-data} (commit-meta db opts*)
+      (let [commit-data (commit-meta db opts*)
             jld-graphs  (commit->graphs commit-data opts*)
             graph-res   (<? (conn-proto/-c-write conn (json-ld/normalize-data jld-graphs)))
             _           (log/info "New DB address:" (:address graph-res))
