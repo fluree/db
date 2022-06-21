@@ -163,7 +163,7 @@
           default-cache-atom   (atom (default-object-cache-factory memory-object-size))
           async-cache-fn       (or async-cache
                                    (default-async-cache-fn default-cache-atom))
-          close-fn             (constantly (log/info (str "IPFS Connection " conn-id " closed")))]
+          close-fn             (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id                   conn-id
                             :ipfs-endpoint        ipfs-endpoint
