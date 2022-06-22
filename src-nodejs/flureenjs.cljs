@@ -1,4 +1,5 @@
 (ns flureenjs
+  (:refer-clojure :exclude [load])
   (:require-macros [cljs.tools.reader.reader-types]
                    [flureenjs :refer [analyzer-state]])
 
@@ -13,6 +14,7 @@
             [fluree.db.dbfunctions.fns :as fns]
             [fluree.db.flake :refer [Flake] :as flake]
             [fluree.db.graphdb :as graphdb]
+            [fluree.db.json-ld.api :as fluree]
             [fluree.db.query.http-signatures :as http-signatures]
             [fluree.db.operations :as ops]
             [fluree.db.permissions :as permissions]
@@ -27,7 +29,7 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [cljs.nodejs :as node-js] ; NodeJS support
+            [cljs.nodejs :as node-js]   ; NodeJS support
 
             ;; shared clojurescript code
             [fluree.db.connection-js :as conn-handler]
@@ -40,6 +42,45 @@
             [cljs.compiler]))
 
 (node-js/enable-util-print!)
+
+;; ----------------------------------------
+;; JSON-LD
+;; ----------------------------------------
+
+(defn ^:export jldConnect
+  [opts]
+  (fluree/connect (js->clj opts :keywordize-keys true)))
+
+(defn ^:export jldCreate
+  ([conn] (fluree/create conn))
+  ([conn ledger-alias] (fluree/create conn ledger-alias))
+  ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldLoad
+  ([address] (fluree/load address))
+  ([conn address] (fluree/load conn address)))
+
+(defn ^:export jldStage
+  ([db-or-ledger json-ld] (fluree/stage db-or-ledger json-ld))
+  ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger json-ld (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldCommit!
+  ([db] (fluree/commit! db))
+  ([ledger db] (fluree/commit! ledger db))
+  ([ledger db opts] (fluree/commit! ledger db (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldStatus
+  ([ledger] (fluree/status ledger))
+  ([ledger branch] (fluree/status ledger branch)))
+
+(defn ^:export jldDb
+  ([ledger] (fluree/db ledger))
+  ([ledger opts] (fluree/db ledger (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldQuery
+  [db query]
+  (fluree/query db (js->clj query :keywordize-keys true)))
+
 
 
 ;;-------------------------------------------------------------------------------------------------
