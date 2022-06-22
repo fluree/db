@@ -1,25 +1,26 @@
 {
   "dependencies": {
-    "@cljs-oss/module-deps": "^1.1.1",
-    "@fluree/sjcl": "^1.0.8-3",
-    "axios": "^0.24.0",
-    "bufferutil": "^4.0.6",
-    "js-sha3": "^0.8.0",
-    "scrypt-js": "^3.0.1",
-    "source-map-support": "^0.5.21",
-    "utf-8-validate": "^5.0.9",
-    "ws": "^8.5.0"
+    "@cljs-oss/module-deps": "1.1.1",
+    "@fluree/sjcl": "1.0.8-3",
+    "axios": "0.27.2",
+    "bufferutil": "4.0.6",
+    "form-data": "4.0.0",
+    "js-sha3": "0.8.0",
+    "scrypt-js": "3.0.1",
+    "source-map-support": "0.5.21",
+    "utf-8-validate": "5.0.9",
+    "ws": "8.8.0"
   },
   "browser": {
     "ws": false
   },
   "devDependencies": {
     "colors": "1.4.0",
-    "karma": "^6.3.10",
-    "karma-chrome-launcher": "^3.1.0",
-    "karma-cljs-test": "^0.1.0",
-    "webpack": "^5.51.1",
-    "webpack-cli": "^4.8.0"
+    "karma": "6.4.0",
+    "karma-chrome-launcher": "3.1.1",
+    "karma-cljs-test": "0.1.0",
+    "webpack": "5.73.0",
+    "webpack-cli": "4.10.0"
   },
   "browserslist": {
     "production": [

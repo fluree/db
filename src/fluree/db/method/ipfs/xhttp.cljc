@@ -81,6 +81,23 @@
 
 
 (comment
+  (def ipfs-endpoint "http://127.0.0.1:5001/")
+  (require '[clojure.core.async :as async])
+  (async/go
+    (let [resp (async/<! (ls ipfs-endpoint "/ipfs/QmQPeNsJPyVWPFDVHb77w8G42Fvo15z4bG2X8D2GhfbSXc/"))]
+      (println resp)))
+
+  (async/go
+    (println (async/<! (cat ipfs-endpoint (str "/ipfs/QmQPeNsJPyVWPFDVHb77w8G42Fvo15z4bG2X8D2GhfbSXc/"
+                                               "readme")))))
+
+  (async/go
+    (println (async/<! (add ipfs-endpoint "Twas brillig"))))
+
+
+  (async/go
+    (println (async/<! (publish ipfs-endpoint "Twas brillig"))))
+
 
   (clojure.core.async/<!!
     (cat "http://127.0.0.1:5001/" "/ipfs/QmXh2W5GPnocpiyFYtQKu4cPLDSwdDELYRTyZkhMSKx7vj"))

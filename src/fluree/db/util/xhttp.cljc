@@ -93,10 +93,11 @@
          :or   {request-timeout 5000
                 keywordize-keys true}} opts
         response-chan (async/chan)
+        multipart? (contains? message :multipart)
         headers*      (cond-> headers
-                              json? (assoc "Content-Type" "application/json")
-                              token (assoc "Authorization" (str "Bearer " token)))
-        base-req      (if (contains? message :multipart)    ;; multipart requests need to be sent in special map structure
+                        json? (assoc "Content-Type" "application/json")
+                        token (assoc "Authorization" (str "Bearer " token)))
+        base-req      (if multipart? ;; multipart requests need to be sent in special map structure
                         message
                         {:body message})]
     #?(:clj (http/post url (assoc base-req :headers headers*
@@ -115,18 +116,23 @@
                                               json? (json/parse keywordize-keys))]
                              (async/put! response-chan data)))))
        :cljs
-            (-> axios
-                (.request (clj->js {:url     url
-                                    :method  "post"
-                                    :timeout request-timeout
-                                    :headers headers*
-                                    :data    message}))
-                (.then (fn [resp]
-                         (async/put! response-chan (if json?
-                                                     (:data (js->clj resp :keywordize-keys keywordize-keys))
-                                                     resp))))
-                (.catch (fn [err]
-                          (async/put! response-chan (format-error-response url err))))))
+       (let [req {:url url
+                  :method "post"
+                  :timeout request-timeout
+                  :headers (cond-> headers*
+                             multipart? (assoc "Content-Type" "multipart/form-data"))
+                  :data (if multipart?
+                          (mapv #(json/stringify (:content %)) (:multipart message))
+                          message)}]
+         (-> axios
+             (.request (clj->js req))
+             (.then (fn [resp]
+                      (let [headers (js->clj (.-headers resp) :keywordize-keys true)]
+                        (async/put! response-chan (condp = (:content-type headers)
+                                                    "application/json" (:data (js->clj resp :keywordize-keys keywordize-keys))
+                                                    resp)))))
+             (.catch (fn [err]
+                       (async/put! response-chan (format-error-response url err)))))))
     response-chan))
 
 
