@@ -92,7 +92,6 @@
   ([ipfs-endpoint root-cid parent-name]
    (go-try
      (let [base-nodes (<? (ipfs/ls ipfs-endpoint root-cid))]
-       (log/warn "base-nodes: " base-nodes)
        (loop [[node & r] base-nodes
               acc {:hash  root-cid
                    :name  parent-name

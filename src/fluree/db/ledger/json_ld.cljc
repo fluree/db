@@ -129,11 +129,24 @@
     (subs ledger-alias 1)
     ledger-alias))
 
+(defn include-dbs
+  [conn db include]
+  (go-try
+    (loop [[commit-address & r] include
+           db* db]
+      (if commit-address
+        (let [base-context {:base commit-address}
+              commit-data  (-> (<? (conn-proto/-c-read conn commit-address))
+                               (json-ld/expand base-context))
+              db**         (<? (jld-reify/load-db db* commit-data))]
+          (recur r db**))
+        db*))))
+
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [context did branch pub-fn blank? ipns]
+    (let [{:keys [context did branch pub-fn blank? ipns include]
            :or   {branch :main}} opts
           did*          (if did
                           (if (map? did)
@@ -174,6 +187,10 @@
                           (bootstrap/blank-db blank-db))]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
+      (when include
+        ;; includes other ledgers - experimental
+        (let [db* (<? (include-dbs conn db include))]
+          (ledger-proto/-db-update ledger db*)))
       ledger)))
 
 (defn load

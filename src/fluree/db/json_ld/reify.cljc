@@ -5,6 +5,7 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.log :as log]))
 
@@ -115,17 +116,20 @@
   (let [last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         next-pid (fn [] (vswap! last-pid inc))
-        next-sid (fn [] (vswap! last-sid inc))]
-    (reduce
-      (fn [acc node]
-        (into acc
-              (assert-node db node t iris refs next-pid next-sid)))
-      []
-      assertions)))
+        next-sid (fn [] (vswap! last-sid inc))
+        flakes   (reduce
+                   (fn [acc node]
+                     (into acc
+                           (assert-node db node t iris refs next-pid next-sid)))
+                   []
+                   assertions)]
+    {:flakes flakes
+     :pid    @last-pid
+     :sid    @last-sid}))
 
 
 (defn merge-flakes
-  [{:keys [novelty stats] :as db} t refs flakes]
+  [{:keys [novelty stats ecount] :as db} t refs flakes]
   (let [bytes #?(:clj (future (flake/size-bytes flakes))    ;; calculate in separate thread for CLJ
                  :cljs (flake/size-bytes flakes))
         {:keys [spot psot post opst tspo size]} novelty
@@ -197,7 +201,7 @@
       (json-ld/expand file-data))))
 
 (defn merge-commit
-  [conn db commit]
+  [conn {:keys [ecount] :as db} commit]
   (go-try
     (let [iris           (volatile! {})
           refs           (volatile! (-> db :schema :refs))
@@ -207,17 +211,15 @@
           assert         (db-assert db-data)
           retract        (db-retract db-data)
           retract-flakes (retract-flakes db retract t iris)
-          assert-flakes  (assert-flakes db assert t iris refs)
+          {:keys [flakes pid sid]} (assert-flakes db assert t iris refs)
           all-flakes     (-> (empty (get-in db [:novelty :spot]))
                              (into retract-flakes)
-                             (into assert-flakes))]
-      (when-not (= t (dec (:t db)))
-        (commit-error (str "Commit 't' values for referenced dbs out of sync. "
-                           "Expected t: " (- (dec (:t db))) " but found t: " (db-t db-data)
-                           " in referenced db: " db-id ".") commit))
+                             (into flakes))
+          ecount*        (assoc ecount const/$_predicate pid
+                                       const/$_default sid)]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!" commit))
-      (merge-flakes db t @refs all-flakes))))
+      (merge-flakes (assoc db :ecount ecount*) t @refs all-flakes))))
 
 
 (defn trace-commits
