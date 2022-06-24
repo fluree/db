@@ -11,7 +11,7 @@
          instaparse/instaparse           {:mvn/version "1.4.12"}
          com.fluree/json-ld              {
                                           :git/url "https://github.com/fluree/json-ld.git"
-                                          :sha "145f4cb430a4ee4c78c8673ed14e479a70a445e0"
+                                          :sha "28cf4ea8edb9845eb9d9fc8a7c37696622862556"
                                           }
 
          ;; logging
