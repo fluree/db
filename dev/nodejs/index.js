@@ -82,6 +82,8 @@ async function go() {
     { message: "First commit: 2 transactions!", "push?": true}
   )
 
+  const status = await flureenjs.jldStatus(ledger);
+  console.log('status', status);
 
 }
 

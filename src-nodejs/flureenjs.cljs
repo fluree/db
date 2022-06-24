@@ -70,8 +70,8 @@
   ([ledger db opts] (fluree/commit! ledger db (js->clj opts :keywordize-keys true))))
 
 (defn ^:export jldStatus
-  ([ledger] (fluree/status ledger))
-  ([ledger branch] (fluree/status ledger branch)))
+  ([ledger] (clj->js (fluree/status ledger)))
+  ([ledger branch] (clj->js (fluree/status ledger branch))))
 
 (defn ^:export jldDb
   ([ledger] (fluree/db ledger))
