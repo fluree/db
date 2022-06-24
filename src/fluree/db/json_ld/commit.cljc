@@ -179,7 +179,7 @@
      :tag            tag
      :t              (- t)
      :v              1.0
-     :prev-commit    (:commit commit)
+     :prev-commit    (:address commit)
      :prev-dbid      (:dbid commit)
      :ledger-address nil                                    ;; TODO
      :time           (util/current-time-iso)

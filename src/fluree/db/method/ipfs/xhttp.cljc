@@ -75,7 +75,8 @@
     (let [endpoint (cond-> (str ipfs-endpoint "api/v0/name/publish?")
                            key (str "key=" key "&")
                            true (str "arg=" ipfs-cid))
-          {:keys [Name Value]} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
+          {:keys [Name Value] :as res} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
+      (log/debug "IPNS publish complete with response: " res)
       {:name  Name
        :value Value})))
 

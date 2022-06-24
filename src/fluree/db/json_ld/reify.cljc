@@ -19,7 +19,7 @@
   [iri db iris]
   (if-let [cached (get @iris iri)]
     cached
-    ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest add:true
+    ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest .-op = true
     (when-let [sid (some-> (flake/match-post (get-in db [:novelty :post]) const/$iri iri)
                            first
                            :s)]
@@ -38,7 +38,8 @@
   [db node t iris]
   (let [{:keys [id type]} node
         sid              (or (get-iri-sid id db iris)
-                             (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id)
+                             (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
+                                                  " at db t value: " t ".")
                                              {:status 400 :error :db/invalid-commit})))
         type-retractions (when type
                            (mapv (fn [type-item]
