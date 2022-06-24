@@ -35,6 +35,13 @@
                (-> (fluree/create conn "test/dan1")
                    (.then (fn [ledger]
                             (println "ledger" (pr-str ledger))
+                            (-> (fluree/query (fluree/db ledger)
+                                              {:select {'?s [:* {:f/role [:*]}]}
+                                               :where [['?s :rdf/type :f/DID]]})
+                                (.then (fn [q0] (println "q0" q0))))
+
+
+
                             (-> (fluree/stage
                                   ledger
                                   {"@context" "https://schema.org",
@@ -54,9 +61,29 @@
                                          (fluree/query ledger
                                                        {:select [:* {:schema/isBasedOn [:*]}]
                                                         :from :wiki/Q836821})))
-                                (.then (fn [q] (println (pr-str q)))))))
+                                (.then (fn [q1] (println "q1" (pr-str q1)))))
+
+                            (-> (fluree/stage
+                                  ledger
+                                  {"@context" "https://schema.org",
+                                   "@graph" [{"@id" "https://www.wikidata.org/wiki/Q836821"
+                                              "name" "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
+                                              "commentCount" 42}]})
+                                (.then (fn [ledger]
+                                         (fluree/query ledger
+                                                       {:select [:* {:schema/isBasedOn [:*]}]
+                                                        :from :wiki/Q836821})))
+                                (.then (fn [q2] (println "q2" q2))))
+
+                            (fluree/commit! ledger {:message "First commit: 2 transactions!" :push? true})
+
+                            #_ (fluree/stage ledger {"@context" "https://schema.org",
+                                                     "@graph" [{"@id" "https://www.wikidata.org/wiki/Q836821"
+                                                                "commentCount" 52}]})
+
+                            #_ (fluree/commit! ledger {:message "Another commit!!"
+                                                       :push? false})))
                    #_(.catch (fn [err] (println "ERR" (pr-str err))))))))
-  #object[Promise [object Promise]]
 
 
 
