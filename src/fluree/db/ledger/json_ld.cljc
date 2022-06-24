@@ -138,7 +138,7 @@
         (let [base-context {:base commit-address}
               commit-data  (-> (<? (conn-proto/-c-read conn commit-address))
                                (json-ld/expand base-context))
-              db**         (<? (jld-reify/load-db db* commit-data))]
+              db**         (<? (jld-reify/load-db db* commit-data true))]
           (recur r db**))
         db*))))
 
@@ -207,7 +207,7 @@
                                                :id     commit-address
                                                :blank? true}))
           db           (ledger-proto/-db ledger)
-          db*          (<? (jld-reify/load-db db commit-data))]
+          db*          (<? (jld-reify/load-db db commit-data false))]
       (ledger-proto/-db-update ledger db*)
       ledger)))
 

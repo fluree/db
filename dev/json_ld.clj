@@ -32,9 +32,7 @@
                      :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}))
 
 
-
-
-  (def ledger @(fluree/create ipfs-conn "test/db1" {:ipns {:key "self"}}))
+  (def ledger @(fluree/create ipfs-conn "test/db1" {}))
 
   @(fluree/query (fluree/db ledger)
                  {:select {'?s [:* {:f/role [:*]}]}
@@ -85,15 +83,18 @@
                "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
                             "commentCount" 52}]}))
 
-  @(fluree/commit! db3 {:message "Another commit!!"
-                        :push?   false})
+  @(fluree/query db3
+                 {:select [:* {:schema/isBasedOn [:*]}]
+                  :from   :wiki/Q836821})
+
+  @(fluree/commit! db3 {:message "Another commit!!"})
 
   (-> ledger
       fluree/db
       :commit)
 
   ;; load ledger from disk
-  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipfs://QmPTXAvmWrmcbqAPxY82N6nRcLUyEWP51UZVtq15CDMVYs"))
+  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipns://data.fluree.com/test/db1"))
 
   @(fluree/query (fluree/db loaded-ledger)
                  {:select [:* {:schema/isBasedOn [:*]}]

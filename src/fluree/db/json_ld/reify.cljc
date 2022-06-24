@@ -202,17 +202,22 @@
       (json-ld/expand file-data))))
 
 (defn merge-commit
-  [conn {:keys [ecount] :as db} commit]
+  [conn {:keys [ecount t] :as db} commit include-db?]
   (go-try
     (let [iris           (volatile! {})
           refs           (volatile! (-> db :schema :refs))
           db-id          (get-in commit [const/iri-db :id])
           db-data        (<? (read-commit conn db-id))
-          t              (- (db-t db-data))
+          t-new          (- (db-t db-data))
+          _              (when (and (not= t-new (dec t))
+                                    (not include-db?)) ;; when including multiple dbs, t values will get reused.
+                           (throw (ex-info (str "Commit t value: " (- t-new)
+                                                " has a gap from latest commit t value: " (- t) ".")
+                                           {:status 500 :error :db/invalid-commit})))
           assert         (db-assert db-data)
           retract        (db-retract db-data)
-          retract-flakes (retract-flakes db retract t iris)
-          {:keys [flakes pid sid]} (assert-flakes db assert t iris refs)
+          retract-flakes (retract-flakes db retract t-new iris)
+          {:keys [flakes pid sid]} (assert-flakes db assert t-new iris refs)
           all-flakes     (-> (empty (get-in db [:novelty :spot]))
                              (into retract-flakes)
                              (into flakes))
@@ -220,7 +225,7 @@
                                        const/$_default sid)]
       (when (empty? all-flakes)
         (commit-error "Commit has neither assertions or retractions!" commit))
-      (merge-flakes (assoc db :ecount ecount*) t @refs all-flakes))))
+      (merge-flakes (assoc db :ecount ecount*) t-new @refs all-flakes))))
 
 
 (defn trace-commits
@@ -258,7 +263,7 @@
 
 
 (defn load-db
-  [{:keys [ledger] :as db} latest-commit]
+  [{:keys [ledger] :as db} latest-commit include-db?]
   (go-try
     (let [{:keys [conn]} ledger
           commits (<? (trace-commits conn latest-commit))]
@@ -267,5 +272,6 @@
         (when proof
           (validate-commit db* commit proof))
         (if commit
-          (recur r (<? (merge-commit conn db* commit)))
+          (let [new-db (<? (merge-commit conn db* commit include-db?))]
+            (recur r new-db))
           db*)))))
