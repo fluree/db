@@ -1,14 +1,17 @@
 (ns fluree.db.query.json-ld.response
   (:require [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.log :as log]))
 
 ;; handles :select response map for JSON-LD based queries
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(declare flakes->res)
 
 (defn wildcard-spec
   [db cache compact-fn pid]
@@ -46,13 +49,32 @@
       iri)))
 
 
-(defn extract-refs
-  [db id-key compact-fn p-flakes]
+(defn iri-only-ref
+  "Extracts result information from a ref predicate. If sub-select exists
+  and additional graph crawl is performed. If it doesn't exist, simply returns
+  {@id <iri>} for each object."
+  [db cache compact-fn p-flakes]
+  (go-try
+    (let [id-key (:as (wildcard-spec db cache compact-fn const/$iri))]
+      (loop [[next-flake & r] p-flakes
+             acc []]
+        (if next-flake
+          (let [iri (<? (dbproto/-iri db (flake/o next-flake) compact-fn))]
+            (recur r (conj acc {id-key iri})))
+          (if (= 1 (count acc))
+            (first acc)
+            acc))))))
+
+(defn crawl-ref
+  "A sub-selection (graph crawl) exists, generate results."
+  [db compact-fn p-flakes sub-select cache fuel-vol max-fuel]
   (go-try
     (loop [[next-flake & r] p-flakes
            acc []]
       (if next-flake
-        (recur r (conj acc {id-key (<? (dbproto/-iri db (flake/o next-flake) compact-fn))}))
+        (let [sub-flakes (<? (query-range/index-range db :spot = [(flake/o next-flake)]))
+              res        (<? (flakes->res db cache compact-fn fuel-vol max-fuel sub-select sub-flakes))]
+          (recur r (conj acc res)))
         (if (= 1 (count acc))
           (first acc)
           acc)))))
@@ -74,9 +96,11 @@
                        (nil? spec)
                        nil
 
+                       ;; flake's .-o value is an IRI string, JSON-LD compact it before returning
                        (iri? p)
                        (-> p-flakes first flake/o compact-fn)
 
+                       ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
                        (rdf-type? p)
                        (loop [[type-id & rest-types] (map flake/o p-flakes)
                               acc []]
@@ -86,10 +110,15 @@
                                                 (<? (cache-sid->iri db cache compact-fn type-id)))))
                            acc))
 
+                       ;; flake's .-o value is a reference to another subject
                        (:ref? spec)
-                       (let [id-key (:as (wildcard-spec db cache compact-fn const/$iri))]
-                         (<? (extract-refs db id-key compact-fn p-flakes)))
+                       (if-let [sub-spec (:spec spec)]
+                         ;; have sub-selection (graph crawl)
+                         (<? (crawl-ref db compact-fn p-flakes sub-spec cache fuel-vol max-fuel))
+                         ;; no sub-selection, just return {@id <iri>} for each ref iri
+                         (<? (iri-only-ref db cache compact-fn p-flakes)))
 
+                       ;; flake's .-o value is a scalar value (e.g. integer, string, etc)
                        :else
                        (p-values p-flakes))]
             (if v
