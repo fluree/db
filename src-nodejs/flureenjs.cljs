@@ -61,10 +61,10 @@
   ([conn address] (fluree/load conn address)))
 
 (defn ^:export jldStage
-  ([db-or-ledger json-ld] (fluree/stage db-or-ledger json-ld))
-  ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger json-ld (js->clj opts :keywordize-keys true))))
+  ([db-or-ledger json-ld] (fluree/stage db-or-ledger (js->clj json-ld)))
+  ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger (js->clj json-ld) (js->clj opts :keywordize-keys true))))
 
-(defn ^:export jldCommit!
+(defn ^:export jldCommit
   ([db] (fluree/commit! db))
   ([ledger db] (fluree/commit! ledger db))
   ([ledger db opts] (fluree/commit! ledger db (js->clj opts :keywordize-keys true))))
@@ -79,7 +79,8 @@
 
 (defn ^:export jldQuery
   [db query]
-  (fluree/query db (js->clj query :keywordize-keys true)))
+  (.then (fluree/query db (js->clj query :keywordize-keys true))
+         (fn [result] (clj->js result))))
 
 
 

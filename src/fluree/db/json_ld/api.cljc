@@ -55,6 +55,9 @@
   (promise-wrap
     (let [opts* (assoc opts :parallelism (or parallelism 4))]
       (case method
+    (let [opts* (assoc opts :parallelism (or parallelism 4))
+          method* (keyword method)]
+      (case method*
         :ipfs (ipfs-conn/connect opts*)
         :file (file-conn/connect opts*)))))
 
