@@ -167,7 +167,7 @@
             db-or-opts)]
 
          res-ch (if ledger
-                  (commit! ledger db opts)
+                  (ledger-proto/-commit! ledger db opts)
                   (ledger-proto/-commit! db opts))]
      (promise-wrap res-ch)))
   ([ledger db opts]
