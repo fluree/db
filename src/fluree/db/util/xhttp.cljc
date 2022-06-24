@@ -122,7 +122,7 @@
                   :headers (cond-> headers*
                              multipart? (assoc "Content-Type" "multipart/form-data"))
                   :data (if multipart?
-                          (mapv #(json/stringify (:content %)) (:multipart message))
+                          (mapv :content (:multipart message))
                           message)}]
          (-> axios
              (.request (clj->js req))
