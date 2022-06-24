@@ -158,9 +158,14 @@
    (promise-wrap
      (ledger-proto/-commit! db)))
   ([ledger-or-db db-or-opts]
-   (let [[ledger db opts] (if (db-proto/db? ledger-or-db)
-                            [nil ledger-or-db db-or-opts]
-                            [ledger-or-db db-or-opts nil])
+   (let [[ledger db opts]
+         [(when (jld-ledger/is-ledger? ledger-or-db)
+            ledger-or-db)
+          (cond (db-proto/db? ledger-or-db) ledger-or-db
+                (db-proto/db? db-or-opts) db-or-opts)
+          (when (not (db-proto/db? db-or-opts))
+            db-or-opts)]
+
          res-ch (if ledger
                   (commit! ledger db opts)
                   (ledger-proto/-commit! db opts))]
