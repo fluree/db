@@ -31,10 +31,11 @@ async function go() {
      "from": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"}
   )
   console.log('q', q)
+
   const q0 = await flureenjs.jldQuery(
     flureenjs.jldDb(ledger),
-    {"select": {"?s": ["*", {"f/role": ["*"]}]},
-     "where": [["?s", "http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "https://ns.flur.ee/ledger#DID"]]}
+    {"select": {"?s": ["*", {"f:role": ["*"]}]},
+     "where": [["?s", "rdf:type", "f:DID"]]}
   )
   console.log("q0", q0)
 
@@ -57,7 +58,7 @@ async function go() {
 
   const q1 = await flureenjs.jldQuery(
     db1,
-    { select: ["*", {"schema/isBasedOn": ["*"]}], from: "wiki/Q836821" }
+    { select: ["*", {"schema:isBasedOn": ["*"]}], from: "wiki:Q836821" }
   )
   console.log('q1', q1)
 
@@ -72,7 +73,7 @@ async function go() {
 
   const q2 = await flureenjs.jldQuery(
     db1,
-    { select: ["*", {"schema/isBasedOn": ["*"]}], from: "wiki/Q836821" }
+    { select: ["*", {"schema:isBasedOn": ["*"]}], from: "wiki:Q836821" }
   )
   console.log('q2', q2)
 
