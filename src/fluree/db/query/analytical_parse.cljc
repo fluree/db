@@ -632,6 +632,13 @@
   [{:keys [where] :as _query-map}]
   (not (sequential? where)))
 
+(defn keywordize-keys
+  [m]
+  (reduce-kv (fn [acc k v]
+               (if (string? k)
+                 (assoc acc (keyword k) v)
+                 (assoc acc k v)))
+             {} m))
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
@@ -640,15 +647,18 @@
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
                             (-> supplied-vars keys set))
+        opts*             (keywordize-keys opts)
         json-ld-db?       (= :json-ld (dbproto/-db-type db))
         context*          (when json-ld-db?
-                            (json-ld/parse-context (get-in db [:schema :context]) context))
+                            (if (:js? opts*)
+                              (json-ld/parse-context (get-in db [:schema :context-str]) context)
+                              (json-ld/parse-context (get-in db [:schema :context]) context)))
         parsed            (cond-> {:json-ld?      json-ld-db?
                                    :strategy      :legacy
                                    :context       context*
                                    :rel-binding?  rel-binding?
                                    :where         (parse-where db query-map' supplied-var-keys context*)
-                                   :opts          opts
+                                   :opts          opts*
                                    :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
                                    :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts
                                    :fuel          (get-max-fuel query-map')

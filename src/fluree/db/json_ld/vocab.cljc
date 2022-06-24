@@ -167,36 +167,41 @@
                               (flake/o %))
                            context-flakes)]
     (try*
-      (-> context-json
-          json/parse
-          json-ld/parse-context)
+      (let [keywordized (-> context-json
+                            json/parse
+                            json-ld/parse-context)
+            stringified (-> context-json
+                            (json/parse false)
+                            json-ld/parse-context)]
+        [keywordized stringified])
       (catch* e (log/warn (str "Invalid db default context, unable to parse: " (pr-str context-json)))
               nil))))
 
 (defn update-with*
   [old-schema t refs vocab-flakes]
   (loop [[s-flakes & r] (partition-by flake/s vocab-flakes)
-         pred*   (:pred old-schema)
-         context nil]
+         pred*       (:pred old-schema)
+         context-kw  nil
+         context-str nil]
     (if s-flakes
       (let [sid (flake/s (first s-flakes))]
         (cond
           (= sid const/$fluree:default-context)
-          (recur r
-                 pred*
-                 (parse-new-context s-flakes))
+          (let [[context-kw context-str] (parse-new-context s-flakes)]
+            (recur r pred* context-kw context-str))
 
           :else
           (let [prop-map (schema-details sid refs s-flakes)]
             (recur r
                    (assoc pred* (:id prop-map) prop-map
                                 (:iri prop-map) prop-map)
-                   context))))
+                   context-kw context-str))))
       (cond-> (assoc old-schema :t t
                                 :refs refs
                                 :pred pred*
                                 :subclasses (delay (calc-subclass pred*)))
-              context (assoc :context context)))))
+              context-kw (assoc :context context-kw
+                                :context-str context-str)))))
 
 
 (defn update-with

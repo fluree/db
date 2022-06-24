@@ -79,8 +79,12 @@
 
 (defn ^:export jldQuery
   [db query]
-  (.then (fluree/query db (js->clj query :keywordize-keys true))
-         (fn [result] (clj->js result))))
+  (let [query* (->> (js->clj query :keywordize-keys false)
+                    (reduce-kv (fn [acc k v]
+                                   (assoc acc (keyword k) v))
+                               {}))]
+       (.then (fluree/query db (assoc-in query* [:opts :js?] true))
+              (fn [result] (clj->js result)))))
 
 
 
