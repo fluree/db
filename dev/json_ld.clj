@@ -42,13 +42,13 @@
     @(fluree/stage
        ledger
        {"@context"                  "https://schema.org",
-        "@id"                       "https://www.wikidata.org/wiki/Q836821",
-        "@type"                     ["Movie"],
+        "id"                        "https://www.wikidata.org/wiki/Q836821",
+        "type"                      ["Movie"],
         "name"                      "The Hitchhiker's Guide to the Galaxy",
         "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
         "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-        "isBasedOn"                 {"@id"    "https://www.wikidata.org/wiki/Q3107329",
-                                     "@type"  "Book",
+        "isBasedOn"                 {"id"     "https://www.wikidata.org/wiki/Q3107329",
+                                     "type"   "Book",
                                      "name"   "The Hitchhiker's Guide to the Galaxy",
                                      "isbn"   "0-330-25864-8",
                                      "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
@@ -64,7 +64,7 @@
   (def db2 @(fluree/stage
               newdb
               {"@context" "https://schema.org",
-               "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+               "@graph"   [{"id"           "https://www.wikidata.org/wiki/Q836821"
                             "name"         "NEW TITLE: The Hitchhiker's Guide to the Galaxy",
                             "commentCount" 42}]}))
 
@@ -80,7 +80,7 @@
   (def db3 @(fluree/stage
               ledger
               {"@context" "https://schema.org",
-               "@graph"   [{"@id"          "https://www.wikidata.org/wiki/Q836821"
+               "@graph"   [{"id"           "https://www.wikidata.org/wiki/Q836821"
                             "commentCount" 52}]}))
 
   @(fluree/query db3
@@ -89,12 +89,11 @@
 
   @(fluree/commit! db3 {:message "Another commit!!"})
 
-  (-> ledger
-      fluree/db
-      :commit)
 
   ;; load ledger from disk
-  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipns://data.fluree.com/test/db1"))
+  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipns://k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2/test/db1"))
+  ;; or, if ipns key set up with DNS-link:
+  ;; (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipns://data.fluree.com/test/db1"))
 
   @(fluree/query (fluree/db loaded-ledger)
                  {:select [:* {:schema/isBasedOn [:*]}]
