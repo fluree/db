@@ -65,9 +65,8 @@
   - profile - (optional) IPFS stored profile to use.
   - did - (optional) DiD information to use, if storing blocks as verifiable credentials
   - context - (optional) Default @context map to use for ledgers formed with this connection."
-  [{:keys [server profile did context] :as opts}]
-  (connect (assoc opts :method :ipfs))
-  )
+  [opts]
+  (connect (assoc opts :method :ipfs)))
 
 
 (defn create

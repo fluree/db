@@ -19,19 +19,18 @@
 
 (defn lookup-address
   "Returns IPNS address for a given key."
-  [{:keys [ipfs-endpoint ipns-default-address] :as _conn} key]
+  [{:keys [ipfs-endpoint ledger-defaults] :as _conn} key]
   (if key
     (ipfs-keys/address ipfs-endpoint key)
-    (async/go ipns-default-address)))
+    (async/go (-> ledger-defaults :ipns :address))))
 
 (defrecord IPFSConnection [id transactor? memory state
-                           context did async-cache
+                           ledger-defaults async-cache
                            local-read local-write
                            read write push
                            parallelism close-fn
                            msg-in-ch msg-out-ch
-                           ipfs-endpoint
-                           ipns-default-key ipns-default-address]
+                           ipfs-endpoint]
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (read commit-key))
@@ -55,8 +54,8 @@
   (-transactor? [_] transactor?)
   (-id [_] id)
   (-read-only? [_] (not (fn? write)))                       ;; if no commit fn, then read-only
-  (-context [_] context)
-  (-did [_] did)
+  (-context [_] (:context ledger-defaults))
+  (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine
                      (log/warn "-msg-in: " msg)
@@ -136,51 +135,57 @@
   [cache-size]
   (cache/lru-cache-factory {} :threshold cache-size))
 
+(defn ledger-defaults
+  "Normalizes ledger defaults settings"
+  [ipfs-endpoint {:keys [ipns context did] :as defaults}]
+  (go-try
+    (let [ipns-default-key     (or (:key ipns) "self")
+          ipns-default-address (<? (ipfs-keys/address ipfs-endpoint ipns-default-key))]
+      (when-not ipns-default-address
+        (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
+                             ipns-default-key)
+                        {:status 400 :error :db/ipfs-keys})))
+      {:ipns    {:key     ipns-default-key
+                 :address ipns-default-address}
+       :context context
+       :did     did})))
+
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [server context did local-read local-write parallelism async-cache memory ipns]
-    :or   {server "http://127.0.0.1:5001/"}
-    :as   opts}]
+  [{:keys [server local-read local-write parallelism async-cache memory defaults]
+    :or   {server "http://127.0.0.1:5001/"}}]
   (go-try
-    (let [ipfs-endpoint        (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
-          ipns-default-key     (or (:key ipns) "self")
-          ipns-default-address (<? (ipfs-keys/address ipfs-endpoint ipns-default-key))
-          _                    (when-not ipns-default-address
-                                 (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
-                                                      ipns-default-key)
-                                                 {:status 400 :error :db/ipfs-keys})))
-          memory               (or memory 1000000)          ;; default 1MB memory
-          conn-id              (str (util/random-uuid))
-          read                 (ipfs/default-read-fn ipfs-endpoint)
-          write                (ipfs/default-commit-fn ipfs-endpoint)
-          push                 (ipfs/default-push-fn ipfs-endpoint)
-          state                (state-machine/blank-state)
-          memory-object-size   (quot memory 100000)         ;; avg 100kb per cache object
-          _                    (when (< memory-object-size 10)
-                                 (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
+    (let [ipfs-endpoint      (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
+          ledger-defaults    (<? (ledger-defaults ipfs-endpoint defaults))
+          memory             (or memory 1000000)            ;; default 1MB memory
+          conn-id            (str (util/random-uuid))
+          read               (ipfs/default-read-fn ipfs-endpoint)
+          write              (ipfs/default-commit-fn ipfs-endpoint)
+          push               (ipfs/default-push-fn ipfs-endpoint)
+          state              (state-machine/blank-state)
+          memory-object-size (quot memory 100000)           ;; avg 100kb per cache object
+          _                  (when (< memory-object-size 10)
+                               (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
 
-          default-cache-atom   (atom (default-object-cache-factory memory-object-size))
-          async-cache-fn       (or async-cache
-                                   (default-async-cache-fn default-cache-atom))
-          close-fn             (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
+          default-cache-atom (atom (default-object-cache-factory memory-object-size))
+          async-cache-fn     (or async-cache
+                                 (default-async-cache-fn default-cache-atom))
+          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
       ;; TODO - need to set up monitor loops for async chans
-      (map->IPFSConnection {:id                   conn-id
-                            :ipfs-endpoint        ipfs-endpoint
-                            :ipns-default-key     ipns-default-key
-                            :ipns-default-address ipns-default-address
-                            :transactor?          false
-                            :context              context
-                            :did                  did
-                            :local-read           local-read
-                            :local-write          local-write
-                            :read                 read
-                            :write                write
-                            :push                 push
-                            :parallelism          parallelism
-                            :msg-in-ch            (async/chan)
-                            :msg-out-ch           (async/chan)
-                            :close                close-fn
-                            :memory               true
-                            :state                state
-                            :async-cache          async-cache-fn}))))
+      (map->IPFSConnection {:id              conn-id
+                            :ipfs-endpoint   ipfs-endpoint
+                            :ledger-defaults ledger-defaults
+                            :transactor?     false
+                            :local-read      local-read
+                            :local-write     local-write
+                            :read            read
+                            :write           write
+                            :push            push
+                            :parallelism     parallelism
+                            :msg-in-ch       (async/chan)
+                            :msg-out-ch      (async/chan)
+                            :close           close-fn
+                            :memory          true
+                            :state           state
+                            :async-cache     async-cache-fn}))))
