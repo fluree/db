@@ -21,7 +21,8 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.storage.core :as storage]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.did :as did]))
+            [fluree.db.did :as did]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -105,6 +106,24 @@
             (xhttp/try-socket ws-url sub-chan pub-chan resp-chan timeout close-fn))))
       resp-chan)))
 
+(defn jld-commit-write
+  [conn commit-data]
+  (let [storage-write (:storage-write conn)
+        dbid          (-> commit-data meta :dbid)           ;; dbid exists if this is a db (not commit) write
+        _             (log/warn "DBID COMMIT WRITE!: " dbid)
+        json          (json-ld/normalize-data commit-data)
+        storage-key   (if dbid
+                        (second (re-find #"^fluree:db:sha256:(.+)$" dbid))
+                        (crypto/sha2-256-normalize json))
+        storage-key*  (str (subs storage-key 0 2) "_" (subs storage-key 2))]
+    (when-not storage-key
+      (throw (ex-info (str "Unable to retrieve storage key from dbid: " dbid ".")
+                      {:status 500 :error :db/unexpected-error})))
+    (throw (ex-info (str "DONT WRITE YET!!")
+                    {}))
+    (storage-write storage-key json)
+    ))
+
 
 ;; all ledger messages are fire and forget
 
@@ -149,6 +168,15 @@
   (-did [conn] did)
   (-context [conn] context)
   (-method [conn] :file)
+
+  ;; following used specifically for JSON-LD dbs
+  conn-proto/iStorage
+  (-c-read [_ commit-key] (storage-read commit-key))
+  (-c-write [conn commit-data] (jld-commit-write conn commit-data))
+
+  conn-proto/iNameService
+  (-address [conn] (async/go "file"))
+  (-address [conn key] (async/go "file"))
 
 
   #?@(:clj

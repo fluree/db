@@ -3,6 +3,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
             [fluree.db.method.ipfs.push :refer [push!]]
+            [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -10,9 +11,10 @@
 (defn default-commit-fn
   "Default push function for IPFS"
   [ipfs-endpoint]
-  (fn [json]
+  (fn [data]
     (go-try
-      (let [res (<? (ipfs/add ipfs-endpoint json))
+      (let [json (json-ld/normalize-data data)
+            res  (<? (ipfs/add ipfs-endpoint json))
             {:keys [name]} res]
         (when-not name
           (throw (ex-info (str "IPFS publish error, unable to retrieve IPFS name. Response object: " res)

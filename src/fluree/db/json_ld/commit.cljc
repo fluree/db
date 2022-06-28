@@ -281,7 +281,7 @@
         db-json*    (-> db-json
                         (assoc id-key db-id)
                         (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
-    db-json*))
+    (with-meta db-json* {:dbid db-id})))
 
 
 
@@ -294,13 +294,14 @@
     (let [{:keys [branch commit t]} db
           {:keys [did id-key push? branch-name] :as opts*} (commit-opts db opts)]
       (let [commit-data (commit-meta db opts*)
-            jld-graphs  (commit->graphs commit-data opts*)
-            graph-res   (<? (conn-proto/-c-write conn (json-ld/normalize-data jld-graphs)))
+            jld-graphs  (commit->graphs commit-data opts*)  ;; writes :dbid as meta on return object for -c-write to leverage
+            graph-res   (<? (conn-proto/-c-write conn jld-graphs))
             _           (log/info "New DB address:" (:address graph-res))
             jld-commit  (commit->json-ld (:address graph-res) opts*)
-            credential  (when did (cred/generate jld-commit opts*))
-            doc         (json-ld/normalize-data (or credential jld-commit))
-            commit-res  (<? (conn-proto/-c-write conn doc))
+            jld-commit* (if did
+                          (cred/generate jld-commit opts*)
+                          jld-commit)
+            commit-res  (<? (conn-proto/-c-write conn (or jld-commit* jld-commit)))
             _           (log/info (str "New Commit address: " (:address commit-res)))
             commit-data {:t       t
                          :dbid    (get jld-graphs id-key)   ;; sha address for database
