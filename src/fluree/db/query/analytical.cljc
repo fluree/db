@@ -403,15 +403,11 @@
   #?(:cljs (throw (ex-info "Full text search is not supported in JS"
                            {:status 400
                             :error  :db/invalid-query}))
-     :clj  (if (:memory conn)
-             (throw (ex-info "Full text search is not supported in when running in-memory"
-                             {:status 400
-                              :error  :db/invalid-query}))
-             (let [lang (-> db :settings :language (or :default))
-                   [var search search-param] clause
-                   var  (variable? var)]
-               (with-open [^Closeable store (full-text/open-storage conn network ledger-id lang)]
-                 (full-text/search store db [var search search-param]))))))
+     :clj  (let [lang (-> db :settings :language (or :default))
+                 [var search search-param] clause
+                 var  (variable? var)]
+             (with-open [^Closeable store (full-text/open-storage conn network ledger-id lang)]
+               (full-text/search store db [var search search-param])))))
 
 
 ;; Can be: ["?item" "rdf:type" "person"]

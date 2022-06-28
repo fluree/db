@@ -144,9 +144,11 @@
 
   #?@(:clj
       [full-text/IndexConnection
-       (open-storage [{:keys [storage-type] :as conn} network ledger-id lang]
-                     (when-let [path (-> conn :meta :file-storage-path)]
-                       (full-text/disk-index path network ledger-id lang)))]))
+       (open-storage [conn network ledger-id lang]
+                     (if (:memory conn)
+                       (full-text/memory-index lang)
+                       (when-let [path (-> conn :meta :file-storage-path)]
+                         (full-text/disk-index path network ledger-id lang))))]))
 
 (defn- normalize-servers
   "Split servers in a string into a vector.
