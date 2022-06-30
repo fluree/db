@@ -1,5 +1,5 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
-         org.clojure/clojurescript       {:mvn/version "1.11.4"}
+         org.clojure/clojurescript       {:mvn/version "1.11.57"}
          org.clojure/core.async          {:mvn/version "1.5.648"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
@@ -7,7 +7,7 @@
          org.clojure/data.xml            {:mvn/version "0.2.0-alpha6"}
          environ/environ                 {:mvn/version "1.2.0"}
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
-         cheshire/cheshire               {:mvn/version "5.10.2"}
+         cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
 
          ;; logging
@@ -19,7 +19,7 @@
          clucie/clucie                   {:mvn/version "0.4.2"}
 
          ;; http
-         http-kit/http-kit               {:mvn/version "2.5.3"}
+         http-kit/http-kit               {:mvn/version "2.6.0"}
          com.fluree/http.async.client    {:mvn/version "1.3.1-25-0xae4f"}
 
          ;; benchmarking
@@ -47,7 +47,7 @@
 
   :dev
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
-   :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.2.0"}
+   :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}}
 
   :cljs-browser-test
@@ -66,7 +66,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.66.1034"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.67.1055"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -121,11 +121,11 @@
 
   :coverage
   {:extra-paths ["test"]
-   :extra-deps  {cloverage/cloverage {:mvn/version "1.2.3"}}
+   :extra-deps  {cloverage/cloverage {:mvn/version "1.2.4"}}
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.2.3"}}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.2.4"}}
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths    ["src" "src-docs"]
                  :test-paths      ["test"]}]}
@@ -135,5 +135,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.04.25"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.05.31"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}

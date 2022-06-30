@@ -1,0 +1,15 @@
+{
+  "name": "flureenjstest",
+  "version": "0.0.0",
+  "description": "Use this to test builds of flureenjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest"
+  },
+  "dependencies": {
+    "@fluree/flureenjs": "file:../../out/flureenjs.js"
+  },
+  "devDependencies": {
+    "jest": "^28.1.1"
+  }
+}

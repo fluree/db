@@ -92,12 +92,15 @@ cljs-node-test: node_modules package-lock.json
 	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
 	clojure -M:cljs-node-test
 
+nodejs-test: out/flureenjs.js
+	cd test/nodejs && npm install && npm test
+
 cljstest: cljs-browser-test cljs-node-test
 
 cljtest:
 	clojure -M:cljtest
 
-test: cljtest cljstest
+test: cljtest cljstest nodejs-test
 
 eastwood:
 	clojure -M:test:eastwood
