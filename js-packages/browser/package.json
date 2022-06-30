@@ -11,6 +11,6 @@
   },
   "keywords" : [ "fluree", "javascript", "database", "ledger" ],
   "author" : "Fluree PBC (https://flur.ee)",
-  "version" : "1.0.3",
+  "version" : "1.0.4",
   "main" : "flureedb.js"
 }

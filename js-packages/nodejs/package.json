@@ -8,7 +8,7 @@
   "types" : "flureenjs.d.ts",
   "author" : "Fluree PBC (https://flur.ee)",
   "requires" : true,
-  "version" : "1.0.3",
+  "version" : "1.0.4",
   "main" : "flureenjs.js",
   "dependencies" : {
     "source-map-support" : "^0.5.21",
