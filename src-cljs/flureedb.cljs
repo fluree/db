@@ -243,10 +243,10 @@
    Ledger creation is handled asynchronously and may not be immediately available.
 
    Options include:
-   - :alias       - Alias, if different than db-ident.
+   - :alias       - Alias, if different than ledger-ident.
    - :root        - Root account id to bootstrap with (string). Defaults to connection default account id.
    - :doc         - Optional doc string about this db.
-   - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
+   - :fork        - If forking an existing db, ref to db (actual identity, not ledger-ident). Must exist in network db.
    - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
    - :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
    - :jwt         - token for Fluree On-Demand access
