@@ -1,6 +1,6 @@
 (ns flureenjs
   (:require-macros [cljs.tools.reader.reader-types]
-                   [flureenjs :refer [analyzer-state]])
+                   [flureenjs :refer [analyzer-state version]])
 
   (:require [clojure.string :as str]
             [cljs.core.async :refer [go <!] :as async]
@@ -80,7 +80,7 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce -app-state (atom {:product "Fluree NodeJs Library"
-                           :version "v1.0.0-rc21"}))
+                           :version (version)}))
 
 (println (:product @-app-state) (:version @-app-state))
 

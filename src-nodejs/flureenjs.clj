@@ -2,7 +2,8 @@
   (:require
     [cljs.compiler :as compiler]
     [cljs.core :as cljs]
-    [cljs.env :as env]))
+    [cljs.env :as env]
+    [clojure.edn :as edn]))
 
 (defmacro analyzer-state [[_ ns-sym]]
   `'~(get-in @env/*compiler* [:cljs.analyzer/namespaces ns-sym]))
@@ -21,3 +22,7 @@
            `(set! (.. ~type -prototype ~(to-property (first method)))
                   (fn ~@(rest method))))
          methods)))
+
+(defmacro version []
+  (let [deps (-> "deps.edn" slurp edn/read-string)]
+    (get-in deps [:aliases :mvn/version])))
