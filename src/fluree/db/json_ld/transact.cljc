@@ -22,8 +22,10 @@
   Only need to test maps that have :id - and if they have other properties they
   are defining then we know it is a node and have additional data to include."
   [mapx]
-  (and (contains? mapx :id)
-       (> (count mapx) 1)))
+  (and (not (contains? mapx :value))
+       (if (contains? mapx :id)                             ;; if the node has an :id, must have more than one k/v pair defined
+         (> (count mapx) 1)
+         true)))
 
 
 (defn json-ld-type-data
@@ -81,7 +83,7 @@
   [sid new-sid? property {:keys [id value] :as v-map}
    {:keys [iris next-sid t db-before new-sids] :as tx-state}]
   (go-try
-    (let [ref?           (boolean id)                       ;; either a ref or a value
+    (let [ref?           (not value)                        ;; either a ref or a value
           existing-pid   (jld-reify/get-iri-sid property db-before iris)
           pid            (or existing-pid
                              (get jld-ledger/predefined-properties property)
