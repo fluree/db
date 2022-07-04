@@ -573,6 +573,11 @@
                       {:variable (:variable parsed-filter-map)
                        :filter   parsed-filter-map})
 
+                    rdf-type?                               ;; _block gets aliasted to _tx
+                    (if (= "_block" o)
+                      (value-type-map "_tx")
+                      (value-type-map o))
+
                     :else
                     (value-type-map o))
         idx       (cond
