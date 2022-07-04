@@ -573,9 +573,9 @@
                       {:variable (:variable parsed-filter-map)
                        :filter   parsed-filter-map})
 
-                    rdf-type?                               ;; _block gets aliasted to _tx
+                    rdf-type?
                     (if (= "_block" o)
-                      (value-type-map "_tx")
+                      (value-type-map "_tx")                ;; _block gets aliased to _tx
                       (value-type-map o))
 
                     :else
@@ -746,7 +746,7 @@
    :order     - :asc or :desc
    :predicate - predicate name, if :predicate type
    :variable  - variable name, if :variable type"
-  [{:keys [where] :as parsed-query} db order-by]
+  [{:keys [where] :as parsed-query} order-by]
   (let [{:keys [variable] :as parsed-order-by} (parse-order-by order-by)]
     (when (and variable (not (variable-in-where? variable where)))
       (throw (ex-info (str "Order by specifies a variable, " variable
@@ -864,6 +864,8 @@
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
                             (-> supplied-vars keys set))
+        orderBy*          (or orderBy (:orderBy opts))
+        groupBy*          (or groupBy (:groupBy opts))
         parsed            (cond-> {:strategy      :legacy
                                    :rel-binding?  rel-binding?
                                    :where         (parse-where db query-map' supplied-var-keys)
@@ -876,8 +878,8 @@
                                                     prettyPrint
                                                     (:prettyPrint opts))}
                                   filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
-                                  orderBy (add-order-by db (or orderBy (:orderBy opts)))
-                                  groupBy (add-group-by (or groupBy (:groupBy opts)))
+                                  orderBy* (add-order-by orderBy*)
+                                  groupBy* (add-group-by groupBy*)
                                   true (add-select-spec query-map'))]
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
