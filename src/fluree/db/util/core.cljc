@@ -168,6 +168,15 @@
     :else (throw (ex-info (str "Cannot convert type " (type s) " to keyword: " (pr-str s))
                           {:status 500 :error :db/unexpected-error}))))
 
+(defn keywordize-keys
+  "Does simple (top-level keys only) keyworize-keys if the key is a string."
+  [m]
+  (reduce-kv
+    (fn [acc k v]
+      (if (string? k)
+        (assoc acc (keyword k) v)
+        (assoc acc k v)))
+    {} m))
 
 (defn str->epoch-ms
   "Takes time as a string and returns an java.time.Instant."
