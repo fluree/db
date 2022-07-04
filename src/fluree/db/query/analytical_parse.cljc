@@ -882,7 +882,12 @@
   (let [query-map*   (if (basic-query? query-map)
                        (basic-to-analytical-transpiler query-map)
                        query-map)
-        {:keys [vars]} query-map*
+        {:keys [vars opts]} query-map*
         vars*        (coerce-vars vars)
-        parsed-query (parse* db (dissoc query-map* :vars) vars*)]
+        opts*        (when opts (util/keywordize-keys opts))
+        parsed-query (parse* db
+                             (-> query-map*
+                                 (assoc :opts opts*)
+                                 (dissoc :vars))
+                             vars*)]
     (assoc parsed-query :vars vars*)))
