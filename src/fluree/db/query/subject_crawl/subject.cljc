@@ -7,7 +7,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject order-results]]
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject]]
             [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
