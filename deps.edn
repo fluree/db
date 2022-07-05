@@ -36,7 +36,7 @@
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
-         org.babashka/sci                {:mvn/version "0.3.4"}}
+         org.babashka/sci                {:mvn/version "0.3.32"}}
 
  :paths ["src" "resources"]
 
@@ -127,8 +127,8 @@
   :eastwood
   {:extra-deps {jonase/eastwood {:mvn/version "1.2.4"}}
    :main-opts  ["-m" "eastwood.lint"
-                {:source-paths    ["src" "src-docs"]
-                 :test-paths      ["test"]}]}
+                {:source-paths ["src" "src-docs"]
+                 :test-paths   ["test"]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
