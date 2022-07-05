@@ -43,7 +43,7 @@
  :aliases
  {:mvn/group-id    com.fluree
   :mvn/artifact-id db
-  :mvn/version     "2.0.0-alpha3" ; Change this down in the docs alias too!
+  :mvn/version     "2.0.0-alpha4" ; Change this down in the docs alias too!
 
   :dev
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
@@ -108,7 +108,7 @@
                 :name        com.fluree/db
                 ;; TODO: Eliminate this copy of the version string
                 ;; I think that tools.build might be the best way to do that
-                :version     "2.0.0-alpha3"
+                :version     "2.0.0-alpha4"
                 :output-path "docs"}}
 
   :deploy
