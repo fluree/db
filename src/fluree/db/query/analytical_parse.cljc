@@ -565,10 +565,23 @@
   (let [offset* (or offset
                     (:offset opts)
                     0)]
-    (when-not (>= offset* 0)
+    (when-not (and (int? offset*) (>= offset* 0))
       (throw (ex-info (str "Invalid query offset specified: " offset*)
                       {:status 400 :error :db/invalid-query})))
     offset*))
+
+(defn get-depth
+  "Extracts depth setting from query, if specified. If not returns
+  default depth of 0"
+  [{:keys [depth opts] :as _query-map'}]
+  (let [depth* (or depth
+                   (:depth opts)
+                   0)]
+    (when-not (and (int? depth*) (>= depth* 0))
+      (throw (ex-info (str "Invalid query depth specified: " depth*)
+                      {:status 400 :error :db/invalid-query})))
+    depth*))
+
 
 (defn get-max-fuel
   "Extracts max-fuel from query if specified, or uses Integer/max a default."
@@ -644,7 +657,7 @@
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [opts prettyPrint filter orderBy groupBy context] :as query-map'} supplied-vars]
+  [db {:keys [opts prettyPrint filter orderBy groupBy context depth] :as query-map'} supplied-vars]
   (let [rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
@@ -663,6 +676,7 @@
                                    :opts          opts*
                                    :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
                                    :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts
+                                   :depth         (get-depth query-map') ;; for query crawling, default depth to crawl
                                    :fuel          (get-max-fuel query-map')
                                    :supplied-vars supplied-var-keys
                                    :pretty-print  (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts

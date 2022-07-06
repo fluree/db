@@ -1,6 +1,7 @@
 (ns fluree.db.query.json-ld.select
   (:require [fluree.json-ld :as json-ld]
-            [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn]]))
+            [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn]]
+            [fluree.db.util.log :as log]))
 
 ;; parses select statement for JSON-LD queries
 
@@ -23,7 +24,7 @@
 
 
 (defn parse-map
-  [select-map]
+  [select-map depth]
   (let [[var selection] (first select-map)
         var-as-symbol (q-var->symbol var)]
     (when (or (not= 1 (count select-map))
@@ -31,10 +32,11 @@
       (throw (ex-info (str "Invalid select statement, maps must have only one key/val. Provided: " select-map)
                       {:status 400 :error :db/invalid-query})))
     {:variable  var-as-symbol
-     :selection selection}))
+     :selection selection
+     :depth     depth}))
 
 (defn parse-select
-  [select-smt]
+  [select-smt depth]
   (let [_ (or (every? #(or (string? %) (map? %)) select-smt)
               (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt)
                               {:status 400 :error :db/invalid-query})))]
@@ -48,7 +50,7 @@
                (parse-aggregate select)
 
                (map? select)
-               (parse-map select)
+               (parse-map select depth)
 
                :else
                (throw (ex-info (str "Invalid select in statement, provided: " select)
@@ -57,7 +59,7 @@
 
 
 (defn expand-selection
-  [{:keys [schema] :as db} context selection]
+  [{:keys [schema] :as db} context {:keys [selection depth]}]
   (reduce
     (fn [acc select-item]
       (cond
@@ -78,30 +80,32 @@
               spec (get-in schema [:pred iri])
               pid  (:id spec)]
           (assoc acc pid (assoc spec :as select-item)))))
-    {} selection))
+    {:depth depth} selection))
 
 
 (defn expand-spec
+  "If a :select item (select statement always coerced to vector if not already)
+  has a :selection key it is a graph crawl. Parse the graph crawl, else leave as is."
   [db context parsed-select]
   (reduce
     (fn [acc select-item]
-      (if-let [selection (:selection select-item)]
-        (conj acc (assoc select-item :spec (expand-selection db context selection))
-              (conj acc select-item))))
+      (if (contains? select-item :selection)
+        (conj acc (assoc select-item :spec (expand-selection db context select-item)))
+        (conj acc select-item)))
     []
     parsed-select))
 
 
 (defn parse
   [db
-   {:keys [limit pretty-print context] :as parsed-query}
+   {:keys [limit pretty-print context depth] :as parsed-query}
    {:keys [selectOne select selectDistinct selectReduced] :as _query-map'}]
   (let [select-smt    (or selectOne select selectDistinct selectReduced)
         selectOne?    (boolean selectOne)
         limit*        (if selectOne? 1 limit)
         inVector?     (sequential? select-smt)
         select-smt    (if inVector? select-smt [select-smt])
-        parsed-select (parse-select select-smt)
+        parsed-select (parse-select select-smt depth)
         aggregates    (filter #(contains? % :function) parsed-select)
         expandMap?    (some #(contains? % :selection) parsed-select)
         spec          (if expandMap?

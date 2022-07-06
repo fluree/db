@@ -67,13 +67,13 @@
 
 (defn crawl-ref
   "A sub-selection (graph crawl) exists, generate results."
-  [db compact-fn p-flakes sub-select cache fuel-vol max-fuel]
+  [db compact-fn p-flakes sub-select cache fuel-vol max-fuel depth-i]
   (go-try
     (loop [[next-flake & r] p-flakes
            acc []]
       (if next-flake
         (let [sub-flakes (<? (query-range/index-range db :spot = [(flake/o next-flake)]))
-              res        (<? (flakes->res db cache compact-fn fuel-vol max-fuel sub-select sub-flakes))]
+              res        (<? (flakes->res db cache compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes))]
           (recur r (conj acc res)))
         (if (= 1 (count acc))
           (first acc)
@@ -82,7 +82,9 @@
 
 ;; TODO - check for @reverse
 (defn flakes->res
-  [db cache compact-fn fuel-vol max-fuel {:keys [wildcard?] :as select-spec} flakes]
+  "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
+  the requested depth within the select-spec"
+  [db cache compact-fn fuel-vol max-fuel {:keys [wildcard? depth] :as select-spec} depth-i flakes]
   (go-try
     (when (not-empty flakes)
       (loop [[p-flakes & r] (partition-by flake/p flakes)
@@ -112,10 +114,17 @@
 
                        ;; flake's .-o value is a reference to another subject
                        (:ref? spec)
-                       (if-let [sub-spec (:spec spec)]
-                         ;; have sub-selection (graph crawl)
-                         (<? (crawl-ref db compact-fn p-flakes sub-spec cache fuel-vol max-fuel))
+                       (cond
+                         ;; have a specified sub-selection (graph crawl)
+                         (:spec spec)
+                         (<? (crawl-ref db compact-fn p-flakes (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
+
+                         ;; requested graph crawl depth has not yet been reached
+                         (< depth-i depth)
+                         (<? (crawl-ref db compact-fn p-flakes select-spec cache fuel-vol max-fuel (inc depth-i)))
+
                          ;; no sub-selection, just return {@id <iri>} for each ref iri
+                         :else
                          (<? (iri-only-ref db cache compact-fn p-flakes)))
 
                        ;; flake's .-o value is a scalar value (e.g. integer, string, etc)

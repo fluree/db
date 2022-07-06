@@ -80,7 +80,7 @@
         fuel-vol    (volatile! 0)
         select-spec (retrieve-select-spec db parsed-query)
         result-fn   (if json-ld?
-                      (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec)
+                      (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
                       (partial legacy-resp/flakes->res db cache fuel-vol fuel select-spec))
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
