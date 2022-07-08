@@ -38,9 +38,11 @@
    Note that for multi-cardinality predicates, the prediate filters must pass for just one flake
   "
   [first-s rest-where supplied-vars]
+  (log/debug "merge-wheres-to-filter first-s:" first-s "\nrest-where:" rest-where
+             "\nsupplied-vars:" supplied-vars)
   (loop [[{:keys [type s p o] :as where-smt} & r] rest-where
-         required-p #{}                                     ;; set of 'p' values that are going to be required for a subject to have
-         filter-map {}]                                     ;; key 'p' value, val is list of filtering fns
+         required-p #{} ;; set of 'p' values that are going to be required for a subject to have
+         filter-map {}] ;; key 'p' value, val is list of filtering fns
     (if where-smt
       (when (and (= :tuple type)
                  (= first-s (:variable s)))
@@ -60,8 +62,11 @@
                           (apply function params)))))
 
                   (and variable (supplied-vars variable))
-                  (fn [flake vars]
-                    (= (flake/o flake) (get vars variable))))]
+                  (do
+                    (log/debug "Returning var resolution filter fn")
+                    (fn [flake vars]
+                      (log/debug "Running var resolution filter fn")
+                      (= (flake/o flake) (get vars variable)))))]
           (recur r
                  (conj required-p p)
                  (if f
@@ -82,6 +87,7 @@
                                (-> first-where :s :variable))
                       (-> first-where :s :variable))]
     (when first-s
+      (log/debug "simple-subject-merge-where first-s:" first-s)
       (if (empty? rest-where)
         (assoc parsed-query :strategy :simple-subject-crawl)
         (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-where supplied-vars)]
@@ -102,7 +108,7 @@
   position of each where statement."
   [{:keys [where select] :as _parsed-query}]
   (let [select-var (-> select :select first :variable)]
-    (when select-var                                        ;; for now exclude any filters on the first where, not implemented
+    (when select-var ;; for now exclude any filters on the first where, not implemented
       (every? #(and (= select-var (-> % :s :variable))
                     ;; exclude if any recursion specified in where statement (e.g. person/follows+3)
                     (not (:recur %)))
@@ -114,10 +120,12 @@
   {:select {?subjects ['*']
    :where [...]}"
   [parsed-query]
+  (log/debug "re-parse-as-simple-subj-crawl parsed-query:" parsed-query)
   (when (and (subject-crawl? parsed-query)
              (simple-subject-crawl? parsed-query)
              (not (:group-by parsed-query))
              (not= :variable (some-> parsed-query :order-by :type))
              (not (not-empty (:supplied-vars parsed-query))))
+    (log/debug "re-parse-as-simple-subj-crawl might be SSC if where clause passes muster")
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))

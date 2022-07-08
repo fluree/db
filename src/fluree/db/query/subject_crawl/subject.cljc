@@ -15,16 +15,19 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause}]
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as where-clause}]
+  (log/debug "subjects-chan vars:" vars "\nwhere-clause:" where-clause)
   (let [o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
                         (get vars variable)))
+        _           (log/debug "subjects-chan o*:" o*)
         [fflake lflake] (case idx
                           :post [(flake/->Flake nil p o* nil nil util/min-integer)
                                  (flake/->Flake nil p o* nil nil util/max-integer)]
                           :psot [(flake/->Flake nil p nil nil nil util/min-integer)
                                  (flake/->Flake nil p nil nil nil util/max-integer)])
+         _          (log/debug "subjects-chan fflake:" fflake "\nlflake:" lflake)
         filter-fn   (cond
                       (and o* (= :psot idx))
                       #(= o* (flake/o %))
@@ -44,7 +47,10 @@
                                     ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
                                     :xf          (when filter-fn
                                                    (map (fn [flakes]
-                                                          (filter filter-fn flakes))))})
+                                                          (log/debug "Filtering flakes w/ filter-fn: " flakes)
+                                                          (let [filtered (filter filter-fn flakes)]
+                                                            (log/debug "Filtered flakes:" filtered)
+                                                            filtered))))})
         resolver    (index/->CachedTRangeResolver conn (get novelty idx) t t (:async-cache conn))
         tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)
         return-chan (async/chan 10 (comp (map flake/s)
@@ -56,9 +62,11 @@
           (let [more? (loop [vs (seq next-chunk)
                              i  0]
                         (if vs
-                          (if (>! return-chan (first vs))
-                            (recur (next vs) (inc i))
-                            false)
+                          (do
+                            (log/debug "subjects-chan putting val on return-chan:" (first vs))
+                            (if (>! return-chan (first vs))
+                              (recur (next vs) (inc i))
+                              false))
                           true))]
             (if more?
               (recur)
@@ -111,6 +119,7 @@
 (defn subj-crawl
   [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
   (go-try
+    (log/debug "subj-crawl opts:" opts)
     (let [sid-ch    (if (= :_id (:type f-where))
                       (subjects-id-chan db error-ch vars f-where)
                       (subjects-chan db error-ch vars f-where))

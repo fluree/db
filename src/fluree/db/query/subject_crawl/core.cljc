@@ -25,6 +25,7 @@
 
 (defn relationship-binding
   [{:keys [rdf-type? vars] :as opts}]
+  (log/debug "relationship-binding opts:" opts)
   (async/go-loop [[next-vars & rest-vars] vars
                   acc []]
     (if next-vars
@@ -32,6 +33,7 @@
             res   (if rdf-type?
                     (<? (rdf-type-crawl opts'))
                     (<? (subj-crawl opts')))]
+        (log/debug "relationship-binding next-vars:" next-vars "\nres:" res)
         (recur rest-vars (into acc res)))
       acc)))
 
@@ -92,7 +94,9 @@
                      :query         parsed-query
                      :finish-fn     finish-fn}]
     (if rel-binding?
-      (relationship-binding opts)
+      (let [rel-binds (relationship-binding opts)]
+        (log/debug "rel bind vars:" rel-binds)
+        rel-binds)
       (if rdf-type?
         (rdf-type-crawl opts)
         (subj-crawl opts)))))

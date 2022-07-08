@@ -29,9 +29,9 @@
                         {:status 400 :error :db/invalid-query})))
       res)
     (catch* e
-            (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
-            (throw (ex-info (code-str "Invalid query function: " code-str)
-                            {:status 400 :error :db/invalid-query})))))
+      (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
+      (throw (ex-info (code-str "Invalid query function: " code-str)
+                      {:status 400 :error :db/invalid-query})))))
 
 (def built-in-aggregates
   (letfn [(sum [coll] (reduce + 0 coll))
@@ -137,7 +137,7 @@
   Checks that has 3 elements to the form, and the last element
   is a symbol that starts with a '?'. Else will throw."
   [as-fn-parsed]
-  (when-not (and (= 3 (count as-fn-parsed))                 ;; e.g. (as (sum ?nums) ?sum) - will always have 3 elements
+  (when-not (and (= 3 (count as-fn-parsed)) ;; e.g. (as (sum ?nums) ?sum) - will always have 3 elements
                  (symbol? (last as-fn-parsed)))
     (throw (ex-info (str "Invalid aggregate function using 'as': " (pr-str as-fn-parsed))
                     {:status 400 :error :db/invalid-query})))
@@ -267,7 +267,7 @@
                     {:status 400 :error :db/invalid-query})))
   (let [code (safe-read-fn having)
         [params code*] (parse-having-code code having)]
-    {:variable nil                                          ;; not used for 'having' fn execution
+    {:variable nil ;; not used for 'having' fn execution
      :params   params
      :fn-str   (str "(fn " params " " code)
      :function (filter/make-executable params code*)}))
@@ -288,7 +288,7 @@
 
 
 (defn add-select-spec
-  [{:keys [group-by order-by limit offset pretty-print] :as parsed-query}
+  [{:keys [limit offset pretty-print] :as parsed-query}
    {:keys [selectOne select selectDistinct selectReduced opts orderBy groupBy having] :as _query-map'}]
   (let [select-smt    (or selectOne select selectDistinct selectReduced)
         selectOne?    (boolean selectOne)
@@ -450,7 +450,7 @@
   (let [[clause-type clause-val] (first map-clause)]
     (case clause-type
       :filter
-      {:type   :filter                                      ;; will process all filters after where completed.
+      {:type   :filter ;; will process all filters after where completed.
        :filter clause-val}
 
       :optional
@@ -477,7 +477,7 @@
                              "and binding scalars, or aggregates, as values.")
                         {:status 400 :error :db/invalid-query})))
 
-      :minus                                                ;; negation - SPARQL 1.1, not yet supported
+      :minus ;; negation - SPARQL 1.1, not yet supported
       (throw (ex-info (str "Invalid where clause, Fluree does not yet support the 'minus' operation.")
                       {:status 400 :error :db/invalid-query}))
 
@@ -562,7 +562,7 @@
                                         db (pred-id-strict db))
                     :else (cond->> p
                                    db (pred-id-strict db)))
-        p-idx?    (when p* (dbproto/-p-prop db :idx? p*))   ;; is the predicate indexed?
+        p-idx?    (when p* (dbproto/-p-prop db :idx? p*)) ;; is the predicate indexed?
         p-tag?    (when p* (= :tag (dbproto/-p-prop db :type p)))
         o*        (cond
                     p-tag?
@@ -575,7 +575,7 @@
 
                     rdf-type?
                     (if (= "_block" o)
-                      (value-type-map "_tx")                ;; _block gets aliased to _tx
+                      (value-type-map "_tx") ;; _block gets aliased to _tx
                       (value-type-map o))
 
                     :else
@@ -616,7 +616,7 @@
      :s      s*
      :p      p*
      :o      o*
-     :recur  recur-n                                        ;; will only show up if recursion specified.
+     :recur  recur-n ;; will only show up if recursion specified.
      :p-tag? p-tag?
      :p-idx? p-idx?}))
 
@@ -644,7 +644,7 @@
                     {:status 400 :error :db/invalid-query})))
   (loop [[where-smt & r] where
          filters        []
-         hoisted-bind   {}                                  ;; bindings whose values are scalars are hoisted to the top level.
+         hoisted-bind   {} ;; bindings whose values are scalars are hoisted to the top level.
          supplied-vars* supplied-vars
          where*         []]
     (if where-smt
@@ -658,7 +658,7 @@
                      filters
                      (merge hoisted-bind scalars)
                      (merge supplied-vars* aggregates scalars)
-                     (if (not-empty aggregates)             ;; if all scalar bindings, no need to add extra where statement
+                     (if (not-empty aggregates) ;; if all scalar bindings, no need to add extra where statement
                        (conj where* {:type :bind, :aggregates aggregates})
                        where*)))
 
@@ -825,7 +825,7 @@
   [supplied-vars]
   (let [ks (keys supplied-vars)]
     (->> (vals supplied-vars)
-         (mapv #(if (sequential? %)                         ;; scalar values get turned into infite lazy seqs of value
+         (mapv #(if (sequential? %) ;; scalar values get turned into infite lazy seqs of value
                   %
                   (repeat %)))
          (apply interleave)
@@ -860,6 +860,7 @@
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
   [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
+  (log/debug "parse* query-map:" query-map' "\nsupplied-vars:" supplied-vars)
   (let [rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
