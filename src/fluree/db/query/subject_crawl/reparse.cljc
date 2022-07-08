@@ -117,6 +117,7 @@
   (when (and (subject-crawl? parsed-query)
              (simple-subject-crawl? parsed-query)
              (not (:group-by parsed-query))
-             (not= :variable (some-> parsed-query :order-by :type)))
+             (not= :variable (some-> parsed-query :order-by :type))
+             (not (not-empty (:supplied-vars parsed-query))))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
