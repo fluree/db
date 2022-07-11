@@ -33,6 +33,7 @@
       (throw (ex-info (code-str "Invalid query function: " code-str)
                       {:status 400 :error :db/invalid-query})))))
 
+
 (def built-in-aggregates
   (letfn [(sum [coll] (reduce + 0 coll))
           (avg [coll] (/ (sum coll) (count coll)))
@@ -108,17 +109,20 @@
      'sum            sum
      'variance       variance}))
 
+
 (defn aggregate?
   "Aggregate as positioned in a :select statement"
   [x]
   (and (string? x)
        (re-matches #"^\(.+\)$" x)))
 
+
 (defn query-fn?
   "Query function as positioned in a :where statement"
   [x]
   (and (string? x)
        (re-matches #"^#\(.+\)$" x)))
+
 
 (defn q-var->symbol
   "Returns a query variable as a symbol, else nil if not a query variable."
@@ -129,6 +133,7 @@
             (and (symbol? x)
                  (= \? (first (name x)))))
     (symbol x)))
+
 
 (defn extract-aggregate-as
   "Returns as var symbol if 'as' function is used in an aggregate,
@@ -213,6 +218,7 @@
                 union (or (variable-in-where? variable (first union))
                           (variable-in-where? variable (second union))))))
         where))
+
 
 (defn parse-map
   [select-map]
@@ -373,6 +379,7 @@
   however there should be exactly one var in the filter fn that isn't in that map - which should be the
   var that will receive flake/o."
   [params supplied-vars]
+  (log/debug "get-object-var params:" params "\nsupplied-vars:" supplied-vars)
   (let [non-assigned-vars (remove #(contains? supplied-vars %) params)]
     (case (count non-assigned-vars)
       1 (first non-assigned-vars)
@@ -426,6 +433,7 @@
   merged into their respective where statements will have
   the variable available to them."
   [bind-map]
+  (log/debug "parse-binding bind-map:" bind-map)
   (reduce-kv (fn [[aggregates scalars] k v]
                (if (query-fn? v)
                  [(assoc aggregates k (parse-aggregate v))
@@ -881,9 +889,15 @@
                                   filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
                                   orderBy* (add-order-by orderBy*)
                                   groupBy* (add-group-by groupBy*)
-                                  true (add-select-spec query-map'))]
-    (or (re-parse-as-simple-subj-crawl parsed)
-        parsed)))
+                                  true (add-select-spec query-map'))
+        ssc-query         (re-parse-as-simple-subj-crawl parsed)]
+    (if ssc-query
+      (do
+        (log/debug "parse* proceeding with simple-subj-crawl query")
+        ssc-query)
+      (do
+        (log/debug "parse* proceeding with legacy query")
+        parsed))))
 
 (defn parse
   [db query-map]

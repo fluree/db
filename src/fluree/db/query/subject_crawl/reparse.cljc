@@ -88,8 +88,11 @@
                       (-> first-where :s :variable))]
     (when first-s
       (log/debug "simple-subject-merge-where first-s:" first-s)
+      (log/debug "simple-subject-merge-where rest-where:" rest-where)
       (if (empty? rest-where)
-        (assoc parsed-query :strategy :simple-subject-crawl)
+        (do
+          (log/debug "simple-subject-merge-where setting strategy to :simple-subject-crawl")
+          (assoc parsed-query :strategy :simple-subject-crawl))
         (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-where supplied-vars)]
           (assoc parsed-query :where [first-where
                                       {:s-filter subj-filter-map}]

@@ -56,8 +56,8 @@
   ([fuel max-fuel fuel-per]
    (fn [xf]
      (fn
-       ([] (xf))                                            ;; transducer start
-       ([result] (xf result))                               ;; transducer stop
+       ([] (xf)) ;; transducer start
+       ([result] (xf result)) ;; transducer stop
        ([result flake]
         (vswap! fuel + fuel-per)
         (when (and max-fuel (> @fuel max-fuel))
@@ -208,7 +208,7 @@
                                   (keep #(expand-map db (assoc opts* :fuel fuel) tuple-res' %)) ;; returns async channels, executes expandmap query
                                   (async/merge)
                                   (async/into [])
-                                  (async/<!)                ;; all expandmaps with final results now in single vector
+                                  (async/<!) ;; all expandmaps with final results now in single vector
                                   (reduce replace-expand-maps tuple-res') ;; update original tuple with expandmaps result(s)
                                   (#(if single-result? [(first %) @query-fuel] [% @query-fuel])) ;; return two-tuple with second element being fuel consumed
                                   (async/put! port)))
@@ -243,13 +243,27 @@
   "Builds function that returns tuple result based on the :select portion of the original query
   when provided the list of tuples that result from the :where portion of the original query."
   [headers vars select]
+  (log/debug "select-fn headers:" headers "\nvars:" vars "\nselect:" select)
   (let [{:keys [as variable value]} select
         select-val   (or as variable)
         idx          (get-header-idx headers select)
         tuple-select (cond
-                       value (constantly value)
-                       idx (fn [tuple] (nth tuple idx))
-                       (get vars select-val) (constantly (get vars select-val)))]
+                       value
+                       (fn [& _]
+                         (log/debug "tuple-select value:" value)
+                         value)
+
+                       idx
+                       (fn [tuple]
+                         (log/debug "tuple-select idx:" idx "\nin tuple:"
+                                    tuple)
+                         (nth tuple idx))
+
+                       (contains? vars select-val)
+                       (fn [& _]
+                         (log/debug "tuple-select get select-val:" select-val
+                                    "\nvars:" vars)
+                         (get vars select-val)))]
     tuple-select))
 
 
@@ -301,34 +315,37 @@
 (defn- process-ad-hoc-group
   ([db fuel max-fuel res select-spec opts]
    (process-ad-hoc-group db fuel max-fuel res select-spec nil opts))
-  ([db fuel max-fuel {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select limit expandMaps? selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
-   (go-try (if
-             (and aggregates (= 1 (count select)))          ;; only aggregate
-             (let [res  (second (analytical/calculate-aggregate res (first aggregates)))
-                   res' (if prettyPrint
-                          {(-> select first :as str (subs 1)) res}
-                          res)]
-               (if inVector? [res'] res'))
+  ([db fuel max-fuel {:keys [vars] :as res}
+    {:keys [aggregates orderBy offset groupBy select limit expandMaps? selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
+   (go-try
+     (log/debug "process-ad-hoc-group res:" res)
+     (if
+       (and aggregates (= 1 (count select))) ;; only aggregate
+       (let [res  (second (analytical/calculate-aggregate res (first aggregates)))
+             res' (if prettyPrint
+                    {(-> select first :as str (subs 1)) res}
+                    res)]
+         (if inVector? [res'] res'))
 
-             (let [{:keys [headers tuples]} (if aggregates (analytical/add-aggregate-cols res aggregates) res)
-                   offset'        (when (and offset (not groupBy)) ;; groupBy results cannot be offset (not sure why! was there)
-                                    offset)
-                   single-result? (and (not prettyPrint) (not inVector?))
-                   pp-keys        (when prettyPrint (get-pretty-print-keys select))
-                   xf             (apply comp
-                                         (cond-> [(map (select-tuples-fn headers vars select))] ;; a function that formats a :where result tuple to specified :select clause
-                                                 single-result? (conj (map first))
-                                                 selectDistinct? (conj (fuel-flake-transducer fuel max-fuel 5)) ;; distinct charges 5 per item touched
-                                                 selectDistinct? (conj (distinct))
-                                                 offset' (conj (drop offset'))
-                                                 group-limit (conj (take group-limit))
-                                                 prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
-                   result         (cond->> tuples
-                                           orderBy (order-result-tuples fuel max-fuel headers orderBy)
-                                           true (into [] xf))]
-               (if expandMaps?
-                 (<? (pipeline-expandmaps-result select pp-keys single-result? db fuel max-fuel opts 8 result))
-                 result))))))
+       (let [{:keys [headers tuples]} (if aggregates (analytical/add-aggregate-cols res aggregates) res)
+             offset'        (when (and offset (not groupBy)) ;; groupBy results cannot be offset (not sure why! was there)
+                              offset)
+             single-result? (and (not prettyPrint) (not inVector?))
+             pp-keys        (when prettyPrint (get-pretty-print-keys select))
+             xf             (apply comp
+                                   (cond-> [(map (select-tuples-fn headers vars select))] ;; a function that formats a :where result tuple to specified :select clause
+                                           single-result? (conj (map first))
+                                           selectDistinct? (conj (fuel-flake-transducer fuel max-fuel 5)) ;; distinct charges 5 per item touched
+                                           selectDistinct? (conj (distinct))
+                                           offset' (conj (drop offset'))
+                                           group-limit (conj (take group-limit))
+                                           prettyPrint (conj (map #(zipmap (get-pretty-print-keys select) %)))))
+             result         (cond->> tuples
+                                     orderBy (order-result-tuples fuel max-fuel headers orderBy)
+                                     true (into [] xf))]
+         (if expandMaps?
+           (<? (pipeline-expandmaps-result select pp-keys single-result? db fuel max-fuel opts 8 result))
+           result))))))
 
 
 (defn ad-hoc-group-by
@@ -380,11 +397,11 @@
                            res      (try*
                                       (function argument)
                                       (catch* e
-                                              (log/error e (str "Error procesing fn: " (:fn-str having)
-                                                                " with argument: " argument))
-                                              (throw (ex-info (str "Error executing having function: " (:fn-str having)
-                                                                   " with error message: " (ex-message e))
-                                                              {:status 400 :error :db/invalid-query}))))]
+                                        (log/error e (str "Error procesing fn: " (:fn-str having)
+                                                          " with argument: " argument))
+                                        (throw (ex-info (str "Error executing having function: " (:fn-str having)
+                                                             " with error message: " (ex-message e))
+                                                        {:status 400 :error :db/invalid-query}))))]
                        (if res
                          (recur r (assoc acc k tuples))
                          (recur r acc)))
@@ -396,42 +413,45 @@
    {:keys [headers vars] :as res}
    {:keys [groupBy orderBy limit selectOne? selectDistinct? inVector? offset having] :as select-spec}
    opts]
-  (go-try (if groupBy
-            (let [order-fn  (build-order-fn orderBy groupBy)
-                  group-map (cond->> (ad-hoc-group-by res groupBy)
-                                     order-fn (into (sorted-map-by order-fn))
-                                     having (filter-having having headers)
-                                     offset (drop offset)
-                                     limit (take limit)
-                                     selectOne? (take 1))]
-              (loop [[[k tuples] & r] group-map
-                     acc {}]
-                (if k
-                  (let [group-as-res {:headers headers :vars vars :tuples tuples}
-                        v            (<? (process-ad-hoc-group db fuel max-fuel
-                                                               group-as-res
-                                                               (assoc select-spec :orderBy nil :offset 0 :limit nil)
-                                                               (assoc opts :offset 0 :limit nil)))]
-                    (recur r (assoc acc k v)))
-                  acc)))
-            ; no group by
-            (let [limit (if selectOne? 1 limit)
-                  res   (<? (process-ad-hoc-group db fuel max-fuel res select-spec limit opts))]
-              (cond (not (coll? res)) (if inVector? [res] res)
-                    selectOne? (first res)
-                    :else res)))))
+  (go-try
+    (log/debug "process-ad-hoc-res res:" res)
+    (if groupBy
+      (let [order-fn  (build-order-fn orderBy groupBy)
+            group-map (cond->> (ad-hoc-group-by res groupBy)
+                               order-fn (into (sorted-map-by order-fn))
+                               having (filter-having having headers)
+                               offset (drop offset)
+                               limit (take limit)
+                               selectOne? (take 1))]
+        (loop [[[k tuples] & r] group-map
+               acc {}]
+          (if k
+            (let [group-as-res {:headers headers :vars vars :tuples tuples}
+                  v            (<? (process-ad-hoc-group db fuel max-fuel
+                                                         group-as-res
+                                                         (assoc select-spec :orderBy nil :offset 0 :limit nil)
+                                                         (assoc opts :offset 0 :limit nil)))]
+              (recur r (assoc acc k v)))
+            acc)))
+      ; no group by
+      (let [limit (if selectOne? 1 limit)
+            res   (<? (process-ad-hoc-group db fuel max-fuel res select-spec limit opts))]
+        (cond (not (coll? res)) (if inVector? [res] res)
+              selectOne? (first res)
+              :else res)))))
 
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
   [db parsed-query query-map]
   (go-try
+    (log/debug "ad-hoc-query parsed-query:" parsed-query "\nquery-map:" query-map)
     (let [{:keys [selectOne limit offset component orderBy groupBy prettyPrint opts]} query-map
           opts'        (cond-> (merge {:limit   limit :offset (or offset 0) :component component
                                        :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
                                       opts)
                                selectOne (assoc :limit 1))
           max-fuel     (:max-fuel opts')
-          fuel         (or (:fuel opts)                     ;; :fuel volatile! can be provided upstream
+          fuel         (or (:fuel opts) ;; :fuel volatile! can be provided upstream
                            (when (or max-fuel (:meta opts))
                              (volatile! 0)))
           where-result (<? (analytical/q query-map fuel max-fuel db opts'))

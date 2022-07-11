@@ -612,6 +612,8 @@
 
 (defn calculate-aggregate
   [tuples aggregate-fn-map]
+  (log/debug "calculate-aggregate tuples:" tuples "\naggregate-fn-map:"
+             aggregate-fn-map)
   (let [{:keys [variable as function]} aggregate-fn-map
         agg-params (flatten (select-from-tuples [variable] tuples))
         agg-result (function agg-params)]
@@ -619,6 +621,7 @@
 
 (defn add-aggregate-cols
   [res aggregate]
+  (log/debug "add-aggregate-cols res:" res "\naggregate:" aggregate)
   (reduce (fn [res agg]
             (let [[as agg-result] (calculate-aggregate res agg)
                   {:keys [headers tuples]} res
@@ -879,35 +882,37 @@
   ([db where q-map vars fuel max-fuel]
    (resolve-where-clause db where q-map vars fuel max-fuel {}))
   ([db where q-map vars fuel max-fuel opts]
-   (go-try (loop [[clause & r] where
-                  res {:vars (symbolize-keys vars)}]
-             (if clause
-               (let [[next-res r] (<? (clause->tuples db q-map res clause r false fuel max-fuel opts))]
-                 (cond (= 2 (count clause))
-                       (recur r next-res)
+   (go-try
+     (loop [[clause & r] where
+            res {:vars (symbolize-keys vars)}]
+       (if clause
+         (let [[next-res r] (<? (clause->tuples db q-map res clause r false fuel max-fuel opts))]
+           (cond (= 2 (count clause))
+                 (recur r next-res)
 
-                       (empty? (dissoc res :vars))
-                       (recur r (or next-res res))
+                 (empty? (dissoc res :vars))
+                 (recur r (or next-res res))
 
-                       (nil? next-res)
-                       (recur r res)
+                 (nil? next-res)
+                 (recur r res)
 
-                       :else
-                       (recur r (inner-join res next-res))))
-               res)))))
+                 :else
+                 (recur r (inner-join res next-res))))
+         res)))))
 
 (defn q
   [q-map fuel max-fuel db opts]
-  (go-try (let [{:keys [vars where optional filter]} q-map
-                where-res    (<? (resolve-where-clause db where q-map vars fuel max-fuel opts))
-                optional-res (if optional
-                               (<? (optional->left-outer-joins db q-map optional where-res fuel max-fuel opts))
-                               where-res)
-                filter-res   (if filter
-                               (tuples->filtered optional-res filter nil)
-                               optional-res)
-                res          filter-res]
-            res)))
+  (go-try
+    (let [{:keys [vars where optional filter]} q-map
+          where-res    (<? (resolve-where-clause db where q-map vars fuel max-fuel opts))
+          optional-res (if optional
+                         (<? (optional->left-outer-joins db q-map optional where-res fuel max-fuel opts))
+                         where-res)
+          filter-res   (if filter
+                         (tuples->filtered optional-res filter nil)
+                         optional-res)
+          res          filter-res]
+      res)))
 
 
 (comment
