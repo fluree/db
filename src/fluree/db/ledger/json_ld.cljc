@@ -180,9 +180,12 @@
   [conn commit-address]
   (go-try
     (let [base-context {:base commit-address}
-          commit-data  (-> (<? (conn-proto/-c-read conn commit-address))
-                           (json-ld/expand base-context))
-          [commit proof] (jld-reify/parse-commit commit-data)
+          commit-data  (<? (conn-proto/-c-read conn commit-address))
+          _            (when-not commit-data
+                         (throw (ex-info (str "Unable to load. No commit exists for: " commit-address)
+                                         {:status 400 :error :db/invalid-db})))
+          commit-data* (json-ld/expand commit-data base-context)
+          [commit proof] (jld-reify/parse-commit commit-data*)
           alias        (or (get-in commit [const/iri-alias :value])
                            commit-address)
           branch       (get-in commit [const/iri-branch :value])
@@ -190,7 +193,7 @@
                                                :id     commit-address
                                                :blank? true}))
           db           (ledger-proto/-db ledger)
-          db*          (<? (jld-reify/load-db db commit-data false))]
+          db*          (<? (jld-reify/load-db db commit-data* false))]
       (ledger-proto/-db-update ledger db*)
       ledger)))
 

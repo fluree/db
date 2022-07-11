@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.api
   (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
+            [fluree.db.conn.memory :as memory-conn]
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
             [fluree.db.api.query :as query-api]
@@ -57,7 +58,8 @@
           method* (keyword method)]
       (case method*
         :ipfs (ipfs-conn/connect opts*)
-        :file (file-conn/connect opts*)))))
+        :file (file-conn/connect opts*)
+        :memory (memory-conn/connect opts*)))))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
@@ -67,6 +69,13 @@
   - context - (optional) Default @context map to use for ledgers formed with this connection."
   [opts]
   (connect (assoc opts :method :ipfs)))
+
+(defn connect-memory
+  "Forms an in-memory connection using default settings.
+  - did - (optional) DiD information to use, if storing blocks as verifiable credentials
+  - context - (optional) Default @context map to use for ledgers formed with this connection."
+  [opts]
+  (connect (assoc opts :method :memory)))
 
 
 (defn create
