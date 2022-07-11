@@ -128,7 +128,7 @@
              (simple-subject-crawl? parsed-query)
              (not (:group-by parsed-query))
              (not= :variable (some-> parsed-query :order-by :type))
-             (empty? (:supplied-vars parsed-query)))
+             (empty? (:supplied-vars parsed-query))) ; TODO: Seems like this should work for SSC queries, but it didn't seem to. Needs more debugging & then delete this guard. - WSM 2022-07-11
     (log/debug "re-parse-as-simple-subj-crawl might be SSC if where clause passes muster")
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
