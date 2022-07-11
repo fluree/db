@@ -125,7 +125,7 @@
              (simple-subject-crawl? parsed-query)
              (not (:group-by parsed-query))
              (not= :variable (some-> parsed-query :order-by :type))
-             (not (not-empty (:supplied-vars parsed-query))))
+             (empty? (:supplied-vars parsed-query)))
     (log/debug "re-parse-as-simple-subj-crawl might be SSC if where clause passes muster")
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
