@@ -19,15 +19,18 @@
 
 (defn lookup-address
   "Returns IPNS address for a given key."
-  [{:keys [ipfs-endpoint ledger-defaults] :as _conn} key]
-  (if key
-    (ipfs-keys/address ipfs-endpoint key)
-    (async/go (-> ledger-defaults :ipns :address))))
+  [{:keys [ipfs-endpoint ledger-defaults] :as _conn} ledger-alias opts]
+  (go-try
+    (let [base-address (if-let [key (-> opts :ipns :key)]
+                         (<? (ipfs-keys/address ipfs-endpoint key))
+                         (-> ledger-defaults :ipns :address))]
+      (str "fluree:ipns://" base-address "/" ledger-alias))))
+
 
 (defrecord IPFSConnection [id transactor? memory state
                            ledger-defaults async-cache
                            local-read local-write
-                           read write push
+                           read write
                            parallelism close-fn
                            msg-in-ch msg-out-ch
                            ipfs-endpoint]
@@ -37,11 +40,10 @@
   (-c-write [_ commit-data] (write commit-data))
 
   conn-proto/iNameService
-  (-push [this ledger-data] (push ledger-data))
+  (-push [this address ledger-data] (ipfs/push! this address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
-  (-address [this] (lookup-address this nil))
-  (-address [this key] (lookup-address this key))
+  (-address [this ledger-alias opts] (lookup-address this ledger-alias opts))
 
   conn-proto/iConnection
   (-close [_]
@@ -162,7 +164,6 @@
           conn-id            (str (util/random-uuid))
           read               (ipfs/default-read-fn ipfs-endpoint)
           write              (ipfs/default-commit-fn ipfs-endpoint)
-          push               (ipfs/default-push-fn ipfs-endpoint)
           state              (state-machine/blank-state)
           memory-object-size (quot memory 100000)           ;; avg 100kb per cache object
           _                  (when (< memory-object-size 10)
@@ -181,7 +182,6 @@
                             :local-write     local-write
                             :read            read
                             :write           write
-                            :push            push
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)

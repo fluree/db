@@ -167,7 +167,7 @@
   (-c-write [_ commit-data] (commit commit-data))
 
   conn-proto/iNameService
-  (-push [this ledger-data] (push ledger-data))
+  (-push [this address ledger-data] (push ledger-data))
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
 

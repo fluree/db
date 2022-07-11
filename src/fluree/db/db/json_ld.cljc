@@ -391,11 +391,6 @@
   (let [ledger (:ledger db)]
     (ledger-proto/-commit! ledger db opts)))
 
-(defn push!
-  [db commit-meta]
-  (let [ledger (:ledger db)]
-    (ledger-proto/-push! ledger commit-meta)))
-
 
 ;; ================ end GraphDB record support fns ============================
 
@@ -408,7 +403,6 @@
   ledger-proto/iCommit
   (-commit! [db] (commit! db nil))
   (-commit! [db opts] (commit! db opts))
-  (-push! [db commit-meta] (push! db commit-meta))
 
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))

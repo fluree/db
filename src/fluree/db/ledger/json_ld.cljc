@@ -10,7 +10,6 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
-            [fluree.db.method.ipfs.push :as ipfs-push]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [load]))
 
@@ -82,10 +81,6 @@
         db*   (or db (ledger-proto/-db ledger (:branch opts*)))]
     (jld-commit/commit ledger db* opts*)))
 
-(defn push!
-  [ledger commit-meta]
-  (ipfs-push/push! ledger commit-meta))
-
 
 (defrecord JsonLDLedger [address alias context did
                          state cache conn
@@ -96,7 +91,6 @@
                                   (commit! ledger db-or-opts nil)
                                   (commit! ledger nil db-or-opts)))
   (-commit! [ledger db opts] (commit! ledger db opts))
-  (-push! [ledger commit-meta] (push! ledger commit-meta))
 
   ledger-proto/iLedger
   (-db [ledger] (db ledger nil))
@@ -112,14 +106,6 @@
   (-alias [_] alias)
   (-address [_] address))
 
-(defn normalize-address
-  "Creates a full IRI from a base-address and ledger alias.
-  Assumes ledger-alias is already normalized via 'normalize-alias'"
-  [base-address ledger-alias]
-  (let [base-address* (if (str/ends-with? base-address "/")
-                        base-address
-                        (str base-address "/"))]
-    (str "fluree:ipns://" base-address* ledger-alias)))
 
 (defn normalize-alias
   "For a ledger alias, removes any preceding '/' or '#' if exists."
@@ -154,10 +140,7 @@
                             {:id did})
                           (conn-proto/-did conn))
           ledger-alias* (normalize-alias ledger-alias)
-          base-address  (if-let [ipns-key (:key ipns)]
-                          (<? (conn-proto/-address conn ipns-key))
-                          (<? (conn-proto/-address conn)))
-          address       (normalize-address base-address ledger-alias*)
+          address       (<? (conn-proto/-address conn ledger-alias* opts))
           context*      (or context (conn-proto/-context conn))
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from

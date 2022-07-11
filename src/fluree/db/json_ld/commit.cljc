@@ -311,5 +311,7 @@
             db*         (assoc db :commit commit-data)]     ;; branch published to
         (ledger-proto/-commit-update ledger (keyword branch-name) db*)
         (when push?
-          (ledger-proto/-push! ledger (assoc commit-data :ledger-state state)))
+          (let [address      (ledger-proto/-address ledger)
+                commit-data* (assoc commit-data :ledger-state state)]
+            (conn-proto/-push conn address commit-data*)))
         db*))))
