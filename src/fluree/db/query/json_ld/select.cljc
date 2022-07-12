@@ -59,7 +59,7 @@
 
 
 (defn expand-selection
-  [{:keys [schema] :as db} context {:keys [selection depth]}]
+  [{:keys [schema] :as db} context depth selection]
   (reduce
     (fn [acc select-item]
       (cond
@@ -69,7 +69,7 @@
               spec (get-in schema [:pred iri])
               pid  (:id spec)]
           (assoc acc pid (-> spec
-                             (assoc :spec (expand-selection db context v)
+                             (assoc :spec (expand-selection db context 0 v)
                                     :as k))))
 
         (#{"*" :* '*} select-item)
@@ -89,8 +89,8 @@
   [db context parsed-select]
   (reduce
     (fn [acc select-item]
-      (if (contains? select-item :selection)
-        (conj acc (assoc select-item :spec (expand-selection db context select-item)))
+      (if-let [selection (:selection select-item)]
+        (conj acc (assoc select-item :spec (expand-selection db context (:depth select-item) selection)))
         (conj acc select-item)))
     []
     parsed-select))
