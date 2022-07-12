@@ -65,11 +65,14 @@
       (cond
         (map? select-item)
         (let [[k v] (first select-item)
-              iri  (json-ld/expand-iri k context)
-              spec (get-in schema [:pred iri])
-              pid  (:id spec)]
+              iri    (json-ld/expand-iri k context)
+              spec   (get-in schema [:pred iri])
+              pid    (:id spec)
+              depth* (if (zero? depth)
+                       0
+                       (dec depth))]
           (assoc acc pid (-> spec
-                             (assoc :spec (expand-selection db context 0 v)
+                             (assoc :spec (expand-selection db context depth* v)
                                     :as k))))
 
         (#{"*" :* '*} select-item)
