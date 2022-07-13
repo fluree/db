@@ -1,0 +1,1 @@
+cp ../../out/flureedb.js .
