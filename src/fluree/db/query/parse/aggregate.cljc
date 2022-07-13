@@ -117,47 +117,57 @@
   (last as-fn-parsed))
 
 
-(defn parse-aggregate
-  [aggregate-fn-str]
-  (let [list-agg   (safe-read-fn aggregate-fn-str)
-        as?        (= 'as (first list-agg))
-        func-list  (if as?
-                     (second list-agg)
-                     list-agg)
-        _          (when-not (coll? func-list)
-                     (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " aggregate-fn-str)
-                                     {:status 400 :error :db/invalid-query})))
-        list-count (count func-list)
+(defn parse-aggregate*
+  [fn-parsed fn-str as]
+  (let [list-count (count fn-parsed)
         [fun arg var] (cond (= 3 list-count)
-                            [(first func-list) (second func-list) (last func-list)]
+                            [(first fn-parsed) (second fn-parsed) (last fn-parsed)]
 
-                            (and (= 2 list-count) (= 'sample (first func-list)))
-                            (throw (ex-info (str "The sample aggregate function takes two arguments: n and a variable, provided: " aggregate-fn-str)
+                            (and (= 2 list-count) (= 'sample (first fn-parsed)))
+                            (throw (ex-info (str "The sample aggregate function takes two arguments: n and a variable, provided: " fn-str)
                                             {:status 400 :error :db/invalid-query}))
 
                             (= 2 list-count)
-                            [(first func-list) nil (last func-list)]
+                            [(first fn-parsed) nil (last fn-parsed)]
 
                             :else
-                            (throw (ex-info (str "Invalid aggregate selection, provided: " aggregate-fn-str)
+                            (throw (ex-info (str "Invalid aggregate selection, provided: " fn-str)
                                             {:status 400 :error :db/invalid-query})))
         agg-fn     (if-let [agg-fn (built-in-aggregates fun)]
                      (if arg (fn [coll] (agg-fn arg coll)) agg-fn)
-                     (throw (ex-info (str "Invalid aggregate selection function, provided: " aggregate-fn-str)
+                     (throw (ex-info (str "Invalid aggregate selection function, provided: " fn-str)
                                      {:status 400 :error :db/invalid-query})))
         [agg-fn variable] (let [distinct? (and (coll? var) (= (first var) 'distinct))
                                 variable  (if distinct? (second var) var)
                                 agg-fn    (if distinct? (fn [coll] (-> coll distinct agg-fn))
                                                         agg-fn)]
                             [agg-fn variable])
-        as         (if as?
-                     (extract-aggregate-as list-agg)
-                     (symbol (str variable "-" fun)))]
+        as'        (or as (symbol (str variable "-" fun)))]
     (when-not (and (symbol? variable)
                    (= \? (first (name variable))))
-      (throw (ex-info (str "Variables used in aggregate functions must start with a '?'. Provided: " aggregate-fn-str)
+      (throw (ex-info (str "Variables used in aggregate functions must start with a '?'. Provided: " fn-str)
                       {:status 400 :error :db/invalid-query})))
     {:variable variable
-     :as       as
-     :fn-str   aggregate-fn-str
+     :as       as'
+     :fn-str   fn-str
      :function agg-fn}))
+
+
+(defn parse-aggregate
+  "Parses an aggregate function string and returns map with keys:
+  :variable - input variable symbol
+  :as - return variable/binding name
+  :fn-str - original function string, for use in reporting errors
+  :function - executable function."
+  [aggregate-fn-str]
+  (let [list-agg  (safe-read-fn aggregate-fn-str)
+        as?       (= 'as (first list-agg))
+        func-list (if as?
+                    (second list-agg)
+                    list-agg)
+        _         (when-not (coll? func-list)
+                    (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " aggregate-fn-str)
+                                    {:status 400 :error :db/invalid-query})))
+        as        (when as?
+                    (extract-aggregate-as list-agg))]
+    (parse-aggregate* func-list aggregate-fn-str as)))

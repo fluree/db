@@ -8,7 +8,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject order-results]]))
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -76,13 +76,15 @@
   [{:keys [db error-ch f-where limit offset parallelism finish-fn vars] :as opts}]
   (go-try
     (let [subj-ch   (subj-flakes-chan db error-ch vars f-where)
-          flakes-af (flakes-xf opts)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]
 
-      (async/pipeline-async parallelism flakes-ch flakes-af subj-ch)
+      ;; take stream of flakes grouped by subject and runs through filtering and permissioning
+      (async/pipeline-async parallelism flakes-ch (flakes-xf opts) subj-ch)
+      ;; takes filtered and permissioned flakes by subject and turns into response map based on select spec
       (async/pipeline-async parallelism result-ch (result-af opts) flakes-ch)
 
+      ;; collect all response maps, If sorting, pretty-print, or selectOne specified then performs finishing function on results
       (loop [acc []]
         (let [[next-res ch] (async/alts! [error-ch result-ch])]
           (cond

@@ -15,7 +15,7 @@
 
 (defn publish
   "'subject' currently only supports db-ident and
-   must be in the form of [network dbid]"
+   must be in the form of [network ledger-id]"
   [event-type dbv data]
   (let [db-subs  (keys (get @sub-state dbv))
         evt-subs (keys (get @sub-state event-type))]

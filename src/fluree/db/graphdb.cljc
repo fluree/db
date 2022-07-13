@@ -28,7 +28,7 @@
 
 ;; TODO - we should make the names more restrictive
 (defn validate-ledger-ident
-  "Returns two-tuple of [network name-or-dbid] if db-ident is valid.
+  "Returns two-tuple of [network name-or-ledger-id] if db-ident is valid.
 
   Will ignore a direct db name reference (prefixed with '_')
   Otherwise throws."
@@ -83,7 +83,9 @@
    (go-try
      (let [t                    (-> flakes first flake/t)
            _                    (when (not= t (dec (:t db)))
-                                  (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " (:t db) " is not beyond supplied transaction t: " t ".")
+                                  (throw (ex-info (str "Invalid with called for ledger " (:ledger-id db)
+                                                       " because current 't', " (:t db)
+                                                       " is not beyond supplied transaction t: " t ".")
                                                   {:status 500
                                                    :error  :db/unexpected-error})))
            add-flakes           (filter include-flake? flakes)
@@ -149,7 +151,7 @@
      (async/go
        (try*
          (when (and (not= block (inc (:block db))))
-           (throw (ex-info (str "Invalid 'with' called for db " (:dbid db)
+           (throw (ex-info (str "Invalid 'with' called for ledger " (:ledger-id db)
                                 " because current db 'block', " (:block db)
                                 " must be one less than supplied block "
                                 block ".")
@@ -205,7 +207,7 @@
   [db tt-id flakes]
   (go-try
    (let [tt-id       (if (nil? tt-id)
-                       (util/random-uuid)
+                       (random-uuid)
                        tt-id)
 
          ;; update each root index with the provided tt-id
@@ -272,9 +274,9 @@
 
 ;; ================ GraphDB record support fns ================================
 
-(defn- graphdb-latest-db [{:keys [current-db-fn permissions]}]
+(defn- graphdb-latest-db [{:keys [current-db-fn permissions] :as db}]
   (go-try
-    (let [current-db (<? (current-db-fn))]
+    (let [current-db (<? (current-db-fn db))]
       (assoc current-db :permissions permissions))))
 
 (defn- graphdb-root-db [this]
@@ -344,7 +346,7 @@
 
 ;; ================ end GraphDB record support fns ============================
 
-(defrecord GraphDb [conn network dbid block t tt-id stats spot psot post opst
+(defrecord GraphDb [conn network ledger-id block t tt-id stats spot psot post opst
                     tspo schema settings comparators schema-cache novelty
                     permissions fork fork-block current-db-fn]
   dbproto/IFlureeDb
@@ -384,7 +386,7 @@
      IPrintWithWriter
      (-pr-writer [db w opts]
        (-write w "#FlureeGraphDB ")
-       (-write w (pr {:network     (:network db) :dbid (:dbid db) :block (:block db)
+       (-write w (pr {:network     (:network db) :ledger-id (:ledger-id db) :block (:block db)
                       :t           (:t db) :stats (:stats db)
                       :permissions (:permissions db)})))))
 
@@ -392,7 +394,7 @@
    (defmethod print-method GraphDb [^GraphDb db, ^Writer w]
      (.write w (str "#FlureeGraphDB "))
      (binding [*out* w]
-       (pr {:network (:network db) :dbid (:dbid db) :block (:block db)
+       (pr {:network (:network db) :ledger-id (:ledger-id db) :block (:block db)
             :t       (:t db) :stats (:stats db) :permissions (:permissions db)}))))
 
 (defn new-novelty-map
@@ -405,10 +407,10 @@
    {:size 0} index/types))
 
 (defn blank-db
-  [conn network dbid schema-cache current-db-fn]
+  [conn network ledger-id schema-cache current-db-fn]
   (assert conn "No conn provided when creating new db.")
   (assert network "No network provided when creating new db.")
-  (assert dbid "No dbid provided when creating new db.")
+  (assert ledger-id "No ledger-id provided when creating new db.")
   (let [novelty     (new-novelty-map index/default-comparators)
         permissions {:collection {:all? false}
                      :predicate  {:all? true}
@@ -420,18 +422,18 @@
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot (index/empty-branch network dbid spot-cmp)
-        psot (index/empty-branch network dbid psot-cmp)
-        post (index/empty-branch network dbid post-cmp)
-        opst (index/empty-branch network dbid opst-cmp)
-        tspo (index/empty-branch network dbid tspo-cmp)
+        spot (index/empty-branch network ledger-id spot-cmp)
+        psot (index/empty-branch network ledger-id psot-cmp)
+        post (index/empty-branch network ledger-id post-cmp)
+        opst (index/empty-branch network ledger-id opst-cmp)
+        tspo (index/empty-branch network ledger-id tspo-cmp)
 
         stats       {:flakes 0, :size 0, :indexed 0}
         fork        nil
         fork-block  nil
         schema      nil
         settings    nil]
-    (->GraphDb conn network dbid 0 -1 nil stats spot psot post opst tspo schema
+    (->GraphDb conn network ledger-id 0 -1 nil stats spot psot post opst tspo schema
                settings index/default-comparators schema-cache novelty
                permissions fork fork-block current-db-fn)))
 

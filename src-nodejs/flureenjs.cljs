@@ -1,7 +1,7 @@
 (ns flureenjs
   (:refer-clojure :exclude [load])
   (:require-macros [cljs.tools.reader.reader-types]
-                   [flureenjs :refer [analyzer-state]])
+                   [flureenjs :refer [analyzer-state version]])
 
   (:require [clojure.string :as str]
             [cljs.core.async :refer [go <!] :as async]
@@ -31,11 +31,11 @@
             [fluree.db.util.log :as log]
             [cljs.nodejs :as node-js]   ; NodeJS support
 
-            ;; shared clojurescript code
+    ;; shared clojurescript code
             [fluree.db.connection-js :as conn-handler]
             [fluree.db.api-js :as fdb-js]
 
-            ;; self-hosted clojurescript
+    ;; self-hosted clojurescript
             [cljs.js]
             [cljs.analyzer]
             [cljs.env]
@@ -126,7 +126,7 @@
 
 ;; define your app data so that it doesn't get over-written on reload
 (defonce -app-state (atom {:product "Fluree NodeJs Library"
-                           :version "v1.0.0-rc21"}))
+                           :version (version)}))
 
 (println (:product @-app-state) (:version @-app-state))
 
@@ -153,7 +153,7 @@
 ;; Support logging at different levels
 ;;
 ;; ======================================
-(log/set-level! :warning)                                   ;; default to log only warnings or errors
+(log/set-level! :warning) ;; default to log only warnings or errors
 ;(def ^:export logging-levels log/levels)
 
 (defn ^:export setLogging
@@ -209,10 +209,10 @@
   "
   []
   (if -njs-crypto
-    (let [ecdh      (js-invoke -njs-crypto "createECDH" "secp256k1")
-          _         (js-invoke ecdh "generateKeys")]
+    (let [ecdh (js-invoke -njs-crypto "createECDH" "secp256k1")
+          _    (js-invoke ecdh "generateKeys")]
       {:private (js-invoke ecdh "getPrivateKey" "hex")
-       :public (js-invoke ecdh "getPublicKey" "hex" "compressed")})
+       :public  (js-invoke ecdh "getPublicKey" "hex" "compressed")})
     (throw "Node.js crypto module not accessible")))
 
 
@@ -238,9 +238,9 @@
 
 
 (defn ^:export setDefaultKey
-  "Sets a new default private key for the entire tx-group, network or db level.
+  "Sets a new default private key for the entire tx-group, network or ledger level.
   This will only succeed if signed by the default private key for the tx-group,
-  or if setting for a dbid, either the tx-group or network.
+  or if setting for a ledger-id, either the tx-group or network.
 
   It will overwrite any existing default private key.
 
@@ -249,8 +249,8 @@
   Returns promise that eventually contains the results. "
   ([conn private-key] (setDefaultKey conn nil nil private-key nil))
   ([conn network private-key] (setDefaultKey conn network nil private-key nil))
-  ([conn network dbid private-key] (setDefaultKey conn network dbid private-key nil))
-  ([conn network dbid private-key opts]
+  ([conn network ledger-id private-key] (setDefaultKey conn network ledger-id private-key nil))
+  ([conn network ledger-id private-key opts]
    (js/Promise.
      (fn [resolve reject]
        (async/go
@@ -258,10 +258,10 @@
            (let [{:keys [nonce expire signing-key]} (js->clj opts :keywordize-keys true)
                  timestamp (util/current-time-millis)
                  nonce     (or nonce timestamp)
-                 expire    (or expire (+ timestamp 30000))          ;; 5 min default
+                 expire    (or expire (+ timestamp 30000)) ;; 5 min default
                  cmd-map   {:type        :default-key
                             :network     network
-                            :dbid        dbid
+                            :ledger-id   ledger-id
                             :private-key private-key
                             :nonce       nonce
                             :expire      expire}
@@ -375,7 +375,7 @@
                                                       {"_id" sid} flakes)))
                                       [] by-subj)))]
             (resolve (assoc block-event :added (to-map add)
-                               :retracted (to-map retract))))
+                                        :retracted (to-map retract))))
           (catch :default e
             (log/error e)
             (reject e)))))))
@@ -417,13 +417,13 @@
      (async/go
        (try
          (let [{:keys [auth jwt]} opts
-               _             (conn-handler/check-connection conn opts)
+               _       (conn-handler/check-connection conn opts)
                [network ledger-id] (session/resolve-ledger conn ledger)
-               auth'        (or auth (if jwt
-                                       ["_auth/id" (-> (conn-handler/validate-token conn jwt)
-                                                       :sub)]))
-               perm-db       (-> (<? (ledger/db conn ledger (assoc opts :auth auth')))
-                                 (assoc :conn conn :network network :dbid ledger-id))]
+               auth'   (or auth
+                           (when jwt
+                             ["_auth/id" (:sub (conn-handler/validate-token conn jwt))]))
+               perm-db (-> (<? (ledger/db conn ledger (assoc opts :auth auth')))
+                           (assoc :conn conn :network network :ledger-id ledger-id))]
            (async/put! pc perm-db))
          (catch :default e
            (log/error e)
@@ -542,9 +542,9 @@
                  {:keys [nonce expire timeout private-key] :or {timeout 60000}} opts
                  timestamp (util/current-time-millis)
                  nonce     (or nonce timestamp)
-                 expire    (or expire (+ timestamp 30000))  ;; 5 min default
-                 cmd-data  {:type   :delete-db
-                            :db     ledger
+                 expire    (or expire (+ timestamp 30000)) ;; 5 min default
+                 cmd-data  {:type   :delete-ledger
+                            :ledger ledger
                             :nonce  nonce
                             :expire expire}
                  cmd       (when private-key
@@ -607,12 +607,12 @@
    Ledger creation is handled asynchronously and may not be immediately available.
 
    Options include:
-   - :alias       - Alias, if different than db-ident.
+   - :alias       - Alias, if different than ledger-ident.
    - :root        - Root account id to bootstrap with (string). Defaults to connection default account id.
    - :doc         - Optional doc string about this db.
    - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
    - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-   - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+   - :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
    "
   ([conn ledger] (newLedger conn ledger nil))
   ([conn ledger opts]
@@ -637,9 +637,9 @@
                  alias*    (when alias (str network-alias "/" ledger-alias)) ;
                  timestamp (util/current-time-millis)
                  nonce     (or nonce timestamp)
-                 expire    (or expire (+ timestamp 30000))  ;; 5 min default
-                 cmd-data  {:type          :new-db
-                            :db            (str network "/" ledger-id)
+                 expire    (or expire (+ timestamp 30000)) ;; 5 min default
+                 cmd-data  {:type          :new-ledger
+                            :ledger        (str network "/" ledger-id)
                             :alias         alias*
                             :auth          auth
                             :doc           doc
@@ -676,7 +676,7 @@
   the provided name is a ledger id.
 
   If you are providing a ledger id, and wish to skip an alias lookup, a prefix of '$'
-  can be used for the name portion of the db-ident.
+  can be used for the name portion of the ledger-ident.
 
   i.e.
   - testnet/testledger - Look for ledger with an alias or id of testledger on network testnet.
@@ -826,10 +826,10 @@
   - deps        - Not yet implemented, list of dependent transactions.
 
   If successful, will return a map with four keys:
-    - cmd  - a map with the command/transaction data as a JSON string
-    - sig  - the signature of the above stringified map
-    - id   - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
-    - db   - the ledger for this transaction"
+    - cmd    - a map with the command/transaction data as a JSON string
+    - sig    - the signature of the above stringified map
+    - id     - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
+    - ledger - the ledger for this transaction"
   ([ledger txn private-key] (txToCommand ledger txn private-key nil))
   ([ledger txn private-key opts]
    (when-not private-key
@@ -839,7 +839,7 @@
      (fn [resolve reject]
        (async/go
          (try
-           (let [db-name     (if (sequential? ledger)
+           (let [ledger-name (if (sequential? ledger)
                                (str (first ledger) "/$" (second ledger))
                                ledger)
                  {:keys [auth expire nonce deps]} opts
@@ -857,9 +857,9 @@
                                     [key-auth-id nil])
                  timestamp   (util/current-time-millis)
                  nonce       (or nonce timestamp)
-                 expire      (or expire (+ timestamp 30000))        ;; 5 min default
+                 expire      (or expire (+ timestamp 30000)) ;; 5 min default
                  cmd         (try (-> {:type      :tx
-                                       :db        db-name
+                                       :ledger    ledger-name
                                        :tx        txn
                                        :nonce     nonce
                                        :auth      auth
@@ -875,7 +875,7 @@
                                                       {:status 400 :error :db/invalid-tx})))))
                  sig         (crypto/sign-message cmd private-key)
                  id          (crypto/sha3-256 cmd)]
-             (resolve {:cmd cmd  :sig sig  :id id  :db ledger}))
+             (resolve {:cmd cmd :sig sig :id id :ledger ledger}))
            (catch :default e
              (log/error e)
              (reject (clj->js e)))))))))
@@ -956,18 +956,18 @@
      (fn [resolve reject]
        (async/go
          (try
-           (let [query-map*  (js->clj query-map :keywordize-keys true)
-                 clj-opts    (merge (:opts query-map*)
-                                    (when opts (js->clj opts :keywordize-keys true)))
-                 _           (conn-handler/check-connection conn clj-opts)
-                 auth-id     (or (:auth clj-opts)
-                                 (:auth-id clj-opts)
-                                 (some->> (:jwt clj-opts)
-                                          (conn-handler/validate-token conn)
-                                          :auth))
-                 result*     (<? (query/block-query-async
-                                   conn ledger
-                                   (update query-map* :opts merge (merge clj-opts (util/without-nils {:auth auth-id})))))]
+           (let [query-map* (js->clj query-map :keywordize-keys true)
+                 clj-opts   (merge (:opts query-map*)
+                                   (when opts (js->clj opts :keywordize-keys true)))
+                 _          (conn-handler/check-connection conn clj-opts)
+                 auth-id    (or (:auth clj-opts)
+                                (:auth-id clj-opts)
+                                (some->> (:jwt clj-opts)
+                                         (conn-handler/validate-token conn)
+                                         :auth))
+                 result*    (<? (query/block-query-async
+                                  conn ledger
+                                  (update query-map* :opts merge (merge clj-opts (util/without-nils {:auth auth-id})))))]
              (resolve (clj->js result*)))
            (catch :default e
              (log/error e)
@@ -1044,12 +1044,12 @@
                                   (= :history (:type parsed-query))
                                   (<? (query/history-query-async db (-> parsed-query
                                                                         (dissoc :type)
-                                                                        (assoc  :opts clj-opts))))
+                                                                        (assoc :opts clj-opts))))
 
                                   (= :block (:type parsed-query))
                                   (<? (query/block-query-async conn ledger (-> parsed-query
                                                                                (dissoc :type)
-                                                                               (assoc  :opts clj-opts))))
+                                                                               (assoc :opts clj-opts))))
 
                                   (:tx parsed-query)
                                   (<? (fdb-js/transact-async conn ledger (:tx parsed-query) clj-opts))
@@ -1057,7 +1057,7 @@
                                   :else
                                   (<? (query/multi-query-async db-ch (-> parsed-query
                                                                          (dissoc :type)
-                                                                         (assoc  :opts clj-opts))))))]
+                                                                         (assoc :opts clj-opts))))))]
              (resolve (clj->js result)))
            (catch :default e
              (log/error e)
@@ -1073,8 +1073,8 @@
          (try
            (let [query-map* (js->clj query-map :keywordize-keys true)
                  clj-opts   (merge (:opts query-map*)
-                              (-> opts
-                                (js->clj :keywordize-keys true)))
+                                   (-> opts
+                                       (js->clj :keywordize-keys true)))
                  result     (<? (query/history-query-async sources (merge query-map* {:opts clj-opts})))]
              (resolve (clj->js result)))
            (catch :default e
@@ -1112,10 +1112,10 @@
       (async/go
         (try
           (-> (js->clj query-map :keywordize-keys true)
-               (as-> qm (query/query source qm))
-               <?
-               clj->js
-               resolve)
+              (as-> qm (query/query source qm))
+              <?
+              clj->js
+              resolve)
           (catch :default e
             (log/error e)
             (reject (clj->js e))))))))

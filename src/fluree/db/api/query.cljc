@@ -67,8 +67,8 @@
 
 
 (defn- isolate-ledger-id
-  [dbid]
-  (re-find #"[a-z0-9]+/[a-z0-9]+" dbid))
+  [ledger-id]
+  (re-find #"[a-z0-9]+/[a-z0-9]+" ledger-id))
 
 
 (defn db
@@ -497,6 +497,6 @@
       :standard (query-async source flureeQL)
       :history (history-query-async source flureeQL)
       :block (let [conn   (:conn source)
-                   ledger (keyword (:network source) (:dbid source))]
+                   ledger (keyword (:network source) (:ledger-id source))]
                (block-query-async conn ledger flureeQL))
       :multi (multi-query-async source flureeQL))))

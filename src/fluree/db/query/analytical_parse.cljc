@@ -9,7 +9,7 @@
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.json-ld.select :as json-ld-select]
-            [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn]]))
+            [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn built-in-aggregates]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -41,13 +41,14 @@
   "Returns true if provided variable exists as a variable
   somewhere within the where clause."
   [variable where]
-  (some (fn [{:keys [o optional bind union] :as _where-smt}]
-          (cond
-            o (= variable (:variable o))
-            optional (map #(variable-in-where? variable %) optional)
-            bind (contains? (-> bind keys set) variable)
-            union (or (variable-in-where? variable (first union))
-                      (variable-in-where? variable (second union)))))
+  (some (fn [{:keys [s o optional bind union] :as _where-smt}]
+          (or (= (:variable o) variable)
+              (= (:variable s) variable)
+              (cond
+                optional (map #(variable-in-where? variable %) optional)
+                bind (contains? (-> bind keys set) variable)
+                union (or (variable-in-where? variable (first union))
+                          (variable-in-where? variable (second union))))))
         where))
 
 (defn parse-map
@@ -60,6 +61,53 @@
                       {:status 400 :error :db/invalid-query})))
     {:variable  var-as-symbol
      :selection selection}))
+
+(defn parse-having-code
+  "Returns two-tuple of [params updated-code]
+  where params are the function parameters and updated-code is a revised version of
+  code-parsed where all functions within the code are mapped to actual executable functions."
+  [code-parsed code-string]
+  (let [[form-f & form-r] code-parsed
+        form-f' (or (get built-in-aggregates form-f)
+                    (get filter/filter-fns-with-ns (str form-f)))
+        vars    (into #{} (filter symbol? form-r))]
+    (loop [[form-next & form-rest] form-r
+           vars* vars
+           acc   []]
+      (if form-next
+        (let [[params item] (if (list? form-next)
+                              (parse-having-code form-next code-string)
+                              [nil (cond
+                                     (symbol? form-next) (if-not (str/starts-with? (str form-next) "?")
+                                                           (throw (ex-info (str "Invalid variable name '" form-next
+                                                                                "' in having function: " code-string
+                                                                                ". All vars must start with '?'.")
+                                                                           {:status 400 :error :db/invalid-query}))
+                                                           form-next)
+                                     (string? form-next) form-next
+                                     (boolean? form-next) form-next
+                                     (number? form-next) form-next
+                                     :else (throw (ex-info (str "Invalid having function: " code-string
+                                                                ". Only scalar types allowed besides functions: " form-next ".")
+                                                           {:status 400 :error :db/invalid-query})))])
+              vars** (if params
+                       (into vars* params)
+                       vars*)]
+          (recur form-rest vars** (conj acc item)))
+        [(vec vars*) (cons form-f' acc)]))))
+
+
+(defn parse-having
+  [having]
+  (when-not (aggregate? having)
+    (throw (ex-info (str "Invalid 'having' statement aggregate: " having)
+                    {:status 400 :error :db/invalid-query})))
+  (let [code (safe-read-fn having)
+        [params code*] (parse-having-code code having)]
+    {:variable nil                                          ;; not used for 'having' fn execution
+     :params   params
+     :fn-str   (str "(fn " params " " code)
+     :function (filter/make-executable params code*)}))
 
 
 (defn parse-select
@@ -79,7 +127,7 @@
 
 (defn add-select-spec-legacy
   [{:keys [limit offset pretty-print] :as parsed-query}
-   {:keys [selectOne select selectDistinct selectReduced opts orderBy groupBy] :as _query-map'}]
+   {:keys [selectOne select selectDistinct selectReduced opts orderBy groupBy having] :as _query-map'}]
   (let [select-smt    (or selectOne select selectDistinct selectReduced)
         selectOne?    (boolean selectOne)
         limit*        (if selectOne? 1 limit)
@@ -96,13 +144,16 @@
                           (if (vector? orderBy) orderBy ["ASC" orderBy])
                           (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
                                           {:status 400
-                                           :error  :db/invalid-query}))))]
+                                           :error  :db/invalid-query}))))
+        having*       (or having (:having opts))
+        having-parsed (when having* (parse-having having*))]
     (assoc parsed-query :limit limit*
                         :selectOne? selectOne?
                         :select {:select           parsed-select
                                  :aggregates       (not-empty aggregates)
                                  :expandMaps?      expandMap?
                                  :orderBy          orderBy*
+                                 :having           having-parsed
                                  :groupBy          (or (:groupBy opts) groupBy)
                                  :componentFollow? (:component opts)
                                  :limit            limit*
@@ -317,6 +368,28 @@
     :else
     {:value value}))
 
+;; The docs say the default depth is 100
+;; here: https://developers.flur.ee/docs/concepts/analytical-queries/inner-joins-in-fluree/#recursion
+(def ^:const default-recursion-depth 100)
+
+(defn recursion-predicate
+  "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
+  predicate. e.g.: person/follows+3
+
+  Returns a two-tuple of predicate followed by # of times to recur.
+
+  If not a recursion predicate, returns nil."
+  [predicate]
+  (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" predicate)]
+    [pred (if recur-n (util/str->int recur-n) default-recursion-depth)]))
+
+(defn pred-id-strict
+  "Returns predicate ID for a given predicate, else will throw with an invalid
+  predicate error."
+  [db predicate]
+  (or (dbproto/-p-prop db :id predicate)
+      (throw (ex-info (str "Invalid predicate: " predicate)
+                      {:status 400 :error :db/invalid-query}))))
 
 (defn parse-where-tuple
   "Parses where clause tuples (not maps)"
@@ -329,6 +402,7 @@
         collection? (and rdf-type? (= :json (dbproto/-db-type db))) ;; legacy fluree json DB
         _id?        (= "_id" p)
         iri?        (= "@id" p)
+        [recur-pred recur-n] (recursion-predicate p)
         s*          (value-type-map context s)
         p*          (cond
                       fulltext? #?(:clj  (full-text/parse-domain p)
@@ -337,11 +411,10 @@
                       collection? :rdf/type
                       _id? :_id
                       iri? :iri
-                      :else (if db
-                              (or (dbproto/-p-prop db :id p)
-                                  (throw (ex-info (str "Invalid predicate: " p)
-                                                  {:status 400 :error :db/invalid-query})))
-                              p))
+                      recur-pred (cond->> recur-pred
+                                          db (pred-id-strict db))
+                      :else (cond->> p
+                                     db (pred-id-strict db)))
         p-idx?      (when p* (dbproto/-p-prop db :idx? p*)) ;; is the predicate indexed?
         p-tag?      (when p* (= :tag (dbproto/-p-prop db :type p)))
         p-ref?      (when p* (true? (dbproto/-p-prop db :ref? p)))
@@ -353,6 +426,11 @@
                       (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
                         {:variable (:variable parsed-filter-map)
                          :filter   parsed-filter-map})
+
+                      rdf-type?
+                      (if (= "_block" o)
+                        (value-type-map context "_tx")      ;; _block gets aliased to _tx
+                        (value-type-map context o))
 
                       :else
                       (value-type-map context o))
@@ -396,6 +474,7 @@
      :s      s*
      :p      p*
      :o      o*
+     :recur  recur-n                                        ;; will only show up if recursion specified.
      :p-tag? p-tag?
      :p-idx? p-idx?
      :p-ref? p-ref?}))
@@ -452,7 +531,9 @@
         (let [tuple-count (count where-smt)
               where-smt*  (case tuple-count
                             3 (apply parse-where-tuple supplied-vars* context db where-smt)
-                            4 (apply parse-remote-tuple supplied-vars* context where-smt)
+                            4 (if (= "$fdb" (first where-smt)) ;; $fdb refers to default/main db, parse as 3-tuple
+                                (apply parse-where-tuple supplied-vars* context db (rest where-smt))
+                                (apply parse-remote-tuple supplied-vars* context where-smt))
                             2 (apply parse-binding-tuple where-smt)
                             ;; else
                             (if (sequential? (first where-smt))
@@ -524,7 +605,7 @@
    :order     - :asc or :desc
    :predicate - predicate name, if :predicate type
    :variable  - variable name, if :variable type"
-  [{:keys [where] :as parsed-query} db order-by]
+  [{:keys [where] :as parsed-query} order-by]
   (let [{:keys [variable] :as parsed-order-by} (parse-order-by order-by)]
     (when (and variable (not (variable-in-where? variable where)))
       (throw (ex-info (str "Order by specifies a variable, " variable
@@ -668,6 +749,8 @@
                             (if (:js? opts*)
                               (json-ld/parse-context (get-in db [:schema :context-str]) context)
                               (json-ld/parse-context (get-in db [:schema :context]) context)))
+        orderBy*          (or orderBy (:orderBy opts))
+        groupBy*          (or groupBy (:groupBy opts))
         parsed            (cond-> {:json-ld?      json-ld-db?
                                    :strategy      :legacy
                                    :context       context*
@@ -683,8 +766,8 @@
                                                     prettyPrint
                                                     (:prettyPrint opts))}
                                   filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
-                                  orderBy (add-order-by db orderBy)
-                                  groupBy (add-group-by groupBy)
+                                  orderBy (add-order-by orderBy*)
+                                  groupBy (add-group-by groupBy*)
                                   true (add-select-spec query-map' db)
                                   json-ld-db? (assoc :compact-fn (json-ld/compact-fn context*)
                                                      :compact-cache (atom {})))]
@@ -696,7 +779,12 @@
   (let [query-map*   (if (basic-query? query-map)
                        (basic-to-analytical-transpiler db query-map)
                        query-map)
-        {:keys [vars]} query-map*
+        {:keys [vars opts]} query-map*
         vars*        (coerce-vars vars)
-        parsed-query (parse* db (dissoc query-map* :vars) vars*)]
+        opts*        (when opts (util/keywordize-keys opts))
+        parsed-query (parse* db
+                             (-> query-map*
+                                 (assoc :opts opts*)
+                                 (dissoc :vars))
+                             vars*)]
     (assoc parsed-query :vars vars*)))

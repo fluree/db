@@ -35,11 +35,13 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 ### Prerequisites
 
 1. Install clojure tools-deps (version 1.10.3.933 or later).
-    1. macOS: `brew install clojure/tools/clojure`
-    1. Arch Linux: `pacman -S clojure`
-1. Install Node & NPM
-    1. macOS: `brew install node`
-    1. Arch Linux: `pacman -S nodejs`
+   1. macOS: `brew install clojure/tools/clojure`
+   2. Arch Linux: `pacman -S clojure`
+2. Install Node & NPM
+   1. macOS: `brew install node`
+   2. Arch Linux: `pacman -S nodejs`
+3. Install babashka
+   1. macOS: `brew install babashka`
 
 ### Building
 

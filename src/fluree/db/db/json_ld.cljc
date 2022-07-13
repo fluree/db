@@ -216,7 +216,7 @@
   the flakes that end up requiring the schema change."
   [db tt-id flakes]
   (go-try
-    (let [tt-id'      (if (nil? tt-id) (util/random-uuid) tt-id)
+    (let [tt-id'      (if (nil? tt-id) (random-uuid) tt-id)
           ;; update each root index with the provided tt-id
           ;; As the root indexes are resolved, the tt-id will carry through the b-tree and ensure
           ;; query caching is specific to this tt-id

@@ -43,7 +43,7 @@
           (catch* e
                   (log/error e
                              "Error resolving index node:"
-                             (select-keys node [:id :network :dbid]))
+                             (select-keys node [:id :network :ledger-id]))
                   (>! error-ch e)))))
 
 (defn resolved?
@@ -100,14 +100,14 @@
     (assoc new-leaf :first new-first)))
 
 (defn empty-leaf
-  "Returns a blank leaf node map for the provided `network`, `dbid`, and index
+  "Returns a blank leaf node map for the provided `network`, `ledger-id`, and index
   comparator `cmp`."
-  [network dbid cmp]
+  [network ledger-id cmp]
   {:comparator cmp
    :network network
-   :dbid dbid
+   :ledger-id ledger-id
    :id :empty
-   :tempid (util/random-uuid)
+   :tempid (random-uuid)
    :leaf true
    :first flake/maximum
    :rhs nil
@@ -117,9 +117,9 @@
    :leftmost? true})
 
 (defn new-leaf
-  [network dbid cmp flakes]
+  [network ledger-id cmp flakes]
   (let [empty-set (flake/sorted-set-by cmp)]
-    (-> (empty-leaf network dbid cmp)
+    (-> (empty-leaf network ledger-id cmp)
         (assoc :flakes empty-set)
         (add-flakes flakes))))
 
@@ -151,15 +151,15 @@
 
 (defn empty-branch
   "Returns a blank branch node which contains a single empty leaf node for the
-  provided `network`, `dbid`, and index comparator `cmp`."
-  [network dbid cmp]
-  (let [child-node (empty-leaf network dbid cmp)
+  provided `network`, `ledger-id`, and index comparator `cmp`."
+  [network ledger-id cmp]
+  (let [child-node (empty-leaf network ledger-id cmp)
         children   (child-map cmp child-node)]
     {:comparator cmp
      :network network
-     :dbid dbid
+     :ledger-id ledger-id
      :id :empty
-     :tempid (util/random-uuid)
+     :tempid (random-uuid)
      :leaf false
      :first flake/maximum
      :rhs nil
@@ -180,8 +180,8 @@
     (assoc branch :first new-first, :size new-size, :children new-kids)))
 
 (defn new-branch
-  [network dbid cmp child-nodes]
-  (-> (empty-branch network dbid cmp)
+  [network ledger-id cmp child-nodes]
+  (-> (empty-branch network ledger-id cmp)
       (reset-children child-nodes)))
 
 (defn after-t?

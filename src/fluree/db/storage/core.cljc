@@ -28,8 +28,8 @@
 #?(:clj
    (defn block-storage-path
      "For a ledger server, will return the relative storage path it is using for blocks for a given ledger."
-     [network dbid]
-     (io/file network dbid "block")))
+     [network ledger-id]
+     (io/file network ledger-id "block")))
 
 (defn serde
   "Returns serializer from connection."
@@ -84,15 +84,17 @@
 
   {:block  block (long)
    :flakes flakes
-   :hash hash
-   :sigs sigs
-   :txns   {tid (tx-id, string)  {:cmd    command (JSON string)
-                                  :sig    signature (string}]}
+   :hash   hash
+   :sigs   sigs
+   :txns   {tid (tx-id, string) {:cmd command (JSON string)
+                                 :sig signature (string}]}
   "
-  [conn network dbid block-data version]
+  [conn network ledger-id block-data version]
   (go-try
     (let [persisted-data (select-keys block-data [:block :t :flakes])
-          key            (str (ledger-block-key network dbid (:block persisted-data)) "--v" version)
+          key            (str (ledger-block-key network ledger-id
+                                                (:block persisted-data))
+                              "--v" version)
           ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
       (<? (write conn key ser)))))
 
@@ -101,15 +103,15 @@
 
   {:block  block (long)
    :flakes flakes
-   :hash hash
-   :sigs sigs
-   :txns   {tid (tx-id, string)  {:cmd    command (JSON string)
-                                  :sig    signature (string}]}
+   :hash   hash
+   :sigs   sigs
+   :txns   {tid (tx-id, string) {:cmd command (JSON string)
+                                 :sig signature (string}]}
   "
-  [conn network dbid block-data]
+  [conn network ledger-id block-data]
   (go-try
     (let [persisted-data (select-keys block-data [:block :t :flakes])
-          key            (ledger-block-key network dbid (:block persisted-data))
+          key            (ledger-block-key network ledger-id (:block persisted-data))
           ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
       (<? (write conn key ser)))))
 
@@ -120,64 +122,64 @@
   (select-keys child [:id :leaf :first :rhs :size]))
 
 (defn random-leaf-id
-  [network dbid idx]
-  (ledger-node-key network dbid idx (util/random-uuid) "l"))
+  [network ledger-id idx]
+  (ledger-node-key network ledger-id idx (random-uuid) "l"))
 
 (defn write-leaf
   "Writes `leaf` to storage under the provided `leaf-id`, computing a new id if
   one isn't provided. Returns the leaf map with the id used attached uner the
   `:id` key"
-  ([conn network dbid idx-type leaf]
-   (let [leaf-id (random-leaf-id network dbid idx-type)]
-     (write-leaf conn network dbid idx-type leaf-id leaf)))
+  ([conn network ledger-id idx-type leaf]
+   (let [leaf-id (random-leaf-id network ledger-id idx-type)]
+     (write-leaf conn network ledger-id idx-type leaf-id leaf)))
 
-  ([conn network dbid idx-type leaf-id {:keys [flakes] :as leaf}]
+  ([conn network ledger-id idx-type leaf-id {:keys [flakes] :as leaf}]
    (go-try
-    (let [data {:flakes flakes}
-          ser  (serdeproto/-serialize-leaf (serde conn) data)]
-      (<? (write conn leaf-id ser))
-      (assoc leaf :id leaf-id)))))
+     (let [data {:flakes flakes}
+           ser  (serdeproto/-serialize-leaf (serde conn) data)]
+       (<? (write conn leaf-id ser))
+       (assoc leaf :id leaf-id)))))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key"
   [conn key data]
   (go-try
-   (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-     (<? (write conn key ser))
-     key)))
+    (let [ser (serdeproto/-serialize-branch (serde conn) data)]
+      (<? (write conn key ser))
+      key)))
 
 (defn random-branch-id
-  [network dbid idx]
-  (ledger-node-key network dbid idx (util/random-uuid) "b"))
+  [network ledger-id idx]
+  (ledger-node-key network ledger-id idx (random-uuid) "b"))
 
 (defn write-branch
   "Writes `branch` to storage under the provided `branch-id`, computing a new id
   if one isn't provided. Returns the branch map with the id used attached uner
   the `:id` key"
-  ([conn network dbid idx-type branch]
-   (let [branch-id (random-branch-id network dbid idx-type)]
-     (write-branch conn network dbid idx-type branch-id branch)))
+  ([conn network ledger-id idx-type branch]
+   (let [branch-id (random-branch-id network ledger-id idx-type)]
+     (write-branch conn network ledger-id idx-type branch-id branch)))
 
-  ([conn network dbid idx-type branch-id {:keys [children] :as branch}]
+  ([conn network ledger-id idx-type branch-id {:keys [children] :as branch}]
    (go-try
-    (let [child-vals  (->> children
-                           (map val)
-                           (mapv child-data))
-          first-flake (->> child-vals first :first)
-          rhs         (->> child-vals rseq first :rhs)
-          data        {:children child-vals}]
-      (<? (write-branch-data conn branch-id data))
-      (assoc branch :id branch-id)))))
+     (let [child-vals  (->> children
+                            (map val)
+                            (mapv child-data))
+           first-flake (->> child-vals first :first)
+           rhs         (->> child-vals rseq first :rhs)
+           data        {:children child-vals}]
+       (<? (write-branch-data conn branch-id data))
+       (assoc branch :id branch-id)))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
   [db garbage]
   (go-try
-    (let [{:keys [conn network dbid block]} db
-          garbage-key (ledger-garbage-key network dbid block)
-          data        {:dbid    dbid
-                       :block   block
-                       :garbage garbage}
+    (let [{:keys [conn network ledger-id block]} db
+          garbage-key (ledger-garbage-key network ledger-id block)
+          data        {:ledger-id ledger-id
+                       :block     block
+                       :garbage   garbage}
           ser         (serdeproto/-serialize-garbage (serde conn) data)]
       (<? (write conn garbage-key ser))
       garbage-key)))
@@ -187,58 +189,58 @@
    (write-db-root db nil))
   ([db custom-ecount]
    (go-try
-    (let [{:keys [conn network dbid block t ecount stats spot psot post opst
-                  tspo fork fork-block]}
-          db
+     (let [{:keys [conn network ledger-id block t ecount stats spot psot post opst
+                   tspo fork fork-block]}
+           db
 
-          db-root-key (ledger-root-key network dbid block)
-          data        {:dbid      dbid
-                       :block     block
-                       :t         t
-                       :ecount    (or custom-ecount ecount)
-                       :stats     (select-keys stats [:flakes :size])
-                       :spot      (child-data spot)
-                       :psot      (child-data psot)
-                       :post      (child-data post)
-                       :opst      (child-data opst)
-                       :tspo      (child-data tspo)
-                       :timestamp (util/current-time-millis)
-                       :prevIndex (or (:indexed stats) 0)
-                       :fork      fork
-                       :forkBlock fork-block}
-          ser         (serdeproto/-serialize-db-root (serde conn) data)]
-      (<? (write conn db-root-key ser))
-      db-root-key))))
+           db-root-key (ledger-root-key network ledger-id block)
+           data        {:ledger-id ledger-id
+                        :block     block
+                        :t         t
+                        :ecount    (or custom-ecount ecount)
+                        :stats     (select-keys stats [:flakes :size])
+                        :spot      (child-data spot)
+                        :psot      (child-data psot)
+                        :post      (child-data post)
+                        :opst      (child-data opst)
+                        :tspo      (child-data tspo)
+                        :timestamp (util/current-time-millis)
+                        :prevIndex (or (:indexed stats) 0)
+                        :fork      fork
+                        :forkBlock fork-block}
+           ser         (serdeproto/-serialize-db-root (serde conn) data)]
+       (<? (write conn db-root-key ser))
+       db-root-key))))
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
-   (when-let [data  (<? (read conn key))]
-     (serdeproto/-deserialize-branch serializer data))))
+    (when-let [data (<? (read conn key))]
+      (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [serializer] :as conn} key]
   (go-try
-   (when-let [data (<? (read conn key))]
-     (serdeproto/-deserialize-leaf serializer data))))
+    (when-let [data (<? (read conn key))]
+      (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
-  [conn {:keys [network dbid comparators block t]} index index-data]
+  [_conn {:keys [network ledger-id comparators block t]} index index-data]
   (let [cmp (or (get comparators index)
                 (throw (ex-info (str "Internal error reifying db index root: "
                                      (pr-str index))
                                 {:status 500
                                  :error  :db/unexpected-error})))]
     (cond-> index-data
-      (:rhs index-data)   (update :rhs flake/parts->Flake)
-      (:first index-data) (update :first flake/parts->Flake)
-      true                (assoc :comparator cmp
-                                 :network network
-                                 :dbid dbid
-                                 :block block
-                                 :t t
-                                 :leftmost? true))))
+            (:rhs index-data) (update :rhs flake/parts->Flake)
+            (:first index-data) (update :first flake/parts->Flake)
+            true (assoc :comparator cmp
+                        :network network
+                        :ledger-id ledger-id
+                        :block block
+                        :t t
+                        :leftmost? true))))
 
 
 (defn reify-db-root
@@ -250,17 +252,17 @@
                             :ecount ecount
                             :stats (assoc stats :indexed block))]
     (reduce
-     (fn [db idx]
-       (let [idx-root (reify-index-root conn db idx (get root-data idx))]
-         (assoc db idx idx-root)))
-     db* index/types)))
+      (fn [db idx]
+        (let [idx-root (reify-index-root conn db idx (get root-data idx))]
+          (assoc db idx idx-root)))
+      db* index/types)))
 
 
 (defn read-garbage
   "Returns a all data for a db index root of a given block."
-  [conn network dbid block]
+  [conn network ledger-id block]
   (go-try
-    (let [key  (ledger-garbage-key network dbid block)
+    (let [key  (ledger-garbage-key network ledger-id block)
           data (read conn key)]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) (<? data))))))
@@ -268,9 +270,9 @@
 
 (defn read-db-root
   "Returns all data for a db index root of a given block."
-  [conn network dbid block]
+  [conn network ledger-id block]
   (go-try
-    (let [key  (ledger-root-key network dbid block)
+    (let [key  (ledger-root-key network ledger-id block)
           data (<? (read conn key))]
       (when data
         (serdeproto/-deserialize-db-root (serde conn) data)))))
@@ -279,48 +281,48 @@
 (defn reify-db
   "Reifies db at specified index point. If unable to read db-root at index,
   throws."
-  [conn network dbid blank-db index]
+  [conn network ledger-id blank-db index]
   (go-try
-   (let [db-root (read-db-root conn network dbid index)]
-     (if-not db-root
-       (throw (ex-info (str "Database " network "/" dbid
-                            " could not be loaded at index point: "
-                            index ".")
-                       {:status 400
-                        :error  :db/unavailable}))
-       (let [db           (reify-db-root conn blank-db (<? db-root))
-             schema-map   (<? (schema/schema-map db))
-             db*          (assoc db :schema  schema-map)
-             settings-map (<? (schema/setting-map db*))]
-         (assoc db* :settings settings-map))))))
+    (let [db-root (read-db-root conn network ledger-id index)]
+      (if-not db-root
+        (throw (ex-info (str "Database " network "/" ledger-id
+                             " could not be loaded at index point: "
+                             index ".")
+                        {:status 400
+                         :error  :db/unavailable}))
+        (let [db           (reify-db-root conn blank-db (<? db-root))
+              schema-map   (<? (schema/schema-map db))
+              db*          (assoc db :schema schema-map)
+              settings-map (<? (schema/setting-map db*))]
+          (assoc db* :settings settings-map))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]
   (go-try
-   (if-let [{:keys [children]} (<? (read-branch conn id))]
-     (let [branch-metadata (select-keys branch [:comparator :network :dbid :block
-                                                :t :tt-id :tempid])
-           child-attrs     (map-indexed (fn [i child]
-                                          (-> branch-metadata
-                                              (assoc :leftmost? (and leftmost?
-                                                                     (zero? i)))
-                                              (merge child)))
-                                        children)
-           child-entries   (mapcat (juxt :first identity)
-                                   child-attrs)]
-       (apply flake/sorted-map-by comparator child-entries))
-     (throw (ex-info (str "Unable to retrieve index branch with id "
-                          id " from storage.")
-                     {:status 500, :error :db/storage-error})))))
+    (if-let [{:keys [children]} (<? (read-branch conn id))]
+      (let [branch-metadata (select-keys branch [:comparator :network :ledger-id
+                                                 :block :t :tt-id :tempid])
+            child-attrs     (map-indexed (fn [i child]
+                                           (-> branch-metadata
+                                               (assoc :leftmost? (and leftmost?
+                                                                      (zero? i)))
+                                               (merge child)))
+                                         children)
+            child-entries   (mapcat (juxt :first identity)
+                                    child-attrs)]
+        (apply flake/sorted-map-by comparator child-entries))
+      (throw (ex-info (str "Unable to retrieve index branch with id "
+                           id " from storage.")
+                      {:status 500, :error :db/storage-error})))))
 
 (defn fetch-leaf-flakes
   [conn {:keys [id comparator]}]
   (go-try
-   (if-let [{:keys [flakes] :as leaf} (<? (read-leaf conn id))]
-     (apply flake/sorted-set-by comparator flakes)
-     (throw (ex-info (str "Unable to retrieve leaf node with id: "
-                          id " from storage")
-                     {:status 500, :error :db/storage-error})))))
+    (if-let [{:keys [flakes] :as leaf} (<? (read-leaf conn id))]
+      (apply flake/sorted-set-by comparator flakes)
+      (throw (ex-info (str "Unable to retrieve leaf node with id: "
+                           id " from storage")
+                      {:status 500, :error :db/storage-error})))))
 
 (defn resolve-index-node
   ([conn node]
@@ -330,17 +332,17 @@
    (let [return-ch (async/chan)]
      (go
        (try*
-        (let [[k data] (if leaf
-                         [:flakes   (<? (fetch-leaf-flakes conn node))]
-                         [:children (<? (fetch-child-attributes conn node))])]
-          (async/put! return-ch
-                      (assoc node k data)))
-        (catch* e
-                (log/error e "Error resolving index node")
-                (when error-fn
-                  (error-fn))
-                (async/put! return-ch e)
-                (async/close! return-ch))))
+         (let [[k data] (if leaf
+                          [:flakes (<? (fetch-leaf-flakes conn node))]
+                          [:children (<? (fetch-child-attributes conn node))])]
+           (async/put! return-ch
+                       (assoc node k data)))
+         (catch* e
+           (log/error e "Error resolving index node")
+           (when error-fn
+             (error-fn
+               (async/put! return-ch e)
+               (async/close! return-ch))))))
      return-ch)))
 
 (defn resolve-empty-leaf

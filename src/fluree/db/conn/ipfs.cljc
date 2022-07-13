@@ -161,7 +161,7 @@
     (let [ipfs-endpoint      (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
           ledger-defaults    (<? (ledger-defaults ipfs-endpoint defaults))
           memory             (or memory 1000000)            ;; default 1MB memory
-          conn-id            (str (util/random-uuid))
+          conn-id            (str (random-uuid))
           read               (ipfs/default-read-fn ipfs-endpoint)
           write              (ipfs/default-commit-fn ipfs-endpoint)
           state              (state-machine/blank-state)

@@ -168,7 +168,7 @@
           (catch* e
                   (log/error e
                              "Error authorizing flake in ledger"
-                             (select-keys db [:network :dbid :t]))
+                             (select-keys db [:network :ledger-id :t]))
                   (>! error-ch e)))))
 
 (defn authorize-flakes

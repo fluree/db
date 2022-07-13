@@ -16,7 +16,7 @@ default-private-key.txt
 /dev/build
 figwheel_server.log
 .cpcache
-/node_modules
+**node_modules
 package-lock.json
 /out/*
 !/out/.gitkeep
@@ -28,3 +28,6 @@ package-lock.json
 /scanning_results
 .dir-locals.el
 .cljs_node_repl
+/js-packages/browser/flureedb.js
+/js-packages/nodejs/flureenjs.js
+/js-packages/webworker/flureeworker.js

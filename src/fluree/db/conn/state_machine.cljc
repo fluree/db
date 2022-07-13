@@ -50,7 +50,7 @@
   "Returns a promise-channel that will contain eventual response for an outgoing message."
   [{:keys [state] :as conn} message]
   (let [ledger (:ledger message)
-        id     (util/random-uuid)
+        id     (random-uuid)
         res-ch (async/promise-chan)]
     (swap! state assoc-in [:ledger ledger :await id] res-ch)
     res-ch))
@@ -62,7 +62,7 @@
 
   Subscription id (sub-id) is opaque, and used to cancel subscription."
   [{:keys [state] :as conn} ledger callback sub-id]
-  (let [id (or sub-id (util/random-uuid))]
+  (let [id (or sub-id (random-uuid))]
     (swap! state assoc-in [:ledger ledger :subs id] callback)))
 
 

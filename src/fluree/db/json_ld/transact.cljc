@@ -181,7 +181,7 @@
   that even though the 't' value hasn't changed it will cache each stage db
   data as its own entity."
   [db]
-  (let [tt-id   (util/random-uuid)
+  (let [tt-id   (random-uuid)
         indexes [:spot :psot :post :opst :tspo]]
     (-> (reduce
           (fn [db* idx]

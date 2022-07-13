@@ -594,6 +594,19 @@
                         {:status 400
                          :error  :db/invalid-query}))))
 
+
+(defn handle-having-condition
+  [having-condition]
+  (let [expressions (-> having-condition
+                        second                              ;; skip :Constraint
+                        second                              ;; skip :BrackettedExpression
+                        rest)                               ;; get all :Expression (s)
+        _           (when (> (count expressions) 1)
+                      (throw (ex-info (str "Multiple 'HAVING' expressions in SPARQL not currently supported, please let us know you'd like this supported!")
+                                      {:status 400 :error :db/invalid-query})))
+        parsed      (handle-expression expressions)]
+    (first parsed)))
+
 (defn handle-solution-modifier
   [solution-modifier]
   (reduce (fn [acc modifier]
@@ -605,7 +618,10 @@
                                                     (handle-group-condition (-> group-conditions first second))
                                                     (mapv #(handle-group-condition (second %)) group-conditions))]
                              (assoc acc :groupBy groupBy))
-              :OrderClause (assoc acc :orderBy (handle-order-condition (-> modifier rest)))))
+              :OrderClause (assoc acc :orderBy (handle-order-condition (-> modifier rest)))
+              :HavingClause (let [having-condition (second (some #(when (and (vector? %) (= :HavingCondition (first %))) %) modifier))
+                                  having           (handle-having-condition having-condition)]
+                              (assoc acc :having having))))
           {} solution-modifier))
 
 (def supported-select-options #{"DISTINCT" "REDUCED"})
@@ -752,7 +768,9 @@
 
   (def recur+depth "SELECT ?followHandle\nWHERE {\n  ?person fdb:person/handle \"anguyen\".\n  ?person fdb:person/follows+3 ?follows.\n  ?follows fdb:person/handle ?followHandle.\n}")
 
-  (def value-query "SELECT ?handle\nWHERE {\n  VALUES ?handle { \"dsanchez\" }\n  ?person fdb:person/handle ?handle.\n}"))
+  (def value-query "SELECT ?handle\nWHERE {\n  VALUES ?handle { \"dsanchez\" }\n  ?person fdb:person/handle ?handle.\n}")
+
+  (def group-having-query "SELECT (SUM(?favNums) AS ?sumNums)\n WHERE {\n ?e fdb:person/favNums ?favNums. \n } \n GROUP BY ?e \n HAVING(SUM(?favNums) > 10)"))
 
 
 

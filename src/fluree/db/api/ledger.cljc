@@ -100,19 +100,19 @@
 
   resp-port is the async port on which any successful response will be placed."
   [db syncTo listen-id resp-port]
-  (let [{:keys [conn network dbid]} db
+  (let [{:keys [conn network ledger-id]} db
         newer-block? (fn [block] (>= block syncTo))
         event-fn     (fn [evt data]
                        (when (and (= :local-ledger-update evt) (newer-block? (:block data)))
-                         (conn/remove-listener conn network dbid listen-id)
+                         (conn/remove-listener conn network ledger-id listen-id)
                          (async/go                          ;; note: avoided async/pipe as I don't believe promise-chan from session/db technically 'closes'
-                           (async/put! resp-port (async/<! (session/db conn (str network "/" dbid) nil))))))]
+                           (async/put! resp-port (async/<! (session/db conn (str network "/" ledger-id) nil))))))]
 
     ;; listener will monitor all blocks, add updated db to resp-port once > syncTo, and close listener
-    (conn/add-listener conn network dbid listen-id event-fn)
+    (conn/add-listener conn network ledger-id listen-id event-fn)
     ;; a preemptive check if newer version of db already exists (db passed in could be old)
     (async/go
-      (let [latest-db (async/<! (session/db conn (str network "/" dbid) nil))] ;; possible while setting up listener the block has come through, check again
+      (let [latest-db (async/<! (session/db conn (str network "/" ledger-id) nil))] ;; possible while setting up listener the block has come through, check again
         (when (newer-block? (:block latest-db))
           (async/put! resp-port latest-db))))))
 
@@ -121,8 +121,8 @@
   [db syncTo syncTimeout]
   (assert (pos-int? syncTo) (str "syncTo must be a block number (positive integer), provided: " syncTo))
   (let [pc        (async/promise-chan)                      ;; final response channel - has db or timeout error
-        {:keys [conn network dbid]} db
-        listen-id (util/random-uuid)
+        {:keys [conn network ledger-id]} db
+        listen-id (random-uuid)
         timeout   (if (pos-int? syncTimeout)
                     (min syncTimeout 120000)                ;; max 2 minutes
                     60000)                                  ;; 1 minute default
@@ -139,7 +139,7 @@
           (let [timeout-ch (async/timeout timeout)
                 updated-db (async/alt! timeout-ch :timeout
                                        res-port ([db] db))]
-            (conn/remove-listener conn network dbid listen-id) ;; close listener to clean up
+            (conn/remove-listener conn network ledger-id listen-id) ;; close listener to clean up
             (if (= :timeout updated-db)
               (async/put! pc (ex-info (str "Timeout waiting for block: " syncTo)
                                       {:status 400 :error :db/timeout}))

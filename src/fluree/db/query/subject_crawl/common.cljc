@@ -119,10 +119,10 @@
   - :order - :asc or :desc
   - :predicate - if type = :predicate, contains predicate pid or name
   - :variable - if type = :variable, contains variable name (not supported for simple subject crawl)"
-  [results {:keys [type order predicate]}]
+  [results {:keys [type order predicate]} limit]
   (if (= :variable type)
     (throw (ex-info "Ordering by a variable not supported in this type of query."
                     {:status 400 :error :db/invalid-query}))
-    (cond-> (sort-by (fn [result] (get result predicate)) results)
-            (= :desc order) reverse
-            true vec)))
+    (let [sorted (cond-> (sort-by (fn [result] (get result predicate)) results)
+                         (= :desc order) reverse)]
+      (vec (take limit sorted)))))

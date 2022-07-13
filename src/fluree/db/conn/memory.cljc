@@ -181,7 +181,7 @@
   (go-try
     (let [ledger-defaults    (<? (ledger-defaults defaults))
           memory             (or memory 1000000)            ;; default 1MB memory
-          conn-id            (str (util/random-uuid))
+          conn-id            (str (random-uuid))
           data-atom          (atom {})
           state              (state-machine/blank-state)
           memory-object-size (quot memory 100000)           ;; avg 100kb per cache object

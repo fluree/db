@@ -1,4 +1,6 @@
-.PHONY: all deps jar install deploy nodejs browser webworker cljtest cljs-browser-test cljs-node-test cljstest test eastwood ci clean
+.PHONY: all deps jar install deploy nodejs browser webworker cljtest \
+        cljs-browser-test cljs-node-test cljstest test eastwood ci clean \
+        js-packages publish-nodejs publish-browser publish-webworker publish-js
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -10,7 +12,7 @@ WEBWORKER_SOURCES := src-cljs/flureeworker.cljs
 NODEJS_SOURCES := $(shell find src-nodejs)
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
 
-all: jar browser nodejs webworker docs
+all: jar browser nodejs webworker js-packages docs
 
 target/fluree-db.jar: out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
 	clojure -X:jar
@@ -21,7 +23,7 @@ package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
 out/flureenjs.js: package.json package-lock.json node_modules build-nodejs.edn deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
-	clojure -M:nodejs && ./script/create-node-package.sh
+	clojure -M:nodejs && cp out/nodejs/flureenjs.js out/flureenjs.js
 
 nodejs: out/flureenjs.js
 
@@ -47,6 +49,33 @@ install: target/fluree-db.jar
 deploy: target/fluree-db.jar
 	clojure -M:deploy
 
+js-packages/nodejs/flureenjs.js: out/flureenjs.js
+	cp $< $@
+	bb run sync-package-json $(@D)/package.json --node
+
+js-packages/browser/flureedb.js: out/flureedb.js
+	cp $< $@
+	bb run sync-package-json $(@D)/package.json
+
+js-packages/webworker/flureeworker.js: out/flureeworker.js
+	cp $< $@
+	bb run sync-package-json $(@D)/package.json
+
+js-packages: js-packages/nodejs/flureenjs.js js-packages/browser/flureedb.js js-packages/webworker/flureeworker.js
+
+NPM_TAG ?= latest
+
+publish-nodejs: js-packages/nodejs/flureenjs.js
+	cd $(<D) && npm publish --tag $(NPM_TAG)
+
+publish-browser: js-packages/browser/flureedb.js
+	cd $(<D) && npm publish --tag $(NPM_TAG)
+
+publish-webworker: js-packages/webworker/flureeworker.js
+	cd $(<D) && npm publish --tag $(NPM_TAG)
+
+publish-js: publish-nodejs publish-browser publish-webworker
+
 docs/fluree.db.api.html docs/index.html: src/fluree/db/api.clj
 	clojure -X:docs :output-path "\"$(@D)\""
 
@@ -63,12 +92,15 @@ cljs-node-test: node_modules package-lock.json
 	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
 	clojure -M:cljs-node-test
 
+nodejs-test: out/flureenjs.js
+	cd test/nodejs && npm install && npm test
+
 cljstest: cljs-browser-test cljs-node-test
 
 cljtest:
 	clojure -M:cljtest
 
-test: cljtest cljstest
+test: cljtest cljstest nodejs-test
 
 eastwood:
 	clojure -M:test:eastwood

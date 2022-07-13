@@ -1,5 +1,5 @@
 {:target        :nodejs
- :output-to     "out/nodejs/package/flureenjs.js"
+ :output-to     "out/nodejs/flureenjs.js"
  :output-dir    "out/nodejs/build"
  :main          flureenjs
  :optimizations :simple

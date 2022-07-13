@@ -14,10 +14,10 @@
 
 (defn- formulate-op-header
   "Creates the operation header."
-  ([operation db] (formulate-op-header operation db 60000))
-  ([operation db timeout]
-   (let [req-id (str (util/random-uuid))
-         header {:db        db
+  ([operation ledger] (formulate-op-header operation ledger 60000))
+  ([operation ledger timeout]
+   (let [req-id (str (random-uuid))
+         header {:ledger    ledger
                  :op        operation
                  :req-id    req-id
                  :timestamp (util/current-time-millis)
@@ -59,10 +59,10 @@
   A final 'completed' message will be sent in the future, if anyone cares to hear it."
   ([session] (delete-ledger-async session nil))
   ([session {:keys [snapshot?] :as opts}]
-   (let [{:keys [dbid network conn]} session]
-     (send-operation conn :delete-db {:network   network
-                                      :dbid      dbid
-                                      :snapshot? snapshot?}))))
+   (let [{:keys [ledger-id network conn]} session]
+     (send-operation conn :delete-ledger {:network   network
+                                          :ledger-id ledger-id
+                                          :snapshot? snapshot?}))))
 
 
 (defn garbage-collect-async
@@ -71,11 +71,11 @@
   A final 'completed' message will be sent in the future, if anyone cares to hear it."
   [session & [{:keys [toBlock toTime]} :as opts]]
   (async/go
-    (let [{:keys [network dbid conn]} session]
-      (send-operation conn :garbage {:network network
-                                     :dbid    dbid
-                                     :toBlock toBlock
-                                     :toTime  toTime}))))
+    (let [{:keys [network ledger-id conn]} session]
+      (send-operation conn :garbage {:network   network
+                                     :ledger-id ledger-id
+                                     :toBlock   toBlock
+                                     :toTime    toTime}))))
 
 
 (defn snapshot-ledger-async
@@ -83,8 +83,8 @@
 
   A final 'completed' message will be sent in the future, if anyone cares to hear it."
   [session opts]
-  (let [{:keys [network dbid conn]} session]
-    (send-operation conn :snapshot-db [network dbid])))
+  (let [{:keys [network ledger-id conn]} session]
+    (send-operation conn :snapshot-ledger [network ledger-id])))
 
 
 (defn command-async
@@ -106,24 +106,24 @@
 
 
 (defn ledger-info-async
-  "Returns information about a ledger in a map, or empty map if db doesn't exist."
+  "Returns information about a ledger in a map, or empty map if ledger doesn't exist."
   [conn ledger]
   (send-operation conn :ledger-info ledger))
 
 (defn ledger-status-async
-  "Returns information about a ledger in a map, or empty map if db doesn't exist."
+  "Returns information about a ledger in a map, or empty map if ledger doesn't exist."
   [conn ledger]
   (:status (send-operation conn :ledger-info ledger)))
 
 (defn ledger-stats-async
-  "Returns stats about a ledger in a map, or empty map if db doesn't exist."
+  "Returns stats about a ledger in a map, or empty map if ledger doesn't exist."
   [conn ledger]
   (send-operation conn :ledger-stats ledger))
 
 (defn ledgers-async
   "Returns a list of ledgers in two-tuples of [network ledger-id]."
   [conn]
-  (send-operation conn :db-list nil))
+  (send-operation conn :ledger-list nil))
 
 
 (defn transact-async
@@ -151,12 +151,15 @@
    (let [{:keys [auth jwt]} opts
          conn        (:conn session)
          auth-or-jwt (or auth jwt)
-         _           (log/trace "Subscribe to: " (:network session) (:dbid session) auth-or-jwt)]
-     (send-operation conn :subscribe [[(:network session) (:dbid session)] auth-or-jwt]))))
+         _           (log/trace "Subscribe to: " (:network session)
+                                (:ledger-id session) auth-or-jwt)]
+     (send-operation conn :subscribe [[(:network session) (:ledger-id session)]
+                                      auth-or-jwt]))))
 
 
 (defn unsubscribe
   "Unsubscribes from the session's ledger."
   [session]
   (let [conn (:conn session)]
-    (send-operation conn :unsbuscribe [(:network session) (:dbid session)])))
+    (send-operation conn :unsubscribe
+                    [(:network session) (:ledger-id session)])))

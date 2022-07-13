@@ -7,8 +7,7 @@
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
   #?(:clj  (:import (java.util UUID Date)
                     (java.time Instant)
-                    (java.net URLEncoder URLDecoder))
-     :cljs (:refer-clojure :exclude [random-uuid])))
+                    (java.net URLEncoder URLDecoder))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -58,12 +57,6 @@
 (defn index-of [coll value]
   (some (fn [[item idx]] (when (= value item) idx))
         (partition 2 (interleave coll (range)))))
-
-(defn random-uuid
-  "Generates random UUID in both clojure/script"
-  []
-  #?(:clj  (UUID/randomUUID)
-     :cljs (clojure.core/random-uuid)))
 
 (defn date->millis
   "Given a date, returns epoch millis if possible."
@@ -180,6 +173,15 @@
     :else (throw (ex-info (str "Cannot convert type " (type s) " to keyword: " (pr-str s))
                           {:status 500 :error :db/unexpected-error}))))
 
+(defn keywordize-keys
+  "Does simple (top-level keys only) keyworize-keys if the key is a string."
+  [m]
+  (reduce-kv
+    (fn [acc k v]
+      (if (string? k)
+        (assoc acc (keyword k) v)
+        (assoc acc k v)))
+    {} m))
 
 (defn str->epoch-ms
   "Takes time as a string and returns an java.time.Instant."
@@ -268,3 +270,36 @@
   (if (sequential? x)
     x
     [x]))
+
+(defmacro condps
+  "Takes an expression and a set of clauses.
+  Each clause can take the form of either:
+
+  unary-predicate-fn? result-expr
+  (unary-predicate-fn?-1 ... unary-predicate-fn?-N) result-expr
+
+  For each clause, (unary-predicate-fn? expr) is evalated (for each
+  unary-predicate-fn? in the clause when >1 is given). If it returns logical
+  true, the clause is a match.
+
+  Similar to condp but takes unary predicates instead of binary and allows
+  multiple predicates to be supplied in a list similar to case."
+  [expr & clauses]
+  (let [gexpr (gensym "expr__")
+        emit  (fn emit [expr args]
+                (let [[[a b :as clause] more] (split-at 2 args)
+                      n (count clause)]
+                  (case n
+                    0 `(throw (IllegalArgumentException.
+                                (str "No matching clause: " ~expr)))
+                    1 a
+                    (let [preds (if (and (coll? a)
+                                         (not (= 'fn* (first a)))
+                                         (not (= 'fn (first a))))
+                                  (vec a)
+                                  [a])]
+                      `(if ((apply some-fn ~preds) ~expr)
+                         ~b
+                         ~(emit expr more))))))]
+    `(let [~gexpr ~expr]
+       ~(emit gexpr clauses))))

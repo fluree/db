@@ -37,7 +37,7 @@
               _       (conn-handler/check-connection conn opts)
               [network ledger-id] (session/resolve-ledger conn ledger)
               root-db (-> (<? (session/db conn ledger opts))
-                          (assoc :conn conn :network network :dbid ledger-id))
+                          (assoc :conn conn :network network :ledger-id ledger-id))
               dbt     (if block
                         (<? (time-travel/as-of-block root-db block))
                         root-db)]
@@ -49,13 +49,13 @@
     ;; return promise chan immediately
     pc))
 
-(defn- db-ident?
+(defn- ledger-ident?
   [source]
   (= (-> source (str/split #"/") count) 2))
 
 (defn- isolate-ledger-id
-  [dbid]
-  (re-find #"[a-z0-9]+/[a-z0-9]+" dbid))
+  [ledger-id]
+  (re-find #"[a-z0-9]+/[a-z0-9]+" ledger-id))
 
 (defn- get-sources
   "Validates & returns the query sources.
@@ -71,21 +71,21 @@
                                  {:status 400
                                   :error  :db/invalid-query})))
                ;; Either open-api is true and the ledger is in the same network
-               (cond (and (db-ident? val) open-api (= network (-> val (str/split #"/") first)))
-                     (let [db-id  (isolate-ledger-id val)
-                           opts   (if auth {:auth auth} {})
-                           ledger (apply db-fn conn db-id opts)]
+               (cond (and (ledger-ident? val) open-api (= network (-> val (str/split #"/") first)))
+                     (let [ledger-id (isolate-ledger-id val)
+                           opts      (if auth {:auth auth} {})
+                           ledger    (apply db-fn conn ledger-id opts)]
                        (assoc acc val ledger))
 
-                     (and (db-ident? val) open-api)
+                     (and (ledger-ident? val) open-api)
                      (throw (ex-info "When attempting to query across multiple databases in different networks, you must be using a closed API."
                                      {:status 400
                                       :error  :db/invalid-query}))
 
                      ;; Or we're using a closed-api
-                     (and (db-ident? val) auth)
-                     (let [db-id  (isolate-ledger-id val)
-                           ledger (apply db-fn conn db-id {:auth auth})]
+                     (and (ledger-ident? val) auth)
+                     (let [ledger-id (isolate-ledger-id val)
+                           ledger    (apply db-fn conn ledger-id {:auth auth})]
                        (assoc acc val ledger))
 
                      :else
@@ -111,7 +111,7 @@
    (async/go
      (try
        (let [{:keys [select selectOne selectDistinct selectReduced from where construct block prefixes opts]} query-map
-             db           (<? sources)                      ;; only support 1 source currently
+             db           (<? sources) ;; only support 1 source currently
              db*          (if block (<? (time-travel/as-of-block db block)) db)
              conn         (:conn db*)
              source-opts  (if prefixes
@@ -195,16 +195,16 @@
   - deps        - Not yet implemented, list of dependent transactions.
 
   If successful, will return a map with four keys:
-    - cmd  - a map with the command/transaction data as a JSON string
-    - sig  - the signature of the above stringified map
-    - id   - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
-    - db   - the ledger for this transaction"
+    - cmd    - a map with the command/transaction data as a JSON string
+    - sig    - the signature of the above stringified map
+    - id     - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
+    - ledger - the ledger for this transaction"
   ([ledger txn private-key] (tx->command ledger txn private-key nil))
   ([ledger txn private-key opts]
    (when-not private-key
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-transaction})))
-   (let [db-name     (if (sequential? ledger)
+   (let [ledger-name (if (sequential? ledger)
                        (str (first ledger) "/$" (second ledger))
                        ledger)
          {:keys [auth expire nonce deps]} opts
@@ -222,9 +222,9 @@
                             [key-auth-id nil])
          timestamp   (util/current-time-millis)
          nonce       (or nonce timestamp)
-         expire      (or expire (+ timestamp 30000))        ;; 5 min default
+         expire      (or expire (+ timestamp 30000)) ;; 5 min default
          cmd         (try (-> {:type      :tx
-                               :db        db-name
+                               :ledger    ledger-name
                                :tx        txn
                                :nonce     nonce
                                :auth      auth
@@ -238,10 +238,10 @@
                                                             {:status 400 :error :db/invalid-tx}))))
          sig         (crypto/sign-message cmd private-key)
          id          (crypto/sha3-256 cmd)]
-     {:cmd cmd
-      :sig sig
-      :id  id
-      :db  ledger})))
+     {:cmd    cmd
+      :sig    sig
+      :id     id
+      :ledger ledger})))
 
 
 (defn transact-async
@@ -263,7 +263,7 @@
              result)
            ;; no private key provided, request ledger to sign request
            (let [tx-map (util/without-nils
-                          {:db     ledger
+                          {:ledger ledger
                            :tx     txn
                            :auth   auth
                            :nonce  nonce
@@ -372,7 +372,7 @@
                         (:block query-map)
                         [(:block query-map) (:block query-map)])
             [block-start block-end]
-            (if (some string? range)                        ;; do we need to convert any times to block integers?
+            (if (some string? range) ;; do we need to convert any times to block integers?
               [(<? (time-travel/block-to-int-format db (first range)))
                (when-let [end (second range)]
                  (<? (time-travel/block-to-int-format db end)))] range)
@@ -388,7 +388,7 @@
                         (throw (ex-info (str "Invalid block range provided: " (pr-str range)) {:status 400 :error :db/invalid-query})))
             [block-start block-end]
             (if (< block-end block-start)
-              [block-end block-start]                       ;; make sure smallest number comes first
+              [block-end block-start] ;; make sure smallest number comes first
               [block-start block-end])
             block-end (if (> block-end db-block)
                         db-block block-end)]
@@ -445,7 +445,7 @@
   ([sources query-map opts]
    (async/go
      (let [{:keys [block history prettyPrint]} query-map
-           db     (<? sources)                              ;; only support 1 source currently
+           db     (<? sources) ;; only support 1 source currently
            [block-start block-end] (if block (<? (resolve-block-range db query-map)))
            result (let [meta?   (:meta opts)
                         ;; From-t is the higher number, meaning it is the older time
@@ -507,7 +507,7 @@
   ([sources multi-query-map] (multi-query-async sources multi-query-map nil db))
   ([sources multi-query-map opts] (multi-query-async sources multi-query-map opts db))
   ([sources multi-query-map opts db-fn]
-   (let [db               sources                           ;; only support 1 source for now
+   (let [db               sources ;; only support 1 source for now
          block            (when-let [block (:block multi-query-map)]
                             (<? (time-travel/block-to-int-format (<? db) block)))
          meta?            (:meta opts)
@@ -590,16 +590,16 @@
   - deps        - Not yet implemented, list of dependent transactions.
 
   If successful, will return a map with four keys:
-    - cmd  - a map with the command/transaction data as a JSON string
-    - sig  - the signature of the above stringified map
-    - id   - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
-    - db   - the ledger for this transaction"
+    - cmd    - a map with the command/transaction data as a JSON string
+    - sig    - the signature of the above stringified map
+    - id     - the ID for this unique request - in case you want to look it up later, sha3 of 'cmd'
+    - ledger - the ledger for this transaction"
   ([ledger qry-map private-key] (qry->command ledger qry-map private-key nil))
   ([ledger qry-map private-key opts]
    (when-not private-key
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-signed-query})))
-   (let [db-name     (if (sequential? ledger)
+   (let [ledger-name (if (sequential? ledger)
                        (str (first ledger) "/$" (second ledger))
                        ledger)
          {:keys [auth expire nonce action]} opts
@@ -616,10 +616,10 @@
          action      (or action :query)
          timestamp   (util/current-time-millis)
          nonce       (or nonce timestamp)
-         expire      (or expire (+ timestamp 30000))        ;; 5 min default
+         expire      (or expire (+ timestamp 30000)) ;; 5 min default
          cmd         (try (-> {:type      :signed-qry
                                :action    action
-                               :db        db-name
+                               :ledger    ledger-name
                                :qry       qry-map
                                :nonce     nonce
                                :auth      auth
@@ -632,10 +632,10 @@
                                             {:status 400 :error :db/invalid-signed-query}))))
          sig         (crypto/sign-message cmd private-key)
          id          (crypto/sha3-256 cmd)]
-     {:cmd cmd
-      :sig sig
-      :id  id
-      :db  ledger})))
+     {:cmd    cmd
+      :sig    sig
+      :id     id
+      :ledger ledger})))
 
 (defn signed-query-async
   "Execute a signed query against a ledger.

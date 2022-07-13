@@ -40,7 +40,7 @@
 ;; Support logging at different levels
 ;;
 ;; ======================================
-(log/set-level! :warning)                                   ;; default to log only warnings or errors
+(log/set-level! :warning) ;; default to log only warnings or errors
 ;(def ^:export logging-levels log/levels)
 
 (defn ^:export set-logging
@@ -195,9 +195,9 @@
                  {:keys [nonce expire timeout private-key] :or {timeout 60000}} opts
                  timestamp (util/current-time-millis)
                  nonce     (or nonce timestamp)
-                 expire    (or expire (+ timestamp 30000))  ;; 5 min default
-                 cmd-data  {:type   :delete-db
-                            :db     ledger
+                 expire    (or expire (+ timestamp 30000)) ;; 5 min default
+                 cmd-data  {:type   :delete-ledger
+                            :ledger ledger
                             :nonce  nonce
                             :expire expire}
                  cmd       (when private-key
@@ -243,12 +243,12 @@
    Ledger creation is handled asynchronously and may not be immediately available.
 
    Options include:
-   - :alias       - Alias, if different than db-ident.
+   - :alias       - Alias, if different than ledger-ident.
    - :root        - Root account id to bootstrap with (string). Defaults to connection default account id.
    - :doc         - Optional doc string about this db.
-   - :fork        - If forking an existing db, ref to db (actual identity, not db-ident). Must exist in network db.
+   - :fork        - If forking an existing db, ref to db (actual identity, not ledger-ident). Must exist in network db.
    - :forkBlock   - If fork is provided, optionally provide the block to fork at. Defaults to latest known.
-   - :persistResp - Respond immediately once persisted with the dbid, don't wait for transaction to be finished
+   - :persistResp - Respond immediately once persisted with the ledger-id, don't wait for transaction to be finished
    - :jwt         - token for Fluree On-Demand access
    "
   ([conn ledger] (new-ledger conn ledger nil))
@@ -274,9 +274,9 @@
                  alias*    (when alias (str network-alias "/" ledger-alias)) ;
                  timestamp (util/current-time-millis)
                  nonce     (or nonce timestamp)
-                 expire    (or expire (+ timestamp 30000))  ;; 5 min default
-                 cmd-data  {:type          :new-db
-                            :db            (str network "/" ledger-id)
+                 expire    (or expire (+ timestamp 30000)) ;; 5 min default
+                 cmd-data  {:type          :new-ledger
+                            :ledger        (str network "/" ledger-id)
                             :alias         alias*
                             :auth          auth
                             :doc           doc
@@ -290,7 +290,7 @@
                             :expire        expire}
                  cmd-data' (if jwt
                              (assoc cmd-data :jwt jwt)
-                             cmd-data)                      ; TO-DO rework how DBAAS tokens sent
+                             cmd-data) ; TO-DO rework how DBAAS tokens sent
                  cmd       (when private-key
                              (-> cmd-data'
                                  (util/without-nils)
