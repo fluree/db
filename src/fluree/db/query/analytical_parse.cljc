@@ -503,10 +503,9 @@
   "For both 's' and 'o', returns a map with respective value
   that indicates the value's type and if needed other information.
 
-
   'o' values have special handling before calling this function as they can
   also have 'tag' values or query-functions."
-  [value]
+  [value subject?]
   (cond
     (util/pred-ident? value)
     {:ident value}
@@ -518,7 +517,11 @@
     nil
 
     :else
-    {:value value}))
+    (if (and subject? (not (int? value)))
+      (throw (ex-info (str "Subject values in where statement must be integer subject IDs or two-tuple identies. "
+                           "Provided: " value ".")
+                      {:status 400 :error :db/invalid-query}))
+      {:value value})))
 
 ;; The docs say the default depth is 100
 ;; here: https://developers.flur.ee/docs/concepts/analytical-queries/inner-joins-in-fluree/#recursion
@@ -544,87 +547,100 @@
                       {:status 400 :error :db/invalid-query}))))
 
 (defn parse-where-tuple
-  "Parses where clause tuples (not maps)"
-  [supplied-vars db s p o]
-  [all-vars db s p o]
-  (let [fulltext? (str/starts-with? p "fullText:")
-        rdf-type? (or (= "rdf:type" p)
-                      (= "a" p))
-        _id?      (= "_id" p)
+  "Parses where clause tuples (not maps).
+  - supplied-vars will include user-supplied variables in the :vars
+  - all-vars will include all variable inputs - which includes any defined in :bind statements."
+  [supplied-vars all-vars db s p o]
+  (let [fulltext?  (str/starts-with? p "fullText:")
+        rdf-type?  (or (= "rdf:type" p)
+                       (= "a" p))
+        _id?       (= "_id" p)
         [recur-pred recur-n] (recursion-predicate p)
-        s*        (value-type-map s)
-        p*        (cond
-                    fulltext? #?(:clj  (full-text/parse-domain p)
-                                 :cljs (throw (ex-info "Full text queries not supported in JavaScript currently."
-                                                       {:status 400 :error :db/invalid-query})))
-                    rdf-type? :rdf/type
-                    _id? :_id
-                    recur-pred (cond->> recur-pred
-                                        db (pred-id-strict db))
-                    :else (cond->> p
-                                   db (pred-id-strict db)))
-        p-idx?    (when p* (dbproto/-p-prop db :idx? p*))   ;; is the predicate indexed?
-        p-tag?    (when p* (= :tag (dbproto/-p-prop db :type p)))
-        o*        (cond
-                    p-tag?
-                    {:tag o}
+        s*         (value-type-map s true)
+        p*         (cond
+                     fulltext? #?(:clj  (full-text/parse-domain p)
+                                  :cljs (throw (ex-info "Full text queries not supported in JavaScript currently."
+                                                        {:status 400 :error :db/invalid-query})))
+                     rdf-type? :rdf/type
+                     _id? :_id
+                     recur-pred (cond->> recur-pred
+                                         db (pred-id-strict db))
+                     :else (cond->> p
+                                    db (pred-id-strict db)))
+        p-idx?     (when p* (dbproto/-p-prop db :idx? p*))  ;; is the predicate indexed?
+        p-ref?     (dbproto/-p-prop db :ref? p)
+        p-tag?     (when p* (= :tag (dbproto/-p-prop db :type p)))
+        o*         (when o
+                     (cond
+                       p-tag?
+                       {:tag o}
 
-                    (query-fn? o)
-                    (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
-                      {:variable (:variable parsed-filter-map)
-                       :filter   parsed-filter-map})
+                       (query-fn? o)
+                       (let [parsed-filter-map (parse-filter-fn o all-vars)]
+                         {:variable (:variable parsed-filter-map)
+                          :filter   parsed-filter-map})
 
-                    rdf-type?
-                    (if (= "_block" o)
-                      (value-type-map "_tx")                ;; _block gets aliased to _tx
-                      (value-type-map o))
+                       rdf-type?
+                       (if (= "_block" o)
+                         (value-type-map "_tx" false)       ;; _block gets aliased to _tx
+                         (value-type-map o false))
 
-                    :else
-                    (value-type-map o))
-        idx       (cond
-                    fulltext?
-                    :full-text
+                       :else
+                       (value-type-map o p-ref?)))
+        idx        (cond
+                     fulltext?
+                     :full-text
 
-                    (or _id? rdf-type?)
-                    :spot
+                     (or _id? rdf-type?)
+                     :spot
 
-                    (and s* (not (:variable s*)))
-                    :spot
+                     (and s* (not (:variable s*)))
+                     :spot
 
-                    (and p-idx? (:value o*))
-                    :post
+                     (and p-idx? o*)
+                     :post
 
-                    p
-                    (do (when (:value o*)
-                          (log/info (str "Searching for a property value on unindexed predicate: " p
-                                         ". Consider making property indexed for improved performance "
-                                         "and lower fuel consumption.")))
-                        :psot)
+                     p
+                     (do (when (:value o*)
+                           (log/info (str "Searching for a property value on unindexed predicate: " p
+                                          ". Consider making property indexed for improved performance "
+                                          "and lower fuel consumption.")))
+                         :psot)
 
-                    o
-                    :opst
+                     o
+                     :opst
 
-                    :else
-                    (throw (ex-info (str "Unable to determine query type for where statement: "
-                                         [s p o] ".")
-                                    {:status 400 :error :db/invalid-query})))]
-    {:type   (cond
-               fulltext? :full-text
-               rdf-type? :rdf/type
-               _id? :_id
-               :else :tuple)
-     :idx    idx
-     :s      s*
-     :p      p*
-     :o      o*
-     :recur  recur-n                                        ;; will only show up if recursion specified.
-     :p-tag? p-tag?
-     :p-idx? p-idx?}))
+                     :else
+                     (throw (ex-info (str "Unable to determine query type for where statement: "
+                                          [s p o] ".")
+                                     {:status 400 :error :db/invalid-query})))
+        ;; if an identity ('s' val or 'o' val when ref?) is a variable,
+        ;; flag them as they need to get resolved before executing query
+        ident-vars (cond-> #{}
+                           (contains? supplied-vars (:variable s*))
+                           (conj (:variable s*))
+
+                           (and p-ref? (contains? supplied-vars (:variable o*)))
+                           (conj (:variable o*)))]
+    {:type       (cond
+                   fulltext? :full-text
+                   rdf-type? :rdf/type
+                   _id? :_id
+                   :else :tuple)
+     :idx        idx
+     :s          s*
+     :p          p*
+     :o          o*
+     :recur      recur-n                                    ;; will only show up if recursion specified.
+     :ident-vars (not-empty ident-vars)
+     :p-ref?     p-ref?
+     :p-tag?     p-tag?
+     :p-idx?     p-idx?}))
 
 (defn parse-remote-tuple
   "When a specific DB is used (not default) for a where statement.
   This is in the form of a 4-tuple where clause."
-  [all-vars db s p o]
+  [supplied-vars all-vars db s p o]
   {:db   db
    :type :remote-tuple
    :s    s
@@ -632,7 +648,7 @@
    :o    o}
   ;; TODO - once we support multiple sources, below will attempt to resolve predicates into pids
   ;; TODO - for now, we just let them all through.
-  #_(-> (parse-where-tuple all-vars nil s p o)
+  #_(-> (parse-where-tuple supplied-vars all-vars nil s p o)
         (assoc :db db
                :type :remote-tuple
                :s s :p p :o o)))
@@ -672,10 +688,10 @@
         (sequential? where-smt)
         (let [tuple-count (count where-smt)
               where-smt*  (case tuple-count
-                            3 (apply parse-where-tuple all-vars db where-smt)
+                            3 (apply parse-where-tuple supplied-vars all-vars db where-smt)
                             4 (if (= "$fdb" (first where-smt)) ;; $fdb refers to default/main db, parse as 3-tuple
-                                (apply parse-where-tuple all-vars db (rest where-smt))
-                                (apply parse-remote-tuple all-vars where-smt))
+                                (apply parse-where-tuple supplied-vars all-vars db (rest where-smt))
+                                (apply parse-remote-tuple supplied-vars all-vars where-smt))
                             2 (apply parse-binding-tuple where-smt)
                             ;; else
                             (if (sequential? (first where-smt))
@@ -843,7 +859,8 @@
     (if (sequential? supplied-vars)
       (mapv symbolize-var-keys supplied-vars)
       (let [supplied-vars* (symbolize-var-keys supplied-vars)
-            rel-binding?   (some sequential? (vals supplied-vars*))]
+            rel-binding?   (and (some sequential? (vals supplied-vars*))
+                                (not (every? #(util/pred-ident? %) (vals supplied-vars*))))]
         (if rel-binding?
           (expand-var-rel-binding supplied-vars*)
           supplied-vars*)))))
@@ -857,6 +874,17 @@
   [{:keys [where] :as _query-map}]
   (not (sequential? where)))
 
+(defn consolidate-ident-vars
+  "When where statements use supplied vars that are identies in s or o position
+  they need to get resolved before executing the query.
+  Here we consolidate them from all where statements into a single :ident-vars
+  key on the parsed query map."
+  [{:keys [where] :as parsed-query}]
+  (let [all-ident-vars (->> where
+                            (mapcat :ident-vars)
+                            (into #{})
+                            not-empty)]
+    (assoc parsed-query :ident-vars all-ident-vars)))
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
@@ -879,8 +907,9 @@
                                                     prettyPrint
                                                     (:prettyPrint opts))}
                                   filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
-                                  orderBy* (add-order-by orderBy*)
-                                  groupBy* (add-group-by groupBy*)
+                                  orderBy* (add-order-by orderBy*) ;; add :order-by if specified
+                                  groupBy* (add-group-by groupBy*) ;; add :group-by if specified
+                                  true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
                                   true (add-select-spec query-map'))]
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))

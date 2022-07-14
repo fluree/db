@@ -7,7 +7,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject]]
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
+                                                          subj-perm-filter-fn filter-subject]]
             [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -107,19 +108,33 @@
       (async/close! return-ch))
     return-ch))
 
+(defn resolve-o-ident
+  "If the predicate is a ref? type with an 'o' value, it must be resolved into a subject id."
+  [db {:keys [o] :as where-clause}]
+  (go-try
+    (let [_id (or (<? (dbproto/-subid db (:ident o))) 0)]
+      (assoc where-clause :o {:value _id}))))
 
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism vars finish-fn] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars finish-fn] :as opts}]
   (go-try
-    (let [sid-ch    (if (= :_id (:type f-where))
-                      (subjects-id-chan db error-ch vars f-where)
-                      (subjects-chan db error-ch vars f-where))
-          flakes-af (flakes-xf opts)
+    (let [{:keys [o p-ref?]} f-where
+          vars*     (if ident-vars
+                      (<? (resolve-ident-vars db vars ident-vars))
+                      vars)
+          opts*     (assoc opts :vars vars*)
+          f-where*  (if (and p-ref? (:ident o))
+                      (<? (resolve-o-ident db f-where))
+                      f-where)
+          sid-ch    (if (= :_id (:type f-where*))
+                      (subjects-id-chan db error-ch vars* f-where*)
+                      (subjects-chan db error-ch vars* f-where*))
+          flakes-af (flakes-xf opts*)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]
 
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
-      (async/pipeline-async parallelism result-ch (result-af opts) flakes-ch)
+      (async/pipeline-async parallelism result-ch (result-af opts*) flakes-ch)
 
       (loop [acc []]
         (let [[next-res ch] (async/alts! [error-ch result-ch])]
