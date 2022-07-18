@@ -70,7 +70,7 @@
   (c) filter subjects based on subsequent where clause(s)
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
-  [db {:keys [vars where limit offset fuel rel-binding? order-by json-ld? compact-fn] :as parsed-query}]
+  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by json-ld? compact-fn] :as parsed-query}]
   (let [error-ch    (async/chan)
         f-where     (first where)
         rdf-type?   (= :rdf/type (:type f-where))
@@ -92,6 +92,7 @@
                      :select-spec   select-spec
                      :error-ch      error-ch
                      :vars          vars
+                     :ident-vars    ident-vars
                      :filter-map    filter-map
                      :limit         (if order-by util/max-long limit) ;; if ordering, limit performed by finish-fn after sort
                      :offset        offset

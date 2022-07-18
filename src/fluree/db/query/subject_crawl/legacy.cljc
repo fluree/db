@@ -140,7 +140,7 @@
 
                      ;; Legacy predicate-based query
                      (and (string? from) (str/includes? from "/"))
-                     [["?s" from "?o"]]
+                     [["?s" from nil]]
 
                      ;; Legacy collection-based query
                      (string? from)
