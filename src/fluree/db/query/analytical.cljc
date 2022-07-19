@@ -627,14 +627,6 @@
               {:headers headers' :tuples tuples'}))
           res aggregate))
 
-
-(defn symbolize-keys
-  [q-map]
-  (let [keys (map symbol (keys q-map))
-        vals (vals q-map)]
-    (zipmap keys vals)))
-
-
 (defn match-tuples-lists
   "Combines two lists of tuples, a-tuples and b-tuples, into a single aggregated
   tuples list based on matching criteria.
@@ -880,7 +872,7 @@
    (resolve-where-clause db where q-map vars fuel max-fuel {}))
   ([db where q-map vars fuel max-fuel opts]
    (go-try (loop [[clause & r] where
-                  res {:vars (symbolize-keys vars)}]
+                  res {:vars vars}]
              (if clause
                (let [[next-res r] (<? (clause->tuples db q-map res clause r false fuel max-fuel opts))]
                  (cond (= 2 (count clause))
@@ -897,43 +889,14 @@
                res)))))
 
 (defn q
-  [q-map fuel max-fuel db opts]
-  (go-try (let [{:keys [vars where optional filter]} q-map
-                where-res    (<? (resolve-where-clause db where q-map vars fuel max-fuel opts))
+  [{:keys [vars query-map fuel max-fuel db] :as opts}]
+  (go-try (let [{:keys [where optional filter]} query-map
+                where-res    (<? (resolve-where-clause db where query-map vars fuel max-fuel opts))
                 optional-res (if optional
-                               (<? (optional->left-outer-joins db q-map optional where-res fuel max-fuel opts))
+                               (<? (optional->left-outer-joins db query-map optional where-res fuel max-fuel opts))
                                where-res)
                 filter-res   (if filter
                                (tuples->filtered optional-res filter nil)
                                optional-res)
                 res          filter-res]
             res)))
-
-
-(comment
-  (def conn (:conn user/system))
-  (def db (async/<!! (fluree.db.api/db conn "fluree/test")))
-
-
-
-  (async/<!! (q {:select ["?chat", "?comment"]
-                 :where  [["?chat" "_predicate/name" "?comment"]]} (volatile! 0) 1000 db {}))
-
-  (async/<!! (fdb-clause->tuples db ['?chat "chat/comments" '?comment] (volatile! 0) 1000000))
-
-  (async/<!! (where->inner-joins db [["?t", "_block/number", "?number"],
-                                     ["?maxBlock" "(max ?number)"],
-                                     ["?t", "_block/hash", "?hash"]]
-                                 {:select   ["?hash", "?pHash", "?number"]
-                                  :where    [["?t", "_block/number", "?number"],
-                                             {"?maxBlock" "(max ?number)"},
-                                             ["?t", "_block/hash", "?hash"]]
-                                  :optional [["?t" "_block/prevHash" "?pHash"]]} nil nil))
-
-
-
-
-  (async/<!! (q {:select   ["?handle" "?num"]
-                 :where    [["?person" "person/handle" "?handle"]]
-                 :optional [["?person" "person/favNums" "?num"]]
-                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))
