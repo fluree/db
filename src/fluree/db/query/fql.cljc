@@ -421,22 +421,42 @@
                     selectOne? (first res)
                     :else res)))))
 
-(defn- ad-hoc-query
-  "Legacy ad-hoc query processor"
-  [db parsed-query query-map]
+(defn- process-ad-hoc-query
+  [{:keys [db parsed-query fuel max-fuel] :as opts}]
   (go-try
-    (let [{:keys [selectOne limit offset component orderBy groupBy prettyPrint opts]} query-map
-          opts'        (cond-> (merge {:limit   limit :offset (or offset 0) :component component
-                                       :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
-                                      opts)
-                               selectOne (assoc :limit 1))
-          max-fuel     (:max-fuel opts')
-          fuel         (or (:fuel opts)                     ;; :fuel volatile! can be provided upstream
-                           (when (or max-fuel (:meta opts))
-                             (volatile! 0)))
-          where-result (<? (analytical/q query-map fuel max-fuel db opts'))
+    (let [where-result (<? (analytical/q opts))
           select-spec  (:select parsed-query)]
       (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))
+
+(defn relationship-binding
+  [{:keys [vars] :as opts}]
+  (async/go-loop [[next-vars & rest-vars] vars
+                  acc []]
+    (if next-vars
+      (let [opts' (assoc opts :vars next-vars)
+            res   (<? (process-ad-hoc-query opts'))]
+        (recur rest-vars (into acc res)))
+      acc)))
+
+(defn- ad-hoc-query
+  "Legacy ad-hoc query processor"
+  [db {:keys [rel-binding? vars] :as parsed-query} query-map]
+  (let [{:keys [selectOne limit offset component orderBy groupBy prettyPrint opts]} query-map
+        opts' (cond-> (merge {:limit   limit :offset (or offset 0) :component component
+                              :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
+                             opts)
+                      selectOne (assoc :limit 1)
+                      true (assoc :max-fuel (:max-fuel opts)
+                                  :fuel (or (:fuel opts)    ;; :fuel volatile! can be provided upstream
+                                            (when (or (:max-fuel opts) (:meta opts))
+                                              (volatile! 0)))
+                                  :parsed-query parsed-query
+                                  :query-map query-map
+                                  :db db
+                                  :vars vars))]
+    (if rel-binding?
+      (relationship-binding opts')
+      (process-ad-hoc-query opts'))))
 
 (defn cache-query
   "Returns already cached query from cache if available, else
