@@ -88,6 +88,7 @@
           permissions (when roles'
                         (<? (permissions/permission-map db roles' :query)))]
       (assoc db :auth auth-sid
+                :auth-id auth
                 :roles roles'
                 :permissions permissions
                 :ctx ctx))))

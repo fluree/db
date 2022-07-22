@@ -382,7 +382,7 @@
           db            sources                             ;; only support 1 source currently
           db*           (if block (<? (time-travel/as-of-block (<? db) block)) (<? db))
           source-opts   (if prefixes
-                          (get-sources (:conn db*) (:network db*) (:auth db*) prefixes)
+                          (get-sources (:conn db*) (:network db*) (:auth-id db*) prefixes)
                           {})
           meta?         (:meta opts)
           fuel          (when (or (:fuel opts) meta?) (volatile! 0)) ;; only measure fuel if fuel budget provided, or :meta true
