@@ -1,7 +1,7 @@
 (ns fluree.db.graphdb
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.storage.core :as storage]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
             [clojure.data.avl :as avl]
@@ -11,8 +11,7 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+            [clojure.core.async :refer [go <!] :as async]
             [clojure.string :as str])
   #?(:clj (:import (java.io Writer))))
 

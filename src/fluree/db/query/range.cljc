@@ -3,15 +3,14 @@
             [fluree.db.constants :as const]
             [fluree.db.index :as index]
             [fluree.db.util.schema :as schema-util]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
             #?(:clj  [clojure.core.async :refer [chan go go-loop <! >!] :as async]
                :cljs [cljs.core.async :refer [chan <! >!] :refer-macros [go go-loop] :as async])
             [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.util.async :refer [<? go-try]])
-  #?(:cljs (:require-macros [fluree.db.util.async])))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

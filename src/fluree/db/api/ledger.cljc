@@ -1,7 +1,7 @@
 (ns fluree.db.api.ledger
   (:require [fluree.db.session :as session]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.connection :as conn]
             [fluree.db.permissions :as permissions]

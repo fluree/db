@@ -4,7 +4,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.json-ld :as json-ld]

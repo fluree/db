@@ -194,6 +194,10 @@
   [^Flake f]
   (.-m f))
 
+(defn flake?
+  [x]
+  (instance? Flake x))
+
 (defn- equiv-flake
   [f other]
   (and (= (s f) (s other))

@@ -1,6 +1,6 @@
 (ns flureedb
   (:require [clojure.string :as str]
-            [cljs.core.async :refer [go <!] :as async]
+            [clojure.core.async :refer [go <!] :as async]
             [alphabase.core :as alphabase]
             [fluree.crypto :as crypto]
             [fluree.db.dbproto :as dbproto]
@@ -17,10 +17,9 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.query.http-signatures :as http-signatures]
-    ;shared clojurescript code
+            ;; shared clojurescript code
             [fluree.db.api-js :as fdb-js]
             [fluree.db.connection-js :as conn-handler]))
-
 
 (enable-console-print!)
 

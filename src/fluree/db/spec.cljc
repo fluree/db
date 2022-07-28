@@ -1,7 +1,7 @@
 (ns fluree.db.spec
   (:require [fluree.db.util.json :as json]
             [alphabase.core :as alphabase]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [clojure.string :as str]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -196,4 +196,3 @@
                      :spec    spec
                      :object  object})
              object))))
-

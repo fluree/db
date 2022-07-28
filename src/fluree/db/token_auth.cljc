@@ -1,10 +1,9 @@
 (ns fluree.db.token-auth
   (:require [fluree.crypto.hmac :refer [hmac-sha256]]
             [alphabase.core :as alphabase]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
-            [clojure.string :as str]
-            [fluree.db.util.core :as util]))
+            [clojure.string :as str]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

@@ -2,7 +2,7 @@
   (:require [sci.core :as sci]
             [fluree.db.dbfunctions.fns]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.core :refer [condps]]
+            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [condps]]
             [fluree.db.util.async :refer [go-try <? channel?]]
             [fluree.db.util.log :as log]
             [clojure.string :as str]))

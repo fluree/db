@@ -1,10 +1,10 @@
 (ns fluree.db.time-travel
-  (:require #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+  (:require [clojure.core.async :as async]
             [clojure.string :as string]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try into?]]
             [fluree.db.util.core :as util :refer [try* catch*]]))
 

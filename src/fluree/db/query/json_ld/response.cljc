@@ -1,6 +1,6 @@
 (ns fluree.db.query.json-ld.response
   (:require [fluree.db.util.async :refer [<? go-try merge-into?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]

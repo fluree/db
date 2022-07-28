@@ -1,7 +1,7 @@
 (ns fluree.db.query.http-signatures
   (:require [fluree.crypto :as crypto]
             [clojure.string :as str]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.util.json :as json])
   #?(:clj (:import (java.time ZoneOffset ZonedDateTime)
@@ -178,5 +178,3 @@
   signed-request
 
   (verify-request* signed-request :query "test/permissions" "localhost"))
-
-

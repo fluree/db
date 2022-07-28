@@ -1,7 +1,7 @@
 (ns fluree.db.json-ld.bootstrap
   (:require [clojure.string :as str]
             [fluree.crypto :as crypto]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
             [fluree.db.dbproto :as db-proto]

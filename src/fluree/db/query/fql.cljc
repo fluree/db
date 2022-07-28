@@ -1,10 +1,9 @@
 (ns fluree.db.query.fql
-  (:require [fluree.db.util.log :as log]
+  (:require [clojure.core.async :refer [go <!] :as async]
             [clojure.string :as str]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.analytical :as analytical]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.query.analytical-parse :as q-parse]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]])

@@ -1,0 +1,28 @@
+{:deps {:aliases [:dev]}
+
+ :dev-http {8000 "dev/browser/"}
+
+ :builds
+ {:browser
+  {:target :browser
+   :output-dir "dev/browser/js"
+   :asset-path "/js"
+
+   :modules {:fluree {:entries [flureedb]}}
+
+   :devtools {:watch-dir "dev/browser"}}
+
+  :webworker
+  {:target :browser
+   :output-dir "dev/browser/ww"
+   :asset-path "/ww"
+   :modules
+   {:worker {:web-worker true
+             :entries [flureeworker]}}}
+
+  :flureenjs
+  {:target :node-library
+   :output-to "out/shadow-node/flureenjs.js"
+   :exports {:fluree flureenjs/exports}
+   :compiler-options {:optimizations :simple}}}
+ }

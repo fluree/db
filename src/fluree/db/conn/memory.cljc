@@ -1,7 +1,9 @@
 (ns fluree.db.conn.memory
   (:require [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
-            [fluree.db.util.core :as util :refer [try* catch* exception?]]
+            [fluree.db.util.core :as util
+             #?@(:clj [:refer [try* catch* exception?]])
+             #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log]
             [fluree.db.conn.proto :as conn-proto]

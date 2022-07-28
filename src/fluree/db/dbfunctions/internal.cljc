@@ -3,12 +3,12 @@
                             boolean re-find and or count str nth rand nil? empty? hash-set not subs not=])
   (:require [#?(:cljs cljs.reader :clj clojure.edn) :as edn]
             [fluree.db.query.fql :as fql]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [#?(:cljs cljs.core.async :clj clojure.core.async) :as async]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [clojure.core.async :as async]
             [fluree.db.util.log :as log]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]))
 

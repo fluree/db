@@ -12,7 +12,9 @@
             #?(:clj [fluree.crypto :as crypto])
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.xhttp :as xhttp]
-            [fluree.db.util.core :as util :refer [try* catch* exception?]]
+            [fluree.db.util.core :as util
+             #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])
+             #?@(:clj [:refer [try* catch* exception?]])]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.query.http-signatures :as http-signatures]

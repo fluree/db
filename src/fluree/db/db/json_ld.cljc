@@ -1,7 +1,7 @@
 (ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.query.fql :as fql]
@@ -517,4 +517,3 @@
 (defn json-ld-db?
   [db]
   (instance? JsonLdDb db))
-
