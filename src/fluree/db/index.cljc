@@ -203,8 +203,9 @@
 
 (defn novelty-subrange
   [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]
+  (log/debug "novelty-subrange: node:" node "\nnovelty:" novelty)
   (let [subrange (cond
-                   ;; standard case.. both left and right boundaries
+                   ;; standard case: both left and right boundaries
                    (and rhs (not leftmost?))
                    (avl/subrange novelty > first-flake <= rhs)
 
