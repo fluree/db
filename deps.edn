@@ -41,7 +41,9 @@
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
-         org.babashka/sci                {:mvn/version "0.3.32"}}
+         org.babashka/sci                {;; :mvn/version "0.3.32"
+                          :git/url "https://github.com/babashka/sci"
+                          :sha "129d388ac2589103b31a561defc33b94ca28b59c"}}
 
  :paths ["src" "resources"]
 
@@ -53,7 +55,8 @@
   :dev
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
-                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}}
+                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
+                 thheller/shadow-cljs {:mvn/version "2.19.6"}}}
 
   :shadow-cljs
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]

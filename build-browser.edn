@@ -1,6 +1,7 @@
 {:output-to          "out/browser/index.js"
  :output-dir         "out/browser"
  :target             :bundle
+ :source-map "out/browser/index.js.map"
  :main               flureedb
  :optimizations      :advanced
  :optimize-constants false

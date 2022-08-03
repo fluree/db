@@ -8,20 +8,23 @@ const flureeServerUrl = "http://localhost:8090";
 
 async function go() {
   const conn = await flureenjs.jldConnect(
-    {method: "ipfs",
-     context: {
-       id: "@id",
-       type: "@type",
-       schema: "http://schema.org/",
-       rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-       rdfs: "http://www.w3.org/2000/01/rdf-schema#",
-       wiki: "https://www.wikidata.org/wiki/",
-       skos: "http://www.w3.org/2008/05/skos#",
-       f: "https://ns.flur.ee/ledger#"},
-     did: {
-       id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
-       "public": "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
-       "private": "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}});
+    {method: "file",
+     "storage-path": "dev/data/nodejs/commits",
+     "publish-path": "dev/data/nodejs",
+     defaults: {
+       context: {
+         id: "@id",
+         type: "@type",
+         schema: "http://schema.org/",
+         rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+         rdfs: "http://www.w3.org/2000/01/rdf-schema#",
+         wiki: "https://www.wikidata.org/wiki/",
+         skos: "http://www.w3.org/2008/05/skos#",
+         f: "https://ns.flur.ee/ledger#"},
+       did: {
+         id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
+         "public": "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
+         "private": "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}}});
 
   const ledger = await flureenjs.jldCreate(conn, "dan/test1");
 
@@ -34,8 +37,17 @@ async function go() {
 
   const q0 = await flureenjs.jldQuery(
     flureenjs.jldDb(ledger),
-    {"select": {"?s": ["*", {"f:role": ["*"]}]},
-     "where": [["?s", "rdf:type", "f:DID"]]}
+    {"select": {"?s": ["*", {"https://ns.flur.ee/ledger#role": ["*"]}]},
+     "where": [["?s", "http://www.w3.org/1999/02/22-rdf-syntax-ns#type", "https://ns.flur.ee/ledger#DID"]],
+     "opts": {"@context": {
+       id: "@id",
+       type: "@type",
+       schema: "http://schema.org/",
+       rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+       rdfs: "http://www.w3.org/2000/01/rdf-schema#",
+       wiki: "https://www.wikidata.org/wiki/",
+       skos: "http://www.w3.org/2008/05/skos#",
+       f: "https://ns.flur.ee/ledger#"}}}
   )
   console.log("q0", q0)
 
@@ -58,7 +70,7 @@ async function go() {
 
   const q1 = await flureenjs.jldQuery(
     db1,
-    { select: ["*", {"schema:isBasedOn": ["*"]}], from: "wiki:Q836821" }
+    { select: ["*", {"http://schema.org/isBasedOn": ["*"]}], from: "https://www.wikidata.org/wiki/Q836821" }
   )
   console.log('q1', q1)
 

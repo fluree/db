@@ -1,17 +1,19 @@
 (ns fluree.db.conn.file
   (:refer-clojure :exclude [exists?])
-  (:require [fluree.db.util.core :as util]
+  (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.conn.state-machine :as state-machine]
+            [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.util.log :as log]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
-            #?(:clj [fluree.db.full-text :as full-text])
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [clojure.core.async :as async]
             [clojure.string :as str]
-            #?(:clj [clojure.java.io :as io])
-            [fluree.crypto :as crypto])
+            [fluree.crypto :as crypto]
+            #?(:node ["fs" :as fs])
+            #?(:node ["path" :as path])
+            #?(:clj [fluree.db.full-text :as full-text])
+            #?(:clj [clojure.java.io :as io]))
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
@@ -26,8 +28,7 @@
             file      (apply io/file base-path split-key)]
         (.toString ^File file))
       :cljs
-      (throw (ex-info "TODO: implement for node" {})))))
-
+      (apply path/resolve base-path (str/split key #"_")))))
 
 (defn read-file
   "Read bytes from disk at `path`. Returns nil if file does not exist."
@@ -43,7 +44,14 @@
          nil)
        (catch Exception e (throw e)))
      :cljs
-     (throw (ex-info "TODO: implement for node" {}))))
+     (try*
+       (fs/readFileSync path)
+       (catch* e
+               (when (not= "ENOENT" (.-code e))
+                 (throw (ex-info  "Error reading file." {"errno" (.-errno e)
+                                                         "syscall" (.-syscall e)
+                                                         "code" (.-code e)
+                                                         "path" (.-path e)})))))))
 
 (defn storage-read
   "Reads file `key` from `base-path` into memory."
@@ -76,7 +84,22 @@
              (System/exit 1))))
        (catch Exception e (throw e)))
      :cljs
-     (throw (ex-info "TODO: implement for node" {}))))
+     (try*
+       (fs/writeFileSync path val)
+       (catch* e
+               (if (= (.-code e) "ENOENT")
+                 (try*
+                   (fs/mkdirSync path (clj->js {:recursive true}))
+                   (fs/writeFileSync path val)
+                   (catch* e
+                           (log/error (str "Unable to create storage directory: " path
+                                           " with error: " (.getMessage e) "."))
+                           (log/error (str "Fatal Error, shutting down!"))
+                           (js/process.exit 1)))
+                 (throw (ex-info "Error writing file." {"errno" (.-errno e)
+                                                        "syscall" (.-syscall e)
+                                                        "code" (.-code e)
+                                                        "path" (.-path e)})))))))
 
 (defn storage-write
   "Write disk `data` bytes to file in `key` file at `base-path` on disk."
@@ -96,7 +119,7 @@
     (let [bytes        (.getBytes data)
           hash         (crypto/sha2-256 bytes :hex)
           path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
-                  :cljs (throw (ex-info "TODO: implement for node" {})))]
+                  :cljs (path/resolve "." base-path "commits" hash) )]
       (write-file bytes path)
       (str "fluree:file:" path))))
 
@@ -105,7 +128,9 @@
   #?(:clj
      (.exists? (io/file path))
      :cljs
-     (throw (ex-info "TODO: implement for node" {}))))
+     (try* (fs/accessSync path)
+           true
+           (catch* e false))))
 
 (defn storage-exists?
   [base-path key]
@@ -138,7 +163,19 @@
               (deliver p (str "fluree:file:" path))))
           p)))
      :cljs
-     (throw (ex-info "TODO: implement for node" {}))))
+     (fn
+       ([commit-id]
+        (let [path (path/resolve "." base-path "HEAD")
+              [_ _ filename] (str/split commit-id #":")]
+          (js/Promise (fn [resolve reject]
+                        (write-file (.getBytes filename) path)
+                        (resolve (str "fluree:file:" path))))))
+       ([commit-id ledger]
+        (let [path (path/resolve "." base-path ledger "HEAD")
+              [_ _ filename] (str/split commit-id #":")]
+          (js/Promise (fn [resolve reject]
+                        (write-file (.getBytes filename) path)
+                        (resolve (str "fluree:file:" path)))))))))
 
 (defn storage-rename
   [base-path old-key new-key]
@@ -147,7 +184,7 @@
        (io/file (key->unix-path base-path old-key))
        (io/file (key->unix-path base-path new-key)))
      :cljs
-     (throw (ex-info "TODO: implement for node" {}))))
+     (fs/renameSync (key->unix-path base-path old-key) (key->unix-path base-path new-key))))
 
 (defn connection-rename
   [base-path]
@@ -170,6 +207,11 @@
   (-push [this address ledger-data] (push ledger-data))
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
+  (-address [conn ledger-alias _] (async/go (str "fluree:file:"
+                                                 #?(:cljs (path/resolve "." (:publish-path conn) ledger-alias "HEAD")
+                                                    :clj (str
+                                                           (-> (io/file "") .getAbsolutePath)
+                                                           "/" (:publish-path conn) "/" ledger-alias "/HEAD")))))
 
   conn-proto/iConnection
   (-close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
@@ -203,38 +245,65 @@
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [conn network dbid lang]
-         (throw (ex-info "File connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+                     (throw (ex-info "File connection does not support full text operations."
+                                     {:status 500 :error :db/unexpected-error})))]))
 
 
 (defn connect
   "Create a new file system connection."
   [{:keys [context did local-read local-write parallelism storage-path publish-path] :as opts}]
-  (let [conn-id  (str (random-uuid))
-        commit   (connection-commit storage-path)
-        read     (connection-read storage-path)
-        write    (connection-write storage-path)
-        exists?  (connection-exists? storage-path)
-        rename   (connection-rename storage-path)
-        push     (connection-push publish-path)
-        state    (state-machine/blank-state)
-        close-fn (fn [] (log/info (str "File Connection " conn-id " Closed")))]
-    ;; TODO - need to set up monitor loops for async chans
-    (map->FileConnection {:id          conn-id
-                          :transactor? false
-                          :context     context
-                          :did         did
-                          :local-read  local-read
-                          :local-write local-write
-                          :read        read
-                          :write       write
-                          :commit      commit
-                          :push        push
-                          :exists?     exists?
-                          :rename      rename
-                          :parallelism parallelism
-                          :msg-in-ch   (async/chan)
-                          :msg-out-ch  (async/chan)
-                          :close       close-fn
-                          :memory      true
-                          :state       state})))
+  #?(:node (go-try
+             (let [conn-id (str (random-uuid))
+                   commit (connection-commit storage-path)
+                   read (connection-read storage-path)
+                   write (connection-write storage-path)
+                   exists? (connection-exists? storage-path)
+                   rename (connection-rename storage-path)
+                   push (connection-push publish-path)
+                   state (state-machine/blank-state)
+                   close-fn (fn [] (log/info (str "File Connection " conn-id " Closed")))]
+               ;; TODO - need to set up monitor loops for async chans
+
+               (map->FileConnection {:id conn-id
+                                     :storage-path storage-path
+                                     :publish-path publish-path
+                                     :transactor? false
+                                     :context context
+                                     :did did
+                                     :local-read local-read
+                                     :local-write local-write
+                                     :read read
+                                     :write write
+                                     :commit commit
+                                     :push push
+                                     :exists? exists?
+                                     :rename rename
+                                     :parallelism parallelism
+                                     :msg-in-ch (async/chan)
+                                     :msg-out-ch (async/chan)
+                                     :close close-fn
+                                     :memory true
+                                     :state state})))
+     :cljs (throw (ex-info "File connection not supported in the browser" opts))))
+
+(comment
+  (def conn (connect {:storage-path "dev/data/nodejs/commits"
+                      :publish-path "dev/data/nodejs"}))
+
+
+
+
+
+
+
+
+  (async/go
+    (let [conn (async/<! conn)]
+      (println conn)
+      (println (conn-proto/address conn))))
+
+
+
+  *target*
+  "default"
+  )
