@@ -1,5 +1,4 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
-         org.clojure/clojurescript       {:mvn/version "1.11.60"}
          org.clojure/core.async          {:mvn/version "1.5.648"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
@@ -41,9 +40,7 @@
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
-         org.babashka/sci                {;; :mvn/version "0.3.32"
-                          :git/url "https://github.com/babashka/sci"
-                          :sha "129d388ac2589103b31a561defc33b94ca28b59c"}}
+         org.babashka/sci                {:mvn/version "0.3.31"}}
 
  :paths ["src" "resources"]
 
