@@ -17,7 +17,7 @@
 
 ;; IPFS Connection object
 
-(defn lookup-address
+(defn get-address
   "Returns IPNS address for a given key."
   [{:keys [ipfs-endpoint ledger-defaults] :as _conn} ledger-alias opts]
   (go-try
@@ -25,6 +25,13 @@
                          (<? (ipfs-keys/address ipfs-endpoint key))
                          (-> ledger-defaults :ipns :address))]
       (str "fluree:ipns://" base-address "/" ledger-alias))))
+
+(defn lookup-address
+  "Given IPNS address, performs lookup and returns latest db address."
+  [_conn ledger-name]
+  (go-try
+    ;; for now, no need to resolve as IPFS auto-resolves as part of its process
+    ledger-name))
 
 
 (defrecord IPFSConnection [id transactor? memory state
@@ -43,7 +50,8 @@
   (-push [this address ledger-data] (ipfs/push! this address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
-  (-address [this ledger-alias opts] (lookup-address this ledger-alias opts))
+  (-lookup [this ledger] (lookup-address this ledger))
+  (-address [this ledger-alias opts] (get-address this ledger-alias opts))
 
   conn-proto/iConnection
   (-close [_]

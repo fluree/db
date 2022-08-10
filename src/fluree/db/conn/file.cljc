@@ -168,6 +168,7 @@
 
   conn-proto/iNameService
   (-push [this address ledger-data] (push ledger-data))
+  (-lookup [this address] (async/go (throw (ex-info "Unsupported FileConnection op: lookup" {}))))
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
 

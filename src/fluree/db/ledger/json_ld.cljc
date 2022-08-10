@@ -180,9 +180,13 @@
   [conn commit-address]
   (go-try
     (let [base-context {:base commit-address}
-          commit-data  (<? (conn-proto/-c-read conn commit-address))
-          _            (when-not commit-data
+          last-commit  (<? (conn-proto/-lookup conn commit-address))
+          _            (when-not last-commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-address)
+                                         {:status 400 :error :db/invalid-db})))
+          commit-data  (<? (conn-proto/-c-read conn last-commit))
+          _            (when-not commit-data
+                         (throw (ex-info (str "Unable to load. No commit exists for: " last-commit)
                                          {:status 400 :error :db/invalid-db})))
           commit-data* (json-ld/expand commit-data base-context)
           [commit proof] (jld-reify/parse-commit commit-data*)

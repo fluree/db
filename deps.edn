@@ -34,10 +34,11 @@
          com.taoensso/nippy              {:mvn/version "3.1.3"}
          org.xerial.snappy/snappy-java   {:mvn/version "1.1.8.4"}
          com.fluree/alphabase            {:git/url "https://github.com/fluree/alphabase.git"
-                                          :sha "1161efe7f5fd5abb066adf2283f5da3c7683a48f"}
+                                          :sha "6aa66bb52336eb6a75c4de8c70ef81054b7011c5"}
 
          ;; cryptography
-         com.fluree/crypto               {:mvn/version "0.3.9"}
+         com.fluree/crypto {:git/url "https://github.com/fluree/fluree.crypto.git"
+                            :sha "93edd919b203a2881213b28142a569b4648692e3"}
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions

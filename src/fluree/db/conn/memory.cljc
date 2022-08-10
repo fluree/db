@@ -73,6 +73,7 @@
   (-push [this address ledger-data] (push! data-atom address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
+  (-lookup [this ledger] (async/go :TODO))
   (-address [_ ledger-alias _] (go (str "fluree:memory://" ledger-alias)))
 
   conn-proto/iConnection

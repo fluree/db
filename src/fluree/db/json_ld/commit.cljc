@@ -198,16 +198,8 @@
 
 (defn db-json->db-id
   [payload]
-  (->> payload
-       crypto/sha2-256
-       (str "fluree:db:sha256:")))
-
-(defn commit-json->commit-id
-  [payload]
-  (->> payload
-       crypto/sha2-256
-       (str "fluree:commit:sha256:")))
-
+  (->> (crypto/sha2-256 payload :base32)
+       (str "fluree:db:sha256:b")))
 
 (defn commit-flakes
   "Returns commit flakes from novelty based on 't' value.
@@ -296,13 +288,12 @@
       (let [commit-data (commit-meta db opts*)
             jld-graphs  (commit->graphs commit-data opts*)  ;; writes :dbid as meta on return object for -c-write to leverage
             graph-res   (<? (conn-proto/-c-write conn jld-graphs))
-            _           (log/info "New DB address:" (:address graph-res))
-            jld-commit  (commit->json-ld (:address graph-res) opts*)
+            db-address  (:address graph-res)
+            jld-commit  (commit->json-ld db-address opts*)
             jld-commit* (if did
                           (cred/generate jld-commit opts*)
                           jld-commit)
             commit-res  (<? (conn-proto/-c-write conn (or jld-commit* jld-commit)))
-            _           (log/info (str "New Commit address: " (:address commit-res)))
             commit-data {:t       t
                          :dbid    (get jld-graphs id-key)   ;; sha address for database
                          :address (:address commit-res)     ;; full address for commit (e.g. fluree:ipfs://...)
