@@ -14,7 +14,7 @@
             query-res @(fluree/query db {:select [:*]
                                          :from   :wiki/Q836821})]
         (is (= (count query-res) 1)
-            "Just one result match")
+            "There should only be one subject in the result set")
         (is (= query-res [{:id                               :wiki/Q836821,
                            :rdf/type                         [:schema/Movie],
                            :schema/name                      "The Hitchhiker's Guide to the Galaxy",
@@ -86,3 +86,20 @@
                                                                :schema/author {:id          :wiki/Q42,
                                                                                :rdf/type    [:schema/Person],
                                                                                :schema/name "Douglas Adams"}}})))))))
+
+
+(deftest json-ld-rdf-type-query
+  (testing "json-ld rdf type queries"
+    (testing "basic analytical RDF type query"
+      (let [movies    (test/get-ledger :test/movies)
+            db        (fluree/db movies)
+            query-res @(fluree/query db {:selectOne {'?s [:* {:f/role [:*]}]}
+                                         :where     [['?s :rdf/type :f/DID]]})]
+        (is (= (dissoc query-res :id)                       ;; :id is a DID and will be unique per DB so exclude from comparison
+               {:rdf/type [:f/DID],
+                :f/role   {:id              "fluree-root-role",
+                           :rdf/type        [:f/Role],
+                           :skos/definition "Default role that gives full root access to a ledger.",
+                           :skos/prefLabel  "Root role",
+                           :f/rules         {:id "fluree-root-rule"}}})
+            "Standard bootstrap data isn't matching.")))))
