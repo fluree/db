@@ -4,25 +4,85 @@
 
  :builds
  {:browser
-  {:target :browser
+  {:target     :browser
    :output-dir "dev/browser/js"
    :asset-path "/js"
 
-   :modules {:fluree {:entries [flureedb]}}
+   :modules     {:fluree {:entries [flureedb]}}
+   :build-hooks [(shadow.cljs.build-report/hook)]
 
    :devtools {:watch-dir "dev/browser"}}
 
   :webworker
-  {:target :browser
-   :output-dir "dev/browser/ww"
-   :asset-path "/ww"
+  {:target      :browser
+   :output-dir  "dev/browser/ww"
+   :asset-path  "/ww"
    :modules
    {:worker {:web-worker true
-             :entries [flureeworker]}}}
+             :entries    [flureeworker]}}
+   :build-hooks [(shadow.cljs.build-report/hook)]}
 
   :flureenjs
-  {:target :node-library
+  {:target    :node-library
    :output-to "out/shadow-node/flureenjs.js"
-   :exports {:fluree flureenjs/exports}
+   :exports   {:-app-state            flureenjs/-app-state
+               :-init-state           flureenjs/-init-state
+               :-njs-crypto           flureenjs/-njs-crypto
+               :-ns-state             flureenjs/-ns-state
+               :accountId             flureenjs/accountId
+               :blockEventToMap       flureenjs/blockEventToMap
+               :blockQuery            flureenjs/blockQuery
+               :blockRange            flureenjs/blockRange
+               :blockRangeWithTxn     flureenjs/blockRangeWithTxn
+               :close                 flureenjs/close
+               :closeListener         flureenjs/closeListener
+               :collectionFlakes      flureenjs/collectionFlakes
+               :connect               flureenjs/connect
+               :db                    flureenjs/db
+               :deleteLedger          flureenjs/deleteLedger
+               :exports               flureenjs/exports
+               :forwardTimeTravel     flureenjs/forwardTimeTravel
+               :graphql               flureenjs/graphql
+               :historyQuery          flureenjs/historyQuery
+               :httpSignature         flureenjs/httpSignature
+               :isForwardTimeTravelDb flureenjs/isForwardTimeTravelDb
+               :jldCommit             flureenjs/jldCommit
+               :jldConnect            flureenjs/jldConnect
+               :jldCreate             flureenjs/jldCreate
+               :jldDb                 flureenjs/jldDb
+               :jldLoad               flureenjs/jldLoad
+               :jldQuery              flureenjs/jldQuery
+               :jldStage              flureenjs/jldStage
+               :jldStatus             flureenjs/jldStatus
+               :ledgerInfo            flureenjs/ledgerInfo
+               :ledgerList            flureenjs/ledgerList
+               :listen                flureenjs/listen
+               :listeners             flureenjs/listeners
+               :monitorTx             flureenjs/monitorTx
+               :multiQuery            flureenjs/multiQuery
+               :newLedger             flureenjs/newLedger
+               :newPrivateKey         flureenjs/newPrivateKey
+               :passwordGenerate      flureenjs/passwordGenerate
+               :passwordLogin         flureenjs/passwordLogin
+               :predicateId           flureenjs/predicateId
+               :predicateName         flureenjs/predicateName
+               :publicKey             flureenjs/publicKey
+               :publicKeyFromPrivate  flureenjs/publicKeyFromPrivate
+               :query                 flureenjs/query
+               :queryWith             flureenjs/queryWith
+               :renewToken            flureenjs/renewToken
+               :resolveLedger         flureenjs/resolveLedger
+               :search                flureenjs/search
+               :session               flureenjs/session
+               :setDefaultKey         flureenjs/setDefaultKey
+               :setLogging            flureenjs/setLogging
+               :sign                  flureenjs/sign
+               :sparql                flureenjs/sparql
+               :sql                   flureenjs/sql
+               :subid                 flureenjs/subid
+               :transact              flureenjs/transact
+               :txToCommand           flureenjs/txToCommand
+               :collectionId          flureenjs/collectionId}
+
    :compiler-options {:optimizations :simple}}}
  }

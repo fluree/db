@@ -33,3 +33,4 @@ package-lock.json
 /js-packages/nodejs/flureenjs.js
 /js-packages/webworker/flureeworker.js
 **/cljs-runtime
+**report.html
