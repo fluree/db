@@ -1,13 +1,12 @@
 (ns fluree.db.query.analytical
   (:require [clojure.set :as set]
             [fluree.db.query.range :as query-range]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [clojure.core.async :as async]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.util.core :as util]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.query.analytical-wikidata :as wikidata]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.union :as union]
@@ -16,8 +15,7 @@
             #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.analytical-parse :as parse])
-  #?(:clj (:import (java.io Closeable)
-                   (fluree.db.flake Flake))))
+  #?(:clj (:import (java.io Closeable))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -440,7 +438,7 @@
                           max-sid   (-> db :ecount (get partition))
                           min-sid   (flake/min-subject-id partition)
                           flakes    (<? (query-range/index-range db :spot >= [max-sid] <= [min-sid]))
-                          xf        (comp (map (fn [^Flake f] [(.-s f)])) (distinct))]
+                          xf        (comp (map (fn [f] [(flake/s f)])) (distinct))]
                       {:headers [subject-var]
                        :tuples  (sequence xf flakes)
                        :vars    {}}))

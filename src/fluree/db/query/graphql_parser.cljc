@@ -1,7 +1,7 @@
 (ns fluree.db.query.graphql-parser
   (:require [clojure.string :as str]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
-            [fluree.db.util.core :as util :refer [if-cljs try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [if-cljs try* catch*]]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.async :refer [<? go-try]]
             #?(:cljs [cljs.reader :refer [read-string]])))

@@ -12,7 +12,7 @@
             [fluree.db.auth :as db-auth]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.dbfunctions.fns :as fns]
-            [fluree.db.flake :refer [Flake] :as flake]
+            [fluree.db.flake :as flake]
             [fluree.db.graphdb :as graphdb]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.query.http-signatures :as http-signatures]

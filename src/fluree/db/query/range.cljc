@@ -6,7 +6,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go go-loop <! >!] :as async]
                :cljs [cljs.core.async :refer [chan <! >!] :refer-macros [go go-loop] :as async])
             [fluree.db.permissions-validate :as perm-validate]
