@@ -609,3 +609,7 @@
     flake-set
     (let [k (nth flake-set n)]
       (first (avl/split-key k flake-set)))))
+
+(defn flake?
+  [x]
+  (instance? Flake x))
