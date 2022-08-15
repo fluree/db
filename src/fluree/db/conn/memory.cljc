@@ -11,6 +11,7 @@
             [fluree.db.conn.state-machine :as state-machine]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.json-ld :as json-ld]
+            [fluree.db.indexer.default :as idx-default]
             [fluree.crypto :as crypto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -88,6 +89,7 @@
   (-id [_] id)
   (-read-only? [_] false)
   (-context [_] (:context ledger-defaults))
+  (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine

@@ -11,7 +11,8 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.indexer.proto :as idx-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -281,7 +282,7 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn state] :as ledger} db opts]
+  [{:keys [conn state indexer] :as ledger} db opts]
   (go-try
     (let [{:keys [branch commit t]} db
           {:keys [did id-key push? branch-name] :as opts*} (commit-opts db opts)]

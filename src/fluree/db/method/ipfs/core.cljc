@@ -14,7 +14,11 @@
   [ipfs-endpoint]
   (fn [data]
     (go-try
-      (let [json (json-ld/normalize-data data)
+      (let [json (if (string? data)
+                   ;; if a string, assume already in JSON.
+                   data
+                   ;; all other data we'd commit will be a data structure, normalize
+                   (json-ld/normalize-data data))
             res  (<? (ipfs/add ipfs-endpoint json))
             {:keys [name]} res]
         (when-not name

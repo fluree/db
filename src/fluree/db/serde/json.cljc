@@ -2,7 +2,9 @@
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.util.json :as json]
             [fluree.db.flake :as flake]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [clojure.string :as str]
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -40,6 +42,17 @@
   [leaf]
   (assoc leaf :flakes (mapv flake/parts->Flake (:flakes leaf))))
 
+(defn- stringify-child
+  "Stringifies keys for child/index branches, and converts #Flake data
+  types into seq."
+  [m]
+  (reduce-kv
+    (fn [acc k v]
+      (assoc acc (name k) (if (flake/flake? v)
+                            (vec v)
+                            v)))
+    {} m))
+
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
@@ -48,28 +61,37 @@
   (-deserialize-block [_ block]
     (-> (json/parse block)
         (deserialize-block)))
-  (-serialize-db-root [_ db-root]
-    ;; turn stats keys into proper strings
-    (throw (ex-info "-serialize-db-root not supported for JSON." {})))
+  (-serialize-db-root [_ {:keys [t block prevIndex timestamp stats
+                                 ledger-id ecount fork forkBlock
+                                 spot psot post opst tspo] :as db-root}]
+    (reduce-kv
+      (fn [acc k v]
+        (assoc acc (name k)
+                   (case k
+                     :stats (util/stringify-keys v)
+                     (:spot :psot :post :opst :tspo) (stringify-child v)
+                     ;; else
+                     v)))
+      {} db-root))
   (-deserialize-db-root [_ db-root]
     (-> (json/parse db-root)
         (deserialize-db-root)))
-  (-serialize-branch [_ branch]
-    (throw (ex-info "-serialize-branch not supported for JSON." {})))
+  (-serialize-branch [_ {:keys [children] :as _branch}]
+    {"children" (map stringify-child children)})
   (-deserialize-branch [_ branch]
     (-> (json/parse branch)
         (deserialize-branch-node)))
   (-serialize-leaf [_ leaf]
-    (throw (ex-info "-serialize-leaf not supported for JSON." {})))
+    {"flakes" (map vec (:flakes leaf))})
   (-deserialize-leaf [_ leaf]
     (-> (json/parse leaf)
         (deserialize-leaf-node)))
   (-serialize-garbage [_ garbage]
-    (throw (ex-info "-serialize-garbage not supported for JSON." {})))
+    (util/stringify-keys garbage))
   (-deserialize-garbage [_ garbage]
     (json/parse garbage))
   (-serialize-db-pointer [_ pointer]
-    (throw (ex-info "-serialize-db-pointer not supported for JSON." {})))
+    (util/stringify-keys pointer))
   (-deserialize-db-pointer [_ pointer]
     (json/parse pointer)))
 

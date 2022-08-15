@@ -11,6 +11,7 @@
   (-id [conn] "Returns internal id for connection object")
   (-read-only? [conn] "Returns true if a read-only connection")
   (-context [conn] "Returns optional default context set at connection level")
+  (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from connection service")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")

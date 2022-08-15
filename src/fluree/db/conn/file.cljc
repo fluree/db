@@ -11,6 +11,7 @@
                :cljs [cljs.core.async :as async])
             [clojure.string :as str]
             #?(:clj [clojure.java.io :as io])
+            [fluree.db.indexer.default :as idx-default]
             [fluree.crypto :as crypto])
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
@@ -181,6 +182,7 @@
   (-id [_] id)
   (-read-only? [_] (not (fn? write)))
   (-context [_] context)
+  (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
   (-did [_] did)
   (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection msg-in: pull" {})))
   (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection msg-out: pull" {})))

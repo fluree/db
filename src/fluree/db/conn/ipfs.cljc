@@ -11,7 +11,9 @@
                :cljs [cljs.core.async :as async :refer [go <!]])
             [fluree.db.conn.state-machine :as state-machine]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
-            [fluree.db.method.ipfs.keys :as ipfs-keys]))
+            [fluree.db.serde.json :refer [json-serde]]
+            [fluree.db.method.ipfs.keys :as ipfs-keys]
+            [fluree.db.indexer.default :as default-indexer]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -38,6 +40,7 @@
                            ledger-defaults async-cache
                            local-read local-write
                            read write
+                           storage-read storage-write serializer
                            parallelism close-fn
                            msg-in-ch msg-out-ch
                            ipfs-endpoint]
@@ -65,6 +68,9 @@
   (-id [_] id)
   (-read-only? [_] (not (fn? write)))                       ;; if no commit fn, then read-only
   (-context [_] (:context ledger-defaults))
+  (-new-indexer [_ opts]                                    ;; default new ledger indexer
+    (let [indexer-fn (:indexer ledger-defaults)]
+      (indexer-fn opts)))
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine
@@ -79,16 +85,15 @@
 
   storage/Store
   (read [_ k]
-    (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
+    (log/warn "idx-read: " k)
+    (storage-read k))
   (write [_ k data]
-    (throw (ex-info (str "Memory connection does not support storage writes. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
+    (storage-write k data))
   (exists? [_ k]
-    (throw (ex-info (str "Memory connection does not support storage exists?. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
+    (log/warn "idx-exists?: " k)
+    (storage-read k))
   (rename [_ old-key new-key]
-    (throw (ex-info (str "Memory connection does not support storage rename. Old/new key: " old-key new-key)
+    (throw (ex-info (str "IPFS does not support renaming of files: " old-key new-key)
                     {:status 500 :error :db/unexpected-error})))
 
   index/Resolver
@@ -147,10 +152,22 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [ipfs-endpoint {:keys [ipns context did] :as defaults}]
+  [ipfs-endpoint {:keys [ipns context did indexer] :as defaults}]
   (go-try
     (let [ipns-default-key     (or (:key ipns) "self")
-          ipns-default-address (<? (ipfs-keys/address ipfs-endpoint ipns-default-key))]
+          ipns-default-address (<? (ipfs-keys/address ipfs-endpoint ipns-default-key))
+          new-indexer-fn       (cond
+                                 (fn? indexer)
+                                 indexer
+
+                                 (or (map? indexer) (nil? indexer))
+                                 (fn [opts]
+                                   (default-indexer/create (merge indexer opts)))
+
+                                 :else
+                                 (throw (ex-info (str "Expected an indexer constructor fn or "
+                                                      "default indexer options map. Provided: " indexer)
+                                                 {:status 400 :error :db/invalid-connection})))]
       (when-not ipns-default-address
         (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
                              ipns-default-key)
@@ -158,13 +175,15 @@
       {:ipns    {:key     ipns-default-key
                  :address ipns-default-address}
        :context context
-       :did     did})))
+       :did     did
+       :indexer new-indexer-fn})))
 
 
 (defn connect
-  "Creates a new memory connection."
-  [{:keys [server local-read local-write parallelism async-cache memory defaults]
-    :or   {server "http://127.0.0.1:5001/"}}]
+  "Creates a new IPFS connection."
+  [{:keys [server local-read local-write parallelism async-cache memory defaults serializer]
+    :or   {server     "http://127.0.0.1:5001/"
+           serializer (json-serde)}}]
   (go-try
     (let [ipfs-endpoint      (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
           ledger-defaults    (<? (ledger-defaults ipfs-endpoint defaults))
@@ -180,7 +199,9 @@
           default-cache-atom (atom (default-object-cache-factory memory-object-size))
           async-cache-fn     (or async-cache
                                  (default-async-cache-fn default-cache-atom))
-          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
+          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))
+          storage-write      (fn [k data]
+                               (write data))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
                             :ipfs-endpoint   ipfs-endpoint
@@ -190,6 +211,9 @@
                             :local-write     local-write
                             :read            read
                             :write           write
+                            :storage-read    (ipfs/default-read-fn ipfs-endpoint)
+                            :storage-write   storage-write
+                            :serializer      serializer
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)
