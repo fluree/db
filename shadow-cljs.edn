@@ -7,7 +7,7 @@
   {:target     :browser
    :output-dir "dev/browser/js"
    :asset-path "/js"
-
+   :closure-defines {fluree.db.conn.env/BROWSER true}
    :modules     {:fluree {:entries [flureedb]}}
    :build-hooks [(shadow.cljs.build-report/hook)]
 
@@ -17,6 +17,7 @@
   {:target      :browser
    :output-dir  "dev/browser/ww"
    :asset-path  "/ww"
+   :closure-defines {fluree.db.conn.env/BROWSER true}
    :modules
    {:worker {:web-worker true
              :entries    [flureeworker]}}
@@ -25,6 +26,8 @@
   :flureenjs
   {:target    :node-library
    :output-to "out/shadow-node/flureenjs.js"
+   :closure-defines {fluree.db.conn.env/BROWSER false}
+   :compiler-options {:optimizations :simple}
    :exports   {:-app-state            flureenjs/-app-state
                :-init-state           flureenjs/-init-state
                :-njs-crypto           flureenjs/-njs-crypto
@@ -82,7 +85,5 @@
                :subid                 flureenjs/subid
                :transact              flureenjs/transact
                :txToCommand           flureenjs/txToCommand
-               :collectionId          flureenjs/collectionId}
-
-   :compiler-options {:optimizations :simple}}}
+               :collectionId          flureenjs/collectionId}}}
  }

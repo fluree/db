@@ -1,6 +1,7 @@
 (ns fluree.db.conn.file
   (:refer-clojure :exclude [exists?])
   (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.conn.platform :as platform]
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.util.log :as log]
@@ -10,13 +11,12 @@
             [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
-            #?(:node ["fs" :as fs])
-            #?(:node ["path" :as path])
+            #?@(:cljs [["fs" :as fs]
+                       ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
             #?(:clj [clojure.java.io :as io]))
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
-
 
 (defn key->unix-path
   "Given an optional base-path and our key, returns the storage path as a
@@ -116,7 +116,8 @@
 (defn connection-commit
   [base-path]
   (fn [data]
-    (let [bytes        (.getBytes data)
+    (let [bytes        #?(:clj (.getBytes data)
+                          :cljs (js/Buffer.from data "utf8"))
           hash         (crypto/sha2-256 bytes :hex)
           path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
                   :cljs (path/resolve "." base-path "commits" hash) )]
@@ -252,58 +253,35 @@
 (defn connect
   "Create a new file system connection."
   [{:keys [context did local-read local-write parallelism storage-path publish-path] :as opts}]
-  #?(:node (go-try
-             (let [conn-id (str (random-uuid))
-                   commit (connection-commit storage-path)
-                   read (connection-read storage-path)
-                   write (connection-write storage-path)
-                   exists? (connection-exists? storage-path)
-                   rename (connection-rename storage-path)
-                   push (connection-push publish-path)
-                   state (state-machine/blank-state)
-                   close-fn (fn [] (log/info (str "File Connection " conn-id " Closed")))]
-               ;; TODO - need to set up monitor loops for async chans
+  (go-try
+    (let [conn-id (str (random-uuid))
+          commit (connection-commit storage-path)
+          read (connection-read storage-path)
+          write (connection-write storage-path)
+          exists? (connection-exists? storage-path)
+          rename (connection-rename storage-path)
+          push (connection-push publish-path)
+          state (state-machine/blank-state)
+          close-fn (fn [] (log/info (str "File Connection " conn-id " Closed")))]
+      ;; TODO - need to set up monitor loops for async chans
 
-               (map->FileConnection {:id conn-id
-                                     :storage-path storage-path
-                                     :publish-path publish-path
-                                     :transactor? false
-                                     :context context
-                                     :did did
-                                     :local-read local-read
-                                     :local-write local-write
-                                     :read read
-                                     :write write
-                                     :commit commit
-                                     :push push
-                                     :exists? exists?
-                                     :rename rename
-                                     :parallelism parallelism
-                                     :msg-in-ch (async/chan)
-                                     :msg-out-ch (async/chan)
-                                     :close close-fn
-                                     :memory true
-                                     :state state})))
-     :cljs (throw (ex-info "File connection not supported in the browser" opts))))
-
-(comment
-  (def conn (connect {:storage-path "dev/data/nodejs/commits"
-                      :publish-path "dev/data/nodejs"}))
-
-
-
-
-
-
-
-
-  (async/go
-    (let [conn (async/<! conn)]
-      (println conn)
-      (println (conn-proto/address conn))))
-
-
-
-  *target*
-  "default"
-  )
+      (map->FileConnection {:id conn-id
+                            :storage-path storage-path
+                            :publish-path publish-path
+                            :transactor? false
+                            :context context
+                            :did did
+                            :local-read local-read
+                            :local-write local-write
+                            :read read
+                            :write write
+                            :commit commit
+                            :push push
+                            :exists? exists?
+                            :rename rename
+                            :parallelism parallelism
+                            :msg-in-ch (async/chan)
+                            :msg-out-ch (async/chan)
+                            :close close-fn
+                            :memory true
+                            :state state}))))
