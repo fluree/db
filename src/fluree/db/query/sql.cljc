@@ -121,7 +121,7 @@
        parse-all
        (apply str)
        #?(:clj  Long/parseLong
-          :cljs Number.parseInt)
+          :cljs js/Number.parseInt)
        bounce))
 
 

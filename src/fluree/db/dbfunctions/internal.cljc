@@ -643,10 +643,13 @@
 ;; TODO - below is java-specific, need a javascript version
 (defn rand
   [instant max']
-  (try*
-    (let [base (.nextDouble (java.util.Random. instant))
-          num  (int (Math/floor (* base max')))] num)
-    (catch* e (function-error e "rand" instant max'))))
+  #?(:clj
+     (try*
+       (let [base (.nextDouble (java.util.Random. instant))
+             num  (int (Math/floor (* base max')))] num)
+       (catch* e (function-error e "rand" instant max')))
+     :cljs
+     (throw (ex-info "Function not implemented in js: fluree.db.dbfunctions.internal/rand" {}))))
 
 (defn cas
   "Returns new-val if existing-val is equal to compare-val, else throws exception"

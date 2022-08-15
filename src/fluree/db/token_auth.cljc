@@ -61,7 +61,7 @@
                                            {:status 401
                                             :error  :db/invalid-token
                                             :meta   {:jwt    jwt
-                                                     :reason (.getMessage e)}}))))
+                                                     :reason ^String (.getMessage e)}}))))
         token    (str header "." payload)
         sig*     (generate-jwt-sig secret token)
         _        (when (not= header* jwt-header)
@@ -84,7 +84,7 @@
                                            {:status 401
                                             :error  :db/invalid-token
                                             :meta   {:jwt    jwt
-                                                     :reason (.getMessage e)}}))))]
+                                                     :reason ^String (.getMessage e)}}))))]
     (when (and (:exp payload*)
                (< (:exp payload*) (util/current-time-millis)))
       (throw (ex-info "JWT has expired."

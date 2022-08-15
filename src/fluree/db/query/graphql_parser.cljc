@@ -331,10 +331,13 @@
   [string]
   (let [res (try*
               (read-string string)
-              (catch* e (str (str string))))]
-    (if (= clojure.lang.Symbol (type res))
+              (catch* e (str string)))]
+    (if (= #?(:clj clojure.lang.Symbol
+              :cljs Symbol)
+           (type res))
       (str res)
       res)))
+
 
 (defn parse-options
   ([option-map]

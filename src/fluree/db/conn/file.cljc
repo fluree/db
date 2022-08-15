@@ -48,8 +48,8 @@
        (fs/readFileSync path)
        (catch* e
                (when (not= "ENOENT" (.-code e))
-                 (throw (ex-info  "Error reading file." {"errno" (.-errno e)
-                                                         "syscall" (.-syscall e)
+                 (throw (ex-info  "Error reading file." {"errno" ^String (.-errno e)
+                                                         "syscall" ^String (.-syscall e)
                                                          "code" (.-code e)
                                                          "path" (.-path e)})))))))
 
