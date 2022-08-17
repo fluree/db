@@ -4,7 +4,7 @@
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
             [clojure.string :as str]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util]
             [clojure.set :as set]
             #?(:cljs [cljs.tools.reader :refer [read-string]])))
@@ -771,8 +771,3 @@
   (def value-query "SELECT ?handle\nWHERE {\n  VALUES ?handle { \"dsanchez\" }\n  ?person fdb:person/handle ?handle.\n}")
 
   (def group-having-query "SELECT (SUM(?favNums) AS ?sumNums)\n WHERE {\n ?e fdb:person/favNums ?favNums. \n } \n GROUP BY ?e \n HAVING(SUM(?favNums) > 10)"))
-
-
-
-
-

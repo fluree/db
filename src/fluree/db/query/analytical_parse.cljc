@@ -1,7 +1,7 @@
 (ns fluree.db.query.analytical-parse
   (:require [clojure.string :as str]
             #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]

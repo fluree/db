@@ -3,7 +3,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.permissions-validate :as perm-validate]))

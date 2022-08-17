@@ -4,7 +4,7 @@
             [fluree.db.flake :as flake]
             [clojure.data.avl :as avl]
             [clojure.string :as str]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
             [fluree.db.dbproto :as dbproto]
             [clojure.core.async :refer [go <!] :as async]

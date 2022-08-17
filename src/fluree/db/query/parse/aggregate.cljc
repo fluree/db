@@ -1,7 +1,7 @@
 (ns fluree.db.query.parse.aggregate
   (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [clojure.string :as str]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

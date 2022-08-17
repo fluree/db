@@ -1,6 +1,6 @@
 (ns fluree.db.permissions-validate
   (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
             [clojure.core.async :refer [go <!] :as async]
             [fluree.db.util.async :refer [<? go-try channel?]]

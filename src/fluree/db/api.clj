@@ -23,7 +23,7 @@
             [fluree.db.util.async :refer [<? channel? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.fql-resp :refer [flakes->res]])
   (:import (java.util UUID)))
 

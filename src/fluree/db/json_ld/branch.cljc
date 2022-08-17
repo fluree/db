@@ -1,6 +1,6 @@
 (ns fluree.db.json-ld.branch
   (:require [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [name]))
 
 #?(:clj (set! *warn-on-reflection* true))

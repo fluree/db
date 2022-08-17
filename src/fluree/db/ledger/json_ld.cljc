@@ -10,7 +10,7 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -203,4 +203,3 @@
   Used to differentiate in cases where ledger or DB could be used."
   [x]
   (satisfies? ledger-proto/iLedger x))
-

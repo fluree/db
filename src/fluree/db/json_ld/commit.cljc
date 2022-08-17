@@ -2,7 +2,7 @@
   (:require [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
             [fluree.db.flake :as flake]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.util.core :as util]

@@ -5,7 +5,7 @@
             [fluree.db.spec :as spec]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.schema :as schema]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 ;; handling for legacy Fluree 'basic queries'
 

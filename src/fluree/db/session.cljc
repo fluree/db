@@ -8,7 +8,7 @@
             [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.storage.core :as storage]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.operations :as ops]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]

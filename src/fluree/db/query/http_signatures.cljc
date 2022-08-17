@@ -2,7 +2,7 @@
   (:require [fluree.crypto :as crypto]
             [clojure.string :as str]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json])
   #?(:clj (:import (java.time ZoneOffset ZonedDateTime)
                    (java.time.format DateTimeFormatter)

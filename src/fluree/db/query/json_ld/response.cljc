@@ -5,7 +5,7 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 ;; handles :select response map for JSON-LD based queries
 

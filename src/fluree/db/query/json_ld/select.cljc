@@ -1,7 +1,7 @@
 (ns fluree.db.query.json-ld.select
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 ;; parses select statement for JSON-LD queries
 

@@ -4,7 +4,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [condps]]
             [fluree.db.util.async :refer [go-try <? channel?]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [clojure.string :as str]))
 
 (defn tx-fn?

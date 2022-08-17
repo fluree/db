@@ -5,7 +5,7 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.method.ipfs.keys :as ipfs-key]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

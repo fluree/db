@@ -5,7 +5,7 @@
              #?@(:clj [:refer [try* catch* exception?]])
              #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])]
             #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.util.async :refer [<? go-try channel?]]

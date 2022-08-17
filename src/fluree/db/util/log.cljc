@@ -46,44 +46,45 @@
        (glog/log logger (get levels level) (fmt args) nil))))
 
 
-(defmacro error
-  {:arglists '([message & more] [throwable message & more])}
-  [& args]
-  `(if-cljs
-     (log logger :severe ~(vec args))
-     (log/logp :error ~@args)))
+#?(:clj
+   (defmacro error
+     {:arglists '([message & more] [throwable message & more])}
+     [& args]
+     `(if-cljs
+          (log logger :severe ~(vec args))
+          (log/logp :error ~@args))))
 
+#?(:clj
+   (defmacro warn
+     {:arglists '([message & more] [throwable message & more])}
+     [& args]
+     `(if-cljs
+          (log logger :warning ~(vec args))
+          (log/logp :warn ~@args))))
 
-(defmacro warn
-  {:arglists '([message & more] [throwable message & more])}
-  [& args]
-  `(if-cljs
-     (log logger :warning ~(vec args))
-     (log/logp :warn ~@args)))
+#?(:clj
+   (defmacro info
+     {:arglists '([message & more] [throwable message & more])}
+     [& args]
+     `(if-cljs
+          (log logger :info ~(vec args))
+          (log/logp :info ~@args))))
 
+#?(:clj
+   (defmacro debug
+     {:arglists '([message & more] [throwable message & more])}
+     [& args]
+     `(if-cljs
+          (log logger :fine ~(vec args))
+          (log/logp :debug ~@args))))
 
-(defmacro info
-  {:arglists '([message & more] [throwable message & more])}
-  [& args]
-  `(if-cljs
-     (log logger :info ~(vec args))
-     (log/logp :info ~@args)))
-
-
-(defmacro debug
-  {:arglists '([message & more] [throwable message & more])}
-  [& args]
-  `(if-cljs
-     (log logger :fine ~(vec args))
-     (log/logp :debug ~@args)))
-
-
-(defmacro trace
-  {:arglists '([message & more] [throwable message & more])}
-  [& args]
-  `(if-cljs
-     (log logger :finer ~(vec args))
-     (log/logp :trace ~@args)))
+#?(:clj
+   (defmacro trace
+     {:arglists '([message & more] [throwable message & more])}
+     [& args]
+     `(if-cljs
+          (log logger :finer ~(vec args))
+          (log/logp :trace ~@args))))
 
 
 #?(:cljs

@@ -5,7 +5,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [clojure.core.async :refer [go <!] :as async]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.schema :as schema-util]))
 

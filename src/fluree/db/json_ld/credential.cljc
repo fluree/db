@@ -6,7 +6,7 @@
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))

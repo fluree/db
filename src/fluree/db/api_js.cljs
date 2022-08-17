@@ -11,7 +11,7 @@
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util]
             [fluree.db.connection-js :as conn-handler]
             [fluree.db.query.fql-resp :refer [flakes->res]]))

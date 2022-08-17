@@ -11,7 +11,7 @@
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.union :as union]
             [clojure.string :as str]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.analytical-parse :as parse])

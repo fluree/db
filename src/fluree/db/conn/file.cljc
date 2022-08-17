@@ -4,7 +4,7 @@
             [fluree.db.conn.platform :as platform]
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
@@ -93,11 +93,11 @@
                    (fs/writeFileSync path val)
                    (catch* e
                            (log/error (str "Unable to create storage directory: " path
-                                           " with error: " (.getMessage e) "."))
+                                           " with error: " ^String (.getMessage e) "."))
                            (log/error (str "Fatal Error, shutting down!"))
                            (js/process.exit 1)))
-                 (throw (ex-info "Error writing file." {"errno" (.-errno e)
-                                                        "syscall" (.-syscall e)
+                 (throw (ex-info "Error writing file." {"errno" ^String (.-errno e)
+                                                        "syscall" ^String (.-syscall e)
                                                         "code" (.-code e)
                                                         "path" (.-path e)})))))))
 

@@ -2,7 +2,7 @@
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.util.json :as json]
             [fluree.db.flake :as flake]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

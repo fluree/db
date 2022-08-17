@@ -2,7 +2,7 @@
   (:require [clojure.java.io :as io]
             [criterium.core :as criterium]
             [fluree.db.api :as fdb]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [clojure.string :as str]))
 
 (set! *warn-on-reflection* true)
@@ -233,5 +233,3 @@
   (def res2 (assoc res1 {:block 3} {:sample 60, :mean 2.2178411651301957E-4, :mean-time "221.784117 µs"}))
 
   (compare-results res1 res2))
-
-

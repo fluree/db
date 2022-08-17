@@ -5,7 +5,7 @@
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
                                                           subj-perm-filter-fn filter-subject]]
             [fluree.db.dbproto :as dbproto]))

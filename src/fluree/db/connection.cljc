@@ -4,7 +4,7 @@
             #?(:clj  [clojure.core.async :as async :refer [go <!]]
                :cljs [cljs.core.async :as async :refer [go <!]])
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
             [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]

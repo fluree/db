@@ -1,7 +1,7 @@
 (ns fluree.db.conn.state-machine
   (:require [fluree.db.util.core :as util]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [clojure.core.async :as async]))
 
 ;; state machine for connections
@@ -100,5 +100,3 @@
     (if request-resp?
       (message-response conn msg)
       (conn-event conn msg))))
-
-

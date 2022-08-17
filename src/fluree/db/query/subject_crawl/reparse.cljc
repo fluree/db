@@ -1,5 +1,5 @@
 (ns fluree.db.query.subject-crawl.reparse
-  (:require [fluree.db.util.log :as log]
+  (:require [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]))
 

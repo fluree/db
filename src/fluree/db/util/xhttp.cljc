@@ -12,7 +12,7 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.conn.platform :as platform]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log :include-macros true])
   (:import #?@(:clj  ((org.httpkit.client TimeoutException)
                       (org.asynchttpclient.ws WebSocket))
                :cljs ((goog.net.ErrorCode)))))

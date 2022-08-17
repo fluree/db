@@ -1,7 +1,7 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :refer [go <!] :as async]
             [clojure.string :as str]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.analytical :as analytical]
             [fluree.db.util.async :refer [<? go-try merge-into?]]

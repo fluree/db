@@ -11,7 +11,7 @@
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
