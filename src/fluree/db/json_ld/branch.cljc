@@ -100,7 +100,7 @@
 
 
 ;; TODO
-(defn branch
+#_(defn branch
   "Creates, or changes, a ledger's branch"
   [ledger branch]
   (let [{:keys [state]} ledger
