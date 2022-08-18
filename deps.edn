@@ -36,7 +36,9 @@
                                           :sha "1161efe7f5fd5abb066adf2283f5da3c7683a48f"}
 
          ;; cryptography
-         com.fluree/crypto               {:mvn/version "0.3.9"}
+         com.fluree/crypto               { ;; :mvn/version "0.3.9"
+                                          :git/url "https://github.com/fluree/fluree.crypto.git"
+                                          :sha "3eaf1bdafa4395f58d2e5105cfd77fb341126fe1"}
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions

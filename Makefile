@@ -86,12 +86,11 @@ docs/%.html: docs/%.md
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
 cljs-browser-test: node_modules package-lock.json
-	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
-	clojure -M:cljs-browser-test
+	npx shadow-cljs release browser-test
+	karma start --single-run
 
 cljs-node-test: node_modules package-lock.json
-	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
-	clojure -M:cljs-node-test
+		npx shadow-cljs release node-test
 
 nodejs-test: out/flureenjs.js
 	cd test/nodejs && npm install && npm test

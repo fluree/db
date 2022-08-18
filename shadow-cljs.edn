@@ -30,7 +30,7 @@
                           "crypto" false}}
    :modules
    {:main {:web-worker true
-             :entries    [flureeworker]}}
+           :entries    [flureeworker]}}
    :build-hooks [(shadow.cljs.build-report/hook)]}
 
   :flureenjs
@@ -94,5 +94,23 @@
                :subid                 flureenjs/subid
                :transact              flureenjs/transact
                :txToCommand           flureenjs/txToCommand
-               :collectionId          flureenjs/collectionId}}}
+               :collectionId          flureenjs/collectionId}}
+
+  :node-test                            ; runs the cljs tests on node
+  {:target    :node-test
+   :output-to "out/nodejs-test/node-tests.js"
+   :autorun true
+   :closure-defines {fluree.db.platform/BROWSER false}
+   :compiler-options {:optimizations :simple}}
+
+  :browser-test                         ; runs the cljs tests in the browser via karma
+  {:target :karma
+   :output-to  "out/browser-teset/browser-tests.js"
+   :closure-defines {fluree.db.platform/BROWSER true
+                     cljs.core/*global* "window"}
+   :js-options {:resolve {"fs" false
+                          "path" false
+                          "process" false
+                          "buffer" false
+                          "crypto" false}}}}
  }
