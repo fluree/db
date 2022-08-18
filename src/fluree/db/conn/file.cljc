@@ -116,7 +116,7 @@
 (defn connection-commit
   [base-path]
   (fn [data]
-    (let [bytes        #?(:clj (.getBytes data)
+    (let [bytes        #?(:clj (.getBytes ^String data)
                           :cljs (js/Buffer.from data "utf8"))
           hash         (crypto/sha2-256 bytes :hex)
           path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
@@ -127,7 +127,7 @@
 (defn exists?
   [path]
   #?(:clj
-     (.exists? (io/file path))
+     (.exists ^File (io/file path))
      :cljs
      (try* (fs/accessSync path)
            true
@@ -152,7 +152,7 @@
           (future
             (let [path (str (-> (io/file "") .getAbsolutePath) "/" base-path "/HEAD")
                   [_ _ filename] (str/split commit-id #":")]
-              (write-file (.getBytes filename) path)
+              (write-file (.getBytes ^String filename) path)
               (deliver p (str "fluree:file:" path))))
           p))
        ([commit-id ledger]
@@ -160,7 +160,7 @@
           (future
             (let [path (str (-> (io/file "") .getAbsolutePath) "/" base-path "/" ledger "/HEAD")
                   [_ _ filename] (str/split commit-id #":")]
-              (write-file (.getBytes filename) path)
+              (write-file (.getBytes ^String filename) path)
               (deliver p (str "fluree:file:" path))))
           p)))
      :cljs
