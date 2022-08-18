@@ -2,7 +2,7 @@
   (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
-            [fluree.db.conn.platform :as platform]
+            [fluree.db.platform :as platform]
             [clojure.core.async :as async]
             [fluree.db.api.query :as query-api]
             [fluree.db.util.core :as util]

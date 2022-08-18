@@ -84,18 +84,6 @@
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
    :main-opts  ["-m" "target-bundle-libs.core"]}
 
-  :nodejs
-  {:extra-paths ["src-nodejs"]
-   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-nodejs.edn" "--compile"]}
-
-  :browser
-  {:extra-paths ["src-cljs"]
-   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-browser.edn" "--compile"]}
-
-  :webworker
-  {:extra-paths ["src-cljs"]
-   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
-
   :jar
   {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
    :exec-fn      hf.depstar/jar

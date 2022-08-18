@@ -3,30 +3,40 @@
  :dev-http {8000 "dev/browser/"}
 
  :builds
- {:browser
+ {:flureedb
   {:target     :browser
-   :output-dir "dev/browser/js"
-   :asset-path "/js"
-   :closure-defines {fluree.db.conn.env/BROWSER true}
-   :modules     {:fluree {:entries [flureedb]}}
+   ;; TODO: different output dir for release/dev?
+   :output-dir "out/browser/"
+   :closure-defines {fluree.db.platform/BROWSER true
+                     cljs.core/*global* "window"}
+   :js-options {:resolve {"fs" false
+                          "path" false
+                          "process" false
+                          "buffer" false
+                          "crypto" false}}
+   :modules     {:main {:entries [flureedb]}}
    :build-hooks [(shadow.cljs.build-report/hook)]
-
    :devtools {:watch-dir "dev/browser"}}
 
-  :webworker
+  :flureeworker
   {:target      :browser
-   :output-dir  "dev/browser/ww"
-   :asset-path  "/ww"
-   :closure-defines {fluree.db.conn.env/BROWSER true}
+   :output-dir  "out/webworker/"
+   :closure-defines {fluree.db.platform/BROWSER true
+                     cljs.core/*global* "self"}
+   :js-options {:resolve {"fs" false
+                          "path" false
+                          "process" false
+                          "buffer" false
+                          "crypto" false}}
    :modules
-   {:worker {:web-worker true
+   {:main {:web-worker true
              :entries    [flureeworker]}}
    :build-hooks [(shadow.cljs.build-report/hook)]}
 
   :flureenjs
   {:target    :node-library
-   :output-to "out/shadow-node/flureenjs.js"
-   :closure-defines {fluree.db.conn.env/BROWSER false}
+   :output-to "out/nodejs/flureenjs.js"
+   :closure-defines {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}
    :exports   {:-app-state            flureenjs/-app-state
                :-init-state           flureenjs/-init-state
@@ -43,7 +53,6 @@
                :connect               flureenjs/connect
                :db                    flureenjs/db
                :deleteLedger          flureenjs/deleteLedger
-               :exports               flureenjs/exports
                :forwardTimeTravel     flureenjs/forwardTimeTravel
                :graphql               flureenjs/graphql
                :historyQuery          flureenjs/historyQuery

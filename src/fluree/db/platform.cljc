@@ -1,4 +1,4 @@
-(ns fluree.db.conn.platform)
+(ns fluree.db.platform)
 
 #?(:cljs
    (goog-define BROWSER true)

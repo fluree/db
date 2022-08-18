@@ -1,7 +1,7 @@
 (ns fluree.db.conn.file
   (:refer-clojure :exclude [exists?])
   (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.conn.platform :as platform]
+            [fluree.db.platform :as platform]
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.util.log :as log :include-macros true]
