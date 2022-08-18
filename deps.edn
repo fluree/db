@@ -132,7 +132,8 @@
    ;; - WSM 2021-09-13
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths ["src" "src-docs"]
-                 :test-paths   ["test"]}]}
+                 ;; :test-paths   ["test"]
+                 }]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
