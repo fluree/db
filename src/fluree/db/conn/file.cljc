@@ -253,7 +253,7 @@
 (defn connect
   "Create a new file system connection."
   [{:keys [context did local-read local-write parallelism storage-path publish-path] :as opts}]
-  (go-try
+  (async/go
     (let [conn-id (str (random-uuid))
           commit (connection-commit storage-path)
           read (connection-read storage-path)

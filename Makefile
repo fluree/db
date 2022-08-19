@@ -90,7 +90,7 @@ cljs-browser-test: node_modules package-lock.json
 	./node_modules/karma/bin/karma start --single-run
 
 cljs-node-test: node_modules package-lock.json
-		npx shadow-cljs release node-test
+	npx shadow-cljs release node-test
 
 nodejs-test: out/flureenjs.js
 	cd test/nodejs && npm install && npm test
