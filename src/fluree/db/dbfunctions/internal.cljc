@@ -640,16 +640,14 @@
       sum)
     (catch* e (function-error e "objF" flakes))))
 
-;; TODO - below is java-specific, need a javascript version
 (defn rand
   [instant max']
-  #?(:clj
-     (try*
-       (let [base (.nextDouble (java.util.Random. instant))
-             num  (int (Math/floor (* base max')))] num)
-       (catch* e (function-error e "rand" instant max')))
-     :cljs
-     (throw (ex-info "Function not implemented in js: fluree.db.dbfunctions.internal/rand" {}))))
+  (try*
+    (let [rng #?(:clj (java.util.Random. instant) :cljs (seedrandom instant))
+          base #?(:clj (.nextDouble rng) :cljs (.double rng))
+          mult (* base max)]
+      (-> mult Math/floor int))
+    (catch* e (function-error e "rand" instant max))))
 
 (defn cas
   "Returns new-val if existing-val is equal to compare-val, else throws exception"
