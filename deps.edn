@@ -126,12 +126,6 @@
 
   :eastwood
   {:extra-deps {jonase/eastwood {:mvn/version "1.2.4"}}
-   ;; Remove the exclude-linter for :def-in-def below
-   ;; when the SCI smartfunctions runner lands. It's
-   ;; only there for the `defn` inside
-   ;; `fluree.db.dbfunctions.core/parse-fn`, which will
-   ;; hopefully go away w/ the SCI change.
-   ;; - WSM 2021-09-13
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths ["src" "src-docs"]
                  :test-paths   ["test"]}]}
