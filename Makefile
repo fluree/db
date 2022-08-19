@@ -87,7 +87,7 @@ docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
 cljs-browser-test: node_modules package-lock.json
 	npx shadow-cljs release browser-test
-	karma start --single-run
+	./node_modules/karma/bin/karma start --single-run
 
 cljs-node-test: node_modules package-lock.json
 		npx shadow-cljs release node-test

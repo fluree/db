@@ -105,7 +105,7 @@
 
   :browser-test                         ; runs the cljs tests in the browser via karma
   {:target :karma
-   :output-to  "out/browser-teset/browser-tests.js"
+   :output-to  "out/browser-test/browser-tests.js"
    :closure-defines {fluree.db.platform/BROWSER true
                      cljs.core/*global* "window"}
    :js-options {:resolve {"fs" false
