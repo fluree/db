@@ -2,8 +2,8 @@
   (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [fluree.db.platform :as platform]
+            [clojure.core.async :as async]
             [fluree.db.api.query :as query-api]
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
@@ -58,7 +58,9 @@
           method* (keyword method)]
       (case method*
         :ipfs (ipfs-conn/connect opts*)
-        :file (file-conn/connect opts*)
+        :file (if platform/BROWSER
+                (throw (ex-info "File connection not supported in the browser" opts))
+                (file-conn/connect opts*))
         :memory (memory-conn/connect opts*)))))
 
 (defn connect-ipfs

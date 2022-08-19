@@ -1,7 +1,7 @@
 (ns fluree.db.query.analytical-filter
   (:require [fluree.db.util.core :as util]
             [clojure.string :as str]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             #?(:cljs [cljs.reader]))
   #?(:clj (:import (java.time Instant))))
 
@@ -216,5 +216,3 @@
 (comment
 
   (filter-row ['?nums '?fruit '?age] [1 "apple" 15] "(bound ?nums)"))
-
-

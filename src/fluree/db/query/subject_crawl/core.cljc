@@ -1,10 +1,9 @@
 (ns fluree.db.query.subject-crawl.core
-  (:require #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+  (:require [clojure.core.async :refer [go <!] :as async]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.query.fql-parser :refer [parse-db]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.subject :refer [subj-crawl]]
             [fluree.db.query.subject-crawl.rdf-type :refer [collection-crawl]]
             [fluree.db.query.subject-crawl.common :refer [order-results]]
@@ -107,4 +106,3 @@
       (if collection?
         (collection-crawl opts)
         (subj-crawl opts)))))
-

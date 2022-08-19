@@ -1,7 +1,7 @@
 (ns fluree.db.api.ledger
   (:require [fluree.db.session :as session]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.connection :as conn]
             [fluree.db.permissions :as permissions]
@@ -11,7 +11,7 @@
             #?(:clj  [clojure.core.async :as async]
                :cljs [cljs.core.async :as async])
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

@@ -1,10 +1,9 @@
 (ns fluree.db.method.ipfs.directory
   (:require [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [clojure.core.async :as async]
             [clojure.string :as str]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.xhttp :as xhttp]
             [fluree.db.method.ipfs.xhttp :as ipfs]))
 

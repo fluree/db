@@ -9,7 +9,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.ledger.proto :as ledger-proto]))
 
@@ -319,4 +319,3 @@
                        (final-db tx-state))]
       (ledger-proto/-db-update ledger db*)
       db*)))
-

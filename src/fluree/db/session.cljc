@@ -1,20 +1,20 @@
 (ns fluree.db.session
   (:require [fluree.db.graphdb :as graphdb]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async :refer [<! >! chan go go-loop]]
-               :cljs [cljs.core.async :as async :refer [<! chan] :refer-macros [go go-loop]])
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [clojure.core.async :as async
+             #?@(:clj [:refer [<! >! chan go go-loop]]
+                 :cljs [:refer [<! chan] :refer-macros [go go-loop]])]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.storage.core :as storage]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.operations :as ops]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.schema :as schema]
-            [fluree.db.conn-events :as conn-events])
-  #?(:clj (:import (fluree.db.flake Flake))))
+            [fluree.db.conn-events :as conn-events]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -290,7 +290,7 @@
                          ", DB at that block, update cached db with flakes."))
          (let [new-db-ch (->> flakes
                               (map (fn [f]
-                                     (if (instance? Flake f)
+                                     (if (flake/flake? f)
                                        f
                                        (flake/parts->Flake f))))
                               (dbproto/-with current-db block))]
@@ -426,7 +426,7 @@
                                          " out of block " block ".")
                                     {:status 500 :error :db/unexpected-error :block (pr-str block-result)})))
         {:keys [t status]} tx-result
-        t-filter  (if (instance? Flake (first flakes))
+        t-filter  (if (flake/flake? (first flakes))
                     #(= t (flake/t %))
                     #(= t (nth % 3)))
         response  (-> tx-result

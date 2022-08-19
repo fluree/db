@@ -3,9 +3,8 @@
             [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.log :as log]))
+            [clojure.core.async :refer [go <!] :as async]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

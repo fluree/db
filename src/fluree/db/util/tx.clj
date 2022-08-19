@@ -5,7 +5,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 (set! *warn-on-reflection* true)
 

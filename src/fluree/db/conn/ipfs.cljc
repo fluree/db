@@ -1,14 +1,14 @@
 (ns fluree.db.conn.ipfs
+  (:refer-clojure :exclude [read])
   (:require [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
-            [fluree.db.util.core :as util :refer [try* catch* exception?]]
+            [fluree.db.util.core :as util :refer [exception?]]
             #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            #?(:clj  [clojure.core.async :as async :refer [go <!]]
-               :cljs [cljs.core.async :as async :refer [go <!]])
+            [clojure.core.async :as async :refer [go <!]]
             [fluree.db.conn.state-machine :as state-machine]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.serde.json :refer [json-serde]]
@@ -66,20 +66,20 @@
   (-parallelism [_] parallelism)
   (-transactor? [_] transactor?)
   (-id [_] id)
-  (-read-only? [_] (not (fn? write)))                       ;; if no commit fn, then read-only
+  (-read-only? [_] (not (fn? write))) ; if no commit fn, then read-only
   (-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]                                    ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
   (-did [_] (:did ledger-defaults))
-  (-msg-in [_ msg] (go-try
-                     ;; TODO - push into state machine
-                     (log/warn "-msg-in: " msg)
-                     :TODO))
-  (-msg-out [_ msg] (go-try
-                      ;; TODO - register/submit event
-                      (log/warn "-msg-out: " msg)
-                      :TODO))
+  ;; (-msg-in [_ msg] (go-try
+  ;;                    ;; TODO - push into state machine
+  ;;                    (log/warn "-msg-in: " msg)
+  ;;                    :TODO))
+  ;; (-msg-out [_ msg] (go-try
+  ;;                     ;; TODO - register/submit event
+  ;;                     (log/warn "-msg-out: " msg)
+  ;;                     :TODO))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 

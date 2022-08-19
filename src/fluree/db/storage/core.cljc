@@ -1,19 +1,17 @@
 (ns fluree.db.storage.core
   (:refer-clojure :exclude [read exists? list])
   (:require [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [clojure.data.avl :as avl]
             [clojure.string :as str]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
             [fluree.db.dbproto :as dbproto]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            #?(:clj [fluree.db.util.async :refer [<? go-try]])
-            #?(:clj [clojure.java.io :as io])
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.query.schema :as schema])
-  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
+            [clojure.core.async :refer [go <!] :as async]
+            [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.query.schema :as schema]
+            #?(:clj [clojure.java.io :as io])))
 
 #?(:clj (set! *warn-on-reflection* true))
 

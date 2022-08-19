@@ -3,14 +3,15 @@
                             boolean re-find and or count str nth rand nil? empty? hash-set not subs not=])
   (:require [#?(:cljs cljs.reader :clj clojure.edn) :as edn]
             [fluree.db.query.fql :as fql]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [#?(:cljs cljs.core.async :clj clojure.core.async) :as async]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [clojure.core.async :as async]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.query.range :as query-range]))
+            [fluree.db.query.range :as query-range]
+            #?(:cljs ["seedrandom" :as seedrandom])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -640,13 +641,15 @@
       sum)
     (catch* e (function-error e "objF" flakes))))
 
-;; TODO - below is java-specific, need a javascript version
 (defn rand
-  [instant max']
+  [instant max]
   (try*
-    (let [base (.nextDouble (java.util.Random. instant))
-          num  (int (Math/floor (* base max')))] num)
-    (catch* e (function-error e "rand" instant max'))))
+    (let [rng #?(:clj (java.util.Random. instant)
+                 :cljs (seedrandom instant))
+          base #?(:clj (.nextDouble rng) :cljs (.double rng))
+          mult (* base max)]
+      (-> mult Math/floor int))
+    (catch* e (function-error e "rand" instant max))))
 
 (defn cas
   "Returns new-val if existing-val is equal to compare-val, else throws exception"

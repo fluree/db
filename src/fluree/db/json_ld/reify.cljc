@@ -5,9 +5,9 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 ;; generates a db/ledger from persisted data
 #?(:clj (set! *warn-on-reflection* true))

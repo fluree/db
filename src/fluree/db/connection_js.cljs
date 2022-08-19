@@ -5,7 +5,7 @@
             [fluree.db.operations :as ops]
             [fluree.db.session :as session]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.token-auth :as token-auth]))
 
 ;; TODO: deprecated

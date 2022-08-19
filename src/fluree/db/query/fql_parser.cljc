@@ -1,5 +1,5 @@
 (ns fluree.db.query.fql-parser
-  (:require [fluree.db.util.core :as util :refer [try* catch*]]
+  (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
             [fluree.db.spec :as spec]
@@ -351,4 +351,3 @@
 
   (-> @select-cache)
   (reset-select-cache!))
-

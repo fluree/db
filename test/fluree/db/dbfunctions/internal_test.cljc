@@ -42,9 +42,3 @@
   (testing "unreverse-var"
     (is (= "my/reverse-ref" (f/unreverse-var "my/_reverse-ref"))
         "reverse ref underscore removed")))
-
-
-
-
-
-

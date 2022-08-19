@@ -1,11 +1,11 @@
 (ns fluree.db.query.subject-crawl.legacy
-  (:require [fluree.db.util.core :as util :refer [try* catch*]]
+  (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
             [fluree.db.spec :as spec]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.schema :as schema]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 ;; handling for legacy Fluree 'basic queries'
 
@@ -159,4 +159,3 @@
                :where where*
                :vars vars*)
         (dissoc :from))))
-

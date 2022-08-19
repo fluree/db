@@ -1,10 +1,9 @@
 (ns fluree.db.query.subject-crawl.common
-  (:require #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+  (:require [clojure.core.async :refer [go <!] :as async]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.permissions-validate :as perm-validate]))

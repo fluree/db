@@ -194,6 +194,10 @@
   [^Flake f]
   (.-m f))
 
+(defn flake?
+  [x]
+  (instance? Flake x))
+
 (defn- equiv-flake
   [f other]
   (and (= (s f) (s other))
@@ -609,7 +613,3 @@
     flake-set
     (let [k (nth flake-set n)]
       (first (avl/split-key k flake-set)))))
-
-(defn flake?
-  [x]
-  (instance? Flake x))

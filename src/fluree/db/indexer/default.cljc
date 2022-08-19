@@ -3,11 +3,10 @@
             [fluree.db.index :as index]
             [fluree.db.storage.core :as storage]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [clojure.core.async :as async]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.async :refer [<? go-try]]))
 
 ;; default indexer
 
@@ -507,5 +506,3 @@
                  :idx-file-read     idx-file-read
                  :idx-file-delete   idx-file-delete}]
     (map->IndexerDefault options)))
-
-

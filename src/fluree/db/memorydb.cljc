@@ -2,10 +2,9 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.query.schema :as schema]
             [fluree.db.constants :as const]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+            [clojure.core.async :refer [go <!] :as async]
             [fluree.db.session :as session]
             [fluree.db.util.async :as async-util]))
 

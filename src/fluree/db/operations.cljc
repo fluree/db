@@ -1,9 +1,8 @@
 (ns fluree.db.operations
   (:require
-    [fluree.db.util.core :as util :refer [try* catch*]]
-    [fluree.db.util.log :as log]
-    #?(:clj  [clojure.core.async :as async]
-       :cljs [cljs.core.async :as async])))
+    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+    [fluree.db.util.log :as log :include-macros true]
+    [clojure.core.async :as async]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

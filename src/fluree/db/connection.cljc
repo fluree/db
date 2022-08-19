@@ -4,15 +4,17 @@
             #?(:clj  [clojure.core.async :as async :refer [go <!]]
                :cljs [cljs.core.async :as async :refer [go <!]])
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
             [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
-            #?(:clj [fluree.crypto :as crypto])
+            [fluree.crypto :as crypto]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.xhttp :as xhttp]
-            [fluree.db.util.core :as util :refer [try* catch* exception?]]
+            [fluree.db.util.core :as util
+             #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])
+             #?@(:clj [:refer [try* catch* exception?]])]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.query.http-signatures :as http-signatures]

@@ -1,8 +1,6 @@
 (ns fluree.db.util.core
   (:require [clojure.string :as str]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <! put!] :as async])
-            #?(:cljs [cljs.js :as cljs])
+            [clojure.core.async :refer [go <! put!] :as async]
             #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
   #?(:clj  (:import (java.util UUID Date)
@@ -24,35 +22,38 @@
   [env]
   (boolean (:ns env)))
 
-(defmacro if-cljs
-  "Return then if we are generating cljs code and else for Clojure code.
+#?(:clj
+   (defmacro if-cljs
+     "Return then if we are generating cljs code and else for Clojure code.
    https://groups.google.com/d/msg/clojurescript/iBY5HaQda4A/w1lAQi9_AwsJ"
-  [then else]
-  (if (cljs-env? &env) then else))
+     [then else]
+     (if (cljs-env? &env) then else)))
 
-(defmacro try-catchall
-  "A cross-platform variant of try-catch that catches all exceptions.
+#?(:clj
+   (defmacro try-catchall
+     "A cross-platform variant of try-catch that catches all exceptions.
    Does not (yet) support finally, and does not need or want an exception class."
-  [& body]
-  (let [try-body (butlast body)
-        [catch sym & catch-body :as catch-form] (last body)]
-    (assert (= catch 'catch))
-    (assert (symbol? sym))
-    `(if-cljs
-       (try ~@try-body (~'catch js/Object ~sym ~@catch-body))
-       (try ~@try-body (~'catch Throwable ~sym ~@catch-body)))))
+     [& body]
+     (let [try-body (butlast body)
+           [catch sym & catch-body :as catch-form] (last body)]
+       (assert (= catch 'catch))
+       (assert (symbol? sym))
+       `(if-cljs
+            (try ~@try-body (~'catch js/Object ~sym ~@catch-body))
+            (try ~@try-body (~'catch Throwable ~sym ~@catch-body))))))
 
 (declare catch*)
 
-(defmacro try*
-  "Like try but supports catch*. catch* is like catch but supports CLJ/CLJS with
+#?(:clj
+   (defmacro try*
+     "Like try but supports catch*. catch* is like catch but supports CLJ/CLJS with
   less boilerplate. In CLJ it catches `Exception`. In CLJS it catches `:default`.
   Use it like this: `(try* ... (catch* err (handle-err err)))`.
   Also supports an optional finally clause."
-  [& body]
-  `(if-cljs
-     (cljs-exceptions/try* ~@body)
-     (clj-exceptions/try* ~@body)))
+     [& body]
+     `(if-cljs
+          (cljs-exceptions/try* ~@body)
+          (clj-exceptions/try* ~@body))))
 
 (defn index-of [coll value]
   (some (fn [[item idx]] (when (= value item) idx))
@@ -214,11 +215,12 @@
     s
     (str (subs s 0 n) " ...")))
 
-(defmacro some-of
-  ([] nil)
-  ([x] x)
-  ([x & more]
-   `(let [x# ~x] (if (nil? x#) (some-of ~@more) x#))))
+#?(:clj
+   (defmacro some-of
+     ([] nil)
+     ([x] x)
+     ([x & more]
+      `(let [x# ~x] (if (nil? x#) (some-of ~@more) x#)))))
 
 (defn filter-vals
   "Filters map k/v pairs dropping any where predicate applied to value is false."
@@ -284,8 +286,9 @@
     x
     [x]))
 
-(defmacro condps
-  "Takes an expression and a set of clauses.
+#?(:clj
+   (defmacro condps
+     "Takes an expression and a set of clauses.
   Each clause can take the form of either:
 
   unary-predicate-fn? result-expr
@@ -297,22 +300,22 @@
 
   Similar to condp but takes unary predicates instead of binary and allows
   multiple predicates to be supplied in a list similar to case."
-  [expr & clauses]
-  (let [gexpr (gensym "expr__")
-        emit  (fn emit [expr args]
-                (let [[[a b :as clause] more] (split-at 2 args)
-                      n (count clause)]
-                  (case n
-                    0 `(throw (IllegalArgumentException.
-                                (str "No matching clause: " ~expr)))
-                    1 a
-                    (let [preds (if (and (coll? a)
-                                         (not (= 'fn* (first a)))
-                                         (not (= 'fn (first a))))
-                                  (vec a)
-                                  [a])]
-                      `(if ((apply some-fn ~preds) ~expr)
-                         ~b
-                         ~(emit expr more))))))]
-    `(let [~gexpr ~expr]
-       ~(emit gexpr clauses))))
+     [expr & clauses]
+     (let [gexpr (gensym "expr__")
+           emit  (fn emit [expr args]
+                   (let [[[a b :as clause] more] (split-at 2 args)
+                         n (count clause)]
+                     (case n
+                       0 `(throw (IllegalArgumentException.
+                                   (str "No matching clause: " ~expr)))
+                       1 a
+                       (let [preds (if (and (coll? a)
+                                            (not (= 'fn* (first a)))
+                                            (not (= 'fn (first a))))
+                                     (vec a)
+                                     [a])]
+                         `(if ((apply some-fn ~preds) ~expr)
+                            ~b
+                            ~(emit expr more))))))]
+       `(let [~gexpr ~expr]
+          ~(emit gexpr clauses)))))

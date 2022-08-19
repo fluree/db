@@ -23,10 +23,9 @@
             [fluree.db.util.async :refer [<? channel? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.fql-resp :refer [flakes->res]])
-  (:import (java.util UUID)
-           (fluree.db.flake Flake)))
+  (:import (java.util UUID)))
 
 (set! *warn-on-reflection* true)
 
@@ -694,13 +693,13 @@
   [db curr-block cache fuel]
   (go-try
     (let [[asserted-subjects
-           retracted-subjects] (loop [[^Flake flake & r] (:flakes curr-block)
+           retracted-subjects] (loop [[flake & r] (:flakes curr-block)
                                       asserted-subjects  {}
                                       retracted-subjects {}]
                                  (if-not flake
                                    [asserted-subjects retracted-subjects]
-                                   (let [subject   (.-s flake)
-                                         asserted? (true? (.-op flake))
+                                   (let [subject   (flake/s flake)
+                                         asserted? (true? (flake/op flake))
                                          flake'    (if asserted? flake
                                                                  (flake/flip-flake flake))]
                                      (if asserted?
@@ -746,8 +745,8 @@
 
 (defn auth-match
   "INTERNAL USE ONLY"
-  [auth-set t-map ^Flake flake]
-  (let [[auth id] (get-in t-map [(.-t flake) :auth])]
+  [auth-set t-map flake]
+  (let [[auth id] (get-in t-map [(flake/t flake) :auth])]
     (or (auth-set auth)
         (auth-set id))))
 
@@ -755,7 +754,7 @@
   "INTERNAL USE ONLY"
   [db resp auth show-auth]
   (go-try
-    (let [ts    (set (map #(.-t ^Flake %) resp))
+    (let [ts    (set (map flake/t resp))
           t-map (<? (async/go-loop [[t & r] ts
                                     acc {}]
                       (if t
@@ -770,7 +769,7 @@
                                                              :where     [[t, "_tx/auth", "?auth"],
                                                                          ["?auth", "_auth/id", "?id"]]}))))]
                           (recur r acc*)) acc)))]
-      (vals (loop [[^Flake flake & r] resp
+      (vals (loop [[flake & r] resp
                    acc {}]
               (cond
                 (and flake auth
@@ -778,7 +777,7 @@
                 (recur r acc)
 
                 flake
-                (let [t   (.-t flake)
+                (let [t   (flake/t flake)
                       {:keys [block auth]} (get t-map t)
                       acc (cond-> acc
                                   true (assoc-in [block :block] block)

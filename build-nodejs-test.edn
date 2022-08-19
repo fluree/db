@@ -1,4 +1,0 @@
-{:target        :nodejs
- :optimizations :none
- :install-deps  true
- :npm-deps      {}}

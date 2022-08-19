@@ -22,18 +22,19 @@ jar: target/fluree-db.jar
 package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
-out/flureenjs.js: package.json package-lock.json node_modules build-nodejs.edn deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
-	clojure -M:nodejs && cp out/nodejs/flureenjs.js out/flureenjs.js
+out/flureenjs.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
+	npx shadow-cljs release flureenjs && cp out/nodejs/flureenjs.js out/flureenjs.js
 
 nodejs: out/flureenjs.js
 
-out/flureedb.js: package.json package-lock.json node_modules build-browser.edn deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
-	clojure -M:browser && cp out/browser/main.js out/flureedb.js
+out/flureedb.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
+	npx shadow-cljs release flureedb && cp out/browser/main.js out/flureedb.js
+
 
 browser: out/flureedb.js
 
-out/flureeworker.js: package.json package-lock.json node_modules build-webworker.edn deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
-	clojure -M:webworker && cp out/webworker/main.js out/flureeworker.js
+out/flureeworker.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
+	npx shadow-cljs release flureeworker && cp out/webworker/main.js out/flureeworker.js
 
 webworker: out/flureeworker.js
 
@@ -85,12 +86,11 @@ docs/%.html: docs/%.md
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
 cljs-browser-test: node_modules package-lock.json
-	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
-	clojure -M:cljs-browser-test
+	npx shadow-cljs release browser-test
+	./node_modules/karma/bin/karma start --single-run
 
 cljs-node-test: node_modules package-lock.json
-	rm -rf out/* # prevent circular dependency cljs.core -> cljs.core error
-	clojure -M:cljs-node-test
+	npx shadow-cljs release node-test
 
 nodejs-test: out/flureenjs.js
 	cd test/nodejs && npm install && npm test

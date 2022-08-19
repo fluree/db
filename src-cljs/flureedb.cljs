@@ -1,12 +1,13 @@
 (ns flureedb
   (:require [clojure.string :as str]
-            [cljs.core.async :refer [go <!] :as async]
+            [clojure.core.async :refer [go <!] :as async]
             [alphabase.core :as alphabase]
             [fluree.crypto :as crypto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.graphdb :as graphdb]
             [fluree.db.api.query :as q]
             [fluree.db.api.ledger :as ledger]
+            [fluree.db.json-ld.api :as fluree]
             [fluree.db.operations :as ops]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.block :as query-block]
@@ -16,10 +17,9 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.query.http-signatures :as http-signatures]
-    ;shared clojurescript code
+            ;; shared clojurescript code
             [fluree.db.api-js :as fdb-js]
             [fluree.db.connection-js :as conn-handler]))
-
 
 (enable-console-print!)
 
@@ -30,10 +30,56 @@
 (println (:product @app-state) (:version @app-state))
 
 
+
+
 ;; optionally touch your app-state to force rerendering depending on
 ;; your application
 ;; (swap! app-state update-in [:__figwheel_counter] inc)
 (defn on-js-reload [])
+
+;; ----------------------------------------
+;; JSON-LD
+;; ----------------------------------------
+
+(defn ^:export jldConnect
+  [opts]
+  (fluree/connect (js->clj opts :keywordize-keys true)))
+
+(defn ^:export jldCreate
+  ([conn] (fluree/create conn))
+  ([conn ledger-alias] (fluree/create conn ledger-alias))
+  ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldLoad
+  ([address] (fluree/load address))
+  ([conn address] (fluree/load conn address)))
+
+(defn ^:export jldStage
+  ([db-or-ledger json-ld] (fluree/stage db-or-ledger (js->clj json-ld)))
+  ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger (js->clj json-ld) (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldCommit
+  ([db] (fluree/commit! db))
+  ([ledger db] (fluree/commit! ledger db))
+  ([ledger db opts] (fluree/commit! ledger db (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldStatus
+  ([ledger] (clj->js (fluree/status ledger)))
+  ([ledger branch] (clj->js (fluree/status ledger branch))))
+
+(defn ^:export jldDb
+  ([ledger] (fluree/db ledger))
+  ([ledger opts] (fluree/db ledger (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldQuery
+  [db query]
+  (let [query* (->> (js->clj query :keywordize-keys false)
+                    (reduce-kv (fn [acc k v]
+                                   (assoc acc (keyword k) v))
+                               {}))]
+       (.then (fluree/query db (assoc-in query* [:opts :js?] true))
+              (fn [result] (clj->js result)))))
+
 
 ;; ======================================
 ;;
@@ -584,5 +630,3 @@
   "Takes an http request and creates an http signature using a private key"
   [req-method url request private-key auth]
   (http-signatures/sign-request req-method url request private-key auth))
-
-

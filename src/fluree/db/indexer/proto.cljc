@@ -1,4 +1,5 @@
-(ns fluree.db.indexer.proto)
+(ns fluree.db.indexer.proto
+  (:refer-clojure :exclude [-add-watch -remove-watch]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -12,5 +13,3 @@
   (-close [indexer]  "Shuts down indexer, removes all watches after notification.")
   (-status [indexer] [indexer index-id]  "Returns current status of reindexing, or if optional index-id just of that index process.")
   (-reindex [indexer db]  "Executes a full reindex on db."))
-
-

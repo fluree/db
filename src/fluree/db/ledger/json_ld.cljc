@@ -11,7 +11,7 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util])
   (:refer-clojure :exclude [load]))
 
@@ -221,4 +221,3 @@
   Used to differentiate in cases where ledger or DB could be used."
   [x]
   (satisfies? ledger-proto/iLedger x))
-

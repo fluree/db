@@ -3,9 +3,8 @@
     [clojure.string :as str]
     [fluree.db.util.core :as util]
     [fluree.db.util.xhttp :as xhttp]
-    [fluree.db.util.log :as log]
-    #?(:clj  [clojure.core.async :as async]
-       :cljs [cljs.core.async :as async])
+    [fluree.db.util.log :as log :include-macros true]
+    [clojure.core.async :as async]
     [fluree.db.util.async :refer [<? go-try merge-into?]]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -41,7 +40,7 @@
   (reduce (fn [res {:keys [optional]}]
             (if optional
               (into res optional)
-              res)) 
+              res))
           []
           coll))
 

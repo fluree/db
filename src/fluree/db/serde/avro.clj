@@ -3,7 +3,7 @@
             [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [clojure.string :as str])
   (:import (java.net URI)
            (java.util UUID)))

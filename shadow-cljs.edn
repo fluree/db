@@ -1,0 +1,112 @@
+{:deps {:aliases [:dev]}
+
+ :dev-http {8000 "dev/browser/"}
+
+ :builds
+ {:flureedb
+  {:target     :browser
+   ;; TODO: different output dir for release/dev?
+   :output-dir "out/browser/"
+   :closure-defines {fluree.db.platform/BROWSER true
+                     cljs.core/*global* "window"}
+   :js-options {:resolve {"fs" false
+                          "path" false
+                          "process" false
+                          "buffer" false
+                          "crypto" false}}
+   :modules     {:main {:entries [flureedb]}}
+   :build-hooks [(shadow.cljs.build-report/hook)]
+   :devtools {:watch-dir "dev/browser"}}
+
+  :flureeworker
+  {:target      :browser
+   :output-dir  "out/webworker/"
+   :closure-defines {fluree.db.platform/BROWSER true
+                     cljs.core/*global* "self"}
+   :js-options {:resolve {"fs" false
+                          "path" false
+                          "process" false
+                          "buffer" false
+                          "crypto" false}}
+   :modules
+   {:main {:web-worker true
+           :entries    [flureeworker]}}
+   :build-hooks [(shadow.cljs.build-report/hook)]}
+
+  :flureenjs
+  {:target    :node-library
+   :output-to "out/nodejs/flureenjs.js"
+   :closure-defines {fluree.db.platform/BROWSER false}
+   :compiler-options {:optimizations :simple}
+   :exports   {:accountId             flureenjs/accountId
+               :blockEventToMap       flureenjs/blockEventToMap
+               :blockQuery            flureenjs/blockQuery
+               :blockRange            flureenjs/blockRange
+               :blockRangeWithTxn     flureenjs/blockRangeWithTxn
+               :close                 flureenjs/close
+               :closeListener         flureenjs/closeListener
+               :collectionFlakes      flureenjs/collectionFlakes
+               :connect               flureenjs/connect
+               :db                    flureenjs/db
+               :deleteLedger          flureenjs/deleteLedger
+               :forwardTimeTravel     flureenjs/forwardTimeTravel
+               :graphql               flureenjs/graphql
+               :historyQuery          flureenjs/historyQuery
+               :httpSignature         flureenjs/httpSignature
+               :isForwardTimeTravelDb flureenjs/isForwardTimeTravelDb
+               :jldCommit             flureenjs/jldCommit
+               :jldConnect            flureenjs/jldConnect
+               :jldCreate             flureenjs/jldCreate
+               :jldDb                 flureenjs/jldDb
+               :jldLoad               flureenjs/jldLoad
+               :jldQuery              flureenjs/jldQuery
+               :jldStage              flureenjs/jldStage
+               :jldStatus             flureenjs/jldStatus
+               :ledgerInfo            flureenjs/ledgerInfo
+               :ledgerList            flureenjs/ledgerList
+               :listen                flureenjs/listen
+               :listeners             flureenjs/listeners
+               :monitorTx             flureenjs/monitorTx
+               :multiQuery            flureenjs/multiQuery
+               :newLedger             flureenjs/newLedger
+               :newPrivateKey         flureenjs/newPrivateKey
+               :passwordGenerate      flureenjs/passwordGenerate
+               :passwordLogin         flureenjs/passwordLogin
+               :predicateId           flureenjs/predicateId
+               :predicateName         flureenjs/predicateName
+               :publicKey             flureenjs/publicKey
+               :publicKeyFromPrivate  flureenjs/publicKeyFromPrivate
+               :query                 flureenjs/query
+               :queryWith             flureenjs/queryWith
+               :renewToken            flureenjs/renewToken
+               :resolveLedger         flureenjs/resolveLedger
+               :search                flureenjs/search
+               :session               flureenjs/session
+               :setDefaultKey         flureenjs/setDefaultKey
+               :setLogging            flureenjs/setLogging
+               :sign                  flureenjs/sign
+               :sparql                flureenjs/sparql
+               :sql                   flureenjs/sql
+               :subid                 flureenjs/subid
+               :transact              flureenjs/transact
+               :txToCommand           flureenjs/txToCommand
+               :collectionId          flureenjs/collectionId}}
+
+  :node-test                            ; runs the cljs tests on node
+  {:target    :node-test
+   :output-to "out/nodejs-test/node-tests.js"
+   :autorun true
+   :closure-defines {fluree.db.platform/BROWSER false}
+   :compiler-options {:optimizations :simple}}
+
+  :browser-test                         ; runs the cljs tests in the browser via karma
+  {:target :karma
+   :output-to  "out/browser-test/browser-tests.js"
+   :closure-defines {fluree.db.platform/BROWSER true
+                     cljs.core/*global* "window"}
+   :js-options {:resolve {"fs" false
+                          "path" false
+                          "process" false
+                          "buffer" false
+                          "crypto" false}}}}
+ }

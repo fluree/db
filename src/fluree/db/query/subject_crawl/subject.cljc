@@ -1,12 +1,11 @@
 (ns fluree.db.query.subject-crawl.subject
-  (:require #?(:clj  [clojure.core.async :refer [go <! >!] :as async]
-               :cljs [cljs.core.async :refer [go <! >!] :as async])
+  (:require [clojure.core.async :refer [go <! >!] :as async]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.query.range :as query-range]
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
                                                           subj-perm-filter-fn filter-subject]]
             [fluree.db.dbproto :as dbproto]))

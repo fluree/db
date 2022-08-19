@@ -1,10 +1,9 @@
 (ns fluree.db.token-auth
   (:require [fluree.crypto.hmac :refer [hmac-sha256]]
             [alphabase.core :as alphabase]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
-            [clojure.string :as str]
-            [fluree.db.util.core :as util]))
+            [clojure.string :as str]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -62,7 +61,7 @@
                                            {:status 401
                                             :error  :db/invalid-token
                                             :meta   {:jwt    jwt
-                                                     :reason (.getMessage e)}}))))
+                                                     :reason ^String (.getMessage e)}}))))
         token    (str header "." payload)
         sig*     (generate-jwt-sig secret token)
         _        (when (not= header* jwt-header)
@@ -85,7 +84,7 @@
                                            {:status 401
                                             :error  :db/invalid-token
                                             :meta   {:jwt    jwt
-                                                     :reason (.getMessage e)}}))))]
+                                                     :reason ^String (.getMessage e)}}))))]
     (when (and (:exp payload*)
                (< (:exp payload*) (util/current-time-millis)))
       (throw (ex-info "JWT has expired."

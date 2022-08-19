@@ -4,7 +4,7 @@
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.util.core :as util]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]))
 
