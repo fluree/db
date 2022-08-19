@@ -38,11 +38,7 @@
    :output-to "out/nodejs/flureenjs.js"
    :closure-defines {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}
-   :exports   {:-app-state            flureenjs/-app-state
-               :-init-state           flureenjs/-init-state
-               :-njs-crypto           flureenjs/-njs-crypto
-               :-ns-state             flureenjs/-ns-state
-               :accountId             flureenjs/accountId
+   :exports   {:accountId             flureenjs/accountId
                :blockEventToMap       flureenjs/blockEventToMap
                :blockQuery            flureenjs/blockQuery
                :blockRange            flureenjs/blockRange

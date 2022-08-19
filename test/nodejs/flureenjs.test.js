@@ -2,12 +2,6 @@ const flureenjs = require("@fluree/flureenjs");
 
 test('expect all flureenjs functions to be defined', () => {
   expect(Object.keys(flureenjs).sort()).toStrictEqual([
-      "_app_state",
-      "_db_instance",
-      "_generate_key_pair",
-      "_init_state",
-      "_njs_crypto",
-      "_ns_state",
       "accountId",
       "blockEventToMap",
       "blockQuery",
