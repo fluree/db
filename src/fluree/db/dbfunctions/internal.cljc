@@ -10,7 +10,8 @@
             [clojure.string :as str]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.query.range :as query-range]))
+            [fluree.db.query.range :as query-range]
+            #?(:cljs ["seedrandom" :as seedrandom])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -641,9 +642,10 @@
     (catch* e (function-error e "objF" flakes))))
 
 (defn rand
-  [instant max']
+  [instant max]
   (try*
-    (let [rng #?(:clj (java.util.Random. instant) :cljs (seedrandom instant))
+    (let [rng #?(:clj (java.util.Random. instant)
+                 :cljs (seedrandom instant))
           base #?(:clj (.nextDouble rng) :cljs (.double rng))
           mult (* base max)]
       (-> mult Math/floor int))
