@@ -10,7 +10,9 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
-            [fluree.db.util.log :as log :include-macros true])
+            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.core :as util])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -82,9 +84,8 @@
     (jld-commit/commit ledger db* opts*)))
 
 
-(defrecord JsonLDLedger [address alias context did
-                         state cache conn
-                         method reindex-min reindex-max]
+(defrecord JsonLDLedger [address alias context did indexer
+                         state cache conn method]
   ledger-proto/iCommit
   (-commit! [ledger] (commit! ledger nil nil))
   (-commit! [ledger db-or-opts] (if (jld-db/json-ld-db? db-or-opts)
@@ -132,13 +133,27 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [context did branch pub-fn blank? ipns include]
+    (let [{:keys [context did branch pub-fn blank? ipns indexer include
+                  reindex-min-bytes reindex-max-bytes]
            :or   {branch :main}} opts
           did*          (if did
                           (if (map? did)
                             did
                             {:id did})
                           (conn-proto/-did conn))
+          indexer       (cond
+                          (satisfies? idx-proto/iIndex indexer)
+                          indexer
+
+                          indexer
+                          (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
+                                               "Provided: " indexer)
+                                          {:status 400 :error :db/invalid-indexer}))
+
+                          :else
+                          (conn-proto/-new-indexer conn (util/without-nils
+                                                          {:reindex-min-bytes reindex-min-bytes
+                                                           :reindex-max-bytes reindex-max-bytes})))
           ledger-alias* (normalize-alias ledger-alias)
           address       (<? (conn-proto/-address conn ledger-alias* opts))
           context*      (or context (conn-proto/-context conn))
@@ -146,22 +161,21 @@
           ;; map of all branches and where they are branched from
           branches      {branch (branch/new-branch-map nil branch)}
           ledger        (map->JsonLDLedger
-                          {:context     context*
-                           :did         did*
-                           :state       (atom {:branches branches
-                                               :branch   branch
-                                               :graphs   {}
-                                               :push     {:complete {:t   0
-                                                                     :dag nil}
-                                                          :pending  {:t   0
-                                                                     :dag nil}}})
-                           :alias       ledger-alias
-                           :address     address
-                           :method      method-type
-                           :cache       (atom {})
-                           :reindex-min 100000
-                           :reindex-max 1000000
-                           :conn        conn})
+                          {:context context*
+                           :did     did*
+                           :state   (atom {:branches branches
+                                           :branch   branch
+                                           :graphs   {}
+                                           :push     {:complete {:t   0
+                                                                 :dag nil}
+                                                      :pending  {:t   0
+                                                                 :dag nil}}})
+                           :alias   ledger-alias
+                           :address address
+                           :method  method-type
+                           :cache   (atom {})
+                           :indexer indexer
+                           :conn    conn})
           blank-db      (jld-db/create ledger)
           bootstrap?    (and (not blank?)
                              (or context* did*))
@@ -180,9 +194,13 @@
   [conn commit-address]
   (go-try
     (let [base-context {:base commit-address}
-          commit-data  (<? (conn-proto/-c-read conn commit-address))
-          _            (when-not commit-data
+          last-commit  (<? (conn-proto/-lookup conn commit-address))
+          _            (when-not last-commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-address)
+                                         {:status 400 :error :db/invalid-db})))
+          commit-data  (<? (conn-proto/-c-read conn last-commit))
+          _            (when-not commit-data
+                         (throw (ex-info (str "Unable to load. No commit exists for: " last-commit)
                                          {:status 400 :error :db/invalid-db})))
           commit-data* (json-ld/expand commit-data base-context)
           [commit proof] (jld-reify/parse-commit commit-data*)

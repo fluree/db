@@ -11,6 +11,7 @@
   (-id [conn] "Returns internal id for connection object")
   (-read-only? [conn] "Returns true if a read-only connection")
   (-context [conn] "Returns optional default context set at connection level")
+  (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from connection service")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
@@ -25,4 +26,5 @@
   (-push [conn address commit-data] "Pushes ledger metadata to all name service destinations")
   (-pull [conn ledger-address] "Performs a pull operation from all name service destinations")
   (-subscribe [conn ledger] "Creates a subscription to nameservice(s) for ledger events")
+  (-lookup [conn ledger-address] "Performs lookup operation on ledger address and returns latest commit address")
   (-address [conn ledger-alias key] "Returns address/iri for provided ledger alias specific to the connection type"))

@@ -184,6 +184,19 @@
         (assoc acc k v)))
     {} m))
 
+(defn stringify-keys
+  "Does simple (top-level keys only) conversion of keyword keys to strings.
+  This only takes the 'name' value of keywords, not the namespace. Could do
+  namespace too, but nothing currently needs that. Used mostly for serializing
+  properly to JSON."
+  [m]
+  (reduce-kv
+    (fn [acc k v]
+      (if (keyword? k)
+        (assoc acc (name k) v)
+        (assoc acc k v)))
+    {} m))
+
 (defn str->epoch-ms
   "Takes time as a string and returns an java.time.Instant."
   [time-str]

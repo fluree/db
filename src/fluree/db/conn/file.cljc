@@ -11,6 +11,7 @@
             [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
+            [fluree.db.indexer.default :as idx-default]
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
@@ -206,6 +207,7 @@
 
   conn-proto/iNameService
   (-push [this address ledger-data] (push ledger-data))
+  (-lookup [this address] (async/go (throw (ex-info "Unsupported FileConnection op: lookup" {}))))
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
   (-address [conn ledger-alias _] (async/go (str "fluree:file:"
@@ -223,6 +225,7 @@
   (-id [_] id)
   (-read-only? [_] (not (fn? write)))
   (-context [_] context)
+  (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
   (-did [_] did)
   (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection msg-in: pull" {})))
   (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection msg-out: pull" {})))

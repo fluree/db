@@ -110,22 +110,51 @@
 
 (defn jld-commit-write
   [conn commit-data]
+  (log/debug "commit-write data: " commit-data)
   (let [storage-write (:storage-write conn)
         dbid          (-> commit-data meta :dbid)           ;; dbid exists if this is a db (not commit) write
-        _             (log/warn "DBID COMMIT WRITE!: " dbid)
         json          (json-ld/normalize-data commit-data)
         storage-key   (if dbid
                         (second (re-find #"^fluree:db:sha256:(.+)$" dbid))
-                        (crypto/sha2-256-normalize json))
-        storage-key*  (str (subs storage-key 0 2) "_" (subs storage-key 2))]
-    (when-not storage-key
-      (throw (ex-info (str "Unable to retrieve storage key from dbid: " dbid ".")
-                      {:status 500 :error :db/unexpected-error})))
-    (throw (ex-info (str "DONT WRITE YET!!")
-                    {}))
-    (storage-write storage-key json)
-    ))
+                        (crypto/sha2-256-normalize json))]
+    (if storage-key
+      (storage-write (str storage-key ".jsonld") json)
+      (async/go
+        (ex-info (str "Unable to retrieve storage key from dbid: " dbid ".")
+                 {:status 500 :error :db/unexpected-error})))))
 
+
+(defn- extract-commit-key
+  "If a commit formatted address, returns filestore key."
+  [commit-key]
+  (let [[_ k] (re-find #"^fluree:raft://(.+)" commit-key)]
+    (when k
+      (str (subs k 0 3) "_" k ".jsonld"))))
+
+(defn- extract-db-key
+  "If a db formatted address, returns filestore key."
+  [db-key]
+  (let [[_ k] (re-find #"^fluree:db:(.+)" db-key)]
+    (when k
+      (str (subs k 0 3) "_" k ".jsonld"))))
+
+
+(defn jld-commit-read
+  [conn commit-key]
+  (log/debug "Commit-read request for key: " commit-key)
+  (go-try
+    (let [k (or (extract-commit-key commit-key)
+                (extract-db-key commit-key))]
+      (when-not k
+        (throw (ex-info (str "Invalid commit address: " commit-key)
+                        {:status 400 :error :db/invalid-commit})))
+      (-> (<? (storage/read conn k))
+          (json/parse false)))))
+
+
+(defn jld-push!
+  [conn address commit-data]
+  (log/debug "Pushing ledger:" address commit-data))
 
 ;; all ledger messages are fire and forget
 
@@ -138,6 +167,7 @@
                        parallelism serializer default-network transactor?
                        publish transact-handler tx-private-key tx-key-id meta
                        add-listener remove-listener close
+                       ns-lookup
                        did context]
 
   storage/Store
@@ -173,11 +203,13 @@
 
   ;; following used specifically for JSON-LD dbs
   conn-proto/iStorage
-  (-c-read [_ commit-key] (storage-read commit-key))
+  (-c-read [conn commit-key] (jld-commit-read conn commit-key))
   (-c-write [conn commit-data] (jld-commit-write conn commit-data))
 
   conn-proto/iNameService
-  (-address [conn ledger-alias key] (async/go "file"))
+  (-push [conn address commit-data] (jld-push! conn address commit-data))
+  (-lookup [conn address] (ns-lookup conn address))
+  (-address [_ ledger-alias opts] (async/go (str "fluree:raft://" ledger-alias)))
 
 
   #?@(:clj
@@ -575,6 +607,7 @@
                 object-cache async-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
+                ns-lookup
                 private keep-alive-fn keep-alive context]
          :or   {memory           1000000                    ;; default 1MB memory
                 parallelism      4
@@ -654,6 +687,7 @@
                             :remove-listener  (partial remove-listener* state-atom)
                             :did              (when tx-private-key
                                                 (did/private->did-map tx-private-key))
+                            :ns-lookup        ns-lookup
                             :context          context}]
     (map->Connection settings)))
 

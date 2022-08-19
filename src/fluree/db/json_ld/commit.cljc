@@ -11,7 +11,8 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.json :as json]))
+            [fluree.db.util.json :as json]
+            [fluree.db.indexer.proto :as idx-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -198,16 +199,8 @@
 
 (defn db-json->db-id
   [payload]
-  (->> payload
-       crypto/sha2-256
-       (str "fluree:db:sha256:")))
-
-(defn commit-json->commit-id
-  [payload]
-  (->> payload
-       crypto/sha2-256
-       (str "fluree:commit:sha256:")))
-
+  (->> (crypto/sha2-256 payload :base32)
+       (str "fluree:db:sha256:b")))
 
 (defn commit-flakes
   "Returns commit flakes from novelty based on 't' value.
@@ -289,20 +282,19 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn state] :as ledger} db opts]
+  [{:keys [conn state indexer] :as ledger} db opts]
   (go-try
     (let [{:keys [branch commit t]} db
           {:keys [did id-key push? branch-name] :as opts*} (commit-opts db opts)]
       (let [commit-data (commit-meta db opts*)
             jld-graphs  (commit->graphs commit-data opts*)  ;; writes :dbid as meta on return object for -c-write to leverage
             graph-res   (<? (conn-proto/-c-write conn jld-graphs))
-            _           (log/info "New DB address:" (:address graph-res))
-            jld-commit  (commit->json-ld (:address graph-res) opts*)
+            db-address  (:address graph-res)
+            jld-commit  (commit->json-ld db-address opts*)
             jld-commit* (if did
                           (cred/generate jld-commit opts*)
                           jld-commit)
             commit-res  (<? (conn-proto/-c-write conn (or jld-commit* jld-commit)))
-            _           (log/info (str "New Commit address: " (:address commit-res)))
             commit-data {:t       t
                          :dbid    (get jld-graphs id-key)   ;; sha address for database
                          :address (:address commit-res)     ;; full address for commit (e.g. fluree:ipfs://...)

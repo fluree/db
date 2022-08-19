@@ -134,17 +134,16 @@
   ([conn network ledger-id idx-type leaf-id {:keys [flakes] :as leaf}]
    (go-try
      (let [data {:flakes flakes}
-           ser  (serdeproto/-serialize-leaf (serde conn) data)]
-       (<? (write conn leaf-id ser))
-       (assoc leaf :id leaf-id)))))
+           ser  (serdeproto/-serialize-leaf (serde conn) data)
+           res  (<? (write conn leaf-id ser))]
+       (assoc leaf :id (or (:name res) leaf-id))))))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key"
   [conn key data]
   (go-try
     (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-      (<? (write conn key ser))
-      key)))
+      (<? (write conn key ser)))))
 
 (defn random-branch-id
   [network ledger-id idx]
@@ -165,9 +164,9 @@
                             (mapv child-data))
            first-flake (->> child-vals first :first)
            rhs         (->> child-vals rseq first :rhs)
-           data        {:children child-vals}]
-       (<? (write-branch-data conn branch-id data))
-       (assoc branch :id branch-id)))))
+           data        {:children child-vals}
+           res         (<? (write-branch-data conn branch-id data))]
+       (assoc branch :id (or (:name res) branch-id))))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
@@ -179,8 +178,7 @@
                        :block     block
                        :garbage   garbage}
           ser         (serdeproto/-serialize-garbage (serde conn) data)]
-      (<? (write conn garbage-key ser))
-      garbage-key)))
+      (<? (write conn garbage-key ser)))))
 
 (defn write-db-root
   ([db]
@@ -207,8 +205,7 @@
                         :fork      fork
                         :forkBlock fork-block}
            ser         (serdeproto/-serialize-db-root (serde conn) data)]
-       (<? (write conn db-root-key ser))
-       db-root-key))))
+       (<? (write conn db-root-key ser))))))
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]

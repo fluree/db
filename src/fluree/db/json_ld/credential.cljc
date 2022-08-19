@@ -92,7 +92,7 @@
                            ["https://www.w3.org/2018/credentials/v1" ctx]
                            "https://www.w3.org/2018/credentials/v1")
      "id"                ""
-     "type"              ["VerifiableCredential" (compact const/iri-CommitProof)]
+     "type"              ["VerifiableCredential" "CommitProof"]
      "issuer"            did*
      "issuanceDate"      (util/current-time-iso)
      "credentialSubject" c-subj

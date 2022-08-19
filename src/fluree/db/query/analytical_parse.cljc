@@ -362,7 +362,9 @@
     nil
 
     context
-    {:value (json-ld/expand-iri value context)}
+    {:value (if (int? value)
+              value
+              (json-ld/expand-iri value context))}
 
     :else
     (if (and subject? (not (int? value)))
@@ -397,12 +399,13 @@
 (defn parse-where-tuple
   "Parses where clause tuples (not maps)"
   [supplied-vars all-vars context db s p o]
-  (let [rdf-type?   (#{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type} p)
+  (let [json-ld-db? (= :json-ld (dbproto/-db-type db))
+        rdf-type?   (#{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type} p)
         p           (if rdf-type?
                       "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                       (json-ld/expand-iri p context))
         fulltext?   (str/starts-with? p "fullText:")
-        collection? (and rdf-type? (= :json (dbproto/-db-type db))) ;; legacy fluree json DB
+        collection? (and rdf-type? (not json-ld-db?))       ;; legacy fluree json DB
         _id?        (= "_id" p)
         iri?        (= "@id" p)
         [recur-pred recur-n] (recursion-predicate p)
@@ -431,9 +434,15 @@
                          :filter   parsed-filter-map})
 
                       rdf-type?
-                      (if (= "_block" o)
-                        (value-type-map context "_tx" false)      ;; _block gets aliased to _tx
-                        (value-type-map context o false))
+                      (if json-ld-db?
+                        (let [id (->> (json-ld/expand-iri o context)
+                                      (dbproto/-p-prop db :id))]
+                          (or (value-type-map context id false)
+                              (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o context))
+                                              {:status 400 :error :db/invalid-query}))))
+                        (if (= "_block" o)
+                          (value-type-map context "_tx" false) ;; _block gets aliased to _tx
+                          (value-type-map context o false)))
 
                       :else
                       (value-type-map context o p-ref?))

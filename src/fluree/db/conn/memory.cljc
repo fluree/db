@@ -13,6 +13,7 @@
             [fluree.db.conn.state-machine :as state-machine]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.json-ld :as json-ld]
+            [fluree.db.indexer.default :as idx-default]
             [fluree.crypto :as crypto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -75,6 +76,7 @@
   (-push [this address ledger-data] (push! data-atom address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
+  (-lookup [this ledger] (async/go :TODO))
   (-address [_ ledger-alias _] (go (str "fluree:memory://" ledger-alias)))
 
   conn-proto/iConnection
@@ -89,6 +91,7 @@
   (-id [_] id)
   (-read-only? [_] false)
   (-context [_] (:context ledger-defaults))
+  (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine
