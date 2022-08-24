@@ -28,8 +28,7 @@ out/flureenjs.js: package.json package-lock.json node_modules deps.edn src/deps.
 nodejs: out/flureenjs.js
 
 out/flureedb.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
-	npx shadow-cljs release flureedb && cp out/browser/main.js out/flureedb.js
-
+	npx shadow-cljs release flureedb
 
 browser: out/flureedb.js
 
@@ -54,6 +53,7 @@ js-packages/nodejs/flureenjs.js: out/flureenjs.js
 	cp $< $@
 	bb run sync-package-json $(@D)/package.json --node
 
+# TODO: fix how flureedb is packaged
 js-packages/browser/flureedb.js: out/flureedb.js
 	cp $< $@
 	bb run sync-package-json $(@D)/package.json
@@ -95,12 +95,15 @@ cljs-node-test: node_modules package-lock.json
 nodejs-test: out/flureenjs.js
 	cd test/nodejs && npm install && npm test
 
+browser-test: out/flureedb.js
+	cd test/browser && npm install && npm test --watchAll=false
+
 cljstest: cljs-browser-test cljs-node-test
 
 cljtest:
 	clojure -M:cljtest
 
-test: cljtest cljstest nodejs-test
+test: cljtest cljstest nodejs-test browser-test
 
 eastwood:
 	clojure -M:test:eastwood
