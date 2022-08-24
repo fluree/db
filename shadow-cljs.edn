@@ -4,8 +4,7 @@
 
  :builds
  {:flureedb
-  {:target     :browser
-   ;; TODO: different output dir for release/dev?
+  {:target     :npm-module
    :output-dir "out/browser/"
    :closure-defines {fluree.db.platform/BROWSER true
                      cljs.core/*global* "window"}
@@ -14,7 +13,7 @@
                           "process" false
                           "buffer" false
                           "crypto" false}}
-   :modules     {:main {:entries [flureedb]}}
+   :entries [flureedb]
    :build-hooks [(shadow.cljs.build-report/hook)]
    :devtools {:watch-dir "dev/browser"}}
 
