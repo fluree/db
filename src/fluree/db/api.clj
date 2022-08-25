@@ -94,6 +94,12 @@
   ([message signature] (crypto/account-id-from-message message signature)))
 
 
+(defn ledger-str
+  [ledger]
+  (if (sequential? ledger)
+    (str (first ledger) "/$" (second ledger))
+    ledger))
+
 (defn tx->command
   "Helper function to fill out the parts of the transaction that are incomplete,
   producing a signed command.
@@ -118,9 +124,7 @@
    (when-not private-key
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-transaction})))
-   (let [ledger      (if (sequential? ledger)
-                       (str (first ledger) "/$" (second ledger))
-                       ledger)
+   (let [ledger      (ledger-str ledger)
          {:keys [auth verified-auth expire nonce deps]} opts
          _           (when deps
                        (assert (sequential? deps)
