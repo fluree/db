@@ -4,7 +4,7 @@
 
  :builds
  {:flureedb
-  {:target     :npm-module
+  {:target     :esm
    :output-dir "out/browser/"
    :closure-defines {fluree.db.platform/BROWSER true
                      cljs.core/*global* "window"}
@@ -13,7 +13,7 @@
                           "process" false
                           "buffer" false
                           "crypto" false}}
-   :entries [flureedb]
+   :modules {:flureedb {:exports {default flureedb/flureedb}}}
    :build-hooks [(shadow.cljs.build-report/hook)]
    :devtools {:watch-dir "dev/browser"}}
 

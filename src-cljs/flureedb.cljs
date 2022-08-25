@@ -630,3 +630,39 @@
   "Takes an http request and creates an http signature using a private key"
   [req-method url request private-key auth]
   (http-signatures/sign-request req-method url request private-key auth))
+
+(def ^:export flureedb
+  #js {:authenticate authenticate
+       :block_query block-query
+       :block_range block-range
+       :block_range_with_txn block-range-with-txn
+       :close close
+       :close_listener close-listener
+       :connect connect
+       :connect_p connect-p
+       :db db
+       :db_schema db-schema
+       :delete_ledger delete-ledger
+       :history_query history-query
+       :http_signature http-signature
+       :jldCommit jldCommit
+       :jldConnect jldConnect
+       :jldCreate jldCreate
+       :jldDb jldDb
+       :jldLoad jldLoad
+       :jldQuery jldQuery
+       :jldStage jldStage
+       :jldStatus jldStatus
+       :ledger_stats ledger-stats
+       :listen listen
+       :listeners listeners
+       :monitor_tx monitor-tx
+       :multi_query multi-query
+       :new_ledger new-ledger
+       :password_generate password-generate
+       :password_login password-login
+       :query query
+       :renew_token renew-token
+       :set_logging set-logging
+       :signed_query signed-query
+       :transact transact})
