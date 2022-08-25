@@ -131,15 +131,9 @@
                                "Command/transaction 'deps', when provided, must be a sequential list/array."))
          key-auth-id (crypto/account-id-from-private private-key)
          _           (when verified-auth (log/debug "Using verified auth:" (:auth verified-auth)))
-         [auth authority] (cond
-                            (and auth (not= auth key-auth-id))
-                            [auth key-auth-id]
-
-                            auth
-                            [auth nil]
-
-                            :else
-                            [key-auth-id nil])
+         auth        (or auth key-auth-id)
+         authority   (when-not (= auth key-auth-id)
+                       key-auth-id)
          timestamp   (System/currentTimeMillis)
          nonce       (or nonce timestamp)
          expire      (or expire (+ timestamp 300000))       ; 5 min default
