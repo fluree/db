@@ -96,7 +96,7 @@ nodejs-test: out/flureenjs.js
 	cd test/nodejs && npm install && npm test
 
 browser-test: out/flureedb.js
-	cd test/browser && npm install && npm test --watchAll=false
+	cd test/browser && npm install && npm ci
 
 cljstest: cljs-browser-test cljs-node-test
 
