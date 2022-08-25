@@ -28,7 +28,7 @@ out/flureenjs.js: package.json package-lock.json node_modules deps.edn src/deps.
 nodejs: out/flureenjs.js
 
 out/flureedb.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
-	npx shadow-cljs release flureedb
+	npx shadow-cljs release flureedb && cp out/browser/flureedb.js out/flureedb.js
 
 browser: out/flureedb.js
 
@@ -53,7 +53,6 @@ js-packages/nodejs/flureenjs.js: out/flureenjs.js
 	cp $< $@
 	bb run sync-package-json $(@D)/package.json --node
 
-# TODO: fix how flureedb is packaged
 js-packages/browser/flureedb.js: out/flureedb.js
 	cp $< $@
 	bb run sync-package-json $(@D)/package.json
