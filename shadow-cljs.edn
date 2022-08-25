@@ -18,7 +18,7 @@
    :devtools {:watch-dir "dev/browser"}}
 
   :flureeworker
-  {:target      :browser
+  {:target      :esm
    :output-dir  "out/webworker/"
    :closure-defines {fluree.db.platform/BROWSER true
                      cljs.core/*global* "self"}
@@ -28,8 +28,8 @@
                           "buffer" false
                           "crypto" false}}
    :modules
-   {:main {:web-worker true
-           :entries    [flureeworker]}}
+   {:flureeworker {:entries [flureeworker]
+                   :init-fn flureeworker/init}}
    :build-hooks [(shadow.cljs.build-report/hook)]}
 
   :flureenjs

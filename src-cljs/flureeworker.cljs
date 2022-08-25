@@ -516,12 +516,11 @@
   [error]
   (js/console.error error))
 
-
-;; when we detect that we are in a web worker, register the onmessage handler
-(when-let [worker? (not (.-document js/self))]
-  (set! (.-onerror js/self) log-error)
-  (set! (.-onmessage js/self) decode-message))
-
-
-;; let server know we're alive
-(worker-action nil :connInit)
+(defn init
+  []
+  ;; when we detect that we are in a web worker, register the onmessage handler
+  (when-let [worker? (not (.-document js/self))]
+    (set! (.-onerror js/self) log-error)
+    (set! (.-onmessage js/self) decode-message))
+  ;; let server know we're alive
+  (worker-action nil :connInit))
