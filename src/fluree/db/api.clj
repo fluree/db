@@ -124,19 +124,20 @@
    (when-not private-key
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-transaction})))
-   (let [ledger      (ledger-str ledger)
-         {:keys [auth verified-auth expire nonce deps]} opts
+   (let [timestamp   (System/currentTimeMillis)
+         {:keys [auth verified-auth expire nonce deps]
+          :or   {nonce  timestamp
+                 expire (+ timestamp 300000)}}
+         opts
          _           (when deps
                        (assert (sequential? deps)
                                "Command/transaction 'deps', when provided, must be a sequential list/array."))
+         ledger      (ledger-str ledger)
          key-auth-id (crypto/account-id-from-private private-key)
          _           (when verified-auth (log/debug "Using verified auth:" (:auth verified-auth)))
          auth        (or auth key-auth-id)
          authority   (when-not (= auth key-auth-id)
                        key-auth-id)
-         timestamp   (System/currentTimeMillis)
-         nonce       (or nonce timestamp)
-         expire      (or expire (+ timestamp 300000))       ; 5 min default
          cmd         (try (-> {:type      :tx
                                :ledger    ledger
                                :tx        txn
