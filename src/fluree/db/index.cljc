@@ -54,6 +54,12 @@
     (leaf? node)   (not (nil? (:flakes node)))
     (branch? node) (not (nil? (:children node)))))
 
+(defn unresolve
+  [node]
+  (cond
+    (leaf? node)   (dissoc node :flakes)
+    (branch? node) (dissoc node :children)))
+
 (defn lookup
   [branch flake]
   (when (and (branch? branch)
