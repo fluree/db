@@ -145,7 +145,8 @@
 
 (defn child-entry
   [{:keys [first] :as node}]
-  [first node])
+  (let [child-node (unresolve node)]
+    [first child-node]))
 
 (defn child-map
   "Returns avl sorted map whose keys are the first flakes of the index node
