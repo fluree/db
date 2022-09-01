@@ -33,8 +33,8 @@
 
 (defprotocol Resolver
   (resolve [r node]
-    "Populate index branch and leaf node maps with either their child node
-     attributes or the flakes the store, respectively."))
+    "Populate the supplied index branch or leaf node maps with either the child
+     node attributes or the flakes they store, respectively."))
 
 (defn try-resolve
   [r error-ch node]
@@ -55,6 +55,8 @@
     (branch? node) (not (nil? (:children node)))))
 
 (defn unresolve
+  "Clear the populated child node attributes from the supplied `node` map if it
+  represents a branch, or the populated flakes if `node` represents a leaf."
   [node]
   (cond
     (leaf? node)   (dissoc node :flakes)
