@@ -204,6 +204,7 @@
   "Returns true if provided variable exists as a variable
   somewhere within the where clause."
   [variable where]
+  (log/debug "variable-in-where? variable:" variable "where:" where)
   (some (fn [{:keys [s o optional bind union] :as _where-smt}]
           (or (= (:variable o) variable)
               (= (:variable s) variable)
