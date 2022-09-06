@@ -767,7 +767,7 @@
   (let [{:keys [variable] :as parsed-order-by} (parse-order-by order-by)]
     (when (and variable (not (variable-in-where? variable where)))
       (throw (ex-info (str "Order by specifies a variable, " variable
-                           " that is used in a where statement.")
+                           " that is not used in a where statement.")
                       {:status 400 :error :db/invalid-query})))
     (assoc parsed-query :order-by parsed-order-by)))
 
