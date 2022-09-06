@@ -205,11 +205,11 @@
   somewhere within the where clause."
   [variable where]
   (log/debug "variable-in-where? variable:" variable "where:" where)
-  (some (fn [{:keys [s o optional bind union] :as _where-smt}]
+  (some (fn [{:keys [s o type bind union] :as where-smt}]
           (or (= (:variable o) variable)
               (= (:variable s) variable)
               (cond
-                optional (variable-in-where? variable optional)
+                (= type :optional) (variable-in-where? variable (:where where-smt))
                 bind (contains? (-> bind keys set) variable)
                 union (or (variable-in-where? variable (first union))
                           (variable-in-where? variable (second union))))))
