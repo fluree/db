@@ -209,7 +209,7 @@
           (or (= (:variable o) variable)
               (= (:variable s) variable)
               (cond
-                optional (some #(variable-in-where? variable %) optional)
+                optional (variable-in-where? variable optional)
                 bind (contains? (-> bind keys set) variable)
                 union (or (variable-in-where? variable (first union))
                           (variable-in-where? variable (second union))))))
