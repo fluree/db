@@ -208,7 +208,7 @@
           (or (= (:variable o) variable)
               (= (:variable s) variable)
               (cond
-                optional (map #(variable-in-where? variable %) optional)
+                optional (some #(variable-in-where? variable %) optional)
                 bind (contains? (-> bind keys set) variable)
                 union (or (variable-in-where? variable (first union))
                           (variable-in-where? variable (second union))))))
