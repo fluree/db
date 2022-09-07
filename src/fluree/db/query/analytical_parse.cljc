@@ -204,14 +204,16 @@
   "Returns true if provided variable exists as a variable
   somewhere within the where clause."
   [variable where]
-  (some (fn [{:keys [s o optional bind union] :as _where-smt}]
+  (log/debug "variable-in-where? variable:" variable "where:" where)
+  (some (fn [{:keys [s o type] :as where-smt}]
           (or (= (:variable o) variable)
               (= (:variable s) variable)
-              (cond
-                optional (map #(variable-in-where? variable %) optional)
-                bind (contains? (-> bind keys set) variable)
-                union (or (variable-in-where? variable (first union))
-                          (variable-in-where? variable (second union))))))
+              (case type
+                :optional (variable-in-where? variable (:where where-smt))
+                :binding (= (:variable where-smt) variable)
+                :union (or (variable-in-where? variable (first (:where where-smt)))
+                           (variable-in-where? variable (second (:where where-smt))))
+                nil)))
         where))
 
 (defn parse-map
@@ -767,7 +769,7 @@
   (let [{:keys [variable] :as parsed-order-by} (parse-order-by order-by)]
     (when (and variable (not (variable-in-where? variable where)))
       (throw (ex-info (str "Order by specifies a variable, " variable
-                           " that is used in a where statement.")
+                           " that is not used in a where statement.")
                       {:status 400 :error :db/invalid-query})))
     (assoc parsed-query :order-by parsed-order-by)))
 
