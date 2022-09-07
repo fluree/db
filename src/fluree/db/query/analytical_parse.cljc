@@ -208,11 +208,11 @@
   (some (fn [{:keys [s o type] :as where-smt}]
           (or (= (:variable o) variable)
               (= (:variable s) variable)
-              (cond
-                (= type :optional) (variable-in-where? variable (:where where-smt))
-                (= type :binding) (= (:variable where-smt) variable)
-                (= type :union) (or (variable-in-where? variable (first (:where where-smt)))
-                          (variable-in-where? variable (second (:where where-smt)))))))
+              (case type
+                :optional (variable-in-where? variable (:where where-smt))
+                :binding (= (:variable where-smt) variable)
+                :union (or (variable-in-where? variable (first (:where where-smt)))
+                           (variable-in-where? variable (second (:where where-smt)))))))
         where))
 
 (defn parse-map
