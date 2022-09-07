@@ -212,7 +212,8 @@
                 :optional (variable-in-where? variable (:where where-smt))
                 :binding (= (:variable where-smt) variable)
                 :union (or (variable-in-where? variable (first (:where where-smt)))
-                           (variable-in-where? variable (second (:where where-smt)))))))
+                           (variable-in-where? variable (second (:where where-smt))))
+                nil)))
         where))
 
 (defn parse-map
