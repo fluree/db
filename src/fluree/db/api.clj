@@ -101,27 +101,6 @@
     (str (first ledger) "/" (second ledger))
     ledger))
 
-(defn cmd-data->json
-  [cmd-data]
-  (try (json/stringify cmd-data)
-       (catch Exception _
-         (throw (ex-info (str "Transaction contains data that cannot be serialized into JSON.")
-                         {:status 400 :error :db/invalid-tx})))))
-
-(defn with-id
-  [{:keys [cmd] :as command}]
-  (let [id (crypto/sha3-256 cmd)]
-    (assoc command :id id)))
-
-(defn sign-command
-  [{:keys [cmd] :as command} private-key opts]
-  (if-let [{:keys [signature signed]} (:verified-auth opts)]
-    (assoc command
-           :sig    signature
-           :signed signed)
-    (let [sig (crypto/sign-message cmd private-key)]
-      (assoc command :sig sig))))
-
 (defn tx->command
   "Helper function to fill out the parts of the transaction that are incomplete,
   producing a signed command.
@@ -143,14 +122,14 @@
     - ledger - the ledger for this transaction"
   ([ledger txn private-key] (tx->command ledger txn private-key nil))
   ([ledger txn private-key opts]
-   (when-not private-key
+   (if private-key
+     (let [timestamp  (System/currentTimeMillis)
+           ledger-str (ledger->str ledger)
+           command    (cmd/build-and-sign txn ledger timestamp private-key opts)]
+       (log/trace "tx->command result:" command)
+       command)
      (throw (ex-info "Private key not provided and no default present on connection"
-                     {:status 400 :error :db/invalid-transaction})))
-   (let [timestamp  (System/currentTimeMillis)
-         ledger-str (ledger->str ledger)
-         command    (cmd/build-and-sign txn ledger timestamp private-key opts)]
-     (log/trace "tx->command result:" command)
-     command)))
+                     {:status 400 :error :db/invalid-transaction})))))
 
 
 (defn monitor-tx-async
