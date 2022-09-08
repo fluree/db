@@ -1,19 +1,18 @@
 (ns fluree.db.conn.memory
-  (:require [fluree.db.storage.core :as storage]
+  (:require [clojure.core.async :as async]
+            [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
-            [fluree.db.util.core :as util
-             #?@(:clj [:refer [try* catch* exception?]])
-             #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])]
-            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.core :as util
+             #?@(:clj [:refer [try* catch*]])
+             #?@(:cljs [:refer-macros [try* catch*]])]
+            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try channel?]]
-            #?(:clj  [clojure.core.async :as async :refer [go <!]]
-               :cljs [cljs.core.async :as async :refer [go <!]])
+            [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.state-machine :as state-machine]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
-            [fluree.json-ld :as json-ld]
             [fluree.db.indexer.default :as idx-default]
+            [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -131,71 +130,23 @@
          (throw (ex-info "Memory connection does not support full text operations."
                          {:status 500 :error :db/unexpected-error})))]))
 
-
-;; TODO - the following few functions are duplicated from fluree.db.connection
-;; TODO - should move to a common space
-
-(defn- lookup-cache
-  [cache-atom k value-fn]
-  (if (nil? value-fn)
-    (swap! cache-atom cache/evict k)
-    (when-let [v (get @cache-atom k)]
-      (do (swap! cache-atom cache/hit k)
-          v))))
-
-(defn- default-object-cache-fn
-  "Default synchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (if-let [v (lookup-cache cache-atom k value-fn)]
-      v
-      (let [v (value-fn k)]
-        (swap! cache-atom cache/miss k v)
-        v))))
-
-(defn- default-async-cache-fn
-  "Default asynchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (let [out (async/chan)]
-      (if-let [v (lookup-cache cache-atom k value-fn)]
-        (async/put! out v)
-        (go
-          (let [v (<! (value-fn k))]
-            (when-not (exception? v)
-              (swap! cache-atom cache/miss k v))
-            (async/put! out v))))
-      out)))
-
-(defn- default-object-cache-factory
-  "Generates a default object cache."
-  [cache-size]
-  (cache/lru-cache-factory {} :threshold cache-size))
-
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
   [{:keys [context did] :as defaults}]
-  (go-try
+  (async/go
     {:context context
      :did     did}))
-
 
 (defn connect
   "Creates a new memory connection."
   [{:keys [local-read local-write parallelism async-cache memory defaults]}]
   (go-try
     (let [ledger-defaults    (<? (ledger-defaults defaults))
-          memory             (or memory 1000000)            ;; default 1MB memory
           conn-id            (str (random-uuid))
           data-atom          (atom {})
           state              (state-machine/blank-state)
-          memory-object-size (quot memory 100000)           ;; avg 100kb per cache object
-          _                  (when (< memory-object-size 10)
-                               (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
-
-          default-cache-atom (atom (default-object-cache-factory memory-object-size))
           async-cache-fn     (or async-cache
-                                 (default-async-cache-fn default-cache-atom))
+                                 (conn-cache/default-async-cache-fn memory))
           close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
