@@ -59,9 +59,12 @@
   ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger (js->clj json-ld) (js->clj opts :keywordize-keys true))))
 
 (defn ^:export jldCommit
-  ([db] (fluree/commit! db))
-  ([ledger db] (fluree/commit! ledger db))
-  ([ledger db opts] (fluree/commit! ledger db (js->clj opts :keywordize-keys true))))
+  ([db] (.then (fluree/commit! db)
+               (fn [result] (clj->js result))))
+  ([ledger db] (.then (fluree/commit! ledger db)
+                      (fn [result] (clj->js result))))
+  ([ledger db opts] (.then (fluree/commit! ledger db (js->clj opts :keywordize-keys true))
+                           (fn [result] (clj->js result)))))
 
 (defn ^:export jldStatus
   ([ledger] (clj->js (fluree/status ledger)))
