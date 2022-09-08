@@ -1,21 +1,23 @@
 (ns fluree.db.conn.file
   (:refer-clojure :exclude [exists?])
-  (:require [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.platform :as platform]
-            [fluree.db.conn.state-machine :as state-machine]
-            [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.storage.core :as storage]
-            [fluree.db.index :as index]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
+            [fluree.db.index :as index]
+            [fluree.db.platform :as platform]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.conn.cache :as conn-cache]
+            [fluree.db.conn.state-machine :as state-machine]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.async :refer [<? go-try channel?]]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.storage.core :as storage]
             [fluree.db.indexer.default :as idx-default]
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
-            #?(:clj [clojure.java.io :as io]))
+            #?(:clj [clojure.java.io :as io])
+            [fluree.db.util.json :as json])
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
@@ -117,13 +119,17 @@
 (defn connection-commit
   [base-path]
   (fn [data]
-    (let [bytes        #?(:clj (.getBytes ^String data)
-                          :cljs (js/Buffer.from data "utf8"))
-          hash         (crypto/sha2-256 bytes :hex)
-          path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
-                  :cljs (path/resolve "." base-path "commits" hash) )]
+    (let [json  (json/stringify data)   ; TODO: formally canonicalize the data.
+          bytes #?(:clj (.getBytes ^String json)
+                   :cljs (js/Buffer.from data "utf8"))
+          hash  (crypto/sha2-256 bytes :hex)
+          path  #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
+                   :cljs (path/resolve "." base-path "commits" hash) )]
       (write-file bytes path)
-      (str "fluree:file:" path))))
+      {:name hash
+       :hash hash
+       :size (count json)
+       :address (str "fluree:file:" path)})))
 
 (defn exists?
   [path]
@@ -200,10 +206,11 @@
                            read write
                            rename exists?
                            parallelism close-fn
-                           msg-in-ch msg-out-ch]
+                           msg-in-ch msg-out-ch
+                           async-cache]
   conn-proto/iStorage
   (-c-read [_ commit-key] (read commit-key))
-  (-c-write [_ commit-data] (commit commit-data))
+  (-c-write [_ commit-data] (async/go (commit commit-data)))
 
   conn-proto/iNameService
   (-push [this address ledger-data] (push ledger-data))
@@ -233,7 +240,6 @@
   (-state [_ ledger] (get @state ledger))
 
   storage/Store
-  ;; I've got this shadowing Commit, is that okay?
   (read [s k] (read k))
   (write [s k data] (write k data))
   (exists? [s k] (exists? k))
@@ -243,7 +249,6 @@
   (resolve
     [conn node]
     ;; all root index nodes will be empty
-
     (storage/resolve-empty-leaf node))
 
   #?@(:clj
@@ -255,36 +260,37 @@
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [context did local-read local-write parallelism storage-path publish-path] :as opts}]
+  [{:keys [defaults local-read local-write parallelism storage-path publish-path async-cache memory] :as opts}]
   (async/go
-    (let [conn-id (str (random-uuid))
-          commit (connection-commit storage-path)
-          read (connection-read storage-path)
-          write (connection-write storage-path)
-          exists? (connection-exists? storage-path)
-          rename (connection-rename storage-path)
-          push (connection-push publish-path)
-          state (state-machine/blank-state)
-          close-fn (fn [] (log/info (str "File Connection " conn-id " Closed")))]
+    (let [conn-id        (str (random-uuid))
+          commit         (connection-commit storage-path)
+          read           (connection-read storage-path)
+          write          (connection-write storage-path)
+          exists?        (connection-exists? storage-path)
+          rename         (connection-rename storage-path)
+          push           (connection-push publish-path)
+          state          (state-machine/blank-state)
+          close-fn       (fn [] (log/info (str "File Connection " conn-id " Closed")))
+          async-cache-fn (or async-cache
+                             (conn-cache/default-async-cache-fn memory))]
       ;; TODO - need to set up monitor loops for async chans
-
-      (map->FileConnection {:id conn-id
+      (map->FileConnection {:id           conn-id
                             :storage-path storage-path
                             :publish-path publish-path
-                            :transactor? false
-                            :context context
-                            :did did
-                            :local-read local-read
-                            :local-write local-write
-                            :read read
-                            :write write
-                            :commit commit
-                            :push push
-                            :exists? exists?
-                            :rename rename
-                            :parallelism parallelism
-                            :msg-in-ch (async/chan)
-                            :msg-out-ch (async/chan)
-                            :close close-fn
-                            :memory true
-                            :state state}))))
+                            :transactor?  false
+                            :context      (:context defaults)
+                            :did          (:did defaults)
+                            :local-read   local-read
+                            :local-write  local-write
+                            :read         read
+                            :write        write
+                            :commit       commit
+                            :push         push
+                            :exists?      exists?
+                            :rename       rename
+                            :parallelism  parallelism
+                            :msg-in-ch    (async/chan)
+                            :msg-out-ch   (async/chan)
+                            :close        close-fn
+                            :state        state
+                            :async-cache  async-cache-fn}))))
