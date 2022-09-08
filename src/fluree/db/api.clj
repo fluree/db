@@ -94,11 +94,62 @@
   ([message signature] (crypto/account-id-from-message message signature)))
 
 
-(defn ledger-str
+(defn ledger->str
   [ledger]
   (if (sequential? ledger)
     (str (first ledger) "/$" (second ledger))
     ledger))
+
+(defn with-auth
+  [cmd-data private-key opts]
+  (if-let [{:keys [auth] :as verified-auth} (:verified-auth opts)]
+    (do (log/debug "Using verified auth:" auth)
+        (assoc cmd-data :auth auth))
+    (let [key-auth-id (crypto/account-id-from-private private-key)]
+      (if-let [auth (:auth opts)]
+        (assoc cmd-data
+               :auth auth
+               :authority (when-not (= auth key-auth-id)
+                            key-auth-id))
+        (assoc cmd-data :auth key-auth-id)))))
+
+(defn tx->cmd-data
+  [txn ledger timestamp private-key opts]
+  (let [{:keys [expire nonce deps]
+         :or   {nonce  timestamp
+                expire (+ timestamp 300000)}}
+        opts
+
+        cmd-data {:type      :tx
+                  :ledger    ledger
+                  :tx        txn
+                  :nonce     nonce
+                  :expire    expire
+                  :deps      deps}]
+    (-> cmd-data
+        (with-auth private-key opts)
+        util/without-nils)))
+
+(defn cmd-data->json
+  [cmd-data]
+  (try (json/stringify cmd-data)
+       (catch Exception _
+         (throw (ex-info (str "Transaction contains data that cannot be serialized into JSON.")
+                         {:status 400 :error :db/invalid-tx})))))
+
+(defn with-id
+  [{:keys [cmd] :as command}]
+  (let [id (crypto/sha3-256 cmd)]
+    (assoc command :id id)))
+
+(defn sign-command
+  [{:keys [cmd] :as command} private-key opts]
+  (if-let [{:keys [signature signed]} (:verified-auth opts)]
+    (assoc command
+           :sig    signature
+           :signed signed)
+    (let [sig (crypto/sign-message cmd private-key)]
+      (assoc command :sig sig))))
 
 (defn tx->command
   "Helper function to fill out the parts of the transaction that are incomplete,
@@ -124,42 +175,14 @@
    (when-not private-key
      (throw (ex-info "Private key not provided and no default present on connection"
                      {:status 400 :error :db/invalid-transaction})))
-   (let [timestamp   (System/currentTimeMillis)
-         {:keys [auth verified-auth expire nonce deps]
-          :or   {nonce  timestamp
-                 expire (+ timestamp 300000)}}
-         opts
-         _           (when deps
-                       (assert (sequential? deps)
-                               "Command/transaction 'deps', when provided, must be a sequential list/array."))
-         ledger      (ledger-str ledger)
-         key-auth-id (crypto/account-id-from-private private-key)
-         _           (when verified-auth (log/debug "Using verified auth:" (:auth verified-auth)))
-         auth        (or auth key-auth-id)
-         authority   (when-not (= auth key-auth-id)
-                       key-auth-id)
-         cmd         (try (-> {:type      :tx
-                               :ledger    ledger
-                               :tx        txn
-                               :nonce     nonce
-                               :auth      (or (:auth verified-auth) auth)
-                               :authority (when-not verified-auth authority)
-                               :expire    expire
-                               :deps      deps}
-                              (util/without-nils)
-                              (json/stringify))
-                          (catch Exception _
-                            (throw (ex-info (str "Transaction contains data that cannot be serialized into JSON.")
-                                            {:status 400 :error :db/invalid-tx}))))
-         sig         (if verified-auth
-                       (:signature verified-auth)
-                       (crypto/sign-message cmd private-key))
-         id          (crypto/sha3-256 cmd)
-         command     {:cmd    cmd
-                      :sig    sig
-                      :signed (:signed verified-auth)
-                      :id     id
-                      :ledger ledger}]
+   (let [timestamp  (System/currentTimeMillis)
+         ledger-str (ledger->str ledger)
+         cmd        (-> txn
+                        (tx->cmd-data ledger-str timestamp private-key opts)
+                        cmd-data->json)
+         command    (-> {:cmd cmd, :ledger ledger-str}
+                        with-id
+                        (sign-command private-key opts))]
      (log/trace "tx->command result:" command)
      command)))
 
