@@ -98,7 +98,7 @@
 (defn ledger->str
   [ledger]
   (if (sequential? ledger)
-    (str (first ledger) "/$" (second ledger))
+    (str (first ledger) "/" (second ledger))
     ledger))
 
 (defn cmd-data->json
