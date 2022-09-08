@@ -14,32 +14,25 @@
 ;; Fns resolve to true or false
 
 
-;; cache for function generation
-(def rule-fn-cache (atom #?(:clj  (cache/fifo-cache-factory {} :threshold 300)
-                            :cljs (cache/lru-cache-factory {} :threshold 300))))
-
 (defn parse-fn
   ([db fn-str]
    (parse-fn db fn-str nil))
   ([db fn-str params]
    (go-try
-     (or (get @rule-fn-cache fn-str)
-         (cond
-           (or (true? fn-str) (= "true" fn-str))
-           true
+     (cond
+       (or (true? fn-str) (= "true" fn-str))
+       true
 
-           (or (false? fn-str) (= "false" fn-str))
-           false
+       (or (false? fn-str) (= "false" fn-str))
+       false
 
-           (re-matches #"^\(.+\)$" fn-str)
-           (let [f-meta (<? (dbfunctions/parse-and-wrap-fn db fn-str "functionDec" params))]
-             (swap! rule-fn-cache assoc fn-str f-meta)
-             f-meta)
+       (re-matches #"^\(.+\)$" fn-str)
+       (<? (dbfunctions/parse-and-wrap-fn db fn-str "functionDec" params))
 
-           :else
-           (throw (ex-info (str "Invalid rule function provided: " fn-str)
-                           {:status 400
-                            :error  :db/invalid-fn})))))))
+       :else
+       (throw (ex-info (str "Invalid rule function provided: " fn-str)
+                       {:status 400
+                        :error  :db/invalid-fn}))))))
 
 ;; TODO - p-queries should be structured to execute all queries simultaneously
 (defn parse-rules
