@@ -24,6 +24,7 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
+            [fluree.db.messages.command :as cmd]
             [fluree.db.query.fql-resp :refer [flakes->res]])
   (:import (java.util UUID)
            (fluree.db.flake Flake)))
@@ -100,36 +101,6 @@
     (str (first ledger) "/$" (second ledger))
     ledger))
 
-(defn with-auth
-  [cmd-data private-key opts]
-  (if-let [{:keys [auth] :as verified-auth} (:verified-auth opts)]
-    (do (log/debug "Using verified auth:" auth)
-        (assoc cmd-data :auth auth))
-    (let [key-auth-id (crypto/account-id-from-private private-key)]
-      (if-let [auth (:auth opts)]
-        (assoc cmd-data
-               :auth auth
-               :authority (when-not (= auth key-auth-id)
-                            key-auth-id))
-        (assoc cmd-data :auth key-auth-id)))))
-
-(defn tx->cmd-data
-  [txn ledger timestamp private-key opts]
-  (let [{:keys [expire nonce deps]
-         :or   {nonce  timestamp
-                expire (+ timestamp 300000)}}
-        opts
-
-        cmd-data {:type      :tx
-                  :ledger    ledger
-                  :tx        txn
-                  :nonce     nonce
-                  :expire    expire
-                  :deps      deps}]
-    (-> cmd-data
-        (with-auth private-key opts)
-        util/without-nils)))
-
 (defn cmd-data->json
   [cmd-data]
   (try (json/stringify cmd-data)
@@ -177,12 +148,7 @@
                      {:status 400 :error :db/invalid-transaction})))
    (let [timestamp  (System/currentTimeMillis)
          ledger-str (ledger->str ledger)
-         cmd        (-> txn
-                        (tx->cmd-data ledger-str timestamp private-key opts)
-                        cmd-data->json)
-         command    (-> {:cmd cmd, :ledger ledger-str}
-                        with-id
-                        (sign-command private-key opts))]
+         command    (cmd/build-and-sign txn ledger timestamp private-key opts)]
      (log/trace "tx->command result:" command)
      command)))
 
