@@ -21,34 +21,27 @@
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
-(defn key->unix-path
-  "Given an optional base-path and our key, returns the storage path as a
-  UNIX-style `/`-separated path."
-  ([key] (key->unix-path nil key))
-  ([base-path key]
-   #?(:clj
-      (let [split-key (str/split key #"_")
-            file      (apply io/file base-path split-key)]
-        (.toString ^File file))
-      :cljs
-      (apply path/resolve base-path (str/split key #"_")))))
+(defn file-address
+  "Turn a path into a fluree file address."
+  [path]
+  (str "fluree:file:" path))
 
 (defn read-file
-  "Read bytes from disk at `path`. Returns nil if file does not exist."
+  "Read a string from disk at `path`. Returns nil if file does not exist."
   [path]
   #?(:clj
      (try
        (with-open [xin  (io/input-stream path)
                    xout (ByteArrayOutputStream.)]
          (io/copy xin xout)
-         (.toByteArray xout))
+         (String. (.toByteArray xout)))
 
        (catch FileNotFoundException _
          nil)
        (catch Exception e (throw e)))
      :cljs
      (try*
-       (fs/readFileSync path)
+       (fs/readFileSync path "utf8")
        (catch* e
                (when (not= "ENOENT" (.-code e))
                  (throw (ex-info  "Error reading file." {"errno" ^String (.-errno e)
@@ -56,16 +49,14 @@
                                                          "code" (.-code e)
                                                          "path" (.-path e)})))))))
 
-(defn storage-read
-  "Reads file `key` from `base-path` into memory."
-  [base-path key]
-  (read-file (key->unix-path base-path key)))
+(defn read-address
+  [address]
+  (let [[_ _ path]  (str/split address #":")]
+    (read-file path)))
 
-(defn connection-read
-  "Closes over base path to create reader."
-  [base-path]
-  (fn [key]
-    (storage-read base-path key)))
+(defn read-commit
+  [address]
+  (json/parse (read-address address) false))
 
 (defn write-file
   "Write bytes to disk at the given file path."
@@ -104,124 +95,67 @@
                                                         "code" (.-code e)
                                                         "path" (.-path e)})))))))
 
-(defn storage-write
-  "Write disk `data` bytes to file in `key` file at `base-path` on disk."
-  [base-path key data]
-  (write-file data (key->unix-path base-path key)))
-
-(defn connection-write
-  "Closes over base-path to create writer."
-  [base-path]
-  ;; TODO: arg order may be backwards?
-  (fn [key data]
-    (write-file data (key->unix-path base-path key))))
-
 (defn connection-commit
   [base-path]
   (fn [data]
-    (let [json  (json/stringify data)   ; TODO: formally canonicalize the data.
-          bytes #?(:clj (.getBytes ^String json)
-                   :cljs (js/Buffer.from data "utf8"))
-          hash  (crypto/sha2-256 bytes :hex)
-          path  #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
-                   :cljs (path/resolve "." base-path "commits" hash) )]
-      (write-file bytes path)
-      {:name hash
-       :hash hash
-       :size (count json)
-       :address (str "fluree:file:" path)})))
-
-(defn exists?
-  [path]
-  #?(:clj
-     (.exists ^File (io/file path))
-     :cljs
-     (try* (fs/accessSync path)
-           true
-           (catch* e false))))
-
-(defn storage-exists?
-  [base-path key]
-  (exists? (key->unix-path base-path key)))
-
-(defn connection-exists?
-  [base-path]
-  (fn [key]
-    (storage-exists? base-path key)))
+    (let [json        (json/stringify data) ; TODO: formally canonicalize the data.
+          bytes       #?(:clj (.getBytes ^String json)
+                         :cljs (js/Buffer.from data "utf8"))
+          hash        (crypto/sha2-256 bytes :hex)
+          commit-path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
+                         :cljs (path/resolve "." base-path "commits" hash) )]
+      (write-file bytes commit-path)
+      {:name    hash
+       :hash    hash
+       :size    (count json)
+       :address (file-address commit-path)})))
 
 (defn connection-push
   "Just write to a different directory?"
   [base-path]
   #?(:clj
      (fn
-       ([commit-id]
-        (let [p (promise)]
-          (future
-            (let [path (str (-> (io/file "") .getAbsolutePath) "/" base-path "/HEAD")
-                  [_ _ filename] (str/split commit-id #":")]
-              (write-file (.getBytes ^String filename) path)
-              (deliver p (str "fluree:file:" path))))
-          p))
-       ([commit-id ledger]
-        (let [p (promise)]
-          (future
-            (let [path (str (-> (io/file "") .getAbsolutePath) "/" base-path "/" ledger "/HEAD")
-                  [_ _ filename] (str/split commit-id #":")]
-              (write-file (.getBytes ^String filename) path)
-              (deliver p (str "fluree:file:" path))))
-          p)))
+       [publish-address commit-data]
+       (let [p (promise)]
+         (future
+           (let [{:keys [t dbid address meta branch ledger-state alias]} commit-data
+                 [_ _ path-to-commit] (str/split address #":")
+                 [_ _ path] (str/split publish-address #":")]
+             (write-file (.getBytes ^String path-to-commit) path)
+             (deliver p (file-address path))))
+         p))
      :cljs
      (fn
-       ([commit-id]
-        (let [path (path/resolve "." base-path "HEAD")
-              [_ _ filename] (str/split commit-id #":")]
-          (js/Promise (fn [resolve reject]
-                        (write-file (.getBytes filename) path)
-                        (resolve (str "fluree:file:" path))))))
-       ([commit-id ledger]
-        (let [path (path/resolve "." base-path ledger "HEAD")
-              [_ _ filename] (str/split commit-id #":")]
-          (js/Promise (fn [resolve reject]
-                        (write-file (.getBytes filename) path)
-                        (resolve (str "fluree:file:" path)))))))))
-
-(defn storage-rename
-  [base-path old-key new-key]
-  #?(:clj
-     (.renameTo
-       (io/file (key->unix-path base-path old-key))
-       (io/file (key->unix-path base-path new-key)))
-     :cljs
-     (fs/renameSync (key->unix-path base-path old-key) (key->unix-path base-path new-key))))
-
-(defn connection-rename
-  [base-path]
-  (fn [old-key new-key]
-    (storage-rename base-path old-key new-key)))
+       [publish-address commit-data]
+       (let [{:keys [t dbid address meta branch ledger-state alias]} commit-data
+             [_ _ path-to-commit] (str/split address #":")
+             [_ _ path] (str/split publish-address #":")]
+         (js/Promise (fn [resolve reject]
+                       (write-file (.getBytes path-to-commit) path)
+                       (resolve (file-address path))))))))
 
 (defrecord FileConnection [id transactor? memory state
                            context did
-                           local-read local-write
                            push commit
-                           read write
-                           rename exists?
                            parallelism close-fn
                            msg-in-ch msg-out-ch
                            async-cache]
+
   conn-proto/iStorage
-  (-c-read [_ commit-key] (read commit-key))
+  (-c-read [_ commit-key] (async/go (read-commit commit-key)))
   (-c-write [_ commit-data] (async/go (commit commit-data)))
 
   conn-proto/iNameService
-  (-push [this address ledger-data] (push ledger-data))
-  (-lookup [this address] (async/go (throw (ex-info "Unsupported FileConnection op: lookup" {}))))
+  (-push [this head-path commit-data] (async/go (push head-path commit-data)))
+  (-lookup [this head-commit-address] (async/go (file-address (read-address head-commit-address))))
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
-  (-address [conn ledger-alias _] (async/go (str "fluree:file:"
-                                                 #?(:cljs (path/resolve "." (:publish-path conn) ledger-alias "HEAD")
-                                                    :clj (str
-                                                           (-> (io/file "") .getAbsolutePath)
-                                                           "/" (:publish-path conn) "/" ledger-alias "/HEAD")))))
+  (-address [conn ledger-alias {:keys [branch] :as _opts}]
+    (async/go (file-address
+                #?(:cljs (path/resolve "." (:storage-path conn) ledger-alias (name branch) "HEAD")
+                   :clj (str (-> (io/file "") .getAbsolutePath)
+                             "/" (:storage-path conn) "/" ledger-alias
+                             "/" (name branch) "/HEAD")))))
 
   conn-proto/iConnection
   (-close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
@@ -230,9 +164,9 @@
   (-parallelism [_] parallelism)
   (-transactor? [_] transactor?)
   (-id [_] id)
-  (-read-only? [_] (not (fn? write)))
+  (-read-only? [_] (not (fn? commit)))
   (-context [_] context)
-  (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
+  (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] did)
   (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection msg-in: pull" {})))
   (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection msg-out: pull" {})))
@@ -240,10 +174,10 @@
   (-state [_ ledger] (get @state ledger))
 
   storage/Store
-  (read [s k] (read k))
-  (write [s k data] (write k data))
-  (exists? [s k] (exists? k))
-  (rename [s old-key new-key] (rename old-key new-key))
+  (read [s k] (throw (ex-info "Unsupported FileConnection Store: read" {})))
+  (write [s k data] (throw (ex-info "Unsupported FileConnection Store: write" {})))
+  (exists? [s k] (throw (ex-info "Unsupported FileConnection Store: exists?" {})))
+  (rename [s old-key new-key] (throw (ex-info "Unsupported FileConnection Store: rename" {})))
 
   index/Resolver
   (resolve
@@ -257,18 +191,20 @@
                      (throw (ex-info "File connection does not support full text operations."
                                      {:status 500 :error :db/unexpected-error})))]))
 
+(defn trim-last-slash
+  [s]
+  (if (str/ends-with? s "/")
+    (subs s 0 (dec (count s)))
+    s))
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults local-read local-write parallelism storage-path publish-path async-cache memory] :as opts}]
+  [{:keys [defaults local-read local-write parallelism storage-path async-cache memory] :as opts}]
   (async/go
-    (let [conn-id        (str (random-uuid))
+    (let [storage-path   (trim-last-slash storage-path)
+          conn-id        (str (random-uuid))
           commit         (connection-commit storage-path)
-          read           (connection-read storage-path)
-          write          (connection-write storage-path)
-          exists?        (connection-exists? storage-path)
-          rename         (connection-rename storage-path)
-          push           (connection-push publish-path)
+          push           (connection-push storage-path)
           state          (state-machine/blank-state)
           close-fn       (fn [] (log/info (str "File Connection " conn-id " Closed")))
           async-cache-fn (or async-cache
@@ -276,21 +212,19 @@
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id           conn-id
                             :storage-path storage-path
-                            :publish-path publish-path
                             :transactor?  false
                             :context      (:context defaults)
                             :did          (:did defaults)
-                            :local-read   local-read
-                            :local-write  local-write
-                            :read         read
-                            :write        write
                             :commit       commit
                             :push         push
-                            :exists?      exists?
-                            :rename       rename
                             :parallelism  parallelism
                             :msg-in-ch    (async/chan)
                             :msg-out-ch   (async/chan)
                             :close        close-fn
                             :state        state
                             :async-cache  async-cache-fn}))))
+
+(comment
+  (read-file (read-file "/home/dan/projects/db2/dev/data/clj/test/db1/main/HEAD" ))
+
+  ,)

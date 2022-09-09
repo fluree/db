@@ -155,7 +155,7 @@
                                                           {:reindex-min-bytes reindex-min-bytes
                                                            :reindex-max-bytes reindex-max-bytes})))
           ledger-alias* (normalize-alias ledger-alias)
-          address       (<? (conn-proto/-address conn ledger-alias* opts))
+          address       (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
           context*      (or context (conn-proto/-context conn))
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
@@ -197,7 +197,7 @@
           last-commit  (<? (conn-proto/-lookup conn commit-address))
           _            (when-not last-commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-address)
-                                         {:status 400 :error :db/invalid-db})))
+                                         {:status 400 :error :db/invalid-commit-address})))
           commit-data  (<? (conn-proto/-c-read conn last-commit))
           _            (when-not commit-data
                          (throw (ex-info (str "Unable to load. No commit exists for: " last-commit)

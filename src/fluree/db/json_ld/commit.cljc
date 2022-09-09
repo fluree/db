@@ -296,10 +296,11 @@
                           jld-commit)
             commit-res  (<? (conn-proto/-c-write conn (or jld-commit* jld-commit)))
             commit-data {:t       t
-                         :dbid    (get jld-graphs id-key)   ;; sha address for database
-                         :address (:address commit-res)     ;; full address for commit (e.g. fluree:ipfs://...)
+                         :dbid    (get jld-graphs id-key) ;; sha address for database
+                         :address (:address commit-res) ;; full address for commit (e.g. fluree:ipfs://...)
                          :meta    (assoc commit-res :db graph-res) ;; additional metadata for ledger method (e.g. ipfs)
-                         :branch  branch-name}
+                         :branch  branch-name
+                         :alias (:alias ledger)}
             db*         (assoc db :commit commit-data)]     ;; branch published to
         (ledger-proto/-commit-update ledger (keyword branch-name) db*)
         (when push?
