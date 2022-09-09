@@ -108,7 +108,7 @@
                 :name        com.fluree/db
                 ;; TODO: Eliminate this copy of the version string
                 ;; I think that tools.build might be the best way to do that
-                :version     "2.0.0-alpha5"
+                :version     "2.0.0-alpha6"
                 :output-path "docs"}}
 
   :deploy
