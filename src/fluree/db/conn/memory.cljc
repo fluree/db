@@ -9,6 +9,7 @@
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try channel?]]
+            [fluree.db.platform :as platform]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.indexer.default :as idx-default]
@@ -19,7 +20,12 @@
 
 ;; Memory Connection object
 
-(defn- addr-path
+(defn memory-address
+  "Turn a path into a fluree memory address."
+  [path]
+  (str "fluree:memory://" path))
+
+(defn- address-path
   "Returns the path portion of a Fluree memory address."
   [address]
   (if-let [[_ path] (re-find #"^fluree:memory://(.+)$" address)]
@@ -32,31 +38,42 @@
   (go-try
     (let [json (json-ld/normalize-data commit-data)
           hash (crypto/sha2-256-normalize json)]
+      #?(:cljs (when platform/BROWSER
+                 (.setItem js/localStorage hash json)))
       (swap! data-atom assoc hash commit-data)
       {:name    hash
        :hash    hash
        :size    (count json)
-       :address (str "fluree:memory://" hash)})))
+       :address (memory-address hash)})))
 
-(defn c-read
-  [data-atom commit-key]
-  (go-try
-    (get @data-atom (addr-path commit-key))))
+(defn read-address
+  [data-atom address]
+  (or (get @data-atom (address-path address))
+      #?(:cljs (and platform/BROWSER (.getItem js/localStorage (address-path address))))))
 
+(defn read-commit
+  [data-atom address]
+  (let [commit (read-address data-atom address)]
+    #?(:cljs (if platform/BROWSER
+               (js->clj (.parse js/JSON commit))
+               commit)
+       :clj commit)))
 
 (defn push!
-  [data-atom address ledger-data]
-  (let [commit-address (:address ledger-data)]
+  [data-atom publish-address ledger-data]
+  (let [commit-address (:address ledger-data)
+        commit-path (address-path commit-address)
+        address-path (address-path publish-address)]
     (swap! data-atom
            (fn [state]
-             (let [commit-path  (addr-path commit-address)
-                   commit       (get state commit-path)
-                   address-path (addr-path address)]
+             (let [commit (get state commit-path)]
                (when-not commit
                  (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                  {:status 500 :error :db/invalid-db})))
-               (log/debug "pushing:" address "referencing commit:" commit-address)
-               (assoc state address-path commit)))))
+               (log/debug "pushing:" publish-address "referencing commit:" commit-address)
+               (js/console.log "pushing:" publish-address "referencing commit:" commit-address)
+               (assoc state address-path commit))))
+    #?(:cljs (and platform/BROWSER (.setItem js/localStorage address-path commit-path))))
   ledger-data)
 
 
@@ -68,15 +85,28 @@
                              ipfs-endpoint data-atom]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (c-read data-atom commit-key))
+  (-c-read [_ commit-key] (async/go (read-commit data-atom commit-key)))
   (-c-write [_ commit-data] (c-write! data-atom commit-data))
 
   conn-proto/iNameService
-  (-push [this address ledger-data] (push! data-atom address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
-  (-lookup [this ledger] (async/go :TODO))
-  (-address [_ ledger-alias _] (go (str "fluree:memory://" ledger-alias)))
+  (-push [this address ledger-data] (async/go (push! data-atom address ledger-data)))
+  (-lookup [this head-commit-address]
+    (async/go #?(:clj (throw (ex-info (str "Cannot lookup ledger address with memory connection: " head-commit-address)
+                                      {:status 500 :error :db/invalid-ledger}))
+                 :cljs
+                 (if platform/BROWSER
+                   (if-let [head-commit (read-address data-atom head-commit-address)]
+                     (memory-address head-commit)
+                     (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
+                                          head-commit-address)
+                                     {:status 500 :error :db/missing-head})))
+                   (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
+                                        head-commit-address)
+                                   {:status 500 :error :db/invalid-ledger}))))))
+  (-address [_ ledger-alias {:keys [branch] :as _opts}]
+    (async/go (memory-address (str ledger-alias "/" (name branch) "/" "HEAD"))))
 
   conn-proto/iConnection
   (-close [_]
@@ -105,8 +135,12 @@
 
   storage/Store
   (read [_ k]
-    (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
+    #?(:clj (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
+                            {:status 500 :error :db/unexpected-error}))
+       :cljs (if platform/BROWSER
+
+               (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
+                               {:status 500 :error :db/unexpected-error})))))
   (write [_ k data]
     (throw (ex-info (str "Memory connection does not support storage writes. Requested key: " k)
                     {:status 500 :error :db/unexpected-error})))
