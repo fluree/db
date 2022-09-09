@@ -117,7 +117,7 @@
   ([ledger txn private-key opts]
    (if private-key
      (let [timestamp  (System/currentTimeMillis)
-           command    (cmd/build-and-sign txn ledger timestamp private-key opts)]
+           command    (cmd/build-and-sign-tx txn ledger timestamp private-key opts)]
        (log/trace "tx->command result:" command)
        command)
      (throw (ex-info "Private key not provided and no default present on connection"

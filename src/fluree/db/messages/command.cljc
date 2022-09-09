@@ -177,7 +177,7 @@
         (assoc cmd-data :auth key-auth-id)))))
 
 (defn ->tx-command
-  [txn ledger timestamp private-key opts]
+  [txn ledger private-key timestamp opts]
   (let [{:keys [expire nonce deps]
          :or   {nonce  timestamp
                 expire (+ timestamp 300000)}}
@@ -191,6 +191,23 @@
                   :deps      deps}]
     (-> cmd-data
         (with-auth private-key opts)
+        util/without-nils
+        validate)))
+
+(defn ->default-key-command
+  [conn network ledger-id private-key timestamp opts]
+  (let [{:keys [expire nonce signing-key]
+         :or   {nonce  timestamp
+                expire (+ timestamp 30000)}}
+        opts
+
+        cmd-data   {:type        :default-key
+                    :network     network
+                    :ledger-id   ledger-id
+                    :private-key private-key
+                    :nonce       nonce
+                    :expire      expire}]
+    (-> cmd-data
         util/without-nils
         validate)))
 
@@ -217,9 +234,9 @@
   (let [id (crypto/sha3-256 cmd)]
     (assoc signed-command :id id)))
 
-(defn build-and-sign
+(defn build-and-sign-tx
   [txn ledger timestamp private-key opts]
   (-> txn
-      (->tx-command ledger timestamp private-key opts)
+      (->tx-command ledger private-key timestamp opts)
       (sign private-key opts)
       with-id))

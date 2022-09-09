@@ -1,5 +1,6 @@
 (ns fluree.db.api.auth
   (:require [fluree.crypto :as crypto]
+            [fluree.db.messages.command :as cmd]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.operations :as ops]
@@ -42,25 +43,12 @@
   ([conn network private-key] (set-default-key-async conn network nil private-key nil))
   ([conn network ledger-id private-key] (set-default-key-async conn network ledger-id private-key nil))
   ([conn network ledger-id private-key opts]
-   (let [{:keys [nonce expire signing-key]} opts
-         timestamp (System/currentTimeMillis)
-         nonce     (or nonce timestamp)
-         expire    (or expire (+ timestamp 30000)) ;; 5 min default
-         cmd-map   {:type        :default-key
-                    :network     network
-                    :ledger-id   ledger-id
-                    :private-key private-key
-                    :nonce       nonce
-                    :expire      expire}
-         cmd       (when signing-key
-                     (-> cmd-map
-                         (util/without-nils)
-                         (json/stringify)))
-         sig       (when signing-key
-                     (crypto/sign-message cmd signing-key))]
-     (if signing-key
-       (ops/command-async conn {:cmd cmd :sig sig})
-       (ops/unsigned-command-async conn cmd-map)))))
+   (let [timestamp (System/currentTimeMillis)
+         command   (cmd/->default-key-command network ledger-id private-key timestamp opts)]
+     (if-let [signing-key (:signing-key opts)]
+       (let [signed-cmd (cmd/sign command signing-key opts)]
+         (ops/command-async conn signed-cmd))
+       (ops/unsigned-command-async conn command)))))
 
 (defn set-default-key
   "Sets a new default private key for the entire tx-group, network or db level.
