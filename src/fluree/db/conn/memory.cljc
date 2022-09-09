@@ -48,13 +48,14 @@
 
 (defn read-address
   [data-atom address]
-  (or (get @data-atom (address-path address))
-      #?(:cljs (and platform/BROWSER (.getItem js/localStorage (address-path address))))))
+  #?(:clj (get @data-atom (address-path address))
+     :cljs (or (get @data-atom (address-path address))
+               (and platform/BROWSER (.getItem js/localStorage (address-path address))))))
 
 (defn read-commit
   [data-atom address]
   (let [commit (read-address data-atom address)]
-    #?(:cljs (if platform/BROWSER
+    #?(:cljs (if (and platform/BROWSER (string? commit))
                (js->clj (.parse js/JSON commit))
                commit)
        :clj commit)))
@@ -71,7 +72,6 @@
                  (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                  {:status 500 :error :db/invalid-db})))
                (log/debug "pushing:" publish-address "referencing commit:" commit-address)
-               (js/console.log "pushing:" publish-address "referencing commit:" commit-address)
                (assoc state address-path commit))))
     #?(:cljs (and platform/BROWSER (.setItem js/localStorage address-path commit-path))))
   ledger-data)

@@ -57,7 +57,7 @@
 
 (defn read-address
   [address]
-  (address-path (read-file path)))
+  (read-file (address-path address)))
 
 (defn read-commit
   [address]
