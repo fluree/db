@@ -94,13 +94,6 @@
   ([public-key] (crypto/account-id-from-public public-key))
   ([message signature] (crypto/account-id-from-message message signature)))
 
-
-(defn ledger->str
-  [ledger]
-  (if (sequential? ledger)
-    (str (first ledger) "/" (second ledger))
-    ledger))
-
 (defn tx->command
   "Helper function to fill out the parts of the transaction that are incomplete,
   producing a signed command.
@@ -124,7 +117,6 @@
   ([ledger txn private-key opts]
    (if private-key
      (let [timestamp  (System/currentTimeMillis)
-           ledger-str (ledger->str ledger)
            command    (cmd/build-and-sign txn ledger timestamp private-key opts)]
        (log/trace "tx->command result:" command)
        command)
