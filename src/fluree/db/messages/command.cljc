@@ -114,7 +114,7 @@
       (throw-invalid (s/explain-str ::signed-cmd msg)))
     signed-cmd))
 
-(defn parse-json-cmd
+(defn parse-json
   [cmd]
   (try
     (-> cmd
@@ -124,7 +124,7 @@
     (catch Exception _
       (throw-invalid "Invalid command serialization, could not decode JSON."))))
 
-(defn validate-cmd-data
+(defn validate
   [cmd-data]
   (let [checked-data (s/conform ::cmd-data cmd-data)]
     (if (s/invalid? checked-data)
@@ -134,8 +134,8 @@
 (defn parse-cmd-data
   [cmd]
   (-> cmd
-      parse-json-cmd
-      validate-cmd-data))
+      parse-json
+      validate))
 
 (defn parse-auth-id
   [{:keys [cmd sig signed] :as _parsed-command}]
@@ -176,7 +176,7 @@
                             key-auth-id))
         (assoc cmd-data :auth key-auth-id)))))
 
-(defn txn->cmd-data
+(defn ->tx-command
   [txn ledger timestamp private-key opts]
   (let [{:keys [expire nonce deps]
          :or   {nonce  timestamp
@@ -192,25 +192,19 @@
     (-> cmd-data
         (with-auth private-key opts)
         util/without-nils
-        validate-cmd-data)))
+        validate)))
 
-(defn cmd-data->json
+(defn json-serialize
   [cmd-data]
   (try (json/stringify cmd-data)
        (catch Exception _
          (throw (ex-info (str "Transaction contains data that cannot be serialized into JSON.")
                          {:status 400 :error :db/invalid-tx})))))
 
-(defn txn->json
-  [txn ledger timestamp private-key opts]
-  (-> txn
-      (txn->cmd-data ledger timestamp private-key opts)
-      cmd-data->json))
-
 (defn with-id
-  [{:keys [cmd] :as command}]
+  [{:keys [cmd] :as signed-command}]
   (let [id (crypto/sha3-256 cmd)]
-    (assoc command :id id)))
+    (assoc signed-command :id id)))
 
 (defn sign
   [{:keys [cmd] :as command} private-key opts]
@@ -223,9 +217,7 @@
 
 (defn build-and-sign
   [txn ledger timestamp private-key opts]
-  (let [cmd (-> txn
-                (txn->cmd-data ledger timestamp private-key opts)
-                cmd-data->json)]
+  (let [cmd (json-serialize (->tx-command txn ledger timestamp private-key opts))]
     (-> {:cmd cmd, :ledger ledger}
         with-id
         (sign private-key opts))))
