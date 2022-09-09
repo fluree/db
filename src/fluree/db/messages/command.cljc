@@ -201,23 +201,25 @@
          (throw (ex-info (str "Transaction contains data that cannot be serialized into JSON.")
                          {:status 400 :error :db/invalid-tx})))))
 
+(defn sign
+  [command private-key opts]
+  (let [cmd (json-serialize command)
+        msg {:cmd cmd}]
+    (if-let [{:keys [signature signed]} (:verified-auth opts)]
+      (assoc msg
+             :sig    signature
+             :signed signed)
+      (let [sig (crypto/sign-message cmd private-key)]
+        (assoc msg :sig sig)))))
+
 (defn with-id
   [{:keys [cmd] :as signed-command}]
   (let [id (crypto/sha3-256 cmd)]
     (assoc signed-command :id id)))
 
-(defn sign
-  [{:keys [cmd] :as command} private-key opts]
-  (if-let [{:keys [signature signed]} (:verified-auth opts)]
-    (assoc command
-           :sig    signature
-           :signed signed)
-    (let [sig (crypto/sign-message cmd private-key)]
-      (assoc command :sig sig))))
-
 (defn build-and-sign
   [txn ledger timestamp private-key opts]
-  (let [cmd (json-serialize (->tx-command txn ledger timestamp private-key opts))]
-    (-> {:cmd cmd, :ledger ledger}
-        with-id
-        (sign private-key opts))))
+  (-> txn
+      (->tx-command ledger timestamp private-key opts)
+      (sign private-key opts)
+      with-id))
