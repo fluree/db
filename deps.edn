@@ -4,7 +4,7 @@
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
-         org.clojure/data.xml            {:mvn/version "0.2.0-alpha6"}
+         org.clojure/data.xml            {:mvn/version "0.2.0-alpha7"}
          environ/environ                 {:mvn/version "1.2.0"}
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.11.0"}
@@ -13,7 +13,7 @@
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
          logback-bundle/core-bundle      {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api             {:mvn/version "1.7.36"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.0"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -32,7 +32,7 @@
          com.fluree/alphabase            {:mvn/version "3.3.0"}
 
          ;; cryptography
-         com.fluree/crypto               {:mvn/version "0.3.10"}
+         com.fluree/crypto               {:mvn/version "0.4.0"}
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
@@ -66,7 +66,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.68.1059"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.69.1069"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -125,7 +125,7 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.2.4"}}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.2.5"}}
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths ["src" "src-docs"]
                  :test-paths   ["test"]}]}
@@ -135,5 +135,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.06.22"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.09.08"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
