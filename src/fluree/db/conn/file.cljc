@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
+            [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
             [fluree.db.platform :as platform]
             [fluree.db.conn.proto :as conn-proto]
@@ -25,6 +26,11 @@
   "Turn a path into a fluree file address."
   [path]
   (str "fluree:file:" path))
+
+(defn address-path
+  [address]
+  (let [[_ _ path]  (str/split address #":")]
+    path))
 
 (defn read-file
   "Read a string from disk at `path`. Returns nil if file does not exist."
@@ -51,8 +57,7 @@
 
 (defn read-address
   [address]
-  (let [[_ _ path]  (str/split address #":")]
-    (read-file path)))
+  (address-path (read-file path)))
 
 (defn read-commit
   [address]
@@ -98,7 +103,7 @@
 (defn connection-commit
   [base-path]
   (fn [data]
-    (let [json        (json/stringify data) ; TODO: formally canonicalize the data.
+    (let [json        (json-ld/normalize-data data)
           bytes       #?(:clj (.getBytes ^String json)
                          :cljs (js/Buffer.from data "utf8"))
           hash        (crypto/sha2-256 bytes :hex)
@@ -115,21 +120,21 @@
   [base-path]
   #?(:clj
      (fn
-       [publish-address commit-data]
+       [publish-address ledger-data]
        (let [p (promise)]
          (future
-           (let [{:keys [t dbid address meta branch ledger-state alias]} commit-data
-                 [_ _ path-to-commit] (str/split address #":")
-                 [_ _ path] (str/split publish-address #":")]
+           (let [{:keys [t dbid address meta branch ledger-state alias]} ledger-data
+                 path-to-commit (address-path address)
+                 path           (address-path publish-address)]
              (write-file (.getBytes ^String path-to-commit) path)
              (deliver p (file-address path))))
          p))
      :cljs
      (fn
-       [publish-address commit-data]
-       (let [{:keys [t dbid address meta branch ledger-state alias]} commit-data
-             [_ _ path-to-commit] (str/split address #":")
-             [_ _ path] (str/split publish-address #":")]
+       [publish-address ledger-data]
+       (let [{:keys [address]} ledger-data
+             path-to-commit    (address-path address)
+             path              (address-path publish-address)]
          (js/Promise (fn [resolve reject]
                        (write-file (.getBytes path-to-commit) path)
                        (resolve (file-address path))))))))
@@ -146,10 +151,10 @@
   (-c-write [_ commit-data] (async/go (commit commit-data)))
 
   conn-proto/iNameService
-  (-push [this head-path commit-data] (async/go (push head-path commit-data)))
-  (-lookup [this head-commit-address] (async/go (file-address (read-address head-commit-address))))
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
+  (-push [this head-path commit-data] (async/go (push head-path commit-data)))
+  (-lookup [this head-commit-address] (async/go (file-address (read-address head-commit-address))))
   (-address [conn ledger-alias {:keys [branch] :as _opts}]
     (async/go (file-address
                 #?(:cljs (path/resolve "." (:storage-path conn) ledger-alias (name branch) "HEAD")
