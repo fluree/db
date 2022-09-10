@@ -92,6 +92,15 @@
   [conn cmd]
   (send-operation conn :cmd cmd))
 
+(defn signed-command-async
+  ([conn signing-key command]
+   (signed-command-async conn signing-key command {}))
+  ([conn signing-key command opts]
+   (let [signed-command (-> command
+                            cmd/validate
+                            (cmd/sign signing-key opts))]
+     (send-operation :cmd signed-command))))
+
 
 (defn unsigned-command-async
   "A response will not be returned until transaction is completed.
