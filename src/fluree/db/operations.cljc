@@ -1,9 +1,9 @@
 (ns fluree.db.operations
-  (:require
-    [fluree.db.util.core :as util :refer [try* catch*]]
-    [fluree.db.util.log :as log]
-    #?(:clj  [clojure.core.async :as async]
-       :cljs [cljs.core.async :as async])))
+  (:require [fluree.db.messages.command :as cmd]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
+            #?(:clj  [clojure.core.async :as async]
+               :cljs [cljs.core.async :as async])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -101,8 +101,8 @@
 
   By default transact will monitor completed blocks and only return once it sees
   the successful transaction completed, or it will return with an error."
-  [conn unsigned-cmd-map]
-  (send-operation conn :unsigned-cmd unsigned-cmd-map))
+  [conn command]
+  (send-operation conn :unsigned-cmd (cmd/validate command)))
 
 
 (defn ledger-info-async

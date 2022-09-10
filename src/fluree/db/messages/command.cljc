@@ -126,7 +126,7 @@
 
 (defn validate
   [cmd-data]
-  (let [checked-data (s/conform ::cmd-data cmd-data)]
+  (let [checked-data (s/conform ::cmd-data (util/without-nils cmd-data))]
     (if (s/invalid? checked-data)
       (throw-invalid (s/explain-str ::cmd-data cmd-data))
       (s/unform ::cmd-data checked-data))))
