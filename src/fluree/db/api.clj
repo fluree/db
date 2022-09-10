@@ -301,23 +301,11 @@
   ([conn ledger opts]
    (try
      (let [timestamp (System/currentTimeMillis)
-
-           {:keys [nonce expire timeout private-key]
-            :or   {timeout 60000, nonce timestamp}} opts
-
-           expire    (or expire (+ timestamp 30000)) ;; 5 min default
-           cmd-data  {:type   :delete-ledger
-                      :ledger ledger
-                      :nonce  nonce
-                      :expire expire}]
-       (if private-key
-         (let [cmd (-> cmd-data
-                       (util/without-nils)
-                       (json/stringify))
-               sig (crypto/sign-message cmd private-key)]
-           (submit-command-async conn {:cmd cmd
-                                       :sig sig}))
-         (ops/unsigned-command-async conn cmd-data)))
+           command   (cmd/->delete-ledger-command)]
+       (if-let [private-key (:private-key opts)]
+         (let [signed-command (cmd/sign command private-key opts)]
+           (submit-command-async conn signed-command))
+         (ops/unsigned-command-async conn command)))
      (catch Exception e (go e)))))
 
 

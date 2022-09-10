@@ -211,6 +211,22 @@
         util/without-nils
         validate)))
 
+(defn ->delete-ledger-command
+  [ledger timestamp opts]
+  (let [{:keys [nonce expire timeout]
+         :or   {timeout 60000,
+                nonce   timestamp
+                expire  (+ timestamp 30000)}}
+        opts
+
+        cmd-data {:type   :delete-ledger
+                  :ledger ledger
+                  :nonce  nonce
+                  :expire expire}]
+    (-> cmd-data
+        util/without-nils
+        validate)))
+
 (defn json-serialize
   [cmd-data]
   (try (json/stringify cmd-data)
