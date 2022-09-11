@@ -46,8 +46,7 @@
    (let [timestamp (System/currentTimeMillis)
          command   (cmd/->default-key-command network ledger-id private-key timestamp opts)]
      (if-let [signing-key (:signing-key opts)]
-       (let [signed-cmd (cmd/sign command signing-key opts)]
-         (ops/command-async conn signed-cmd))
+       (ops/signed-command-async conn command signing-key)
        (ops/unsigned-command-async conn command)))))
 
 (defn set-default-key

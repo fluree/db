@@ -93,9 +93,9 @@
   (send-operation conn :cmd cmd))
 
 (defn signed-command-async
-  ([conn signing-key command]
-   (signed-command-async conn signing-key command {}))
-  ([conn signing-key command opts]
+  ([conn command signing-key]
+   (signed-command-async conn command signing-key {}))
+  ([conn command signing-key opts]
    (let [signed-command (-> command
                             cmd/validate
                             (cmd/sign signing-key opts))]

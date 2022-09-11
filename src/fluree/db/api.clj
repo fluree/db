@@ -303,8 +303,7 @@
      (let [timestamp (System/currentTimeMillis)
            command   (cmd/->delete-ledger-command)]
        (if-let [private-key (:private-key opts)]
-         (let [signed-command (cmd/sign command private-key opts)]
-           (submit-command-async conn signed-command))
+         (ops/signed-command-async conn command private-key)
          (ops/unsigned-command-async conn command)))
      (catch Exception e (go e)))))
 
