@@ -213,9 +213,8 @@
 
 (defn ->delete-ledger-command
   [ledger timestamp opts]
-  (let [{:keys [nonce expire timeout]
-         :or   {timeout 60000,
-                nonce   timestamp
+  (let [{:keys [nonce expire]
+         :or   {nonce   timestamp
                 expire  (+ timestamp 30000)}}
         opts
 
