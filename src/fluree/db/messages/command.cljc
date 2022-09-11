@@ -249,11 +249,13 @@
     (assoc envelope :sig sig)))
 
 (defn sign
-  [command private-key opts]
-  (let [envelope (command->envelope command)]
-    (if-let [verified-auth (:verified-auth opts)]
-      (with-verified-auth envelope verified-auth)
-      (with-signature envelope private-key))))
+  ([command private-key]
+   (sign command private-key {}))
+  ([command private-key opts]
+   (let [envelope (command->envelope command)]
+     (if-let [verified-auth (:verified-auth opts)]
+       (with-verified-auth envelope verified-auth)
+       (with-signature envelope private-key)))))
 
 (defn with-id
   [{:keys [cmd] :as envelope}]
