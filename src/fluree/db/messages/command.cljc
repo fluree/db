@@ -42,12 +42,13 @@
   [kw]
   (-> kw namespace boolean))
 
+(s/def ::id string?)
 (s/def ::cmd (s/and string? small?))
 (s/def ::sig string?)
 (s/def ::signed (s/nilable string?))
 
 (s/def ::signed-cmd
-  (s/keys :req-un [::cmd ::sig]
+  (s/keys :req-un [::id ::cmd ::sig]
           :opt-un [::signed]))
 
 (s/def ::type keyword?)
@@ -248,19 +249,19 @@
   (let [sig (crypto/sign-message cmd private-key)]
     (assoc envelope :sig sig)))
 
-(defn sign
-  ([command private-key]
-   (sign command private-key {}))
-  ([command private-key opts]
-   (let [envelope (command->envelope command)]
-     (if-let [verified-auth (:verified-auth opts)]
-       (with-verified-auth envelope verified-auth)
-       (with-signature envelope private-key)))))
-
 (defn with-id
   [{:keys [cmd] :as envelope}]
   (let [id (crypto/sha3-256 cmd)]
     (assoc envelope :id id)))
+
+(defn sign
+  ([command private-key]
+   (sign command private-key {}))
+  ([command private-key opts]
+   (let [envelope (-> command command->envelope with-id)]
+     (if-let [verified-auth (:verified-auth opts)]
+       (with-verified-auth envelope verified-auth)
+       (with-signature envelope private-key)))))
 
 (defn build-and-sign-tx
   [txn ledger timestamp private-key opts]
