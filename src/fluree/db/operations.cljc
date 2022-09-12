@@ -99,7 +99,7 @@
    (let [signed-command (-> command
                             cmd/validate
                             (cmd/sign signing-key opts))]
-     (send-operation :cmd signed-command))))
+     (send-operation conn :cmd signed-command))))
 
 
 (defn unsigned-command-async
