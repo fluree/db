@@ -338,7 +338,7 @@
   being in a deletion state during the deletion process.
 
   Attempts to use a ledger in a deletion state will throw an exception."
-  ([conn ledger] (delete-ledger-async conn ledger))
+  ([conn ledger] (delete-ledger-async conn ledger nil))
   ([conn ledger opts]
    (try
      (let [timestamp (System/currentTimeMillis)

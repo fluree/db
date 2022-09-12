@@ -439,7 +439,11 @@
                     (let [partition (dbproto/-c-prop db :partition (last clause))
                           max-sid   (-> db :ecount (get partition))
                           min-sid   (flake/min-subject-id partition)
-                          flakes    (<? (query-range/index-range db :spot >= [max-sid] <= [min-sid]))
+                          flakes    (if max-sid
+                                      (<? (query-range/index-range db :spot
+                                                                   >= [max-sid]
+                                                                   <= [min-sid]))
+                                      [])
                           xf        (comp (map (fn [^Flake f] [(.-s f)])) (distinct))]
                       {:headers [subject-var]
                        :tuples  (sequence xf flakes)
