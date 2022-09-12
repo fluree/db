@@ -159,4 +159,4 @@
   "Unsubscribes from the session's ledger."
   [session]
   (let [conn (:conn session)]
-    (send-operation conn :unsbuscribe [(:network session) (:dbid session)])))
+    (send-operation conn :unsubscribe [(:network session) (:dbid session)])))
