@@ -169,13 +169,14 @@
   (if-let [{:keys [auth] :as verified-auth} (:verified-auth opts)]
     (do (log/debug "Using verified auth:" auth)
         (assoc cmd-data :auth auth))
-    (let [key-auth-id (crypto/account-id-from-private private-key)]
+    (if-let [key-auth-id (some-> private-key crypto/account-id-from-private)]
       (if-let [auth (:auth opts)]
         (assoc cmd-data
-               :auth auth
+               :auth      auth
                :authority (when-not (= auth key-auth-id)
                             key-auth-id))
-        (assoc cmd-data :auth key-auth-id)))))
+        (assoc cmd-data :auth key-auth-id))
+      cmd-data)))
 
 (defn ->tx-command
   [txn ledger private-key timestamp opts]
