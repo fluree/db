@@ -1241,7 +1241,7 @@
   (let [timeout-at (+ (System/currentTimeMillis) timeout)]
     (async/go-loop []
       (let [db-status (-> (async/<! (ledger-info-async conn ledger)) :status)]
-        (if (= "ready" db-status)
+        (if (= :ready db-status)
           true
           (when (<= (System/currentTimeMillis) timeout-at)
             (async/<! (async/timeout 100))
@@ -1263,7 +1263,7 @@
   (async/go
     (-> (async/<! (ledger-info-async conn ledger))
         :status
-        (= "ready"))))
+        (= :ready))))
 
 
 (defn ledger-ready?
