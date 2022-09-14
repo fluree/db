@@ -23,14 +23,23 @@
   "Coerces args that may be core async channels into values.
   Returns exception instead of args if any exception occurs during resolution."
   [args]
+  ;; This fn looks more complicated than it needs to be at first glance, but other simpler forms
+  ;; I've tried run into go's fn boundary. Obviously something like `reduce` would since you'd be
+  ;; taking from the channel inside the anonymous fn arg. But even `for` exhibits this issue.
+  ;; Possibly because it macroexpands into an anon fn? Not sure. - WSM 2022-09-14
   (go-try
-    (loop [[arg & r] args
-           acc []]
-      (if-not arg
-        acc
-        (if (channel? arg)
-          (recur r (conj acc (<? arg)))
-          (recur r (conj acc arg)))))))
+    ;; This loop is controlled by the arg count b/c valid args can be false, nil, etc. so
+    ;; you don't want to accidentally treat that as an "out of args" condition.
+    (let [arg-count (clojure.core/count args)]
+      (loop [i 0
+             acc []]
+        (if (clojure.core/= i arg-count)
+          acc
+          (let [arg (clojure.core/nth args i)
+                next-i (clojure.core/inc i)]
+            (if (channel? arg)
+              (recur next-i (conj acc (<? arg)))
+              (recur next-i (conj acc arg)))))))))
 
 (defn stack
   "Returns the current stack."
