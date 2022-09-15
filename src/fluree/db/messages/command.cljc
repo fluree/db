@@ -74,7 +74,7 @@
 (defmethod cmd-data-spec :tx
   [_]
   (s/keys :req-un [::type ::tx ::ledger]
-          :opt-un [::deps ::expire ::nonce]))
+          :opt-un [::auth ::deps ::expire ::nonce]))
 
 (defmethod cmd-data-spec :signed-qry
   [_]

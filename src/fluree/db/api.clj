@@ -396,36 +396,19 @@
                     but instead return with the txid once it is successfully persisted by the
                     transactors. The txid can be used to look up/monitor the response at a later time.
   - timeout       - will respond with an exception if timeout reached before response available."
-  ([conn ledger txn] (transact-async conn ledger txn nil))
-  ([conn ledger txn opts]
+  ([conn ledger txn]
+   (transact-async conn ledger txn nil))
+  ([conn ledger txn {:keys [private-key txid-only timeout]
+                     :or   {timeout 60000} :as opts}]
    (go-try
-     (let [{:keys [private-key txid-only timeout auth verified-auth nonce deps
-                   expire]
-            :or   {timeout 60000
-                   nonce   (System/currentTimeMillis)}} opts]
-       (if private-key
-         ;; private key, so generate command locally and submit signed command
-         (let [command (tx->command ledger txn private-key opts)
-               txid    (<? (submit-command-async conn command))
-               result  (if txid-only
-                         txid
-                         (<? (monitor-tx-async conn ledger txid timeout)))]
-           result)
-         ;; no private key provided, request ledger to sign request
-         (let [tx-map (util/without-nils
-                        {:ledger        ledger
-                         :tx            txn
-                         :auth          auth
-                         :verified-auth verified-auth
-                         :nonce         nonce
-                         :deps          deps
-                         :expire        expire})
-               ;; will received txid once transaction is persisted, else an error
-               txid   (<? (ops/transact-async conn tx-map))
-               result (if txid-only
-                        txid
-                        (<? (monitor-tx-async conn ledger txid timeout)))]
-           result))))))
+    (let [timestamp (System/currentTimeMillis)
+          command   (cmd/->tx-command txn ledger private-key timestamp opts)
+          txid      (if private-key
+                      (<? (ops/signed-command-async conn command private-key opts))
+                      (<? (ops/unsigned-command-async conn command)))]
+      (if txid-only
+        txid
+        (<? (monitor-tx-async conn ledger txid timeout)))))))
 
 
 (defn transact
