@@ -57,8 +57,10 @@
       (let [ipfs-addr (if (= "ipns" proto)
                         (str "/ipns/" address)
                         address)]
+        ;; address might be a directory, or could directly be a commit file - try to look up as directory first
         (let [dbs (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
-          (get dbs db)))
+          (or (get dbs db)
+              ledger-name)))
       ledger-name)))
 
 
