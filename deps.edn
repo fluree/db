@@ -8,7 +8,8 @@
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
-         com.fluree/json-ld              {:local/root "../json-ld"}
+         com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
+                                          :sha "eb9abefdcc78cd92beab759ed350f10a368b7c39"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
