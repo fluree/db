@@ -19,7 +19,7 @@
   "Generates a dag directory file given list/vector of items to add in the file
   where each item must have:
   :name - name of file
-  :hash - the IPFS CID hash for the fiel the name points to
+  :hash - the IPFS CID hash for the field the name points to
   :size - the size of the file contained in the hash"
   [ipfs-endpoint items]
   (go-try
@@ -110,13 +110,14 @@
   "Flattens our dag representation returning a list of two-tuples as:
   [relative-path ipfs-cid]"
   [node prefix]
-  (let [{:keys [child hash name]} node
-        full-name (if prefix (str prefix "/" name) name)]
-    (if child
-      (reduce-kv (fn [acc _ child-node]
-                   (into acc (flatten-dag child-node full-name)))
-                 [] child)
-      [[full-name hash]])))
+  (reduce-kv (fn [acc _ {:keys [name child hash]}]
+               (let [name* (if prefix
+                             (str prefix "/" name)
+                             name)]
+                 (if child
+                   (into acc (flatten-dag child name*))
+                   (conj acc [name* (str "fluree:ipfs://" hash)]))))
+             [] node))
 
 (defn list-all
   "Takes a root address, like IPNS, and returns a map of all the ledgers and
@@ -128,12 +129,8 @@
    'a-db        'Qmx...}"
   [ipfs-endpoint root-cid]
   (go-try
-    (let [dag-map (<? (dag-map ipfs-endpoint root-cid))]
-      (->> (reduce-kv
-             (fn [acc _ node]
-               (into acc (flatten-dag node nil)))
-             []
-             dag-map)
+    (let [{:keys [child]} (<? (dag-map ipfs-endpoint root-cid))]
+      (->> (flatten-dag child nil)
            (into {})))))
 
 
@@ -167,7 +164,14 @@
   ;; ------- DB
 
   (async/<!!
-    (refresh-state "http://127.0.0.1:5001/" "bafybeic67u4q3a2lxp4g4jebdfoc7ij754nho3x3ybv5wgetzl5zh7zqdy"))
+    (refresh-state "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
+  (async/<!!
+    (list-all "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
+  (async/<!!
+    (list-all "http://127.0.0.1:5001/" "/ipns/k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"))
+
+
+  (async/<!! (dag-map "http://127.0.0.1:5001/" "bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou"))
 
   @ipns-state
 

@@ -13,7 +13,9 @@
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
-            [fluree.db.indexer.default :as default-indexer]))
+            [fluree.db.method.ipfs.directory :as ipfs-dir]
+            [fluree.db.indexer.default :as default-indexer]
+            [clojure.string :as str]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -28,12 +30,36 @@
                          (-> ledger-defaults :ipns :address))]
       (str "fluree:ipns://" base-address "/" ledger-alias))))
 
+(defn trim-slashes
+  "Trims any leading or following slash '/' characters from string"
+  [s]
+  (when s
+    (cond-> s
+            (str/ends-with? s "/") (subs 0 (dec (count s)))
+            (str/starts-with? s "/") (subs 1))))
+
+(defn address-parts
+  "Returns three-tuple of ipfs/ipns (protocol), address, and ledger alias(directory)
+  If no match, returns nil.
+  e.g. fluree:ipfs://QmZ9FQA7eHnnuTV5kjiaQKPf99NSPzk2pi1AMe6XkDa2P2
+       ->> [QmZ9FQA7eHnnuTV5kjiaQKPf99NSPzk2pi1AMe6XkDa2P2 nil]
+       fluree:ipns://bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou/my/db
+       ->> [bafybeibtk2qwvuvbawhcgrktkgbdfnor4qzxitk4ct5mfwmvbaao53awou my/db]"
+  [address]
+  (when-let [[_ proto address db] (re-find #"^fluree:([^:]+)://([^/]+)(/.+)?$" address)]
+    [proto address (trim-slashes db)]))
+
 (defn lookup-address
   "Given IPNS address, performs lookup and returns latest db address."
-  [_conn ledger-name]
+  [{:keys [ipfs-endpoint] :as _conn} ledger-name]
   (go-try
-    ;; for now, no need to resolve as IPFS auto-resolves as part of its process
-    ledger-name))
+    (if-let [[proto address db] (address-parts ledger-name)]
+      (let [ipfs-addr (if (= "ipns" proto)
+                        (str "/ipns/" address)
+                        address)]
+        (let [dbs (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
+          (get dbs db)))
+      ledger-name)))
 
 
 (defrecord IPFSConnection [id transactor? memory state
@@ -53,7 +79,9 @@
   (-push [this address ledger-data] (ipfs/push! this address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
-  (-lookup [this ledger] (lookup-address this ledger))
+  (-lookup [this ledger-address] (lookup-address this ledger-address))
+  (-alias [_ ledger-address] (let [[_ _ alias] (address-parts ledger-address)]
+                               alias))
   (-address [this ledger-alias opts] (get-address this ledger-alias opts))
 
   conn-proto/iConnection
@@ -85,12 +113,10 @@
 
   storage/Store
   (read [_ k]
-    (log/warn "idx-read: " k)
     (storage-read k))
   (write [_ k data]
     (storage-write k data))
   (exists? [_ k]
-    (log/warn "idx-exists?: " k)
     (storage-read k))
   (rename [_ old-key new-key]
     (throw (ex-info (str "IPFS does not support renaming of files: " old-key new-key)
@@ -98,10 +124,15 @@
 
   index/Resolver
   (resolve
-    [_ node]
-    ;; all root index nodes will be empty
-
-    (storage/resolve-empty-leaf node))
+    [conn {:keys [id leaf tempid] :as node}]
+    (if (= :empty id)
+      (storage/resolve-empty-leaf node)
+      (async-cache
+          [::resolve id tempid]
+          (fn [_]
+            (storage/resolve-index-node conn node
+                                        (fn []
+                                          (async-cache [::resolve id tempid] nil)))))))
 
   #?@(:clj
       [full-text/IndexConnection
@@ -211,7 +242,7 @@
                             :local-write     local-write
                             :read            read
                             :write           write
-                            :storage-read    (ipfs/default-read-fn ipfs-endpoint)
+                            :storage-read    (ipfs/default-read-fn ipfs-endpoint true)
                             :storage-write   storage-write
                             :serializer      serializer
                             :parallelism     parallelism

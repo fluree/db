@@ -83,42 +83,44 @@
   [sid new-sid? property {:keys [id value] :as v-map}
    {:keys [iris next-sid t db-before new-sids] :as tx-state}]
   (go-try
-    (let [ref?           (not value)                        ;; either a ref or a value
-          existing-pid   (jld-reify/get-iri-sid property db-before iris)
-          pid            (or existing-pid
-                             (get jld-ledger/predefined-properties property)
-                             (new-pid property ref? tx-state))
-          property-flake (when-not existing-pid
-                           (flake/new-flake pid const/$iri property t true))
+    (let [ref?            (not value)                       ;; either a ref or a value
+          existing-pid    (<? (jld-reify/get-iri-sid property db-before iris))
+          pid             (or existing-pid
+                              (get jld-ledger/predefined-properties property)
+                              (new-pid property ref? tx-state))
+          property-flakes (when-not existing-pid
+                            (cond-> [(flake/new-flake pid const/$iri property t true)]
+                                    ref? (conj (flake/new-flake pid const/$rdf:type const/$iri t true))))
           ;; only process retractions if the pid existed previously (in the db-before)
-          retractions    (when (and (not new-sid?)          ;; don't need to check if sid is new
-                                    existing-pid            ;; don't need to check if just generated pid
-                                    (not (newly-added? existing-pid new-sids))) ;; don't need to check if generated pid during this transaction
-                           (->> (<? (query-range/index-range db-before :spot = [sid pid]))
-                                (map #(flake/flip-flake % t))))
-          flakes         (if ref?
-                           (if (node? v-map)
-                             (let [node-flakes (<? (json-ld-node->flakes v-map tx-state))
-                                   node-sid    (get @iris id)]
-                               (conj node-flakes (flake/new-flake sid pid node-sid t true)))
-                             (let [[id-sid id-flake] (if-let [existing (get @iris id)]
-                                                       [existing nil]
-                                                       (let [id-sid (next-sid)]
-                                                         (vswap! iris assoc id id-sid)
-                                                         (if (str/starts-with? id "_:") ;; blank node
-                                                           [id-sid nil]
-                                                           [id-sid (flake/new-flake id-sid const/$iri id t true)])))]
-                               (cond-> [(flake/new-flake sid pid id-sid t true)]
-                                       id-flake (conj id-flake))))
-                           [(flake/new-flake sid pid value t true)])]
+          retractions     (when (and (not new-sid?)         ;; don't need to check if sid is new
+                                     existing-pid           ;; don't need to check if just generated pid
+                                     (not (newly-added? existing-pid new-sids))) ;; don't need to check if generated pid during this transaction
+                            (->> (<? (query-range/index-range db-before :spot = [sid pid]))
+                                 (map #(flake/flip-flake % t))))
+          flakes          (if ref?
+                            (if (node? v-map)
+                              (let [node-flakes (<? (json-ld-node->flakes v-map tx-state))
+                                    node-sid    (get @iris id)]
+                                (conj node-flakes (flake/new-flake sid pid node-sid t true)))
+                              (let [[id-sid id-flake] (if-let [existing (get @iris id)]
+                                                        [existing nil]
+                                                        (let [id-sid (next-sid)]
+                                                          (vswap! iris assoc id id-sid)
+                                                          (if (str/starts-with? id "_:") ;; blank node
+                                                            [id-sid nil]
+                                                            [id-sid (flake/new-flake id-sid const/$iri id t true)])))]
+                                (cond-> [(flake/new-flake sid pid id-sid t true)]
+                                        id-flake (conj id-flake))))
+                            [(flake/new-flake sid pid value t true)])]
       (cond-> (into flakes retractions)
-              property-flake (conj property-flake)))))
+              property-flakes (into property-flakes)))))
 
 (defn json-ld-node->flakes
   [{:keys [id] :as node}
    {:keys [t next-pid next-sid iris db-before new-sids] :as tx-state}]
   (go-try
-    (let [existing-sid (when id (jld-reify/get-iri-sid id db-before iris))
+    (let [existing-sid (when id
+                         (<? (jld-reify/get-iri-sid id db-before iris)))
           new?         (not existing-sid)
           sid          (if new?
                          (let [new-sid (jld-ledger/generate-new-sid node iris next-pid next-sid)]
@@ -153,7 +155,8 @@
   (let [{:keys [block ecount schema branch ledger], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
-        t        (- (inc (:t (:commit (ledger-proto/-status ledger (branch/name branch))))))]
+        commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
+        t        (-> commit-t inc -)]                       ;; commit-t is always positive, need to make negative for internal indexing
     {:db-before     db
      :bootstrap?    bootstrap?
      :stage-update? (= t db-t)                              ;; if a previously staged db is getting updated again before committed
@@ -241,7 +244,8 @@
   "Returns base set of flakes needed in any new ledger."
   [t]
   [(flake/new-flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" t true)
-   (flake/new-flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" t true)])
+   (flake/new-flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" t true)
+   (flake/new-flake const/$iri const/$iri "@id" t true)])
 
 (defn ref-flakes
   "Returns ref flakes from set of all flakes"
@@ -317,5 +321,4 @@
                        <?
                        (stage* tx-state)
                        (final-db tx-state))]
-      (ledger-proto/-db-update ledger db*)
-      db*)))
+      (ledger-proto/-db-update ledger db*))))

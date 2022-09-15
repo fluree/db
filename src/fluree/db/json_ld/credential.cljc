@@ -82,21 +82,22 @@
 
 (defn generate
   "Generate a VerifiableCredential given a subject and some issuer opts."
-  [credential-subject {:keys [did private compact] :as opts}]
-  (let [[c-subj ctx] (if-let [ctx (get credential-subject "@context")]
-                       [(dissoc credential-subject "@context") ctx]
-                       [credential-subject nil])
-        did* (or (:id did)
-                 (str "did:fluree:" (crypto/account-id-from-private private)))]
-    {"@context"          (if ctx
-                           ["https://www.w3.org/2018/credentials/v1" ctx]
-                           "https://www.w3.org/2018/credentials/v1")
-     "id"                ""
-     "type"              ["VerifiableCredential" "CommitProof"]
-     "issuer"            did*
-     "issuanceDate"      (util/current-time-iso)
-     "credentialSubject" c-subj
-     "proof"             (create-proof (json-ld/normalize-data credential-subject) did* private)}))
+  ([credential-subject private] (generate credential-subject private nil))
+  ([credential-subject private did]
+   (let [[c-subj ctx] (if-let [ctx (get credential-subject "@context")]
+                        [(dissoc credential-subject "@context") ctx]
+                        [credential-subject nil])
+         did* (or did
+                  (str "did:fluree:" (crypto/account-id-from-private private)))]
+     {"@context"          (if ctx
+                            ["https://www.w3.org/2018/credentials/v1" ctx]
+                            "https://www.w3.org/2018/credentials/v1")
+      "id"                ""
+      "type"              ["VerifiableCredential" "CommitProof"]
+      "issuer"            did*
+      "issuanceDate"      (util/current-time-iso)
+      "credentialSubject" c-subj
+      "proof"             (create-proof (json-ld/normalize-data credential-subject) did* private)})))
 
 
 (defn verify

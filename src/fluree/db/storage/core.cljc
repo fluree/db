@@ -2,7 +2,6 @@
   (:refer-clojure :exclude [read exists? list])
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
-            [clojure.data.avl :as avl]
             [clojure.string :as str]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
@@ -11,6 +10,7 @@
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
+            [fluree.db.json-ld.vocab :as vocab]
             #?(:clj [clojure.java.io :as io])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -136,7 +136,7 @@
      (let [data {:flakes flakes}
            ser  (serdeproto/-serialize-leaf (serde conn) data)
            res  (<? (write conn leaf-id ser))]
-       (assoc leaf :id (or (:name res) leaf-id))))))
+       (assoc leaf :id (or (:address res) leaf-id))))))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key"
@@ -166,7 +166,7 @@
            rhs         (->> child-vals rseq first :rhs)
            data        {:children child-vals}
            res         (<? (write-branch-data conn branch-id data))]
-       (assoc branch :id (or (:name res) branch-id))))))
+       (assoc branch :id (or (:address res) branch-id))))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
@@ -245,7 +245,7 @@
         db* (assoc blank-db :block block
                             :t t
                             :ecount ecount
-                            :stats (assoc stats :indexed block))]
+                            :stats (assoc stats :indexed (- t)))]
     (reduce
       (fn [db idx]
         (let [idx-root (reify-index-root conn db idx (get root-data idx))]
@@ -265,31 +265,50 @@
 
 (defn read-db-root
   "Returns all data for a db index root of a given block."
-  [conn network ledger-id block]
-  (go-try
-    (let [key  (ledger-root-key network ledger-id block)
-          data (<? (read conn key))]
-      (when data
-        (serdeproto/-deserialize-db-root (serde conn) data)))))
+  ([conn idx-address]
+   (go-try
+     (let [data (<? (read conn idx-address))]
+       (when data
+         (serdeproto/-deserialize-db-root (serde conn) data)))))
+  ([conn network ledger-id block]
+   (go-try
+     (let [key  (ledger-root-key network ledger-id block)
+           data (<? (read conn key))]
+       (when data
+         (serdeproto/-deserialize-db-root (serde conn) data))))))
 
 
 (defn reify-db
   "Reifies db at specified index point. If unable to read db-root at index,
   throws."
-  [conn network ledger-id blank-db index]
-  (go-try
-    (let [db-root (read-db-root conn network ledger-id index)]
-      (if-not db-root
-        (throw (ex-info (str "Database " network "/" ledger-id
-                             " could not be loaded at index point: "
-                             index ".")
-                        {:status 400
-                         :error  :db/unavailable}))
-        (let [db           (reify-db-root conn blank-db (<? db-root))
-              schema-map   (<? (schema/schema-map db))
-              db*          (assoc db :schema schema-map)
-              settings-map (<? (schema/setting-map db*))]
-          (assoc db* :settings settings-map))))))
+  ([conn blank-db idx-address]
+   (go-try
+     (let [db-root (<? (read-db-root conn idx-address))]
+       (if-not db-root
+         (throw (ex-info (str "Database " (:address blank-db)
+                              " could not be loaded at index point: "
+                              idx-address ".")
+                         {:status 400
+                          :error  :db/unavailable}))
+         (let [db     (reify-db-root conn blank-db db-root)
+               schema (<? (vocab/vocab-map db))
+               db*    (assoc db :schema schema)]
+           ;(assoc db* :settings settings-map)
+           db*)))))
+  ([conn network ledger-id blank-db index]
+   (go-try
+     (let [db-root (read-db-root conn network ledger-id index)]
+       (if-not db-root
+         (throw (ex-info (str "Database " network "/" ledger-id
+                              " could not be loaded at index point: "
+                              index ".")
+                         {:status 400
+                          :error  :db/unavailable}))
+         (let [db           (reify-db-root conn blank-db (<? db-root))
+               schema-map   (<? (schema/schema-map db))
+               db*          (assoc db :schema schema-map)
+               settings-map (<? (schema/setting-map db*))]
+           (assoc db* :settings settings-map)))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]

@@ -138,7 +138,9 @@
 
 (defn child-entry
   [{:keys [first] :as node}]
-  [first node])
+  (if (branch? node)
+    [first (dissoc node :children)]
+    [first (dissoc node :flakes)]))
 
 (defn child-map
   "Returns avl sorted map whose keys are the first flakes of the index node

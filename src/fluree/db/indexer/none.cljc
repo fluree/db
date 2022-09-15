@@ -15,13 +15,13 @@
   idx-proto/iIndex
   (-index? [_ db] false)
   (-halt? [_ db] false)
-  (-index [indexer db remove-preds] (not-supported! "push events!"))
+  (-index [indexer db] (not-supported! "perform index!"))
+  (-index [indexer db opts] (not-supported! "perform index!"))
   (-add-watch [_ watch-id callback] (not-supported! "add watches!"))
   (-remove-watch [_ watch-id] (not-supported! "remove watches!"))
   (-push-event [_ event-data] (not-supported! "push events!"))
   (-close [indexer] true)
   (-status [indexer] (not-supported! "index status!"))
-  (-status [indexer index-id] (not-supported! "index status!"))
   (-reindex [indexer db] (not-supported! "reindex!")))
 
 

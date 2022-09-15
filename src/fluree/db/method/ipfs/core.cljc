@@ -28,20 +28,23 @@
 
 
 (defn default-read-fn
-  "Default reading function for IPFS. Reads either IPFS or IPNS docs"
-  [ipfs-endpoint]
-  (fn [file-key]
-    (when-not (string? file-key)
-      (throw (ex-info (str "Invalid file key, cannot read: " file-key)
-                      {:status 500 :error :db/invalid-commit})))
-    (let [[address path] (str/split file-key #"://")
-          [type method] (str/split address #":")
-          ipfs-cid (str "/" method "/" path)]
-      (when-not (and (= "fluree" type)
-                     (#{"ipfs" "ipns"} method))
-        (throw (ex-info (str "Invalid file type or method: " file-key)
-                        {:status 500 :error :db/invalid-commit})))
-      (ipfs/cat ipfs-endpoint ipfs-cid))))
+  "Default reading function for IPFS. Reads either IPFS or IPNS docs.
+  Reads JSON only, returning clojure map with optional keywordize-keys? (default false)."
+  ([ipfs-endpoint] (default-read-fn ipfs-endpoint false))
+  ([ipfs-endpoint keywordize-keys?]
+   (fn [file-key]
+     (when-not (string? file-key)
+       (throw (ex-info (str "Invalid file key, cannot read: " file-key)
+                       {:status 500 :error :db/invalid-commit})))
+     (let [[address path] (str/split file-key #"://")
+           [type method] (str/split address #":")
+           ipfs-cid (str "/" method "/" path)]
+       (when-not (and (= "fluree" type)
+                      (#{"ipfs" "ipns"} method))
+         (throw (ex-info (str "Invalid file type or method: " file-key)
+                         {:status 500 :error :db/invalid-commit})))
+       (ipfs/cat ipfs-endpoint ipfs-cid keywordize-keys?)))))
+
 
 
 (defn address-parts
@@ -55,15 +58,15 @@
 (defn push!
   "Publishes ledger metadata document (ledger root) to IPFS and recursively updates any
   directory files, culminating in an update to the IPNS address."
-  [conn address ipfs-commit-map]
+  [{:keys [ipfs-endpoint] :as _conn} address commit-map]
   (go-try
-    (let [{:keys [meta t dbid ledger-state]} ipfs-commit-map
+    (let [{:keys [meta db ledger-state]} commit-map
+          {:keys [t]} db
           {:keys [hash size]} meta
           {:keys [ipns-address relative-address]} (address-parts address)
-          ipfs-endpoint    (:ipfs-endpoint conn)
           current-dag-map  (<? (ipfs-dir/refresh-state ipfs-endpoint (str "/ipns/" ipns-address)))
           updated-dir-map  (<? (ipfs-dir/update-directory! current-dag-map ipfs-endpoint relative-address hash size))
-          _                (swap! ledger-state update-in [:push :pending] (fn [m] (assoc m :t t :dag updated-dir-map)))
+          _                (swap! ledger-state update-in [:push :pending] assoc :t t :dag updated-dir-map)
           ipns-key         (<? (ipfs-key/key ipfs-endpoint ipns-address))
           _                (when-not ipns-key
                              (throw (ex-info (str "IPNS key for address: " ipns-address " appears to no longer be registered "

@@ -19,7 +19,8 @@
   (-with-t [db flakes] [db flakes opts] "Applies flakes to this db as a new 't', but retains current block.")
   (-add-predicate-to-idx [db pred-id] "Adds predicate to idx, return updated db.")
   (-db-type [db] "Returns db type, e.g. :json-ld, :json")
-  (-stage [db tx] [db tx opts] "Stages a database transaction."))
+  (-stage [db tx] [db tx opts] "Stages a database transaction.")
+  (-index-update [db commit-index] "Updates db to reflect a new index point described by commit-index metadata"))
 
 (defn db?
   [db]

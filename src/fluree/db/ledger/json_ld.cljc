@@ -2,6 +2,8 @@
   (:require [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try]]
+            #?(:clj  [clojure.core.async :as async]
+               :cljs [cljs.core.async :as async])
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
@@ -37,38 +39,43 @@
     (branch/latest-db branch-meta)))
 
 (defn db-update
-  "Updates db, will throw if not next 't' from current db."
+  "Updates db, will throw if not next 't' from current db.
+  Returns original db, or if index has since been updated then
+  updated db with new index point."
   [{:keys [state] :as _ledger} {:keys [branch] :as db}]
-  (let [branch-name (branch/name branch)]
-    (swap! state update-in [:branches branch-name] branch/update-db db)))
+  (-> (swap! state update-in [:branches branch] branch/update-db db)
+      (get-in [:branches branch :latest-db])))
 
 (defn commit-update
-  "Updates both latest db and commit db."
+  "Updates both latest db and commit db. If latest registered index is
+  newer than provided db, updates index before storing.
+
+  If index in provided db is newer, updates latest index held in ledger state."
   [{:keys [state] :as _ledger} branch-name db force?]
   (when-not (get-in @state [:branches branch-name])
     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
                     {:status 400 :error :db/invalid-branch})))
-  (swap! state update-in [:branches branch-name] branch/update-commit db force?))
+  (-> (swap! state update-in [:branches branch-name] branch/update-commit db force?)
+      (get-in [:branches branch-name :commit-db])))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
-  [{:keys [state address] :as _ledger} requested-branch]
+  [{:keys [state address alias] :as _ledger} requested-branch]
   (let [{:keys [branch branches]} @state
         branch-data (if requested-branch
                       (get branches requested-branch)
                       (get branches branch))
-        {:keys [latest-db commit commit-meta]} branch-data
+        {:keys [latest-db commit]} branch-data
         {:keys [stats t]} latest-db
         {:keys [size flakes]} stats]
     {:address address
+     :alias   alias
      :branch  branch
      :t       (when t (- t))
      :size    size
      :flakes  flakes
-     :commit  {:t       (when commit (- commit))
-               :address (:address commit-meta)
-               :db      (:address (:db commit-meta))}}))
+     :commit  commit}))
 
 (defn normalize-opts
   "Normalizes commit options"
@@ -84,7 +91,14 @@
     (jld-commit/commit ledger db* opts*)))
 
 
-(defrecord JsonLDLedger [address alias context did indexer
+(defn close-ledger
+  "Shuts down ledger and resources."
+  [{:keys [indexer cache state] :as _ledger}]
+  (idx-proto/-close indexer)
+  (reset! state {:closed? true})
+  (reset! cache {}))
+
+(defrecord JsonLDLedger [id address alias context did indexer
                          state cache conn method]
   ledger-proto/iCommit
   (-commit! [ledger] (commit! ledger nil nil))
@@ -105,7 +119,8 @@
   (-status [ledger branch] (status ledger branch))
   (-did [_] did)
   (-alias [_] alias)
-  (-address [_] address))
+  (-address [_] address)
+  (-close [ledger] (close-ledger ledger)))
 
 
 (defn normalize-alias
@@ -125,9 +140,37 @@
         (let [base-context {:base commit-address}
               commit-data  (-> (<? (conn-proto/-c-read conn commit-address))
                                (json-ld/expand base-context))
-              db**         (<? (jld-reify/load-db db* commit-data true))]
+              [commit proof] (jld-reify/parse-commit commit-data)
+              _            (when proof
+                             (jld-reify/validate-commit db commit proof))
+              db**         (<? (jld-reify/load-db db* commit true))]
           (recur r db**))
         db*))))
+
+
+(defn update-index
+  "When indexing is complete, updates index market for DB/ledger"
+  [ledger {:keys [t port] :as event-meta}]
+  (async/go
+    (let [indexed-db (async/<! port)
+          {:keys [stats commit]} indexed-db]
+      (log/warn "update-index - meta: " event-meta)
+
+      )
+
+    )
+  )
+
+(defn register-index-watcher
+  [indexer {:keys [id address] :as ledger}]
+  (let [f (fn [{:keys [event] :as event-meta}]
+            (log/debug "Indexing event for ledger" address ":" event)
+            (case event
+              :index-start :TODO
+              :index-end (update-index ledger event-meta)
+              ;; else
+              (log/warn "Other index event: " event-meta)))]
+    (idx-proto/-add-watch indexer id f)))
 
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
@@ -159,11 +202,13 @@
           context*      (or context (conn-proto/-context conn))
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map nil branch)}
+          branches      {branch (branch/new-branch-map nil ledger-alias* branch)}
           ledger        (map->JsonLDLedger
-                          {:context context*
+                          {:id      (random-uuid)
+                           :context context*
                            :did     did*
-                           :state   (atom {:branches branches
+                           :state   (atom {:closed?  false
+                                           :branches branches
                                            :branch   branch
                                            :graphs   {}
                                            :push     {:complete {:t   0
@@ -182,6 +227,7 @@
           db            (if bootstrap?
                           (<? (bootstrap/bootstrap blank-db context* (:id did*)))
                           (bootstrap/blank-db blank-db))]
+      (register-index-watcher indexer ledger)
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
       (when include
@@ -204,15 +250,17 @@
                                          {:status 400 :error :db/invalid-db})))
           commit-data* (json-ld/expand commit-data base-context)
           [commit proof] (jld-reify/parse-commit commit-data*)
+          _            (when proof
+                         (jld-reify/validate-commit db commit proof))
           alias        (or (get-in commit [const/iri-alias :value])
-                           commit-address)
-          branch       (get-in commit [const/iri-branch :value])
+                           (conn-proto/-alias conn commit-address))
+          branch       (keyword (get-in commit [const/iri-branch :value]))
           ledger       (<? (create conn alias {:branch branch
-                                               :id     commit-address
+                                               :id     last-commit
                                                :blank? true}))
           db           (ledger-proto/-db ledger)
-          db*          (<? (jld-reify/load-db db commit-data* false))]
-      (ledger-proto/-db-update ledger db*)
+          db*          (<? (jld-reify/load-db-idx db commit last-commit false))]
+      (ledger-proto/-commit-update ledger branch db*)
       ledger)))
 
 

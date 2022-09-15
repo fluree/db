@@ -60,10 +60,10 @@
 (defn cat
   "Retrieves JSON object from IPFS, returns core async channel with
   parsed JSON without keywordizing keys."
-  [ipfs-endpoint block-id]
+  [ipfs-endpoint block-id keywordize-keys?]
   (log/debug "Retrieving json from IPFS cid:" block-id)
   (let [url (str ipfs-endpoint "api/v0/cat?arg=" block-id)]
-    (xhttp/post-json url nil {:keywordize-keys false})))
+    (xhttp/post-json url nil {:keywordize-keys keywordize-keys?})))
 
 
 (defn publish
@@ -80,10 +80,22 @@
       {:name  Name
        :value Value})))
 
+(defn name-resolve
+  [ipfs-endpoint ipns-key]
+  (go-try
+    (let [endpoint (cond-> (str ipfs-endpoint "api/v0/name/resolve?")
+                           ipns-key (str "arg=" ipns-key))
+          {:keys [Path] :as res} (<? (xhttp/post-json endpoint nil {:request-timeout 200000}))]
+      (log/debug "IPNS name resolve complete with response: " res)
+      Path)))
+
 
 (comment
   (def ipfs-endpoint "http://127.0.0.1:5001/")
   (require '[clojure.core.async :as async])
+
+  (async/<!! (name-resolve ipfs-endpoint "k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2"))
+
   (async/go
     (let [resp (async/<! (ls ipfs-endpoint "/ipfs/QmQPeNsJPyVWPFDVHb77w8G42Fvo15z4bG2X8D2GhfbSXc/"))]
       (println resp)))

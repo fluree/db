@@ -28,47 +28,49 @@
 
 
 (defn schema-details
-  [sid refs s-flakes]
-  (let [ref? (boolean (refs sid))]
-    (loop [[f & r] s-flakes
-           details (if (= sid const/$rdf:type)
-                     {:id    sid                            ;; rdf:type is predefined, so flakes to build map won't be present.
-                      :class false
-                      :idx?  true
-                      :ref?  true}
-                     {:id                 sid
-                      :class              true              ;; default
-                      :idx?               true
-                      :ref?               ref?              ;; could go from false->true if defined in vocab but hasn't been use dyet
-                      :subclassOf         []
-                      :equivalentProperty []})]
-      (if f
-        (let [pid      (flake/p f)
-              details* (cond
-                         (= const/$iri pid)
-                         (assoc details :iri (flake/o f))
+  [sid s-flakes]
+  (loop [[f & r] s-flakes
+         details (if (= sid const/$rdf:type)
+                   {:id    sid                              ;; rdf:type is predefined, so flakes to build map won't be present.
+                    :class false
+                    :idx?  true
+                    :ref?  true}
+                   {:id                 sid
+                    :class              true                ;; default
+                    :idx?               true
+                    :ref?               false               ;; could go from false->true if defined in vocab but hasn't been used yet
+                    :subclassOf         []
+                    :equivalentProperty []})]
+    (if f
+      (let [pid      (flake/p f)
+            details* (cond
+                       (= const/$iri pid)
+                       (assoc details :iri (flake/o f))
 
-                         (= const/$rdf:type pid)
-                         (if (property-sids (flake/o f))
-                           (if (= const/$owl:ObjectProperty (flake/o f))
-                             (assoc details :class false
-                                            :ref? true)
-                             (assoc details :class false))
+                       (= const/$rdf:type pid)
+                       (if (property-sids (flake/o f))
+                         (if (= const/$owl:ObjectProperty (flake/o f))
+                           (assoc details :class false
+                                          :ref? true)
+                           (assoc details :class false))
+                         (if (= const/$iri (flake/o f))
+                           (assoc details :class false
+                                          :ref? true)
                            ;; it is a class, but we already did :class true as a default
-                           details)
+                           details))
 
-                         (= const/$rdfs:subClassOf pid)
-                         (update details :subclassOf conj (flake/o f))
+                       (= const/$rdfs:subClassOf pid)
+                       (update details :subclassOf conj (flake/o f))
 
-                         (= const/$_predicate:equivalentProperty pid)
-                         (update details :equivalentProperty conj (flake/o f))
+                       (= const/$_predicate:equivalentProperty pid)
+                       (update details :equivalentProperty conj (flake/o f))
 
-                         :else details)]
-          (recur r details*))
-        details))))
+                       :else details)]
+        (recur r details*))
+      details)))
 
 
-(defn hash-map-both-id-iri
+(defn map-pred-id+iri
   "In the schema map, we index properties by both integer :id and :iri for easy lookup of either."
   [properties]
   (reduce
@@ -124,41 +126,9 @@
                    (:iri class) (get subclass-map (:id class))))
       {} classes)))
 
-(defn vocab-map*
-  "Helper to vocab-map that does core vocab mapping logic with already resolved flakes
-  so does not return async chan.
-
-  refs is a set of predicate ids (pids) that are refs to other properties."
-  [db-t refs vocab-flakes]
-  (let [coll          {-1           {:name "_tx" :id -1 :sid -1}
-                       "_tx"        {:name "_tx" :id -1 :sid -1}
-                       0            {:name "_predicate" :id 0 :sid nil}
-                       "_predicate" {:name "_predicate" :id 0 :sid nil}
-                       11           {:name "_default" :id 11 :sid nil}
-                       "_default"   {:name "_default" :id 11 :sid nil}}
-        property-maps (->> vocab-flakes
-                           (partition-by flake/s)
-                           (map #(schema-details (flake/s (first %)) refs %)))]
-    {:t          db-t                                       ;; record time of spec generation, can use to determine cache validity
-     :coll       coll
-     :refs       refs                                       ;; Any properties defined (or inferred) as @id
-     :pred       (-> property-maps
-                     (conj {:iri  "@id"
-                            :idx? true
-                            :id   0}
-                           {:iri  "@type"
-                            :ref? true
-                            :idx? true
-                            :id   200}
-                           {:iri  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                            :ref? true
-                            :idx? true
-                            :id   200})
-                     hash-map-both-id-iri)
-     :prefix     {}
-     :fullText   #{}
-     :subclasses (delay (calc-subclass property-maps))      ;; delay because might not be needed
-     }))
+(defn extract-ref-sids
+  [property-maps]
+  (into #{} (keep #(when (true? (:ref? %)) (:id %)) property-maps)))
 
 (defn parse-new-context
   "Retrieve context json out of default context flakes, and returns a fully parsed context."
@@ -178,9 +148,9 @@
               nil))))
 
 (defn update-with*
-  [old-schema t refs vocab-flakes]
+  [{:keys [pred] :as schema} t vocab-flakes]
   (loop [[s-flakes & r] (partition-by flake/s vocab-flakes)
-         pred*       (:pred old-schema)
+         pred*       pred
          context-kw  nil
          context-str nil]
     (if s-flakes
@@ -191,15 +161,14 @@
             (recur r pred* context-kw context-str))
 
           :else
-          (let [prop-map (schema-details sid refs s-flakes)]
+          (let [prop-map (schema-details sid s-flakes)]
             (recur r
                    (assoc pred* (:id prop-map) prop-map
                                 (:iri prop-map) prop-map)
                    context-kw context-str))))
-      (cond-> (assoc old-schema :t t
-                                :refs refs
-                                :pred pred*
-                                :subclasses (delay (calc-subclass pred*)))
+      (cond-> (assoc schema :t t
+                            :pred pred*
+                            :subclasses (delay (calc-subclass pred*)))
               context-kw (assoc :context context-kw
                                 :context-str context-str)))))
 
@@ -208,9 +177,42 @@
   "When creating a new db from a transaction, merge new schema changes
   into existing schema of previous db."
   [{:keys [schema] :as _db-before} db-t new-refs vocab-flakes]
-  (let [{:keys [refs]} schema
-        refs* (into refs new-refs)]
-    (update-with* schema db-t refs* vocab-flakes)))
+  (if (empty? vocab-flakes)
+    schema
+    (let [{:keys [refs]} schema
+          refs* (into refs new-refs)]
+      (-> (assoc schema :refs refs*)
+          (update-with* db-t vocab-flakes)
+          (assoc :refs refs*)))))
+
+(defn base-schema
+  []
+  (let [coll {-1           {:name "_tx" :id -1 :sid -1}
+              "_tx"        {:name "_tx" :id -1 :sid -1}
+              0            {:name "_predicate" :id 0 :sid nil}
+              "_predicate" {:name "_predicate" :id 0 :sid nil}
+              11           {:name "_default" :id 11 :sid nil}
+              "_default"   {:name "_default" :id 11 :sid nil}}
+        pred (map-pred-id+iri [{:iri  "@id"
+                                :idx? true
+                                :id   0}
+                               {:iri  "@type"
+                                :ref? true
+                                :idx? true
+                                :id   200}
+                               {:iri  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                                :ref? true
+                                :idx? true
+                                :id   200}])]
+    {:t           0
+     :refs        #{}
+     :coll        coll
+     :pred        pred
+     :context     nil
+     :context-str nil
+     :prefix      {}
+     :fullText    #{}
+     :subclasses  (delay {})}))
 
 
 (defn vocab-map
@@ -221,12 +223,13 @@
   - :pred - predicate info, mapping pid->properties and name->properties for quick lookup based on id or name respectively
   - :fullText - contains predicate ids that need fulltext search
   "
-  ([db] (vocab-map db nil))
-  ([db new-refs]
-   (go-try
-     (let [vocab-flakes (<? (query-range/index-range db :spot
-                                                     >= [(flake/max-subject-id const/$_collection)]
-                                                     <= [0]))
-           refs         (-> (get-in db [:schema :refs])
-                            (into new-refs))]
-       (vocab-map* (:t db) refs vocab-flakes)))))
+  [{:keys [t] :as db}]
+  (go-try
+    (let [vocab-flakes (<? (query-range/index-range db :spot
+                                                    >= [(flake/max-subject-id const/$_collection)]
+                                                    <= [0]))
+          base-schema  (base-schema)
+          schema       (update-with* base-schema t vocab-flakes)
+          refs         (extract-ref-sids (:pred schema))]
+      (-> schema
+          (assoc :refs refs)))))

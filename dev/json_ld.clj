@@ -14,7 +14,46 @@
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
+            [fluree.db.indexer.default :as indexer]
+            [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.log :as log]))
+
+(comment
+
+  (def loaded-ledger @(fluree/load ipfs-conn "fluree:ipns://k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2/test/db2"))
+
+  (->> (fluree/db loaded-ledger)
+      :schema)
+
+  (def dbx (fluree/db loaded-ledger))
+
+  @(fluree/query dbx
+                 {:select [:* {:schema/isBasedOn [:*]}]
+                  :from   :wiki/Q836821})
+
+  (-> (fluree/db ledger)
+      :schema
+      :refs
+      sort)
+
+  (->> (fluree/db ledger)
+       :schema
+       :pred
+       vals
+       set
+       (filter #(true? (:ref? %)))
+       (map :id)
+       sort)
+
+  (->> (fluree/db ledger)
+      :novelty
+      :spot
+      (filter #(and (= 200 (flake/p %)) (= 0 (flake/o %)))))
+
+
+  )
+
+
 
 (comment
 
@@ -22,6 +61,8 @@
                     {:server   nil                          ;; use default
                      ;; ledger defaults used for newly created ledgers
                      :defaults {:ipns    {:key "self"}      ;; publish to ipns by default using the provided key/profile
+                                :indexer {:reindex-min-bytes 100
+                                          :reindex-max-bytes 10000000}
                                 :context {:id     "@id"
                                           :type   "@type"
                                           :schema "http://schema.org/"

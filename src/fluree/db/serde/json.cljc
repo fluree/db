@@ -20,15 +20,30 @@
          :first (some-> child-node :first flake/parts->Flake)
          :rhs   (some-> child-node :rhs flake/parts->Flake)))
 
+(defn- deserialize-ecount
+  "Converts ecount from keywordized keys back to integers."
+  [ecount]
+  (reduce-kv
+    (fn [acc k v]
+      (if (keyword? k)
+        (assoc acc (-> k name util/str->int) v)
+        (throw (ex-info (str "Expected serialized ecount values to be keywords, instead found: " ecount)
+                        {:status 500 :error :db/invalid-index}))))
+    {} ecount))
+
 (defn- deserialize-db-root
+  "Assumes all data comes in as keywordized JSON.
+  :ecount will have string keys converted to keywords. Need to re-convert
+  them to integer keys."
   [db-root]
-  (let [{:keys [spot psot post opst tspo]} db-root]
+  (let [{:keys [spot psot post opst tspo ecount]} db-root]
     (assoc db-root
-           :spot (deserialize-child-node spot)
-           :psot (deserialize-child-node psot)
-           :post (deserialize-child-node post)
-           :opst (deserialize-child-node opst)
-           :tspo (deserialize-child-node tspo))))
+           :ecount (deserialize-ecount ecount)
+           :spot   (deserialize-child-node spot)
+           :psot   (deserialize-child-node psot)
+           :post   (deserialize-child-node post)
+           :opst   (deserialize-child-node opst)
+           :tspo   (deserialize-child-node tspo))))
 
 
 (defn- deserialize-branch-node
@@ -41,6 +56,10 @@
 (defn- deserialize-leaf-node
   [leaf]
   (assoc leaf :flakes (mapv flake/parts->Flake (:flakes leaf))))
+
+(defn- deserialize-garbage
+  [garbage-data]
+  garbage-data)
 
 (defn- stringify-child
   "Stringifies keys for child/index branches, and converts #Flake data
@@ -74,22 +93,19 @@
                      v)))
       {} db-root))
   (-deserialize-db-root [_ db-root]
-    (-> (json/parse db-root)
-        (deserialize-db-root)))
+    (deserialize-db-root db-root))
   (-serialize-branch [_ {:keys [children] :as _branch}]
     {"children" (map stringify-child children)})
   (-deserialize-branch [_ branch]
-    (-> (json/parse branch)
-        (deserialize-branch-node)))
+    (deserialize-branch-node branch))
   (-serialize-leaf [_ leaf]
     {"flakes" (map vec (:flakes leaf))})
   (-deserialize-leaf [_ leaf]
-    (-> (json/parse leaf)
-        (deserialize-leaf-node)))
+    (deserialize-leaf-node leaf))
   (-serialize-garbage [_ garbage]
     (util/stringify-keys garbage))
   (-deserialize-garbage [_ garbage]
-    (json/parse garbage))
+    (deserialize-garbage garbage))
   (-serialize-db-pointer [_ pointer]
     (util/stringify-keys pointer))
   (-deserialize-db-pointer [_ pointer]

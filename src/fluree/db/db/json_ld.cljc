@@ -16,7 +16,10 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.json-ld.transact :as jld-transact])
+            [fluree.db.json-ld.transact :as jld-transact]
+            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.util.log :as log]
+            [fluree.db.json-ld.commit-data :as commit-data])
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -117,7 +120,6 @@
       {:schema-change?  schema-change?
        :setting-change? setting-change?
        :ecount          ecount})))
-
 
 
 (defn- with-t-updated-schema
@@ -391,12 +393,31 @@
   (let [ledger (:ledger db)]
     (ledger-proto/-commit! ledger db opts)))
 
+(defn index-update
+  "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
+  If it is not newer, returns original db."
+  [{:keys [ledger commit] :as db} {index-db :db, :keys [spot psot post opst tspo] :as commit-index}]
+  (let [index-t      (:t index-db)
+        newer-index? (and index-db
+                          (or (nil? (commit-data/index-t commit))
+                              (> index-t (commit-data/index-t commit))))]
+    (if newer-index?
+      (-> db
+          (assoc :commit (assoc commit :index commit-index)
+                 :novelty* (idx-proto/-empty-novelty (:indexer ledger) db (- index-t))
+                 :spot spot
+                 :psot psot
+                 :post post
+                 :opst opst
+                 :tspo tspo)
+          (assoc-in [:stats :indexed] index-t))
+      db)))
 
 ;; ================ end GraphDB record support fns ============================
 
 ;; TODO - conn is included here because current index-range query looks for conn on the db
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
-(defrecord JsonLdDb [ledger conn method alias branch block t tt-id stats
+(defrecord JsonLdDb [ledger conn method alias branch commit block t tt-id stats
                      spot psot post opst tspo
                      schema comparators novelty
                      permissions ecount]
@@ -432,7 +453,8 @@
   (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil))
   (-db-type [_] :json-ld)
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
-  (-stage [db json-ld opts] (jld-transact/stage db json-ld opts)))
+  (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
+  (-index-update [db commit-index] (index-update db commit-index)))
 
 #?(:cljs
    (extend-type JsonLdDb
@@ -491,13 +513,14 @@
         opst        (index/empty-branch method alias opst-cmp)
         tspo        (index/empty-branch method alias tspo-cmp)
         stats       {:flakes 0, :size 0, :indexed 0}
-        schema      (vocab/vocab-map* 0 #{} nil)
+        schema      (vocab/base-schema)
         branch      (branch/branch-meta ledger)]
     (map->JsonLdDb {:ledger      ledger
                     :conn        conn
                     :method      method
                     :alias       alias
-                    :branch      branch
+                    :branch      (:name branch)
+                    :commit      (:commit branch)
                     :block       0
                     :t           0
                     :tt-id       nil
