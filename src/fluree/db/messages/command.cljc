@@ -192,7 +192,6 @@
                   :expire    expire
                   :deps      deps}]
     (-> cmd-data
-        (with-auth private-key opts)
         util/without-nils
         validate)))
 
@@ -239,12 +238,6 @@
   [command]
   {:cmd (json-serialize command)})
 
-(defn with-verified-auth
-  [envelope {:keys [signature signed]}]
-  (assoc envelope
-         :sig    signature
-         :signed signed))
-
 (defn with-signature
   [{:keys [cmd] :as envelope} private-key]
   (let [sig (crypto/sign-message cmd private-key)]
@@ -255,14 +248,45 @@
   (let [id (crypto/sha3-256 cmd)]
     (assoc envelope :id id)))
 
+(defn with-verified-auth
+  [command {:keys [auth signature signed]}]
+  (-> command
+      (assoc :auth auth)
+      validate
+      command->envelope
+      (assoc :sig    signature
+             :signed signed)
+      with-id))
+
+(defn with-private-key
+  [command private-key auth]
+  (let [key-auth-id (crypto/account-id-from-private private-key)
+        auth        (or auth key-auth-id)
+        authority   (when-not (= auth key-auth-id)
+                      key-auth-id)]
+    (-> command
+        (assoc :auth      auth
+               :authority authority)
+        validate
+        command->envelope
+        (with-signature private-key)
+        with-id)))
+
 (defn sign
   ([command private-key]
    (sign command private-key {}))
-  ([command private-key opts]
-   (let [envelope (-> command command->envelope with-id)]
-     (if-let [verified-auth (:verified-auth opts)]
-       (with-verified-auth envelope verified-auth)
-       (with-signature envelope private-key)))))
+  ([command private-key {:keys [auth verified-auth] :as opts}]
+   (cond
+     verified-auth
+     (do (log/debug "Using verified auth:" auth)
+         (with-verified-auth command verified-auth))
+
+     private-key
+     (with-private-key command private-key auth)
+
+     :else
+     (throw (ex-info "Must provide a verified auth or private key to sign commands"
+                     {})))))
 
 (defn build-and-sign-tx
   [txn ledger timestamp private-key opts]
