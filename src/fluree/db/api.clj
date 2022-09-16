@@ -405,7 +405,7 @@
           command   (cmd/->tx-command txn ledger private-key timestamp opts)
           txid      (if private-key
                       (<? (ops/signed-command-async conn command private-key opts))
-                      (<? (ops/unsigned-command-async conn command)))]
+                      (<? (ops/unsigned-command-async conn command opts)))]
       (if txid-only
         txid
         (<? (monitor-tx-async conn ledger txid timeout)))))))

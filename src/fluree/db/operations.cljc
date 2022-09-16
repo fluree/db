@@ -110,8 +110,12 @@
 
   By default transact will monitor completed blocks and only return once it sees
   the successful transaction completed, or it will return with an error."
-  [conn command]
-  (send-operation conn :unsigned-cmd (cmd/validate command)))
+  ([conn command]
+   (unsigned-command-async conn command {}))
+  ([conn command {:keys [auth verified-auth]}]
+   (send-operation conn :unsigned-cmd {:command (cmd/validate command)
+                                       :auth auth
+                                       :verified-auth verified-auth})))
 
 
 (defn ledger-info-async
