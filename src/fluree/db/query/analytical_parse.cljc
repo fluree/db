@@ -926,6 +926,7 @@
                                   groupBy* (add-group-by groupBy*) ;; add :group-by if specified
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
                                   true (add-select-spec query-map'))]
+    (log/debug "parsed query:" parsed)
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
 
