@@ -342,9 +342,10 @@
                                 {:_id top-level-subject}
                                 {})
             acc+refs          (if (get-in select-spec [:select :reverse])
-                                (->> (select-spec->reverse-pred-specs select-spec)
+                                (->> select-spec
+                                     select-spec->reverse-pred-specs
                                      (resolve-reverse-refs db cache fuel max-fuel (flake/s (first flakes)))
-                                     (<?)
+                                     <?
                                      (merge base-acc))
                                 base-acc)
             result            (loop [p-flakes   (partition-by :p flakes)

@@ -8,7 +8,8 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
-                                                          subj-perm-filter-fn filter-subject]]
+                                                          subj-perm-filter-fn filter-subject
+                                                          flake-deserializer-xf]]
             [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -16,7 +17,7 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause}]
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause} parse-json?]
   (let [o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
@@ -38,14 +39,15 @@
         range-set   (flake/sorted-set-by cmp fflake lflake)
         in-range?   (fn [node]
                       (query-range/intersects-range? node range-set))
+        xf          (let [xfs (remove nil? [(when parse-json? (flake-deserializer-xf db))
+                                            ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
+                                            (when filter-fn (map (fn [flakes] (filter filter-fn flakes))))])]
+                      (when (seq xfs) (apply comp xfs)))
         query-xf    (where-subj-xf {:start-test  >=
                                     :start-flake fflake
                                     :end-test    <=
                                     :end-flake   lflake
-                                    ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
-                                    :xf          (when filter-fn
-                                                   (map (fn [flakes]
-                                                          (filter filter-fn flakes))))})
+                                    :xf          xf})
         resolver    (index/->CachedTRangeResolver conn (get novelty idx) t t (:async-cache conn))
         tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)
         return-chan (async/chan 10 (comp (map flake/s)
@@ -116,7 +118,7 @@
       (assoc where-clause :o {:value _id}))))
 
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars finish-fn] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars finish-fn parse-json?] :as opts}]
   (go-try
     (let [{:keys [o p-ref?]} f-where
           vars*     (if ident-vars
@@ -128,7 +130,7 @@
                       f-where)
           sid-ch    (if (= :_id (:type f-where*))
                       (subjects-id-chan db error-ch vars* f-where*)
-                      (subjects-chan db error-ch vars* f-where*))
+                      (subjects-chan db error-ch vars* f-where* parse-json?))
           flakes-af (flakes-xf opts*)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]

@@ -7,10 +7,13 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject]]))
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af
+                                                          subj-perm-filter-fn filter-subject
+                                                          flake-deserializer-xf]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -35,29 +38,37 @@
             (async/close! port))
           (catch* e (async/put! error-ch e) (async/close! port) nil))))))
 
+
 (defn subj-flakes-chan
   "Returns a channel that has a stream of flakes grouped by subject id.
   Always uses :spot index."
-  [{:keys [conn novelty t spot] :as db} error-ch vars {:keys [o] :as _where-clause}]
-  (let [rdf-type    (or (:value o)
-                        (get vars (:variable o)))
-        cid         (or (dbproto/-c-prop db :id rdf-type)
-                        (throw (ex-info (str "Invalid data type: " rdf-type)
-                                        {:status 400 :error :db/invalid-query})))
-        fflake      (flake/->Flake (flake/max-subject-id cid) -1 nil nil nil util/min-integer)
-        lflake      (flake/->Flake (flake/min-subject-id cid) util/max-integer nil nil nil util/max-integer)
-        cmp         (:comparator spot)
-        range-set   (flake/sorted-set-by cmp fflake lflake)
-        in-range?   (fn [node]
-                      (query-range/intersects-range? node range-set))
-        query-xf    (where-subj-xf {:start-test  >=
-                                    :start-flake fflake
-                                    :end-test    <=
-                                    :end-flake   lflake
-                                    :return-type :flake-by-sid})
-        resolver    (index/->CachedTRangeResolver conn (:spot novelty) t t (:async-cache conn))
-        tree-chan   (index/tree-chan resolver spot in-range? query-range/resolved-leaf? 1 query-xf error-ch)
-        return-chan (async/chan 10 (partition-by flake/s))]
+  [{:keys [conn novelty t spot] :as db} error-ch vars {:keys [o] :as _where-clause} parse-json?]
+  (let [rdf-type     (or (:value o)
+                         (get vars (:variable o)))
+        cid          (or (dbproto/-c-prop db :id rdf-type)
+                         (throw (ex-info (str "Invalid data type: " rdf-type)
+                                         {:status 400 :error :db/invalid-query})))
+        fflake       (flake/->Flake (flake/max-subject-id cid) -1 nil nil nil util/min-integer)
+        lflake       (flake/->Flake (flake/min-subject-id cid) util/max-integer nil nil nil util/max-integer)
+        cmp          (:comparator spot)
+        range-set    (flake/sorted-set-by cmp fflake lflake)
+        in-range?    (fn [node]
+                       (query-range/intersects-range? node range-set))
+        flake-xf     (when parse-json?
+                       (log/debug "subj-flakes-chan parsing JSON")
+                       (flake-deserializer-xf db))
+        subj-xf-opts {:start-test  >=
+                      :start-flake fflake
+                      :end-test    <=
+                      :end-flake   lflake
+                      :return-type :flake-by-sid}
+        subj-xf-opts (if flake-xf
+                       (assoc subj-xf-opts :xf flake-xf)
+                       subj-xf-opts)
+        query-xf     (where-subj-xf subj-xf-opts)
+        resolver     (index/->CachedTRangeResolver conn (:spot novelty) t t (:async-cache conn))
+        tree-chan    (index/tree-chan resolver spot in-range? query-range/resolved-leaf? 1 query-xf error-ch)
+        return-chan  (async/chan 10 (partition-by flake/s))]
     (async/go-loop []
       (let [next-chunk (<! tree-chan)]
         (if (nil? next-chunk)
@@ -75,9 +86,9 @@
     return-chan))
 
 (defn rdf-type-crawl
-  [{:keys [db error-ch f-where limit offset parallelism finish-fn vars] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism finish-fn vars parse-json?] :as opts}]
   (go-try
-    (let [subj-ch   (subj-flakes-chan db error-ch vars f-where)
+    (let [subj-ch   (subj-flakes-chan db error-ch vars f-where parse-json?)
           flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
           result-ch (async/chan)]
 

@@ -913,7 +913,7 @@
         parsed            (cond-> {:strategy      :legacy
                                    :rel-binding?  rel-binding?
                                    :where         (parse-where db query-map' supplied-var-keys)
-                                   :opts          opts
+                                   :opts          (-> opts (assoc :parse-json? (:parseJSON opts)) (dissoc :parseJSON))
                                    :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
                                    :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts
                                    :fuel          (get-max-fuel query-map')

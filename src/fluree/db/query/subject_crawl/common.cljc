@@ -6,6 +6,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
+            [fluree.db.util.json :as json]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.query.fql-resp :refer [flakes->res]]))
@@ -151,3 +152,23 @@
                                  "Provided: " v)
                             {:status 400 :error :db/invalid-query}))))
         vars*))))
+
+(defn pred-id->pred-type*
+  [db pred-id]
+  (dbproto/-p-prop db :type pred-id))
+
+(def pred-id->pred-type (memoize pred-id->pred-type*))
+
+(defn flake->pred-type
+  [db flake]
+  (->> flake flake/p (pred-id->pred-type db)))
+
+(defn flake-deserializer-xf
+  [db]
+  (map (fn [flakes]
+         (map (fn [flake]
+                (let [pred-type (flake->pred-type db flake)]
+                  (if (= :json pred-type)
+                    (update flake :o json/parse)
+                    flake)))
+              flakes))))
