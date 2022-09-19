@@ -198,7 +198,7 @@
     {} m))
 
 (defn str->epoch-ms
-  "Takes time as a string and returns an java.time.Instant."
+  "Takes time as a string and returns epoch millis."
   [time-str]
   (try
     #?(:clj  (.toEpochMilli (Instant/parse time-str))

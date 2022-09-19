@@ -214,7 +214,7 @@
   (go-try
     (let [iris           (volatile! {})
           refs           (volatile! (-> db :schema :refs))
-          db-address     (get-in commit [const/iri-db const/iri-address :value])
+          db-address     (get-in commit [const/iri-data const/iri-address :value])
           db-data        (<? (read-commit conn db-address))
           t-new          (- (db-t db-data))
           _              (when (and (not= t-new (dec t))
@@ -252,10 +252,10 @@
     (loop [commit  latest-commit
            last-t  nil
            commits (list)]
-      (let [dbid        (get-in commit [const/iri-db :id])
-            db-address  (get-in commit [const/iri-db const/iri-address :value])
+      (let [dbid        (get-in commit [const/iri-data :id])
+            db-address  (get-in commit [const/iri-data const/iri-address :value])
             prev-commit (get-in commit [const/iri-prevCommit const/iri-address :value])
-            commit-t    (get-in commit [const/iri-db const/iri-t :value])
+            commit-t    (get-in commit [const/iri-data const/iri-t :value])
             commits*    (conj commits commit)]
         (when (or (nil? commit-t)
                   (and last-t (not= (dec last-t) commit-t)))
@@ -309,13 +309,13 @@
                                                (-> (select-keys db-base index/types)
                                                    (assoc :commit-address commit-address)))
           db-base*   (assoc db-base :commit commit-map)
-          through-t  (if-let [index-t (commit-data/index-t commit-map)]
-                       (inc index-t)
-                       1)
-          commits    (<? (trace-commits conn latest-commit through-t))]
-      (loop [[commit & r] commits
-             db* db-base*]
-        (if commit
-          (let [new-db (<? (merge-commit conn db* commit merged-db?))]
-            (recur r new-db))
-          db*)))))
+          index-t    (commit-data/index-t commit-map)
+          commit-t   (commit-data/t commit-map)]
+      (if (= commit-t index-t)
+        db-base*                                            ;; if index-t is same as latest commit, no additional commits to load
+        (loop [[commit & r] (<? (trace-commits conn latest-commit (inc index-t))) ;; TODO - can load in parallel
+               db* db-base*]
+          (if commit
+            (let [new-db (<? (merge-commit conn db* commit merged-db?))]
+              (recur r new-db))
+            db*))))))

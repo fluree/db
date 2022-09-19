@@ -23,19 +23,19 @@
    :message     "optional commit message"
    :prev-commit {:id      "fluree:commit:sha256:ljklj"
                  :address "previous commit address"}        ;; previous commit address
-   ;; database information commit refers to:
-   :db          {:id      "fluree:db:sha256:lkjlkjlj"       ;; db's unique identifier
+   ;; data information commit refers to:
+   :data        {:id      "fluree:db:sha256:lkjlkjlj"       ;; db's unique identifier
                  :t       52
-                 :address "fluree:ipfs://sdfsdfgfdgk"       ;; address to locate db
+                 :address "fluree:ipfs://sdfsdfgfdgk"       ;; address to locate data file / db
                  :flakes  4242424
                  :size    123145}
    ;; name service(s) used to manage global ledger state
-   :fns         {:id   "fluree:ipns://data.flur.ee/my/db"   ;; one (or more) Fluree Name Services that can be consulted for the latest ledger state
-                 :type [:FNS]}
+   :ns          {:id  "fluree:ipns://data.flur.ee/my/db"    ;; one (or more) Name Services that can be consulted for the latest ledger state
+                 :foo ""}                                   ;; each name service can contain additional data relevant to it
    ;; latest index (note the index roots below are not recorded into JSON-LD commit file, but short-cut when internally managing transitions)
    :index       {:id      "fluree:index:sha256:fghfgh"      ;; unique id (hash of root) of index
                  :address "fluree:ipfs://lkjdsflkjsdf"      ;; address to get to index 'root'
-                 :db      {:id      "fluree:db:sha256:lkjlkjlj" ;; db of last index unique identifier
+                 :data    {:id      "fluree:db:sha256:lkjlkjlj" ;; db of last index unique identifier
                            :t       42
                            :address "fluree:ipfs://sdfsdfgfdgk" ;; address to locate db
                            :flakes  4240000
@@ -60,7 +60,7 @@
    ["tag" :tag]
    ["message" :message]
    ["prevCommit" :prev-commit]                              ;; refer to :prev-commit template
-   ["db" :db]                                               ;; refer to :db template
+   ["data" :data]                                           ;; refer to :data template
    ["fns" :fns]                                             ;; refer to :fns template
    ["index" :index]])                                       ;; refer to :fns template
 
@@ -70,7 +70,7 @@
    ["type" ["Commit"]]
    ["address" :address]])
 
-(def json-ld-db-template
+(def json-ld-data-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["id" :id]
    ["type" ["DB"]]
@@ -79,7 +79,7 @@
    ["flakes" :flakes]
    ["size" :size]])
 
-(def json-ld-fns-template
+(def json-ld-ns-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
   [["id" :id]
    ["type" ["FNS"]]])
@@ -89,7 +89,7 @@
   [["id" :id]
    ["type" ["Index"]]
    ["address" :address]
-   ["db" :db]])
+   ["data" :data]])
 
 (defn merge-template
   "Merges provided map with template and places any
@@ -121,13 +121,13 @@
   that exist in both the commit-map and the json-ld template,
   except for some defaults (like rdf:type) which are not in
   our internal commit map, but are part of json-ld."
-  [{:keys [prev-commit db fns index] :as commit-map}]
+  [{:keys [prev-commit data fns index] :as commit-map}]
   (let [commit-map* (assoc commit-map
                       :prev-commit (merge-template prev-commit json-ld-prev-commit-template)
-                      :db (merge-template db json-ld-db-template)
-                      :fns (merge-template fns json-ld-fns-template)
-                      :index (-> (merge-template (:db index) json-ld-db-template) ;; index has an embedded db map
-                                 (#(assoc index :db %))
+                      :data (merge-template data json-ld-data-template)
+                      :fns (merge-template fns json-ld-ns-template)
+                      :index (-> (merge-template (:data index) json-ld-data-template) ;; index has an embedded db map
+                                 (#(assoc index :data %))
                                  (merge-template json-ld-index-template)))]
     (merge-template commit-map* json-ld-base-template)))
 
@@ -157,8 +157,8 @@
          tag         const/iri-tag,
          message     const/iri-message
          prev-commit const/iri-prevCommit,
-         db          const/iri-db,
-         fns         const/iri-fns,
+         data        const/iri-data,
+         ns          const/iri-ns,
          index       const/iri-index} commit-json-ld
         db-object (fn [{id      :id,
                         t       const/iri-t,
@@ -183,18 +183,18 @@
      :prev-commit {:id      (:id prev-commit)
                    :address (get-in prev-commit [const/iri-address :value])} ;; previous commit address
      ;; database information commit refers to:
-     :db          (db-object db)
+     :data        (db-object data)
      ;; name service(s) used to manage global ledger state
      ;; TODO - flesh out with final fns data structure
-     :fns         (when fns                                 ;; one (or more) Fluree Name Services that can be consulted for the latest ledger state
-                    (if (sequential? fns)
-                      (mapv (fn [namespace] {:id (:id namespace)}) fns)
-                      {:id (:id fns)}))
+     :ns          (when ns                                  ;; one (or more) Fluree Name Services that can be consulted for the latest ledger state
+                    (if (sequential? ns)
+                      (mapv (fn [namespace] {:id (:id namespace)}) ns)
+                      {:id (:id ns)}))
      ;; latest index (note the index roots below are not recorded into JSON-LD commit file, but short-cut when internally managing transitions)
      :index       (when index
                     {:id      (:id index)                   ;; unique id (hash of root) of index
                      :address (get-in index [const/iri-address :value]) ;; address to get to index 'root'
-                     :db      (db-object (get index const/iri-db))
+                     :data    (db-object (get index const/iri-data))
                      :spot    spot                          ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
                      :psot    psot
                      :post    post
@@ -245,11 +245,11 @@
   the indexing process (which contains the db info used for the index), the
   index id, index address and optionally index-type-addresses which contain
   the address for each index type top level branch node."
-  [indexed-db id address index-type-address]
+  [data-map id address index-root-maps]
   (merge {:id      id
           :address address
-          :db      indexed-db}
-         index-type-address))
+          :data    data-map}
+         index-root-maps))
 
 (defn update-index
   "Updates an existing commit with recently completed index data.
@@ -260,8 +260,8 @@
   Verifies commit-index is at least as current as the index in the commit map, else
   just returns original commit map."
   [commit-map new-commit-index]
-  (let [{existing-index-db :db} (:index commit-map)
-        {new-index-db :db} new-commit-index]
+  (let [{existing-index-db :data} (:index commit-map)
+        {new-index-db :data} new-commit-index]
     (if (and existing-index-db
              (> (:t existing-index-db) (:t new-index-db)))
       commit-map
@@ -270,12 +270,12 @@
 (defn t
   "Given a commit map, returns the t value of the commit."
   [commit-map]
-  (-> commit-map :db :t))
+  (-> commit-map :data :t))
 
 (defn index-t
   "Given a commit map, returns the t value of the index (if exists)."
   [commit-map]
-  (-> commit-map :index :db :t))
+  (-> commit-map :index :data :t))
 
 
 (defn older-t?
@@ -309,7 +309,7 @@
     new-commit))
 
 (defn new-db-commit
-  "Returns the :db portion of the commit map for a new db commit."
+  "Returns the :data portion of the commit map for a new db commit."
   [dbid t db-address flakes size]
   {:id      dbid                                            ;; db's unique identifier
    :t       (- t)
@@ -325,9 +325,9 @@
   (let [db-commit   (new-db-commit dbid t db-address flakes size)
         prev-commit (not-empty (select-keys old-commit [:id :address]))
         commit      (-> old-commit
-                        (dissoc :id :address :db :time :message :tag :prev-commit)
+                        (dissoc :id :address :data :time :message :tag :prev-commit)
                         (assoc :address ""
-                               :db db-commit
+                               :data db-commit
                                :time (util/current-time-iso)))]
     (cond-> commit
             prev-commit (assoc :prev-commit prev-commit)
@@ -335,8 +335,8 @@
             tag (assoc :tag tag))))
 
 (defn update-db
-  "Updates the :db portion of the commit map to represent a saved new db update."
+  "Updates the :data portion of the commit map to represent a saved new db update."
   [commit-map dbid t db-address flakes size]
-  (assoc commit-map :db (new-db-commit dbid t db-address flakes size)))
+  (assoc commit-map :data (new-db-commit dbid t db-address flakes size)))
 
 

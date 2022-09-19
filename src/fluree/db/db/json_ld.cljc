@@ -396,9 +396,9 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [ledger commit] :as db} {index-db :db, :keys [spot psot post opst tspo] :as commit-index}]
-  (let [index-t      (:t index-db)
-        newer-index? (and index-db
+  [{:keys [ledger commit] :as db} {data-map :data, :keys [spot psot post opst tspo] :as commit-index}]
+  (let [index-t      (:t data-map)
+        newer-index? (and data-map
                           (or (nil? (commit-data/index-t commit))
                               (> index-t (commit-data/index-t commit))))]
     (if newer-index?

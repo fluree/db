@@ -471,7 +471,7 @@
                        index-address (:address db-root-res)
                        ;; TODO - generate our own internal hash for the index id.
                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
-                       commit-index  (commit-data/new-index (-> indexed-db :commit :db)
+                       commit-index  (commit-data/new-index (-> indexed-db :commit :data)
                                                             index-id
                                                             index-address
                                                             (select-keys indexed-db index/types))
