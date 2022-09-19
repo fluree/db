@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.fns
   (:refer-clojure :exclude [max min get inc dec + - * / quot mod == rem contains? get-in < <= > >=
-                            boolean re-find and or count str nth rand nil? hash-set empty? not uuid subs not=])
+                            boolean re-find and or count str nth first rand nil? hash-set empty? not uuid subs not=])
   (:require [fluree.db.dbfunctions.internal :as fdb]
             [fluree.db.util.log :as log]
             [fluree.db.util.json :as json]
@@ -78,6 +78,20 @@
           res   (fdb/nth coll key)
           cost  (clojure.core/+ 9 (clojure.core/count coll))
           entry [{:function "nth" :arguments [coll key] :result res} cost]]
+      (add-stack ?ctx entry)
+      res)))
+
+(defn first
+  {:doc "Returns the first item in a collection"
+   :fdb/spec nil
+   :fdb/cost 10}
+  [?ctx coll]
+  (go-try
+    (let [coll (extract coll)
+          coll (if (set? coll) (vec coll) coll)
+          res (fdb/first coll)
+          cost 10
+          entry [{:function "first" :arguments [coll] :result res} cost]]
       (add-stack ?ctx entry)
       res)))
 
@@ -288,7 +302,7 @@
           pred     (extract pred)
           subject' (if (vector? subject)
                      (if (= 1 (clojure.core/count subject))
-                       (first subject)
+                       (clojure.core/first subject)
                        subject)
                      subject)
           res      (cond
@@ -344,7 +358,7 @@
           path     (extract path)
           subject' (if (vector? subject)
                      (if (= 1 (clojure.core/count subject))
-                       (first subject)
+                       (clojure.core/first subject)
                        subject)
                      subject)
           sid?     (int? subject')
@@ -399,7 +413,9 @@
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
-          args' (if (clojure.core/and (= 1 (clojure.core/count args)) (coll? (first args))) (first args) args)
+          args' (if (clojure.core/and (= 1 (clojure.core/count args)) (coll? (clojure.core/first args)))
+                  (clojure.core/first args)
+                  args)
           res   (apply fdb/hash-set args')
           cost  (clojure.core/+ 9 (clojure.core/count [args']))
           entry [{:function "hash-set" :arguments [args'] :result res} cost]]
