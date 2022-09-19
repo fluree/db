@@ -340,14 +340,27 @@
   If the filter fn uses a var not found in a where statement, throws
   an exception"
   [where {:keys [variable] :as filter-fn-map}]
-  (loop [[{:keys [o] :as where-smt} & r] where
+  (log/debug "add-filter-where where:" where "- filter-fn-map:" filter-fn-map)
+  (loop [[{:keys [o type] :as where-smt} & r] where
          found-var? false
          where*     []]
+    (log/debug "add-filter-where loop where-smt:" where-smt "- found-var?:" found-var?
+               "- where*:" where*)
     (if where-smt
-      (let [match? (= variable (:variable o))]
-        (if match?
+      (cond
+        (= :optional type)
+        (do
+          (log/debug "add-filter-where loop handling optional")
+          (recur (concat (:where where-smt) r) found-var? (conj where* where-smt)))
+
+        (= variable (:variable o))
+        (do
+          (log/debug "add-filter-where loop found match")
           (recur r true (conj where* (assoc where-smt :o {:variable variable
-                                                          :filter   filter-fn-map})))
+                                                          :filter   filter-fn-map}))))
+        :else
+        (do
+          (log/debug "add-filter-where loop default case")
           (recur r found-var? (conj where* where-smt))))
       (if found-var?
         where*
