@@ -26,11 +26,13 @@
 
 
 (defn result-af
-  [{:keys [db cache fuel-vol max-fuel select-spec error-ch] :as _opts}]
+  [{:keys [db cache fuel-vol max-fuel select-spec error-ch parse-json?] :as _opts}]
   (fn [flakes port]
     (go
       (try*
-        (some->> (<? (flakes->res db cache fuel-vol max-fuel select-spec flakes))
+        (some->> flakes
+                 (flakes->res db cache fuel-vol max-fuel select-spec {:parse-json? parse-json?})
+                 <?
                  not-empty
                  (async/put! port))
         (async/close! port)
@@ -153,22 +155,3 @@
                             {:status 400 :error :db/invalid-query}))))
         vars*))))
 
-(defn pred-id->pred-type*
-  [db pred-id]
-  (dbproto/-p-prop db :type pred-id))
-
-(def pred-id->pred-type (memoize pred-id->pred-type*))
-
-(defn flake->pred-type
-  [db flake]
-  (->> flake flake/p (pred-id->pred-type db)))
-
-(defn flake-deserializer-xf
-  [db]
-  (map (fn [flakes]
-         (map (fn [flake]
-                (let [pred-type (flake->pred-type db flake)]
-                  (if (= :json pred-type)
-                    (update flake :o json/parse)
-                    flake)))
-              flakes))))

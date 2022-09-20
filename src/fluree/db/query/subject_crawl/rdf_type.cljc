@@ -12,8 +12,7 @@
             [fluree.db.util.schema :as schema-util]
             [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af
-                                                          subj-perm-filter-fn filter-subject
-                                                          flake-deserializer-xf]]))
+                                                          subj-perm-filter-fn filter-subject]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -54,18 +53,11 @@
         range-set    (flake/sorted-set-by cmp fflake lflake)
         in-range?    (fn [node]
                        (query-range/intersects-range? node range-set))
-        flake-xf     (when parse-json?
-                       (log/debug "subj-flakes-chan parsing JSON")
-                       (flake-deserializer-xf db))
-        subj-xf-opts {:start-test  >=
-                      :start-flake fflake
-                      :end-test    <=
-                      :end-flake   lflake
-                      :return-type :flake-by-sid}
-        subj-xf-opts (if flake-xf
-                       (assoc subj-xf-opts :xf flake-xf)
-                       subj-xf-opts)
-        query-xf     (where-subj-xf subj-xf-opts)
+        query-xf     (where-subj-xf {:start-test  >=
+                                     :start-flake fflake
+                                     :end-test    <=
+                                     :end-flake   lflake
+                                     :return-type :flake-by-sid})
         resolver     (index/->CachedTRangeResolver conn (:spot novelty) t t (:async-cache conn))
         tree-chan    (index/tree-chan resolver spot in-range? query-range/resolved-leaf? 1 query-xf error-ch)
         return-chan  (async/chan 10 (partition-by flake/s))]
@@ -88,9 +80,9 @@
 (defn rdf-type-crawl
   [{:keys [db error-ch f-where limit offset parallelism finish-fn vars parse-json?] :as opts}]
   (go-try
-    (let [subj-ch   (subj-flakes-chan db error-ch vars f-where parse-json?)
-          flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
-          result-ch (async/chan)]
+    (let [subj-ch       (subj-flakes-chan db error-ch vars f-where parse-json?)
+          flakes-ch     (async/chan 32 (comp (drop offset) (take limit)))
+          result-ch     (async/chan)]
 
       ;; take stream of flakes grouped by subject and runs through filtering and permissioning
       (async/pipeline-async parallelism flakes-ch (flakes-xf opts) subj-ch)

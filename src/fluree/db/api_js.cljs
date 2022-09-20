@@ -302,7 +302,7 @@
            rest-flakes (rest flakes)
            acc         []]
       ; flakes->res should never be called as a test from format-flake-group-pretty, as this is for block and history
-      (let [flake-res (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} flake-group))
+      (let [flake-res (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} {} flake-group))
             acc'      (concat acc [flake-res])]
         (if (first rest-flakes)
           (recur (first rest-flakes) (rest rest-flakes) acc')
