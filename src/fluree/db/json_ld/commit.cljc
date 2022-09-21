@@ -48,7 +48,7 @@
 
 
 (defn- subject-block
-  [s-flakes {:keys [schema] :as db} iri-map ctx compact-fn]
+  [s-flakes {:keys [schema] :as db} iri-map ^clojure.lang.Volatile ctx compact-fn]
   (go-try
     (loop [[flake & r] s-flakes
            assert  nil
