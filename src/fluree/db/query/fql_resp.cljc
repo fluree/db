@@ -7,13 +7,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [clojure.set :as set]
-            [fluree.db.query.analytical :as analytical]
-            [fluree.db.query.schema :as schema]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
-            [fluree.db.query.analytical-parse :as q-parse])
+            [fluree.db.util.async :refer [<? go-try]])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -84,9 +78,9 @@
 
 (defn resolve-reverse-refs
   "Resolves all reverse references into a result map."
-  [db cache fuel max-fuel subject-id reverse-refs-specs]
+  [db cache fuel max-fuel subject-id opts reverse-refs-specs]
   (go-try
-    (loop [[n & r] reverse-refs-specs                       ;; loop through reverse refs
+    (loop [[n & r] reverse-refs-specs ;; loop through reverse refs
            acc nil]
       (if-not n
         acc
@@ -113,7 +107,8 @@
                                                    acc'
                                                    (do
                                                      (when fuel (add-fuel fuel (count sub-flakes) max-fuel))
-                                                     (conj acc' (<? (flakes->res db cache fuel max-fuel sub-pred-spec {} sub-flakes)))))]
+                                                     (conj acc' (<? (flakes->res db cache fuel max-fuel sub-pred-spec
+                                                                                 opts sub-flakes)))))]
                                (recur r' (inc n) acc'*))))]
           (recur r (assoc acc (or as name p) sub-result)))))))
 
@@ -141,8 +136,8 @@
   ([fuel max-fuel fuel-per]
    (fn [xf]
      (fn
-       ([] (xf))                                            ;; transducer start
-       ([result] (xf result))                               ;; transducer stop
+       ([] (xf)) ;; transducer start
+       ([result] (xf result)) ;; transducer stop
        ([result flake]
         (vswap! fuel + fuel-per)
         (when (and max-fuel (> @fuel max-fuel))
@@ -180,9 +175,8 @@
             (cond (empty? acc) results
                   multi? (assoc results as acc)
                   :else (assoc results as (first acc)))
-            (let [recur-subject (flake/o flake)                 ;; ref, so recur subject is the object of the incoming flake
+            (let [recur-subject (flake/o flake) ;; ref, so recur subject is the object of the incoming flake
                   seen?         (contains? recur-seen recur-subject) ;; subject has been seen before, stop recursion
-
                   sub-flakes    (cond->> (<? (query-range/index-range db :spot = [recur-subject]))
                                          fuel (sequence (fuel-flake-transducer fuel max-fuel)))
                   skip?         (or seen? (empty? sub-flakes))
@@ -206,7 +200,7 @@
   all with the same subject and predicate values."
   [db cache fuel max-fuel acc pred-spec flakes componentFollow? recur? offset-map opts]
   (go-try
-    (let [compact?   (:compact? pred-spec)                 ;retain original value
+    (let [compact?   (:compact? pred-spec) ;retain original value
           pred-spec  (if (and (:wildcard? pred-spec) (nil? (:as pred-spec)))
                        ;; nested 'refs' can be wildcard, but also have a pred-spec... so only get a default wildcard spec if we have no other spec
                        (wildcard-pred-spec db cache (-> flakes first :p) (:compact? pred-spec))
@@ -325,14 +319,6 @@
              offset (drop offset)
              limit (take limit)) res))
 
-(defn parse-json-flakes
-  [db flakes]
-  (log/debug "parse-json-flakes flakes:" flakes)
-  ;; TODO: Should we cache predicate id -> type mappings?
-  (map #(if (= :json (->> % flake/p (dbproto/-p-prop db :type)))
-          (update % :o json/parse)
-          %)
-       flakes))
 
 (defn flakes->res
   "Takes a sequence of flakes of the same subject and
@@ -347,37 +333,37 @@
                                 (catch* e
                                   (log/error e)
                                   (throw e)))
-            _ (log/debug "flakes->res top-level-subject:" top-level-subject)
+            _                 (log/debug "flakes->res top-level-subject:" top-level-subject)
             select-spec       (if (has-ns-lookups? base-select-spec)
                                 (full-select-spec db cache base-select-spec top-level-subject)
                                 base-select-spec)
-            _ (log/debug "flakes->res select-spec:" select-spec)
+            _                 (log/debug "flakes->res select-spec:" select-spec)
             base-acc          (if (or (:wildcard? select-spec) (:id? select-spec))
                                 {:_id top-level-subject}
                                 {})
-            _ (log/debug "flakes->res base-acc:" base-acc)
+            _                 (log/debug "flakes->res base-acc:" base-acc)
             acc+refs          (if (get-in select-spec [:select :reverse])
                                 (->> select-spec
                                      select-spec->reverse-pred-specs
-                                     (resolve-reverse-refs db cache fuel max-fuel (flake/s (first flakes)))
+                                     (resolve-reverse-refs db cache fuel max-fuel (flake/s (first flakes)) opts)
                                      <?
                                      (merge base-acc))
                                 base-acc)
-            _ (log/debug "flakes->res acc+refs:" acc+refs)
+            _                 (log/debug "flakes->res acc+refs:" acc+refs)
             result            (loop [p-flakes   (partition-by :p flakes)
                                      acc        acc+refs
                                      offset-map {}]
                                 (if (empty? p-flakes)
                                   acc
-                                  (let [flakes           (first p-flakes)
-                                        _ (log/debug "flakes->res loop flakes:" flakes)
+                                  (let [flakes              (first p-flakes)
+                                        _                   (log/debug "flakes->res loop flakes:" flakes)
                                         deserialized-flakes (if parse-json?
-                                                              (parse-json-flakes db flakes)
+                                                              (json/parse-json-flakes db flakes)
                                                               flakes)
-                                        pred-spec        (get-in select-spec [:select :pred-id
-                                                                              (-> deserialized-flakes first :p)])
-                                        _ (log/debug "flakes->res pred-spec:" pred-spec)
-                                        componentFollow? (component-follow? pred-spec select-spec)
+                                        pred-spec           (get-in select-spec [:select :pred-id
+                                                                                 (-> deserialized-flakes first :p)])
+                                        _                   (log/debug "flakes->res pred-spec:" pred-spec)
+                                        componentFollow?    (component-follow? pred-spec select-spec)
                                         [acc flakes' offset-map'] (cond
                                                                     (:recur pred-spec)
                                                                     [(<? (flake->recur db deserialized-flakes pred-spec
@@ -407,9 +393,9 @@
 
                                                                     :else
                                                                     [acc (rest p-flakes) offset-map])
-                                        acc*             (assoc acc :_id (-> deserialized-flakes first :s))]
+                                        acc*                (assoc acc :_id (-> deserialized-flakes first :s))]
                                     (recur flakes' acc* offset-map'))))
-            _ (log/debug "flakes->res result:" result)
+            _                 (log/debug "flakes->res result:" result)
             sort-preds        (reduce (fn [acc spec]
                                         (log/debug "flakes->res sort-preds acc:" acc)
                                         (if (or (and (:multi? spec) (:orderBy spec))
