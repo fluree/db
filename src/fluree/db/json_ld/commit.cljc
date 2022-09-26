@@ -15,7 +15,8 @@
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.json-ld.vocab :as vocab]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -148,8 +149,8 @@
 
 (defn- enrich-commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
-  [{:keys [ledger branch schema t commit stats] :as db}
-   {:keys [context did private message tag push?] :as _opts}]
+  [{:keys [ledger branch schema t commit stats] :as _db}
+   {:keys [context did private push?] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
                             (:context schema))
@@ -167,7 +168,7 @@
     {:alias          (ledger-proto/-alias ledger)
      :push?          (not (false? push?))
      :t              (- t)
-     :v              1.0
+     :v              0
      :prev-commit    (:address commit)
      :prev-dbid      (:dbid commit)
      :ledger-address nil                                    ;; TODO
@@ -218,10 +219,11 @@
 
 (defn ledger-update-jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [db {:keys [type-key compact ctx-used-atom t v prev-dbid id-key stats] :as commit-opts}]
+  [{:keys [commit] :as db} {:keys [type-key compact ctx-used-atom t v id-key stats] :as commit-opts}]
   (go-try
-    (let [{:keys [assert retract refs-ctx]} (<? (commit-opts->data db commit-opts))
-          prev-db-key (compact const/iri-prevDB)
+    (let [prev-dbid   (commit-data/data-id commit)
+          {:keys [assert retract refs-ctx]} (<? (commit-opts->data db commit-opts))
+          prev-db-key (compact const/iri-previous)
           assert-key  (compact const/iri-assert)
           retract-key (compact const/iri-retract)
           refs-ctx*   (cond-> refs-ctx
@@ -244,12 +246,96 @@
                           (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
       (with-meta db-json* {:dbid dbid}))))
 
+(defn add-commit-flakes-to-db
+  "ecount and sid must be updated prior to calling this."
+  [db flakes]
+  (let [{:keys [novelty]} db
+        {:keys [spot psot post opst tspo]} novelty
+        size (flake/size-bytes flakes)]
+    (assoc db :novelty {:spot (into spot flakes)
+                        :psot (into psot flakes)
+                        :post (into post flakes)
+                        :opst opst
+                        :tspo (into tspo flakes)
+                        :size (+ (:size novelty) size)}
+              :stats (-> (:stats db)
+                         (update :size + size)
+                         (update :flakes + (count flakes))))))
+
+(defn add-commit-schema-flakes
+  [{:keys [schema] :as db} t]
+  (let [schema-flakes [(flake/->Flake const/$_block:hash const/$iri const/iri-time t true nil)
+                       (flake/->Flake const/$_block:hash const/$rdf:type const/$iri t true nil)
+                       (flake/->Flake const/$_block:transactions const/$iri const/iri-commit t true nil)
+                       (flake/->Flake const/$_block:transactions const/$rdf:type const/$iri t true nil)
+                       ;(flake/->Flake const/$_block:prevHash const/$iri const/iri-previous t true nil)
+                       ;(flake/->Flake const/$_block:prevHash const/$rdf:type const/$iri t true nil)
+                       (flake/->Flake const/$_block:instant const/$iri const/iri-time t true nil)
+                       (flake/->Flake const/$_block:ledgers const/$iri const/iri-message t true nil) ;; reused $_block:ledgers as commit message
+                       (flake/->Flake const/$_block:number const/$iri const/iri-tag t true nil) ;; reused $_block:number as commit tags
+                       (flake/->Flake const/$_block:sigs const/$iri const/iri-issuer t true nil)
+                       (flake/->Flake const/$_block:sigs const/$rdf:type const/$iri t true nil)]
+        db*           (add-commit-flakes-to-db db schema-flakes)]
+    (log/warn "ADDED SCHEMA FLAKES!: " schema-flakes)
+    (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
+
+(defn add-commit-flakes
+  [{:keys [commit] :as db}]
+  (go-try
+    (let [last-sid       (volatile! (jld-ledger/last-commit-sid db))
+          next-sid       (fn [] (vswap! last-sid inc))
+          {:keys [message tag time id data previous issuer]} commit
+          _              (log/warn "commit id, prev-commit: " id previous)
+          {db-id :id, db-address :address, db-t :t} data
+          t              (- db-t)
+          db*            (if (= 1 db-t)
+                           (add-commit-schema-flakes db t)
+                           db)
+          db-address-sid (next-sid)
+          commit-sid     (next-sid)
+          tag-flakes     (when tag
+                           (let [tags (if (sequential? tag) tag [tag])]
+                             (loop [[tag & r] tags
+                                    flakes []]
+                               (if tag
+                                 (if-let [existing-sid (<? (dbproto/-subid db* tag))]
+                                   (recur r (conj flakes (flake/->Flake commit-sid const/$_block:number existing-sid t true nil)))
+                                   (let [new-sid (next-sid)]
+                                     (recur r (conj flakes
+                                                    (flake/->Flake new-sid const/$iri tag t true nil)
+                                                    (flake/->Flake t const/$_block:number new-sid t true nil)))))
+                                 flakes))))
+          issuer-flakes  (when-let [issuer-iri (:id issuer)]
+                           (let [issuer-sid   (<? (dbproto/-subid db* issuer-iri))
+                                 issuer-flake (when-not issuer-sid
+                                                (flake/->Flake (next-sid) const/$iri issuer-iri t true nil))]
+
+                             (cond-> [(flake/->Flake commit-sid const/$_block:sigs issuer-sid t true nil)]
+                                     issuer-flake (conj issuer-flake))))
+          flakes         (cond-> [(flake/->Flake t const/$iri db-id t true nil)
+                                  ;; TODO - add @type: DB into default data flakes?
+                                  ;; link db to associated commit meta
+                                  (flake/->Flake t const/$_block:transactions commit-sid t true nil)
+                                  ;; commit flakes below
+                                  (flake/->Flake commit-sid const/$_block:instant time t true nil)]
+                                 ;; if address for db exists
+                                 db-address (into [(flake/->Flake t const/$_block:hash db-address-sid t true nil)
+                                                   (flake/->Flake db-address-sid const/$iri db-address t true nil)])
+                                 ;; additional commit meta if applicable
+                                 issuer-flakes (into issuer-flakes)
+                                 message (conj (flake/->Flake commit-sid const/$_block:ledgers message t true nil)) ;; reused $_block:ledgers as commit message
+                                 tag-flakes (into tag-flakes))
+          db**           (assoc-in db* [:ecount const/$_shard] @last-sid)]
+      (add-commit-flakes-to-db db** flakes))))
+
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
   [{:keys [ledger commit] :as db} {:keys [branch push? did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
           ledger-commit (:commit (ledger-proto/-status ledger branch))
+          new-t?        (or (nil? (commit-data/t ledger-commit))
+                            (> (commit-data/t commit) (commit-data/t ledger-commit)))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
           signed-commit (if did
@@ -258,14 +344,17 @@
           commit-res    (<? (conn-proto/-c-write conn signed-commit))
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
           db*           (assoc db :commit new-commit**)     ;; branch published to
-          db**          (ledger-proto/-commit-update ledger branch db*)]
+          db**          (if new-t?
+                          (<? (add-commit-flakes db*))
+                          db*)
+          db***         (ledger-proto/-commit-update ledger branch db**)]
       ;; push is asynchronous!
       (when push?
         (let [address      (ledger-proto/-address ledger)
               commit-data* (assoc new-commit** :meta commit-res
                                                :ledger-state state)]
           (conn-proto/-push conn address commit-data*)))
-      db**)))
+      db***)))
 
 (defn update-commit-fn
   "Returns a fn that receives a newly indexed db as its only argument.
@@ -293,14 +382,14 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn indexer] :as ledger} {:keys [t stats] :as db} {:keys [message tag] :as opts}]
+  [{:keys [conn indexer] :as ledger} {:keys [t stats commit] :as db} {:keys [message tag] :as opts}]
   (go-try
-    (let [{:keys [id-key] :as opts*} (enrich-commit-opts db opts)]
+    (let [{:keys [id-key did] :as opts*} (enrich-commit-opts db opts)]
       (let [ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
             dbid              (get ledger-update id-key)    ;; sha address of latest "db" point in ledger
             ledger-update-res (<? (conn-proto/-c-write conn ledger-update))
             db-address        (:address ledger-update-res)  ;; may not have address (e.g. IPFS) until after writing file
-            new-commit        (commit-data/new-db-commit-map (:commit db) message tag dbid t db-address (:flakes stats) (:size stats))
+            new-commit        (commit-data/new-db-commit-map commit did message tag dbid t db-address (:flakes stats) (:size stats))
             db*               (assoc db :commit new-commit)
             db**              (<? (do-commit+push db* opts*))]
         (when (idx-proto/-index? indexer db**)

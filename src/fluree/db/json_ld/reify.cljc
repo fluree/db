@@ -252,11 +252,11 @@
     (loop [commit  latest-commit
            last-t  nil
            commits (list)]
-      (let [dbid        (get-in commit [const/iri-data :id])
-            db-address  (get-in commit [const/iri-data const/iri-address :value])
-            prev-commit (get-in commit [const/iri-prevCommit const/iri-address :value])
-            commit-t    (get-in commit [const/iri-data const/iri-t :value])
-            commits*    (conj commits commit)]
+      (let [dbid             (get-in commit [const/iri-data :id])
+            db-address       (get-in commit [const/iri-data const/iri-address :value])
+            prev-commit-addr (get-in commit [const/iri-previous const/iri-address :value])
+            commit-t         (get-in commit [const/iri-data const/iri-t :value])
+            commits*         (conj commits commit)]
         (when (or (nil? commit-t)
                   (and last-t (not= (dec last-t) commit-t)))
           (throw (ex-info (str "Commit t values are inconsistent. Last commit t was: " last-t
@@ -276,7 +276,7 @@
                                           (str commit))})))
         (if (>= through-t commit-t)
           commits*
-          (let [commit-data (<? (read-commit conn prev-commit))
+          (let [commit-data (<? (read-commit conn prev-commit-addr))
                 [commit proof] (parse-commit commit-data)]
             (when proof                                     ;; TODO
               (validate-commit nil commit proof))

@@ -10,6 +10,7 @@
 ;; iri constants
 (def ^:const iri-CommitProof "https://ns.flur.ee/ledger#CommitProof")
 (def ^:const iri-Commit "https://ns.flur.ee/ledger#Commit")
+(def ^:const iri-commit "https://ns.flur.ee/ledger#commit")
 (def ^:const iri-DB "https://ns.flur.ee/ledger#DB")
 (def ^:const iri-data "https://ns.flur.ee/ledger#data")
 (def ^:const iri-t "https://ns.flur.ee/ledger#t")
@@ -19,11 +20,11 @@
 (def ^:const iri-size "https://ns.flur.ee/ledger#size")
 (def ^:const iri-assert "https://ns.flur.ee/ledger#assert")
 (def ^:const iri-retract "https://ns.flur.ee/ledger#retract")
-(def ^:const iri-prevCommit "https://ns.flur.ee/ledger#prevCommit")
-(def ^:const iri-prevDB "https://ns.flur.ee/ledger#prevDB")
+(def ^:const iri-previous "https://ns.flur.ee/ledger#previous")
 (def ^:const iri-alias "https://ns.flur.ee/ledger#alias")
 (def ^:const iri-ledger "https://ns.flur.ee/ledger#ledger")
 (def ^:const iri-branch "https://ns.flur.ee/ledger#branch")
+(def ^:const iri-issuer "https://www.w3.org/2018/credentials#issuer")
 (def ^:const iri-index "https://ns.flur.ee/ledger#index")
 (def ^:const iri-ns "https://ns.flur.ee/ledger#ns")
 (def ^:const iri-time "https://ns.flur.ee/ledger#time")
@@ -60,13 +61,15 @@
 
 ;; predicate id constants
 
-(def ^:const $_block:hash 1)
+(def ^:const $_block:hash 1)                                ;; JSON-LD: turning into data/db id
 (def ^:const $_block:prevHash 2)
-(def ^:const $_block:transactions 3)
-(def ^:const $_block:ledgers 4)
-(def ^:const $_block:instant 5)
-(def ^:const $_block:number 6)
-(def ^:const $_block:sigs 7)
+(def ^:const $_block:transactions 3)                        ;; JSON-LD: turning into commit id ref
+(def ^:const $_block:ledgers 4)                             ;; JSON-LD - reuse as commit message
+(def ^:const $_block:instant 5)                             ;; JSON-LD: turning into commit timestamp
+(def ^:const $_block:number 6)                              ;; JSON-LD: reuse as commit tag(s)
+(def ^:const $_block:sigs 7)                                ;; JSON-LD: turning into signer of commit
+
+
 
 (def ^:const $_predicate:name 10)
 (def ^:const $_predicate:doc 11)

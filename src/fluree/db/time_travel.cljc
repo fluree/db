@@ -143,6 +143,24 @@
                         {:status 400
                          :error  :db/invalid-time}))))))
 
+(defn as-of
+  "Gets database as of a specific moment. Resolves 't' value provided to internal Fluree indexing
+  negative 't' long integer value."
+  [db t]
+  (let [pc (async/promise-chan)]
+    (async/go
+      (try*
+        (let [t* (cond
+                   (pos-int? t) (- t)
+                   (neg-int? t) t
+                   :else (throw (ex-info (str "Time travel to t value of: " t " not yet supported.")
+                                         {:status 400 :error :db/invalid-query})))]
+          (async/put! pc (assoc db :t t*)))
+        (catch* e
+                ;; return exception into promise-chan
+                (async/put! pc e))))
+    pc))
+
 
 (defn as-of-block
   "Gets the database as-of a specified block. Either block number or a time string in ISO-8601 format.

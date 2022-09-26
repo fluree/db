@@ -373,7 +373,7 @@
   Returns core async channel containing result."
   [sources flureeQL]
   (go-try
-    (let [{:keys [select selectOne selectDistinct selectReduced from where construct block prefixes opts]} flureeQL
+    (let [{:keys [select selectOne selectDistinct selectReduced from where construct block prefixes opts t]} flureeQL
           _             (when-not (->> [select selectOne selectDistinct selectReduced]
                                        (remove nil?) count (#(= 1 %)))
                           (throw (ex-info (str "Only one type of select-key (select, selectOne, selectDistinct, selectReduced) allowed. Provided: " (pr-str flureeQL))
@@ -382,7 +382,10 @@
           db            (if (async-util/channel? sources)   ;; only support 1 source currently
                           (<? sources)
                           sources)
-          db*           (if block (<? (time-travel/as-of-block db block)) db)
+          db*           (cond
+                          t (<? (time-travel/as-of db t))
+                          block (<? (time-travel/as-of-block db block))
+                          :else db)
           source-opts   (if prefixes
                           (get-sources (:conn db*) (:network db*) (:auth db*) prefixes)
                           {})

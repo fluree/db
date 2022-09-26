@@ -56,9 +56,18 @@
   (-> db :ecount (get const/$_predicate)))
 
 (defn last-sid
+  "Last used sid - so next available would increment result of this by one."
   [db]
   (or (-> db :ecount (get const/$_default))
+      ;; decrement because
       (dec (flake/->sid const/$_default 0))))
+
+(defn last-commit-sid
+  "Last used sid - so next available would increment result of this by one.
+  Commits use a different address space than all other 'default' flakes."
+  [db]
+  (or (-> db :ecount (get const/$_shard))
+      (dec (flake/->sid const/$_shard 0))))
 
 (defn generate-new-sid
   [{:keys [id] :as node} iris next-pid next-sid]
