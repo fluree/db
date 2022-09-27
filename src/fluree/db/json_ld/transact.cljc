@@ -312,11 +312,11 @@
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
-  [{:keys [ledger] :as db} json-ld opts]
+  [{:keys [ledger schema] :as db} json-ld opts]
   (go-try
     (let [tx-state (->tx-state db opts)
           db*      (-> json-ld
-                       json-ld/expand
+                       (json-ld/expand (:context schema))
                        (stage-flakes tx-state)
                        <?
                        (stage* tx-state)
