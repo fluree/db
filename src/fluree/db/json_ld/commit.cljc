@@ -72,6 +72,46 @@
           (recur r assert* retract*))
         [assert retract]))))
 
+(defn get-ref-iris
+  "Returns a list of object IRIs from a set of flakes.
+  Only to be used for ref? predicates"
+  [db iri-map compact-fn flakes]
+  (go-try
+    (loop [[flake & r] flakes
+           acc []]
+      (if flake
+        (recur r (conj acc (<? (get-s-iri (flake/o flake) db iri-map compact-fn))))
+        acc))))
+
+(defn- subject-block
+  [s-flakes {:keys [schema] :as db} iri-map ^clojure.lang.Volatile ctx compact-fn]
+  (go-try
+    (loop [[p-flakes & r] (partition-by flake/p s-flakes)
+           acc nil]
+      (if p-flakes
+        (let [fflake    (first p-flakes)
+              p-iri     (<? (get-s-iri (flake/p fflake) db iri-map compact-fn))
+              ref?      (get-in schema [:pred (flake/p fflake) :ref?])
+              list?     (:i (flake/m fflake))
+              p-flakes* (if list?
+                          (sort-by #(:i (flake/m %)) p-flakes)
+                          p-flakes)
+              objs      (if ref?
+                          (do
+                            (vswap! ctx assoc-in [p-iri "@type"] "@id")
+                            (<? (get-ref-iris db iri-map compact-fn p-flakes*)))
+                          (mapv flake/o p-flakes*))
+              objs*     (cond
+                          list?
+                          {"@list" objs}
+
+                          (= 1 (count objs))
+                          (first objs)
+
+                          :else
+                          objs)]
+          (recur r (assoc acc p-iri objs*)))
+        acc))))
 
 (defn generate-commit
   "Generates assertion and retraction flakes for a given set of flakes
@@ -107,13 +147,18 @@
                   [assert retract]
 
                   :else
-                  (let [[s-assert s-retract ctx] (<? (subject-block non-iri-flakes db id->iri ctx compact-fn))]
-                    [(if s-assert
-                       (conj assert (assoc s-assert id-key s-iri))
-                       assert)
-                     (if s-retract
-                       (conj retract (assoc s-retract id-key s-iri))
-                       retract)]))]
+                  (let [{assert-flakes  true,
+                         retract-flakes false} (group-by flake/op non-iri-flakes)
+                        s-assert  (when assert-flakes
+                                    (-> (<? (subject-block assert-flakes db id->iri ctx compact-fn))
+                                        (assoc id-key s-iri)))
+                        s-retract (when retract-flakes
+                                    (-> (<? (subject-block retract-flakes db id->iri ctx compact-fn))
+                                        (assoc id-key s-iri)))]
+                    [(cond-> assert
+                             s-assert (conj s-assert))
+                     (cond-> retract
+                             s-retract (conj s-retract))]))]
             (recur r assert* retract*))
           {:refs-ctx (dissoc @ctx type-key)                 ; @type will be marked as @type: @id, which is implied
            :assert   assert
@@ -276,7 +321,6 @@
                        (flake/->Flake const/$_block:sigs const/$iri const/iri-issuer t true nil)
                        (flake/->Flake const/$_block:sigs const/$rdf:type const/$iri t true nil)]
         db*           (add-commit-flakes-to-db db schema-flakes)]
-    (log/warn "ADDED SCHEMA FLAKES!: " schema-flakes)
     (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
 
 (defn add-commit-flakes
@@ -285,7 +329,6 @@
     (let [last-sid       (volatile! (jld-ledger/last-commit-sid db))
           next-sid       (fn [] (vswap! last-sid inc))
           {:keys [message tag time id data previous issuer]} commit
-          _              (log/warn "commit id, prev-commit: " id previous)
           {db-id :id, db-address :address, db-t :t} data
           t              (- db-t)
           db*            (if (= 1 db-t)

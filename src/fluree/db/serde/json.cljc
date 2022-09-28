@@ -57,6 +57,14 @@
   [leaf]
   (assoc leaf :flakes (mapv flake/parts->Flake (:flakes leaf))))
 
+(defn serialize-flake
+  "Flake with an 'm' value need keys converted from keyword keys into strings."
+  [flake]
+  (if-let [m (flake/m flake)]
+    (-> (vec flake)
+        (assoc 5 (util/stringify-keys m)))                  ;; flake 'm' value is at index #5 (6th flake element)
+    (vec flake)))
+
 (defn- deserialize-garbage
   [garbage-data]
   garbage-data)
@@ -99,7 +107,7 @@
   (-deserialize-branch [_ branch]
     (deserialize-branch-node branch))
   (-serialize-leaf [_ leaf]
-    {"flakes" (map vec (:flakes leaf))})
+    {"flakes" (map serialize-flake (:flakes leaf))})
   (-deserialize-leaf [_ leaf]
     (deserialize-leaf-node leaf))
   (-serialize-garbage [_ garbage]
