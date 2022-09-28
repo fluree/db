@@ -312,8 +312,8 @@
           index-t    (commit-data/index-t commit-map)
           commit-t   (commit-data/t commit-map)]
       (if (= commit-t index-t)
-        db-base*                                            ;; if index-t is same as latest commit, no additional commits to load
-        (loop [[commit & r] (<? (trace-commits conn latest-commit (inc index-t))) ;; TODO - can load in parallel
+        db-base* ;; if index-t is same as latest commit, no additional commits to load
+        (loop [[commit & r] (<? (trace-commits conn latest-commit (inc (or index-t 0) ))) ;; TODO - can load in parallel
                db* db-base*]
           (if commit
             (let [new-db (<? (merge-commit conn db* commit merged-db?))]
