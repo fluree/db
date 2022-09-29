@@ -103,3 +103,32 @@
                            :skos/prefLabel  "Root role",
                            :f/rules         {:id "fluree-root-rule"}}})
             "Standard bootstrap data isn't matching.")))))
+
+
+(deftest json-ld-list-order-preservation
+  (testing "json-ld @container @list option"
+    (testing "define @list container in context"
+      (let [movies    (test/get-ledger :test/movies)
+            db        @(fluree/stage movies {:context {:ex      "http://example.org/ns#"
+                                                       :ex/list {"@container" "@list"}}
+                                             :id      "list-test"
+                                             :ex/list [42 2 88 1]})
+            query-res @(fluree/query db {:context   {:ex "http://example.org/ns#"}
+                                         :selectOne [:*]
+                                         :from      "list-test"})]
+        (is (= query-res
+               {:id      "list-test"
+                :ex/list [42 2 88 1]})
+            "Order of query result is different from transaction.")))
+    (testing "define @list directly on subject"
+      (let [movies    (test/get-ledger :test/movies)
+            db        @(fluree/stage movies {:context {:ex "http://example.org/ns#"}
+                                             :id      "list-test2"
+                                             :ex/list {"@list" [42 2 88 1]}})
+            query-res @(fluree/query db {:context   {:ex "http://example.org/ns#"}
+                                         :selectOne [:*]
+                                         :from      "list-test2"})]
+        (is (= query-res
+               {:id      "list-test2"
+                :ex/list [42 2 88 1]})
+            "Order of query result is different from transaction.")))))
