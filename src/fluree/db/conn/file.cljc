@@ -140,7 +140,7 @@
                        (resolve (file-address path))))))))
 
 (defrecord FileConnection [id transactor? memory state
-                           context did
+                           ledger-defaults
                            push commit
                            parallelism close-fn
                            msg-in-ch msg-out-ch
@@ -153,6 +153,16 @@
   conn-proto/iNameService
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
+  (-alias [conn ledger-address]
+    ;; TODO: need to validate that the branch doesn't have a slash?
+    (let [{:keys [storage-path]} conn
+          root-path #?(:cljs (path/resolve "." storage-path)
+                       :clj (str (-> (io/file "") .getAbsolutePath) "/" storage-path))]
+      (-> (address-path ledger-address)
+          (str/replace-first (re-pattern root-path) "")
+          (str/split  #"/")
+          (->> (drop-last 2)            ; branch-name, HEAD
+               (str/join #"/")))))
   (-push [this head-path commit-data] (async/go (push head-path commit-data)))
   (-lookup [this head-commit-address] (async/go (file-address (read-address head-commit-address))))
   (-address [conn ledger-alias {:keys [branch] :as _opts}]
@@ -170,9 +180,12 @@
   (-transactor? [_] transactor?)
   (-id [_] id)
   (-read-only? [_] (not (fn? commit)))
-  (-context [_] context)
-  (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
-  (-did [_] did)
+  (-context [_] (:context ledger-defaults))
+  (-new-indexer [_ opts]
+    (let [indexer-fn (:indexer ledger-defaults)]
+      (indexer-fn opts)))
+  ;; default new ledger indexer
+  (-did [_] (:did ledger-defaults))
   (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection msg-in: pull" {})))
   (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection msg-out: pull" {})))
   (-state [_] @state)
@@ -202,6 +215,23 @@
     (subs s 0 (dec (count s)))
     s))
 
+(defn ledger-defaults
+  [{:keys [context did indexer]}]
+  {:context context
+   :did did
+   :indexer (cond
+              (fn? indexer)
+              indexer
+
+              (or (map? indexer) (nil? indexer))
+              (fn [opts]
+                (idx-default/create (merge indexer opts)))
+
+              :else
+              (throw (ex-info (str "Expected an indexer constructor fn or "
+                                   "default indexer options map. Provided: " indexer)
+                              {:status 400 :error :db/invalid-file-connection})))})
+
 (defn connect
   "Create a new file system connection."
   [{:keys [defaults local-read local-write parallelism storage-path async-cache memory] :as opts}]
@@ -217,9 +247,8 @@
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id           conn-id
                             :storage-path storage-path
+                            :ledger-defaults (ledger-defaults defaults)
                             :transactor?  false
-                            :context      (:context defaults)
-                            :did          (:did defaults)
                             :commit       commit
                             :push         push
                             :parallelism  parallelism

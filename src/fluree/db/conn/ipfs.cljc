@@ -14,7 +14,7 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
-            [fluree.db.indexer.default :as default-indexer]
+            [fluree.db.indexer.default :as idx-default]
             [clojure.string :as str]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -139,7 +139,7 @@
   #?@(:clj
       [full-text/IndexConnection
        (open-storage [conn network dbid lang]
-         (throw (ex-info "Memory connection does not support full text operations."
+         (throw (ex-info "IPFS connection does not support full text operations."
                          {:status 500 :error :db/unexpected-error})))]))
 
 
@@ -195,12 +195,12 @@
 
                                  (or (map? indexer) (nil? indexer))
                                  (fn [opts]
-                                   (default-indexer/create (merge indexer opts)))
+                                   (idx-default/create (merge indexer opts)))
 
                                  :else
                                  (throw (ex-info (str "Expected an indexer constructor fn or "
                                                       "default indexer options map. Provided: " indexer)
-                                                 {:status 400 :error :db/invalid-connection})))]
+                                                 {:status 400 :error :db/invalid-ipfs-connection})))]
       (when-not ipns-default-address
         (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
                              ipns-default-key)
