@@ -47,31 +47,6 @@
                             [% val])
                           val)))
 
-
-(defn- subject-block
-  [s-flakes {:keys [schema] :as db} iri-map ^clojure.lang.Volatile ctx compact-fn]
-  (go-try
-    (loop [[flake & r] s-flakes
-           assert  nil
-           retract nil]
-      (if flake
-        (let [add?     (true? (flake/op flake))
-              p-iri    (<? (get-s-iri (flake/p flake) db iri-map compact-fn))
-              ref?     (get-in schema [:pred (flake/p flake) :ref?])
-              o        (if ref?
-                         (do
-                           (vswap! ctx assoc-in [p-iri "@type"] "@id")
-                           (<? (get-s-iri (flake/o flake) db iri-map compact-fn)))
-                         (flake/o flake))
-              assert*  (if add?
-                         (update-subj-prop assert p-iri o)
-                         assert)
-              retract* (if add?
-                         retract
-                         (update-subj-prop retract p-iri o))]
-          (recur r assert* retract*))
-        [assert retract]))))
-
 (defn get-ref-iris
   "Returns a list of object IRIs from a set of flakes.
   Only to be used for ref? predicates"
