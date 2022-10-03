@@ -1,20 +1,15 @@
 (ns fluree.db.query.fql
-  (:require [fluree.db.query.fql-parser :refer [parse-db ns-lookup-pred-spec p->pred-config parse-where]]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.log :as log]
-            [clojure.string :as str]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [clojure.set :as set]
-            [fluree.db.query.analytical :as analytical]
-            [fluree.db.query.schema :as schema]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
-            [fluree.db.query.analytical-parse :as q-parse]
-            [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
-            [fluree.db.query.fql-resp :refer [flakes->res]])
+  (:require
+    [fluree.db.dbproto :as dbproto]
+    [fluree.db.util.log :as log]
+    [clojure.string :as str]
+    [fluree.db.util.core :as util :refer [try* catch*]]
+    [fluree.db.query.analytical :as analytical]
+    #?(:clj  [clojure.core.async :refer [go <!] :as async]
+       :cljs [cljs.core.async :refer [go <!] :as async])
+    [fluree.db.util.async :refer [<? go-try]]
+    [fluree.db.query.analytical-parse :as q-parse]
+    [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -423,8 +418,10 @@
 
 (defn- process-ad-hoc-query
   [{:keys [db parsed-query fuel max-fuel] :as opts}]
+  (log/debug "process-ad-hoc-query opts:" opts)
   (go-try
     (let [where-result (<? (analytical/q opts))
+          _ (log/debug "process-ad-hoc-query where-result:" where-result)
           select-spec  (:select parsed-query)]
       (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))
 
@@ -441,10 +438,12 @@
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
   [db {:keys [rel-binding? vars] :as parsed-query} query-map]
+  (log/debug "Running ad hoc query:" query-map)
   (let [{:keys [selectOne limit offset component orderBy groupBy prettyPrint opts]} query-map
+        opts' (-> opts (assoc :parse-json? (:parseJSON opts)) (dissoc :parseJSON))
         opts' (cond-> (merge {:limit   limit :offset (or offset 0) :component component
                               :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
-                             opts)
+                             opts')
                       selectOne (assoc :limit 1)
                       true (assoc :max-fuel (:max-fuel opts)
                                   :fuel (or (:fuel opts)    ;; :fuel volatile! can be provided upstream
@@ -483,7 +482,7 @@
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
-  (log/debug "Running query:" (pr-str query-map))
+  (log/debug "Running query:" query-map)
   (if (cache? query-map)
     (cache-query db query-map)
     (let [parsed-query (q-parse/parse db query-map)

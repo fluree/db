@@ -16,7 +16,8 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause}]
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause} parse-json?]
+  (log/debug "subjects-chan")
   (let [o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
@@ -38,14 +39,13 @@
         range-set   (flake/sorted-set-by cmp fflake lflake)
         in-range?   (fn [node]
                       (query-range/intersects-range? node range-set))
+                    ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
+        xf          (when filter-fn (map (fn [flakes] (filter filter-fn flakes))))
         query-xf    (where-subj-xf {:start-test  >=
                                     :start-flake fflake
                                     :end-test    <=
                                     :end-flake   lflake
-                                    ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
-                                    :xf          (when filter-fn
-                                                   (map (fn [flakes]
-                                                          (filter filter-fn flakes))))})
+                                    :xf          xf})
         resolver    (index/->CachedTRangeResolver conn (get novelty idx) t t (:async-cache conn))
         tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)
         return-chan (async/chan 10 (comp (map flake/s)
@@ -92,6 +92,7 @@
   "For queries that specify _id as the predicate, we will have a
   single subject as a value."
   [db error-ch vars {:keys [o] :as f-where}]
+  (log/debug "subjects-id-chan f-where:" f-where)
   (let [return-ch (async/chan)
         _id-val   (or (:value o)
                       (get vars (:variable o)))]
@@ -116,22 +117,23 @@
       (assoc where-clause :o {:value _id}))))
 
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars finish-fn] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars finish-fn parse-json?] :as opts}]
   (go-try
+    (log/debug "subj-crawl opts:" opts)
     (let [{:keys [o p-ref?]} f-where
-          vars*     (if ident-vars
-                      (<? (resolve-ident-vars db vars ident-vars))
-                      vars)
-          opts*     (assoc opts :vars vars*)
-          f-where*  (if (and p-ref? (:ident o))
-                      (<? (resolve-o-ident db f-where))
-                      f-where)
-          sid-ch    (if (= :_id (:type f-where*))
-                      (subjects-id-chan db error-ch vars* f-where*)
-                      (subjects-chan db error-ch vars* f-where*))
-          flakes-af (flakes-xf opts*)
-          flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
-          result-ch (async/chan)]
+          vars*         (if ident-vars
+                          (<? (resolve-ident-vars db vars ident-vars))
+                          vars)
+          opts*         (assoc opts :vars vars*)
+          f-where*      (if (and p-ref? (:ident o))
+                          (<? (resolve-o-ident db f-where))
+                          f-where)
+          sid-ch        (if (= :_id (:type f-where*))
+                          (subjects-id-chan db error-ch vars* f-where*)
+                          (subjects-chan db error-ch vars* f-where* parse-json?))
+          flakes-af     (flakes-xf opts*)
+          flakes-ch     (async/chan 32 (comp (drop offset) (take limit)))
+          result-ch     (async/chan)]
 
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
       (async/pipeline-async parallelism result-ch (result-af opts*) flakes-ch)

@@ -66,7 +66,8 @@
   (c) filter subjects based on subsequent where clause(s)
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
-  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by] :as parsed-query}]
+  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by opts] :as parsed-query}]
+  (log/debug "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
         f-where     (first where)
         rdf-type?   (= :rdf/type (:type f-where))
@@ -90,8 +91,10 @@
                      :permissioned? (not (get-in db [:permissions :root?]))
                      :parallelism   3
                      :f-where       f-where
+                     :parse-json?   (:parse-json? opts)
                      :query         parsed-query
                      :finish-fn     finish-fn}]
+    (log/debug "simple-subject-crawl opts:" opts)
     (if rel-binding?
       (relationship-binding opts)
       (if rdf-type?

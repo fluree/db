@@ -174,12 +174,14 @@
                                  acc []]
                             (if-not subject
                               acc
-                              (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
+                              (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}}
+                                                                  {} subject))))))
                 asserted  (loop [[subject & r] (vals asserted-subjects)
                                  acc []]
                             (if-not subject
                               acc
-                              (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
+                              (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}}
+                                                                  {} subject))))))]
             {:block     (:block curr-block)
              :t         (:t curr-block)
              :retracted retracted
@@ -198,8 +200,6 @@
       (if (first rest-blocks)
         (recur fuel cache (first rest-blocks) (rest rest-blocks) acc')
         acc'))))
-
-
 
 
 (defn block-range

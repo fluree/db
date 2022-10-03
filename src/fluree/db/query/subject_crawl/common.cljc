@@ -6,6 +6,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
+            [fluree.db.util.json :as json]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.query.fql-resp :refer [flakes->res]]))
@@ -25,11 +26,13 @@
 
 
 (defn result-af
-  [{:keys [db cache fuel-vol max-fuel select-spec error-ch] :as _opts}]
+  [{:keys [db cache fuel-vol max-fuel select-spec error-ch parse-json?] :as _opts}]
   (fn [flakes port]
     (go
       (try*
-        (some->> (<? (flakes->res db cache fuel-vol max-fuel select-spec flakes))
+        (some->> flakes
+                 (flakes->res db cache fuel-vol max-fuel select-spec {:parse-json? parse-json?})
+                 <?
                  not-empty
                  (async/put! port))
         (async/close! port)
@@ -151,3 +154,4 @@
                                  "Provided: " v)
                             {:status 400 :error :db/invalid-query}))))
         vars*))))
+
