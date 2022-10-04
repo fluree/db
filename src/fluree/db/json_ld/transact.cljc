@@ -22,10 +22,15 @@
   Only need to test maps that have :id - and if they have other properties they
   are defining then we know it is a node and have additional data to include."
   [mapx]
-  (and (not (contains? mapx :value))
-       (if (contains? mapx :id)                             ;; if the node has an :id, must have more than one k/v pair defined
-         (> (count mapx) 1)
-         true)))
+  (if (contains? mapx :value)
+    false
+    (let [n (count mapx)]
+      (case n
+        2 (not (and (contains? mapx :id)
+                    (contains? mapx :idx)))
+        1 (not (contains? mapx :id))                        ;; I think all nodes now contain :idx, so this is likely unnecessary check
+        ;;else
+        true))))
 
 
 (defn json-ld-type-data
