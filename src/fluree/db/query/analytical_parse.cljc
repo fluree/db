@@ -904,6 +904,7 @@
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
   [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
+  (log/debug "parse* query-map':" query-map')
   (let [rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
@@ -913,7 +914,11 @@
         parsed            (cond-> {:strategy      :legacy
                                    :rel-binding?  rel-binding?
                                    :where         (parse-where db query-map' supplied-var-keys)
-                                   :opts          (-> opts (assoc :parse-json? (:parseJSON opts)) (dissoc :parseJSON))
+                                   :opts          (if (not (nil? (:parseJSON opts)))
+                                                    (-> opts
+                                                        (assoc :parse-json? (:parseJSON opts))
+                                                        (dissoc :parseJSON))
+                                                    opts)
                                    :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
                                    :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts
                                    :fuel          (get-max-fuel query-map')
