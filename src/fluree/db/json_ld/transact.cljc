@@ -37,23 +37,24 @@
   "Returns two-tuple of [class-subject-ids class-flakes]
   where class-flakes will only contain newly generated class
   flakes if they didn't already exist."
-  [class-iris {:keys [t next-pid iris] :as tx-state}]
-  (loop [[class-iri & r] class-iris
-         class-sids   []
-         class-flakes []]
-    (if class-iri
-      (if-let [existing (get @iris class-iri)]
-        (recur r (conj class-sids existing) class-flakes)
-        (let [type-sid (if-let [predefined-pid (get jld-ledger/predefined-properties class-iri)]
-                         predefined-pid
-                         (next-pid))]
-          (vswap! iris assoc class-iri type-sid)
-          (recur r
-                 (conj class-sids type-sid)
-                 (into class-flakes
-                       [(flake/new-flake type-sid const/$iri class-iri t true)
-                        (flake/new-flake type-sid const/$rdf:type const/$rdfs:Class t true)]))))
-      [class-sids class-flakes])))
+  [class-iris {:keys [t next-pid ^clojure.lang.Volatile iris db-before] :as _tx-state}]
+  (go-try
+    (loop [[class-iri & r] class-iris
+           class-sids   []
+           class-flakes []]
+      (if class-iri
+        (if-let [existing (<? (jld-reify/get-iri-sid class-iri db-before iris))]
+          (recur r (conj class-sids existing) class-flakes)
+          (let [type-sid (if-let [predefined-pid (get jld-ledger/predefined-properties class-iri)]
+                           predefined-pid
+                           (next-pid))]
+            (vswap! iris assoc class-iri type-sid)
+            (recur r
+                   (conj class-sids type-sid)
+                   (conj class-flakes
+                         (flake/new-flake type-sid const/$iri class-iri t true)
+                         (flake/new-flake type-sid const/$rdf:type const/$rdfs:Class t true)))))
+        [class-sids class-flakes]))))
 
 (defn process-retractions
   "Processes all retractions at once from set of [sid pid] registered
@@ -117,12 +118,14 @@
        (= :list (-> v first key))))
 
 (defn json-ld-node->flakes
-  [{:keys [id] :as node}
+  [{:keys [id type] :as node}
    {:keys [t next-pid next-sid iris db-before new-sids] :as tx-state}]
   (go-try
     (let [existing-sid (when id
                          (<? (jld-reify/get-iri-sid id db-before iris)))
           new-subj?    (not existing-sid)
+          [type-sids type-flakes] (when type
+                                    (<? (json-ld-type-data type tx-state)))
           sid          (if new-subj?
                          (let [new-sid (jld-ledger/generate-new-sid node iris next-pid next-sid)]
                            (vswap! new-sids conj new-sid)
@@ -131,39 +134,38 @@
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid)                    ;; create a blank node id
                          id)
-          id-flake     (if new-subj?
-                         [(flake/new-flake sid const/$iri id* t true)]
-                         [])]
-      (loop [[[k v] & r] node
-             flakes id-flake]
+          base-flakes  (cond-> []
+                               new-subj? (conj (flake/new-flake sid const/$iri id* t true))
+                               type-flakes (into type-flakes)
+                               type-sids (into (map #(flake/new-flake sid const/$rdf:type % t true) type-sids)))]
+      (loop [[[k v] & r] (dissoc node :id :idx :type)
+             flakes base-flakes]
         (if k
-          (recur r
-                 (case k
-                   (:id :idx) flakes
-                   :type (let [[type-sids class-flakes] (json-ld-type-data v tx-state)
-                               type-flakes (map #(flake/new-flake sid const/$rdf:type % t true) type-sids)]
-                           (into flakes (concat class-flakes type-flakes)))
-                   ;;else
-                   (let [list?           (list-value? v)
-                         v*              (if list?
-                                           (:list v)
-                                           (util/sequential v))
-                         ref?            (not (:value (first v*))) ;; either a ref or a value
-                         existing-pid    (<? (jld-reify/get-iri-sid k db-before iris))
-                         pid             (or existing-pid
-                                             (get jld-ledger/predefined-properties k)
-                                             (new-pid k ref? tx-state))
-                         property-flakes (when-not existing-pid
-                                           (cond-> [(flake/new-flake pid const/$iri k t true)]
-                                                   ref? (conj (flake/new-flake pid const/$rdf:type const/$iri t true))))
-                         ;; check-retracts? - a new subject or property don't require checking for flake retractions
-                         check-retracts? (or (not new-subj?) existing-pid)]
-                     (loop [[v' & r] v*
-                            flakes* flakes]
-                       (if v'
-                         (recur r (into flakes* (<? (add-property sid pid check-retracts? ref? list? v' tx-state))))
-                         (cond-> flakes*
-                                 property-flakes (into property-flakes)))))))
+          (let [list?           (list-value? v)
+                v*              (if list?
+                                  (let [list-vals (:list v)]
+                                    (when-not (sequential? list-vals)
+                                      (throw (ex-info (str "List values have to be vectors, provided: " v)
+                                                      {:status 400 :error :db/invalid-transaction})))
+                                    list-vals)
+                                  (util/sequential v))
+                ref?            (not (:value (first v*)))   ;; either a ref or a value
+                existing-pid    (<? (jld-reify/get-iri-sid k db-before iris))
+                pid             (or existing-pid
+                                    (get jld-ledger/predefined-properties k)
+                                    (new-pid k ref? tx-state))
+                property-flakes (when-not existing-pid
+                                  (cond-> [(flake/new-flake pid const/$iri k t true)]
+                                          ref? (conj (flake/new-flake pid const/$rdf:type const/$iri t true))))
+                ;; check-retracts? - a new subject or property don't require checking for flake retractions
+                check-retracts? (or (not new-subj?) existing-pid)
+                flakes*         (loop [[v' & r] v*
+                                       flakes* flakes]
+                                  (if v'
+                                    (recur r (into flakes* (<? (add-property sid pid check-retracts? ref? list? v' tx-state))))
+                                    (cond-> flakes*
+                                            property-flakes (into property-flakes))))]
+            (recur r flakes*))
           flakes)))))
 
 (defn ->tx-state
