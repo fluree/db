@@ -101,7 +101,8 @@
                             (conj node-flakes (flake/new-flake sid pid node-sid t true m)))
                           (let [[id-sid id-flake] (if-let [existing (get @iris id)]
                                                     [existing nil]
-                                                    (let [id-sid (next-sid)]
+                                                    (let [id-sid (or (get jld-ledger/predefined-properties id)
+                                                                     (next-sid))]
                                                       (vswap! iris assoc id id-sid)
                                                       (if (str/starts-with? id "_:") ;; blank node
                                                         [id-sid nil]
