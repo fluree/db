@@ -11,6 +11,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
+            [fluree.db.datatype :as datatype]
             [fluree.db.util.log :as log :include-macros true]))
 
 ;; generates a db/ledger from persisted data
@@ -33,8 +34,8 @@
 (defn get-vocab-flakes
   [flakes]
   (flake/subrange flakes
-                  >= (flake/->Flake (flake/max-subject-id const/$_collection) -1 nil nil nil nil)
-                  <= (flake/->Flake 0 -1 nil nil nil nil)))
+                  >= (flake/parts->Flake [(flake/max-subject-id const/$_collection) -1])
+                  <= (flake/parts->Flake [0 -1])))
 
 
 (defn retract-node
@@ -45,24 +46,26 @@
                                (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
                                                     " at db t value: " t ".")
                                                {:status 400 :error :db/invalid-commit})))
-          type-retractions (when type
+          type-retractions (if type
                              (loop [[type-item & r] type
                                     acc []]
                                (if type-item
                                  (let [type-id (or (<? (get-iri-sid type-item db iris))
                                                    (throw (ex-info (str "Retractions specifies an @type that does not exist: " type-item)
                                                                    {:status 400 :error :db/invalid-commit})))]
-                                   (recur r (conj acc (flake/->Flake sid const/$rdf:type type-id t false nil))))
-                                 acc)))]
+                                   (recur r (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t false nil))))
+                                 acc))
+                             [])]
       (loop [[[k v-map] & r] node
-             acc (or type-retractions [])]
+             acc type-retractions]
         (if k
           (if (keyword? k)
             (recur r acc)
             (let [pid (or (<? (get-iri-sid k db iris))
                           (throw (ex-info (str "Retraction on a property that does not exist: " k)
-                                          {:status 400 :error :db/invalid-commit})))]
-              (recur r (conj acc (flake/->Flake sid pid (:value v-map) t false nil)))))
+                                          {:status 400 :error :db/invalid-commit})))
+                  datatype (datatype/from-expanded v-map)]
+              (recur r (conj acc (flake/create sid pid (:value v-map) datatype t false nil)))))
           acc)))))
 
 
@@ -93,16 +96,16 @@
                                       type-id     (or existing-id
                                                       (jld-ledger/generate-new-pid type-item iris next-pid nil nil))
                                       type-flakes (when-not existing-id
-                                                    [(flake/->Flake type-id const/$iri type-item t true nil)
-                                                     (flake/->Flake type-id const/$rdf:type const/$rdfs:Class t true nil)])]
+                                                    [(flake/create type-id const/$iri type-item const/$xsd:string t true nil)
+                                                     (flake/create type-id const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)])]
                                   (recur r (cond-> (conj acc
-                                                         (flake/->Flake sid const/$rdf:type type-id t true nil))
+                                                         (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))
                                                    type-flakes (into type-flakes))))
                                 acc))
                             [])
           base-flakes     (if existing-sid
                             type-assertions
-                            (conj type-assertions (flake/->Flake sid const/$iri id t true nil)))]
+                            (conj type-assertions (flake/create sid const/$iri id const/$xsd:string t true nil)))]
       (loop [[[k {:keys [id] :as v-map}] & r] node
              acc base-flakes]
         (if k
@@ -116,10 +119,10 @@
                                          (let [existing-sid (<? (get-iri-sid id db iris))
                                                ref-sid      (or existing-sid
                                                                 (jld-ledger/generate-new-sid v-map iris next-pid next-sid))]
-                                           (cond-> (conj acc (flake/->Flake sid pid ref-sid t true nil))
-                                                   (nil? existing-sid) (conj (flake/->Flake ref-sid const/$iri id t true nil))))
-                                         (conj acc (flake/->Flake sid pid (:value v-map) t true nil)))
-                                       (nil? existing-pid) (conj (flake/->Flake pid const/$iri k t true nil)))]
+                                           (cond-> (conj acc (flake/create sid pid ref-sid const/$xsd:anyURI t true nil))
+                                                   (nil? existing-sid) (conj (flake/create ref-sid const/$iri id const/$xsd:string t true nil))))
+                                         (conj acc (flake/create sid pid (:value v-map) (datatype/from-expanded v-map) t true nil)))
+                                       (nil? existing-pid) (conj (flake/create pid const/$iri k const/$xsd:string t true nil)))]
               (recur r acc*)))
           acc)))))
 
@@ -312,8 +315,8 @@
           index-t    (commit-data/index-t commit-map)
           commit-t   (commit-data/t commit-map)]
       (if (= commit-t index-t)
-        db-base* ;; if index-t is same as latest commit, no additional commits to load
-        (loop [[commit & r] (<? (trace-commits conn latest-commit (inc (or index-t 0) ))) ;; TODO - can load in parallel
+        db-base*                                            ;; if index-t is same as latest commit, no additional commits to load
+        (loop [[commit & r] (<? (trace-commits conn latest-commit (inc (or index-t 0)))) ;; TODO - can load in parallel
                db* db-base*]
           (if commit
             (let [new-db (<? (merge-commit conn db* commit merged-db?))]

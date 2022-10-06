@@ -91,11 +91,15 @@
 (defn resolve-match-flake
   [db test parts]
   (go-try
-   (let [[s p o t op m] parts
-         s' (<? (resolve-subid db s))
-         o' (<? (resolve-subid db o))
-         m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
-     (flake/->Flake s' p o' t op m'))))
+    (let [[s p o t op m] parts
+          s'       (<? (resolve-subid db s))
+          o-ident? (util/pred-ident? o)
+          o'       (if o-ident?
+                     (<? (dbproto/-subid db o))
+                     o)
+          m'       (or m (if (identical? >= test) util/min-integer util/max-integer))
+          dt       (when o-ident? const/$xsd:anyURI)]
+      (flake/create s' p o' dt t op m'))))
 
 (defn resolved-leaf?
   [node]
@@ -387,9 +391,9 @@
                   acc []]
     (if flake
       (if (is-tag-flake? flake)
-        (let [[s p o t op m] (flake/Flake->parts flake)
-              o (<? (dbproto/-tag db o p))]
-          (recur r (conj acc (flake/parts->Flake [s p o t op m]))))
+        (let [[s p o _ t op m] (flake/Flake->parts flake)
+              o* (<? (dbproto/-tag db o p))]
+          (recur r (conj acc (flake/create s p o* const/$xsd:anyURI t op m))))
         (recur r (conj acc flake))) acc)))
 
 (defn search

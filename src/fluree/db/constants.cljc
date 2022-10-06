@@ -61,13 +61,13 @@
 
 ;; predicate id constants
 
-(def ^:const $_block:hash 1)                                ;; JSON-LD: turning into data/db id
-(def ^:const $_block:prevHash 2)
-(def ^:const $_block:transactions 3)                        ;; JSON-LD: turning into commit id ref
-(def ^:const $_block:ledgers 4)                             ;; JSON-LD - reuse as commit message
-(def ^:const $_block:instant 5)                             ;; JSON-LD: turning into commit timestamp
-(def ^:const $_block:number 6)                              ;; JSON-LD: reuse as commit tag(s)
-(def ^:const $_block:sigs 7)                                ;; JSON-LD: turning into signer of commit
+(def ^:const $_block:hash 51)                                ;; JSON-LD: turning into data/db id
+(def ^:const $_block:prevHash 52)
+(def ^:const $_block:transactions 53)                        ;; JSON-LD: turning into commit id ref
+(def ^:const $_block:ledgers 54)                             ;; JSON-LD - reuse as commit message
+(def ^:const $_block:instant 55)                             ;; JSON-LD: turning into commit timestamp
+(def ^:const $_block:number 56)                              ;; JSON-LD: reuse as commit tag(s)
+(def ^:const $_block:sigs 57)                                ;; JSON-LD: turning into signer of commit
 
 
 
@@ -97,14 +97,73 @@
 (def ^:const $rdfs:subPropertyOf 202)
 (def ^:const $rdfs:Class 203)
 (def ^:const $rdf:Property 204)
-;; owl
-(def ^:const $owl:Class 205)
-(def ^:const $owl:ObjectProperty 206)
-(def ^:const $owl:DatatypeProperty 207)
-;; fluree-specific
-(def ^:const $fluree:context 208)
 
-(def ^:const $fluree:default-context 300)
+;; shacl
+(def ^:const $sh:NodeShape 210)
+(def ^:const $sh:PropertyShape 211)
+(def ^:const $sh:targetClass 212)
+(def ^:const $sh:targetNode 213)
+(def ^:const $sh:targetObjectsOf 214)
+(def ^:const $sh:targetSubjectsOf 215)
+(def ^:const $sh:property 216)
+(def ^:const $sh:path 217)
+(def ^:const $sh:minCount 218)
+(def ^:const $sh:maxCount 219)
+(def ^:const $sh:datatype 220)
+(def ^:const $sh:nodeKind 221)
+(def ^:const $sh:IRI 222)
+
+
+;; fluree-specific
+(def ^:const $fluree:context 230)
+
+;; owl
+(def ^:const $owl:Class 245)
+(def ^:const $owl:ObjectProperty 246)
+(def ^:const $owl:DatatypeProperty 247)
+
+;; == xsd data types ==
+;; major types (a) ref, (b) string, (c) number, (d) boolean
+;; xsd common types
+(def ^:const $xsd:anyURI 0)
+(def ^:const $xsd:string 1)
+(def ^:const $xsd:boolean 2)
+(def ^:const $xsd:date 3)
+(def ^:const $xsd:dateTime 4)
+(def ^:const $xsd:decimal 5)
+(def ^:const $xsd:double 6)
+(def ^:const $xsd:integer 7)
+(def ^:const $xsd:long 8)
+;; xsd number types
+(def ^:const $xsd:int 10)
+(def ^:const $xsd:short 11)
+(def ^:const $xsd:float 12)
+(def ^:const $xsd:unsignedLong 13)
+(def ^:const $xsd:unsignedInt 14)
+(def ^:const $xsd:unsignedShort 15)
+(def ^:const $xsd:positiveInteger 16)
+(def ^:const $xsd:nonPositiveInteger 17)
+(def ^:const $xsd:negativeInteger 18)
+(def ^:const $xsd:nonNegativeInteger 19)
+;; xsd date and specialized strings
+(def ^:const $xsd:duration 20)
+(def ^:const $xsd:gDay 21)
+(def ^:const $xsd:gMonth 22)
+(def ^:const $xsd:gMonthDay 23)
+(def ^:const $xsd:gYear 24)
+(def ^:const $xsd:gYearMonth 25)
+(def ^:const $xsd:time 26)
+(def ^:const $xsd:normalizedString 27)
+(def ^:const $xsd:token 28)
+(def ^:const $xsd:language 29)
+;; xsd binary types
+(def ^:const $xsd:byte 30)                                  ;; store as number
+(def ^:const $xsd:unsignedByte 31)                          ;; store as number
+(def ^:const $xsd:hexBinary 32)
+(def ^:const $xsd:base64Binary 33)
+;; NOTE: Add multibyte type?
+;; NOTE: Add JSON type?
+;; NOTE: Add geo types? string-encoded GeoJSON?
 
 
 (def ^:const $_tag:id 30)
@@ -185,6 +244,8 @@
 (def ^:const $_ctx:key 141)
 (def ^:const $_ctx:fn 142)
 (def ^:const $_ctx:doc 143)
+
+(def ^:const $fluree:default-context 150)
 
 ;; tags
 ;; _predicate/type tags

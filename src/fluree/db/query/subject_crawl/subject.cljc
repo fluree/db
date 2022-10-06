@@ -8,7 +8,8 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
                                                           subj-perm-filter-fn filter-subject]]
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.datatype :as datatype]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -24,10 +25,10 @@
                       :psot
                       idx)
         [fflake lflake] (case idx*
-                          :post [(flake/->Flake nil p o* nil nil util/min-integer)
-                                 (flake/->Flake nil p o* nil nil util/max-integer)]
-                          :psot [(flake/->Flake nil p nil nil nil util/min-integer)
-                                 (flake/->Flake nil p nil nil nil util/max-integer)])
+                          :post [(flake/create nil p o* nil nil nil util/min-integer)
+                                 (flake/create nil p o* nil nil nil util/max-integer)]
+                          :psot [(flake/create nil p nil nil nil nil util/min-integer)
+                                 (flake/create nil p nil nil nil nil util/max-integer)])
         filter-fn   (cond
                       (and o* (= :psot idx*))
                       #(= o* (flake/o %))

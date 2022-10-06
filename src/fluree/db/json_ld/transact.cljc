@@ -11,7 +11,8 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.ledger.proto :as ledger-proto]))
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.datatype :as datatype]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -52,8 +53,8 @@
             (recur r
                    (conj class-sids type-sid)
                    (conj class-flakes
-                         (flake/new-flake type-sid const/$iri class-iri t true)
-                         (flake/new-flake type-sid const/$rdf:type const/$rdfs:Class t true)))))
+                         (flake/create type-sid const/$iri class-iri const/$xsd:string t true nil)
+                         (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
         [class-sids class-flakes]))))
 
 (defn process-retractions
@@ -98,18 +99,18 @@
                         (if (node? v-map)
                           (let [node-flakes (<? (json-ld-node->flakes v-map tx-state))
                                 node-sid    (get @iris id)]
-                            (conj node-flakes (flake/new-flake sid pid node-sid t true m)))
-                          (let [[id-sid id-flake] (if-let [existing (get @iris id)]
+                            (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+                          (let [[id-sid id-flake] (if-let [existing (<? (jld-reify/get-iri-sid id db-before iris))]
                                                     [existing nil]
                                                     (let [id-sid (or (get jld-ledger/predefined-properties id)
                                                                      (next-sid))]
                                                       (vswap! iris assoc id id-sid)
                                                       (if (str/starts-with? id "_:") ;; blank node
                                                         [id-sid nil]
-                                                        [id-sid (flake/new-flake id-sid const/$iri id t true)])))]
-                            (cond-> [(flake/new-flake sid pid id-sid t true m)]
+                                                        [id-sid (flake/create id-sid const/$iri id const/$xsd:string t true nil)])))]
+                            (cond-> [(flake/create sid pid id-sid const/$xsd:anyURI t true m)]
                                     id-flake (conj id-flake))))
-                        [(flake/new-flake sid pid value t true m)])]
+                        [(flake/create sid pid value (datatype/from-expanded v-map) t true m)])]
       (into flakes retractions))))
 
 (defn list-value?
@@ -136,9 +137,9 @@
                          (str "_:f" sid)                    ;; create a blank node id
                          id)
           base-flakes  (cond-> []
-                               new-subj? (conj (flake/new-flake sid const/$iri id* t true))
+                               new-subj? (conj (flake/create sid const/$iri id* const/$xsd:string t true nil))
                                type-flakes (into type-flakes)
-                               type-sids (into (map #(flake/new-flake sid const/$rdf:type % t true) type-sids)))]
+                               type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) type-sids)))]
       (loop [[[k v] & r] (dissoc node :id :idx :type)
              flakes base-flakes]
         (if k
@@ -156,8 +157,8 @@
                                     (get jld-ledger/predefined-properties k)
                                     (new-pid k ref? tx-state))
                 property-flakes (when-not existing-pid
-                                  (cond-> [(flake/new-flake pid const/$iri k t true)]
-                                          ref? (conj (flake/new-flake pid const/$rdf:type const/$iri t true))))
+                                  (cond-> [(flake/create pid const/$iri k const/$xsd:string t true nil)]
+                                          ref? (conj (flake/create pid const/$rdf:type const/$iri const/$xsd:anyURI t true nil))))
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts? (or (not new-subj?) existing-pid)
                 flakes*         (loop [[v' & r] v*
@@ -262,9 +263,9 @@
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
-  [(flake/new-flake const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" t true)
-   (flake/new-flake const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" t true)
-   (flake/new-flake const/$iri const/$iri "@id" t true)])
+  [(flake/create const/$rdf:type const/$iri "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" const/$xsd:string t true nil)
+   (flake/create const/$rdfs:Class const/$iri "http://www.w3.org/2000/01/rdf-schema#Class" const/$xsd:string t true nil)
+   (flake/create const/$iri const/$iri "@id" const/$xsd:string t true nil)])
 
 (defn ref-flakes
   "Returns ref flakes from set of all flakes"

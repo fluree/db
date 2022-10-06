@@ -2,6 +2,7 @@
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
             [clojure.string :as str]))
 
 ;; methods to link/trace back a ledger and return flakes
@@ -19,13 +20,27 @@
   (some class+property-iris type))
 
 (def ^:const predefined-properties
-  {"http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
-   "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
-   "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
-   "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
-   "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type
-   "https://ns.flur.ee/ledger#context"                   const/$fluree:context})
+  (merge datatype/default-data-types
+         {"http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
+          "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
+          "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
+          "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
+          "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
+          "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type
+          "http://www.w3.org/ns/shacl#NodeShape"                const/$sh:NodeShape
+          "http://www.w3.org/ns/shacl#PropertyShape"            const/$sh:PropertyShape
+          "http://www.w3.org/ns/shacl#IRI"                      const/$sh:IRI
+          "http://www.w3.org/ns/shacl#tagetClass"               const/$sh:targetClass
+          "http://www.w3.org/ns/shacl#tagetNode"                const/$sh:targetNode
+          "http://www.w3.org/ns/shacl#tagetObjectsOf"           const/$sh:targetObjectsOf
+          "http://www.w3.org/ns/shacl#tagetSubjectsOf"          const/$sh:targetSubjectsOf
+          "http://www.w3.org/ns/shacl#property"                 const/$sh:property
+          "http://www.w3.org/ns/shacl#path"                     const/$sh:path
+          "http://www.w3.org/ns/shacl#minCount"                 const/$sh:minCount
+          "http://www.w3.org/ns/shacl#maxCount"                 const/$sh:maxCount
+          "http://www.w3.org/ns/shacl#datatype"                 const/$sh:datatype
+          "http://www.w3.org/ns/shacl#nodeKind"                 const/$sh:nodeKind
+          "https://ns.flur.ee/ledger#context"                   const/$fluree:context}))
 
 (def ^:const predefined-subjects
   {const/iri-default-context const/$fluree:default-context})
@@ -97,7 +112,7 @@
   (if-let [cached (get @iris iri)]
     cached
     ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest add:true
-    (when-let [sid (some-> (flake/match-post (get-in db [:novelty :post]) const/$iri iri)
+    (when-let [sid (some-> (flake/match-post (get-in db [:novelty :post]) const/$iri iri const/$xsd:string)
                            first
                            :s)]
       (vswap! iris assoc iri sid)
