@@ -311,13 +311,13 @@
   "We only need to do this if there is an orderBy, otherwise limit and offset
   were performed in index-range."
   [sortPred sortOrder offset limit res]
-
   (if (vector? res)
     (cond->> res
-             sortPred (sort-by #(get % sortPred) compare-fn)
-             (= "DESC" sortOrder) (reverse)
-             offset (drop offset)
-             limit (take limit)) res))
+      sortPred             (sort-by #(get % sortPred) compare-fn)
+      (= "DESC" sortOrder) reverse
+      offset               (drop offset)
+      limit                (take limit))
+    res))
 
 
 (defn flakes->res
