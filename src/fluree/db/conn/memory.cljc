@@ -87,6 +87,7 @@
   conn-proto/iStorage
   (-c-read [_ commit-key] (async/go (read-commit data-atom commit-key)))
   (-c-write [_ commit-data] (c-write! data-atom commit-data))
+  (-c-write [_ db commit-data] (c-write! data-atom commit-data))
 
   conn-proto/iNameService
   (-pull [this ledger] :TODO)

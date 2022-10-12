@@ -18,7 +18,8 @@
                        ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
             #?(:clj [clojure.java.io :as io])
-            [fluree.db.util.json :as json])
+            [fluree.db.util.json :as json]
+            [fluree.db.ledger.proto :as ledger-proto])
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
@@ -113,46 +114,51 @@
   #?(:clj (.getBytes ^String s)
      :cljs (js/Uint8Array. (js/Buffer.from s "utf8"))))
 
-(defn connection-commit
-  [base-path]
-  (fn [data]
-    (let [json        (json-ld/normalize-data data)
-          bytes       (->bytes json)
-          hash        (crypto/sha2-256 bytes :hex)
-          commit-path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
-                         :cljs (path/resolve "." base-path "commits" hash) )]
-      (log/debug (str "Writing commit " hash " at " commit-path))
-      (write-file commit-path bytes)
-      {:name    hash
-       :hash    hash
-       :size    (count json)
-       :address (file-address commit-path)})))
+(defn commit
+  ([conn data] (commit conn nil data))
+  ([conn db data]
+   (let [base-path   (:storage-path conn)
+         ledger      (:ledger db)
+         alias       (ledger-proto/-alias ledger)
+         branch      (name (:name (ledger-proto/-branch ledger)))
 
-(defn connection-push
+         json        (json-ld/normalize-data data)
+         bytes       (->bytes json)
+         hash        (crypto/sha2-256 bytes :hex)
+
+         commit-path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path
+                                  (when alias (str "/" alias))
+                                  (when branch (str "/" branch))
+                                  "/commits/" hash ".json")
+                        :cljs (path/resolve "." base-path (or alias "") (or branch "") "commits" hash ".json"))]
+       (log/debug (str "Writing commit " hash " at " commit-path))
+       (write-file commit-path bytes)
+       {:name    hash
+        :hash    hash
+        :size    (count json)
+        :address (file-address commit-path)})))
+
+(defn push
   "Just write to a different directory?"
-  [_base-path]
+  [publish-address ledger-data]
   #?(:clj
-     (fn
-       [publish-address ledger-data]
-       (let [p (promise)]
-         (future
-           (let [{:keys [t dbid address meta branch ledger-state alias]} ledger-data
-                 path-to-commit (address-path address)
-                 path           (address-path publish-address)]
-             (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
-             (write-file path (.getBytes ^String path-to-commit))
-             (deliver p (file-address path))))
-         p))
+     (let [p (promise)]
+       (future
+         (let [{:keys [address]} ledger-data
+               path-to-commit    (address-path address)
+               path              (address-path publish-address)]
+           (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
+           (write-file path (.getBytes ^String path-to-commit))
+           (deliver p (file-address path))))
+       p)
      :cljs
-     (fn
-       [publish-address ledger-data]
-       (let [{:keys [address]} ledger-data
-             path-to-commit    (address-path address)
-             path              (address-path publish-address)]
-         (js/Promise. (fn [resolve reject]
-                        (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
-                        (write-file path (js/Buffer.from path-to-commit))
-                        (resolve (file-address path))))))))
+     (let [{:keys [address]} ledger-data
+           path-to-commit    (address-path address)
+           path              (address-path publish-address)]
+       (js/Promise. (fn [resolve reject]
+                      (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
+                      (write-file path (js/Buffer.from path-to-commit))
+                      (resolve (file-address path)))))))
 
 (defrecord FileConnection [id transactor? memory state
                            ledger-defaults
@@ -163,7 +169,8 @@
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (async/go (read-commit commit-key)))
-  (-c-write [_ commit-data] (async/go (commit commit-data)))
+  (-c-write [conn commit-data] (async/go (commit conn commit-data)))
+  (-c-write [conn db commit-data] (async/go (commit conn db commit-data)))
 
   conn-proto/iNameService
   (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
@@ -249,12 +256,10 @@
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults local-read local-write parallelism storage-path async-cache memory] :as opts}]
+  [{:keys [defaults parallelism storage-path async-cache memory] :as opts}]
   (async/go
     (let [storage-path   (trim-last-slash storage-path)
           conn-id        (str (random-uuid))
-          commit         (connection-commit storage-path)
-          push           (connection-push storage-path)
           state          (state-machine/blank-state)
           close-fn       (fn [] (log/info (str "File Connection " conn-id " Closed")))
           async-cache-fn (or async-cache

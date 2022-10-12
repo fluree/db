@@ -21,7 +21,7 @@
 
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
-  (-c-write [conn commit-data] "Writes a commit to storage"))
+  (-c-write [conn commit-data] [conn db commit-data] "Writes a commit to storage"))
 
 (defprotocol iNameService
   (-push [conn address commit-data] "Pushes ledger metadata to all name service destinations")

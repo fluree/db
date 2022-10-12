@@ -157,11 +157,10 @@ test("file conn", async () => {
     },
   };
   const conn = await flureenjs.jldConnect(connOpts);
-  // console.log(conn);
   const ledgerName = "jld/one";
   const newLedger = await flureenjs.jldCreate(conn, ledgerName);
-  // console.log("NEW LEDGER", newLedger);
   const db = await flureenjs.jldStage(newLedger, testJson);
+
   await flureenjs.jldCommit(newLedger, db, {
     message: "commit!",
     push: true,

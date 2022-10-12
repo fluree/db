@@ -184,9 +184,7 @@
              (loop [[t-flakes & r] flakes-by-t
                     db db]
                (if t-flakes
-                 (let [db' (-> db
-                               (with-t t-flakes opts)
-                               <?)]
+                 (let [db' (<? (with-t db t-flakes opts))]
                    (recur r db'))
                  (async/put! resp-ch db)))))
          (catch* e

@@ -359,7 +359,7 @@
           signed-commit (if did
                           (cred/generate jld-commit private (:id did))
                           jld-commit)
-          commit-res    (<? (conn-proto/-c-write conn signed-commit))
+          commit-res    (<? (conn-proto/-c-write conn db signed-commit)) ;; write commit credential
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
           db*           (assoc db :commit new-commit**)     ;; branch published to
           db**          (if new-t?
@@ -405,7 +405,7 @@
     (let [{:keys [id-key did] :as opts*} (enrich-commit-opts db opts)]
       (let [ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
             dbid              (get ledger-update id-key)    ;; sha address of latest "db" point in ledger
-            ledger-update-res (<? (conn-proto/-c-write conn ledger-update))
+            ledger-update-res (<? (conn-proto/-c-write conn db ledger-update)) ;; write commit data
             db-address        (:address ledger-update-res)  ;; may not have address (e.g. IPFS) until after writing file
             new-commit        (commit-data/new-db-commit-map commit did message tag dbid t db-address (:flakes stats) (:size stats))
             db*               (assoc db :commit new-commit)
