@@ -34,3 +34,4 @@ package-lock.json
 /js-packages/webworker/flureeworker.js
 **cljs-runtime
 **report.html
+test/nodejs/store

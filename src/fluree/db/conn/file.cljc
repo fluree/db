@@ -65,10 +65,9 @@
 
 (defn write-file
   "Write bytes to disk at the given file path."
-  [^bytes val path]
+  [path ^bytes val]
   #?(:clj
      (try
-       (println "writing:" path)
        (with-open [out (io/output-stream (io/file path))]
          (.write out val))
        (catch FileNotFoundException _
@@ -88,11 +87,20 @@
        (catch* e
                (if (= (.-code e) "ENOENT")
                  (try*
-                   (fs/mkdirSync path (clj->js {:recursive true}))
-                   (fs/writeFileSync path val)
+                   (fs/mkdirSync (path/dirname path) #js{:recursive true})
+                   (try*
+                     (fs/writeFileSync path val)
+                     (catch* e
+                             (log/error (str "Unable to write file to path " path
+                                             " with error: " ^String (.-message e) "."))
+                             (log/error (str "Fatal Error, shutting down! " {"errno" ^String (.-errno e)
+                                                                             "syscall" ^String (.-syscall e)
+                                                                             "code" (.-code e)
+                                                                             "path" (.-path e)}))
+                             (js/process.exit 1)))
                    (catch* e
                            (log/error (str "Unable to create storage directory: " path
-                                           " with error: " ^String (.getMessage e) "."))
+                                           " with error: " ^String (.-message e) "."))
                            (log/error (str "Fatal Error, shutting down!"))
                            (js/process.exit 1)))
                  (throw (ex-info "Error writing file." {"errno" ^String (.-errno e)
@@ -100,16 +108,21 @@
                                                         "code" (.-code e)
                                                         "path" (.-path e)})))))))
 
+(defn ->bytes
+  [s]
+  #?(:clj (.getBytes ^String s)
+     :cljs (js/Uint8Array. (js/Buffer.from s "utf8"))))
+
 (defn connection-commit
   [base-path]
   (fn [data]
     (let [json        (json-ld/normalize-data data)
-          bytes       #?(:clj (.getBytes ^String json)
-                         :cljs (js/Buffer.from data "utf8"))
+          bytes       (->bytes json)
           hash        (crypto/sha2-256 bytes :hex)
           commit-path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path "/commits/" hash)
                          :cljs (path/resolve "." base-path "commits" hash) )]
-      (write-file bytes commit-path)
+      (log/debug (str "Writing commit " hash " at " commit-path))
+      (write-file commit-path bytes)
       {:name    hash
        :hash    hash
        :size    (count json)
@@ -117,7 +130,7 @@
 
 (defn connection-push
   "Just write to a different directory?"
-  [base-path]
+  [_base-path]
   #?(:clj
      (fn
        [publish-address ledger-data]
@@ -126,7 +139,8 @@
            (let [{:keys [t dbid address meta branch ledger-state alias]} ledger-data
                  path-to-commit (address-path address)
                  path           (address-path publish-address)]
-             (write-file (.getBytes ^String path-to-commit) path)
+             (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
+             (write-file path (.getBytes ^String path-to-commit))
              (deliver p (file-address path))))
          p))
      :cljs
@@ -135,9 +149,10 @@
        (let [{:keys [address]} ledger-data
              path-to-commit    (address-path address)
              path              (address-path publish-address)]
-         (js/Promise (fn [resolve reject]
-                       (write-file (.getBytes path-to-commit) path)
-                       (resolve (file-address path))))))))
+         (js/Promise. (fn [resolve reject]
+                        (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
+                        (write-file path (js/Buffer.from path-to-commit))
+                        (resolve (file-address path))))))))
 
 (defrecord FileConnection [id transactor? memory state
                            ledger-defaults
