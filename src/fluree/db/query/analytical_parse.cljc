@@ -903,7 +903,8 @@
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map'} supplied-vars]
+  [db {:keys [opts prettyPrint filter orderBy groupBy] :as query-map} supplied-vars]
+  (log/debug "parse* query-map:" query-map)
   (let [rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
@@ -912,11 +913,15 @@
         groupBy*          (or groupBy (:groupBy opts))
         parsed            (cond-> {:strategy      :legacy
                                    :rel-binding?  rel-binding?
-                                   :where         (parse-where db query-map' supplied-var-keys)
-                                   :opts          (-> opts (assoc :parse-json? (:parseJSON opts)) (dissoc :parseJSON))
-                                   :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
-                                   :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts
-                                   :fuel          (get-max-fuel query-map')
+                                   :where         (parse-where db query-map supplied-var-keys)
+                                   :opts          (if (not (nil? (:parseJSON opts)))
+                                                    (-> opts
+                                                        (assoc :parse-json? (:parseJSON opts))
+                                                        (dissoc :parseJSON))
+                                                    opts)
+                                   :limit         (get-limit query-map) ;; limit can be a primary key, or within :opts
+                                   :offset        (get-offset query-map) ;; offset can be a primary key, or within :opts
+                                   :fuel          (get-max-fuel query-map)
                                    :supplied-vars supplied-var-keys
                                    :pretty-print  (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
                                                     prettyPrint
@@ -925,7 +930,7 @@
                                   orderBy* (add-order-by orderBy*) ;; add :order-by if specified
                                   groupBy* (add-group-by groupBy*) ;; add :group-by if specified
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
-                                  true (add-select-spec query-map'))]
+                                  true (add-select-spec query-map))]
     (log/debug "parsed query:" parsed)
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
