@@ -40,7 +40,7 @@
   - order-by exists, in which case we need to perform a sort
   - selectOne? exists, in which case we take the (first result)
   - pretty-print is true, in which case each result needs to get embedded in a map"
-  [{:keys [selectOne? order-by pretty-print limit] :as parsed-query}]
+  [{:keys [selectOne? order-by pretty-print limit offset] :as parsed-query}]
   (let [fns (cond-> []
                     selectOne? (conj (fn [result] (first result)))
                     pretty-print (conj (let [select-var (-> parsed-query
@@ -52,7 +52,8 @@
                                                             (subs 1))]
                                          (fn [result]
                                            (mapv #(array-map select-var %) result))))
-                    order-by (conj (fn [result] (order-results result order-by limit))))]
+                    order-by (conj (fn [result]
+                                     (order-results result order-by limit offset))))]
     (if (empty? fns)
       identity
       (apply comp fns))))
@@ -87,7 +88,7 @@
                      :ident-vars    ident-vars
                      :filter-map    filter-map
                      :limit         (if order-by util/max-long limit) ;; if ordering, limit performed by finish-fn after sort
-                     :offset        offset
+                     :offset        (if order-by 0 offset)
                      :permissioned? (not (get-in db [:permissions :root?]))
                      :parallelism   3
                      :f-where       f-where
@@ -100,4 +101,3 @@
       (if rdf-type?
         (rdf-type-crawl opts)
         (subj-crawl opts)))))
-
