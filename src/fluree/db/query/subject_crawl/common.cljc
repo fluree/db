@@ -124,13 +124,16 @@
   - :order - :asc or :desc
   - :predicate - if type = :predicate, contains predicate pid or name
   - :variable - if type = :variable, contains variable name (not supported for simple subject crawl)"
-  [results {:keys [type order predicate]} limit]
+  [results {:keys [type order predicate]} limit offset]
   (if (= :variable type)
     (throw (ex-info "Ordering by a variable not supported in this type of query."
                     {:status 400 :error :db/invalid-query}))
     (let [sorted (cond-> (sort-by (fn [result] (get result predicate)) results)
                          (= :desc order) reverse)]
-      (vec (take limit sorted)))))
+      (into []
+            (comp (drop offset)
+                  (take limit))
+            sorted))))
 
 (defn resolve-ident-vars
   "When some variables may be idents (two-tuples) they need to get resolved into
@@ -154,4 +157,3 @@
                                  "Provided: " v)
                             {:status 400 :error :db/invalid-query}))))
         vars*))))
-
