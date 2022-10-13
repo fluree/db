@@ -3,9 +3,10 @@
             [clojure.core.async :refer [go <! put!] :as async]
             #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
-  #?(:clj  (:import (java.util UUID Date)
-                    (java.time Instant)
-                    (java.net URLEncoder URLDecoder))))
+  #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
+  #?(:clj (:import (java.util UUID Date)
+                   (java.time Instant)
+                   (java.net URLEncoder URLDecoder))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -279,6 +280,14 @@
     (vector x)
     (conj coll x)))
 
+(defn conjs
+  "Like conj, but if collection is nil creates a new set instead of list.
+  Not built to handle variable arity values"
+  [coll x]
+  (if (nil? coll)
+    #{x}
+    (conj coll x)))
+
 (defn sequential
   "Returns input wrapped in a vector if not already sequential."
   [x]
@@ -319,3 +328,21 @@
                             ~(emit expr more))))))]
        `(let [~gexpr ~expr]
           ~(emit gexpr clauses)))))
+
+(defmacro case+
+  "Same as case, but evaluates dispatch values, needed for referring to
+   class and def'ed constants as well as java.util.Enum instances."
+  [value & clauses]
+  (let [clauses       (partition 2 2 nil clauses)
+        default       (when (-> clauses last count (== 1))
+                        (last clauses))
+        clauses       (if default (drop-last clauses) clauses)
+        eval-dispatch (fn [d]
+                        (if (list? d)
+                          (map eval d)
+                          (eval d)))]
+    `(case ~value
+       ~@(concat (->> clauses
+                      (map #(-> % first eval-dispatch (list (second %))))
+                      (mapcat identity))
+                 default))))

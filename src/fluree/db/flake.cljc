@@ -584,8 +584,8 @@
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
   (let [o      (o f)
-        dt     (dt f)
-        o-size (case dt
+        dt     (int (dt f))
+        o-size (util/case+ dt
                  const/$xsd:string (* 2 (count o))
                  const/$xsd:anyURI 8
                  const/$xsd:boolean 1

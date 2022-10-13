@@ -64,7 +64,7 @@
             (let [pid (or (<? (get-iri-sid k db iris))
                           (throw (ex-info (str "Retraction on a property that does not exist: " k)
                                           {:status 400 :error :db/invalid-commit})))
-                  datatype (datatype/from-expanded v-map)]
+                  datatype (datatype/from-expanded v-map nil)]
               (recur r (conj acc (flake/create sid pid (:value v-map) datatype t false nil)))))
           acc)))))
 
@@ -121,7 +121,7 @@
                                                                 (jld-ledger/generate-new-sid v-map iris next-pid next-sid))]
                                            (cond-> (conj acc (flake/create sid pid ref-sid const/$xsd:anyURI t true nil))
                                                    (nil? existing-sid) (conj (flake/create ref-sid const/$iri id const/$xsd:string t true nil))))
-                                         (conj acc (flake/create sid pid (:value v-map) (datatype/from-expanded v-map) t true nil)))
+                                         (conj acc (flake/create sid pid (:value v-map) (datatype/from-expanded v-map nil) t true nil)))
                                        (nil? existing-pid) (conj (flake/create pid const/$iri k const/$xsd:string t true nil)))]
               (recur r acc*)))
           acc)))))

@@ -76,6 +76,7 @@
   conn-proto/iStorage
   (-c-read [_ commit-key] (read commit-key))
   (-c-write [_ commit-data] (write commit-data))
+  (-c-write [_ _ commit-data] (write commit-data))
 
   conn-proto/iNameService
   (-push [this address ledger-data] (ipfs/push! this address ledger-data))

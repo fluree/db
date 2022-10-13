@@ -147,7 +147,7 @@
           (recur r db**))
         db*))))
 
-
+;; TODO - below is just an event handler for indexing service, ultimately pass message to any listeners for the ledger
 (defn update-index
   "When indexing is complete, updates index market for DB/ledger"
   [ledger {:keys [t port] :as event-meta}]

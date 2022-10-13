@@ -74,6 +74,12 @@
             (first acc)
             acc))))))
 
+(defn crawl-ref-item
+  [db compact-fn ref-flake sub-select cache fuel-vol max-fuel depth-i]
+  (go-try
+    (let [sub-flakes (<? (query-range/index-range db :spot = [(flake/o ref-flake)]))]
+      (<? (flakes->res db cache compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes)))))
+
 (defn crawl-ref
   "A sub-selection (graph crawl) exists, generate results."
   [db compact-fn p-flakes sub-select cache fuel-vol max-fuel depth-i]
@@ -99,46 +105,57 @@
       (loop [[p-flakes & r] (partition-by flake/p flakes)
              acc {}]
         (if p-flakes
-          (let [p    (-> p-flakes first flake/p)
-                spec (or (get select-spec p)
-                         (when wildcard?
-                           (wildcard-spec db cache compact-fn p)))
-                v    (cond
-                       (nil? spec)
-                       nil
+          (let [ff    (first p-flakes)
+                p     (flake/p ff)
+                list? (contains? (flake/m ff) :i)
+                spec  (or (get select-spec p)
+                          (when wildcard?
+                            (wildcard-spec db cache compact-fn p)))
+                v     (cond
+                        (nil? spec)
+                        nil
 
-                       ;; flake's .-o value is an IRI string, JSON-LD compact it before returning
-                       (iri? p)
-                       (-> p-flakes first flake/o compact-fn)
+                        ;; flake's .-o value is an IRI string, JSON-LD compact it before returning
+                        (iri? p)
+                        (-> p-flakes first flake/o compact-fn)
 
-                       ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
-                       (rdf-type? p)
-                       (loop [[type-id & rest-types] (map flake/o p-flakes)
-                              acc []]
-                         (if type-id
-                           (recur rest-types
-                                  (conj acc (or (get @cache type-id)
-                                                (<? (cache-sid->iri db cache compact-fn type-id)))))
-                           acc))
+                        ;; flake's .-o value is a rdf:type, resolve subject id to IRI then JSON-LD compact it
+                        (rdf-type? p)
+                        (loop [[type-id & rest-types] (map flake/o p-flakes)
+                               acc []]
+                          (if type-id
+                            (recur rest-types
+                                   (conj acc (or (get @cache type-id)
+                                                 (<? (cache-sid->iri db cache compact-fn type-id)))))
+                            acc))
 
-                       ;; flake's .-o value is a reference to another subject
-                       (:ref? spec)
-                       (cond
-                         ;; have a specified sub-selection (graph crawl)
-                         (:spec spec)
-                         (<? (crawl-ref db compact-fn p-flakes (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
+                        :else                               ;; display all values
+                        (loop [[f & r] (if list?
+                                         (sort-by #(:i (flake/m %)) p-flakes)
+                                         p-flakes)
+                               acc []]
+                          (if f
+                            (let [res (if (= const/$xsd:anyURI (flake/dt f))
+                                        (cond
+                                          ;; have a specified sub-selection (graph crawl)
+                                          (:spec spec)
+                                          (<? (crawl-ref-item db compact-fn f (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
 
-                         ;; requested graph crawl depth has not yet been reached
-                         (< depth-i depth)
-                         (<? (crawl-ref db compact-fn p-flakes select-spec cache fuel-vol max-fuel (inc depth-i)))
+                                          ;; requested graph crawl depth has not yet been reached
+                                          (< depth-i depth)
+                                          (<? (crawl-ref-item db compact-fn f select-spec cache fuel-vol max-fuel (inc depth-i)))
 
-                         ;; no sub-selection, just return {@id <iri>} for each ref iri
-                         :else
-                         (<? (iri-only-ref db cache compact-fn p-flakes)))
-
-                       ;; flake's .-o value is a scalar value (e.g. integer, string, etc)
-                       :else
-                       (p-values p-flakes))]
+                                          ;; no sub-selection, just return {@id <iri>} for each ref iri
+                                          :else
+                                          ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
+                                          (let [id-key (:as (wildcard-spec db cache compact-fn const/$iri))
+                                                c-iri  (<? (dbproto/-iri db (flake/o f) compact-fn))]
+                                            {id-key c-iri}))
+                                        (flake/o f))]
+                              (recur r (conj acc res)))
+                            (if (= 1 (count acc))
+                              (first acc)
+                              acc))))]
             (if v
               (recur r (assoc acc (:as spec) v))
               (recur r acc)))

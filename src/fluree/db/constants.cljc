@@ -105,17 +105,42 @@
 (def ^:const $sh:targetNode 213)
 (def ^:const $sh:targetObjectsOf 214)
 (def ^:const $sh:targetSubjectsOf 215)
-(def ^:const $sh:property 216)
-(def ^:const $sh:path 217)
-(def ^:const $sh:minCount 218)
-(def ^:const $sh:maxCount 219)
-(def ^:const $sh:datatype 220)
-(def ^:const $sh:nodeKind 221)
-(def ^:const $sh:IRI 222)
+(def ^:const $sh:closed 216)
+(def ^:const $sh:ignoredProperties 217)
+(def ^:const $sh:property 218)
+(def ^:const $sh:path 219)
+(def ^:const $sh:minCount 220)
+(def ^:const $sh:maxCount 221)
+(def ^:const $sh:datatype 222)
+;; nodes
+(def ^:const $sh:nodeKind 223)
+(def ^:const $sh:IRI 224)
+(def ^:const $sh:IRIOrLiteral 225)
+(def ^:const $sh:BlankNodeOrIRI 226)
+(def ^:const $sh:BlankNode 227)
+(def ^:const $sh:BlankNodeOrLiteral 228)
+(def ^:const $sh:Literal 229)
+;; string validation
+(def ^:const $sh:minLength 230)
+(def ^:const $sh:maxLength 231)
+(def ^:const $sh:pattern 232)
+(def ^:const $sh:languageIn 233)
+(def ^:const $sh:uniqueLang 234)
+;; class restrictions
+(def ^:const $sh:class 235)
+(def ^:const $sh:hasValue 236)
+(def ^:const $sh:in 237)
+;; number comparisons
+(def ^:const $sh:minExclusive 238)
+(def ^:const $sh:minInclusive 239)
+(def ^:const $sh:maxExclusive 240)
+(def ^:const $sh:maxInclusive 241)
+
+
 
 
 ;; fluree-specific
-(def ^:const $fluree:context 230)
+(def ^:const $fluree:context 250)
 
 ;; owl
 (def ^:const $owl:Class 245)

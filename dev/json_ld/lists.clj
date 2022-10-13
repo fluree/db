@@ -41,15 +41,58 @@
 
   (def ledger @(fluree/create ipfs-conn "lists/a" {}))
 
+  (-> @(fluree/stage
+         ledger
+         {:context   {:id "@id"
+                      :ex "http://example.org/ns#"}
+          :id        :ex/myRecord
+          :ex/note   "Note query reorders list."
+          :ex/myList [42 2 88 1]})
+      (fluree/query {:context {:ex "http://example.org/ns#"}
+                     :select  [:*]
+                     :from    :ex/myRecord})
+      deref)
+
+  (-> @(fluree/stage
+         ledger
+         {:context   {:id        "@id"
+                      :ex        "http://example.org/ns#"
+                      :ex/myList {"@container" "@list"}}
+          :id        :ex/myRecord
+          :ex/note   "Don't change my list! (using context)"
+          :ex/myList [42 2 88 1]})
+      (fluree/query {:context {:ex "http://example.org/ns#"}
+                     :select  [:*]
+                     :from    :ex/myRecord})
+      deref)
+
+  (-> @(fluree/stage
+         ledger
+         {:context   {:id "@id"
+                      :ex "http://example.org/ns#"}
+          :id        :ex/myRecord
+          :ex/note   "Don't change my list! (embedding directly)"
+          :ex/myList {"@list" [42 2 88 1]}})
+      (fluree/query {:context {:ex "http://example.org/ns#"}
+                     :select  [:*]
+                     :from    :ex/myRecord})
+      deref)
+
+
+
+
+
+
+
   (def newdb
     @(fluree/stage
        ledger
-       {:context    {:id "@id"
-                     :ex        "http://example.org/ns#"
-                     :ex/myList {"@container" "@list"}}
-        :id         :ex/myRecord
-        :ex/message "Hello"
-        :ex/myList  [1 9 4 8]}))
+       {:context   {:id        "@id"
+                    :ex        "http://example.org/ns#"
+                    :ex/myList {"@container" "@list"}}
+        :id        :ex/myRecord
+        :ex/note   "This subject uses an @list to guarantee vector result ordering"
+        :ex/myList [1 9 4 8]}))
 
   @(fluree/query newdb
                  {:context {:ex        "http://example.org/ns#"

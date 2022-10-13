@@ -210,10 +210,17 @@
      :pred        pred
      :context     nil
      :context-str nil
+     :shapes (atom {:class {}
+                    :pred {}})
      :prefix      {}
      :fullText    #{}
      :subclasses  (delay {})}))
 
+(defn reset-shapes
+  "Resets the shapes cache - called when new shapes added to db"
+  [{:keys [shapes] :as _schema}]
+  (reset! shapes {:class {}
+                  :pred {}}))
 
 (defn vocab-map
   "Returns a map of the schema for a db to allow quick lookups of schema properties.

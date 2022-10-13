@@ -21,25 +21,48 @@
 
 (def ^:const predefined-properties
   (merge datatype/default-data-types
-         {"http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
-          "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
+         {"http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
+          "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type
+          ;; rdfs
+          "http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
+          ;; owl
           "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
           "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
           "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
-          "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type
+          ;; shacl
           "http://www.w3.org/ns/shacl#NodeShape"                const/$sh:NodeShape
           "http://www.w3.org/ns/shacl#PropertyShape"            const/$sh:PropertyShape
           "http://www.w3.org/ns/shacl#IRI"                      const/$sh:IRI
-          "http://www.w3.org/ns/shacl#tagetClass"               const/$sh:targetClass
-          "http://www.w3.org/ns/shacl#tagetNode"                const/$sh:targetNode
-          "http://www.w3.org/ns/shacl#tagetObjectsOf"           const/$sh:targetObjectsOf
-          "http://www.w3.org/ns/shacl#tagetSubjectsOf"          const/$sh:targetSubjectsOf
+          "http://www.w3.org/ns/shacl#IRIOrLiteral"             const/$sh:IRIOrLiteral
+          "http://www.w3.org/ns/shacl#BlankNodeOrIRI"           const/$sh:BlankNodeOrIRI
+          "http://www.w3.org/ns/shacl#BlankNode"                const/$sh:BlankNode
+          "http://www.w3.org/ns/shacl#BlankNodeOrLiteral"       const/$sh:BlankNodeOrLiteral
+          "http://www.w3.org/ns/shacl#Literal"                  const/$sh:Literal
+          "http://www.w3.org/ns/shacl#targetClass"              const/$sh:targetClass
+          "http://www.w3.org/ns/shacl#targetNode"               const/$sh:targetNode
+          "http://www.w3.org/ns/shacl#targetObjectsOf"          const/$sh:targetObjectsOf
+          "http://www.w3.org/ns/shacl#targetSubjectsOf"         const/$sh:targetSubjectsOf
+          "http://www.w3.org/ns/shacl#closed"                   const/$sh:closed
+          "http://www.w3.org/ns/shacl#ignoredProperties"        const/$sh:ignoredProperties
           "http://www.w3.org/ns/shacl#property"                 const/$sh:property
           "http://www.w3.org/ns/shacl#path"                     const/$sh:path
           "http://www.w3.org/ns/shacl#minCount"                 const/$sh:minCount
           "http://www.w3.org/ns/shacl#maxCount"                 const/$sh:maxCount
           "http://www.w3.org/ns/shacl#datatype"                 const/$sh:datatype
           "http://www.w3.org/ns/shacl#nodeKind"                 const/$sh:nodeKind
+          "http://www.w3.org/ns/shacl#minLength"                const/$sh:minLength
+          "http://www.w3.org/ns/shacl#maxLength"                const/$sh:maxLength
+          "http://www.w3.org/ns/shacl#pattern"                  const/$sh:pattern
+          "http://www.w3.org/ns/shacl#languageIn"               const/$sh:languageIn
+          "http://www.w3.org/ns/shacl#uniqueLang"               const/$sh:uniqueLang
+          "http://www.w3.org/ns/shacl#class"                    const/$sh:class
+          "http://www.w3.org/ns/shacl#hasValue"                 const/$sh:hasValue
+          "http://www.w3.org/ns/shacl#in"                       const/$sh:in
+          "http://www.w3.org/ns/shacl#minExclusive"             const/$sh:minExclusive
+          "http://www.w3.org/ns/shacl#minInclusive"             const/$sh:minInclusive
+          "http://www.w3.org/ns/shacl#maxExclusive"             const/$sh:maxExclusive
+          "http://www.w3.org/ns/shacl#maxInclusive"             const/$sh:maxInclusive
+          ;; fluree
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context}))
 
 (def ^:const predefined-subjects

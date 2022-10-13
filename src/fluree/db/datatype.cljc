@@ -1,5 +1,7 @@
 (ns fluree.db.datatype
-  (:require [fluree.db.constants :as const]))
+  (:require [fluree.db.constants :as const]
+            [clojure.string :as str]
+            [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -48,11 +50,66 @@
     (number? x) const/$xsd:decimal
     (boolean? x) const/$xsd:boolean))
 
+(defn coerced
+  "Given a value and required type, attempts to return a coerced value or nil (not coercable).
+  We should be cautious about what we coerce, it is really a judgement decision in some
+  circumstances. While we could coerce, e.g. numbers to strings, an exception is likely the most ideal behavior.
+  Examples of things that seem OK to coerce are:
+   - a string type to a date, assuming it meets the formatting
+   - a decimal like 3.0 to an integer
+   - the strings 'true' or 'false' to a boolean"
+  [value required-type]
+  (util/case+ (int required-type)
+    const/$xsd:string
+    (if (string? value)
+      value
+      nil)
+
+    const/$xsd:anyURI
+    (if (string? value)
+      value
+      nil)
+
+    const/$xsd:boolean
+    (when (string? value)
+      (cond
+        (= "true" (str/lower-case value))
+        true
+
+        (= "false" (str/lower-case value))
+        false
+
+        :else
+        nil))
+
+    ;; TODO - other data types!
+    ;; else
+    value))
+
 (defn from-expanded
   "Returns a data type sid from an expanded json-ld value map.
   If type is defined but not a predefined data type, will return nil
   prompting downstream process to look up (or create) a custom data type."
-  [{:keys [type value] :as _value-map}]
+  [{:keys [type value] :as _value-map} required-type]
   (if type
-    (get default-data-types type)
-    (infer value)))
+    (let [type-id (get default-data-types type)]
+      (when (and required-type
+                 (not= required-type type-id))
+        (throw (ex-info (str "Required data type " required-type
+                             " does not match provided data type: " type ".")
+                        {:status 400 :error :db/shacl-validation})))
+      (let [value* (coerced value type-id)]
+        (throw (ex-info (str "Provided data type " type
+                             " does not match provided value: " value ".")
+                        {:status 400 :error :db/shacl-validation}))
+        [value* type-id]))
+    (let [inferred-type (infer value)]
+      (if required-type
+        (if (= inferred-type required-type)
+          [value inferred-type]
+          (if-some [value* (coerced value required-type)]
+            [value* required-type]
+            (throw (ex-info (str "Required data type " required-type
+                                 " cannot be coerced from provided value: " value ".")
+                            {:status 400 :error :db/shacl-validation}))))
+        [value inferred-type]))))
