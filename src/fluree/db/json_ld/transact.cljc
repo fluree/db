@@ -114,8 +114,10 @@
                                 [id-sid id-flake] (if-let [existing (<? (jld-reify/get-iri-sid iri db-before iris))]
                                                     [existing nil]
                                                     (let [id-sid (or (get jld-ledger/predefined-properties iri)
-                                                                     (if (or (= pid const/$sh:path)
-                                                                             (= pid const/$sh:ignoredProperties))
+                                                                     (if (#{const/$sh:path const/$sh:ignoredProperties
+                                                                            const/$sh:targetClass
+                                                                            const/$sh:targetSubjectsOf const/$sh:targetObjectsOf}
+                                                                          pid)
                                                                        (next-pid) ;; shacl path is a property, so assign pid
                                                                        (next-sid)))]
                                                       (vswap! iris assoc iri id-sid)
@@ -400,4 +402,5 @@
                        (final-db tx-state)
                        (validate-rules tx-state)
                        <?)]
-      (ledger-proto/-db-update ledger db*))))
+      #_(ledger-proto/-db-update ledger db*)
+      db*)))
