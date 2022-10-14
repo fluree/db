@@ -84,7 +84,7 @@
 (defn add-property
   "Adds property. Parameters"
   [sid pid {shacl-dt :dt, validate-fn :validate-fn} check-retracts? list? {:keys [id value] :as v-map}
-   {:keys [iris next-sid t db-before] :as tx-state}]
+   {:keys [iris next-sid next-pid t db-before] :as tx-state}]
   (go-try
     (let [retractions (when check-retracts?                 ;; don't need to check if generated pid during this transaction
                         (->> (<? (query-range/index-range db-before :spot = [sid pid]))
@@ -107,14 +107,17 @@
                                                 {:status 400 :error :db/shacl-validation}))))
                           [(flake/create sid pid value* dt t true m)])
 
-                        ;; otherwise should be an IRI 'ref' either as an :id, or mis-cast as a value that needs coersion
+                        ;; otherwise should be an IRI 'ref' either as an :id, or mis-cast as a value that needs coercion
                         :else
                         (let [iri (or id value)]
                           (let [blank? (str/starts-with? iri "_:")
                                 [id-sid id-flake] (if-let [existing (<? (jld-reify/get-iri-sid iri db-before iris))]
                                                     [existing nil]
                                                     (let [id-sid (or (get jld-ledger/predefined-properties iri)
-                                                                     (next-sid))]
+                                                                     (if (or (= pid const/$sh:path)
+                                                                             (= pid const/$sh:ignoredProperties))
+                                                                       (next-pid) ;; shacl path is a property, so assign pid
+                                                                       (next-sid)))]
                                                       (vswap! iris assoc iri id-sid)
                                                       [id-sid (flake/create id-sid const/$iri iri const/$xsd:string t true nil)]))]
                             (cond-> [(flake/create sid pid id-sid const/$xsd:anyURI t true m)]
