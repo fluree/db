@@ -56,25 +56,6 @@
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
                  thheller/shadow-cljs {:mvn/version "2.19.6"}}}
 
-  :shadow-cljs
-  {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
-   :extra-deps {thheller/shadow-cljs {:mvn/version "2.19.6"}}
-   :main-opts ["-m" "shadow.cljs.devtools.cli"]}
-
-  :cljs-browser-test
-  {:extra-paths ["src-cljs" "test"]
-   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
-   :main-opts   ["-m" "cljs-test-runner.main"
-                 "-D" "doo.edn"
-                 "-c" "build-browser-test.edn"
-                 "-x" "chrome-headless"]}
-
-  :cljs-node-test
-  {:extra-paths ["src-nodejs" "test"]
-   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
-   :main-opts   ["-m" "cljs-test-runner.main"
-                 "-c" "build-nodejs-test.edn"]}
-
   :cljtest
   {:extra-paths ["test"]
    :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.68.1059"}
