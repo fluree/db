@@ -64,13 +64,18 @@
                       {:status 400 :error :db/shacl-validation})))))
 
 (defn validate-shape
-  [{:keys [property] :as shape} flakes-p]
+  [{:keys [property closed-props] :as shape} flakes-p]
   (loop [[p-flakes & r] flakes-p
          required (:required shape)]
     (if p-flakes
       (let [pid      (flake/p (first p-flakes))
             p-shapes (get property pid)
             error?   (some #(validate-property % p-flakes) p-shapes)]
+        (when closed-props
+          (when-not (closed-props pid)
+            (throw (ex-info (str "SHACL shape is closed, property: " pid
+                                 " is not an allowed.")
+                            {:status 400 :error :db/shacl-validation}))))
         (recur r (disj required pid)))
       (if (seq required)
         (throw (ex-info (str "Required properties not present: " required)
@@ -260,6 +265,15 @@
                   validate-latter
                   validate-latter)})
 
+(defn add-closed-props
+  "Given a Fluree formatted shape, returns list of predicate/property ids
+  that can only be included in the shape. Any properties outside of this shoudl error."
+  [{:keys [ignored-properties property] :as shape}]
+  (let [closed-props (-> ignored-properties
+                         (conj 0)                           ;; pid 0 holds the IRI and is always allowed
+                         (into (keys property)))]
+    (assoc shape :closed-props closed-props)))
+
 
 (defn build-class-shapes
   "Given a class SID, returns class shape"
@@ -316,7 +330,8 @@
                                                       ;; else
                                                       shape)]
                                          (recur r' shape* p-shapes))))
-                                   (assoc shape :property p-shapes)))]
+                                   (cond-> (assoc shape :property p-shapes)
+                                           (:closed? shape) add-closed-props)))]
               (let [datatype* (merge-with merge-datatype datatype (:datatype shape))]
                 (recur r datatype* (conj shapes shape))))
             {:shapes   shapes

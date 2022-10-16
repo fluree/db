@@ -142,3 +142,48 @@
                :rdf/type    [:ex/User],
                :schema/name "John"}])
           "basic rdf:type query response not correct"))))
+
+
+(deftest shacl-closed-shape
+  (testing "shacl closed shape"
+    (let [conn          test/memory-conn
+          ledger        @(fluree/create conn "shacl/c")
+          user-query    {:context {:ex "http://example.org/ns/"}
+                         :select  {'?s [:*]}
+                         :where   [['?s :rdf/type :ex/User]]}
+          db            @(fluree/stage
+                           ledger
+                           {:context              {:ex "http://example.org/ns/"}
+                            :id                   :ex/UserShape,
+                            :type                 [:sh/NodeShape],
+                            :sh/targetClass       :ex/User
+                            :sh/property          [{:sh/path     :schema/name
+                                                    :sh/datatype :xsd/string}]
+                            :sh/ignoredProperties [:rdf/type]
+                            :sh/closed            true})
+          db-ok         @(fluree/stage
+                           db
+                           {:context     {:ex "http://example.org/ns/"}
+                            :id          :ex/john,
+                            :type        [:ex/User],
+                            :schema/name "John"})
+          ; no :schema/name
+          db-extra-prop (try
+                          @(fluree/stage
+                             db
+                             {:context      {:ex "http://example.org/ns/"}
+                              :id           :ex/john,
+                              :type         [:ex/User],
+                              :schema/name  "John"
+                              :schema/email "john@flur.ee"})
+                          (catch Exception e e))]
+      (is (util/exception? db-extra-prop)
+          "Exception, because :schema/name is an integer and not a string.")
+      (is (str/starts-with? (ex-message db-extra-prop)
+                            "SHACL shape is closed"))
+
+      (is (= @(fluree/query db-ok user-query)
+             [{:id          :ex/john,
+               :rdf/type    [:ex/User],
+               :schema/name "John"}])
+          "basic rdf:type query response not correct"))))
