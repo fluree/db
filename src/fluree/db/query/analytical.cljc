@@ -61,11 +61,13 @@
   (reduce-kv (fn [acc idx key]
                (let [key-as-var   (as-variable key)
                      static-value (get interm-vars key-as-var)]
-                 (when (and (= idx 1) (not key-as-var) (not= "_id" key)
-                            (not (dbproto/-p-prop db :name (re-find #"[_a-zA-Z0-9/]*" key))))
+                 (when (and (= idx 1)
+                            (not key-as-var)
+                            (not= "_id" key)
+                            (not (dbproto/-p-prop db :name (parse/as-predicate-name key))))
                    (throw (ex-info (str "Invalid predicate provided: " key)
-                                   {:status 400
-                                    :error  :db/invalid-query})))
+                                                 {:status 400
+                                                  :error  :db/invalid-query})))
                  (cond static-value
                        (update acc :search #(conj % static-value))
 
