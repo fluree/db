@@ -9,7 +9,9 @@
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.json-ld.select :as json-ld-select]
-            [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn built-in-aggregates]]))
+            [fluree.db.flake :as flake]
+            [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn built-in-aggregates]]
+            [clojure.set :as set]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -761,6 +763,126 @@
                             not-empty)]
     (assoc parsed-query :ident-vars all-ident-vars)))
 
+(defn update-positions
+  [{:keys [variable] :as tuple-item} in-flake-pos in-pass-pos]
+  (if variable
+    (let [flake-in (->> in-flake-pos
+                        (keep-indexed
+                          (fn [idx var]
+                            (when (and var (= variable var))
+                              idx)))
+                        first)
+          pos-in   (->> in-pass-pos
+                        (keep-indexed
+                          (fn [idx var]
+                            (when (and var (= variable var))
+                              idx)))
+                        first)
+          join?    (or flake-in pos-in)]
+      (cond-> tuple-item
+              flake-in (assoc :flake-n flake-in)
+              pos-in (assoc :pos-n pos-in)
+              join? (assoc :join? true)))
+    tuple-item))
+
+(defn gen-x-form
+  [[s-var p-var o-var]]
+  (cond
+    (and s-var o-var)
+    (map (fn [f] [(flake/s f) nil (flake/o f)]))
+
+    s-var
+    (map (fn [f] [(flake/s f) nil nil]))
+
+    o-var
+    (map (fn [f] [nil nil (flake/o f)]))))
+
+(defn get-idx
+  [{s-variable :variable, s-supplied? :supplied?, s-join? :join?} p {o-variable :variable, o-supplied? :supplied?, o-join? :join?}]
+  (let [have-s? (if s-variable
+                  s-supplied?
+                  true)
+        have-o? (if o-variable
+                  o-supplied?
+                  true)]
+    (cond
+      have-s? :spot
+      (and p have-o?) :post
+      p :psot
+      have-o? :opst)))
+
+
+(defn where-meta-reverse
+  [where select-out-vars]
+  (loop [[{:keys [prior-vars in-flake-pos out-flake-pos s p o] :as clause} & r] (reverse where)
+         out-vars (into #{} select-out-vars)
+         acc      []]
+    (if clause
+      (let [out-flake-pos* (mapv out-vars out-flake-pos)
+            out-flake-vars (into #{} (remove nil? out-flake-pos*))
+            out-pass-pos   (into [] (remove out-flake-vars out-vars))
+            all-vars       (into out-vars (remove nil? out-flake-pos))
+            in-flake-pos*  (mapv all-vars in-flake-pos)
+            flake-vars     (into out-flake-vars (remove nil? in-flake-pos*))
+            in-pass-pos    (into [] (set/difference out-vars flake-vars))
+            in-vars        (into #{} (concat in-pass-pos (remove nil? in-flake-pos*)))
+            s*             (update-positions s in-flake-pos* in-pass-pos)
+            o*             (update-positions o in-flake-pos* in-pass-pos)
+            flake-x-form   (gen-x-form out-flake-pos*)
+            clause*        (assoc clause :in-flake-pos in-flake-pos* ;; update to only include needed input variables
+                                         :in-pass-pos in-pass-pos
+                                         :out-flake-pos out-flake-pos*
+                                         :out-pass-pos out-pass-pos
+                                         :flake-x-form flake-x-form
+                                         :idx (get-idx s* p o*)
+                                         :s s*
+                                         :o o*)]
+        (recur r in-vars (conj acc clause*)))
+      (into [] (reverse acc)))))
+
+
+(defn update-select
+  "Updates select statement variables with final where clause positions of items."
+  [{:keys [spec] :as select} where]
+  (let [{:keys [out-flake-pos out-pass-pos] :as last-where} (last where)
+        spec* (mapv #(update-positions % out-flake-pos out-pass-pos) spec)]
+    (assoc select :spec spec*)))
+
+
+(defn add-where-meta
+  "Adds input vars and output vars to each where statement."
+  [{:keys [out-vars where select supplied-vars] :as parsed-query}]
+  (loop [[{:keys [s p o] :as where-smt} & r] where
+         i            0
+         prior-vars   #{}                                   ;; cascading set of all variables used in statements through current one
+         in-flake-pos []
+         acc          []]
+    (if where-smt
+      (let [s-var         (:variable s)
+            o-var         (:variable o)
+            s-out?        (not (supplied-vars s-var))
+            o-out?        (not (supplied-vars o-var))
+            all-vars*     (cond-> prior-vars
+                                  s-out? (conj s-var)
+                                  o-out? (conj o-var))
+            out-flake-pos (cond
+                            (and s-out? o-out?) [s-var nil o-var]
+                            s-out? [s-var nil nil]
+                            o-out? [nil nil o-var])
+            where-smt*    (cond-> (assoc where-smt
+                                    :i i
+                                    :prior-vars prior-vars
+                                    :in-flake-pos in-flake-pos
+                                    :out-flake-pos out-flake-pos)
+                                  (supplied-vars s-var) (assoc-in [:s :supplied?] true)
+                                  (supplied-vars o-var) (assoc-in [:o :supplied?] true))]
+        (recur r (inc i) all-vars* out-flake-pos (conj acc where-smt*)))
+      (let [where*  (where-meta-reverse acc out-vars)
+            select* (update-select select where*)]
+        (assoc parsed-query :where where*
+                            :select select*)))))
+
+
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
   [db {:keys [opts prettyPrint filter orderBy groupBy context depth] :as query-map'} supplied-vars]
@@ -795,6 +917,7 @@
                                   groupBy (add-group-by groupBy*)
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
                                   true (add-select-spec query-map' db)
+                                  true (add-where-meta)
                                   json-ld-db? (assoc :compact-fn (json-ld/compact-fn context*)
                                                      :compact-cache (atom {})))]
     (or (re-parse-as-simple-subj-crawl parsed)

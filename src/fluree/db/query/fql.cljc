@@ -6,7 +6,10 @@
             [fluree.db.query.analytical :as analytical]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.query.analytical-parse :as q-parse]
-            [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]])
+            [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
+            [fluree.db.query.compound :as compound]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.query.json-ld.response :as json-ld-resp])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -413,22 +416,65 @@
                     selectOne? (first res)
                     :else res)))))
 
+(defn process-where-item
+  [db cache compact-fn fuel-vol fuel where-item spec inVector?]
+  (go-try
+    (loop [[spec-item & r'] spec
+           result-item []]
+      (if spec-item
+        (let [{:keys [selection flake-n pos-n]} spec-item
+              value  (if flake-n
+                       (nth where-item flake-n)
+                       (nth where-item pos-n))
+              value* (if selection
+                       (let [flakes (<? (query-range/index-range db :spot = [value]))]
+                         (<? (json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel (:spec spec-item) 0 flakes)))
+                       value)]
+          (recur r' (conj result-item value*)))
+        (if inVector?
+          result-item
+          (first result-item))))))
+
+(defn process-select-results
+  "Processes where results into final shape of specified select statement."
+  [db out-ch where-ch error-ch {:keys [select fuel compact-fn] :as parsed-query}]
+  (go-try
+    (let [{:keys [spec selectOne? inVector?]} select
+          cache    (volatile! {})
+          fuel-vol (volatile! 0)]
+      (loop []
+        (let [where-items (async/alt!
+                            error-ch ([e]
+                                      (throw e))
+                            where-ch ([result-chunk]
+                                      result-chunk))]
+          (if where-items
+            (do
+              (loop [[where-item & r] where-items]
+                (if where-item
+                  (let [where-result (<? (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector?))]
+                    (async/>! out-ch where-result)
+                    (recur r))))
+              (recur))
+            (async/close! out-ch)))))))
+
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
   [db parsed-query query-map]
-  (go-try
+  (let [out-ch (async/chan)]
     (let [{:keys [selectOne limit offset component orderBy groupBy prettyPrint opts]} query-map
-          opts'        (cond-> (merge {:limit   limit :offset (or offset 0) :component component
-                                       :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
-                                      opts)
-                               selectOne (assoc :limit 1))
-          max-fuel     (:max-fuel opts')
-          fuel         (or (:fuel opts)                     ;; :fuel volatile! can be provided upstream
-                           (when (or max-fuel (:meta opts))
-                             (volatile! 0)))
-          where-result (<? (analytical/q query-map fuel max-fuel db opts'))
-          select-spec  (:select parsed-query)]
-      (<? (process-ad-hoc-res db fuel max-fuel where-result select-spec opts)))))
+          opts'       (cond-> (merge {:limit   limit :offset (or offset 0) :component component
+                                      :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
+                                     opts)
+                              selectOne (assoc :limit 1))
+          max-fuel    (:max-fuel opts')
+          fuel        (or (:fuel opts)                      ;; :fuel volatile! can be provided upstream
+                          (when (or max-fuel (:meta opts))
+                            (volatile! 0)))
+          error-ch    (async/chan)
+          where-ch    (compound/where parsed-query error-ch fuel max-fuel db opts')]
+      (process-select-results db out-ch where-ch error-ch parsed-query))
+    out-ch))
 
 (defn cache-query
   "Returns already cached query from cache if available, else
@@ -462,4 +508,4 @@
           db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)
-        (ad-hoc-query db* parsed-query query-map)))))
+        (async/into [] (ad-hoc-query db* parsed-query query-map))))))

@@ -37,7 +37,7 @@
 
 (defn parse-select
   [select-smt depth]
-  (let [_ (or (every? #(or (string? %) (map? %)) select-smt)
+  (let [_ (or (every? #(or (string? %) (map? %) (symbol? %)) select-smt)
               (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt)
                               {:status 400 :error :db/invalid-query})))]
     (map (fn [select]
@@ -116,6 +116,7 @@
                         parsed-select)]
     (assoc parsed-query :limit limit*
                         :selectOne? selectOne?
+                        :out-vars (mapv :variable parsed-select)
                         :select {:spec            spec
                                  :aggregates      (not-empty aggregates)
                                  :expandMaps?     expandMap?
