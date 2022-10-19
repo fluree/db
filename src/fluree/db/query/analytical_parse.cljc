@@ -546,6 +546,12 @@
   [predicate]
   (re-find #"[^\+]*" predicate))
 
+(defn recursion-predicate?
+  [x]
+  (->> x
+       (re-find #"\+")
+       boolean))
+
 (defn as-recursion-predicate
   "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
   predicate. e.g.: person/follows+3

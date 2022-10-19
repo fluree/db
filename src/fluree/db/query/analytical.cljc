@@ -88,11 +88,8 @@
                              (assoc-in [:opts :object-fn] filter-fn)
                              (assoc-in [:rel var] idx)))
 
-                       (and (= idx 1) (re-find #"\+" key))
-                       (let [[pred recur-amt] (str/split key #"\+")
-                             recur-amt (if recur-amt
-                                         (or (safe-read-string recur-amt) 100)
-                                         100)]
+                       (and (= idx 1) (parse/recursion-predicate? key))
+                       (let [[pred recur-amt] (parse/as-recursion-predicate key)]
                          (-> acc
                              (update :search #(conj % pred))
                              (assoc-in [:opts :recur] recur-amt)))
