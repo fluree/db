@@ -43,16 +43,20 @@
   (some #(or (as-variable %) (when (coll? %) (get-vars %))) filter-code))
 
 (defn clause->rel
-  "Given any interm-vars, such as {?article 351843720901583}
-  and an fdb clause, such as  [\"?article\", \"articles/leadInstitutionOrg\", \"?org\"],
+  "Given any interm-vars, such as {?article 351843720901583} and an fdb clause,
+  such as [\"?article\", \"articles/leadInstitutionOrg\", \"?org\"],
 
 
   Returns a map with the following keys:
 
-  - search - a vector that will be passed to query-range/search, i.e. [ nil \"articles/leadInstitutionOrg\" nil ]
-  - rel - a map with any variables (that are not present in interm-vars) and their idx, i.e. {?org 2}
-  - opts - search opts, currently recur, if the predicate is recurred, and object-fn, if there is an object function.
- "
+  - search: a vector that will be passed to query-range/search,
+            i.e. [ nil \"articles/leadInstitutionOrg\" nil ]
+
+  - rel:    a map with any variables (that are not present in interm-vars)
+            and their index, i.e. {?org 2}
+
+  - opts:   search opts, currently recur, if the predicate is recurred,
+            and object-fn, if there is an object function."
   [db interm-vars clause]
   (reduce-kv (fn [acc idx key]
                (let [key-as-var   (as-variable key)
@@ -95,7 +99,8 @@
                        (update acc :search #(conj % (safe-read-string key)))
 
                        :else
-                       (update acc :search #(conj % key))))) {:search [] :rel {} :opts {}} clause))
+                       (update acc :search #(conj % key)))))
+             {:search [] :rel {} :opts {}} clause))
 
 (defn transform-tuples-to-idxs
   "Returns an updated list of tuples that only contains tuple indexes from idx.
