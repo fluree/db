@@ -53,12 +53,19 @@
   Also supports an optional finally clause."
      [& body]
      `(if-cljs
-          (cljs-exceptions/try* ~@body)
-          (clj-exceptions/try* ~@body))))
+        (cljs-exceptions/try* ~@body)
+        (clj-exceptions/try* ~@body))))
 
-(defn index-of [coll value]
-  (some (fn [[item idx]] (when (= value item) idx))
-        (partition 2 (interleave coll (range)))))
+(defn index-of
+  "Returns index integer (n) of item within a Vector.
+  If item cannot be found, returns nil."
+  [^clojure.lang.PersistentVector coll value]
+  #?(:clj  (let [n (.indexOf coll value)]
+             (if (< n 0)
+               nil
+               n))
+     :cljs (some (fn [[item idx]] (when (= value item) idx))
+                 (partition 2 (interleave coll (range))))))
 
 (defn date->millis
   "Given a date, returns epoch millis if possible."

@@ -764,41 +764,55 @@
     (assoc parsed-query :ident-vars all-ident-vars)))
 
 (defn update-positions
-  [{:keys [variable] :as tuple-item} in-flake-pos in-pass-pos]
+  [{:keys [variable] :as tuple-item} in-vars]
   (if variable
-    (let [flake-in (->> in-flake-pos
-                        (keep-indexed
-                          (fn [idx var]
-                            (when (and var (= variable var))
-                              idx)))
-                        first)
-          pos-in   (->> in-pass-pos
-                        (keep-indexed
-                          (fn [idx var]
-                            (when (and var (= variable var))
-                              idx)))
-                        first)
-          join?    (or flake-in pos-in)]
+    (let [in-n  (util/index-of in-vars variable)]
       (cond-> tuple-item
-              flake-in (assoc :flake-n flake-in)
-              pos-in (assoc :pos-n pos-in)
-              join? (assoc :join? true)))
+              in-n (assoc :in-n in-n)))
     tuple-item))
 
 (defn gen-x-form
-  [[s-var p-var o-var]]
-  (cond
-    (and s-var o-var)
-    (map (fn [f] [(flake/s f) nil (flake/o f)]))
+  [out-vars {s-variable :variable} {o-variable :variable}]
+  (let [s-var? (util/index-of out-vars s-variable)
+        o-var? (util/index-of out-vars o-variable)]
+    (cond
+      (and s-var? o-var?)
+      (map (fn [f] [(flake/s f) (flake/o f)]))
 
-    s-var
-    (map (fn [f] [(flake/s f) nil nil]))
+      s-var?
+      (map (fn [f] [(flake/s f)]))
 
-    o-var
-    (map (fn [f] [nil nil (flake/o f)]))))
+      o-var?
+      (map (fn [f] [(flake/o f)])))))
+
+(defn gen-passthrough-fn
+  "Transforms input variables into required passthrough variables.
+  Optimized for several arity."
+  [out-vars {:keys [others] :as _vars} in-vars]
+  (let [passthrough-vars  (filter (set others) out-vars)    ;; only keep output vars in 'others'
+        passthrough-count (count passthrough-vars)
+        passthrough-pos   (mapv #(util/index-of in-vars %) passthrough-vars)
+        [n1 n2 n3 n4 n5] passthrough-pos]
+    (case passthrough-count
+      0 nil
+      1 (fn [input-item]
+          [(nth input-item n1)])
+      2 (fn [input-item]
+          [(nth input-item n1) (nth input-item n2)])
+      3 (fn [input-item]
+          [(nth input-item n1) (nth input-item n2) (nth input-item n3)])
+      4 (fn [input-item]
+          [(nth input-item n1) (nth input-item n2) (nth input-item n3) (nth input-item n4)])
+      5 (fn [input-item]
+          [(nth input-item n1) (nth input-item n2) (nth input-item n3) (nth input-item n4) (nth input-item n5)])
+      ;; else - less optimized, handle all other cases
+      (fn [input-item]
+        (mapv (fn [n]
+                (nth input-item n))
+              passthrough-pos)))))
 
 (defn get-idx
-  [{s-variable :variable, s-supplied? :supplied?, s-join? :join?} p {o-variable :variable, o-supplied? :supplied?, o-join? :join?}]
+  [{s-variable :variable, s-supplied? :supplied?} p {o-variable :variable, o-supplied? :supplied?}]
   (let [have-s? (if s-variable
                   s-supplied?
                   true)
@@ -811,32 +825,86 @@
       p :psot
       have-o? :opst)))
 
+(defn rearrange-out-vars
+  "Puts pass-through vars (passed through from prior where statements)
+  next to each other, and vars generated in the current where clause
+  that need to carry through next to each other - so we can efficiently
+  concat the two when passing on to next step.
+
+  Ensures the generated vars (which come from flakes as a result of searches)
+  are in order of s p o so the flake-x-form function retains proper ordering."
+  [out-vars-s out-flake-pos passthrough-vars]
+  (let [generated-vars-s (set/difference out-vars-s (into #{} passthrough-vars))
+        out-flake-pos*   (filter generated-vars-s out-flake-pos)]
+    (into [] (concat out-flake-pos* passthrough-vars))))
+
+(defn get-passthrough-vars
+  "Variables in the parsing that are not used in the next where statement join, but
+  are needed in a future where statement, or 'select' variable output.
+
+  Passthrough vars are vars in 'out-vars' that are out output of the flake
+  results from the search."
+  [out-vars-set out-flake-vars]
+  (into [] (set/difference out-vars-set out-flake-vars)))
+
+
+(defn order-in-vars
+  "The needed vars will be ordered by the prior-vars flake-out followed by
+  the prior-vars others as applicable to retain ordering across where statements."
+  [in-vars-s {:keys [flake-out others] :as _prior-vars}]
+  (let [in-vars-flake (filter in-vars-s flake-out)
+        in-vars-other (filter in-vars-s others)]
+    (into [] (concat in-vars-flake in-vars-other))))
+
+(defn get-in-vars
+  "In vars are all variables needed to be output minus flake-out
+  vars that are query result output in this step, plus flake-in vars that
+  are needed to perform that query."
+  [out-vars {:keys [flake-in flake-out] :as vars} prior-vars]
+  ;; all vars are the output vars + any var needed as input into the query search
+  (let [in-vars-s (-> (set out-vars)
+                      (set/difference (set flake-out))
+                      (into flake-in))]
+    (order-in-vars in-vars-s prior-vars)))
+
+
+(defn order-out-vars
+  "We use the final 'select' statement output variables as the foundation of what is needed
+  as cascaded through prior where statements.
+
+  The out vars will consist of query result flake output and possible other vars passed through
+  from prior where clauses.
+
+  This makes the flake output vars needed come first (in 's p o' order) followed by any vars
+  required that are passed through from prior statments. This allows the x-forms of both the
+  query result flakes and the prior results passed through able to 'concat' to produce the final
+  properly ordered output."
+  [out-vars {:keys [flake-in flake-out others all] :as vars}]
+  (let [out-vars-s (set out-vars)
+        flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
+        others-out (filter out-vars-s others)               ;; only keep other vars needed in final output
+        ]
+    (into [] (concat flake-out others-out))))
+
 
 (defn where-meta-reverse
   [where select-out-vars]
-  (loop [[{:keys [prior-vars in-flake-pos out-flake-pos s p o] :as clause} & r] (reverse where)
-         out-vars (into #{} select-out-vars)
+  (loop [[{:keys [s p o vars prior-vars] :as clause} & r] (reverse where)
+         out-vars (order-out-vars select-out-vars vars)
          acc      []]
     (if clause
-      (let [out-flake-pos* (mapv out-vars out-flake-pos)
-            out-flake-vars (into #{} (remove nil? out-flake-pos*))
-            out-pass-pos   (into [] (remove out-flake-vars out-vars))
-            all-vars       (into out-vars (remove nil? out-flake-pos))
-            in-flake-pos*  (mapv all-vars in-flake-pos)
-            flake-vars     (into out-flake-vars (remove nil? in-flake-pos*))
-            in-pass-pos    (into [] (set/difference out-vars flake-vars))
-            in-vars        (into #{} (concat in-pass-pos (remove nil? in-flake-pos*)))
-            s*             (update-positions s in-flake-pos* in-pass-pos)
-            o*             (update-positions o in-flake-pos* in-pass-pos)
-            flake-x-form   (gen-x-form out-flake-pos*)
-            clause*        (assoc clause :in-flake-pos in-flake-pos* ;; update to only include needed input variables
-                                         :in-pass-pos in-pass-pos
-                                         :out-flake-pos out-flake-pos*
-                                         :out-pass-pos out-pass-pos
-                                         :flake-x-form flake-x-form
-                                         :idx (get-idx s* p o*)
+      (let [in-vars        (get-in-vars out-vars vars prior-vars)
+            s*             (update-positions s in-vars)
+            o*             (update-positions o in-vars)
+            flake-x-form   (gen-x-form out-vars s* o*)
+            passthrough-fn (gen-passthrough-fn out-vars vars in-vars)
+            clause*        (assoc clause :in-vars in-vars
+                                         :out-vars out-vars
                                          :s s*
-                                         :o o*)]
+                                         :o o*
+                                         :idx (get-idx s* p o*)
+                                         :flake-x-form flake-x-form
+                                         :passthrough-fn passthrough-fn)]
         (recur r in-vars (conj acc clause*)))
       (into [] (reverse acc)))))
 
@@ -844,39 +912,62 @@
 (defn update-select
   "Updates select statement variables with final where clause positions of items."
   [{:keys [spec] :as select} where]
-  (let [{:keys [out-flake-pos out-pass-pos] :as last-where} (last where)
-        spec* (mapv #(update-positions % out-flake-pos out-pass-pos) spec)]
+  (let [{:keys [out-vars] :as _last-where} (last where)
+        spec* (mapv #(update-positions % out-vars) spec)]
     (assoc select :spec spec*)))
+
+(defn get-clause-vars
+  [new-flake-vars {:keys [others all] :as _prior-vars}]
+  (let [flake-in*      (filter all new-flake-vars)          ;; any pre-existing var used in the flake
+        all*           (into all new-flake-vars)
+        new-flakes-set (set new-flake-vars)
+        others-set     (set/difference all new-flakes-set)]
+    {:flake-in  flake-in*
+     :flake-out new-flake-vars
+     :all       all*
+     ;; takes others-set (all vars not output by query result flakes)
+     ;; and retains the prior 'others' ordering, appending any new vars to end.
+     :others    (loop [[old-other & r] others
+                       remaining-others others-set
+                       new-others       []]
+                  (if old-other
+                    ;; and old other might end up being flake
+                    (let [new-other* (if (others-set old-other)
+                                       (conj new-others old-other) ;; and old-other might now be flake output, so make sure in the set
+                                       new-others)]
+                      (recur r (disj remaining-others old-other) new-other*))
+                    ;; once we retain the previous other ordering, add in any remaining others that might be new
+                    (into new-others remaining-others)))}))
 
 
 (defn add-where-meta
   "Adds input vars and output vars to each where statement."
   [{:keys [out-vars where select supplied-vars] :as parsed-query}]
   (loop [[{:keys [s p o] :as where-smt} & r] where
-         i            0
-         prior-vars   #{}                                   ;; cascading set of all variables used in statements through current one
-         in-flake-pos []
-         acc          []]
+         i          0
+         prior-vars {:flake-in  []                          ;; variables query will need to execute
+                     :flake-out []                          ;; variables query result flakes will output
+                     :all       #{}                         ;; cascading set of all variables used in statements through current one
+                     :others    []}                         ;; this is all vars minus the flake vars
+         acc        []]
     (if where-smt
-      (let [s-var         (:variable s)
-            o-var         (:variable o)
-            s-out?        (not (supplied-vars s-var))
-            o-out?        (not (supplied-vars o-var))
-            all-vars*     (cond-> prior-vars
-                                  s-out? (conj s-var)
-                                  o-out? (conj o-var))
-            out-flake-pos (cond
-                            (and s-out? o-out?) [s-var nil o-var]
-                            s-out? [s-var nil nil]
-                            o-out? [nil nil o-var])
-            where-smt*    (cond-> (assoc where-smt
-                                    :i i
-                                    :prior-vars prior-vars
-                                    :in-flake-pos in-flake-pos
-                                    :out-flake-pos out-flake-pos)
-                                  (supplied-vars s-var) (assoc-in [:s :supplied?] true)
-                                  (supplied-vars o-var) (assoc-in [:o :supplied?] true))]
-        (recur r (inc i) all-vars* out-flake-pos (conj acc where-smt*)))
+      (let [s-var       (:variable s)
+            o-var       (:variable o)
+            s-supplied? (supplied-vars s-var)
+            o-supplied? (supplied-vars o-var)
+            s-out?      (and s-var (not s-supplied?))
+            o-out?      (and o-var (not o-supplied?))
+            flake-vars  (cond-> []
+                                s-out? (conj s-var)
+                                o-out? (conj o-var))
+            vars        (get-clause-vars flake-vars prior-vars)
+            where-smt*  (cond-> (assoc where-smt
+                                  :i i
+                                  :vars vars
+                                  :prior-vars prior-vars)
+                                s-supplied? (assoc-in [:s :supplied?] true)
+                                o-supplied? (assoc-in [:o :supplied?] true))]
+        (recur r (inc i) vars (conj acc where-smt*)))
       (let [where*  (where-meta-reverse acc out-vars)
             select* (update-select select where*)]
         (assoc parsed-query :where where*

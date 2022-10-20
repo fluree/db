@@ -33,20 +33,24 @@
 
 
 (defn next-chunk-s
-  [{:keys [conn] :as db} error-ch s-vals p idx t]
+  [{:keys [conn] :as db} error-ch next-in {:keys [in-n] :as s} p idx t flake-x-form passthrough-fn]
   (let [out-ch   (async/chan)
         idx-root (get db idx)
         novelty  (get-in db [:novelty idx])]
     (async/go
-      (loop [[s & r] s-vals]
-        (if s
-          (let [opts  (query-range-opts idx t s p nil)
+      (loop [[in-item & r] next-in]
+        (if in-item
+          (let [pass-vals (when passthrough-fn
+                            (passthrough-fn in-item))
+                sid   (nth in-item in-n)
+                opts  (query-range-opts idx t sid p nil)
                 in-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
             ;; pull all subject results off chan, push on out-ch
             (loop []
-              (let [next-chunk (async/<! in-ch)]
-                (when next-chunk
-                  (async/>! out-ch next-chunk)
+              (when-let [next-chunk (async/<! in-ch)]
+                (let [result (cond->> (sequence flake-x-form next-chunk)
+                                     pass-vals (map #(concat % pass-vals)))]
+                  (async/>! out-ch result)
                   (recur))))
             (recur r))
           (async/close! out-ch))))
@@ -56,19 +60,18 @@
 (defn get-chan
   [db prev-chan error-ch clause t]
   (let [out-ch (async/chan 2)
-        {:keys [s p o idx flake-x-form]} clause
-        {s-var :variable, s-join? :join?, s-flake-n :flake-n} s
-        {o-var :variable, o-join? :join?, o-flake-n :flake-n} o]
+        {:keys [s p o idx flake-x-form passthrough-fn]} clause
+        {s-var :variable, s-in-n :in-n} s
+        {o-var :variable, o-in-n :in-n} o]
     (async/go
       (loop []
         (if-let [next-in (async/<! prev-chan)]
           (let []
-            (if s-join?
-              (let [s-vals      (map #(nth % s-flake-n) next-in)
-                    s-vals-chan (next-chunk-s db error-ch s-vals p idx t)]
+            (if s-in-n
+              (let [s-vals-chan (next-chunk-s db error-ch next-in s p idx t flake-x-form passthrough-fn)]
                 (loop []
                   (when-let [next-s (async/<! s-vals-chan)]
-                    (async/>! out-ch (sequence flake-x-form next-s))
+                    (async/>! out-ch next-s)
                     (recur)))))
             (recur))
           (async/close! out-ch))))
@@ -82,8 +85,8 @@
   [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch opts]
   (let [out-ch      (async/chan 2)
         {:keys [s p o idx flake-x-form]} clause
-        {s-var :variable, s-n :n} s
-        {o-var :variable, o-n :n} o
+        {s-var :variable} s
+        {o-var :variable} o
         s*          (or (:value s)
                         (get vars s-var))
         o*          (or (:value o)

@@ -422,10 +422,8 @@
     (loop [[spec-item & r'] spec
            result-item []]
       (if spec-item
-        (let [{:keys [selection flake-n pos-n]} spec-item
-              value  (if flake-n
-                       (nth where-item flake-n)
-                       (nth where-item pos-n))
+        (let [{:keys [selection in-n]} spec-item
+              value  (nth where-item in-n)
               value* (if selection
                        (let [flakes (<? (query-range/index-range db :spot = [value]))]
                          (<? (json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel (:spec spec-item) 0 flakes)))
