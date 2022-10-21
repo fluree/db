@@ -608,7 +608,7 @@
 (defn size-bytes
   "Returns approx number of bytes in a collection of flakes."
   [flakes]
-  (reduce #(+ %1 (size-flake %2)) 0 flakes))
+  (reduce (fn [size f] (+ size (size-flake f))) 0 flakes))
 
 
 (defn size-kb

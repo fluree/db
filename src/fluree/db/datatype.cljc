@@ -71,45 +71,43 @@
       nil)
 
     const/$xsd:boolean
-    (when (string? value)
-      (cond
-        (= "true" (str/lower-case value))
-        true
+    (cond (boolean? value)
+          value
 
-        (= "false" (str/lower-case value))
-        false
+          (string? value)
+          (cond
+            (= "true" (str/lower-case value))
+            true
 
-        :else
-        nil))
+            (= "false" (str/lower-case value))
+            false
+
+            :else
+            nil))
 
     ;; TODO - other data types!
     ;; else
     value))
 
 (defn from-expanded
-  "Returns a data type sid from an expanded json-ld value map.
-  If type is defined but not a predefined data type, will return nil
-  prompting downstream process to look up (or create) a custom data type."
+  "Returns a tuple of the value (possibly coerced from string) and the data type sid from
+  an expanded json-ld value map. If type is defined but not a predefined data type, will
+  return nil prompting downstream process to look up (or create) a custom data
+  type. Value coercion is only attempted value when a required-type is supplied."
   [{:keys [type value] :as _value-map} required-type]
-  (if type
-    (let [type-id (get default-data-types type)]
-      (when (and required-type
-                 (not= required-type type-id))
-        (throw (ex-info (str "Required data type " required-type
-                             " does not match provided data type: " type ".")
-                        {:status 400 :error :db/shacl-validation})))
-      (let [value* (coerced value type-id)]
-        (throw (ex-info (str "Provided data type " type
-                             " does not match provided value: " value ".")
-                        {:status 400 :error :db/shacl-validation}))
-        [value* type-id]))
-    (let [inferred-type (infer value)]
-      (if required-type
-        (if (= inferred-type required-type)
-          [value inferred-type]
-          (if-some [value* (coerced value required-type)]
-            [value* required-type]
-            (throw (ex-info (str "Required data type " required-type
-                                 " cannot be coerced from provided value: " value ".")
-                            {:status 400 :error :db/shacl-validation}))))
-        [value inferred-type]))))
+  (let [type-id (if type
+                  (get default-data-types type)
+                  (infer value))
+        value* (coerced value type-id)]
+    (cond (and required-type (not= type-id required-type))
+          (throw (ex-info (str "Required data type " required-type
+                               " does not match provided data type: " type ".")
+                          {:status 400 :error :db/shacl-required}))
+
+          (nil? value*)
+          (throw (ex-info (str "Data type " type-id
+                               " cannot be coerced from provided value: " value ".")
+                          {:status 400 :error :db/shacl-value-coercion}))
+
+          :else
+          [value type-id])))

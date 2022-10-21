@@ -64,8 +64,8 @@
             (let [pid (or (<? (get-iri-sid k db iris))
                           (throw (ex-info (str "Retraction on a property that does not exist: " k)
                                           {:status 400 :error :db/invalid-commit})))
-                  datatype (datatype/from-expanded v-map nil)]
-              (recur r (conj acc (flake/create sid pid (:value v-map) datatype t false nil)))))
+                  [value dt] (datatype/from-expanded v-map nil)]
+              (recur r (conj acc (flake/create sid pid value dt t false nil)))))
           acc)))))
 
 
@@ -115,14 +115,15 @@
                   pid          (or existing-pid
                                    (get jld-ledger/predefined-properties k)
                                    (jld-ledger/generate-new-pid k iris next-pid id refs))
-                  acc*         (cond-> (if id               ;; is a ref to another IRI
+                  acc*         (cond-> (if id ;; is a ref to another IRI
                                          (let [existing-sid (<? (get-iri-sid id db iris))
                                                ref-sid      (or existing-sid
                                                                 (jld-ledger/generate-new-sid v-map iris next-pid next-sid))]
                                            (cond-> (conj acc (flake/create sid pid ref-sid const/$xsd:anyURI t true nil))
-                                                   (nil? existing-sid) (conj (flake/create ref-sid const/$iri id const/$xsd:string t true nil))))
-                                         (conj acc (flake/create sid pid (:value v-map) (datatype/from-expanded v-map nil) t true nil)))
-                                       (nil? existing-pid) (conj (flake/create pid const/$iri k const/$xsd:string t true nil)))]
+                                             (nil? existing-sid) (conj (flake/create ref-sid const/$iri id const/$xsd:string t true nil))))
+                                         (let [[value dt] (datatype/from-expanded v-map nil)]
+                                           (conj acc (flake/create sid pid value dt t true nil))))
+                                 (nil? existing-pid) (conj (flake/create pid const/$iri k const/$xsd:string t true nil)))]
               (recur r acc*)))
           acc)))))
 

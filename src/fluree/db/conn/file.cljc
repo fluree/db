@@ -14,6 +14,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.storage.core :as storage]
             [fluree.db.indexer.default :as idx-default]
+            [fluree.db.serde.json :as json-serde]
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
@@ -27,6 +28,14 @@
   "Turn a path into a fluree file address."
   [path]
   (str "fluree:file:" path))
+
+(defn local-path
+  [conn]
+  (str #?(:clj (-> (io/file "") .getAbsolutePath)
+          :cljs (path/resolve "."))
+       "/"
+       (:storage-path conn)
+       "/"))
 
 (defn address-path
   [address]
@@ -57,12 +66,12 @@
                                                          "path" (.-path e)})))))))
 
 (defn read-address
-  [address]
-  (read-file (address-path address)))
+  [conn address]
+  (read-file (str (local-path conn) (address-path address))))
 
 (defn read-commit
-  [address]
-  (json/parse (read-address address) false))
+  [conn address]
+  (json/parse (read-address conn address) false))
 
 (defn write-file
   "Write bytes to disk at the given file path."
@@ -117,22 +126,21 @@
 (defn commit
   ([conn data] (commit conn nil data))
   ([conn db data]
-   (let [base-path   (:storage-path conn)
-         ledger      (:ledger db)
-         alias       (ledger-proto/-alias ledger)
-         branch      (name (:name (ledger-proto/-branch ledger)))
+   (let [ledger     (:ledger db)
+         alias      (ledger-proto/-alias ledger)
+         branch     (name (:name (ledger-proto/-branch ledger)))
 
-         json        (json-ld/normalize-data data)
-         bytes       (->bytes json)
-         hash        (crypto/sha2-256 bytes :hex)
+         json  (json-ld/normalize-data data)
+         bytes (->bytes json)
+         hash  (crypto/sha2-256 bytes :hex)
 
-         commit-path #?(:clj (str (-> (io/file "") .getAbsolutePath) "/" base-path
-                                  (when alias (str "/" alias))
-                                  (when branch (str "/" branch))
-                                  "/commits/" hash ".json")
-                        :cljs (path/resolve "." base-path (or alias "") (or branch "") "commits" hash ".json"))]
-       (log/debug (str "Writing commit " hash " at " commit-path))
-       (write-file commit-path bytes)
+         commit-path (str alias
+                          (when branch (str "/" branch))
+                          "/commits/"
+                          hash ".json")
+         write-path (str (local-path conn) commit-path)]
+       (log/debug (str "Writing commit at " write-path))
+       (write-file write-path bytes)
        {:name    hash
         :hash    hash
         :size    (count json)
