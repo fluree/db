@@ -36,7 +36,7 @@
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
-         org.babashka/sci                {:mvn/version "0.4.33"}}
+         org.babashka/sci                {:mvn/version "0.5.34"}}
 
  :paths ["src" "resources"]
 
@@ -135,5 +135,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.10.05"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.10.14"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
