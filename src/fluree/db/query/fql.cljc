@@ -496,6 +496,13 @@
   [{:keys [opts] :as _query-map}]
   #?(:clj (:cache opts) :cljs false))
 
+(defn first-async
+  "Returns first result of a sequence returned from an async channel."
+  [ch]
+  (go-try
+    (let [res (<? ch)]
+      (first res))))
+
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
@@ -506,4 +513,5 @@
           db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)
-        (async/into [] (ad-hoc-query db* parsed-query query-map))))))
+        (cond-> (async/into [] (ad-hoc-query db* parsed-query query-map))
+                (:selectOne? parsed-query) (first-async))))))

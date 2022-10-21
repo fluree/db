@@ -766,7 +766,7 @@
 (defn update-positions
   [{:keys [variable] :as tuple-item} in-vars]
   (if variable
-    (let [in-n  (util/index-of in-vars variable)]
+    (let [in-n (util/index-of in-vars variable)]
       (cond-> tuple-item
               in-n (assoc :in-n in-n)))
     tuple-item))
@@ -898,13 +898,15 @@
             o*             (update-positions o in-vars)
             flake-x-form   (gen-x-form out-vars s* o*)
             passthrough-fn (gen-passthrough-fn out-vars vars in-vars)
-            clause*        (assoc clause :in-vars in-vars
-                                         :out-vars out-vars
-                                         :s s*
-                                         :o o*
-                                         :idx (get-idx s* p o*)
-                                         :flake-x-form flake-x-form
-                                         :passthrough-fn passthrough-fn)]
+            clause*        (-> clause
+                               (assoc :in-vars in-vars
+                                      :out-vars out-vars
+                                      :s s*
+                                      :o o*
+                                      :idx (get-idx s* p o*)
+                                      :flake-x-form flake-x-form
+                                      :passthrough-fn passthrough-fn)
+                               (dissoc :prior-vars))]       ;; note, we could also dissoc :vars as they are no longer needed, but retain for now to help debug query parsing
         (recur r in-vars (conj acc clause*)))
       (into [] (reverse acc)))))
 
