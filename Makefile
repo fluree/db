@@ -15,7 +15,7 @@ ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURC
 all: jar browser nodejs webworker js-packages docs
 
 target/fluree-db.jar: out node_modules src/deps.cljs $(ALL_SOURCES) $(RESOURCES)
-	clojure -X:jar
+	clojure -T:build jar
 
 jar: target/fluree-db.jar
 
@@ -44,7 +44,7 @@ src/deps.cljs: package.json
 	clojure -M:js-deps
 
 install: target/fluree-db.jar
-	clojure -M:install
+	clojure -T:build install
 
 deploy: target/fluree-db.jar
 	clojure -M:deploy
@@ -77,10 +77,10 @@ publish-webworker: js-packages/webworker/flureeworker.js
 publish-js: publish-nodejs publish-browser publish-webworker
 
 docs/fluree.db.api.html docs/index.html: src/fluree/db/api.clj
-	clojure -X:docs :output-path "\"$(@D)\""
+	clojure -T:build docs :output-path "\"$(@D)\""
 
 docs/%.html: docs/%.md
-	clojure -X:docs :output-path "\"$(@D)\""
+	clojure -T:build docs :output-path "\"$(@D)\""
 
 docs: docs/fluree.db.api.html docs/index.html $(DOCS_TARGETS)
 
@@ -108,8 +108,7 @@ eastwood:
 ci: test eastwood
 
 clean:
-	rm -rf target
+	clojure -T:build clean
 	rm -rf out/*
 	rm -rf docs/*.html
 	rm -rf node_modules
-	rm -f pom.xml
