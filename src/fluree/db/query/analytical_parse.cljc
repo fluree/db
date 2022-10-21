@@ -585,31 +585,39 @@
 
 (defn parse-order-by
   [order-by-clause]
-  (let [throw!   (fn [msg] (throw (ex-info (or msg
-                                               (str "Invalid orderBy clause: " order-by-clause))
-                                           {:status 400 :error :db/invalid-query})))
-        [pred order] (cond (vector? order-by-clause)
-                           [(second order-by-clause) (first order-by-clause)]
+  (let [throw!           (fn [msg] (throw (ex-info (or msg
+                                                       (str "Invalid orderBy clause: " order-by-clause))
+                                                   {:status 400 :error :db/invalid-query})))
+        order-by-clauses (if (vector? order-by-clause)
+                           order-by-clause
+                           [order-by-clause])
+        clause-maps      (mapv (fn [order-by-clause]
+                                 (let [[pred order] (cond
+                                                      (string? order-by-clause)
+                                                      [order-by-clause :asc]
 
-                           (string? order-by-clause)
-                           [order-by-clause :asc]
+                                                      (list? order-by-clause)
+                                                      (if (and (= 2 (count order-by-clause))
+                                                               (#{'desc "desc"} (first order-by-clause)))
+                                                        [(second order-by-clause) :desc]
+                                                        (throw "Invalid orderBy, if trying to order in descending order try: (desc ?myvar)"))
 
-                           :else
-                           (throw! nil))
-        order*   (case order
-                   (:asc :desc) order
-                   "ASC" :asc
-                   "DESC" :desc
-                   ;; else
-                   (throw! nil))
-        pred-var (q-var->symbol pred)]
-    (if pred-var
-      {:type     :variable
-       :order    order*
-       :variable pred-var}
-      {:type      :predicate
-       :order     order*
-       :predicate pred})))
+                                                      (symbol? order-by-clause)
+                                                      [order-by-clause :asc]
+
+                                                      :else
+                                                      (throw! nil))
+                                       variable (q-var->symbol pred)]
+                                   (if variable
+                                     {:type     :variable
+                                      :order    order
+                                      :variable variable}
+                                     {:type      :predicate
+                                      :order     order
+                                      :predicate pred})))
+                               order-by-clauses)]
+    {:input  order-by-clause
+     :parsed clause-maps}))
 
 
 (defn add-order-by
@@ -918,6 +926,36 @@
         spec* (mapv #(update-positions % out-vars) spec)]
     (assoc select :spec spec*)))
 
+(defn build-order-fn
+  "Returns final ordering function that take a single arg, the where results,
+  and outputs the sorted where results."
+  [{:keys [parsed] :as _order-by}]
+  (let [compare-fns (mapv (fn [{:keys [in-n order]}]
+                            (case order
+                              :asc (fn [x y]
+                                     (compare (nth x in-n) (nth y in-n)))
+                              :desc (fn [x y]
+                                      (compare (nth y in-n) (nth x in-n)))))
+                          parsed)]
+    (if (= 1 (count compare-fns))
+      (first compare-fns)
+      (fn [x y]
+        (loop [[compare-fn & r] compare-fns]
+          (let [res (compare-fn x y)]
+            (if (zero? res)
+              (recur r)
+              res)))))))
+
+(defn update-order-by
+  "Updates order-by, if applicable, with final where clause positions of items."
+  [{:keys [parsed] :as order-by} group-by where]
+  (when order-by
+    (let [{:keys [out-vars] :as _last-where} (last where)
+          parsed*    (mapv #(update-positions % out-vars) parsed)
+          order-by*  (assoc order-by :parsed parsed*)
+          comparator (build-order-fn order-by*)]
+      (assoc order-by* :comparator comparator))))
+
 (defn get-clause-vars
   [new-flake-vars {:keys [others all] :as _prior-vars}]
   (let [flake-in*      (filter all new-flake-vars)          ;; any pre-existing var used in the flake
@@ -944,7 +982,8 @@
 
 (defn add-where-meta
   "Adds input vars and output vars to each where statement."
-  [{:keys [out-vars where select supplied-vars] :as parsed-query}]
+  [{:keys [out-vars where select supplied-vars order-by group-by] :as parsed-query}]
+  ;; note: Currently 'p' is always fixed, but that is an imposed limitation - it should be able to be a variable.
   (loop [[{:keys [s p o] :as where-smt} & r] where
          i          0
          prior-vars {:flake-in  []                          ;; variables query will need to execute
@@ -970,10 +1009,12 @@
                                 s-supplied? (assoc-in [:s :supplied?] true)
                                 o-supplied? (assoc-in [:o :supplied?] true))]
         (recur r (inc i) vars (conj acc where-smt*)))
-      (let [where*  (where-meta-reverse acc out-vars)
-            select* (update-select select where*)]
+      (let [where*    (where-meta-reverse acc out-vars)
+            select*   (update-select select where*)
+            order-by* (update-order-by order-by group-by where*)]
         (assoc parsed-query :where where*
-                            :select select*)))))
+                            :select select*
+                            :order-by order-by*)))))
 
 
 ;; TODO - only capture :select, :where, :limit - need to get others

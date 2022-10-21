@@ -435,9 +435,9 @@
 
 (defn process-select-results
   "Processes where results into final shape of specified select statement."
-  [db out-ch where-ch error-ch {:keys [select fuel compact-fn] :as parsed-query}]
+  [db out-ch where-ch error-ch {:keys [select fuel compact-fn] :as _parsed-query}]
   (go-try
-    (let [{:keys [spec selectOne? inVector?]} select
+    (let [{:keys [spec inVector?]} select
           cache    (volatile! {})
           fuel-vol (volatile! 0)]
       (loop []
@@ -458,19 +458,12 @@
 
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
-  [db parsed-query query-map]
+  [db {:keys [fuel] :as parsed-query}]
   (let [out-ch (async/chan)]
-    (let [{:keys [selectOne limit offset component orderBy groupBy prettyPrint opts]} query-map
-          opts'       (cond-> (merge {:limit   limit :offset (or offset 0) :component component
-                                      :orderBy orderBy :groupBy groupBy :prettyPrint prettyPrint}
-                                     opts)
-                              selectOne (assoc :limit 1))
-          max-fuel    (:max-fuel opts')
-          fuel        (or (:fuel opts)                      ;; :fuel volatile! can be provided upstream
-                          (when (or max-fuel (:meta opts))
-                            (volatile! 0)))
-          error-ch    (async/chan)
-          where-ch    (compound/where parsed-query error-ch fuel max-fuel db opts')]
+    (let [max-fuel fuel
+          fuel     (volatile! 0)
+          error-ch (async/chan)
+          where-ch (compound/where parsed-query error-ch fuel max-fuel db)]
       (process-select-results db out-ch where-ch error-ch parsed-query))
     out-ch))
 
@@ -513,5 +506,5 @@
           db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)
-        (cond-> (async/into [] (ad-hoc-query db* parsed-query query-map))
+        (cond-> (async/into [] (ad-hoc-query db* parsed-query))
                 (:selectOne? parsed-query) (first-async))))))

@@ -102,4 +102,30 @@
               ["Brian" 7]])
           "Multi-cardinality values should duplicate non-multicardinality values ")
 
+      ;; ordering by a single variable
+      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                                :select  ['?name '?favNums]
+                                :where   [['?s :schema/name '?name]
+                                          ['?s :ex/favNums '?favNums]]
+                                :orderBy '?favNums})
+             [["Cam" 5] ["Brian" 7] ["Alice" 9] ["Cam" 10] ["Alice" 42] ["Alice" 76]])
+          "Ordering of favNums not in ascending order.")
+
+      ;; ordering by a single variable descending
+      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                                :select  ['?name '?favNums]
+                                :where   [['?s :schema/name '?name]
+                                          ['?s :ex/favNums '?favNums]]
+                                :orderBy '(desc ?favNums)})
+             [["Alice" 76] ["Alice" 42] ["Cam" 10] ["Alice" 9] ["Brian" 7] ["Cam" 5]])
+          "Ordering of favNums not in descending order.")
+
+      ;; ordering by multiple variables
+      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                                :select  ['?name '?favNums]
+                                :where   [['?s :schema/name '?name]
+                                          ['?s :ex/favNums '?favNums]]
+                                :orderBy ['?name '(desc ?favNums)]})
+             [["Alice" 76] ["Alice" 42] ["Alice" 9] ["Brian" 7] ["Cam" 10] ["Cam" 5]])
+          "Ordering of multiple variables not working.")
       )))

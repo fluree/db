@@ -78,11 +78,11 @@
     out-ch))
 
 
-(defmulti get-clause-res (fn [_ _ {:keys [type] :as _clause} _ _ _ _ _ _]
+(defmulti get-clause-res (fn [_ _ {:keys [type] :as _clause} _ _ _ _ _]
                            type))
 
 (defmethod get-clause-res :tuple
-  [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch opts]
+  [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch]
   (let [out-ch      (async/chan 2)
         {:keys [s p o idx flake-x-form]} clause
         {s-var :variable} s
@@ -93,15 +93,14 @@
                         (get vars o-var))
         start-flake (flake/create s* p o* nil nil nil util/min-integer)
         end-flake   (flake/create s* p o* nil nil nil util/max-integer)
-        opts        (assoc opts
-                      :idx idx
-                      :from-t t
-                      :to-t t
-                      :start-test >=
-                      :start-flake start-flake
-                      :end-test <=
-                      :end-flake end-flake
-                      :object-fn nil)
+        opts        {:idx         idx
+                     :from-t      t
+                     :to-t        t
+                     :start-test  >=
+                     :start-flake start-flake
+                     :end-test    <=
+                     :end-flake   end-flake
+                     :object-fn   nil}
         idx-root    (get db idx)
         novelty     (get-in db [:novelty idx])
         range-ch    (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
@@ -116,8 +115,8 @@
     out-ch))
 
 (defn resolve-where-clause
-  [{:keys [t] :as db} {:keys [where vars] :as _q-map} error-ch fuel max-fuel opts]
-  (let [initial-chan (get-clause-res db nil (first where) t vars fuel max-fuel error-ch opts)]
+  [{:keys [t] :as db} {:keys [where vars] :as _parsed-query} error-ch fuel max-fuel]
+  (let [initial-chan (get-clause-res db nil (first where) t vars fuel max-fuel error-ch)]
     (loop [[clause & r] (rest where)
            prev-chan initial-chan]
       ;; TODO - get 't' from query!
@@ -126,16 +125,21 @@
           (recur r out-chan))
         prev-chan))))
 
-(defn where
-  [q-map error-ch fuel max-fuel db opts]
-  (let [{:keys [ident-vars where optional filter]} q-map
-        where-ch (resolve-where-clause db q-map error-ch fuel max-fuel opts)
-        ;optional-res (if optional
-        ;               (<? (optional->left-outer-joins db q-map optional where-res fuel max-fuel opts))
-        ;               where-res)
-        ;filter-res   (if filter
-        ;               (tuples->filtered optional-res filter nil)
-        ;               optional-res)
+(defn order-results
+  "Ordering must first consume all results and then sort."
+  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by}]
+  (async/go
+    (let [results (loop [results []]
+                    (if-let [next-res (async/<! results-ch)]
+                      (recur (into results next-res))
+                      results))]
+      (sort comparator results))))
 
-        ]
-    where-ch))
+(defn where
+  [parsed-query error-ch fuel max-fuel db]
+  (let [{:keys [order-by]} parsed-query
+        where-results (resolve-where-clause db parsed-query error-ch fuel max-fuel)
+        out-ch        (if order-by
+                        (order-results where-results error-ch fuel max-fuel order-by)
+                        where-results)]
+    out-ch))
