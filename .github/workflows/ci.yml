@@ -10,8 +10,8 @@ jobs:
     name: Run tests & build Docker image
     runs-on: [self-hosted, docker]
     steps:
-      - uses: actions/checkout@v2
-      - uses: docker/setup-buildx-action@v1
+      - uses: actions/checkout@v3.1.0
+      - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
       - name: Run tests
@@ -22,7 +22,7 @@ jobs:
         if: github.ref == 'refs/heads/main' && failure()
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        uses: voxmedia/github-action-slack-notify-build@v1
+        uses: voxmedia/github-action-slack-notify-build@v2
         with:
           channel_id: CNCH08G14 # development channel
           status: FAILED
