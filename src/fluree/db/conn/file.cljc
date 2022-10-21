@@ -148,25 +148,20 @@
 
 (defn push
   "Just write to a different directory?"
-  [publish-address ledger-data]
-  #?(:clj
-     (let [p (promise)]
-       (future
-         (let [{:keys [address]} ledger-data
-               path-to-commit    (address-path address)
-               path              (address-path publish-address)]
-           (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
-           (write-file path (.getBytes ^String path-to-commit))
-           (deliver p (file-address path))))
-       p)
-     :cljs
-     (let [{:keys [address]} ledger-data
-           path-to-commit    (address-path address)
-           path              (address-path publish-address)]
-       (js/Promise. (fn [resolve reject]
-                      (log/debug (str "Updating HEAD at " path " to " path-to-commit "."))
-                      (write-file path (js/Buffer.from path-to-commit))
-                      (resolve (file-address path)))))))
+  [conn publish-address {commit-address :address}]
+  (let [local-path  (local-path conn)
+        commit-path (address-path commit-address)
+        head-path   (address-path publish-address)
+        write-path  (str local-path head-path)
+
+        work (fn [complete]
+               (log/debug (str "Updating head at " write-path " to " commit-path "."))
+               (write-file write-path (->bytes commit-path))
+               (complete (file-address head-path)))]
+    #?(:clj (let [p (promise)]
+              (future (work (partial deliver p)))
+              p)
+       :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
 (defrecord FileConnection [id transactor? memory state
                            ledger-defaults
@@ -176,31 +171,23 @@
                            async-cache]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (async/go (read-commit commit-key)))
+  (-c-read [conn commit-key] (async/go (read-commit conn commit-key)))
   (-c-write [conn commit-data] (async/go (commit conn commit-data)))
   (-c-write [conn db commit-data] (async/go (commit conn db commit-data)))
 
   conn-proto/iNameService
-  (-pull [this ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
-  (-subscribe [this ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
+  (-pull [conn ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
+  (-subscribe [conn ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
   (-alias [conn ledger-address]
     ;; TODO: need to validate that the branch doesn't have a slash?
-    (let [{:keys [storage-path]} conn
-          root-path #?(:cljs (path/resolve "." storage-path)
-                       :clj (str (-> (io/file "") .getAbsolutePath) "/" storage-path))]
-      (-> (address-path ledger-address)
-          (str/replace-first (re-pattern root-path) "")
-          (str/split  #"/")
-          (->> (drop-last 2)            ; branch-name, HEAD
-               (str/join #"/")))))
-  (-push [this head-path commit-data] (async/go (push head-path commit-data)))
-  (-lookup [this head-commit-address] (async/go (file-address (read-address head-commit-address))))
+    (-> (address-path ledger-address)
+        (str/split  #"/")
+        (->> (drop-last 2)              ; branch-name, head
+             (str/join #"/"))))
+  (-push [conn head-path commit-data] (async/go (push conn head-path commit-data)))
+  (-lookup [conn head-address] (async/go (file-address (read-address conn head-address))))
   (-address [conn ledger-alias {:keys [branch] :as _opts}]
-    (async/go (file-address
-                #?(:cljs (path/resolve "." (:storage-path conn) ledger-alias (name branch) "HEAD")
-                   :clj (str (-> (io/file "") .getAbsolutePath)
-                             "/" (:storage-path conn) "/" ledger-alias
-                             "/" (name branch) "/HEAD")))))
+    (async/go (file-address (str ledger-alias (when branch (str "/" (name branch))) "/head"))))
 
   conn-proto/iConnection
   (-close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
@@ -222,10 +209,21 @@
   (-state [_ ledger] (get @state ledger))
 
   storage/Store
-  (read [s k] (throw (ex-info "Unsupported FileConnection Store: read" {})))
-  (write [s k data] (throw (ex-info "Unsupported FileConnection Store: write" {})))
-  (exists? [s k] (throw (ex-info "Unsupported FileConnection Store: exists?" {})))
-  (rename [s old-key new-key] (throw (ex-info "Unsupported FileConnection Store: rename" {})))
+  (exists? [s k]
+    (log/error "TODO: file Store/exists?" k))
+  (list [s d]
+    (log/error "TODO: file Store/list" d))
+  (read [s k]
+    (log/error "TODO: file Store/read" k))
+  (write [s k data]
+    (let [[_ ledger & r] (str/split k #"_")
+          path (str (local-path s) ledger "/" "indexes" "/" (str/join "/" r))]
+      (write-file path (->bytes data)))
+    (log/error "TODO: file Store/write" k))
+  (rename [s old-key new-key]
+    (log/error "TODO: file Store/rename" old-key new-key))
+  (delete [s k]
+    (log/error "TODO: file Store/delete" k))
 
   index/Resolver
   (resolve
@@ -273,18 +271,19 @@
           async-cache-fn (or async-cache
                              (conn-cache/default-async-cache-fn memory))]
       ;; TODO - need to set up monitor loops for async chans
-      (map->FileConnection {:id           conn-id
-                            :storage-path storage-path
+      (map->FileConnection {:id              conn-id
+                            :storage-path    storage-path
                             :ledger-defaults (ledger-defaults defaults)
-                            :transactor?  false
-                            :commit       commit
-                            :push         push
-                            :parallelism  parallelism
-                            :msg-in-ch    (async/chan)
-                            :msg-out-ch   (async/chan)
-                            :close        close-fn
-                            :state        state
-                            :async-cache  async-cache-fn}))))
+                            :serializer      (json-serde/json-serde)
+                            :transactor?     false
+                            :commit          commit
+                            :push            push
+                            :parallelism     parallelism
+                            :msg-in-ch       (async/chan)
+                            :msg-out-ch      (async/chan)
+                            :close           close-fn
+                            :state           state
+                            :async-cache     async-cache-fn}))))
 
 (comment
   (read-file (read-file "/home/dan/projects/db2/dev/data/clj/test/db1/main/HEAD" ))
