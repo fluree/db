@@ -42,14 +42,14 @@
         (if in-item
           (let [pass-vals (when passthrough-fn
                             (passthrough-fn in-item))
-                sid   (nth in-item in-n)
-                opts  (query-range-opts idx t sid p nil)
-                in-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+                sid       (nth in-item in-n)
+                opts      (query-range-opts idx t sid p nil)
+                in-ch     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
             ;; pull all subject results off chan, push on out-ch
             (loop []
               (when-let [next-chunk (async/<! in-ch)]
                 (let [result (cond->> (sequence flake-x-form next-chunk)
-                                     pass-vals (map #(concat % pass-vals)))]
+                                      pass-vals (map #(concat % pass-vals)))]
                   (async/>! out-ch result)
                   (recur))))
             (recur r))
@@ -125,21 +125,22 @@
           (recur r out-chan))
         prev-chan))))
 
-(defn order-results
+(defn order+group-results
   "Ordering must first consume all results and then sort."
-  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by}]
+  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by} {:keys [grouping-fn] :as _group-by}]
   (async/go
     (let [results (loop [results []]
                     (if-let [next-res (async/<! results-ch)]
                       (recur (into results next-res))
                       results))]
-      (sort comparator results))))
+      (cond-> (sort comparator results)
+              grouping-fn grouping-fn))))
+
 
 (defn where
   [parsed-query error-ch fuel max-fuel db]
-  (let [{:keys [order-by]} parsed-query
+  (let [{:keys [order-by group-by]} parsed-query
         where-results (resolve-where-clause db parsed-query error-ch fuel max-fuel)
-        out-ch        (if order-by
-                        (order-results where-results error-ch fuel max-fuel order-by)
-                        where-results)]
+        out-ch        (cond-> where-results
+                              order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
     out-ch))

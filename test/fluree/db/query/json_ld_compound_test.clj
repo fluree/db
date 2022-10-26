@@ -25,7 +25,7 @@
                       :type         :ex/User,
                       :schema/name  "Alice"
                       :schema/email "alice@example.org"
-                      :schema/age   42
+                      :schema/age   50
                       :ex/favNums   [42, 76, 9]}
                      {:context      {:ex "http://example.org/ns/"}
                       :id           :ex/cam,
@@ -59,11 +59,11 @@
                    :schema/email "brian@example.org",
                    :schema/age   50,
                    :ex/favNums   7}]
-              [42 {:id           :ex/alice,
+              [50 {:id           :ex/alice,
                    :rdf/type     [:ex/User],
                    :schema/name  "Alice",
                    :schema/email "alice@example.org",
-                   :schema/age   42,
+                   :schema/age   50,
                    :ex/favNums   [9, 42, 76]}]]))
 
       ;; here we have pass-through variables (?name and ?age) which must get "passed through"
@@ -76,7 +76,7 @@
                                           ['?f :schema/age '?age]
                                           ['?f :schema/email '?email]]})
              [["Brian" 50 "brian@example.org"]
-              ["Alice" 42 "alice@example.org"]])
+              ["Alice" 50 "alice@example.org"]])
           "Prior where statement variables may not be passing through to select results")
 
       ;; same as prior query, but using selectOne
@@ -128,4 +128,37 @@
                                 :orderBy ['?name '(desc ?favNums)]})
              [["Alice" 76] ["Alice" 42] ["Alice" 9] ["Brian" 7] ["Cam" 10] ["Cam" 5]])
           "Ordering of multiple variables not working.")
+
+      ;; ordering by multiple variables where some are equal, and not all carried to 'select'
+      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                                :select  ['?name '?favNums]
+                                :where   [['?s :schema/name '?name]
+                                          ['?s :schema/age '?age]
+                                          ['?s :ex/favNums '?favNums]]
+                                :orderBy ['?age '?name '(desc ?favNums)]})
+             [["Cam" 10] ["Cam" 5] ["Alice" 76] ["Alice" 42] ["Alice" 9] ["Brian" 7]])
+          "Ordering of multiple variables where some are equal working.")
+
+      ;; group-by with a multicardinality value, but not using any aggregate function
+      (is (= @(fluree/query db {:context  {:ex "http://example.org/ns/"}
+                                :select   ['?name '?favNums]
+                                :where    [['?s :schema/name '?name]
+                                           ['?s :ex/favNums '?favNums]]
+                                :group-by '?name})
+             [["Alice" [9 42 76]] ["Brian" [7]] ["Cam" [5 10]]])
+          "Sums of favNums by person are not accurate.")
+
+
+
+      ; using sum aggregate function on multicardinality value
+      ;(is (= @(fluree/query db {:context  {:ex "http://example.org/ns/"}
+      ;                          :select   ['?name '(sum ?favNums)]
+      ;                          :where    [['?s :schema/name '?name]
+      ;                                     ['?s :ex/favNums '?favNums]]
+      ;                          :group-by '?name})
+      ;       [["Alice" 127]
+      ;        ["Brian" 7]
+      ;        ["Cam" 15]])
+      ;    "Sums of favNums by person are not accurate.")
+
       )))

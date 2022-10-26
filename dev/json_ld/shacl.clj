@@ -25,6 +25,34 @@
 
 (comment
 
+  (def ledger @(fluree/create ipfs-conn "shacl/mytest" {}))
+  (def db @(fluree/stage
+             ledger
+             {:context              {:ex "http://example.org/ns/"}
+              :id                   :ex/UserShape,
+              :type                 [:sh/NodeShape],
+              :sh/targetClass       :ex/User
+              :sh/property          [{:sh/path     :schema/name
+                                      :sh/minCount 1
+                                      :sh/maxCount 1
+                                      :sh/datatype :xsd/string}]
+              :sh/ignoredProperties [:rdf/type]
+              :sh/closed            true}))
+
+  (def db2 @(fluree/stage
+              db
+              {:context         {:ex "http://example.org/ns/"}
+               :id              :ex/john,
+               :type            [:ex/User],
+               :schema/name     "John"
+               :schema/callSign "j-rock"}))
+
+
+  )
+
+
+(comment
+
   (def ipfs-conn @(fluree/connect-ipfs
                     {:server   nil                          ;; use default
                      ;; ledger defaults used for newly created ledgers
@@ -62,7 +90,7 @@
 
   (def newdb2
     @(fluree/stage
-       newdb
+       ledger
        {:context              {:ex "http://example.org/ns/"}
         :id                   :ex/UserShape,
         :type                 [:sh/NodeShape],
@@ -79,8 +107,10 @@
                                 :sh/minCount 1
                                 :sh/maxCount 1
                                 :sh/nodeKind :sh/IRI}]
-        :sh/ignoredProperties [:rdf/type]
+        :sh/ignoredProperties [:rdf/type :schema/author]
         :sh/closed            true}))
+
+  (-> newdb2 :novelty :spot)
 
 
   @(fluree/query newdb2 {:context {:ex "http://example.org/ns/"}

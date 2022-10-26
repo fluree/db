@@ -435,11 +435,12 @@
 
 (defn process-select-results
   "Processes where results into final shape of specified select statement."
-  [db out-ch where-ch error-ch {:keys [select fuel compact-fn] :as _parsed-query}]
+  [db out-ch where-ch error-ch {:keys [select fuel compact-fn group-by] :as _parsed-query}]
   (go-try
     (let [{:keys [spec inVector?]} select
           cache    (volatile! {})
-          fuel-vol (volatile! 0)]
+          fuel-vol (volatile! 0)
+          {:keys [group-finish-fn]} group-by]
       (loop []
         (let [where-items (async/alt!
                             error-ch ([e]
@@ -448,7 +449,9 @@
                                       result-chunk))]
           (if where-items
             (do
-              (loop [[where-item & r] where-items]
+              (loop [[where-item & r] (if group-finish-fn   ;; note - this could be added to the chan as a transducer - however as all results are in one big, sorted chunk I don't expect any performance benefit
+                                        (map group-finish-fn where-items)
+                                        where-items)]
                 (if where-item
                   (let [where-result (<? (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector?))]
                     (async/>! out-ch where-result)

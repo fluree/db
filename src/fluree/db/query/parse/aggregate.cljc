@@ -159,15 +159,17 @@
   :as - return variable/binding name
   :fn-str - original function string, for use in reporting errors
   :function - executable function."
-  [aggregate-fn-str]
-  (let [list-agg  (safe-read-fn aggregate-fn-str)
+  [aggregate-input]
+  (let [list-agg  (if (string? aggregate-input)
+                    (safe-read-fn aggregate-input)
+                    aggregate-input)
         as?       (= 'as (first list-agg))
         func-list (if as?
                     (second list-agg)
                     list-agg)
         _         (when-not (coll? func-list)
-                    (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " aggregate-fn-str)
+                    (throw (ex-info (str "Invalid aggregate selection. As can only be used in conjunction with other functions. Provided: " aggregate-input)
                                     {:status 400 :error :db/invalid-query})))
         as        (when as?
                     (extract-aggregate-as list-agg))]
-    (parse-aggregate* func-list aggregate-fn-str as)))
+    (parse-aggregate* func-list aggregate-input as)))

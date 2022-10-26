@@ -19,8 +19,10 @@
 (defn aggregate?
   "Aggregate as positioned in a :select statement"
   [x]
-  (and (string? x)
-       (re-matches #"^\(.+\)$" x)))
+  (or (and (string? x)
+           (re-matches #"^\(.+\)$" x))
+      (and (list? x)
+           (symbol? (first x)))))
 
 
 (defn parse-map
@@ -37,7 +39,7 @@
 
 (defn parse-select
   [select-smt depth]
-  (let [_ (or (every? #(or (string? %) (map? %) (symbol? %)) select-smt)
+  (let [_ (or (every? #(or (string? %) (map? %) (symbol? %) (list? %)) select-smt)
               (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt)
                               {:status 400 :error :db/invalid-query})))]
     (map (fn [select]

@@ -637,16 +637,24 @@
 
 
 (defn add-group-by
-  [{:keys [where] :as parsed-query} group-by]
-  (let [group-by* (->> (if (sequential? group-by) group-by [group-by])
-                       (mapv q-var->symbol))]
-    (when-not (every? symbol? group-by*)
+  "Adds group-by clause.
+  If no order-by is present, uses group-by statement to create corresponding
+  order-by. If order-by is present, uses it for ordering - but if inconsistent
+  with group-by the desired results may not be achieved.
+  *note - we could implement more logic to check if group-by is inconsistent with
+  order-by"
+  [{:keys [where order-by] :as parsed-query} group-by]
+  (let [group-symbols (->> (if (sequential? group-by) group-by [group-by])
+                           (mapv q-var->symbol))]
+    (when-not (every? symbol? group-symbols)
       (throw (ex-info (str "Group by must only include variable(s), provided: " group-by)
                       {:status 400 :error :db/invalid-query})))
-    (when-not (every? #(variable-in-where? % where) group-by*)
+    (when-not (every? #(variable-in-where? % where) group-symbols)
       (throw (ex-info (str "Group by includes variable(s) not specified in the where clause: " group-by)
                       {:status 400 :error :db/invalid-query})))
-    (assoc parsed-query :group-by group-by*)))
+    (cond-> (assoc parsed-query :group-by {:input  group-by
+                                           :parsed (mapv (fn [sym] {:variable sym}) group-symbols)})
+            (not order-by) (add-order-by group-symbols))))
 
 
 (defn get-limit
@@ -793,15 +801,11 @@
       o-var?
       (map (fn [f] [(flake/o f)])))))
 
-(defn gen-passthrough-fn
-  "Transforms input variables into required passthrough variables.
-  Optimized for several arity."
-  [out-vars {:keys [others] :as _vars} in-vars]
-  (let [passthrough-vars  (filter (set others) out-vars)    ;; only keep output vars in 'others'
-        passthrough-count (count passthrough-vars)
-        passthrough-pos   (mapv #(util/index-of in-vars %) passthrough-vars)
-        [n1 n2 n3 n4 n5] passthrough-pos]
-    (case passthrough-count
+(defn build-vec-extraction-fn
+  [extraction-positions]
+  (let [n (count extraction-positions)
+        [n1 n2 n3 n4 n5 & _r] extraction-positions]
+    (case n
       0 nil
       1 (fn [input-item]
           [(nth input-item n1)])
@@ -817,7 +821,15 @@
       (fn [input-item]
         (mapv (fn [n]
                 (nth input-item n))
-              passthrough-pos)))))
+              extraction-positions)))))
+
+(defn gen-passthrough-fn
+  "Transforms input variables into required passthrough variables.
+  Optimized for several arity."
+  [out-vars {:keys [others] :as _vars} in-vars]
+  (let [passthrough-vars (filter (set others) out-vars)     ;; only keep output vars in 'others'
+        passthrough-pos  (mapv #(util/index-of in-vars %) passthrough-vars)]
+    (build-vec-extraction-fn passthrough-pos)))
 
 (defn get-idx
   [{s-variable :variable, s-supplied? :supplied?} p {o-variable :variable, o-supplied? :supplied?}]
@@ -886,9 +898,14 @@
   This makes the flake output vars needed come first (in 's p o' order) followed by any vars
   required that are passed through from prior statments. This allows the x-forms of both the
   query result flakes and the prior results passed through able to 'concat' to produce the final
-  properly ordered output."
-  [out-vars {:keys [flake-in flake-out others all] :as vars}]
-  (let [out-vars-s (set out-vars)
+  properly ordered output.
+
+  There could be an order-by or group-by var not included in the select statement, so
+  those must get added into the results here - note group-by without order-by will create an order-by"
+  [out-vars {:keys [flake-out others] :as _vars} {:keys [parsed] :as _order-by}]
+  (let [order-by   (->> (map :variable parsed)
+                        (remove nil?))
+        out-vars-s (into (set out-vars) order-by)
         flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
         others-out (filter out-vars-s others)               ;; only keep other vars needed in final output
         ]
@@ -896,9 +913,9 @@
 
 
 (defn where-meta-reverse
-  [where select-out-vars]
+  [where select-out-vars order-by]
   (loop [[{:keys [s p o vars prior-vars] :as clause} & r] (reverse where)
-         out-vars (order-out-vars select-out-vars vars)
+         out-vars (order-out-vars select-out-vars vars order-by)
          acc      []]
     (if clause
       (let [in-vars        (get-in-vars out-vars vars prior-vars)
@@ -920,10 +937,14 @@
 
 
 (defn update-select
-  "Updates select statement variables with final where clause positions of items."
-  [{:keys [spec] :as select} where]
-  (let [{:keys [out-vars] :as _last-where} (last where)
-        spec* (mapv #(update-positions % out-vars) spec)]
+  "Updates select statement variables with final where clause positions of items.
+
+  If group-by is used, grouping can re-order output so utilize out-vars from that
+  as opposed to the last where statement."
+  [{:keys [spec] :as select} where {group-out-vars :out-vars :as _group-by}]
+  (let [out-vars (or group-out-vars
+                     (-> where last :out-vars))
+        spec*    (mapv #(update-positions % out-vars) spec)]
     (assoc select :spec spec*)))
 
 (defn build-order-fn
@@ -941,10 +962,13 @@
       (first compare-fns)
       (fn [x y]
         (loop [[compare-fn & r] compare-fns]
-          (let [res (compare-fn x y)]
-            (if (zero? res)
-              (recur r)
-              res)))))))
+          (if compare-fn
+            (let [res (compare-fn x y)]
+              (if (zero? res)
+                (recur r)
+                res))
+            ;; no more compare functions, items are equal and return zero
+            0))))))
 
 (defn update-order-by
   "Updates order-by, if applicable, with final where clause positions of items."
@@ -955,6 +979,118 @@
           order-by*  (assoc order-by :parsed parsed*)
           comparator (build-order-fn order-by*)]
       (assoc order-by* :comparator comparator))))
+
+
+(defn grouped-vals-result-fn
+  "Returns grouped results in a consolidated vector.
+  e.g. [[:a :b :c] [:a1 :b1 :c1] [:a2 :b2 :c2] [:a3 :b3 :c3]] will turn into:
+  ==>  [[:a :a1 :a2 :a3] [:b :b1 :b2 :b3] [:c :c1 :c2 :c3]
+
+  The optimized case-specific versions are > 50% faster than the less optimized"
+  [extraction-positions]
+  (let [n-positions (count extraction-positions)]
+    (case n-positions
+      0 nil
+      1 (fn [group-results]
+          (let [grouped (pop group-results)]
+            (conj grouped (mapv first (last group-results)))))
+      2 (fn [group-results]
+          (let [grouped (pop group-results)
+                grouped-block (last group-results)]
+            (loop [grouped-block grouped-block
+                   r1-acc       (transient [])
+                   r2-acc       (transient [])]
+              (let [[r1 r2] (first grouped-block)]
+                (if r1
+                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2))
+                  (-> grouped
+                      (conj (persistent! r1-acc))
+                      (conj (persistent! r2-acc))))))))
+      3 (fn [group-results]
+          (loop [group-results group-results
+                 r1-acc        (transient [])
+                 r2-acc        (transient [])
+                 r3-acc        (transient [])]
+            (let [[r1 r2 r3] (first group-results)]
+              (if r1
+                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3))
+                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc)]))))
+      4 (fn [group-results]
+          (loop [group-results group-results
+                 r1-acc        (transient [])
+                 r2-acc        (transient [])
+                 r3-acc        (transient [])
+                 r4-acc        (transient [])]
+            (let [[r1 r2 r3 r4] (first group-results)]
+              (if r1
+                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4))
+                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc)]))))
+      5 (fn [group-results]
+          (loop [group-results group-results
+                 r1-acc        (transient [])
+                 r2-acc        (transient [])
+                 r3-acc        (transient [])
+                 r4-acc        (transient [])
+                 r5-acc        (transient [])]
+            (let [[r1 r2 r3 r4 r5] (first group-results)]
+              (if r1
+                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4) (conj! r5-acc r5))
+                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc) (persistent! r5-acc)]))))
+      ;; else - less optimized, handle all other cases
+      (fn [group-results]
+        ;; note: args are returned here in a list which should be OK downstream.
+        ;; If turned into a vector, benchmarking shows time doubles.
+        ;; A more complex fn using a reducer with transients is about equal in time to what is here.
+        ;; If we must move to using vector in result sets, then performance-wise it will make more sense
+        (apply mapv (fn [& args] args) group-results)))))
+
+
+(defn lazy-group-by
+  "Returns lazily parsed results from group-by.
+  Even though the query results must be fully realized through sorting,
+  a pre-requisite of grouping, the grouping itself can be lazy which will
+  help with large result sets that have a 'limit'."
+  [grouping-fn grouped-vals-fn results]
+  (lazy-seq
+    (when-let [results* (seq results)]
+      (let [fst  (first results*)
+            fv   (grouping-fn fst)
+            fres (grouped-vals-fn fst)
+            [next-chunk rest-results] (loop [rest-results (rest results*)
+                                             acc          [fres]]
+                                        (let [result (first rest-results)]
+                                          (if result
+                                            (if (= fv (grouping-fn result))
+                                              (recur (next rest-results) (conj acc (grouped-vals-fn result)))
+                                              [(conj fv acc) rest-results])
+                                            [(conj fv acc) nil])))]
+        (cons next-chunk (lazy-group-by grouping-fn grouped-vals-fn (lazy-seq rest-results)))))))
+
+
+(defn update-group-by
+  "Updates group-by, if applicable, with final where clause positions of items."
+  [{:keys [parsed] :as group-by} where]
+  (when group-by
+    (let [{:keys [out-vars] :as _last-where} (last where)
+          parsed*               (mapv #(update-positions % out-vars) parsed)
+          group-by*             (assoc group-by :parsed parsed*)
+          grouped-positions     (mapv :in-n parsed*)        ;; returns 'n' positions of values used for grouping
+          partition-fn          (build-vec-extraction-fn grouped-positions) ;; returns fn containing only grouping vals, used like a 'partition-by' fn
+          grouped-val-positions (filterv                    ;; returns 'n' positions of values that are being grouped
+                                  (complement (set grouped-positions))
+                                  (range (count out-vars)))
+          grouped-vals-fn       (build-vec-extraction-fn grouped-val-positions) ;; returns fn containing only values being grouped (excludes grouping vals)
+          ;; grouping fn takes sorted results, and partitions results by group-by vars returning only the values being grouped.
+          ;; we don't yet merge all results together as that work is unnecessary if using an offset, or limit
+          grouping-fn           (fn [results]
+                                  (lazy-group-by partition-fn grouped-vals-fn results))
+          ;; group-finish-fn takes final results and merges results together
+          group-finish-fn       (grouped-vals-result-fn grouped-val-positions)
+          grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
+      (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
+                       :grouping-fn grouping-fn
+                       :group-finish-fn group-finish-fn))))
+
 
 (defn get-clause-vars
   [new-flake-vars {:keys [others all] :as _prior-vars}]
@@ -1009,17 +1145,20 @@
                                 s-supplied? (assoc-in [:s :supplied?] true)
                                 o-supplied? (assoc-in [:o :supplied?] true))]
         (recur r (inc i) vars (conj acc where-smt*)))
-      (let [where*    (where-meta-reverse acc out-vars)
-            select*   (update-select select where*)
-            order-by* (update-order-by order-by group-by where*)]
+      (let [where*    (where-meta-reverse acc out-vars order-by)
+            order-by* (update-order-by order-by group-by where*)
+            group-by* (update-group-by group-by where*)
+            select*   (update-select select where* group-by*)]
         (assoc parsed-query :where where*
                             :select select*
-                            :order-by order-by*)))))
+                            :order-by order-by*
+                            :group-by group-by*)))))
 
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [opts prettyPrint filter orderBy groupBy context depth] :as query-map'} supplied-vars]
+  [db {:keys [opts prettyPrint filter context depth
+              orderBy order-by groupBy group-by] :as query-map'} supplied-vars]
   (let [rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
@@ -1030,8 +1169,8 @@
                             (if (:js? opts*)
                               (json-ld/parse-context (get-in db [:schema :context-str]) context)
                               (json-ld/parse-context (get-in db [:schema :context]) context)))
-        orderBy*          (or orderBy (:orderBy opts))
-        groupBy*          (or groupBy (:groupBy opts))
+        order-by*         (or orderBy order-by (:orderBy opts))
+        group-by*         (or groupBy group-by (:groupBy opts))
         parsed            (cond-> {:json-ld?      json-ld-db?
                                    :strategy      :legacy
                                    :context       context*
@@ -1047,8 +1186,8 @@
                                                     prettyPrint
                                                     (:prettyPrint opts))}
                                   filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
-                                  orderBy (add-order-by orderBy*)
-                                  groupBy (add-group-by groupBy*)
+                                  order-by* (add-order-by order-by*)
+                                  group-by* (add-group-by group-by*)
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
                                   true (add-select-spec query-map' db)
                                   true (add-where-meta)
