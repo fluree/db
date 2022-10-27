@@ -337,7 +337,7 @@
 (defn- graphdb-p-prop [{:keys [schema] :as this} property predicate]
   (assert (#{:name :id :iri :type :ref? :idx? :unique :multi :index :upsert
              :component :noHistory :restrictCollection :spec :specDoc :txSpec
-             :txSpecDoc :restrictTag :retractDuplicates :subclass :new?} property)
+             :txSpecDoc :restrictTag :retractDuplicates :subclassOf :new?} property)
           (str "Invalid predicate property: " (pr-str property)))
   (cond->> (get-in schema [:pred predicate property])
            (= :restrictCollection property) (dbproto/-c-prop this :partition)))
@@ -430,7 +430,7 @@
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
   (-c-prop [this property collection] (graphdb-c-prop this property collection))
   (-class-prop [this property class]
-    (if (= :subclass property)
+    (if (= :subclasses property)
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
   (-p-prop [this property predicate] (graphdb-p-prop this property predicate))

@@ -402,7 +402,7 @@
   "Parses where clause tuples (not maps)"
   [supplied-vars all-vars context db s p o]
   (let [json-ld-db? (= :json-ld (dbproto/-db-type db))
-        rdf-type?   (#{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type} p)
+        rdf-type?   (#{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type "@type"} p)
         p           (if rdf-type?
                       "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                       (json-ld/expand-iri p context))
@@ -479,6 +479,7 @@
                                            [s p o] ".")
                                       {:status 400 :error :db/invalid-query})))]
     {:type   (cond
+               rdf-type? :class
                fulltext? :full-text
                collection? :collection
                iri? :iri
@@ -995,11 +996,11 @@
           (let [grouped (pop group-results)]
             (conj grouped (mapv first (last group-results)))))
       2 (fn [group-results]
-          (let [grouped (pop group-results)
+          (let [grouped       (pop group-results)
                 grouped-block (last group-results)]
             (loop [grouped-block grouped-block
-                   r1-acc       (transient [])
-                   r2-acc       (transient [])]
+                   r1-acc        (transient [])
+                   r2-acc        (transient [])]
               (let [[r1 r2] (first grouped-block)]
                 (if r1
                   (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2))

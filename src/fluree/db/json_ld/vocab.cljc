@@ -118,13 +118,14 @@
   "Calculates subclass map for use with queries for rdf:type."
   [property-maps]
   (let [classes      (filter #(true? (:class %)) property-maps)
-        subclass-map (recur-sub-classes classes)]
+        subclass-map (recur-sub-classes (vals property-maps))]
     ;; map subclasses for both subject-id and iri
-    (reduce
-      (fn [acc class]
-        (assoc acc (:id class) (get subclass-map (:id class))
-                   (:iri class) (get subclass-map (:id class))))
-      {} classes)))
+    subclass-map
+    (reduce-kv
+      (fn [acc class-id subclasses]
+        (let [iri (get-in property-maps [class-id :iri])]
+          (assoc acc iri subclasses)))
+      subclass-map subclass-map)))
 
 (defn extract-ref-sids
   [property-maps]
@@ -240,3 +241,10 @@
           refs         (extract-ref-sids (:pred schema))]
       (-> schema
           (assoc :refs refs)))))
+
+(defn refresh-schema
+  "Updates the schema map of a db."
+  [db]
+  (go-try
+    (let [schema (<? (vocab-map db))]
+      (assoc db :schema schema))))

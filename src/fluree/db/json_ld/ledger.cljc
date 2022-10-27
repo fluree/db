@@ -3,7 +3,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.util.core :as util]))
 
 ;; methods to link/trace back a ledger and return flakes
 #?(:clj (set! *warn-on-reflection* true))
@@ -17,7 +18,7 @@
 
 (defn class-or-property?
   [{:keys [type] :as node}]
-  (some class+property-iris type))
+  (some class+property-iris (util/sequential type)))
 
 (def ^:const predefined-properties
   (merge datatype/default-data-types
@@ -25,6 +26,8 @@
           "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type
           ;; rdfs
           "http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
+          "http://www.w3.org/2000/01/rdf-schema#subClassOf"     const/$rdfs:subClassOf
+          "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"  const/$rdfs:subPropertyOf
           ;; owl
           "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
           "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty

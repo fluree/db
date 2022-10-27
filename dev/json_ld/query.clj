@@ -94,7 +94,7 @@
 
 
   @(fluree/query db {:context  {:ex "http://example.org/ns/"}
-                     :select   ['?name '(sum ?favNums) '(avg ?scores)]
+                     :select   ['?name '(sum ?favNums)]
                      :where    [['?s :schema/name '?name]
                                 ['?s :ex/last '?last]
                                 ['?s :ex/favNums '?favNums]
