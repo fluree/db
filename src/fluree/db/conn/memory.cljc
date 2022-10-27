@@ -93,9 +93,19 @@
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
   (-push [this address ledger-data] (async/go (push! data-atom address ledger-data)))
+  (-alias [this address]
+    (-> (address-path address)
+        (str/split #"/")
+        (->> (drop 2)
+             (str/join "/"))))
   (-lookup [this head-commit-address]
-    (async/go #?(:clj (throw (ex-info (str "Cannot lookup ledger address with memory connection: " head-commit-address)
-                                      {:status 500 :error :db/invalid-ledger}))
+    (async/go #?(:clj
+                 (if-let [head-commit (read-address data-atom head-commit-address)]
+                   (-> head-commit (get "credentialSubject") (get "data") (get "address"))
+                   (throw (ex-info (str "Unable to lookup ledger address from conn: "
+                                        head-commit-address)
+                                   {:status 500 :error :db/missing-head})))
+
                  :cljs
                  (if platform/BROWSER
                    (if-let [head-commit (read-address data-atom head-commit-address)]
