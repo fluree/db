@@ -181,6 +181,7 @@
              subj-flakes     base-flakes]
         (if k
           (let [list?            (list-value? v)
+                retract?         (nil? v)
                 v*               (if list?
                                    (let [list-vals (:list v)]
                                      (when-not (sequential? list-vals)
@@ -200,12 +201,15 @@
                                            ref? (conj (flake/create pid const/$rdf:type const/$iri const/$xsd:anyURI t true nil))))
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts?  (or (not new-subj?) existing-pid)
-                flakes*          (loop [[v' & r] v*
-                                        flakes* subj-flakes]
-                                   (if v'
-                                     (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
-                                     (cond-> flakes*
-                                             property-flakes (into property-flakes))))]
+                flakes*          (if retract?
+                                   (->> (<? (query-range/index-range db-before :spot = [sid pid]))
+                                        (map #(flake/flip-flake % t)))
+                                   (loop [[v' & r] v*
+                                          flakes* subj-flakes]
+                                     (if v'
+                                       (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
+                                       (cond-> flakes*
+                                               property-flakes (into property-flakes)))))]
             (recur r property-flakes* flakes*))
           (into subj-flakes property-flakes))))))
 
@@ -342,7 +346,7 @@
                         :remove     remove
                         :ref-add    (ref-flakes add)
                         :ref-remove (ref-flakes remove)
-                        :count      (cond-> (when add (count add))
+                        :count      (cond-> (if add (count add) 0)
                                             remove (- (count remove)))
                         :size       (cond-> (flake/size-bytes add)
                                             remove (- (flake/size-bytes remove)))}
