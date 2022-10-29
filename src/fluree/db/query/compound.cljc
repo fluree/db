@@ -43,8 +43,9 @@
         (if in-item
           (let [pass-vals (when passthrough-fn
                             (passthrough-fn in-item))
+                {pid :value} p
                 sid       (nth in-item in-n)
-                opts      (query-range-opts idx t sid p nil)
+                opts      (query-range-opts idx t sid pid nil)
                 in-ch     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
             ;; pull all subject results off chan, push on out-ch
             (loop []
@@ -86,6 +87,7 @@
   [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch]
   (let [out-ch      (async/chan 2)
         {:keys [s p o idx flake-x-form]} clause
+        {pid :value} p
         {s-var :variable} s
         {o-var :variable} o
         s*          (or (:value s)
@@ -100,7 +102,7 @@
       (loop [[next-class & rest-classes] all-classes
              all-seen #{}]
         (if next-class
-          (let [class-opts (query-range-opts idx t s* p next-class)
+          (let [class-opts (query-range-opts idx t s* pid next-class)
                 class-chan (query-range/resolve-flake-slices conn idx-root novelty error-ch class-opts)
                 ;; exhaust class, return all seen sids for the class
                 class-seen (loop [class-seen []]
@@ -122,13 +124,14 @@
   [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch]
   (let [out-ch   (async/chan 2)
         {:keys [s p o idx flake-x-form]} clause
+        {pid :value} p
         {s-var :variable} s
         {o-var :variable} o
         s*       (or (:value s)
                      (get vars s-var))
         o*       (or (:value o)
                      (get vars o-var))
-        opts     (query-range-opts idx t s* p o*)
+        opts     (query-range-opts idx t s* pid o*)
         idx-root (get db idx)
         novelty  (get-in db [:novelty idx])
         range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]

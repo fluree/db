@@ -37,6 +37,5 @@
                              :from    :ex/alice})
              [{:id           :ex/alice,
                :rdf/type     [:ex/User],
-               :schema/email "alice@example.org",
                :schema/name  "Alice"}])
           "Alice should no longer have an age property"))))

@@ -14,6 +14,7 @@
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]))
 
 #?(:clj (set! *warn-on-reflection* true))
