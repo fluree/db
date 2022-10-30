@@ -78,10 +78,8 @@
   ledger-data)
 
 
-(defrecord MemoryConnection [id transactor? memory state
-                             ledger-defaults async-cache
-                             parallelism close-fn
-                             msg-in-ch msg-out-ch
+(defrecord MemoryConnection [id memory state ledger-defaults async-cache
+                             parallelism close-fn msg-in-ch msg-out-ch
                              ipfs-endpoint data-atom]
 
   conn-proto/iStorage
@@ -127,7 +125,6 @@
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
-  (-transactor? [_] transactor?)
   (-id [_] id)
   (-read-only? [_] false)
   (-context [_] (:context ledger-defaults))
@@ -196,7 +193,6 @@
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom
-                              :transactor?     false
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)
                               :msg-out-ch      (async/chan)

@@ -163,11 +163,8 @@
               p)
        :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
-(defrecord FileConnection [id transactor? memory state
-                           ledger-defaults
-                           push commit
-                           parallelism close-fn
-                           msg-in-ch msg-out-ch
+(defrecord FileConnection [id memory state ledger-defaults push commit
+                           parallelism close-fn msg-in-ch msg-out-ch
                            async-cache]
 
   conn-proto/iStorage
@@ -194,7 +191,6 @@
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :file)
   (-parallelism [_] parallelism)
-  (-transactor? [_] transactor?)
   (-id [_] id)
   (-read-only? [_] (not (fn? commit)))
   (-context [_] (:context ledger-defaults))
@@ -275,7 +271,6 @@
                             :storage-path    storage-path
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      (json-serde/json-serde)
-                            :transactor?     false
                             :commit          commit
                             :push            push
                             :parallelism     parallelism

@@ -64,9 +64,9 @@
       ledger-name)))
 
 
-(defrecord IPFSConnection [id transactor? memory state ledger-defaults
-                           async-cache serializer parallelism close-fn msg-in-ch
-                           msg-out-ch ipfs-endpoint]
+(defrecord IPFSConnection [id memory state ledger-defaults async-cache
+                           serializer parallelism close-fn msg-in-ch msg-out-ch
+                           ipfs-endpoint]
 
   conn-proto/iStorage
   (-c-read [_ commit-key]
@@ -96,7 +96,6 @@
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
-  (-transactor? [_] transactor?)
   (-id [_] id)
   (-read-only? [_]
     :TODO) ; TODO: remove in favor of different read only connection impl
@@ -238,7 +237,6 @@
       (map->IPFSConnection {:id              conn-id
                             :ipfs-endpoint   ipfs-endpoint
                             :ledger-defaults ledger-defaults
-                            :transactor?     false
                             :serializer      serializer
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)

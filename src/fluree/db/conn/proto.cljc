@@ -8,7 +8,6 @@
   (-closed? [conn] "Indicates if connection is open or closed")
   (-method [conn] "Returns connection method type (as keyword)")
   (-parallelism [conn] "Returns parallelism integer to use for running multi-thread operations (1->8)")
-  (-transactor? [conn] "Returns true if this connection is running on a transactor service")
   (-id [conn] "Returns internal id for connection object")
   (-read-only? [conn] "Returns true if a read-only connection")
   (-context [conn] "Returns optional default context set at connection level")
