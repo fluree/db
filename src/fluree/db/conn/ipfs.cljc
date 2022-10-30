@@ -66,7 +66,6 @@
 
 (defrecord IPFSConnection [id transactor? memory state
                            ledger-defaults async-cache
-                           local-read local-write
                            read write
                            storage-read storage-write serializer
                            parallelism close-fn
@@ -215,7 +214,7 @@
 
 (defn connect
   "Creates a new IPFS connection."
-  [{:keys [server local-read local-write parallelism async-cache memory defaults serializer]
+  [{:keys [server parallelism async-cache memory defaults serializer]
     :or   {server     "http://127.0.0.1:5001/"
            serializer (json-serde)}}]
   (go-try
@@ -241,8 +240,6 @@
                             :ipfs-endpoint   ipfs-endpoint
                             :ledger-defaults ledger-defaults
                             :transactor?     false
-                            :local-read      local-read
-                            :local-write     local-write
                             :read            read
                             :write           write
                             :storage-read    (ipfs/default-read-fn ipfs-endpoint true)

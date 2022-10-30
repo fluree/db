@@ -80,7 +80,6 @@
 
 (defrecord MemoryConnection [id transactor? memory state
                              ledger-defaults async-cache
-                             local-read local-write
                              parallelism close-fn
                              msg-in-ch msg-out-ch
                              ipfs-endpoint data-atom]
@@ -185,7 +184,7 @@
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [local-read local-write parallelism async-cache memory defaults]}]
+  [{:keys [parallelism async-cache memory defaults]}]
   (go-try
     (let [ledger-defaults    (<? (ledger-defaults defaults))
           conn-id            (str (random-uuid))
@@ -198,8 +197,6 @@
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom
                               :transactor?     false
-                              :local-read      local-read
-                              :local-write     local-write
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)
                               :msg-out-ch      (async/chan)
