@@ -192,7 +192,6 @@
   (-method [_] :file)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-read-only? [_] (not (fn? commit)))
   (-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]

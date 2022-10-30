@@ -126,7 +126,6 @@
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-read-only? [_] false)
   (-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))

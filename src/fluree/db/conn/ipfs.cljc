@@ -97,8 +97,6 @@
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-read-only? [_]
-    :TODO) ; TODO: remove in favor of different read only connection impl
   (-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]                                    ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]
