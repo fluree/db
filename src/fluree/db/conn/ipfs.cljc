@@ -1,5 +1,4 @@
 (ns fluree.db.conn.ipfs
-  (:refer-clojure :exclude [read])
   (:require [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.core :as util :refer [exception?]]
@@ -7,6 +6,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.method.ipfs.core :as ipfs]
+            [fluree.db.method.ipfs.xhttp :as ipfs-xhttp]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.conn.state-machine :as state-machine]
@@ -64,18 +64,19 @@
       ledger-name)))
 
 
-(defrecord IPFSConnection [id transactor? memory state
-                           ledger-defaults async-cache
-                           read write
-                           storage-read storage-write serializer
-                           parallelism close-fn
-                           msg-in-ch msg-out-ch
-                           ipfs-endpoint]
+(defrecord IPFSConnection [id transactor? memory state ledger-defaults
+                           async-cache serializer parallelism close-fn msg-in-ch
+                           msg-out-ch ipfs-endpoint]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (read commit-key))
-  (-c-write [_ commit-data] (write commit-data))
-  (-c-write [_ _ commit-data] (write commit-data))
+  (-c-read [_ commit-key]
+    (ipfs/read ipfs-endpoint commit-key))
+
+  (-c-write [_ commit-data]
+    (ipfs/commit ipfs-endpoint commit-data))
+
+  (-c-write [_ _ commit-data]
+    (ipfs/commit ipfs-endpoint commit-data))
 
   conn-proto/iNameService
   (-push [this address ledger-data] (ipfs/push! this address ledger-data))
@@ -96,7 +97,8 @@
   (-parallelism [_] parallelism)
   (-transactor? [_] transactor?)
   (-id [_] id)
-  (-read-only? [_] (not (fn? write))) ; if no commit fn, then read-only
+  (-read-only? [_]
+    :TODO) ; TODO: remove in favor of different read only connection impl
   (-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]                                    ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]
@@ -115,11 +117,11 @@
 
   storage/Store
   (read [_ k]
-    (storage-read k))
+    (ipfs/read ipfs-endpoint k true))
   (write [_ k data]
-    (storage-write k data))
-  (exists? [_ k]
-    (storage-read k))
+    (ipfs/commit ipfs-endpoint k data))
+  (exists? [conn k]
+    (storage/read conn k))
   (rename [_ old-key new-key]
     (throw (ex-info (str "IPFS does not support renaming of files: " old-key new-key)
                     {:status 500 :error :db/unexpected-error})))
@@ -222,8 +224,6 @@
           ledger-defaults    (<? (ledger-defaults ipfs-endpoint defaults))
           memory             (or memory 1000000)            ;; default 1MB memory
           conn-id            (str (random-uuid))
-          read               (ipfs/default-read-fn ipfs-endpoint)
-          write              (ipfs/default-commit-fn ipfs-endpoint)
           state              (state-machine/blank-state)
           memory-object-size (quot memory 100000)           ;; avg 100kb per cache object
           _                  (when (< memory-object-size 10)
@@ -232,18 +232,12 @@
           default-cache-atom (atom (default-object-cache-factory memory-object-size))
           async-cache-fn     (or async-cache
                                  (default-async-cache-fn default-cache-atom))
-          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))
-          storage-write      (fn [k data]
-                               (write data))]
+          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
                             :ipfs-endpoint   ipfs-endpoint
                             :ledger-defaults ledger-defaults
                             :transactor?     false
-                            :read            read
-                            :write           write
-                            :storage-read    (ipfs/default-read-fn ipfs-endpoint true)
-                            :storage-write   storage-write
                             :serializer      serializer
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
