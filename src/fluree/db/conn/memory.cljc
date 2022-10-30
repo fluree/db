@@ -79,8 +79,7 @@
 
 
 (defrecord MemoryConnection [id memory state ledger-defaults async-cache
-                             parallelism close-fn msg-in-ch msg-out-ch
-                             ipfs-endpoint data-atom]
+                             parallelism close-fn msg-in-ch msg-out-ch data-atom]
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (async/go (read-commit data-atom commit-key)))
