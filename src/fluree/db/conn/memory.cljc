@@ -79,7 +79,7 @@
 
 
 (defrecord MemoryConnection [id memory state ledger-defaults async-cache
-                             parallelism close-fn msg-in-ch msg-out-ch data-atom]
+                             parallelism msg-in-ch msg-out-ch data-atom]
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (async/go (read-commit data-atom commit-key)))
@@ -118,8 +118,7 @@
 
   conn-proto/iConnection
   (-close [_]
-    (when (fn? close-fn)
-      (close-fn))
+    (log/info "Closing memory connection" id)
     (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :ipfs)
@@ -186,15 +185,13 @@
           data-atom          (atom {})
           state              (state-machine/blank-state)
           async-cache-fn     (or async-cache
-                                 (conn-cache/default-async-cache-fn memory))
-          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
+                                 (conn-cache/default-async-cache-fn memory))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)
                               :msg-out-ch      (async/chan)
-                              :close           close-fn
                               :memory          true
                               :state           state
                               :async-cache     async-cache-fn}))))

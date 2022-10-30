@@ -65,7 +65,7 @@
 
 
 (defrecord IPFSConnection [id memory state ledger-defaults async-cache
-                           serializer parallelism close-fn msg-in-ch msg-out-ch
+                           serializer parallelism msg-in-ch msg-out-ch
                            ipfs-endpoint]
 
   conn-proto/iStorage
@@ -90,8 +90,7 @@
 
   conn-proto/iConnection
   (-close [_]
-    (when (fn? close-fn)
-      (close-fn))
+    (log/info "Closing IPFS Connection" id)
     (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :ipfs)
@@ -229,8 +228,7 @@
 
           default-cache-atom (atom (default-object-cache-factory memory-object-size))
           async-cache-fn     (or async-cache
-                                 (default-async-cache-fn default-cache-atom))
-          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
+                                 (default-async-cache-fn default-cache-atom))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
                             :ipfs-endpoint   ipfs-endpoint
@@ -239,7 +237,6 @@
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)
-                            :close           close-fn
                             :memory          true
                             :state           state
                             :async-cache     async-cache-fn}))))

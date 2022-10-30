@@ -164,8 +164,7 @@
        :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
 (defrecord FileConnection [id memory state ledger-defaults push commit
-                           parallelism close-fn msg-in-ch msg-out-ch
-                           async-cache]
+                           parallelism msg-in-ch msg-out-ch async-cache]
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (async/go (read-commit conn commit-key)))
@@ -187,7 +186,9 @@
     (async/go (file-address (str ledger-alias (when branch (str "/" (name branch))) "/head"))))
 
   conn-proto/iConnection
-  (-close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
+  (-close [_]
+    (log/info "Closing file connection" id)
+    (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :file)
   (-parallelism [_] parallelism)
@@ -262,7 +263,6 @@
     (let [storage-path   (trim-last-slash storage-path)
           conn-id        (str (random-uuid))
           state          (state-machine/blank-state)
-          close-fn       (fn [] (log/info (str "File Connection " conn-id " Closed")))
           async-cache-fn (or async-cache
                              (conn-cache/default-async-cache-fn memory))]
       ;; TODO - need to set up monitor loops for async chans
@@ -275,7 +275,6 @@
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)
-                            :close           close-fn
                             :state           state
                             :async-cache     async-cache-fn}))))
 
