@@ -887,7 +887,10 @@
 
   There could be an order-by or group-by var not included in the select statement, so
   those must get added into the results here - note group-by without order-by will create an order-by"
-  [out-vars {:keys [flake-out others] :as _vars} {:keys [parsed] :as _order-by}]
+  [out-vars {:keys [flake-out others all] :as _vars} {:keys [parsed] :as _order-by}]
+  (when-let [illegal-var (some #(when-not (all %) %) out-vars)]
+    (throw (ex-info (str "Variable " illegal-var " used in select statement but does not exist in the query.")
+                    {:status 400 :error :db/invalid-query})))
   (let [order-by   (->> (map :variable parsed)
                         (remove nil?))
         out-vars-s (into (set out-vars) order-by)
