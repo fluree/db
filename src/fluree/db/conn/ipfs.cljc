@@ -79,7 +79,8 @@
     (ipfs/commit ipfs-endpoint commit-data))
 
   conn-proto/iNameService
-  (-push [this address ledger-data] (ipfs/push! this address ledger-data))
+  (-push [_ address ledger-data]
+    (ipfs/push! ipfs-endpoint address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
   (-lookup [this ledger-address] (lookup-address this ledger-address))

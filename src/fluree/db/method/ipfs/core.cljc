@@ -57,7 +57,7 @@
 (defn push!
   "Publishes ledger metadata document (ledger root) to IPFS and recursively updates any
   directory files, culminating in an update to the IPNS address."
-  [{:keys [ipfs-endpoint] :as _conn} address commit-map]
+  [ipfs-endpoint address commit-map]
   (go-try
     (let [{:keys [meta db ledger-state]} commit-map
           {:keys [t]} db
