@@ -757,18 +757,31 @@
     tuple-item))
 
 (defn gen-x-form
-  [out-vars {s-variable :variable} {o-variable :variable}]
+  [out-vars {s-variable :variable} {p-variable :variable} {o-variable :variable}]
   (let [s-var? (util/index-of out-vars s-variable)
+        p-var? (util/index-of out-vars p-variable)
         o-var? (util/index-of out-vars o-variable)]
     (cond
+      (and s-var? p-var? o-var?)
+      (map (fn [f] [(flake/s f) (flake/p f) (flake/o f)]))
+
       (and s-var? o-var?)
       (map (fn [f] [(flake/s f) (flake/o f)]))
+
+      (and s-var? p-var?)
+      (map (fn [f] [(flake/s f) (flake/p f)]))
+
+      (and p-var? o-var?)
+      (map (fn [f] [(flake/p f) (flake/o f)]))
 
       s-var?
       (map (fn [f] [(flake/s f)]))
 
       o-var?
-      (map (fn [f] [(flake/o f)])))))
+      (map (fn [f] [(flake/o f)]))
+
+      p-var?
+      (map (fn [f] [(flake/p f)])))))
 
 (defn build-vec-extraction-fn
   [extraction-positions]
@@ -892,8 +905,9 @@
     (if clause
       (let [in-vars        (get-in-vars out-vars vars prior-vars)
             s*             (update-positions s in-vars)
+            p*             (update-positions p in-vars)
             o*             (update-positions o in-vars)
-            flake-x-form   (gen-x-form out-vars s* o*)
+            flake-x-form   (gen-x-form out-vars s* p* o*)
             passthrough-fn (gen-passthrough-fn out-vars vars in-vars)
             clause*        (-> clause
                                (assoc :in-vars in-vars
@@ -1101,13 +1115,17 @@
          acc        []]
     (if where-smt
       (let [s-var       (:variable s)
+            p-var       (:variable p)
             o-var       (:variable o)
             s-supplied? (supplied-vars s-var)
+            p-supplied? (supplied-vars p-var)
             o-supplied? (supplied-vars o-var)
             s-out?      (and s-var (not s-supplied?))
+            p-out?      (and p-var (not p-supplied?))
             o-out?      (and o-var (not o-supplied?))
             flake-vars  (cond-> []
                                 s-out? (conj s-var)
+                                p-out? (conj p-var)
                                 o-out? (conj o-var))
             vars        (get-clause-vars flake-vars prior-vars)
             where-smt*  (cond-> (assoc where-smt
@@ -1115,6 +1133,7 @@
                                   :vars vars
                                   :prior-vars prior-vars)
                                 s-supplied? (assoc-in [:s :supplied?] true)
+                                p-supplied? (assoc-in [:p :supplied?] true)
                                 o-supplied? (assoc-in [:o :supplied?] true))]
         (recur r (inc i) vars (conj acc where-smt*)))
       (let [where*    (where-meta-reverse acc out-vars order-by)
