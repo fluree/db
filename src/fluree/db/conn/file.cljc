@@ -53,8 +53,7 @@
          (String. (.toByteArray xout)))
 
        (catch FileNotFoundException _
-         nil)
-       (catch Exception e (throw e)))
+         nil))
      :cljs
      (try*
        (fs/readFileSync path "utf8")
@@ -277,8 +276,3 @@
                             :msg-out-ch      (async/chan)
                             :state           state
                             :async-cache     async-cache-fn}))))
-
-(comment
-  (read-file (read-file "/home/dan/projects/db2/dev/data/clj/test/db1/main/HEAD" ))
-
-  ,)
