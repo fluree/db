@@ -54,124 +54,54 @@
                           (variable-in-where? variable (second union))))))
         where))
 
-(defn parse-map
-  [select-map]
-  (let [[var selection] (first select-map)
-        var-as-symbol (q-var->symbol var)]
-    (when (or (not= 1 (count select-map))
-              (nil? var-as-symbol))
-      (throw (ex-info (str "Invalid select statement, maps must have only one key/val. Provided: " select-map)
-                      {:status 400 :error :db/invalid-query})))
-    {:variable  var-as-symbol
-     :selection selection}))
 
-(defn parse-having-code
-  "Returns two-tuple of [params updated-code]
-  where params are the function parameters and updated-code is a revised version of
-  code-parsed where all functions within the code are mapped to actual executable functions."
-  [code-parsed code-string]
-  (let [[form-f & form-r] code-parsed
-        form-f' (or (get built-in-aggregates form-f)
-                    (get filter/filter-fns-with-ns (str form-f)))
-        vars    (into #{} (filter symbol? form-r))]
-    (loop [[form-next & form-rest] form-r
-           vars* vars
-           acc   []]
-      (if form-next
-        (let [[params item] (if (list? form-next)
-                              (parse-having-code form-next code-string)
-                              [nil (cond
-                                     (symbol? form-next) (if-not (str/starts-with? (str form-next) "?")
-                                                           (throw (ex-info (str "Invalid variable name '" form-next
-                                                                                "' in having function: " code-string
-                                                                                ". All vars must start with '?'.")
-                                                                           {:status 400 :error :db/invalid-query}))
-                                                           form-next)
-                                     (string? form-next) form-next
-                                     (boolean? form-next) form-next
-                                     (number? form-next) form-next
-                                     :else (throw (ex-info (str "Invalid having function: " code-string
-                                                                ". Only scalar types allowed besides functions: " form-next ".")
-                                                           {:status 400 :error :db/invalid-query})))])
-              vars** (if params
-                       (into vars* params)
-                       vars*)]
-          (recur form-rest vars** (conj acc item)))
-        [(vec vars*) (cons form-f' acc)]))))
-
-
-(defn parse-having
-  [having]
-  (when-not (aggregate? having)
-    (throw (ex-info (str "Invalid 'having' statement aggregate: " having)
-                    {:status 400 :error :db/invalid-query})))
-  (let [code (safe-read-fn having)
-        [params code*] (parse-having-code code having)]
-    {:variable nil                                          ;; not used for 'having' fn execution
-     :params   params
-     :fn-str   (str "(fn " params " " code)
-     :function (filter/make-executable params code*)}))
-
-
-(defn parse-select
-  [select-smt]
-  (let [_ (or (every? #(or (string? %) (map? %)) select-smt)
-              (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt)
-                              {:status 400 :error :db/invalid-query})))]
-    (map (fn [select]
-           (let [var-symbol (q-var->symbol select)]
-             (cond var-symbol {:variable var-symbol}
-                   (aggregate? select) (parse-aggregate select)
-                   (map? select) (parse-map select)
-                   :else (throw (ex-info (str "Invalid select in statement, provided: " select)
-                                         {:status 400 :error :db/invalid-query})))))
-         select-smt)))
-
-
-(defn add-select-spec-legacy
-  [{:keys [limit offset pretty-print] :as parsed-query}
-   {:keys [selectOne select selectDistinct selectReduced opts orderBy groupBy having] :as _query-map'}]
-  (let [select-smt    (or selectOne select selectDistinct selectReduced)
-        selectOne?    (boolean selectOne)
-        limit*        (if selectOne? 1 limit)
-        inVector?     (vector? select-smt)
-        select-smt    (if inVector? select-smt [select-smt])
-        parsed-select (parse-select select-smt)
-        aggregates    (filter #(contains? % :function) parsed-select)
-        expandMap?    (some #(contains? % :selection) parsed-select)
-        ;; legacy orderBy handling below
-        orderBy*      (when-let [orderBy (or (:orderBy opts) orderBy)]
-                        (if (or (string? orderBy)
-                                (and (vector? orderBy)
-                                     (#{"DESC" "ASC"} (first orderBy))))
-                          (if (vector? orderBy) orderBy ["ASC" orderBy])
-                          (throw (ex-info (str "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: " orderBy)
-                                          {:status 400
-                                           :error  :db/invalid-query}))))
-        having*       (or having (:having opts))
-        having-parsed (when having* (parse-having having*))]
-    (assoc parsed-query :limit limit*
-                        :selectOne? selectOne?
-                        :select {:select           parsed-select
-                                 :aggregates       (not-empty aggregates)
-                                 :expandMaps?      expandMap?
-                                 :orderBy          orderBy*
-                                 :having           having-parsed
-                                 :groupBy          (or (:groupBy opts) groupBy)
-                                 :componentFollow? (:component opts)
-                                 :limit            limit*
-                                 :offset           (or offset 0)
-                                 :selectOne?       selectOne?
-                                 :selectDistinct?  (boolean (or selectDistinct selectReduced))
-                                 :inVector?        inVector?
-                                 :prettyPrint      pretty-print})))
-
-
-(defn add-select-spec
-  [{:keys [json-ld?] :as parsed-query} query-map' db]
-  (if json-ld?
-    (json-ld-select/parse db parsed-query query-map')
-    (add-select-spec-legacy parsed-query query-map')))
+;; TODO - need to add back in 'having' to new json-ld parsing - retain old code here temporarily for reference
+;(defn parse-having-code
+;  "Returns two-tuple of [params updated-code]
+;  where params are the function parameters and updated-code is a revised version of
+;  code-parsed where all functions within the code are mapped to actual executable functions."
+;  [code-parsed code-string]
+;  (let [[form-f & form-r] code-parsed
+;        form-f' (or (get built-in-aggregates form-f)
+;                    (get filter/filter-fns-with-ns (str form-f)))
+;        vars    (into #{} (filter symbol? form-r))]
+;    (loop [[form-next & form-rest] form-r
+;           vars* vars
+;           acc   []]
+;      (if form-next
+;        (let [[params item] (if (list? form-next)
+;                              (parse-having-code form-next code-string)
+;                              [nil (cond
+;                                     (symbol? form-next) (if-not (str/starts-with? (str form-next) "?")
+;                                                           (throw (ex-info (str "Invalid variable name '" form-next
+;                                                                                "' in having function: " code-string
+;                                                                                ". All vars must start with '?'.")
+;                                                                           {:status 400 :error :db/invalid-query}))
+;                                                           form-next)
+;                                     (string? form-next) form-next
+;                                     (boolean? form-next) form-next
+;                                     (number? form-next) form-next
+;                                     :else (throw (ex-info (str "Invalid having function: " code-string
+;                                                                ". Only scalar types allowed besides functions: " form-next ".")
+;                                                           {:status 400 :error :db/invalid-query})))])
+;              vars** (if params
+;                       (into vars* params)
+;                       vars*)]
+;          (recur form-rest vars** (conj acc item)))
+;        [(vec vars*) (cons form-f' acc)]))))
+;
+;
+;(defn parse-having
+;  [having]
+;  (when-not (aggregate? having)
+;    (throw (ex-info (str "Invalid 'having' statement aggregate: " having)
+;                    {:status 400 :error :db/invalid-query})))
+;  (let [code (safe-read-fn having)
+;        [params code*] (parse-having-code code having)]
+;    {:variable nil                                          ;; not used for 'having' fn execution
+;     :params   params
+;     :fn-str   (str "(fn " params " " code)
+;     :function (filter/make-executable params code*)}))
 
 
 (defn symbolize-var-keys
@@ -931,9 +861,20 @@
   If group-by is used, grouping can re-order output so utilize out-vars from that
   as opposed to the last where statement."
   [{:keys [spec] :as select} where {group-out-vars :out-vars :as _group-by}]
-  (let [out-vars (or group-out-vars
-                     (-> where last :out-vars))
-        spec*    (mapv #(update-positions % out-vars) spec)]
+  (let [last-where (last where)
+        out-vars   (or group-out-vars
+                       (:out-vars last-where))
+        {:keys [s-vars p-vars o-vars]} (:vars last-where)   ;; the last where statement has an aggregation of all variables
+        spec*      (->> spec
+                        (map #(update-positions % out-vars))
+                        (reduce
+                          (fn [spec* {:keys [variable] :as select-item}]
+                            (if (and variable
+                                     (or (s-vars variable)
+                                         (p-vars variable)))
+                              (conj spec* (assoc select-item :iri? true))
+                              (conj spec* select-item)))
+                          []))]
     (assoc select :spec spec*)))
 
 (defn build-order-fn
@@ -1082,14 +1023,25 @@
 
 
 (defn get-clause-vars
-  [new-flake-vars {:keys [others all] :as _prior-vars}]
-  (let [flake-in*      (filter all new-flake-vars)          ;; any pre-existing var used in the flake
-        all*           (into all new-flake-vars)
-        new-flakes-set (set new-flake-vars)
+  [new-flake-vars {:keys [others all s-vars p-vars o-vars]
+                   :or   {s-vars #{}, p-vars #{}, o-vars #{}} :as _prior-vars}]
+  (let [[s-var p-var o-var] new-flake-vars
+        new-flakes-set (set (remove nil? new-flake-vars))
+        flake-in*      (filter all new-flake-vars)          ;; any pre-existing var used in the flake
+        all*           (into all new-flakes-set)
         others-set     (set/difference all new-flakes-set)]
     {:flake-in  flake-in*
      :flake-out new-flake-vars
      :all       all*
+     :s-vars    (if s-var
+                  (conj s-vars s-var)
+                  s-vars)
+     :p-vars    (if p-var
+                  (conj p-vars p-var)
+                  p-vars)
+     :o-vars    (if o-var
+                  (conj o-vars o-var)
+                  o-vars)
      ;; takes others-set (all vars not output by query result flakes)
      ;; and retains the prior 'others' ordering, appending any new vars to end.
      :others    (loop [[old-other & r] others
@@ -1126,10 +1078,7 @@
             s-out?      (and s-var (not s-supplied?))
             p-out?      (and p-var (not p-supplied?))
             o-out?      (and o-var (not o-supplied?))
-            flake-vars  (cond-> []
-                                s-out? (conj s-var)
-                                p-out? (conj p-var)
-                                o-out? (conj o-var))
+            flake-vars  [(when s-out? s-var) (when p-out? p-var) (when o-out? o-var)] ;; each var needed coming out of flake in [s p o] position
             vars        (get-clause-vars flake-vars prior-vars)
             where-smt*  (cond-> (assoc where-smt
                                   :i i
@@ -1178,15 +1127,14 @@
                                    :supplied-vars supplied-var-keys
                                    :pretty-print  (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
                                                     prettyPrint
-                                                    (:prettyPrint opts))}
+                                                    (:prettyPrint opts))
+                                   :compact-fn    (json-ld/compact-fn context*)}
                                   filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
                                   order-by* (add-order-by order-by*)
                                   group-by* (add-group-by group-by*)
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
-                                  true (add-select-spec query-map' db)
-                                  true (add-where-meta)
-                                  json-ld-db? (assoc :compact-fn (json-ld/compact-fn context*)
-                                                     :compact-cache (atom {})))]
+                                  true (json-ld-select/parse query-map' db)
+                                  true (add-where-meta))]
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
 

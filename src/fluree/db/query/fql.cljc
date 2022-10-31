@@ -9,7 +9,8 @@
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.compound :as compound]
             [fluree.db.query.range :as query-range]
-            [fluree.db.query.json-ld.response :as json-ld-resp])
+            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.dbproto :as db-proto])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -422,11 +423,22 @@
     (loop [[spec-item & r'] spec
            result-item []]
       (if spec-item
-        (let [{:keys [selection in-n]} spec-item
+        (let [{:keys [selection in-n iri?]} spec-item
               value  (nth where-item in-n)
-              value* (if selection
+              value* (cond
+                       ;; there is a sub-selection (graph crawl)
+                       selection
                        (let [flakes (<? (query-range/index-range db :spot = [value]))]
                          (<? (json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel (:spec spec-item) 0 flakes)))
+
+                       ;; subject id coming it, we know it is an IRI so resolve here
+                       iri?
+                       (or (get @cache value)
+                           (let [c-iri (<? (db-proto/-iri db value compact-fn))]
+                             (vswap! cache assoc value c-iri)
+                             c-iri))
+
+                       :else
                        value)]
           (recur r' (conj result-item value*)))
         (if inVector?

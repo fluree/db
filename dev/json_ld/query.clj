@@ -44,14 +44,14 @@
                                           :f      "https://ns.flur.ee/ledger#"}
                                 :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}}))
 
-  (def ledger @(fluree/create ipfs-conn "query/b" {}))
+  (def ledger @(fluree/create ipfs-conn "query/b" {:context {:ex "http://example.org/ns/"}}))
+
 
   ;; should work OK
   (def db
     @(fluree/stage
        ledger
-       [{:context      {:ex "http://example.org/ns/"}
-         :id           :ex/brian,
+       [{:id           :ex/brian,
          :type         :ex/User,
          :schema/name  "Brian"
          :ex/last      "Platz"
@@ -59,8 +59,7 @@
          :schema/age   50
          :ex/favNums   7
          :ex/scores    [76 80 15]}
-        {:context      {:ex "http://example.org/ns/"}
-         :id           :ex/alice,
+        {:id           :ex/alice,
          :type         :ex/User,
          :schema/name  "Alice"
          :ex/last      "Blah"
@@ -68,8 +67,7 @@
          :schema/age   42
          :ex/favNums   [42, 76, 9]
          :ex/scores    [102 92.5 90]}
-        {:context      {:ex "http://example.org/ns/"}
-         :id           :ex/cam,
+        {:id           :ex/cam,
          :type         :ex/User,
          :schema/name  "Cam"
          :ex/last      "Platz"
@@ -148,10 +146,9 @@
                      :vars    {'?name "Cam"}})
 
   @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  ['?ssn '?fname '?email {'?f [:*]}]
+                     :select  ['?fname '?email {'?f [:*]}]
                      :where   [['?s :schema/name '?name]
                                ['?s :ex/friend '?f]
-                               ['?f :schema/ssn '?ssn]
                                ['?f :schema/name '?fname]
                                ['?f :schema/email '?email]]
                      :vars    {'?name "Cam"}})
