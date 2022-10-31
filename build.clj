@@ -35,10 +35,10 @@
               :class-dir class-dir}))
 
 (defn docs [{:keys [output-path]}]
-  ;; Seems like there should be a better way to do this, but I couldn't figure
-  ;; one out. If you try to run codox directly from here it can't find any of
-  ;; the project namespaces. Seems like codox would need a way to pass a basis
-  ;; into it. But this at least lets us inject the version set in here.
-  (let [opts (cond-> {:version version}
+  ;; This is (for now) the best way to run things like codox that expect the
+  ;; full project classpath to be available.
+  (let [opts (cond-> {:version version
+                      :source-uri (str source-uri
+                                       "/blob/v{version}/{filepath}#L{line}")}
                      output-path (assoc :output-path output-path))]
     (b/process {:command-args ["clojure" "-X:docs" (pr-str opts)]})))
