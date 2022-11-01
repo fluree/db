@@ -513,6 +513,33 @@
        (add-stack ?ctx entry)
        res))))
 
+(defn query-db-before
+  {:doc      "Executes a query on the db before the transaction is applied."
+   :fdb/spec nil
+   :fdb/cost "Fuel required for query"}
+  ([?ctx query-map]
+   (go-try
+     (let [query-map (extract query-map)
+           query-map (if (string? query-map)
+                       (json/parse query-map)
+                       query-map)
+           q-res     (<? (fdb/query (:db-before ?ctx) query-map))
+           [res fuel] q-res
+           entry     [{:function "query" :arguments [query-map] :result res} fuel]]
+       (add-stack ?ctx entry)
+       res)))
+  ([?ctx select from where block limit]
+   (go-try
+     (let [select (extract select)
+           from   (extract from)
+           where  (extract where)
+           block  (extract block)
+           limit  (extract limit)
+           [res fuel] (<? (fdb/query (:db-before ?ctx) select from where block limit))
+           entry  [{:function "query" :arguments [select from where block] :result res} fuel]]
+       (add-stack ?ctx entry)
+       res))))
+
 (defn relationship?
   {:doc      "Determines whether there is a relationship between two subjects"
    :fdb/spec nil

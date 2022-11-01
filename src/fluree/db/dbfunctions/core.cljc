@@ -277,11 +277,12 @@
 
 (defn execute-tx-fn
   "Executes a transaction function"
-  [db auth_id credits s p o fuel block-instant]
+  [db db-before auth_id credits s p o fuel block-instant]
   (go-try
     (let [fn-str  (subs o 1)                                ;; remove preceding '#'
           credits 10000000
           ctx     {:db      db
+                   :db-before db-before
                    :instant block-instant
                    :sid     s
                    :pid     p
