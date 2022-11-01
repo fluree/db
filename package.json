@@ -2,24 +2,27 @@
   "dependencies": {
     "@cljs-oss/module-deps": "^1.1.1",
     "@fluree/sjcl": "^1.0.8-3",
-    "axios": "^0.24.0",
+    "axios": "^0.27.2",
     "bufferutil": "^4.0.7",
+    "form-data": "^4.0.0",
     "js-sha3": "^0.8.0",
     "scrypt-js": "^3.0.1",
     "source-map-support": "^0.5.21",
     "utf-8-validate": "^5.0.10",
-    "ws": "^8.9.0"
+    "ws": "^8.8.0",
+    "seedrandom": "^3.0.5"
   },
   "browser": {
     "ws": false
   },
   "devDependencies": {
-    "colors": "1.4.0",
-    "karma": "^6.3.18",
+    "colors": "^1.4.0",
+    "karma": "^6.4.0",
     "karma-chrome-launcher": "^3.1.1",
     "karma-cljs-test": "^0.1.0",
-    "webpack": "^5.72.0",
-    "webpack-cli": "^4.9.2"
+    "shadow-cljs": "^2.19.6",
+    "webpack": "^5.73.0",
+    "webpack-cli": "^4.10.0"
   },
   "browserslist": {
     "production": [

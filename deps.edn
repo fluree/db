@@ -1,6 +1,5 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
-         org.clojure/clojurescript       {:mvn/version "1.11.60"}
-         org.clojure/core.async          {:mvn/version "1.5.648"}
+         org.clojure/core.async          {:mvn/version "1.6.673"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
@@ -9,6 +8,9 @@
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
+         com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
+                                          :sha "c22e943a9c4618379759eb9e2ca0cd384e1a1882"}
+
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
@@ -33,10 +35,11 @@
 
          ;; cryptography
          com.fluree/crypto               {:mvn/version "0.4.0"}
+
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
-         org.babashka/sci                {:mvn/version "0.5.34"}}
+         org.babashka/sci                {:mvn/version "0.3.31"}}
 
  :paths ["src" "resources"]
 
@@ -48,43 +51,18 @@
   :dev
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
-                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}}
-
-  :cljs-browser-test
-  {:extra-paths ["src-cljs" "test"]
-   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
-   :main-opts   ["-m" "cljs-test-runner.main"
-                 "-D" "doo.edn"
-                 "-c" "build-browser-test.edn"
-                 "-x" "chrome-headless"]}
-
-  :cljs-node-test
-  {:extra-paths ["src-nodejs" "test"]
-   :extra-deps  {olical/cljs-test-runner {:mvn/version "3.8.0"}}
-   :main-opts   ["-m" "cljs-test-runner.main"
-                 "-c" "build-nodejs-test.edn"]}
+                 figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
+                 thheller/shadow-cljs {:mvn/version "2.20.7"}}}
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.70.1086"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.71.1119"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
   :js-deps
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
    :main-opts  ["-m" "target-bundle-libs.core"]}
-
-  :nodejs
-  {:extra-paths ["src-nodejs"]
-   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-nodejs.edn" "--compile"]}
-
-  :browser
-  {:extra-paths ["src-cljs"]
-   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-browser.edn" "--compile"]}
-
-  :webworker
-  {:extra-paths ["src-cljs"]
-   :main-opts   ["-m" "cljs.main" "--compile-opts" "build-webworker.edn" "--compile"]}
 
   :docs
   {:extra-deps {codox/codox {:mvn/version "0.10.8"}}

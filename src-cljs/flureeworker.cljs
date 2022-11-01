@@ -28,13 +28,12 @@
   "Parses a (nested) JavaScript object into a Clojure map"
   [obj]
   (if (goog.isObject obj)
-    (-> (fn [result key]
-          (let [v (goog.object/get obj key)]
-            (if (= "function" (goog/typeOf v))
-              result
-              (assoc result (keyword key) (obj->clj v)))))
-
-        (reduce {} (.getKeys goog/object obj)))
+    (reduce (fn [result key]
+             (let [v (goog.object/get obj key)]
+               (if (= "function" (goog/typeOf v))
+                 result
+                 (assoc result (keyword key) (obj->clj v)))))
+            {} (goog.object/getKeys obj))
     obj))
 
 
@@ -516,12 +515,11 @@
   [error]
   (js/console.error error))
 
-
-;; when we detect that we are in a web worker, register the onmessage handler
-(when-let [worker? (not (.-document js/self))]
-  (set! (.-onerror js/self) log-error)
-  (set! (.-onmessage js/self) decode-message))
-
-
-;; let server know we're alive
-(worker-action nil :connInit)
+(defn init
+  []
+  ;; when we detect that we are in a web worker, register the onmessage handler
+  (when-let [worker? (not (.-document js/self))]
+    (set! (.-onerror js/self) log-error)
+    (set! (.-onmessage js/self) decode-message))
+  ;; let server know we're alive
+  (worker-action nil :connInit))

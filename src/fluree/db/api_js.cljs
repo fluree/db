@@ -11,7 +11,7 @@
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util]
             [fluree.db.connection-js :as conn-handler]
             [fluree.db.query.fql-resp :refer [flakes->res]]))
@@ -317,19 +317,19 @@
            rest-blocks (rest resp)
            acc         []]
       (let [flakes      (:flakes curr-block)
-            asserted    (filter #(.-op %) flakes)
+            asserted    (filter flake/op flakes)
             asserted'   (if (not (empty? asserted))
                           (->> asserted
-                               (group-by #(.-s %))
+                               (group-by flake/s)
                                (vals)
                                (format-flake-groups-pretty db cache fuel)
                                (<?))
                           nil)
-            retracted   (filter #(false? (.-op %)) flakes)
+            retracted   (filter #(false? (flake/op %)) flakes)
             retracted'  (if (not (empty? retracted))
                           (->> retracted
                                (map flake/flip-flake)
-                               (group-by #(.-s %))
+                               (group-by flake/s)
                                (vals)
                                (format-flake-groups-pretty db cache fuel)
                                (<?))
@@ -343,7 +343,7 @@
 
 (defn- format-history-resp
   [db resp]
-  (go-try (let [ts    (-> (map #(.-t %) resp) set)
+  (go-try (let [ts    (-> (map flake/t resp) set)
                 t-map (<? (async/go
                             (loop [[t & r] ts
                                    acc {}]
@@ -354,7 +354,7 @@
                 resp  (-> (loop [[flake & r] resp
                                  acc {}]
                             (if flake
-                              (let [t     (.-t flake)
+                              (let [t     (flake/t flake)
                                     block (get t-map t)
                                     acc   (assoc-in acc [block :block] block)
                                     acc'  (update-in acc [block :flakes] conj flake)

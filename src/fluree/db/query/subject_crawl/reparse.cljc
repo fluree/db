@@ -1,7 +1,7 @@
 (ns fluree.db.query.subject-crawl.reparse
-  (:require [fluree.db.util.log :as log]
+  (:require [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -78,7 +78,7 @@
   (let [first-where (first where)
         rest-where  (rest where)
         first-type  (:type first-where)
-        first-s     (when (and (#{:rdf/type :_id :tuple} first-type)
+        first-s     (when (and (#{:rdf/type :collection :_id :iri :tuple} first-type)
                                (-> first-where :s :variable))
                       (-> first-where :s :variable))]
     (when first-s
@@ -101,8 +101,9 @@
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
   [{:keys [where select] :as _parsed-query}]
-  (let [select-var (-> select :select first :variable)]
-    (when select-var ;; for now exclude any filters on the first where, not implemented
+  (let [select-var (or (-> select :select first :variable)  ;; legacy select spec
+                       (-> select :spec first :variable))]
+    (when select-var                                        ;; for now exclude any filters on the first where, not implemented
       (every? #(and (= select-var (-> % :s :variable))
                     ;; exclude if any recursion specified in where statement (e.g. person/follows+3)
                     (not (:recur %)))

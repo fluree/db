@@ -5,8 +5,8 @@
             #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
                :cljs [cljs.core.async :refer [chan go <!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]))
 
 (def default-comparators
   "Map of default index comparators for the five index types"
@@ -115,6 +115,7 @@
    :network network
    :ledger-id ledger-id
    :id :empty
+   :tempid (random-uuid)
    :leaf true
    :first flake/maximum
    :rhs nil
@@ -167,6 +168,7 @@
      :network network
      :ledger-id ledger-id
      :id :empty
+     :tempid (random-uuid)
      :leaf false
      :first flake/maximum
      :rhs nil

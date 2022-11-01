@@ -1,7 +1,7 @@
 (ns fluree.db.graphdb
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.storage.core :as storage]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
             [clojure.data.avl :as avl]
@@ -11,8 +11,7 @@
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+            [clojure.core.async :refer [go <!] :as async]
             [clojure.string :as str])
   #?(:clj (:import (java.io Writer))))
 
@@ -81,66 +80,66 @@
   ([db flakes] (with-t db flakes nil))
   ([db flakes opts]
    (go-try
-    (let [t                    (-> flakes first flake/t)
-          _                    (when (not= t (dec (:t db)))
-                                 (throw (ex-info (str "Invalid with called for ledger " (:ledger-id db)
-                                                      " because current 't', " (:t db)
-                                                      " is not beyond supplied transaction t: " t ".")
-                                                 {:status 500
-                                                  :error  :db/unexpected-error})))
-          add-flakes           (filter include-flake? flakes)
-          add-preds            (into #{} (map flake/p add-flakes))
-          idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
-          ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
-          flakes-bytes         (flake/size-bytes add-flakes)
-          system-change?       (schema-util/system-change? add-flakes)
-          root-setting-change? (schema-util/setting-change? add-flakes)
-          pred-ecount          (-> db :ecount (get const/$_predicate))
-          add-pred-to-idx?     (if system-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
-          db*                  (loop [[add-pred & r] add-pred-to-idx?
-                                      db db]
-                                 (if add-pred
-                                   (recur r (<? (add-predicate-to-idx db add-pred opts)))
-                                   db))
-          ;; this could require reindexing, so we handle remove predicates later
-          db*                  (-> db*
-                                   (assoc :t t)
-                                   (update-in [:stats :size] + flakes-bytes) ;; total db ~size
-                                   (update-in [:stats :flakes] + (count add-flakes)))]
-      (loop [[f & r] add-flakes
-             spot   (get-in db* [:novelty :spot])
-             psot   (get-in db* [:novelty :psot])
-             post   (get-in db* [:novelty :post])
-             opst   (get-in db* [:novelty :opst])
-             tspo   (get-in db* [:novelty :tspo])
-             ecount (:ecount db)]
-        (if-not f
-          (let [flake-size (-> db*
-                               (get-in [:novelty :size])
-                               (+ flakes-bytes))
-                db*  (assoc db* :ecount ecount
-                            :novelty {:spot spot, :psot psot, :post post,
-                                      :opst opst, :tspo tspo, :size flake-size})]
-            (cond-> db*
-              (or system-change?
-                  (-> db* :schema nil?))
-              (assoc :schema (<? (schema/schema-map db*)))
+     (let [t                    (-> flakes first flake/t)
+           _                    (when (not= t (dec (:t db)))
+                                  (throw (ex-info (str "Invalid with called for ledger " (:ledger-id db)
+                                                       " because current 't', " (:t db)
+                                                       " is not beyond supplied transaction t: " t ".")
+                                                  {:status 500
+                                                   :error  :db/unexpected-error})))
+           add-flakes           (filter include-flake? flakes)
+           add-preds            (into #{} (map flake/p add-flakes))
+           idx?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :idx? p)]) add-preds))
+           ref?-map             (into {} (map (fn [p] [p (dbproto/-p-prop db :ref? p)]) add-preds))
+           flakes-bytes         (flake/size-bytes add-flakes)
+           system-change?       (schema-util/system-change? add-flakes)
+           root-setting-change? (schema-util/setting-change? add-flakes)
+           pred-ecount          (-> db :ecount (get const/$_predicate))
+           add-pred-to-idx?     (if system-change? (schema-util/add-to-post-preds? add-flakes pred-ecount) [])
+           db*                  (loop [[add-pred & r] add-pred-to-idx?
+                                       db db]
+                                  (if add-pred
+                                    (recur r (<? (add-predicate-to-idx db add-pred opts)))
+                                    db))
+           ;; this could require reindexing, so we handle remove predicates later
+           db*                  (-> db*
+                                    (assoc :t t)
+                                    (update-in [:stats :size] + flakes-bytes) ;; total db ~size
+                                    (update-in [:stats :flakes] + (count add-flakes)))]
+       (loop [[f & r] add-flakes
+              spot   (get-in db* [:novelty :spot])
+              psot   (get-in db* [:novelty :psot])
+              post   (get-in db* [:novelty :post])
+              opst   (get-in db* [:novelty :opst])
+              tspo   (get-in db* [:novelty :tspo])
+              ecount (:ecount db)]
+         (if-not f
+           (let [flake-size (-> db*
+                                (get-in [:novelty :size])
+                                (+ flakes-bytes))
+                 db*        (assoc db* :ecount ecount
+                                       :novelty {:spot spot, :psot psot, :post post,
+                                                 :opst opst, :tspo tspo, :size flake-size})]
+             (cond-> db*
+                     (or system-change?
+                         (-> db* :schema nil?))
+                     (assoc :schema (<? (schema/schema-map db*)))
 
-              root-setting-change?
-              (assoc :settings (<? (schema/setting-map db*)))))
-          (let [cid     (flake/sid->cid (flake/s f))
-                ecount* (update ecount cid #(if % (max % (flake/s f)) (flake/s f)))]
-            (recur r
-                   (conj spot f)
-                   (conj psot f)
-                   (if (get idx?-map (flake/p f))
-                     (conj post f)
-                     post)
-                   (if (get ref?-map (flake/p f))
-                     (conj opst f)
-                     opst)
-                   (conj tspo f)
-                   ecount*))))))))
+                     root-setting-change?
+                     (assoc :settings (<? (schema/setting-map db*)))))
+           (let [cid     (flake/sid->cid (flake/s f))
+                 ecount* (update ecount cid #(if % (max % (flake/s f)) (flake/s f)))]
+             (recur r
+                    (conj spot f)
+                    (conj psot f)
+                    (if (get idx?-map (flake/p f))
+                      (conj post f)
+                      post)
+                    (if (get ref?-map (flake/p f))
+                      (conj opst f)
+                      opst)
+                    (conj tspo f)
+                    ecount*))))))))
 
 (defn with
   "Returns db 'with' flakes added as a core async promise channel.
@@ -355,6 +354,10 @@
   (-forward-time-travel [db flakes] (forward-time-travel db nil flakes))
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
   (-c-prop [this property collection] (graphdb-c-prop this property collection))
+  (-class-prop [this property class]
+    (if (= :subclass property)
+      (get @(:subclasses schema) class)
+      (get-in schema [:pred class property])))
   (-p-prop [this property predicate] (graphdb-p-prop this property predicate))
   (-tag [this tag-id] (graphdb-tag this tag-id))
   (-tag [this tag-id pred] (graphdb-tag this tag-id pred))
@@ -362,13 +365,20 @@
   (-tag-id [this tag-name pred] (graphdb-tag-id this tag-name pred))
   (-subid [this ident] (subid this ident false))
   (-subid [this ident strict?] (subid this ident strict?))
+  (-iri [_ _] (throw (ex-info "-iri not supported in JSON database"
+                              {:status 500 :error :db/unexpected-error})))
+  (-iri [_ _ _] (throw (ex-info "-iri not supported in JSON database"
+                                {:status 500 :error :db/unexpected-error})))
   (-search [this fparts] (query-range/search this fparts))
   (-query [this query-map] (fql/query this query-map))
   (-with [this block flakes] (with this block flakes nil))
   (-with [this block flakes opts] (with this block flakes opts))
   (-with-t [this flakes] (with-t this flakes nil))
   (-with-t [this flakes opts] (with-t this flakes opts))
-  (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil)))
+  (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil))
+  (-db-type [_] :json)
+  (-stage [db tx] (throw (ex-info "DB stage not supported on json database." {:status 500 :error :db/unexpected-error})))
+  (-stage [db tx opts] (throw (ex-info "DB stage not supported on json database." {:status 500 :error :db/unexpected-error}))))
 
 #?(:cljs
    (extend-type GraphDb

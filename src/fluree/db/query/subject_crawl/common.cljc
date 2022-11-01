@@ -1,15 +1,12 @@
 (ns fluree.db.query.subject-crawl.common
-  (:require #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+  (:require [clojure.core.async :refer [go] :as async]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            [fluree.db.util.json :as json]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.schema :as schema-util]
-            [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.query.fql-resp :refer [flakes->res]]))
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.permissions-validate :as perm-validate]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -26,12 +23,12 @@
 
 
 (defn result-af
-  [{:keys [db cache fuel-vol max-fuel select-spec error-ch parse-json?] :as _opts}]
+  [{:keys [result-fn error-ch] :as _opts}]
   (fn [flakes port]
     (go
       (try*
         (some->> flakes
-                 (flakes->res db cache fuel-vol max-fuel select-spec {:parse-json? parse-json?})
+                 result-fn
                  <?
                  not-empty
                  (async/put! port))

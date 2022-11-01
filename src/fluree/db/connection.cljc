@@ -4,22 +4,27 @@
             #?(:clj  [clojure.core.async :as async :refer [go <!]]
                :cljs [cljs.core.async :as async :refer [go <!]])
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
             [fluree.db.dbfunctions.core :as dbfunctions]
             [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.session :as session]
-            #?(:clj [fluree.crypto :as crypto])
+            [fluree.crypto :as crypto]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.xhttp :as xhttp]
-            [fluree.db.util.core :as util :refer [try* catch* exception?]]
+            [fluree.db.util.core :as util
+             #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])
+             #?@(:clj [:refer [try* catch* exception?]])]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.query.http-signatures :as http-signatures]
             #?(:clj [fluree.db.serde.avro :refer [avro-serde]])
             [fluree.db.conn-events :as conn-events]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.storage.core :as storage]))
+            [fluree.db.storage.core :as storage]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.did :as did]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -103,6 +108,53 @@
             (xhttp/try-socket ws-url sub-chan pub-chan resp-chan timeout close-fn))))
       resp-chan)))
 
+(defn jld-commit-write
+  [conn commit-data]
+  (log/debug "commit-write data: " commit-data)
+  (let [storage-write (:storage-write conn)
+        dbid          (-> commit-data meta :dbid)           ;; dbid exists if this is a db (not commit) write
+        json          (json-ld/normalize-data commit-data)
+        storage-key   (if dbid
+                        (second (re-find #"^fluree:db:sha256:(.+)$" dbid))
+                        (crypto/sha2-256-normalize json))]
+    (if storage-key
+      (storage-write (str storage-key ".jsonld") json)
+      (async/go
+        (ex-info (str "Unable to retrieve storage key from dbid: " dbid ".")
+                 {:status 500 :error :db/unexpected-error})))))
+
+
+(defn- extract-commit-key
+  "If a commit formatted address, returns filestore key."
+  [commit-key]
+  (let [[_ k] (re-find #"^fluree:raft://(.+)" commit-key)]
+    (when k
+      (str (subs k 0 3) "_" k ".jsonld"))))
+
+(defn- extract-db-key
+  "If a db formatted address, returns filestore key."
+  [db-key]
+  (let [[_ k] (re-find #"^fluree:db:(.+)" db-key)]
+    (when k
+      (str (subs k 0 3) "_" k ".jsonld"))))
+
+
+(defn jld-commit-read
+  [conn commit-key]
+  (log/debug "Commit-read request for key: " commit-key)
+  (go-try
+    (let [k (or (extract-commit-key commit-key)
+                (extract-db-key commit-key))]
+      (when-not k
+        (throw (ex-info (str "Invalid commit address: " commit-key)
+                        {:status 400 :error :db/invalid-commit})))
+      (-> (<? (storage/read conn k))
+          (json/parse false)))))
+
+
+(defn jld-push!
+  [conn address commit-data]
+  (log/debug "Pushing ledger:" address commit-data))
 
 ;; all ledger messages are fire and forget
 
@@ -114,7 +166,9 @@
                        storage-rename storage-delete object-cache async-cache
                        parallelism serializer default-network transactor?
                        publish transact-handler tx-private-key tx-key-id meta
-                       add-listener remove-listener close]
+                       add-listener remove-listener close
+                       ns-lookup
+                       did context]
 
   storage/Store
   (read [_ k]
@@ -136,11 +190,27 @@
     (if (= :empty id)
       (storage/resolve-empty-leaf node)
       (async-cache
-       [::resolve id tempid]
-       (fn [_]
-         (storage/resolve-index-node conn node
-                                     (fn []
-                                       (async-cache [::resolve id tempid] nil)))))))
+        [::resolve id tempid]
+        (fn [_]
+          (storage/resolve-index-node conn node
+                                      (fn []
+                                        (async-cache [::resolve id tempid] nil)))))))
+
+  conn-proto/iConnection
+  (-did [conn] did)
+  (-context [conn] context)
+  (-method [conn] :file)
+
+  ;; following used specifically for JSON-LD dbs
+  conn-proto/iStorage
+  (-c-read [conn commit-key] (jld-commit-read conn commit-key))
+  (-c-write [conn commit-data] (jld-commit-write conn commit-data))
+
+  conn-proto/iNameService
+  (-push [conn address commit-data] (jld-push! conn address commit-data))
+  (-lookup [conn address] (ns-lookup conn address))
+  (-address [_ ledger-alias opts] (async/go (str "fluree:raft://" ledger-alias)))
+
 
   #?@(:clj
       [full-text/IndexConnection
@@ -513,7 +583,7 @@
       (swap! server-connections-atom update-in [conn-id :token] #(or % token))
       true
       (catch* e
-        false))))
+              false))))
 
 (defn- generate-connection
   "Generates connection object."
@@ -537,7 +607,8 @@
                 object-cache async-cache close-fn serializer
                 tx-private-key private-key-file memory
                 transactor? transact-handler publish meta memory?
-                private keep-alive-fn keep-alive]
+                ns-lookup
+                private keep-alive-fn keep-alive context]
          :or   {memory           1000000                    ;; default 1MB memory
                 parallelism      4
                 req-chan         (async/chan)
@@ -613,7 +684,11 @@
                             :keep-alive-fn    (when (or (fn? keep-alive-fn) (string? keep-alive-fn))
                                                 keep-alive-fn)
                             :add-listener     (partial add-listener* state-atom)
-                            :remove-listener  (partial remove-listener* state-atom)}]
+                            :remove-listener  (partial remove-listener* state-atom)
+                            :did              (when tx-private-key
+                                                (did/private->did-map tx-private-key))
+                            :ns-lookup        ns-lookup
+                            :context          context}]
     (map->Connection settings)))
 
 (defn close!

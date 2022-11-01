@@ -1,13 +1,14 @@
 (ns fluree.db.query.subject-crawl.core
-  (:require #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+  (:require [clojure.core.async :refer [go <!] :as async]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.query.fql-parser :refer [parse-db]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.subject :refer [subj-crawl]]
-            [fluree.db.query.subject-crawl.rdf-type :refer [rdf-type-crawl]]
-            [fluree.db.query.subject-crawl.common :refer [order-results]]))
+            [fluree.db.query.subject-crawl.rdf-type :refer [collection-crawl]]
+            [fluree.db.query.subject-crawl.common :refer [order-results]]
+            [fluree.db.query.fql-resp :as legacy-resp]
+            [fluree.db.query.json-ld.response :as json-ld-resp]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -16,21 +17,23 @@
 
   This strategy is only deployed if there is a single selection graph crawl,
   so this assumes this case is true in code."
-  [db {:keys [select opts] :as parsed-query}]
-  (let [select-smt (-> select
-                       :select
-                       first
-                       :selection)]
-    (parse-db db select-smt opts)))
+  [db {:keys [select opts json-ld?] :as _parsed-query}]
+  (if json-ld?
+    (-> select :spec first :spec)
+    (let [select-smt (-> select
+                         :select
+                         first
+                         :selection)]
+      (parse-db db select-smt opts))))
 
 (defn relationship-binding
-  [{:keys [rdf-type? vars] :as opts}]
+  [{:keys [collection? vars] :as opts}]
   (async/go-loop [[next-vars & rest-vars] vars
                   acc []]
     (if next-vars
       (let [opts' (assoc opts :vars next-vars)
-            res   (if rdf-type?
-                    (<? (rdf-type-crawl opts'))
+            res   (if collection?
+                    (<? (collection-crawl opts'))
                     (<? (subj-crawl opts')))]
         (recur rest-vars (into acc res)))
       acc)))
@@ -67,17 +70,23 @@
   (c) filter subjects based on subsequent where clause(s)
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
-  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by opts] :as parsed-query}]
+  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by
+              json-ld? compact-fn opts] :as parsed-query}]
   (log/debug "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
         f-where     (first where)
         rdf-type?   (= :rdf/type (:type f-where))
+        collection? (= :collection (:type f-where))
         filter-map  (:s-filter (second where))
         cache       (volatile! {})
         fuel-vol    (volatile! 0)
         select-spec (retrieve-select-spec db parsed-query)
+        result-fn   (if json-ld?
+                      (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
+                      (partial legacy-resp/flakes->res db cache fuel-vol fuel select-spec opts))
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
+                     :collection?   collection?
                      :db            db
                      :cache         cache
                      :fuel-vol      fuel-vol
@@ -94,10 +103,11 @@
                      :f-where       f-where
                      :parse-json?   (:parse-json? opts)
                      :query         parsed-query
+                     :result-fn     result-fn
                      :finish-fn     finish-fn}]
     (log/debug "simple-subject-crawl opts:" opts)
     (if rel-binding?
       (relationship-binding opts)
-      (if rdf-type?
-        (rdf-type-crawl opts)
+      (if collection?
+        (collection-crawl opts)
         (subj-crawl opts)))))

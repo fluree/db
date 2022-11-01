@@ -1,12 +1,11 @@
 (ns fluree.db.query.subject-crawl.subject
-  (:require #?(:clj  [clojure.core.async :refer [go <! >!] :as async]
-               :cljs [cljs.core.async :refer [go <! >!] :as async])
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
+  (:require [clojure.core.async :refer [<! >!] :as async]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
                                                           subj-perm-filter-fn filter-subject]]
             [fluree.db.dbproto :as dbproto]))
@@ -16,54 +15,57 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx] :as _where-clause} parse-json?]
-  (log/debug "subjects-chan")
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx p-ref?] :as _where-clause}]
   (let [o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
                         (get vars variable)))
-        [fflake lflake] (case idx
-                          :post [(flake/->Flake nil p o* nil nil util/min-integer)
-                                 (flake/->Flake nil p o* nil nil util/max-integer)]
-                          :psot [(flake/->Flake nil p nil nil nil util/min-integer)
-                                 (flake/->Flake nil p nil nil nil util/max-integer)])
+        idx*        (if (nil? o*)
+                      :psot
+                      idx)
+        [fflake lflake] (case idx*
+                          :post [(flake/create nil p o* nil nil nil util/min-integer)
+                                 (flake/create nil p o* nil nil nil util/max-integer)]
+                          :psot [(flake/create nil p nil nil nil nil util/min-integer)
+                                 (flake/create nil p nil nil nil nil util/max-integer)])
         filter-fn   (cond
-                      (and o* (= :psot idx))
+                      (and o* (= :psot idx*))
                       #(= o* (flake/o %))
 
                       (:filter o)
                       (let [f (get-in o [:filter :function])]
                         #(-> % flake/o f)))
-        idx-root    (get db idx)
-        cmp         (:comparator idx-root)
-        range-set   (flake/sorted-set-by cmp fflake lflake)
-        in-range?   (fn [node]
+        return-chan (async/chan 10 (comp (map flake/s)
+                                         (dedupe)))]
+    (let [idx-root  (get db idx*)
+          cmp       (:comparator idx-root)
+          range-set (flake/sorted-set-by cmp fflake lflake)
+          in-range? (fn [node]
                       (query-range/intersects-range? node range-set))
-                    ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
-        xf          (when filter-fn (map (fn [flakes] (filter filter-fn flakes))))
-        query-xf    (where-subj-xf {:start-test  >=
+          query-xf  (where-subj-xf {:start-test  >=
                                     :start-flake fflake
                                     :end-test    <=
                                     :end-flake   lflake
-                                    :xf          xf})
-        resolver    (index/->CachedTRangeResolver conn (get novelty idx) t t (:async-cache conn))
-        tree-chan   (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)
-        return-chan (async/chan 10 (comp (map flake/s)
-                                         (dedupe)))]
-    (async/go-loop []
-      (let [next-chunk (<! tree-chan)]
-        (if (nil? next-chunk)
-          (async/close! return-chan)
-          (let [more? (loop [vs (seq next-chunk)
-                             i  0]
-                        (if vs
-                          (if (>! return-chan (first vs))
-                            (recur (next vs) (inc i))
-                            false)
-                          true))]
-            (if more?
-              (recur)
-              (async/close! return-chan))))))
+                                    ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
+                                    :xf          (when filter-fn
+                                                   (map (fn [flakes]
+                                                          (filter filter-fn flakes))))})
+          resolver  (index/->CachedTRangeResolver conn (get novelty idx*) t t (:async-cache conn))
+          tree-chan (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
+      (async/go-loop []
+        (let [next-chunk (<! tree-chan)]
+          (if (nil? next-chunk)
+            (async/close! return-chan)
+            (let [more? (loop [vs (seq next-chunk)
+                               i  0]
+                          (if vs
+                            (if (>! return-chan (first vs))
+                              (recur (next vs) (inc i))
+                              false)
+                            true))]
+              (if more?
+                (recur)
+                (async/close! return-chan)))))))
     return-chan))
 
 
@@ -103,11 +105,29 @@
       (if (number? _id-val)
         (async/>! return-ch _id-val)
         (let [sid (async/<! (dbproto/-subid db _id-val))]
-          (if (util/exception? sid)
-            (async/put! error-ch sid)
-            (async/put! return-ch sid))))
+          (cond (util/exception? sid)
+                (async/put! error-ch sid)
+
+                (some? sid)
+                (async/put! return-ch sid))))
       (async/close! return-ch))
     return-ch))
+
+(defn resolve-refs
+  "If the where clause has a ref, we need to resolve it to a subject id."
+  [db vars {:keys [p-ref? o] :as where-clause}]
+  (go-try
+    (if p-ref?
+      (let [v   (if-some [v (:value o)]
+                  v
+                  (when-let [variable (:variable o)]
+                    (get vars variable)))
+            sid (when v
+                  (or (<? (dbproto/-subid db v)) 0))]
+        (if sid
+          (assoc where-clause :o {:value sid})
+          (assoc where-clause :o {:value nil})))
+      where-clause)))
 
 (defn resolve-o-ident
   "If the predicate is a ref? type with an 'o' value, it must be resolved into a subject id."
@@ -116,24 +136,26 @@
     (let [_id (or (<? (dbproto/-subid db (:ident o))) 0)]
       (assoc where-clause :o {:value _id}))))
 
+
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars finish-fn parse-json?] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars
+           finish-fn] :as opts}]
   (go-try
     (log/debug "subj-crawl opts:" opts)
     (let [{:keys [o p-ref?]} f-where
-          vars*         (if ident-vars
-                          (<? (resolve-ident-vars db vars ident-vars))
-                          vars)
-          opts*         (assoc opts :vars vars*)
-          f-where*      (if (and p-ref? (:ident o))
-                          (<? (resolve-o-ident db f-where))
-                          f-where)
-          sid-ch        (if (= :_id (:type f-where*))
-                          (subjects-id-chan db error-ch vars* f-where*)
-                          (subjects-chan db error-ch vars* f-where* parse-json?))
-          flakes-af     (flakes-xf opts*)
-          flakes-ch     (async/chan 32 (comp (drop offset) (take limit)))
-          result-ch     (async/chan)]
+          vars*     (if ident-vars
+                      (<? (resolve-ident-vars db vars ident-vars))
+                      vars)
+          opts*     (assoc opts :vars vars*)
+          f-where*  (if (and p-ref? (:ident o))
+                      (<? (resolve-o-ident db f-where))
+                      f-where)
+          sid-ch    (if (#{:_id :iri} (:type f-where*))
+                      (subjects-id-chan db error-ch vars* f-where*)
+                      (subjects-chan db error-ch vars* f-where*))
+          flakes-af (flakes-xf opts*)
+          flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
+          result-ch (async/chan)]
 
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
       (async/pipeline-async parallelism result-ch (result-af opts*) flakes-ch)

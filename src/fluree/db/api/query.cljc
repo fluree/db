@@ -2,8 +2,7 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.string :as str]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [clojure.core.async :as async]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
@@ -13,9 +12,10 @@
             [fluree.db.permissions :as permissions]
             [fluree.db.auth :as auth]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.fql-resp :refer [flakes->res]]))
+            [fluree.db.query.fql-resp :refer [flakes->res]]
+            [fluree.db.util.async :as async-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -373,14 +373,19 @@
   Returns core async channel containing result."
   [sources flureeQL]
   (go-try
-    (let [{:keys [select selectOne selectDistinct selectReduced from where construct block prefixes opts]} flureeQL
+    (let [{:keys [select selectOne selectDistinct selectReduced from where construct block prefixes opts t]} flureeQL
           _             (when-not (->> [select selectOne selectDistinct selectReduced]
                                        (remove nil?) count (#(= 1 %)))
                           (throw (ex-info (str "Only one type of select-key (select, selectOne, selectDistinct, selectReduced) allowed. Provided: " (pr-str flureeQL))
                                           {:status 400
                                            :error  :db/invalid-query})))
-          db            sources                             ;; only support 1 source currently
-          db*           (if block (<? (time-travel/as-of-block (<? db) block)) (<? db))
+          db            (if (async-util/channel? sources)   ;; only support 1 source currently
+                          (<? sources)
+                          sources)
+          db*           (cond
+                          t (<? (time-travel/as-of db t))
+                          block (<? (time-travel/as-of-block db block))
+                          :else db)
           source-opts   (if prefixes
                           (get-sources (:conn db*) (:network db*) (:auth-id db*) prefixes)
                           {})

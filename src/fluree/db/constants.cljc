@@ -7,7 +7,38 @@
 
 (def ^:const data_version 4)
 
+;; iri constants
+(def ^:const iri-CommitProof "https://ns.flur.ee/ledger#CommitProof")
+(def ^:const iri-Commit "https://ns.flur.ee/ledger#Commit")
+(def ^:const iri-commit "https://ns.flur.ee/ledger#commit")
+(def ^:const iri-DB "https://ns.flur.ee/ledger#DB")
+(def ^:const iri-data "https://ns.flur.ee/ledger#data")
+(def ^:const iri-t "https://ns.flur.ee/ledger#t")
+(def ^:const iri-address "https://ns.flur.ee/ledger#address")
+(def ^:const iri-v "https://ns.flur.ee/ledger#v")
+(def ^:const iri-flakes "https://ns.flur.ee/ledger#flakes")
+(def ^:const iri-size "https://ns.flur.ee/ledger#size")
+(def ^:const iri-assert "https://ns.flur.ee/ledger#assert")
+(def ^:const iri-retract "https://ns.flur.ee/ledger#retract")
+(def ^:const iri-previous "https://ns.flur.ee/ledger#previous")
+(def ^:const iri-alias "https://ns.flur.ee/ledger#alias")
+(def ^:const iri-ledger "https://ns.flur.ee/ledger#ledger")
+(def ^:const iri-branch "https://ns.flur.ee/ledger#branch")
+(def ^:const iri-issuer "https://www.w3.org/2018/credentials#issuer")
+(def ^:const iri-index "https://ns.flur.ee/ledger#index")
+(def ^:const iri-ns "https://ns.flur.ee/ledger#ns")
+(def ^:const iri-time "https://ns.flur.ee/ledger#time")
+(def ^:const iri-message "https://ns.flur.ee/ledger#message")
+(def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
+(def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
+(def ^:const iri-context "https://ns.flur.ee/ledger#context")
+
+(def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
+
 ;; system constants
+
+;; @id (unique subject identifier) in the form of IRI
+(def ^:const $iri 0)
 
 ;; system collection ids
 (def ^:const $_tx -1)                                       ;; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
@@ -22,19 +53,23 @@
 (def ^:const $_rule 8)
 (def ^:const $_setting 9)
 (def ^:const $_ctx 10)
+(def ^:const $_prefix 11)
+(def ^:const $_default 12)
 
 (def ^:const $numSystemCollections 19)                      ;; max number reserved for 'system'
 (def ^:const $maxSystemPredicates 999)
 
 ;; predicate id constants
 
-(def ^:const $_block:hash 1)
-(def ^:const $_block:prevHash 2)
-(def ^:const $_block:transactions 3)
-(def ^:const $_block:ledgers 4)
-(def ^:const $_block:instant 5)
-(def ^:const $_block:number 6)
-(def ^:const $_block:sigs 7)
+(def ^:const $_block:hash 51)                                ;; JSON-LD: turning into data/db id
+(def ^:const $_block:prevHash 52)
+(def ^:const $_block:transactions 53)                        ;; JSON-LD: turning into commit id ref
+(def ^:const $_block:ledgers 54)                             ;; JSON-LD - reuse as commit message
+(def ^:const $_block:instant 55)                             ;; JSON-LD: turning into commit timestamp
+(def ^:const $_block:number 56)                              ;; JSON-LD: reuse as commit tag(s)
+(def ^:const $_block:sigs 57)                                ;; JSON-LD: turning into signer of commit
+
+
 
 (def ^:const $_predicate:name 10)
 (def ^:const $_predicate:doc 11)
@@ -54,8 +89,107 @@
 (def ^:const $_predicate:txSpecDoc 25)
 (def ^:const $_predicate:restrictTag 26)
 (def ^:const $_predicate:fullText 27)
-;(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
+(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
 (def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
+;; TODO - jumping predicate ids - rethink ordering a bit
+(def ^:const $rdf:type 200)
+(def ^:const $rdfs:subClassOf 201)
+(def ^:const $rdfs:subPropertyOf 202)
+(def ^:const $rdfs:Class 203)
+(def ^:const $rdf:Property 204)
+
+;; shacl
+(def ^:const $sh:NodeShape 210)
+(def ^:const $sh:PropertyShape 211)
+(def ^:const $sh:targetClass 212)
+(def ^:const $sh:targetNode 213)
+(def ^:const $sh:targetObjectsOf 214)
+(def ^:const $sh:targetSubjectsOf 215)
+(def ^:const $sh:closed 216)
+(def ^:const $sh:ignoredProperties 217)
+(def ^:const $sh:property 218)
+(def ^:const $sh:path 219)
+(def ^:const $sh:minCount 220)
+(def ^:const $sh:maxCount 221)
+(def ^:const $sh:datatype 222)
+;; nodes
+(def ^:const $sh:nodeKind 223)
+(def ^:const $sh:IRI 224)
+(def ^:const $sh:IRIOrLiteral 225)
+(def ^:const $sh:BlankNodeOrIRI 226)
+(def ^:const $sh:BlankNode 227)
+(def ^:const $sh:BlankNodeOrLiteral 228)
+(def ^:const $sh:Literal 229)
+;; string validation
+(def ^:const $sh:minLength 230)
+(def ^:const $sh:maxLength 231)
+(def ^:const $sh:pattern 232)
+(def ^:const $sh:languageIn 233)
+(def ^:const $sh:uniqueLang 234)
+;; class restrictions
+(def ^:const $sh:class 235)
+(def ^:const $sh:hasValue 236)
+(def ^:const $sh:in 237)
+;; number comparisons
+(def ^:const $sh:minExclusive 238)
+(def ^:const $sh:minInclusive 239)
+(def ^:const $sh:maxExclusive 240)
+(def ^:const $sh:maxInclusive 241)
+
+
+
+
+;; fluree-specific
+(def ^:const $fluree:context 250)
+
+;; owl
+(def ^:const $owl:Class 245)
+(def ^:const $owl:ObjectProperty 246)
+(def ^:const $owl:DatatypeProperty 247)
+
+;; == xsd data types ==
+;; major types (a) ref, (b) string, (c) number, (d) boolean
+;; xsd common types
+(def ^:const $xsd:anyURI 0)
+(def ^:const $xsd:string 1)
+(def ^:const $xsd:boolean 2)
+(def ^:const $xsd:date 3)
+(def ^:const $xsd:dateTime 4)
+(def ^:const $xsd:decimal 5)
+(def ^:const $xsd:double 6)
+(def ^:const $xsd:integer 7)
+(def ^:const $xsd:long 8)
+;; xsd number types
+(def ^:const $xsd:int 10)
+(def ^:const $xsd:short 11)
+(def ^:const $xsd:float 12)
+(def ^:const $xsd:unsignedLong 13)
+(def ^:const $xsd:unsignedInt 14)
+(def ^:const $xsd:unsignedShort 15)
+(def ^:const $xsd:positiveInteger 16)
+(def ^:const $xsd:nonPositiveInteger 17)
+(def ^:const $xsd:negativeInteger 18)
+(def ^:const $xsd:nonNegativeInteger 19)
+;; xsd date and specialized strings
+(def ^:const $xsd:duration 20)
+(def ^:const $xsd:gDay 21)
+(def ^:const $xsd:gMonth 22)
+(def ^:const $xsd:gMonthDay 23)
+(def ^:const $xsd:gYear 24)
+(def ^:const $xsd:gYearMonth 25)
+(def ^:const $xsd:time 26)
+(def ^:const $xsd:normalizedString 27)
+(def ^:const $xsd:token 28)
+(def ^:const $xsd:language 29)
+;; xsd binary types
+(def ^:const $xsd:byte 30)                                  ;; store as number
+(def ^:const $xsd:unsignedByte 31)                          ;; store as number
+(def ^:const $xsd:hexBinary 32)
+(def ^:const $xsd:base64Binary 33)
+;; NOTE: Add multibyte type?
+;; NOTE: Add JSON type?
+;; NOTE: Add geo types? string-encoded GeoJSON?
+
 
 (def ^:const $_tag:id 30)
 (def ^:const $_tag:doc 31)
@@ -135,6 +269,8 @@
 (def ^:const $_ctx:key 141)
 (def ^:const $_ctx:fn 142)
 (def ^:const $_ctx:doc 143)
+
+(def ^:const $fluree:default-context 150)
 
 ;; tags
 ;; _predicate/type tags

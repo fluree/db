@@ -7,12 +7,12 @@
                       [http.async.client.websocket :as ws]])
             #?@(:cljs [["axios" :as axios]
                        ["ws" :as NodeWebSocket]])
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [clojure.core.async :as async]
             [clojure.string :as str]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.platform :as platform]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log :include-macros true])
   (:import #?@(:clj  ((org.httpkit.client TimeoutException)
                       (org.asynchttpclient.ws WebSocket))
                :cljs ((goog.net.ErrorCode)))))
@@ -86,20 +86,22 @@
        (throw (TimeoutException. (-> response :error :error/cause)))
        response)))
 
-
-(defn post-json
-  "Posts JSON content.
-  opts is a map with following optional keys:
-  :request-timeout - how many milliseconds until we throw an exception without a response (default 5000)"
+(defn post
+  "Posts pre-formatted message (e.g. already stringified JSON)."
   [url message opts]
-  (let [{:keys [request-timeout token headers] :or {request-timeout 5000}} opts
+  (let [{:keys [request-timeout token headers keywordize-keys json?]
+         :or   {request-timeout 5000
+                keywordize-keys true}} opts
         response-chan (async/chan)
-        headers       (cond-> {"Content-Type" "application/json"}
-                              headers (merge headers)
-                              token (assoc "Authorization" (str "Bearer " token)))]
-    #?(:clj (http/post url {:headers headers
-                            :timeout request-timeout
-                            :body    (json/stringify message)}
+        multipart? (contains? message :multipart)
+        headers*      (cond-> headers
+                        json? (assoc "Content-Type" "application/json")
+                        token (assoc "Authorization" (str "Bearer " token)))
+        base-req      (if multipart? ;; multipart requests need to be sent in special map structure
+                        message
+                        {:body message})]
+    #?(:clj (http/post url (assoc base-req :headers headers*
+                                           :timeout request-timeout)
                        (fn [{:keys [error status body] :as response}]
                          (if (or error (< 299 status))
                            (do
@@ -110,20 +112,41 @@
                                  url
                                  (or error (ex-info "error response"
                                                     response)))))
-                           (let [body (-> body bs/to-string json/parse)]
-                             (async/put! response-chan body)))))
+                           (let [data (cond-> (bs/to-string body)
+                                              json? (json/parse keywordize-keys))]
+                             (async/put! response-chan data)))))
        :cljs
-       (-> axios
-           (.request (clj->js {:url     url
-                               :method  "post"
-                               :timeout request-timeout
-                               :headers headers
-                               :data    message}))
-           (.then (fn [resp]
-                    (async/put! response-chan (:data (js->clj resp :keywordize-keys true)))))
-           (.catch (fn [err]
-                     (async/put! response-chan (format-error-response url err))))))
+       (let [req {:url url
+                  :method "post"
+                  :timeout request-timeout
+                  :headers (cond-> headers*
+                             multipart? (assoc "Content-Type" "multipart/form-data"))
+                  :data (if multipart?
+                          (mapv :content (:multipart message))
+                          message)}]
+         (-> axios
+             (.request (clj->js req))
+             (.then (fn [resp]
+                      (let [headers (js->clj (.-headers resp) :keywordize-keys true)]
+                        (async/put! response-chan (condp = (:content-type headers)
+                                                    "application/json" (:data (js->clj resp :keywordize-keys keywordize-keys))
+                                                    resp)))))
+             (.catch (fn [err]
+                       (async/put! response-chan (format-error-response url err)))))))
     response-chan))
+
+
+(defn post-json
+  "Posts JSON content, returns parsed JSON response as core async channel.
+  opts is a map with following optional keys:
+  :request-timeout - how many milliseconds until we throw an exception without a response (default 5000)"
+  [url message opts]
+  (let [base-req (if (contains? message :multipart)
+                   (->> (:multipart message)                ;; stringify each :content key of multipart message
+                        (mapv #(assoc % :content (json/stringify (:content %))))
+                        (assoc message :multipart))
+                   {:body (json/stringify message)})]
+    (post url base-req (assoc opts :json? true))))
 
 
 (defn get
@@ -218,8 +241,8 @@
                :cljs (.send ws msg))
             (async/put! resp-chan true)
             (catch* e
-              (log/error e "Error sending websocket message:" msg)
-              (async/put! resp-chan false)))
+                    (log/error e "Error sending websocket message:" msg)
+                    (async/put! resp-chan false)))
           (recur))))))
 
 
@@ -251,9 +274,9 @@
        (async/put! resp-chan ws))
 
      :cljs
-     (let [ws           (if (identical? *target* "nodejs")
-                          (NodeWebSocket. url)
-                          (js/WebSocket. url))
+     (let [ws           (if platform/BROWSER
+                          (js/WebSocket. url)
+                          (NodeWebSocket. url))
            open?        (async/promise-chan)
            timeout-chan (async/timeout timeout)]
 

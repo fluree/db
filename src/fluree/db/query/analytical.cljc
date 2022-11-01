@@ -1,24 +1,22 @@
 (ns fluree.db.query.analytical
   (:require [clojure.set :as set]
             [fluree.db.query.range :as query-range]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+            [clojure.core.async :as async]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.query.analytical-wikidata :as wikidata]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.union :as union]
             [clojure.string :as str]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.analytical-parse :as parse])
-  #?(:clj (:import (java.io Closeable)
-                   (fluree.db.flake Flake))))
+  #?(:clj (:import (java.io Closeable))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -55,6 +53,7 @@
  "
   [db interm-vars clause]
   (reduce-kv (fn [acc idx key]
+               (println "key:" (pr-str key))
                (let [key-as-var   (variable? key)
                      static-value (get interm-vars key-as-var)]
                  (when (and (= idx 1) (not key-as-var) (not= "_id" key)
@@ -443,12 +442,10 @@
                     (let [partition (dbproto/-c-prop db :partition (last clause))
                           max-sid   (-> db :ecount (get partition))
                           min-sid   (flake/min-subject-id partition)
-                          flakes    (if max-sid
-                                      (<? (query-range/index-range db :spot
-                                                                   >= [max-sid]
-                                                                   <= [min-sid]))
-                                      [])
-                          xf        (comp (map (fn [^Flake f] [(.-s f)])) (distinct))]
+                          flakes    (<? (query-range/index-range db :spot
+                                                                 >= [max-sid]
+                                                                 <= [min-sid]))
+                          xf        (comp (map (fn [f] [(flake/s f)])) (distinct))]
                       {:headers [subject-var]
                        :tuples  (sequence xf flakes)
                        :vars    {}}))
@@ -461,7 +458,6 @@
                     {:headers [object-var]
                      :tuples  [[cname]]
                      :vars    {}})))))
-
 
 
 (def all-functions #{"STR" "RAND" "ABS" "CEIL" "FLOOR" "CONCAT"

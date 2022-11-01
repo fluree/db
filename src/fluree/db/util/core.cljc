@@ -1,13 +1,12 @@
 (ns fluree.db.util.core
   (:require [clojure.string :as str]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <! put!] :as async])
-            #?(:cljs [cljs.js :as cljs])
             #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
-  #?(:clj  (:import (java.util UUID Date)
-                    (java.time Instant)
-                    (java.net URLEncoder URLDecoder))))
+  #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
+  #?(:clj (:import (java.util UUID Date)
+                   (java.time Instant)
+                   (java.net URLEncoder URLDecoder)))
+  (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -24,39 +23,49 @@
   [env]
   (boolean (:ns env)))
 
-(defmacro if-cljs
-  "Return then if we are generating cljs code and else for Clojure code.
+#?(:clj
+   (defmacro if-cljs
+     "Return then if we are generating cljs code and else for Clojure code.
    https://groups.google.com/d/msg/clojurescript/iBY5HaQda4A/w1lAQi9_AwsJ"
-  [then else]
-  (if (cljs-env? &env) then else))
+     [then else]
+     (if (cljs-env? &env) then else)))
 
-(defmacro try-catchall
-  "A cross-platform variant of try-catch that catches all exceptions.
+#?(:clj
+   (defmacro try-catchall
+     "A cross-platform variant of try-catch that catches all exceptions.
    Does not (yet) support finally, and does not need or want an exception class."
-  [& body]
-  (let [try-body (butlast body)
-        [catch sym & catch-body :as catch-form] (last body)]
-    (assert (= catch 'catch))
-    (assert (symbol? sym))
-    `(if-cljs
-       (try ~@try-body (~'catch js/Object ~sym ~@catch-body))
-       (try ~@try-body (~'catch Throwable ~sym ~@catch-body)))))
+     [& body]
+     (let [try-body (butlast body)
+           [catch sym & catch-body :as catch-form] (last body)]
+       (assert (= catch 'catch))
+       (assert (symbol? sym))
+       `(if-cljs
+            (try ~@try-body (~'catch js/Object ~sym ~@catch-body))
+            (try ~@try-body (~'catch Throwable ~sym ~@catch-body))))))
 
 (declare catch*)
 
-(defmacro try*
-  "Like try but supports catch*. catch* is like catch but supports CLJ/CLJS with
+#?(:clj
+   (defmacro try*
+     "Like try but supports catch*. catch* is like catch but supports CLJ/CLJS with
   less boilerplate. In CLJ it catches `Exception`. In CLJS it catches `:default`.
   Use it like this: `(try* ... (catch* err (handle-err err)))`.
   Also supports an optional finally clause."
-  [& body]
-  `(if-cljs
-     (cljs-exceptions/try* ~@body)
-     (clj-exceptions/try* ~@body)))
+     [& body]
+     `(if-cljs
+        (cljs-exceptions/try* ~@body)
+        (clj-exceptions/try* ~@body))))
 
-(defn index-of [coll value]
-  (some (fn [[item idx]] (when (= value item) idx))
-        (partition 2 (interleave coll (range)))))
+(defn index-of
+  "Returns index integer (n) of item within a Vector.
+  If item cannot be found, returns nil."
+  [^clojure.lang.PersistentVector coll value]
+  #?(:clj  (let [n (.indexOf coll value)]
+             (if (< n 0)
+               nil
+               n))
+     :cljs (some (fn [[item idx]] (when (= value item) idx))
+                 (partition 2 (interleave coll (range))))))
 
 (defn date->millis
   "Given a date, returns epoch millis if possible."
@@ -90,6 +99,11 @@
   #?(:clj  (System/currentTimeMillis)
      :cljs (.getTime (js/Date.))))
 
+(defn current-time-iso
+  "Returns current time as string for ISO-8601 format"
+  []
+  #?(:clj  (str (Instant/now))
+     :cljs (.toISOString (js/Date.))))
 
 (defn response-time-formatted
   "Returns response time, formatted as string. Must provide start time of request
@@ -178,8 +192,21 @@
         (assoc acc k v)))
     {} m))
 
+(defn stringify-keys
+  "Does simple (top-level keys only) conversion of keyword keys to strings.
+  This only takes the 'name' value of keywords, not the namespace. Could do
+  namespace too, but nothing currently needs that. Used mostly for serializing
+  properly to JSON."
+  [m]
+  (reduce-kv
+    (fn [acc k v]
+      (if (keyword? k)
+        (assoc acc (name k) v)
+        (assoc acc k v)))
+    {} m))
+
 (defn str->epoch-ms
-  "Takes time as a string and returns an java.time.Instant."
+  "Takes time as a string and returns epoch millis."
   [time-str]
   (try
     #?(:clj  (.toEpochMilli (Instant/parse time-str))
@@ -196,11 +223,12 @@
     s
     (str (subs s 0 n) " ...")))
 
-(defmacro some-of
-  ([] nil)
-  ([x] x)
-  ([x & more]
-   `(let [x# ~x] (if (nil? x#) (some-of ~@more) x#))))
+#?(:clj
+   (defmacro some-of
+     ([] nil)
+     ([x] x)
+     ([x & more]
+      `(let [x# ~x] (if (nil? x#) (some-of ~@more) x#)))))
 
 (defn filter-vals
   "Filters map k/v pairs dropping any where predicate applied to value is false."
@@ -251,7 +279,6 @@
       (recur (str "0" s))
       s)))
 
-
 (defn conjv
   "Like conj, but if collection is nil creates a new vector instead of list.
   Not built to handle variable arity values"
@@ -260,9 +287,24 @@
     (vector x)
     (conj coll x)))
 
+(defn conjs
+  "Like conj, but if collection is nil creates a new set instead of list.
+  Not built to handle variable arity values"
+  [coll x]
+  (if (nil? coll)
+    #{x}
+    (conj coll x)))
 
-(defmacro condps
-  "Takes an expression and a set of clauses.
+(defn sequential
+  "Returns input wrapped in a vector if not already sequential."
+  [x]
+  (if (sequential? x)
+    x
+    [x]))
+
+#?(:clj
+   (defmacro condps
+     "Takes an expression and a set of clauses.
   Each clause can take the form of either:
 
   unary-predicate-fn? result-expr
@@ -274,22 +316,66 @@
 
   Similar to condp but takes unary predicates instead of binary and allows
   multiple predicates to be supplied in a list similar to case."
-  [expr & clauses]
-  (let [gexpr (gensym "expr__")
-        emit  (fn emit [expr args]
-                (let [[[a b :as clause] more] (split-at 2 args)
-                      n (count clause)]
-                  (case n
-                    0 `(throw (IllegalArgumentException.
-                                (str "No matching clause: " ~expr)))
-                    1 a
-                    (let [preds (if (and (coll? a)
-                                         (not (= 'fn* (first a)))
-                                         (not (= 'fn (first a))))
-                                  (vec a)
-                                  [a])]
-                      `(if ((apply some-fn ~preds) ~expr)
-                         ~b
-                         ~(emit expr more))))))]
-    `(let [~gexpr ~expr]
-       ~(emit gexpr clauses))))
+     [expr & clauses]
+     (let [gexpr (gensym "expr__")
+           emit  (fn emit [expr args]
+                   (let [[[a b :as clause] more] (split-at 2 args)
+                         n (count clause)]
+                     (case n
+                       0 `(throw (IllegalArgumentException.
+                                   (str "No matching clause: " ~expr)))
+                       1 a
+                       (let [preds (if (and (coll? a)
+                                            (not (= 'fn* (first a)))
+                                            (not (= 'fn (first a))))
+                                     (vec a)
+                                     [a])]
+                         `(if ((apply some-fn ~preds) ~expr)
+                            ~b
+                            ~(emit expr more))))))]
+       `(let [~gexpr ~expr]
+          ~(emit gexpr clauses)))))
+
+#?(:clj
+   (defmacro case+
+     "Same as case, but evaluates dispatch values, needed for referring to
+   class and def'ed constants as well as java.util.Enum instances."
+     [value & clauses]
+     (let [clauses       (partition 2 2 nil clauses)
+           default       (when (-> clauses last count (== 1))
+                           (last clauses))
+           clauses       (if default (drop-last clauses) clauses)
+           eval-dispatch (fn [d]
+                           (if (list? d)
+                             (map eval d)
+                             (eval d)))]
+       (if-cljs
+         `(condp = ~value
+            ~@(concat clauses default))
+         `(case ~value
+            ~@(concat (->> clauses
+                           (map #(-> % first eval-dispatch (list (second %))))
+                           (mapcat identity))
+                      default))))))
+
+
+(defn vswap!
+  "This silly fn exists to work around a bug in go macros where they sometimes clobber
+  type hints and issue reflection warnings. The vswap! macro uses interop so those forms
+  get macroexpanded into the go block. You'll then see reflection warnings for reset
+  deref. By letting the macro expand into this fn instead, it avoids the go bug.
+  I've filed a JIRA issue here: https://clojure.atlassian.net/browse/ASYNC-240
+  NB: I couldn't figure out how to get a var-arg version working so this only supports
+  0-3 args. I didn't see any usages in here that need more than 2, but note well and
+  feel free to add additional arities if needed (but maybe see if that linked bug has
+  been fixed first in which case delete this thing with a vengeance and remove the
+  refer-clojure exclude in the ns form).
+  - WSM 2021-08-26"
+  ([vol f]
+   (clojure.core/vswap! vol f))
+  ([vol f arg1]
+   (clojure.core/vswap! vol f arg1))
+  ([vol f arg1 arg2]
+   (clojure.core/vswap! vol f arg1 arg2))
+  ([vol f arg1 arg2 arg3]
+   (clojure.core/vswap! vol f arg1 arg2 arg3)))

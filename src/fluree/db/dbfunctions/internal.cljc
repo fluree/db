@@ -3,14 +3,15 @@
                             boolean re-find and or count str nth first rand nil? empty? hash-set not subs not=])
   (:require [#?(:cljs cljs.reader :clj clojure.edn) :as edn]
             [fluree.db.query.fql :as fql]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [#?(:cljs cljs.core.async :clj clojure.core.async) :as async]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [clojure.core.async :as async]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [go-try <?]]
-            [fluree.db.dbproto :as dbproto]
             [clojure.string :as str]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
-            [fluree.db.query.range :as query-range]))
+            [fluree.db.query.range :as query-range]
+            #?(:cljs ["seedrandom" :as seedrandom])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -67,22 +68,22 @@
   "Coerce to boolean. Everything except `false' and `nil' is true in boolean context."
   [x]
   (try* (clojure.core/boolean x)
-        (catch* e (function-error e "boolean" x))))
+    (catch* e (function-error e "boolean" x))))
 
 (defn nil?
   [arg]
   (try* (clojure.core/nil? arg)
-        (catch* e (function-error e "nil?" arg))))
+    (catch* e (function-error e "nil?" arg))))
 
 (defn not
   [arg]
   (try* (clojure.core/not arg)
-        (catch* e (function-error e "not" arg))))
+    (catch* e (function-error e "not" arg))))
 
 (defn empty?
   [arg]
   (try* (clojure.core/or (clojure.core/empty? arg) (= #{nil} arg))
-        (catch* e (function-error e "empty?" arg))))
+    (catch* e (function-error e "empty?" arg))))
 
 (defn if-else
   "Like clojure.core/if"
@@ -92,7 +93,7 @@
 
               :else
               false-res)
-        (catch* e (function-error e "if-else" test true-res false-res))))
+    (catch* e (function-error e "if-else" test true-res false-res))))
 
 (defn and
   "Returns true if all true"
@@ -118,73 +119,73 @@
   "Returns the number of items in the collection. (count nil) returns 0.  Also works on strings, arrays, and Java Collections and Maps"
   [coll]
   (try* (clojure.core/count coll)
-        (catch* e (function-error e "count" coll))))
+    (catch* e (function-error e "count" coll))))
 
 (defn str
   "Like clojure.core/str"
   [& args]
   (try* (apply clojure.core/str args)
-        (catch* e (function-error e "str" args))))
+    (catch* e (function-error e "str" args))))
 
 (defn subs
   "Like clojure.core/subs"
   [& args]
   (try* (apply clojure.core/subs args)
-        (catch* e (function-error e "subs" args))))
+    (catch* e (function-error e "subs" args))))
 
 (defn lower-case
   "Like clojure.core/lower-case"
   [str]
   (try* (clojure.string/lower-case str)
-        (catch* e (function-error e "lower-case" str))))
+    (catch* e (function-error e "lower-case" str))))
 
 (defn upper-case
   "Like clojure.core/upper-case"
   [str]
   (try* (clojure.string/upper-case str)
-        (catch* e (function-error e "upper-case" str))))
+    (catch* e (function-error e "upper-case" str))))
 
 (defn max
   "Like clojure.core/max, but applies max on a sequence"
   [& args]
   (try* (apply clojure.core/max (remove nil? args))
-        (catch* e (function-error e "max" args))))
+    (catch* e (function-error e "max" args))))
 
 (defn min
   "Like clojure.core/min, but applies min on a sequence"
   [& args]
   (try* (apply clojure.core/min (remove nil? args))
-        (catch* e (function-error e "min" args))))
+    (catch* e (function-error e "min" args))))
 
 (defn >
   "Like clojure.core/>, but applies > on a sequence"
   [& args]
   (try* (apply clojure.core/> args)
-        (catch* e (function-error e ">" args))))
+    (catch* e (function-error e ">" args))))
 
 (defn >=
   "Like clojure.core/>=, but applies > on a sequence"
   [& args]
   (try* (apply clojure.core/>= args)
-        (catch* e (function-error e ">=" args))))
+    (catch* e (function-error e ">=" args))))
 
 
 (defn <
   "Like clojure.core/>, but applies < on a sequence"
   [& args]
   (try* (apply clojure.core/< args)
-        (catch* e (function-error e "<" args))))
+    (catch* e (function-error e "<" args))))
 
 (defn <=
   "Like clojure.core/>, but applies < on a sequence"
   [& args]
   (try* (apply clojure.core/<= args)
-        (catch* e (function-error e "<=" args))))
+    (catch* e (function-error e "<=" args))))
 
 (defn not=
   [& args]
   (try* (apply clojure.core/not= args)
-        (catch* e (function-error e "not=" args))))
+    (catch* e (function-error e "not=" args))))
 
 (defn query
   "Executes a database query, but returns the :results directly."
@@ -324,7 +325,6 @@
   If multi returns a vector, else a single value."
   [db sid pred]
   (go-try
-
     (let [reverse?  (and (string? pred) (re-matches #".+/_.+" pred))
           pred*     (if reverse?
                       (str/replace pred "/_" "/")
@@ -653,13 +653,15 @@
       sum)
     (catch* e (function-error e "objF" flakes))))
 
-;; TODO - below is java-specific, need a javascript version
 (defn rand
-  [instant max']
+  [instant max]
   (try*
-    (let [base (.nextDouble (java.util.Random. instant))
-          num  (int (Math/floor (* base max')))] num)
-    (catch* e (function-error e "rand" instant max'))))
+    (let [rng #?(:clj (java.util.Random. instant)
+                 :cljs (seedrandom instant))
+          base #?(:clj (.nextDouble rng) :cljs (.double rng))
+          mult (* base max)]
+      (-> mult Math/floor int))
+    (catch* e (function-error e "rand" instant max))))
 
 (defn cas
   "Returns new-val if existing-val is equal to compare-val, else throws exception"

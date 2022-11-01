@@ -1,12 +1,13 @@
 (ns flureedb
   (:require [clojure.string :as str]
-            [cljs.core.async :refer [go <!] :as async]
+            [clojure.core.async :refer [go <!] :as async]
             [alphabase.core :as alphabase]
             [fluree.crypto :as crypto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.graphdb :as graphdb]
             [fluree.db.api.query :as q]
             [fluree.db.api.ledger :as ledger]
+            [fluree.db.json-ld.api :as fluree]
             [fluree.db.operations :as ops]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.block :as query-block]
@@ -16,10 +17,9 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
             [fluree.db.query.http-signatures :as http-signatures]
-    ;shared clojurescript code
+            ;; shared clojurescript code
             [fluree.db.api-js :as fdb-js]
             [fluree.db.connection-js :as conn-handler]))
-
 
 (enable-console-print!)
 
@@ -30,10 +30,59 @@
 (println (:product @app-state) (:version @app-state))
 
 
+
+
 ;; optionally touch your app-state to force rerendering depending on
 ;; your application
 ;; (swap! app-state update-in [:__figwheel_counter] inc)
 (defn on-js-reload [])
+
+;; ----------------------------------------
+;; JSON-LD
+;; ----------------------------------------
+
+(defn ^:export jldConnect
+  [opts]
+  (fluree/connect (js->clj opts :keywordize-keys true)))
+
+(defn ^:export jldCreate
+  ([conn] (fluree/create conn))
+  ([conn ledger-alias] (fluree/create conn ledger-alias))
+  ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldLoad
+  ([address] (fluree/load address))
+  ([conn address] (fluree/load conn address)))
+
+(defn ^:export jldStage
+  ([db-or-ledger json-ld] (fluree/stage db-or-ledger (js->clj json-ld)))
+  ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger (js->clj json-ld) (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldCommit
+  ([db] (.then (fluree/commit! db)
+               (fn [result] (clj->js result))))
+  ([ledger db] (.then (fluree/commit! ledger db)
+                      (fn [result] (clj->js result))))
+  ([ledger db opts] (.then (fluree/commit! ledger db (js->clj opts :keywordize-keys true))
+                           (fn [result] (clj->js result)))))
+
+(defn ^:export jldStatus
+  ([ledger] (clj->js (fluree/status ledger)))
+  ([ledger branch] (clj->js (fluree/status ledger branch))))
+
+(defn ^:export jldDb
+  ([ledger] (fluree/db ledger))
+  ([ledger opts] (fluree/db ledger (js->clj opts :keywordize-keys true))))
+
+(defn ^:export jldQuery
+  [db query]
+  (let [query* (->> (js->clj query :keywordize-keys false)
+                    (reduce-kv (fn [acc k v]
+                                   (assoc acc (keyword k) v))
+                               {}))]
+       (.then (fluree/query db (assoc-in query* [:opts :js?] true))
+              (fn [result] (clj->js result)))))
+
 
 ;; ======================================
 ;;
@@ -585,4 +634,38 @@
   [req-method url request private-key auth]
   (http-signatures/sign-request req-method url request private-key auth))
 
-
+(def ^:export flureedb
+  #js {:authenticate authenticate
+       :block_query block-query
+       :block_range block-range
+       :block_range_with_txn block-range-with-txn
+       :close close
+       :close_listener close-listener
+       :connect connect
+       :connect_p connect-p
+       :db db
+       :db_schema db-schema
+       :delete_ledger delete-ledger
+       :history_query history-query
+       :http_signature http-signature
+       :jldCommit jldCommit
+       :jldConnect jldConnect
+       :jldCreate jldCreate
+       :jldDb jldDb
+       :jldLoad jldLoad
+       :jldQuery jldQuery
+       :jldStage jldStage
+       :jldStatus jldStatus
+       :ledger_stats ledger-stats
+       :listen listen
+       :listeners listeners
+       :monitor_tx monitor-tx
+       :multi_query multi-query
+       :new_ledger new-ledger
+       :password_generate password-generate
+       :password_login password-login
+       :query query
+       :renew_token renew-token
+       :set_logging set-logging
+       :signed_query signed-query
+       :transact transact})

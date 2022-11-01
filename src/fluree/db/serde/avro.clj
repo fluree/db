@@ -3,7 +3,7 @@
             [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [clojure.string :as str])
   (:import (java.net URI)
            (java.util UUID)))
@@ -103,6 +103,7 @@
      :fields         [{:name "s", :type :long}
                       {:name "p", :type :long}
                       {:name "o", :type [:long :int :string :boolean :float :double "BigInteger" "BigDecimal" "URI" "UUID"]}
+                      {:name "dt", :type :long}
                       {:name "t", :type :long}
                       {:name "op", :type :boolean}
                       {:name "m", :type [:string :null]}]}))
@@ -238,7 +239,7 @@
   [stats]
   (convert-keys stats util/keyword->str))
 
-(def ^:const bindings {'fluree/Flake #'flake/->Flake
+(def ^:const bindings {'fluree/Flake #'flake/create
                        'BigInteger   #'->BigInteger
                        'BigDecimal   #'->BigDecimal
                        'URI          #'->URI

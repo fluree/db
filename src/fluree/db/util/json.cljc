@@ -55,25 +55,27 @@
           (thisfn x))))))
 
 (defn parse
-  [x]
-  #?(:clj  (-> (cond (string? x) x
-                     (bytes? x) (butil/UTF8->string x)
-                     (instance? ByteArrayInputStream x) (slurp x)
-                     (instance? InputStream x) (slurp x)
-                     :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
-                                           {:status 500 :error :db/unexpected-error})))
-               ;; set binding parameter to decode BigDecimals
-               ;; without truncation.  Unfortunately, this causes
-               ;; all floating point and doubles to be designated
-               ;; as BigDecimals.
-               (as-> x'
+  ([x] (parse x true))
+  ([x keywordize-keys?]
+   #?(:clj  (-> (cond (string? x) x
+                      (bytes? x) (butil/UTF8->string x)
+                      (instance? ByteArrayInputStream x) (slurp x)
+                      (instance? InputStream x) (slurp x)
+                      :else (throw (ex-info (str "json parse error, unknown input type: " (pr-str (type x)))
+                                            {:status 500 :error :db/unexpected-error})))
+                ;; set binding parameter to decode BigDecimals
+                ;; without truncation.  Unfortunately, this causes
+                ;; all floating point and doubles to be designated
+                ;; as BigDecimals.
+                (as-> x'
                       (binding [cparse/*use-bigdecimals?* true]
-                        (cjson/decode x' true))))
-     :cljs (-> (if (string? x)
-                 x
-                 (butil/UTF8->string x))
-               (js/JSON.parse)
-               (js->clj :keywordize-keys true))))
+                        (cjson/decode x' keywordize-keys?))))
+      :cljs (-> (if (string? x)
+                  x
+                  (butil/UTF8->string x))
+                (js/JSON.parse)
+                (js->clj :keywordize-keys keywordize-keys?)))))
+
 
 #?(:cljs
    (defn stringify-preserve-namespace

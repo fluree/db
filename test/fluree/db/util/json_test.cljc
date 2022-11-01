@@ -10,8 +10,6 @@
               (java.lang Double Float Integer)
               (clojure.lang PersistentArrayMap))))
 
-(defn abs [x] (if (> x 0) x (* -1 x)))
-
 ;; Clojure-specific
 #?(:clj
    (defn string->stream
@@ -337,4 +335,3 @@
    (deftest db-util-json-test
      (testing "boolean"
        (is (= (float 0) (double 0))))))
-

@@ -2,12 +2,12 @@
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.query.schema :as schema]
             [fluree.db.constants :as const]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.flake :as flake]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+            [clojure.core.async :refer [go <!] :as async]
             [fluree.db.session :as session]
-            [fluree.db.util.async :as async-util]))
+            [fluree.db.util.async :as async-util]
+            [fluree.db.datatype :as datatype]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -52,6 +52,12 @@
         (async/put! pc db**)))
     pc))
 
+(defn to-flake
+  "Creates flake out of tuple parts, adds in data type based on object."
+  [s p o t op]
+  (let [dt (datatype/infer o)]
+    (flake/create s p o dt t (if (false? op) false true) nil)))
+
 
 (defn transact-tuples
   "Transacts tuples which includes s, p, o and optionally op.
@@ -67,7 +73,7 @@
             t      (dec (:t db*))
             flakes (->> tuples
                         (map (fn [[s p o op]]
-                               (flake/->Flake s p o t (if (false? op) false true) nil))))
+                               (to-flake s p o t op))))
             db**   (async/<! (transact-flakes db* flakes))]
         (async/put! pc db**)))
     pc))
@@ -625,4 +631,6 @@
    [-2 5 1597383559372 -2 true nil]
    [-2 6 1 -2 true nil]])
 
-(def ^:const bootstrap-flakes (mapv flake/parts->Flake bootstrap-tuples))
+(def ^:const bootstrap-flakes (mapv (fn [[s p o t op]]
+                                      (to-flake s p o t op))
+                                    bootstrap-tuples))

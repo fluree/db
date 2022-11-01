@@ -1,10 +1,10 @@
 (ns fluree.db.time-travel
-  (:require #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
+  (:require [clojure.core.async :as async]
             [clojure.string :as string]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try into?]]
             [fluree.db.util.core :as util :refer [try* catch*]]))
 
@@ -142,6 +142,24 @@
         (throw (ex-info (str "Invalid time value provided: " (pr-str block-or-t-or-time))
                         {:status 400
                          :error  :db/invalid-time}))))))
+
+(defn as-of
+  "Gets database as of a specific moment. Resolves 't' value provided to internal Fluree indexing
+  negative 't' long integer value."
+  [db t]
+  (let [pc (async/promise-chan)]
+    (async/go
+      (try*
+        (let [t* (cond
+                   (pos-int? t) (- t)
+                   (neg-int? t) t
+                   :else (throw (ex-info (str "Time travel to t value of: " t " not yet supported.")
+                                         {:status 400 :error :db/invalid-query})))]
+          (async/put! pc (assoc db :t t*)))
+        (catch* e
+                ;; return exception into promise-chan
+                (async/put! pc e))))
+    pc))
 
 
 (defn as-of-block

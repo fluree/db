@@ -75,14 +75,14 @@
   (- sid (lshift (sid->cid sid) 44)))
 
 
-(deftype Flake [s p o t op m]
+(deftype Flake [s p o dt t op m]
   #?@(:clj  [avro/AvroSerializable
              (schema-name [_] "fluree.Flake")
              (field-get [f field] (get f field))
-             (field-list [_] #{:s :p :o :t :op :m})
+             (field-list [_] #{:s :p :o :dt :t :op :m})
 
              clojure.lang.Seqable
-             (seq [f] (list (.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f)))
+             (seq [f] (list (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)))
 
              clojure.lang.Indexed
              (nth [f i] (nth-flake f i nil))
@@ -95,7 +95,7 @@
              clojure.lang.IPersistentCollection
              (equiv [f o] (and (instance? Flake o) (equiv-flake f o)))
              (empty [f] (throw (UnsupportedOperationException. "empty is not supported on Flake")))
-             (count [f] 6)
+             (count [f] 7)
              (cons [f [k v]] (assoc-flake f k v))
 
              clojure.lang.IPersistentMap
@@ -104,7 +104,7 @@
 
              clojure.lang.Associative
              (entryAt [f k] (some->> (get f k nil) (clojure.lang.MapEntry k)))
-             (containsKey [_ k] (boolean (#{:s :p :o :t :op :m} k)))
+             (containsKey [_ k] (boolean (#{:s :p :o :dt :t :op :m} k)))
              (assoc [f k v] (assoc-flake f k v))
 
              Object
@@ -147,7 +147,7 @@
              (-nth [this i not-found] (nth-flake this i not-found))
 
              ISeqable
-             (-seq [this] (list (.-s this) (.-p this) (.-o this) (.-t this) (.-op this) (.-m this)))
+             (-seq [this] (list (.-s this) (.-p this) (.-o this) (.-dt this) (.-t this) (.-op this) (.-m this)))
 
              IHash
              (-hash [this] (hash (seq this)))
@@ -162,13 +162,13 @@
              (-pr-writer [^Flake f writer opts]
                          (pr-sequential-writer writer pr-writer
                                                "#Flake [" " " "]"
-                                               opts [(.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f)]))]))
+                                               opts [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))]))
 
 
 #?(:clj (defmethod print-method Flake [^Flake f, ^java.io.Writer w]
           (.write w (str "#Flake "))
           (binding [*out* w]
-            (pr [(.-s f) (.-p f) (.-o f) (.-t f) (.-op f) (.-m f)]))))
+            (pr [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))))
 
 (defn s
   [^Flake f]
@@ -182,6 +182,10 @@
   [^Flake f]
   (.-o f))
 
+(defn dt
+  [^Flake f]
+  (.-dt f))
+
 (defn t
   [^Flake f]
   (.-t f))
@@ -194,42 +198,53 @@
   [^Flake f]
   (.-m f))
 
+(defn flake?
+  [x]
+  (instance? Flake x))
+
 (defn- equiv-flake
   [f other]
   (and (= (s f) (s other))
        (= (p f) (p other))
-       (= (o f) (o other))))
+       (= (o f) (o other))
+       (= (dt f) (dt other))))
 
 (defn parts->Flake
   "Used primarily to generate flakes for comparator. If you wish to
   generate a flake for other purposes, be sure to supply all components."
-  ([[s p o t op m]]
-   (->Flake s p o t op m))
-  ([[s p o t op m] default-tx]
-   (->Flake s p o (or t default-tx) op m))
-  ([[s p o t op m] default-tx default-op]
-   (->Flake s p o (or t default-tx) (or op default-op) m)))
+  ([[s p o dt t op m]]
+   (->Flake s p o dt t op m))
+  ([[s p o dt t op m] default-tx]
+   (->Flake s p o dt (or t default-tx) op m))
+  ([[s p o dt t op m] default-tx default-op]
+   (->Flake s p o dt (or t default-tx) (or op default-op) m)))
+
+(defn create
+  "Creates a new flake from parts"
+  [s p o dt t op m]
+  (->Flake s p o dt t op m))
 
 
 (defn Flake->parts
   [flake]
-  [(s flake) (p flake) (o flake) (t flake) (op flake) (m flake)])
+  [(s flake) (p flake) (o flake) (dt flake) (t flake) (op flake) (m flake)])
 
 (def maximum
   "The largest flake possible"
-  (->Flake util/max-long 0 util/max-long 0 true nil))
+  (->Flake util/max-long 0 util/max-long const/$xsd:decimal 0 true nil))
 
 (defn- assoc-flake
   "Assoc for Flakes"
   [flake k v]
-  (let [[s p o t op m] (Flake->parts flake)]
+  (let [[s p o dt t op m] (Flake->parts flake)]
     (case k
-      :s (->Flake v p o t op m)
-      :p (->Flake s v o t op m)
-      :o (->Flake s p v t op m)
-      :t (->Flake s p o v op m)
-      :op (->Flake s p o t v m)
-      :m (->Flake s p o t op v)
+      :s (->Flake v p o dt t op m)
+      :p (->Flake s v o dt t op m)
+      :o (->Flake s p v dt t op m)
+      :dt (->Flake s p o v t op m)
+      :t (->Flake s p o dt v op m)
+      :op (->Flake s p o dt t v m)
+      :m (->Flake s p o dt t op v)
       #?(:clj  (throw (IllegalArgumentException. (str "Flake does not contain key: " k)))
          :cljs (throw (js/Error. (str "Flake does not contain key: " k)))))))
 
@@ -240,6 +255,7 @@
     :s (s flake) "s" (s flake)
     :p (p flake) "p" (p flake)
     :o (o flake) "o" (o flake)
+    :dt (dt flake) "dt" (dt flake)
     :t (t flake) "t" (t flake)
     :op (op flake) "op" (op flake)
     :m (m flake) "m" (m flake)
@@ -253,9 +269,10 @@
     (case ii 0 (s flake)
              1 (p flake)
              2 (o flake)
-             3 (t flake)
-             4 (op flake)
-             5 (m flake)
+             3 (dt flake)
+             4 (t flake)
+             5 (op flake)
+             6 (m flake)
              (or not-found
                  #?(:clj  (throw (IndexOutOfBoundsException.))
                     :cljs (throw (js/Error. (str "Index " ii " out of bounds for flake: " flake))))))))
@@ -272,29 +289,6 @@
                 ~res
                 c#)))
          res))))
-
-
-(defn cmp-val [o1 o2]
-  (if (and (some? o1) (some? o2))
-    (compare o1 o2)
-    0))
-
-(defn cc-cmp-class [x]
-  (if (string? x)
-    "string"
-    "number"))
-
-(defn cmp-val-xtype
-  "Use this instead of `cmp-val` if possibly doing cross-type value comparison"
-  [o1 o2]
-  (if (and (some? o1) (some? o2))
-    (let [o1-str   (cc-cmp-class o1)
-          o2-str   (cc-cmp-class o2)
-          type-cmp (compare o1-str o2-str)]
-      (if (= 0 type-cmp)
-        (compare o1 o2)
-        type-cmp))
-    0))
 
 
 (defn cmp-bool [b1 b2]
@@ -332,9 +326,43 @@
   [t1 t2]
   (cmp-long t2 t1))
 
+(defn cmp-dt
+  "Used within cmp-obj to compare data types in more edge cases"
+  [dt1 dt2]
+  (if (and dt1 dt2)
+    (compare dt1 dt2)
+    0))
+
 (defn cmp-obj
-  [o1 o2]
-  (cmp-val-xtype o1 o2))
+  [o1 dt1 o2 dt2]
+  (if (and (some? o1) (some? o2))
+    (cond
+      ;; same data types (common case), just standard compare
+      (= dt1 dt2)
+      ;; TODO this does a generic compare, might boost performance if further look at common types and call specific comparator fns (e.g. boolean, long, etc.)
+      (compare o1 o2)
+
+      ;; different data types, but strings
+      (and (string? o1)
+           (string? o2))
+      (let [s-cmp (compare o1 o2)]
+        (if (= 0 s-cmp)                                     ;; could be identical values, but different data types
+          (cmp-dt dt1 dt2)
+          s-cmp))
+
+      ;; different data types, but numbers
+      (and (number? o1)
+           (number? o2))
+      (let [s-cmp (compare o1 o2)]
+        (if (= 0 s-cmp)                                     ;; could be identical values, but different data types
+          (cmp-dt dt1 dt2)
+          s-cmp))
+
+      ;; different data types, not comparable
+      :else
+      (cmp-dt dt1 dt2))
+    0)
+  )
 
 (defn cmp-op
   [op1 op2]
@@ -344,7 +372,7 @@
   (combine-cmp
     (cmp-subj (s f1) (s f2))
     (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (o f2))
+    (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
     (cmp-tx (t f1) (t f2))
     (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
@@ -353,7 +381,7 @@
   (combine-cmp
     (cmp-pred (p f1) (p f2))
     (cmp-subj (s f1) (s f2))
-    (cmp-obj (o f1) (o f2))
+    (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
     (cmp-tx (t f1) (t f2))
     (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
@@ -362,7 +390,7 @@
 (defn cmp-flakes-post [f1 f2]
   (combine-cmp
     (cmp-pred (p f1) (p f2))
-    (cmp-obj (o f1) (o f2))
+    (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
     (cmp-subj (s f1) (s f2))
     (cmp-tx (t f1) (t f2))
     (cmp-bool (op f1) (op f2))
@@ -384,12 +412,12 @@
   moved up front."
   [f1 f2]
   (combine-cmp
-   (cmp-tx (t f1) (t f2))
-   (cmp-subj (s f1) (s f2))
-   (cmp-pred (p f1) (p f2))
-   (cmp-obj (o f1) (o f2))
-   (cmp-bool (op f1) (op f2))
-   (cmp-meta (m f1) (m f2))))
+    (cmp-tx (t f1) (t f2))
+    (cmp-subj (s f1) (s f2))
+    (cmp-pred (p f1) (p f2))
+    (cmp-obj (o f1) (dt f1) (o f2) (dt f2))
+    (cmp-bool (op f1) (op f2))
+    (cmp-meta (m f1) (m f2))))
 
 
 (defn cmp-flakes-history
@@ -413,29 +441,14 @@
        :cljs (compare (op f2) (op f1)))))
 
 
-(defn new-flake
-  [& parts]
-  (let [[s p o t op m] parts]
-    (->Flake s p o t op m)))
-
-
 (defn flip-flake
   "Takes a flake and returns one with the provided block and op flipped from true/false.
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
   will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
   ([flake]
-   (->Flake (s flake) (p flake) (o flake) (t flake) (not (op flake)) (m flake)))
-  ([flake tx]
-   (->Flake (s flake) (p flake) (o flake) tx (not (op flake)) (m flake))))
-
-(defn change-t
-  "Takes a flake and returns one with the provided block and op flipped from true/false.
-  Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
-  will have the no-history flag, but we need the old inserts to be properly retracted in the txlog."
+   (->Flake (s flake) (p flake) (o flake) (dt flake) (t flake) (not (op flake)) (m flake)))
   ([flake t]
-   (->Flake (s flake) (p flake) (o flake) t (op flake) (m flake))))
-
-
+   (->Flake (s flake) (p flake) (o flake) (dt flake) t (not (op flake)) (m flake))))
 
 (defn slice
   "From and to are Flakes"
@@ -447,6 +460,31 @@
     :else (throw (ex-info "Unexpected error performing slice, both from and to conditions are nil. Please report."
                           {:status 500
                            :error  :db/unexpected-error}))))
+
+(defn match-spot
+  "Returns all matching flakes to a specific subject, and optionaly also a predicate if provided
+  Must be provided with subject/predicate integer ids, no lookups are performed."
+  [ss sid pid]
+  (if pid
+    (avl/subrange ss >= (->Flake sid pid nil -1 nil nil nil)
+                  <= (->Flake sid (inc pid) nil util/max-long nil nil nil))
+    (avl/subrange ss > (->Flake (inc sid) MAX-COLL-SUBJECTS nil nil nil nil nil)
+                  < (->Flake (dec sid) -1 nil nil nil nil nil))))
+
+
+(defn match-post
+  "Returns all matching flakes to a predicate + object match."
+  [ss pid o dt]
+  (avl/subrange ss
+                >= (->Flake util/max-long pid o dt nil nil nil)
+                <= (->Flake 0 pid o dt nil nil nil)))
+
+(defn match-tspo
+  "Returns all matching flakes to a specific 't' value."
+  [ss t]
+  (avl/subrange ss
+                >= (->Flake util/max-long nil nil nil t nil nil)
+                <= (->Flake util/min-long nil nil nil t nil nil)))
 
 (defn lookup
   [ss start-flake end-flake]
@@ -535,6 +573,7 @@
     - s - 8 bytes
     - p - 8 bytes
     - o - ??
+    - dt - 4 bytes
     - t - 8 bytes
     - add? - 1 byte
     - m - 1 byte + ??
@@ -544,26 +583,32 @@
   it should be 'close enough'
   reference: https://www.javamex.com/tutorials/memory/string_memory_usage.shtml"
   [^Flake f]
-  (let [o (o f)]
-    (+ 37 #?(:clj  (condp = (type o)
-                     String (+ 38 (* 2 (count o)))
-                     Long 8
-                     Double 8
-                     Integer 4
-                     Float 4
-                     Boolean 1
-                     ;; else
-                     (count (pr-str o)))
-             :cljs (count (pr-str o)))
-       (if (nil? (m f))
-         1
-         (* 2 (count (pr-str (m f))))))))
+  (let [o      (o f)
+        dt     (int (dt f))
+        o-size (util/case+ dt
+                 const/$xsd:string (* 2 (count o))
+                 const/$xsd:anyURI 8
+                 const/$xsd:boolean 1
+                 const/$xsd:long 8
+                 const/$xsd:int 4
+                 const/$xsd:short 2
+                 const/$xsd:double 8
+                 const/$xsd:float 4
+                 const/$xsd:byte 1
+                 ;; else
+                 (if (number? o)
+                   8
+                   (if (string? o)
+                     (* 2 (count o))
+                     (* 2 (count (pr-str o))))))]
+    (cond-> (+ 42 o-size)
+            (m f) (* 2 (count (pr-str (m f)))))))
 
 
 (defn size-bytes
   "Returns approx number of bytes in a collection of flakes."
   [flakes]
-  (reduce #(+ %1 (size-flake %2)) 0 flakes))
+  (reduce (fn [size f] (+ size (size-flake f))) 0 flakes))
 
 
 (defn size-kb

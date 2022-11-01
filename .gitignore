@@ -28,6 +28,10 @@ package-lock.json
 /scanning_results
 .dir-locals.el
 .cljs_node_repl
+.shadow-cljs
 /js-packages/browser/flureedb.js
 /js-packages/nodejs/flureenjs.js
 /js-packages/webworker/flureeworker.js
+**cljs-runtime
+**report.html
+test/nodejs/store

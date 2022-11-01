@@ -7,9 +7,10 @@
     "test": "jest"
   },
   "dependencies": {
-    "@fluree/flureenjs": "file:../../out/flureenjs.js"
+    "@fluree/flureenjs": "file:../../out/nodejs/flureenjs.js"
   },
   "devDependencies": {
-    "jest": "^28.1.1"
+    "jest": "^28.1.1",
+    "prettier": "^2.7.1"
   }
 }

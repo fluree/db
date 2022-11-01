@@ -2,7 +2,7 @@
   (:refer-clojure :exclude [max min get inc dec + - * / quot mod == rem contains? get-in < <= > >=
                             boolean re-find and or count str nth first rand nil? hash-set empty? not uuid subs not=])
   (:require [fluree.db.dbfunctions.internal :as fdb]
-            [fluree.db.util.log :as log]
+            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json]
             [fluree.db.util.async :refer [channel? go-try <?]]
             [fluree.db.util.core :as util])

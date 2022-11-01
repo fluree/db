@@ -3,15 +3,14 @@
             [fluree.db.constants :as const]
             [fluree.db.index :as index]
             [fluree.db.util.schema :as schema-util]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
-            [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake #?@(:cljs [:refer [Flake]])]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go go-loop <! >!] :as async]
                :cljs [cljs.core.async :refer [chan <! >!] :refer-macros [go go-loop] :as async])
             [fluree.db.permissions-validate :as perm-validate]
-            [fluree.db.util.async :refer [<? go-try]])
-  #?(:cljs (:require-macros [fluree.db.util.async])))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -92,11 +91,15 @@
 (defn resolve-match-flake
   [db test parts]
   (go-try
-   (let [[s p o t op m] parts
-         s' (<? (resolve-subid db s))
-         o' (<? (resolve-subid db o))
-         m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
-     (flake/->Flake s' p o' t op m'))))
+    (let [[s p o t op m] parts
+          s'       (<? (resolve-subid db s))
+          o-ident? (util/pred-ident? o)
+          o'       (if o-ident?
+                     (<? (dbproto/-subid db o))
+                     o)
+          m'       (or m (if (identical? >= test) util/min-integer util/max-integer))
+          dt       (when o-ident? const/$xsd:anyURI)]
+      (flake/create s' p o' dt t op m'))))
 
 (defn resolved-leaf?
   [node]
@@ -388,9 +391,9 @@
                   acc []]
     (if flake
       (if (is-tag-flake? flake)
-        (let [[s p o t op m] (flake/Flake->parts flake)
-              o (<? (dbproto/-tag db o p))]
-          (recur r (conj acc (flake/parts->Flake [s p o t op m]))))
+        (let [[s p o _ t op m] (flake/Flake->parts flake)
+              o* (<? (dbproto/-tag db o p))]
+          (recur r (conj acc (flake/create s p o* const/$xsd:anyURI t op m))))
         (recur r (conj acc flake))) acc)))
 
 (defn search

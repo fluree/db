@@ -64,3 +64,5 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
     * Needs karma-cli installed globally: `npm install -g karma-cli`
     * Needs Google Chrome browser installed
 * `make cljs-node-test` - run CLJS tests in NodeJS
+* `make nodejs-test` - run node package in node
+* `make browser-test` - run browser package in headless Chrome
