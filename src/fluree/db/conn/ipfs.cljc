@@ -116,7 +116,7 @@
   (read [_ k]
     (ipfs/read ipfs-endpoint k true))
   (write [_ k data]
-    (ipfs/commit ipfs-endpoint k data))
+    (ipfs/commit ipfs-endpoint data))
   (exists? [conn k]
     (storage/read conn k))
   (rename [_ old-key new-key]

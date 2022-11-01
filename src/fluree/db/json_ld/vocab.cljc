@@ -120,7 +120,6 @@
   (let [classes      (filter #(true? (:class %)) property-maps)
         subclass-map (recur-sub-classes (vals property-maps))]
     ;; map subclasses for both subject-id and iri
-    subclass-map
     (reduce-kv
       (fn [acc class-id subclasses]
         (let [iri (get-in property-maps [class-id :iri])]
