@@ -53,8 +53,7 @@
          (String. (.toByteArray xout)))
 
        (catch FileNotFoundException _
-         nil)
-       (catch Exception e (throw e)))
+         nil))
      :cljs
      (try*
        (fs/readFileSync path "utf8")
@@ -163,12 +162,8 @@
               p)
        :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
-(defrecord FileConnection [id transactor? memory state
-                           ledger-defaults
-                           push commit
-                           parallelism close-fn
-                           msg-in-ch msg-out-ch
-                           async-cache]
+(defrecord FileConnection [id memory state ledger-defaults push commit
+                           parallelism msg-in-ch msg-out-ch async-cache]
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (async/go (read-commit conn commit-key)))
@@ -190,13 +185,13 @@
     (async/go (file-address (str ledger-alias (when branch (str "/" (name branch))) "/head"))))
 
   conn-proto/iConnection
-  (-close [_] #_(when (fn? close-fn) (close-fn) (swap! state assoc :closed? true)))
+  (-close [_]
+    (log/info "Closing file connection" id)
+    (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :file)
   (-parallelism [_] parallelism)
-  (-transactor? [_] transactor?)
   (-id [_] id)
-  (-read-only? [_] (not (fn? commit)))
   (-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
@@ -267,7 +262,6 @@
     (let [storage-path   (trim-last-slash storage-path)
           conn-id        (str (random-uuid))
           state          (state-machine/blank-state)
-          close-fn       (fn [] (log/info (str "File Connection " conn-id " Closed")))
           async-cache-fn (or async-cache
                              (conn-cache/default-async-cache-fn memory))]
       ;; TODO - need to set up monitor loops for async chans
@@ -275,17 +269,10 @@
                             :storage-path    storage-path
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      (json-serde/json-serde)
-                            :transactor?     false
                             :commit          commit
                             :push            push
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)
-                            :close           close-fn
                             :state           state
                             :async-cache     async-cache-fn}))))
-
-(comment
-  (read-file (read-file "/home/dan/projects/db2/dev/data/clj/test/db1/main/HEAD" ))
-
-  ,)

@@ -14,6 +14,7 @@
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
+            [clojure.string :as str]
             [fluree.crypto :as crypto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -77,12 +78,8 @@
   ledger-data)
 
 
-(defrecord MemoryConnection [id transactor? memory state
-                             ledger-defaults async-cache
-                             local-read local-write
-                             parallelism close-fn
-                             msg-in-ch msg-out-ch
-                             ipfs-endpoint data-atom]
+(defrecord MemoryConnection [id memory state ledger-defaults async-cache
+                             parallelism msg-in-ch msg-out-ch data-atom]
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (async/go (read-commit data-atom commit-key)))
@@ -93,9 +90,19 @@
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
   (-push [this address ledger-data] (async/go (push! data-atom address ledger-data)))
+  (-alias [this address]
+    (-> (address-path address)
+        (str/split #"/")
+        (->> (drop 2)
+             (str/join "/"))))
   (-lookup [this head-commit-address]
-    (async/go #?(:clj (throw (ex-info (str "Cannot lookup ledger address with memory connection: " head-commit-address)
-                                      {:status 500 :error :db/invalid-ledger}))
+    (async/go #?(:clj
+                 (if-let [head-commit (read-address data-atom head-commit-address)]
+                   (-> head-commit (get "credentialSubject") (get "data") (get "address"))
+                   (throw (ex-info (str "Unable to lookup ledger address from conn: "
+                                        head-commit-address)
+                                   {:status 500 :error :db/missing-head})))
+
                  :cljs
                  (if platform/BROWSER
                    (if-let [head-commit (read-address data-atom head-commit-address)]
@@ -111,15 +118,12 @@
 
   conn-proto/iConnection
   (-close [_]
-    (when (fn? close-fn)
-      (close-fn))
+    (log/info "Closing memory connection" id)
     (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
-  (-transactor? [_] transactor?)
   (-id [_] id)
-  (-read-only? [_] false)
   (-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
@@ -174,25 +178,20 @@
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [local-read local-write parallelism async-cache memory defaults]}]
+  [{:keys [parallelism async-cache memory defaults]}]
   (go-try
     (let [ledger-defaults    (<? (ledger-defaults defaults))
           conn-id            (str (random-uuid))
           data-atom          (atom {})
           state              (state-machine/blank-state)
           async-cache-fn     (or async-cache
-                                 (conn-cache/default-async-cache-fn memory))
-          close-fn           (fn [& _] (log/info (str "IPFS Connection " conn-id " closed")))]
+                                 (conn-cache/default-async-cache-fn memory))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom
-                              :transactor?     false
-                              :local-read      local-read
-                              :local-write     local-write
                               :parallelism     parallelism
                               :msg-in-ch       (async/chan)
                               :msg-out-ch      (async/chan)
-                              :close           close-fn
                               :memory          true
                               :state           state
                               :async-cache     async-cache-fn}))))

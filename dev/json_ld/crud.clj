@@ -1,4 +1,4 @@
-(ns json-ld.query
+(ns json-ld.crud
   (:require [fluree.db.method.ipfs.core :as ipfs]
             [fluree.db.api :as fdb]
             [fluree.db.db.json-ld :as jld-db]
@@ -79,90 +79,19 @@
          :ex/scores    [97.2 100 80]
          :ex/friend    [:ex/brian :ex/alice]}]))
 
-  @fluree.db.query.fql/LAST-PARSED
 
   @(fluree/query db {:context  {:ex "http://example.org/ns/"}
-                     :select   ['?name '?favNums]
-                     :where    [['?s :schema/name '?name]
-                                ['?s :ex/favNums '?favNums]]
-                     :group-by '?name})
+                     :select   [:*]
+                     :from :ex/alice})
 
-  (=
-     [["Alice" 127]
-      ["Brian" 7]
-      ["Cam" 15]])
+  (def db2 @(fluree/stage db
+                          {:context    {:ex "http://example.org/ns/"}
+                           :id         :ex/alice,
+                           :schema/age nil}))
 
+  @(fluree/query db2 {:context  {:ex "http://example.org/ns/"}
+                     :select   [:*]
+                     :from :ex/alice})
 
-  @(fluree/query db {:context  {:ex "http://example.org/ns/"}
-                     :select   ['?name '(sum ?favNums)]
-                     :where    [['?s :schema/name '?name]
-                                ['?s :ex/last '?last]
-                                ['?s :ex/favNums '?favNums]
-                                ['?s :ex/scores '?scores]]
-                     :group-by '?name})
-
-  @(fluree/query db {:context  {:ex "http://example.org/ns/"}
-                     :select   ['?name '?favNums]
-                     :where    [['?s :schema/name '?name]
-                                ['?s :ex/favNums '?favNums]]
-                     :order-by ['?name '(desc ?favNums)]})
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  ['?name '?favNums]
-                     :where   [['?s :schema/name '?name]
-                               ['?s :ex/favNums '?favNums]]})
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  ['?name "(sum ?favNums)"]
-                     :where   [['?s :schema/name '?name]
-                               ['?s :ex/favNums '?favNums]]
-                     :groupBy '?name})
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  ['?name '?favNums]
-                     :where   [['?s :schema/name '?name]
-                               ['?s :ex/favNums '?favNums]]})
-
-
-  @(fluree/query db {:context   {:ex "http://example.org/ns/"}
-                     :selectOne ['?name '?age '?email]
-                     :where     [['?s :schema/name "Cam"]
-                                 ['?s :ex/friend '?f]
-                                 ['?f :schema/name '?name]
-                                 ['?f :schema/age '?age]
-                                 ['?f :schema/email '?email]]})
-
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  ['?age {'?f [:*]}]
-                     :where   [['?s :schema/name '?name]
-                               ['?s :ex/friend '?f]
-                               ['?f :schema/age '?age]]
-                     :vars    {'?name "Cam"}})
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  ['?f '?age]
-                     :where   [['?s :schema/name '?name]
-                               ['?s :ex/friend '?f]
-                               ['?f :schema/age '?age]]
-                     :vars    {'?name "Cam"}})
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  ['?ssn '?fname '?email {'?f [:*]}]
-                     :where   [['?s :schema/name '?name]
-                               ['?s :ex/friend '?f]
-                               ['?f :schema/ssn '?ssn]
-                               ['?f :schema/name '?fname]
-                               ['?f :schema/email '?email]]
-                     :vars    {'?name "Cam"}})
-
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  [:*]
-                     :from    :ex/brian})
-
-  @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                     :select  {'?s [:* {:ex/friend [:*]}]}
-                     :where   [['?s :rdf/type :ex/User]]})
 
   )

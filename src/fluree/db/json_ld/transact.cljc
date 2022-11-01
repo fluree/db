@@ -154,6 +154,7 @@
           [new-type-sids type-flakes] (when type
                                         (<? (json-ld-type-data type tx-state)))
           sid          (if new-subj?
+                         ;; TODO - this will check if subject is rdfs:Class, but we already have the new-type-sids above and know that - this can be a little faster, but reify.cljc also uses this logic and they need to align
                          (jld-ledger/generate-new-sid node iris next-pid next-sid)
                          existing-sid)
           classes      (if new-subj?
@@ -181,6 +182,7 @@
              subj-flakes     base-flakes]
         (if k
           (let [list?            (list-value? v)
+                retract?         (nil? v)
                 v*               (if list?
                                    (let [list-vals (:list v)]
                                      (when-not (sequential? list-vals)
@@ -200,12 +202,15 @@
                                            ref? (conj (flake/create pid const/$rdf:type const/$iri const/$xsd:anyURI t true nil))))
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts?  (or (not new-subj?) existing-pid)
-                flakes*          (loop [[v' & r] v*
-                                        flakes* subj-flakes]
-                                   (if v'
-                                     (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
-                                     (cond-> flakes*
-                                             property-flakes (into property-flakes))))]
+                flakes*          (if retract?
+                                   (->> (<? (query-range/index-range db-before :spot = [sid pid]))
+                                        (map #(flake/flip-flake % t)))
+                                   (loop [[v' & r] v*
+                                          flakes* subj-flakes]
+                                     (if v'
+                                       (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
+                                       (cond-> flakes*
+                                               property-flakes (into property-flakes)))))]
             (recur r property-flakes* flakes*))
           (into subj-flakes property-flakes))))))
 
@@ -286,17 +291,9 @@
    (flake/create const/$iri const/$iri "@id" const/$xsd:string t true nil)])
 
 (defn ref-flakes
-  "Returns ref flakes from set of all flakes"
-  [flakes schema]
-  (->> flakes
-       (sort-by flake/p)
-       (partition-by flake/p)
-       (reduce
-         (fn [acc p-flakes]
-           (if (get-in schema [:pred (flake/p (first p-flakes)) :ref?])
-             (into acc p-flakes)
-             acc))
-         [])))
+  "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
+  [flakes]
+  (filter #(= (flake/dt %) const/$xsd:anyURI) flakes))
 
 ;; TODO - can use transient! below
 (defn stage-update-novelty
@@ -317,7 +314,7 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn db-after
-  [{:keys [add remove ref-add ref-remove size count schema] :as staged} {:keys [db-before bootstrap? t block] :as tx-state}]
+  [{:keys [add remove ref-add ref-remove size count] :as staged} {:keys [db-before bootstrap? t block] :as tx-state}]
   (let [{:keys [novelty]} db-before
         {:keys [spot psot post opst tspo]} novelty
         new-db (assoc db-before :ecount (final-ecount tx-state)
@@ -331,31 +328,33 @@
                                           :size (+ (:size novelty) size)}
                                 :stats (-> (:stats db-before)
                                            (update :size + size)
-                                           (update :flakes + count))
-                                :schema schema)]
+                                           (update :flakes + count)))]
     (if bootstrap?
       new-db
+      ;; TODO - we used to add tt-id to break the cache, so multiple 'staged' dbs with same t value don't get cached as the same
+      ;; TODO - now that each db should have its own unique hash, we can use the db's hash id instead of 't' or 'tt-id' for caching
       (add-tt-id new-db))))
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an updated db."
   [new-flakes {:keys [t stage-update? db-before refs class-mods] :as _tx-state}]
-  (let [[add remove] (if stage-update?
-                       (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
-                       [new-flakes nil])
-        vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
-        schema       (vocab/update-with db-before t @refs vocab-flakes)
-
-        final-map    {:add        add
-                      :remove     remove
-                      :ref-add    (ref-flakes add schema)
-                      :ref-remove (ref-flakes remove schema)
-                      :count      (cond-> (when add (count add))
-                                          remove (- (count remove)))
-                      :size       (cond-> (flake/size-bytes add)
-                                          remove (- (flake/size-bytes remove)))
-                      :schema     schema}]
-    (assoc final-map :db-after (db-after final-map _tx-state))))
+  (go-try
+    (let [[add remove] (if stage-update?
+                         (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
+                         [new-flakes nil])
+          vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
+          staged-map   {:add        add
+                        :remove     remove
+                        :ref-add    (ref-flakes add)
+                        :ref-remove (ref-flakes remove)
+                        :count      (cond-> (if add (count add) 0)
+                                            remove (- (count remove)))
+                        :size       (cond-> (flake/size-bytes add)
+                                            remove (- (flake/size-bytes remove)))}
+          db-after     (cond-> (db-after staged-map _tx-state)
+                               vocab-flakes vocab/refresh-schema
+                               vocab-flakes <?)]
+      (assoc staged-map :db-after db-after))))
 
 (defn stage-flakes
   [json-ld {:keys [new? t] :as tx-state}]
@@ -369,7 +368,7 @@
           flakes*)))))
 
 (defn validate-rules
-  [{:keys [db-after add]} {:keys [subj-mods] :as tx-state}]
+  [{:keys [db-after add]} {:keys [subj-mods] :as _tx-state}]
   (let [subj-mods' @subj-mods]
     (go-try
       (loop [[s-flakes & r] (partition-by flake/s add)
@@ -393,7 +392,7 @@
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
-  [{:keys [ledger schema] :as db} json-ld opts]
+  [{:keys [schema] :as db} json-ld opts]
   (go-try
     (let [tx-state (->tx-state db opts)
           db*      (-> json-ld
@@ -401,7 +400,7 @@
                        (stage-flakes tx-state)
                        <?
                        (final-db tx-state)
+                       <?
                        (validate-rules tx-state)
                        <?)]
-      #_(ledger-proto/-db-update ledger db*)
       db*)))

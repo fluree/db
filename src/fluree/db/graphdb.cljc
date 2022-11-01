@@ -355,7 +355,7 @@
   (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
   (-c-prop [this property collection] (graphdb-c-prop this property collection))
   (-class-prop [this property class]
-    (if (= :subclass property)
+    (if (= :subclasses property)
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
   (-p-prop [this property predicate] (graphdb-p-prop this property predicate))

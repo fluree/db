@@ -11,7 +11,8 @@
             [fluree.db.query.json-ld.select :as json-ld-select]
             [fluree.db.flake :as flake]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn built-in-aggregates]]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -401,9 +402,16 @@
   Returns a two-tuple of predicate followed by # of times to recur.
 
   If not a recursion predicate, returns nil."
-  [predicate]
-  (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" predicate)]
-    [pred (if recur-n (util/str->int recur-n) default-recursion-depth)]))
+  [predicate context]
+  (cond
+    (string? predicate)
+    (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" predicate)]
+      [(json-ld/expand pred context) (if recur-n (util/str->int recur-n) default-recursion-depth)])
+
+    (keyword? predicate)
+    (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" (name predicate))]
+      [(json-ld/expand (keyword (namespace predicate) pred) context)
+       (if recur-n (util/str->int recur-n) default-recursion-depth)])))
 
 (defn pred-id-strict
   "Returns predicate ID for a given predicate, else will throw with an invalid
@@ -413,100 +421,61 @@
       (throw (ex-info (str "Invalid predicate: " predicate)
                       {:status 400 :error :db/invalid-query}))))
 
+(def rdf:type? #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type "@type"})
+
+
 (defn parse-where-tuple
   "Parses where clause tuples (not maps)"
-  [supplied-vars all-vars context db s p o]
-  (let [json-ld-db? (= :json-ld (dbproto/-db-type db))
-        rdf-type?   (#{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type" "a" :a "rdf:type" :rdf/type} p)
-        p           (if rdf-type?
-                      "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                      (json-ld/expand-iri p context))
-        fulltext?   (str/starts-with? p "fullText:")
-        collection? (and rdf-type? (not json-ld-db?))       ;; legacy fluree json DB
-        _id?        (= "_id" p)
-        iri?        (= "@id" p)
-        [recur-pred recur-n] (recursion-predicate p)
-        s*          (value-type-map context s true)
-        p*          (cond
-                      fulltext? #?(:clj  (full-text/parse-domain p)
-                                   :cljs (throw (ex-info "Full text queries not supported in JavaScript currently."
-                                                         {:status 400 :error :db/invalid-query})))
-                      collection? :rdf/type
-                      _id? :_id
-                      iri? :iri
-                      recur-pred (cond->> recur-pred
-                                          db (pred-id-strict db))
-                      :else (cond->> p
-                                     db (pred-id-strict db)))
-        p-idx?      (when p* (dbproto/-p-prop db :idx? p*)) ;; is the predicate indexed?
-        p-tag?      (when p* (= :tag (dbproto/-p-prop db :type p)))
-        p-ref?      (when p* (true? (dbproto/-p-prop db :ref? p)))
-        o*          (cond
-                      p-tag?
-                      {:tag o}
+  [supplied-vars _ context db s p o]
+  (let [s*        (value-type-map context s true)
+        p*        (cond
+                    (rdf:type? p)
+                    {:value const/$rdf:type}
 
-                      (query-fn? o)
-                      (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
-                        {:variable (:variable parsed-filter-map)
-                         :filter   parsed-filter-map})
+                    (= "@id" p)
+                    {:value const/$iri}
 
-                      rdf-type?
-                      (if json-ld-db?
-                        (let [id (->> (json-ld/expand-iri o context)
-                                      (dbproto/-p-prop db :id))]
-                          (or (value-type-map context id false)
-                              (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o context))
-                                              {:status 400 :error :db/invalid-query}))))
-                        (if (= "_block" o)
-                          (value-type-map context "_tx" false) ;; _block gets aliased to _tx
-                          (value-type-map context o false)))
+                    (q-var->symbol p)
+                    {:variable (q-var->symbol p)}
 
-                      :else
-                      (value-type-map context o p-ref?))
-        idx         (cond
-                      fulltext?
-                      :full-text
+                    (recursion-predicate p context)
+                    (let [[p-iri recur-n] (recursion-predicate p context)]
+                      {:value (pred-id-strict db p-iri)
+                       :recur (or recur-n util/max-integer)}) ;; default recursion depth
 
-                      collection?
-                      :spot
+                    (and (string? p)
+                         (str/starts-with? p "fullText:"))
+                    {:full-text (->> (json-ld/expand-iri (subs p 9) context)
+                                     (pred-id-strict db))}
 
-                      (or _id? iri?)
-                      :spot
+                    :else
+                    {:value (->> (json-ld/expand-iri p context)
+                                 (pred-id-strict db))})
+        rdf-type? (= const/$rdf:type (:value p*))
+        iri?      (= const/$iri (:value p*))
+        o*        (cond
+                    (query-fn? o)
+                    (let [parsed-filter-map (parse-filter-fn o supplied-vars)]
+                      {:variable (:variable parsed-filter-map)
+                       :filter   parsed-filter-map})
 
-                      (and s* (not (:variable s*)))
-                      :spot
+                    rdf-type?
+                    (let [id (->> (json-ld/expand-iri o context)
+                                  (dbproto/-p-prop db :id))]
+                      (or (value-type-map context id false)
+                          (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o context))
+                                          {:status 400 :error :db/invalid-query}))))
 
-                      (and p-idx? o*)
-                      :post
-
-                      p
-                      (do (when (:value o*)
-                            (log/info (str "Searching for a property value on unindexed predicate: " p
-                                           ". Consider making property indexed for improved performance "
-                                           "and lower fuel consumption.")))
-                          :psot)
-
-                      o
-                      :opst
-
-                      :else
-                      (throw (ex-info (str "Unable to determine query type for where statement: "
-                                           [s p o] ".")
-                                      {:status 400 :error :db/invalid-query})))]
-    {:type   (cond
-               fulltext? :full-text
-               collection? :collection
-               iri? :iri
-               _id? :_id
-               :else :tuple)
-     :idx    idx
-     :s      s*
-     :p      p*
-     :o      o*
-     :recur  recur-n                                        ;; will only show up if recursion specified.
-     :p-tag? p-tag?
-     :p-idx? p-idx?
-     :p-ref? p-ref?}))
+                    :else
+                    (value-type-map context o false))]
+    {:type (cond
+             rdf-type? :class
+             iri? :iri
+             (:full-text p) :full-text
+             :else :tuple)
+     :s    s*
+     :p    p*
+     :o    o*}))
 
 (defn parse-remote-tuple
   "When a specific DB is used (not default) for a where statement.
@@ -847,17 +816,20 @@
     (build-vec-extraction-fn passthrough-pos)))
 
 (defn get-idx
-  [{s-variable :variable, s-supplied? :supplied?} p {o-variable :variable, o-supplied? :supplied?}]
+  [{s-variable :variable, s-supplied? :supplied?, s-in? :in-n}
+   {p-value :value, p-variable :variable}
+   {o-variable :variable, o-supplied? :supplied?, o-in? :in-n}]
   (let [have-s? (if s-variable
-                  s-supplied?
+                  (or s-supplied? s-in?)
                   true)
+        have-p? (boolean p-value)                           ;; todo - add variable support for 'p'
         have-o? (if o-variable
-                  o-supplied?
+                  (or o-supplied? o-in?)
                   true)]
     (cond
       have-s? :spot
-      (and p have-o?) :post
-      p :psot
+      (and have-p? have-o?) :post
+      have-p? :psot
       have-o? :opst)))
 
 (defn rearrange-out-vars
@@ -1010,11 +982,11 @@
           (let [grouped (pop group-results)]
             (conj grouped (mapv first (last group-results)))))
       2 (fn [group-results]
-          (let [grouped (pop group-results)
+          (let [grouped       (pop group-results)
                 grouped-block (last group-results)]
             (loop [grouped-block grouped-block
-                   r1-acc       (transient [])
-                   r2-acc       (transient [])]
+                   r1-acc        (transient [])
+                   r2-acc        (transient [])]
               (let [[r1 r2] (first grouped-block)]
                 (if r1
                   (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2))
