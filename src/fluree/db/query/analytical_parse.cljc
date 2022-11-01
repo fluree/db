@@ -686,6 +686,19 @@
               in-n (assoc :in-n in-n)))
     tuple-item))
 
+(defn update-position+type
+  "Like update-position, but also flags data type for things that need it (e.g. grouping, select statement)"
+  [{:keys [variable] :as tuple-item} in-vars all-types]
+  (cond-> (update-positions tuple-item in-vars)
+
+          ;; we know item is an IRI
+          (#{:s :p} (get all-types variable))
+          (assoc :iri? true)
+
+          ;; we know item is an object variable and will therefore be a two-tuple of [value datatype]
+          (= :o (get all-types variable))
+          (assoc :o-var? true)))
+
 (defn gen-x-form
   [out-vars {s-variable :variable} {p-variable :variable} {o-variable :variable}]
   (let [s-var? (util/index-of out-vars s-variable)
@@ -693,22 +706,22 @@
         o-var? (util/index-of out-vars o-variable)]
     (cond
       (and s-var? p-var? o-var?)
-      (map (fn [f] [(flake/s f) (flake/p f) (flake/o f)]))
+      (map (fn [f] [(flake/s f) (flake/p f) [(flake/o f) (flake/dt f)]]))
 
       (and s-var? o-var?)
-      (map (fn [f] [(flake/s f) (flake/o f)]))
+      (map (fn [f] [(flake/s f) [(flake/o f) (flake/dt f)]]))
 
       (and s-var? p-var?)
       (map (fn [f] [(flake/s f) (flake/p f)]))
 
       (and p-var? o-var?)
-      (map (fn [f] [(flake/p f) (flake/o f)]))
+      (map (fn [f] [(flake/p f) [(flake/o f) (flake/dt f)]]))
 
       s-var?
       (map (fn [f] [(flake/s f)]))
 
       o-var?
-      (map (fn [f] [(flake/o f)]))
+      (map (fn [f] [[(flake/o f) (flake/dt f)]]))
 
       p-var?
       (map (fn [f] [(flake/p f)])))))
@@ -860,36 +873,47 @@
 
   If group-by is used, grouping can re-order output so utilize out-vars from that
   as opposed to the last where statement."
-  [{:keys [spec] :as select} where {group-out-vars :out-vars :as _group-by}]
+  [{:keys [spec] :as select} where {group-out-vars :out-vars, grouped-vars :grouped-vars, :as _group-by}]
   (let [last-where (last where)
         out-vars   (or group-out-vars
                        (:out-vars last-where))
-        {:keys [s-vars p-vars o-vars]} (:vars last-where)   ;; the last where statement has an aggregation of all variables
-        spec*      (->> spec
-                        (map #(update-positions % out-vars))
-                        (reduce
-                          (fn [spec* {:keys [variable] :as select-item}]
-                            (if (and variable
-                                     (or (s-vars variable)
-                                         (p-vars variable)))
-                              (conj spec* (assoc select-item :iri? true))
-                              (conj spec* select-item)))
-                          []))]
+        {:keys [all-types]} (:vars last-where)              ;; the last where statement has an aggregation of all variables
+        spec*      (cond->> (mapv #(update-position+type % out-vars all-types) spec)
+                            grouped-vars (mapv #(if (grouped-vars (:variable %))
+                                                  (assoc % :grouped? true)
+                                                  %)))]
     (assoc select :spec spec*)))
 
 (defn build-order-fn
   "Returns final ordering function that take a single arg, the where results,
   and outputs the sorted where results."
   [{:keys [parsed] :as _order-by}]
-  (let [compare-fns (mapv (fn [{:keys [in-n order]}]
+  (let [compare-fns (mapv (fn [{:keys [in-n order o-var?]}]
                             (case order
-                              :asc (fn [x y]
-                                     (compare (nth x in-n) (nth y in-n)))
-                              :desc (fn [x y]
-                                      (compare (nth y in-n) (nth x in-n)))))
+                              :asc (if o-var?
+                                     (fn [x y]
+                                       (let [[x-val x-dt] (nth x in-n)
+                                             [y-val y-dt] (nth y in-n)]
+                                         (let [dt-cmp (compare x-dt y-dt)]
+                                           (if (zero? dt-cmp)
+                                             (compare x-val y-val)
+                                             dt-cmp))))
+                                     (fn [x y]
+                                       (compare (nth x in-n) (nth y in-n))))
+                              :desc (if o-var?
+                                      (fn [x y]
+                                        (let [[x-val x-dt] (nth x in-n)
+                                              [y-val y-dt] (nth y in-n)]
+                                          (let [dt-cmp (compare y-dt x-dt)]
+                                            (if (zero? dt-cmp)
+                                              (compare y-val x-val)
+                                              dt-cmp))))
+                                      (fn [x y]
+                                        (compare (nth y in-n) (nth x in-n))))))
                           parsed)]
     (if (= 1 (count compare-fns))
       (first compare-fns)
+      ;; if more than one variable being ordered, need to compose comparators together
       (fn [x y]
         (loop [[compare-fn & r] compare-fns]
           (if compare-fn
@@ -904,8 +928,8 @@
   "Updates order-by, if applicable, with final where clause positions of items."
   [{:keys [parsed] :as order-by} group-by where]
   (when order-by
-    (let [{:keys [out-vars] :as _last-where} (last where)
-          parsed*    (mapv #(update-positions % out-vars) parsed)
+    (let [{:keys [out-vars vars] :as _last-where} (last where)
+          parsed*    (mapv #(update-position+type % out-vars (:all-types vars)) parsed)
           order-by*  (assoc order-by :parsed parsed*)
           comparator (build-order-fn order-by*)]
       (assoc order-by* :comparator comparator))))
@@ -1001,8 +1025,8 @@
   "Updates group-by, if applicable, with final where clause positions of items."
   [{:keys [parsed] :as group-by} where]
   (when group-by
-    (let [{:keys [out-vars] :as _last-where} (last where)
-          parsed*               (mapv #(update-positions % out-vars) parsed)
+    (let [{:keys [out-vars all-types] :as _last-where} (last where)
+          parsed*               (mapv #(update-position+type % out-vars all-types) parsed)
           group-by*             (assoc group-by :parsed parsed*)
           grouped-positions     (mapv :in-n parsed*)        ;; returns 'n' positions of values used for grouping
           partition-fn          (build-vec-extraction-fn grouped-positions) ;; returns fn containing only grouping vals, used like a 'partition-by' fn
@@ -1018,13 +1042,13 @@
           group-finish-fn       (grouped-vals-result-fn grouped-val-positions)
           grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
       (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
+                       :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions)) ;; these are the variable names in the output that are grouped
                        :grouping-fn grouping-fn
                        :group-finish-fn group-finish-fn))))
 
 
 (defn get-clause-vars
-  [new-flake-vars {:keys [others all s-vars p-vars o-vars]
-                   :or   {s-vars #{}, p-vars #{}, o-vars #{}} :as _prior-vars}]
+  [new-flake-vars {:keys [others all all-types] :as _prior-vars}]
   (let [[s-var p-var o-var] new-flake-vars
         new-flakes-set (set (remove nil? new-flake-vars))
         flake-in*      (filter all new-flake-vars)          ;; any pre-existing var used in the flake
@@ -1033,15 +1057,10 @@
     {:flake-in  flake-in*
      :flake-out new-flake-vars
      :all       all*
-     :s-vars    (if s-var
-                  (conj s-vars s-var)
-                  s-vars)
-     :p-vars    (if p-var
-                  (conj p-vars p-var)
-                  p-vars)
-     :o-vars    (if o-var
-                  (conj o-vars o-var)
-                  o-vars)
+     :all-types (cond-> all-types
+                        s-var (assoc s-var :s)
+                        p-var (assoc p-var :p)
+                        o-var (assoc o-var :o))
      ;; takes others-set (all vars not output by query result flakes)
      ;; and retains the prior 'others' ordering, appending any new vars to end.
      :others    (loop [[old-other & r] others
