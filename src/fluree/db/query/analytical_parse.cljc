@@ -688,15 +688,15 @@
 
 (defn update-position+type
   "Like update-position, but also flags data type for things that need it (e.g. grouping, select statement)"
-  [{:keys [variable] :as tuple-item} in-vars all-types]
+  [{:keys [variable] :as tuple-item} in-vars all-vars]
   (cond-> (update-positions tuple-item in-vars)
 
           ;; we know item is an IRI
-          (#{:s :p} (get all-types variable))
+          (#{:s :p} (get all-vars variable))
           (assoc :iri? true)
 
           ;; we know item is an object variable and will therefore be a two-tuple of [value datatype]
-          (= :o (get all-types variable))
+          (= :o (get all-vars variable))
           (assoc :o-var? true)))
 
 (defn gen-x-form
@@ -831,7 +831,7 @@
   There could be an order-by or group-by var not included in the select statement, so
   those must get added into the results here - note group-by without order-by will create an order-by"
   [out-vars {:keys [flake-out others all] :as _vars} {:keys [parsed] :as _order-by}]
-  (when-let [illegal-var (some #(when-not (all %) %) out-vars)]
+  (when-let [illegal-var (some #(when-not (contains? all %) %) out-vars)]
     (throw (ex-info (str "Variable " illegal-var " used in select statement but does not exist in the query.")
                     {:status 400 :error :db/invalid-query})))
   (let [order-by   (->> (map :variable parsed)
@@ -877,8 +877,8 @@
   (let [last-where (last where)
         out-vars   (or group-out-vars
                        (:out-vars last-where))
-        {:keys [all-types]} (:vars last-where)              ;; the last where statement has an aggregation of all variables
-        spec*      (cond->> (mapv #(update-position+type % out-vars all-types) spec)
+        {:keys [all]} (:vars last-where)                    ;; the last where statement has an aggregation of all variables
+        spec*      (cond->> (mapv #(update-position+type % out-vars all) spec)
                             grouped-vars (mapv #(if (grouped-vars (:variable %))
                                                   (assoc % :grouped? true)
                                                   %)))]
@@ -929,7 +929,7 @@
   [{:keys [parsed] :as order-by} group-by where]
   (when order-by
     (let [{:keys [out-vars vars] :as _last-where} (last where)
-          parsed*    (mapv #(update-position+type % out-vars (:all-types vars)) parsed)
+          parsed*    (mapv #(update-position+type % out-vars (:all vars)) parsed)
           order-by*  (assoc order-by :parsed parsed*)
           comparator (build-order-fn order-by*)]
       (assoc order-by* :comparator comparator))))
@@ -1025,8 +1025,8 @@
   "Updates group-by, if applicable, with final where clause positions of items."
   [{:keys [parsed] :as group-by} where]
   (when group-by
-    (let [{:keys [out-vars all-types] :as _last-where} (last where)
-          parsed*               (mapv #(update-position+type % out-vars all-types) parsed)
+    (let [{:keys [out-vars all] :as _last-where} (last where)
+          parsed*               (mapv #(update-position+type % out-vars all) parsed)
           group-by*             (assoc group-by :parsed parsed*)
           grouped-positions     (mapv :in-n parsed*)        ;; returns 'n' positions of values used for grouping
           partition-fn          (build-vec-extraction-fn grouped-positions) ;; returns fn containing only grouping vals, used like a 'partition-by' fn
@@ -1048,16 +1048,14 @@
 
 
 (defn get-clause-vars
-  [new-flake-vars {:keys [others all all-types] :as _prior-vars}]
+  [new-flake-vars {:keys [others all] :as _prior-vars}]
   (let [[s-var p-var o-var] new-flake-vars
         new-flakes-set (set (remove nil? new-flake-vars))
-        flake-in*      (filter all new-flake-vars)          ;; any pre-existing var used in the flake
-        all*           (into all new-flakes-set)
-        others-set     (set/difference all new-flakes-set)]
+        flake-in*      (filter #(contains? all %) new-flake-vars) ;; any pre-existing var used in the flake
+        others-set     (set/difference (into #{} (keys all)) new-flakes-set)]
     {:flake-in  flake-in*
      :flake-out new-flake-vars
-     :all       all*
-     :all-types (cond-> all-types
+     :all       (cond-> all
                         s-var (assoc s-var :s)
                         p-var (assoc p-var :p)
                         o-var (assoc o-var :o))
@@ -1084,7 +1082,7 @@
          i          0
          prior-vars {:flake-in  []                          ;; variables query will need to execute
                      :flake-out []                          ;; variables query result flakes will output
-                     :all       #{}                         ;; cascading set of all variables used in statements through current one
+                     :all       {}                          ;; cascading set of all variables used in statements through current one
                      :others    []}                         ;; this is all vars minus the flake vars
          acc        []]
     (if where-smt
