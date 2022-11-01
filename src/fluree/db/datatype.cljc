@@ -51,7 +51,7 @@
     (boolean? x) const/$xsd:boolean))
 
 (defn coerced
-  "Given a value and required type, attempts to return a coerced value or nil (not coercable).
+  "Given a value and required type, attempts to return a coerced value or nil (not coercible).
   We should be cautious about what we coerce, it is really a judgement decision in some
   circumstances. While we could coerce, e.g. numbers to strings, an exception is likely the most ideal behavior.
   Examples of things that seem OK to coerce are:
@@ -59,7 +59,7 @@
    - a decimal like 3.0 to an integer
    - the strings 'true' or 'false' to a boolean"
   [value required-type]
-  (util/case+ (int required-type)
+  (case (int required-type)
     const/$xsd:string
     (if (string? value)
       value

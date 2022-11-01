@@ -1,21 +1,21 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
-         org.clojure/core.async          {:mvn/version "1.5.648"}
+         org.clojure/core.async          {:mvn/version "1.6.673"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
-         org.clojure/data.xml            {:mvn/version "0.2.0-alpha6"}
+         org.clojure/data.xml            {:mvn/version "0.2.0-alpha8"}
          environ/environ                 {:mvn/version "1.2.0"}
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :sha "c22e943a9c4618379759eb9e2ca0cd384e1a1882"
-                                          }
+                                          :sha "c22e943a9c4618379759eb9e2ca0cd384e1a1882"}
+
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
          logback-bundle/core-bundle      {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api             {:mvn/version "1.7.36"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.3"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -29,14 +29,12 @@
 
          ;; serialization / compression
          com.fluree/abracad              {:mvn/version "0.4.19"}
-         com.taoensso/nippy              {:mvn/version "3.1.3"}
+         com.taoensso/nippy              {:mvn/version "3.2.0"}
          org.xerial.snappy/snappy-java   {:mvn/version "1.1.8.4"}
-         com.fluree/alphabase            {:git/url "https://github.com/fluree/alphabase.git"
-                                          :sha "6aa66bb52336eb6a75c4de8c70ef81054b7011c5"}
+         com.fluree/alphabase            {:mvn/version "3.3.0"}
 
          ;; cryptography
-         com.fluree/crypto               {:git/url "https://github.com/fluree/fluree.crypto.git"
-                                          :sha "3eaf1bdafa4395f58d2e5105cfd77fb341126fe1"}
+         com.fluree/crypto               {:mvn/version "0.4.0"}
 
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
@@ -46,19 +44,19 @@
  :paths ["src" "resources"]
 
  :aliases
- {:mvn/group-id    com.fluree
-  :mvn/artifact-id db
-  :mvn/version     "2.0.0-alpha4" ; Change this down in the docs alias too!
+ {:build
+  {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.3" :git/sha "0d20256"}}
+   :ns-default build}
 
   :dev
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs {:mvn/version "2.19.6"}}}
+                 thheller/shadow-cljs {:mvn/version "2.20.7"}}}
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.68.1059"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.71.1119"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -66,29 +64,12 @@
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
    :main-opts  ["-m" "target-bundle-libs.core"]}
 
-  :jar
-  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
-   :exec-fn      hf.depstar/jar
-   :exec-args    {:jar         "target/fluree-db.jar"
-                  :group-id    :mvn/group-id
-                  :artifact-id :mvn/artifact-id
-                  :version     :mvn/version
-                  :sync-pom    true}}
-
-  :install
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.0"}}
-   :main-opts    ["-m" "deps-deploy.deps-deploy" "install"
-                  "target/fluree-db.jar"]}
-
   :docs
   {:extra-deps {codox/codox {:mvn/version "0.10.8"}}
    :exec-fn    codox.main/generate-docs
    :exec-args  {:namespaces  [fluree.db.api]
                 :description "Fluree DB Clojure API Documentation"
                 :name        com.fluree/db
-                ;; TODO: Eliminate this copy of the version string
-                ;; I think that tools.build might be the best way to do that
-                :version     "2.0.0-alpha4"
                 :output-path "docs"}}
 
   :deploy
@@ -105,7 +86,7 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.2.4"}}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.3.0"}}
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths ["src" "src-docs"]
                  :test-paths   ["test"]}]}
@@ -115,5 +96,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.06.22"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.10.14"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}

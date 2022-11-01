@@ -3,7 +3,7 @@
    [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
    [clojure.core.async :refer [go <!] :as async]
    [clojure.core.async.impl.protocols :as async-protocols])
-  #?(:cljs (:require-macros [fluree.db.util.async :refer [<?]])))
+  #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
 

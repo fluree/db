@@ -43,7 +43,7 @@
   - order-by exists, in which case we need to perform a sort
   - selectOne? exists, in which case we take the (first result)
   - pretty-print is true, in which case each result needs to get embedded in a map"
-  [{:keys [selectOne? order-by pretty-print limit] :as parsed-query}]
+  [{:keys [selectOne? order-by pretty-print limit offset] :as parsed-query}]
   (let [fns (cond-> []
                     selectOne? (conj (fn [result] (first result)))
                     pretty-print (conj (let [select-var (-> parsed-query
@@ -55,7 +55,8 @@
                                                             (subs 1))]
                                          (fn [result]
                                            (mapv #(array-map select-var %) result))))
-                    order-by (conj (fn [result] (order-results result order-by limit))))]
+                    order-by (conj (fn [result]
+                                     (order-results result order-by limit offset))))]
     (if (empty? fns)
       identity
       (apply comp fns))))
@@ -69,7 +70,9 @@
   (c) filter subjects based on subsequent where clause(s)
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
-  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by json-ld? compact-fn] :as parsed-query}]
+  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by
+              json-ld? compact-fn opts] :as parsed-query}]
+  (log/debug "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
         f-where     (first where)
         rdf-type?   (= :rdf/type (:type f-where))
@@ -80,7 +83,7 @@
         select-spec (retrieve-select-spec db parsed-query)
         result-fn   (if json-ld?
                       (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
-                      (partial legacy-resp/flakes->res db cache fuel-vol fuel select-spec))
+                      (partial legacy-resp/flakes->res db cache fuel-vol fuel select-spec opts))
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
                      :collection?   collection?
@@ -94,13 +97,15 @@
                      :ident-vars    ident-vars
                      :filter-map    filter-map
                      :limit         (if order-by util/max-long limit) ;; if ordering, limit performed by finish-fn after sort
-                     :offset        offset
+                     :offset        (if order-by 0 offset)
                      :permissioned? (not (get-in db [:permissions :root?]))
                      :parallelism   3
                      :f-where       f-where
+                     :parse-json?   (:parse-json? opts)
                      :query         parsed-query
                      :result-fn     result-fn
                      :finish-fn     finish-fn}]
+    (log/debug "simple-subject-crawl opts:" opts)
     (if rel-binding?
       (relationship-binding opts)
       (if collection?

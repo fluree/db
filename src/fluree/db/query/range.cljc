@@ -400,51 +400,52 @@
   ([db fparts]
    (search db fparts {}))
   ([db fparts opts]
-   (go-try (let [[s p o t] fparts
-                 idx-predicate? (dbproto/-p-prop db :idx? p)
-                 tag-predicate? (if p (= :tag (dbproto/-p-prop db :type p)) false)
-                 o-coerce?      (and tag-predicate? (string? o))
-                 o              (cond (not o-coerce?)
-                                      o
+   (go-try
+     (let [[s p o t] fparts
+           idx-predicate? (dbproto/-p-prop db :idx? p)
+           tag-predicate? (if p (= :tag (dbproto/-p-prop db :type p)) false)
+           o-coerce?      (and tag-predicate? (string? o))
+           o              (cond (not o-coerce?)
+                                o
 
-                                      (tag-string? o)
-                                      (<? (dbproto/-tag-id db o))
-                                      ;; Returns tag-id
+                                (tag-string? o)
+                                (<? (dbproto/-tag-id db o))
+                                ;; Returns tag-id
 
-                                      ;; if string, but not tag string, we have a string
-                                      ;; like "query" with no namespace, we need to ns.
-                                      (string? o)
-                                      (let [tag-name (str (dbproto/-p-prop db :name p) ":" o)]
-                                        (<? (dbproto/-tag-id db tag-name))))
+                                ;; if string, but not tag string, we have a string
+                                ;; like "query" with no namespace, we need to ns.
+                                (string? o)
+                                (let [tag-name (str (dbproto/-p-prop db :name p) ":" o)]
+                                  (<? (dbproto/-tag-id db tag-name))))
 
-                 res            (cond
-                                  s
-                                  (if (= "_id" p)
-                                    (<? (index-range db :spot = [s nil nil t] opts))
-                                    (<? (index-range db :spot = [s p o t] opts)))
+           res            (cond
+                            s
+                            (if (= "_id" p)
+                              (<? (index-range db :spot = [s nil nil t] opts))
+                              (<? (index-range db :spot = [s p o t] opts)))
 
-                                  (and p (non-nil-non-boolean? o) idx-predicate? (not (fn? o)))
-                                  (<? (index-range db :post = [p o s t] opts))
+                            (and p (non-nil-non-boolean? o) idx-predicate? (not (fn? o)))
+                            (<? (index-range db :post = [p o s t] opts))
 
-                                  (and p (not idx-predicate?) o)
-                                  (let [obj-fn (if-let [obj-fn (:object-fn opts)]
-                                                 (fn [x] (and (obj-fn x) (= x o)))
-                                                 (fn [x] (= x o)))]
-                                    ;; check for special case where search specifies _id and an integer, i.e. [nil _id 12345]
-                                    (if (and (= "_id" p) (int? o))
-                                      ;; TODO - below should not need a `take 1` - `:limit 1` does not work properly - likely fixed in tsop branch, remove take 1 once :limit works
-                                      (take 1 (<? (index-range db :spot = [o] (assoc opts :limit 1))))
-                                      (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn)))))
+                            (and p (not idx-predicate?) o)
+                            (let [obj-fn (if-let [obj-fn (:object-fn opts)]
+                                           (fn [x] (and (obj-fn x) (= x o)))
+                                           (fn [x] (= x o)))]
+                              ;; check for special case where search specifies _id and an integer, i.e. [nil _id 12345]
+                              (if (and (= "_id" p) (int? o))
+                                ;; TODO - below should not need a `take 1` - `:limit 1` does not work properly - likely fixed in tsop branch, remove take 1 once :limit works
+                                (take 1 (<? (index-range db :spot = [o] (assoc opts :limit 1))))
+                                (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn)))))
 
-                                  p
-                                  (<? (index-range db :psot = [p s o t] opts))
+                            p
+                            (<? (index-range db :psot = [p s o t] opts))
 
-                                  o
-                                  (<? (index-range db :opst = [o p s t] opts)))
-                 res*           (if tag-predicate?
-                                  (<? (coerce-tag-flakes db res))
-                                  res)]
-             res*))))
+                            o
+                            (<? (index-range db :opst = [o p s t] opts)))]
+       (log/debug "search res:" res)
+       (if tag-predicate?
+         (<? (coerce-tag-flakes db res))
+         res)))))
 
 (defn collection
   "Returns spot index range for only the requested collection."

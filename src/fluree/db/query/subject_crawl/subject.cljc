@@ -1,6 +1,6 @@
 (ns fluree.db.query.subject-crawl.subject
-  (:require [clojure.core.async :refer [go <! >!] :as async]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
+  (:require [clojure.core.async :refer [<! >!] :as async]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
@@ -8,8 +8,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
                                                           subj-perm-filter-fn filter-subject]]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.datatype :as datatype]))
+            [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -95,6 +94,7 @@
   "For queries that specify _id as the predicate, we will have a
   single subject as a value."
   [db error-ch vars {:keys [o] :as f-where}]
+  (log/debug "subjects-id-chan f-where:" f-where)
   (let [return-ch (async/chan)
         _id-val   (or (:value o)
                       (get vars (:variable o)))]
@@ -138,8 +138,10 @@
 
 
 (defn subj-crawl
-  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars finish-fn] :as opts}]
+  [{:keys [db error-ch f-where limit offset parallelism vars ident-vars
+           finish-fn] :as opts}]
   (go-try
+    (log/debug "subj-crawl opts:" opts)
     (let [{:keys [o p-ref?]} f-where
           vars*     (if ident-vars
                       (<? (resolve-ident-vars db vars ident-vars))

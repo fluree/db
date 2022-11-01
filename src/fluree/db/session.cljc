@@ -232,29 +232,24 @@
   "Resolves a ledger identity in the form of 'network/alias' and returns a
   two-tuple of [network ledger-id].
 
-  An alias lookup is always performed first, and if an alias doesn't exist it is assumed
-  the provided name is a ledger-id.
-
-  If you are providing a ledger-id, and wish to skip an alias lookup, a prefix of '$'
-  can be used for the name portion of the ledger.
-
   i.e.
-  - testnet/testledger - Look for ledger with an alias testledger on network testnet.
-  - testnet/$testledger - look for a ledger with id testledger on network testnet (skip alias lookup).
-  - [testnet testledger] - already in form of [network ledger-id]"
-  [conn ledger]
-  (if (sequential? ledger)
-    ledger
-    (let [ledger      (keyword ledger)
-          network     (namespace ledger)
-          maybe-alias (name ledger)
+  - testnet/testledger - Look for ledger named testledger on network testnet.
+  - [testnet testledger] - already in form of [network ledger-id]
 
-          _           (when-not (and network maybe-alias)
-                        (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
-                                        {:status 400 :error :db/invalid-db})))]
-      (if (str/starts-with? maybe-alias "$")
-        [network (subs maybe-alias 1)]
-        [network (ledger-alias->id network maybe-alias) maybe-alias]))))
+  The two-arity version of this exists for backwards compatibility. It doesn't do anything with the
+  conn arg so there is also a single-arity version that just takes the ledger name."
+  ([ledger] (resolve-ledger nil ledger))
+  ([_conn ledger]
+   (if (sequential? ledger)
+     ledger
+     (let [ledger      (keyword ledger)
+           network     (namespace ledger)
+           ledger-id   (name ledger)
+
+           _           (when-not (and network ledger-id)
+                         (throw (ex-info (str "Invalid ledger identity: " (pr-str ledger))
+                                         {:status 400 :error :db/invalid-db})))]
+         [network ledger-id]))))
 
 
 ;; note all process-ledger-update operations must return a go-channel

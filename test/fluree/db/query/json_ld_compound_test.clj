@@ -1,8 +1,10 @@
 (ns fluree.db.query.json-ld-compound-test
-  (:require [clojure.test :refer :all]
-            [fluree.db.test-fixtures :as test]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+  (:require
+    [clojure.string :as str]
+    [clojure.test :refer :all]
+    [fluree.db.test-fixtures :as test]
+    [fluree.db.json-ld.api :as fluree]
+    [fluree.db.util.log :as log]))
 
 
 (use-fixtures :once test/test-system)
@@ -146,7 +148,7 @@
                                            ['?s :ex/favNums '?favNums]]
                                 :group-by '?name})
              [["Alice" [9 42 76]] ["Brian" [7]] ["Cam" [5 10]]])
-          "Sums of favNums by person are not accurate.")
+          "Sums of favNums by person are not accurate."))))
 
 
 
@@ -161,4 +163,4 @@
       ;        ["Cam" 15]])
       ;    "Sums of favNums by person are not accurate.")
 
-      )))
+

@@ -354,7 +354,7 @@
   being in a deletion state during the deletion process.
 
   Attempts to use a ledger in a deletion state will throw an exception."
-  ([conn ledger] (delete-ledger-async conn ledger))
+  ([conn ledger] (delete-ledger-async conn ledger nil))
   ([conn ledger opts]
    (try
      (let [timestamp (System/currentTimeMillis)
@@ -711,12 +711,12 @@
                            acc []]
                       (if-not subject
                         acc
-                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))
+                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} {} subject))))))
           asserted  (loop [[subject & r] (vals asserted-subjects)
                            acc []]
                       (if-not subject
                         acc
-                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} subject))))))]
+                        (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}} {} subject))))))]
       {:block     (:block curr-block)
        :t         (:t curr-block)
        :retracted retracted

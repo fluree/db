@@ -4,13 +4,14 @@
             [clojure.core.async :as async]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.time-travel :as time-travel]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util]
             [fluree.db.flake :as flake]
             [fluree.db.query.analytical-wikidata :as wikidata]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.union :as union]
             [clojure.string :as str]
+            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
             #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto]
@@ -52,6 +53,7 @@
  "
   [db interm-vars clause]
   (reduce-kv (fn [acc idx key]
+               (println "key:" (pr-str key))
                (let [key-as-var   (variable? key)
                      static-value (get interm-vars key-as-var)]
                  (when (and (= idx 1) (not key-as-var) (not= "_id" key)
@@ -334,36 +336,39 @@
             (if var-first? tuples (distinct (map #(-> % second vector) tuples))))))
 
 (defn fdb-clause->tuples
-  [db {:keys [headers tuples vars] :as res} clause fuel max-fuel]
-  (go-try (let [{:keys [search rel opts]} (clause->rel db vars clause)
+  [db {:keys [headers tuples vars] :as res} clause fuel max-fuel opts]
+  (go-try (let [{:keys [search rel] search-opts :opts} (clause->rel db vars clause)
                 common-keys (intersecting-keys-tuples-clause res clause)
-                object-fn   (:object-fn opts)
-                recur-depth (:recur opts)
-                [opts clause'] (reduce (fn [[acc clause'] common-key]
-                                         (let [idx-of    (util/index-of clause (str common-key))
-                                               k         (condp = idx-of 0 :subject-fn 1 :predicate-fn 2 :object-fn)
-                                               res-idx   (util/index-of headers common-key)
-                                               v         (into #{} (map first (transform-tuples-to-idxs [res-idx] tuples)))
-                                               single-v? (= 1 (count v))
-                                               v         (if (and (not single-v?) object-fn (= k object-fn))
-                                                           (comp v object-fn)
-                                                           v)]
-                                           (if single-v?
-                                             [acc (assoc clause' idx-of (first v))]
-                                             [(assoc acc k v) clause'])))
-                                       [{} search] common-keys)
+                object-fn   (:object-fn search-opts)
+                recur-depth (:recur search-opts)
+                [search-opts' clause'] (reduce (fn [[acc clause'] common-key]
+                                                 (let [idx-of    (util/index-of clause (str common-key))
+                                                       k         (condp = idx-of 0 :subject-fn 1 :predicate-fn 2 :object-fn)
+                                                       res-idx   (util/index-of headers common-key)
+                                                       v         (into #{} (map first (transform-tuples-to-idxs [res-idx] tuples)))
+                                                       single-v? (= 1 (count v))
+                                                       v         (if (and (not single-v?) object-fn (= k object-fn))
+                                                                   (comp v object-fn)
+                                                                   v)]
+                                                   (if single-v?
+                                                     [acc (assoc clause' idx-of (first v))]
+                                                     [(assoc acc k v) clause'])))
+                                               [{} search] common-keys)
                 ;; Currently, only pass in object-fn to search opts. Seems to be faster to filter
                 ;; subject after. I'm sure this depends on a number of variables
                 ;; TODO - determine what, when, and how to filter - in index range? after index-range?
-                search-opts {:object-fn (or (:object-fn opts) object-fn)}
-                res         (<? (query-range/search db clause' search-opts))
+                search-opts' {:object-fn (or (:object-fn search-opts') object-fn)}
+                res         (<? (query-range/search db clause' search-opts'))
+                res'        (if (:parse-json? opts)
+                              (json/parse-json-flakes db res)
+                              res)
                 ;; Currently, not supporting subject and predicate fns, but leaving this here.
                 ;{:keys [subject-fn predicate-fn]} opts
                 ;res         (cond->> res
                 ;                     subject-fn    (filter #(subject-fn (.-s %)))
                 ;                     predicate-fn  (filter #(predicate-fn (.-p %))))
-                _           (add-fuel (count res) fuel max-fuel)
-                tuples      (transform-tuples-to-idxs (vals rel) res)
+                _           (add-fuel (count res') fuel max-fuel)
+                tuples      (transform-tuples-to-idxs (vals rel) res')
                 tuples'     (if recur-depth
                               (let [clause-1st (first clause')
                                     var-first? (variable? (first clause))
@@ -387,7 +392,7 @@
                                                      (assoc {} clause-1st (flatten tuples))
 
                                                      (coll? clause-1st)
-                                                     (assoc {} (-> res first first) (flatten tuples)))]
+                                                     (assoc {} (-> res' first first) (flatten tuples)))]
 
                                 (<? (tuples->recur db predicate recur-map recur-depth var-first?)))
                               tuples)]
@@ -437,7 +442,9 @@
                     (let [partition (dbproto/-c-prop db :partition (last clause))
                           max-sid   (-> db :ecount (get partition))
                           min-sid   (flake/min-subject-id partition)
-                          flakes    (<? (query-range/index-range db :spot >= [max-sid] <= [min-sid]))
+                          flakes    (<? (query-range/index-range db :spot
+                                                                 >= [max-sid]
+                                                                 <= [min-sid]))
                           xf        (comp (map (fn [f] [(flake/s f)])) (distinct))]
                       {:headers [subject-var]
                        :tuples  (sequence xf flakes)
@@ -451,7 +458,6 @@
                     {:headers [object-var]
                      :tuples  [[cname]]
                      :vars    {}})))))
-
 
 
 (def all-functions #{"STR" "RAND" "ABS" "CEIL" "FLOOR" "CONCAT"
@@ -624,14 +630,6 @@
                   headers' (conj (vec headers) as)]
               {:headers headers' :tuples tuples'}))
           res aggregate))
-
-
-(defn symbolize-keys
-  [q-map]
-  (let [keys (map symbol (keys q-map))
-        vals (vals q-map)]
-    (zipmap keys vals)))
-
 
 (defn match-tuples-lists
   "Combines two lists of tuples, a-tuples and b-tuples, into a single aggregated
@@ -850,7 +848,7 @@
           [(<? (collection->tuples db res clause)) r]
 
           (= 3 (count clause))
-          [(<? (fdb-clause->tuples db res clause fuel max-fuel)) r]
+          [(<? (fdb-clause->tuples db res clause fuel max-fuel opts)) r]
 
           (= 2 (count clause))
           [(update res :vars merge (bind-clause->vars res clause)) r]
@@ -870,68 +868,39 @@
                   [(full-text->tuples db res clause) r]
 
                   :else
-                  [(<? (fdb-clause->tuples db res clause fuel max-fuel)) r])))))
+                  [(<? (fdb-clause->tuples db res clause fuel max-fuel opts)) r])))))
 
 
 (defn resolve-where-clause
   ([db where q-map vars fuel max-fuel]
    (resolve-where-clause db where q-map vars fuel max-fuel {}))
   ([db where q-map vars fuel max-fuel opts]
-   (go-try (loop [[clause & r] where
-                  res {:vars (symbolize-keys vars)}]
-             (if clause
-               (let [[next-res r] (<? (clause->tuples db q-map res clause r false fuel max-fuel opts))]
-                 (cond (= 2 (count clause))
-                       (recur r next-res)
+   (go-try
+     (loop [[clause & r] where
+            res {:vars vars}]
+       (if clause
+         (let [[next-res r] (<? (clause->tuples db q-map res clause r false fuel max-fuel opts))]
+           (cond (= 2 (count clause))
+                 (recur r next-res)
 
-                       (empty? (dissoc res :vars))
-                       (recur r (or next-res res))
+                 (empty? (dissoc res :vars))
+                 (recur r (or next-res res))
 
-                       (nil? next-res)
-                       (recur r res)
+                 (nil? next-res)
+                 (recur r res)
 
-                       :else
-                       (recur r (inner-join res next-res))))
-               res)))))
+                 :else
+                 (recur r (inner-join res next-res))))
+         res)))))
 
 (defn q
-  [q-map fuel max-fuel db opts]
-  (go-try (let [{:keys [vars where optional filter]} q-map
-                where-res    (<? (resolve-where-clause db where q-map vars fuel max-fuel opts))
-                optional-res (if optional
-                               (<? (optional->left-outer-joins db q-map optional where-res fuel max-fuel opts))
-                               where-res)
-                filter-res   (if filter
-                               (tuples->filtered optional-res filter nil)
-                               optional-res)
-                res          filter-res]
-            res)))
-
-
-(comment
-  (def conn (:conn user/system))
-  (def db (async/<!! (fluree.db.api/db conn "fluree/test")))
-
-
-
-  (async/<!! (q {:select ["?chat", "?comment"]
-                 :where  [["?chat" "_predicate/name" "?comment"]]} (volatile! 0) 1000 db {}))
-
-  (async/<!! (fdb-clause->tuples db ['?chat "chat/comments" '?comment] (volatile! 0) 1000000))
-
-  (async/<!! (where->inner-joins db [["?t", "_block/number", "?number"],
-                                     ["?maxBlock" "(max ?number)"],
-                                     ["?t", "_block/hash", "?hash"]]
-                                 {:select   ["?hash", "?pHash", "?number"]
-                                  :where    [["?t", "_block/number", "?number"],
-                                             {"?maxBlock" "(max ?number)"},
-                                             ["?t", "_block/hash", "?hash"]]
-                                  :optional [["?t" "_block/prevHash" "?pHash"]]} nil nil))
-
-
-
-
-  (async/<!! (q {:select   ["?handle" "?num"]
-                 :where    [["?person" "person/handle" "?handle"]]
-                 :optional [["?person" "person/favNums" "?num"]]
-                 :filter   [["optional" "(> 10 ?num)"]]} (volatile! 0) 1000 db)))
+  [{:keys [vars query-map fuel max-fuel db] :as opts}]
+  (go-try
+    (let [{:keys [where optional filter]} query-map
+          where-res    (<? (resolve-where-clause db where query-map vars fuel max-fuel opts))
+          optional-res (if optional
+                         (<? (optional->left-outer-joins db query-map optional where-res fuel max-fuel opts))
+                         where-res)]
+      (if filter
+        (tuples->filtered optional-res filter nil)
+        optional-res))))

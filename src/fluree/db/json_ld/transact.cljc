@@ -8,12 +8,13 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.datatype :as datatype]
-            [fluree.db.json-ld.shacl :as shacl]))
+            [fluree.db.json-ld.shacl :as shacl])
+  (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
