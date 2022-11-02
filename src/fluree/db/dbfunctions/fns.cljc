@@ -748,6 +748,15 @@
       (add-stack ?ctx entry)
       res)))
 
+(defn ?retraction
+  {:doc "Returns true if there are any retractions."
+   :fdb/spec nil
+   :fdb/cost 10}
+  [?ctx x]
+  (let [res (boolean (:delete ?ctx))]
+    (add-stack ?ctx [{:function "?retraction" :arguments "?ctx" :result res} 10])
+    res))
+
 (defn ?auth_id
   {:doc      "Gets current auth _id."
    :fdb/spec nil

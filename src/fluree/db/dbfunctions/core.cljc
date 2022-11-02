@@ -39,6 +39,7 @@
                      'contains?     (resolve 'fluree.db.dbfunctions.fns/contains?)
                      'relationship? (resolve 'fluree.db.dbfunctions.fns/relationship?)
                      'query         (resolve 'fluree.db.dbfunctions.fns/query)
+                     'query-db-before (resolve 'fluree.db.dbfunctions.fns/query-db-before)
                      'max-pred-val  (resolve 'fluree.db.dbfunctions.fns/max-pred-val)
                      'max           (resolve 'fluree.db.dbfunctions.fns/max)
                      'min           (resolve 'fluree.db.dbfunctions.fns/min)
@@ -62,6 +63,7 @@
                      '?o            (resolve 'fluree.db.dbfunctions.fns/?o)
                      '?s            (resolve 'fluree.db.dbfunctions.fns/?s)
                      '?p            (resolve 'fluree.db.dbfunctions.fns/?p)
+                     '?retraction   (resolve 'fluree.db.dbfunctions.fns/?retraction)
                      'nil?          (resolve 'fluree.db.dbfunctions.fns/nil?)
                      'empty?        (resolve 'fluree.db.dbfunctions.fns/empty?)
                      'not           (resolve 'fluree.db.dbfunctions.fns/not)
@@ -277,12 +279,11 @@
 
 (defn execute-tx-fn
   "Executes a transaction function"
-  [db db-before auth_id credits s p o fuel block-instant]
+  [db db-before auth_id credits s p o delete? fuel block-instant]
   (go-try
     (let [fn-str  (subs o 1)                                ;; remove preceding '#'
           credits 10000000
           ctx     {:db      db
-                   :db-before db-before
                    :instant block-instant
                    :sid     s
                    :pid     p
