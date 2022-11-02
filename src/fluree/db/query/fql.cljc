@@ -8,7 +8,9 @@
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.compound :as compound]
             [fluree.db.query.range :as query-range]
-            [fluree.db.query.json-ld.response :as json-ld-resp])
+            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.dbproto :as db-proto]
+            [fluree.db.constants :as const])
   (:refer-clojure :exclude [vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -23,7 +25,7 @@
     (loop [[spec-item & r'] spec
            result-item []]
       (if spec-item
-        (let [{:keys [selection in-n iri?]} spec-item
+        (let [{:keys [selection in-n iri? o-var? grouped?]} spec-item
               value  (nth where-item in-n)
               value* (cond
                        ;; there is a sub-selection (graph crawl)
@@ -31,12 +33,26 @@
                        (let [flakes (<? (query-range/index-range db :spot = [value]))]
                          (<? (json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel (:spec spec-item) 0 flakes)))
 
+                       grouped?
+                       (if o-var?
+                         (mapv first value)
+                         value)
+
                        ;; subject id coming it, we know it is an IRI so resolve here
                        iri?
                        (or (get @cache value)
                            (let [c-iri (<? (db-proto/-iri db value compact-fn))]
                              (vswap! cache assoc value c-iri)
                              c-iri))
+
+                       o-var?
+                       (let [[val datatype] value]
+                         (if (= const/$xsd:anyURI datatype)
+                           (or (get @cache val)
+                               (let [c-iri (<? (db-proto/-iri db val compact-fn))]
+                                 (vswap! cache assoc val c-iri)
+                                 c-iri))
+                           val))
 
                        :else
                        value)]

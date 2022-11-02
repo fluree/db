@@ -148,7 +148,7 @@
                                            ['?s :ex/favNums '?favNums]]
                                 :group-by '?name})
              [["Alice" [9 42 76]] ["Brian" [7]] ["Cam" [5 10]]])
-          "Sums of favNums by person are not accurate."))))
+          "Sums of favNums by person are not accurate.")
 
 
 
@@ -163,4 +163,20 @@
       ;        ["Cam" 15]])
       ;    "Sums of favNums by person are not accurate.")
 
+      ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
+      (is (= @(fluree/query db
+                            {:context  {:ex "http://example.org/ns/"}
+                             :select  ['?s '?p '?o]
+                             :where   [['?s :schema/age 34]
+                                       ['?s '?p '?o]]})
+             [[:ex/cam :id "http://example.org/ns/cam"]
+              [:ex/cam :rdf/type :ex/User]
+              [:ex/cam :schema/name "Cam"]
+              [:ex/cam :schema/email "cam@example.org"]
+              [:ex/cam :schema/age 34]
+              [:ex/cam :ex/favNums 5]
+              [:ex/cam :ex/favNums 10]
+              [:ex/cam :ex/friend :ex/brian]
+              [:ex/cam :ex/friend :ex/alice]])
+          "IRIs are resolved from subj ids, whether s, p, or o vals."))))
 

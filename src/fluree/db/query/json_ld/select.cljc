@@ -102,9 +102,9 @@
 
 
 (defn parse
-  [db
-   {:keys [limit pretty-print context depth] :as parsed-query}
-   {:keys [selectOne select selectDistinct selectReduced] :as _query-map'}]
+  [{:keys [limit pretty-print context depth where] :as parsed-query}
+   {:keys [selectOne select selectDistinct selectReduced] :as _query-map'}
+   db]
   (let [select-smt    (or selectOne select selectDistinct selectReduced)
         selectOne?    (boolean selectOne)
         limit*        (if selectOne? 1 limit)
