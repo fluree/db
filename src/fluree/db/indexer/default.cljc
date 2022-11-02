@@ -602,15 +602,11 @@
 (defn create
   "Creates a new indexer."
   [{:keys [reindex-min-bytes reindex-max-bytes
-           state-atom
-           idx-file-write idx-file-read idx-file-delete]
+           state-atom]
     :or   {reindex-min-bytes 100000                         ;; 100 kb
            reindex-max-bytes 1000000                        ;; 1 mb
            state-atom        (new-state-atom)}}]
   (let [options {:reindex-min-bytes reindex-min-bytes
                  :reindex-max-bytes reindex-max-bytes
-                 :state-atom        state-atom
-                 :idx-file-write    idx-file-write
-                 :idx-file-read     idx-file-read
-                 :idx-file-delete   idx-file-delete}]
+                 :state-atom        state-atom}]
     (map->IndexerDefault options)))

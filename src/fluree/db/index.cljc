@@ -33,8 +33,8 @@
 
 (defprotocol Resolver
   (resolve [r node]
-    "Populate index branch and leaf node maps with either their child node
-     attributes or the flakes the store, respectively."))
+    "Populate the supplied index branch or leaf node maps with either the child
+     node attributes or the flakes they store, respectively."))
 
 (defn try-resolve
   [r error-ch node]
@@ -53,6 +53,14 @@
   (cond
     (leaf? node)   (not (nil? (:flakes node)))
     (branch? node) (not (nil? (:children node)))))
+
+(defn unresolve
+  "Clear the populated child node attributes from the supplied `node` map if it
+  represents a branch, or the populated flakes if `node` represents a leaf."
+  [node]
+  (cond
+    (leaf? node)   (dissoc node :flakes)
+    (branch? node) (dissoc node :children)))
 
 (defn lookup
   [branch flake]
@@ -138,9 +146,8 @@
 
 (defn child-entry
   [{:keys [first] :as node}]
-  (if (branch? node)
-    [first (dissoc node :children)]
-    [first (dissoc node :flakes)]))
+  (let [child-node (unresolve node)]
+    [first child-node]))
 
 (defn child-map
   "Returns avl sorted map whose keys are the first flakes of the index node
@@ -207,8 +214,9 @@
 
 (defn novelty-subrange
   [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]
+  (log/debug "novelty-subrange: first-flake:" first-flake "\nrhs:" rhs "\nleftmost?" leftmost?)
   (let [subrange (cond
-                   ;; standard case.. both left and right boundaries
+                   ;; standard case: both left and right boundaries
                    (and rhs (not leftmost?))
                    (avl/subrange novelty > first-flake <= rhs)
 

@@ -1,8 +1,10 @@
 (ns fluree.db.query.json-ld-compound-test
-  (:require [clojure.test :refer :all]
-            [fluree.db.test-fixtures :as test]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+  (:require
+    [clojure.string :as str]
+    [clojure.test :refer :all]
+    [fluree.db.test-fixtures :as test]
+    [fluree.db.json-ld.api :as fluree]
+    [fluree.db.util.log :as log]))
 
 
 (use-fixtures :once test/test-system)
@@ -177,3 +179,4 @@
               [:ex/cam :ex/friend :ex/brian]
               [:ex/cam :ex/friend :ex/alice]])
           "IRIs are resolved from subj ids, whether s, p, or o vals."))))
+

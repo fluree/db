@@ -7,7 +7,10 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af subj-perm-filter-fn filter-subject]]))
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf
+                                                          result-af
+                                                          subj-perm-filter-fn
+                                                          filter-subject]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -31,6 +34,7 @@
 
             (async/close! port))
           (catch* e (async/put! error-ch e) (async/close! port) nil))))))
+
 
 (defn subj-flakes-chan
   "Returns a channel that has a stream of flakes grouped by subject id.
@@ -74,9 +78,9 @@
 (defn collection-crawl
   [{:keys [db error-ch f-where limit offset parallelism finish-fn vars] :as opts}]
   (go-try
-    (let [subj-ch   (subj-flakes-chan db error-ch vars f-where)
-          flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
-          result-ch (async/chan)]
+    (let [subj-ch       (subj-flakes-chan db error-ch vars f-where)
+          flakes-ch     (async/chan 32 (comp (drop offset) (take limit)))
+          result-ch     (async/chan)]
 
       ;; take stream of flakes grouped by subject and runs through filtering and permissioning
       (async/pipeline-async parallelism flakes-ch (flakes-xf opts) subj-ch)

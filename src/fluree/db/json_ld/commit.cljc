@@ -4,7 +4,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -16,7 +16,8 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.json-ld.vocab :as vocab]))
+            [fluree.db.json-ld.vocab :as vocab])
+  (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

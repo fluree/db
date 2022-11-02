@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.internal
   (:refer-clojure :exclude [max min get inc dec + - * / == quot mod rem contains? get-in < <= > >=
-                            boolean re-find and or count str nth rand nil? empty? hash-set not subs not=])
+                            boolean re-find and or count str nth first rand nil? empty? hash-set not subs not=])
   (:require [#?(:cljs cljs.reader :clj clojure.edn) :as edn]
             [fluree.db.query.fql :as fql]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
@@ -20,12 +20,12 @@
   (let [parsed-param (if (string? param-str) (edn/read-string param-str) param-str)]
     (cond
       (map? parsed-param)
-      (let [key     (first (keys parsed-param))
+      (let [key     (clojure.core/first (keys parsed-param))
             key'    (if (string? key) key
                                       (if (clojure.core/nil? (namespace key))
                                         (name key)
                                         (clojure.core/str (namespace key) "/" (name key))))
-            value   (first (vals parsed-param))
+            value   (clojure.core/first (vals parsed-param))
             value'  (parse-select-map value)
             value'' (if (coll? value')
                       (into [] value')
@@ -68,22 +68,22 @@
   "Coerce to boolean. Everything except `false' and `nil' is true in boolean context."
   [x]
   (try* (clojure.core/boolean x)
-        (catch* e (function-error e "boolean" x))))
+    (catch* e (function-error e "boolean" x))))
 
 (defn nil?
   [arg]
   (try* (clojure.core/nil? arg)
-        (catch* e (function-error e "nil?" arg))))
+    (catch* e (function-error e "nil?" arg))))
 
 (defn not
   [arg]
   (try* (clojure.core/not arg)
-        (catch* e (function-error e "not" arg))))
+    (catch* e (function-error e "not" arg))))
 
 (defn empty?
   [arg]
   (try* (clojure.core/or (clojure.core/empty? arg) (= #{nil} arg))
-        (catch* e (function-error e "empty?" arg))))
+    (catch* e (function-error e "empty?" arg))))
 
 (defn if-else
   "Like clojure.core/if"
@@ -93,7 +93,7 @@
 
               :else
               false-res)
-        (catch* e (function-error e "if-else" test true-res false-res))))
+    (catch* e (function-error e "if-else" test true-res false-res))))
 
 (defn and
   "Returns true if all true"
@@ -119,73 +119,73 @@
   "Returns the number of items in the collection. (count nil) returns 0.  Also works on strings, arrays, and Java Collections and Maps"
   [coll]
   (try* (clojure.core/count coll)
-        (catch* e (function-error e "count" coll))))
+    (catch* e (function-error e "count" coll))))
 
 (defn str
   "Like clojure.core/str"
   [& args]
   (try* (apply clojure.core/str args)
-        (catch* e (function-error e "str" args))))
+    (catch* e (function-error e "str" args))))
 
 (defn subs
   "Like clojure.core/subs"
   [& args]
   (try* (apply clojure.core/subs args)
-        (catch* e (function-error e "subs" args))))
+    (catch* e (function-error e "subs" args))))
 
 (defn lower-case
   "Like clojure.core/lower-case"
   [str]
   (try* (clojure.string/lower-case str)
-        (catch* e (function-error e "lower-case" str))))
+    (catch* e (function-error e "lower-case" str))))
 
 (defn upper-case
   "Like clojure.core/upper-case"
   [str]
   (try* (clojure.string/upper-case str)
-        (catch* e (function-error e "upper-case" str))))
+    (catch* e (function-error e "upper-case" str))))
 
 (defn max
   "Like clojure.core/max, but applies max on a sequence"
   [& args]
   (try* (apply clojure.core/max (remove nil? args))
-        (catch* e (function-error e "max" args))))
+    (catch* e (function-error e "max" args))))
 
 (defn min
   "Like clojure.core/min, but applies min on a sequence"
   [& args]
   (try* (apply clojure.core/min (remove nil? args))
-        (catch* e (function-error e "min" args))))
+    (catch* e (function-error e "min" args))))
 
 (defn >
   "Like clojure.core/>, but applies > on a sequence"
   [& args]
   (try* (apply clojure.core/> args)
-        (catch* e (function-error e ">" args))))
+    (catch* e (function-error e ">" args))))
 
 (defn >=
   "Like clojure.core/>=, but applies > on a sequence"
   [& args]
   (try* (apply clojure.core/>= args)
-        (catch* e (function-error e ">=" args))))
+    (catch* e (function-error e ">=" args))))
 
 
 (defn <
   "Like clojure.core/>, but applies < on a sequence"
   [& args]
   (try* (apply clojure.core/< args)
-        (catch* e (function-error e "<" args))))
+    (catch* e (function-error e "<" args))))
 
 (defn <=
   "Like clojure.core/>, but applies < on a sequence"
   [& args]
   (try* (apply clojure.core/<= args)
-        (catch* e (function-error e "<=" args))))
+    (catch* e (function-error e "<=" args))))
 
 (defn not=
   [& args]
   (try* (apply clojure.core/not= args)
-        (catch* e (function-error e "not=" args))))
+    (catch* e (function-error e "not=" args))))
 
 (defn query
   "Executes a database query, but returns the :results directly."
@@ -214,7 +214,7 @@
                             :limit  limit
                             :opts   {:fuel fuel :max-fuel max-fuel}})
            query'        (if (and (:where query)
-                                  (= "[" (str (first (:where query))))
+                                  (= "[" (str (clojure.core/first (:where query))))
                                   (= "]" (str (last (:where query)))))
                            (let [where (#?(:clj read-string :cljs cljs.reader/read-string) (:where query))]
                              (assoc query :where where)) query)
@@ -325,7 +325,6 @@
   If multi returns a vector, else a single value."
   [db sid pred]
   (go-try
-
     (let [reverse?  (and (string? pred) (re-matches #".+/_.+" pred))
           pred*     (if reverse?
                       (str/replace pred "/_" "/")
@@ -340,7 +339,7 @@
       (when (seq res)
         (if multi?
           (mapv flake-val res)
-          (flake-val (first res)))))))
+          (flake-val (clojure.core/first res)))))))
 
 (defn now
   "Returns current epoch milliseconds."
@@ -451,7 +450,7 @@
     (let [r-path (reverse path)]
       (reduce
         (fn [acc p] {p [acc]})
-        (first r-path)
+        (clojure.core/first r-path)
         (rest r-path)))))
 
 (defn follow-subject
@@ -463,12 +462,15 @@
             query' {:selectOne select
                     :from      sid
                     :opts      {}}
+            _ (log/debug "follow-subject query:" query')
             [res fuel] (<? (query (:db ?ctx) query'))
+            _ (log/debug "follow-subject results:" res)
             res*   (get-all res (if (= "_id" (last path))
                                   path
                                   (conj path "_id")))]
+        (log/debug "follow-subject res*:" res*)
         [res* (+ fuel (count path) 9)])
-      (catch* e (function-error e "get-all" sid path)))))
+      (catch* e (function-error e "follow-subject" sid path)))))
 
 
 (defn get-in
@@ -495,7 +497,7 @@
     (catch* e (function-error e "hash-set" args))))
 
 (defn nth
-  "Returns true if key is present."
+  "Returns the nth element in coll."
   [coll key]
   (try*
     (let [coll' (if (set? coll)
@@ -503,6 +505,16 @@
                   coll)]
       (clojure.core/nth coll' key))
     (catch* e (function-error e "nth" coll key))))
+
+(defn first
+  "Returns the first element in coll."
+  [coll]
+  (try*
+    (let [coll' (if (set? coll)
+                  (vec coll)
+                  coll)]
+      (clojure.core/first coll'))
+    (catch* e (function-error e "first" coll))))
 
 (defn ==
   "Return true if arguments in sequence equal each other."
@@ -529,7 +541,7 @@
               db'       (assoc db :t prevT)
               prev-vals (<? (dbproto/-search db' [(:sid ?ctx) (:pid ?ctx)])) ;; could be multi-cardinality, only take first one (consider throwing?)
               fuel      (count prev-vals)
-              pO        (some-> (first prev-vals)
+              pO        (some-> (clojure.core/first prev-vals)
                                 (#(let [f %] (flake/o f))))]
           ;predName (dbproto/-p-prop db :name (:pid ?ctx))
           ;pOQuery  {:select [predName]
@@ -610,7 +622,7 @@
                     :from   (:auth_id ?ctx)
                     :opts   {}}
             [res fuel] (<? (query (:db ?ctx) query'))
-            user   (first (get-in res ["_user/_auth" "_id"]))]
+            user   (clojure.core/first (get-in res ["_user/_auth" "_id"]))]
         [user fuel])
       (catch* e (function-error e "?user_id-from-auth" "Context Object")))))
 
@@ -672,7 +684,7 @@
           [res _] (<? (query db {:select "?current-val"
                                  :where  [[sid p-name "?current-val"]]
                                  :opts   {}}))
-          current-val (first res)]
+          current-val (clojure.core/first res)]
       (if (= current-val compare-val)
         new-val
         (throw (ex-info (clojure.core/str "The current value: " current-val " does not match the comparison value: " compare-val ".")

@@ -39,8 +39,8 @@
   "
   [first-s rest-where supplied-vars]
   (loop [[{:keys [type s p o] :as where-smt} & r] rest-where
-         required-p #{}                                     ;; set of 'p' values that are going to be required for a subject to have
-         filter-map {}]                                     ;; key 'p' value, val is list of filtering fns
+         required-p #{} ;; set of 'p' values that are going to be required for a subject to have
+         filter-map {}] ;; key 'p' value, val is list of filtering fns
     (if where-smt
       (when (and (= :tuple type)
                  (= first-s (:variable s)))

@@ -7,18 +7,19 @@
   "keywords" : [ "fluree", "nodejs" ],
   "author" : "Fluree PBC (https://flur.ee)",
   "requires" : true,
-  "version" : "2.0.0-alpha4",
+  "version" : null,
   "main" : "flureenjs.js",
   "dependencies" : {
-    "source-map-support" : "0.5.21",
-    "axios" : "0.27.2",
-    "ws" : "8.8.0",
-    "js-sha3" : "0.8.0",
-    "scrypt-js" : "3.0.1",
-    "@fluree/sjcl" : "1.0.8-3",
-    "form-data" : "4.0.0",
-    "bufferutil" : "4.0.6",
-    "utf-8-validate" : "5.0.9",
-    "@cljs-oss/module-deps" : "1.1.1"
+    "source-map-support" : "^0.5.21",
+    "axios" : "^0.27.2",
+    "ws" : "^8.8.0",
+    "js-sha3" : "^0.8.0",
+    "scrypt-js" : "^3.0.1",
+    "@fluree/sjcl" : "^1.0.8-3",
+    "form-data" : "^4.0.0",
+    "seedrandom" : "^3.0.5",
+    "bufferutil" : "^4.0.7",
+    "utf-8-validate" : "^5.0.10",
+    "@cljs-oss/module-deps" : "^1.1.1"
   }
 }

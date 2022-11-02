@@ -1,4 +1,5 @@
 (ns fluree.db.method.ipfs.core
+  (:refer-clojure :exclude [read])
   (:require [fluree.db.method.ipfs.xhttp :as ipfs]
             [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
@@ -9,41 +10,39 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn default-commit-fn
-  "Default push function for IPFS"
-  [ipfs-endpoint]
-  (fn [data]
-    (go-try
-      (let [json (if (string? data)
-                   ;; if a string, assume already in JSON.
-                   data
-                   ;; all other data we'd commit will be a data structure, normalize
-                   (json-ld/normalize-data data))
-            res  (<? (ipfs/add ipfs-endpoint json))
-            {:keys [name]} res]
-        (when-not name
-          (throw (ex-info (str "IPFS publish error, unable to retrieve IPFS name. Response object: " res)
-                          {:status 500 :error :db/push-ipfs})))
-        (assoc res :address (str "fluree:ipfs://" name))))))
+(defn commit
+  "Push to IPFS"
+  [ipfs-endpoint data]
+  (go-try
+   (let [json (if (string? data)
+                ;; if a string, assume already in JSON.
+                data
+                ;; all other data we'd commit will be a data structure, normalize
+                (json-ld/normalize-data data))
+         res  (<? (ipfs/add ipfs-endpoint json))
+         {:keys [name]} res]
+     (when-not name
+       (throw (ex-info (str "IPFS publish error, unable to retrieve IPFS name. Response object: " res)
+                       {:status 500 :error :db/push-ipfs})))
+     (assoc res :address (str "fluree:ipfs://" name)))))
 
-
-(defn default-read-fn
-  "Default reading function for IPFS. Reads either IPFS or IPNS docs.
-  Reads JSON only, returning clojure map with optional keywordize-keys? (default false)."
-  ([ipfs-endpoint] (default-read-fn ipfs-endpoint false))
-  ([ipfs-endpoint keywordize-keys?]
-   (fn [file-key]
-     (when-not (string? file-key)
-       (throw (ex-info (str "Invalid file key, cannot read: " file-key)
+(defn read
+  "Reads either IPFS or IPNS docs. Reads JSON only, returning clojure map with
+  optional keywordize-keys? (default false)."
+  ([ipfs-endpoint file-key]
+   (read ipfs-endpoint file-key false))
+  ([ipfs-endpoint file-key keywordize-keys?]
+   (when-not (string? file-key)
+     (throw (ex-info (str "Invalid file key, cannot read: " file-key)
+                     {:status 500 :error :db/invalid-commit})))
+   (let [[address path] (str/split file-key #"://")
+         [type method] (str/split address #":")
+         ipfs-cid (str "/" method "/" path)]
+     (when-not (and (= "fluree" type)
+                    (#{"ipfs" "ipns"} method))
+       (throw (ex-info (str "Invalid file type or method: " file-key)
                        {:status 500 :error :db/invalid-commit})))
-     (let [[address path] (str/split file-key #"://")
-           [type method] (str/split address #":")
-           ipfs-cid (str "/" method "/" path)]
-       (when-not (and (= "fluree" type)
-                      (#{"ipfs" "ipns"} method))
-         (throw (ex-info (str "Invalid file type or method: " file-key)
-                         {:status 500 :error :db/invalid-commit})))
-       (ipfs/cat ipfs-endpoint ipfs-cid keywordize-keys?)))))
+     (ipfs/cat ipfs-endpoint ipfs-cid keywordize-keys?))))
 
 
 
@@ -58,7 +57,7 @@
 (defn push!
   "Publishes ledger metadata document (ledger root) to IPFS and recursively updates any
   directory files, culminating in an update to the IPNS address."
-  [{:keys [ipfs-endpoint] :as _conn} address commit-map]
+  [ipfs-endpoint address commit-map]
   (go-try
     (let [{:keys [meta db ledger-state]} commit-map
           {:keys [t]} db

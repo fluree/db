@@ -44,14 +44,16 @@
   "Returns true if provided variable exists as a variable
   somewhere within the where clause."
   [variable where]
-  (some (fn [{:keys [s o optional bind union] :as _where-smt}]
+  (log/debug "variable-in-where? variable:" variable "where:" where)
+  (some (fn [{:keys [s o type] :as where-smt}]
           (or (= (:variable o) variable)
               (= (:variable s) variable)
-              (cond
-                optional (map #(variable-in-where? variable %) optional)
-                bind (contains? (-> bind keys set) variable)
-                union (or (variable-in-where? variable (first union))
-                          (variable-in-where? variable (second union))))))
+              (case type
+                :optional (variable-in-where? variable (:where where-smt))
+                :binding (= (:variable where-smt) variable)
+                :union (or (variable-in-where? variable (first (:where where-smt)))
+                           (variable-in-where? variable (second (:where where-smt))))
+                nil)))
         where))
 
 
@@ -116,14 +118,27 @@
   If the filter fn uses a var not found in a where statement, throws
   an exception"
   [where {:keys [variable] :as filter-fn-map}]
-  (loop [[{:keys [o] :as where-smt} & r] where
+  (log/debug "add-filter-where where:" where "- filter-fn-map:" filter-fn-map)
+  (loop [[{:keys [o type] :as where-smt} & r] where
          found-var? false
          where*     []]
+    (log/debug "add-filter-where loop where-smt:" where-smt "- found-var?:" found-var?
+               "- where*:" where*)
     (if where-smt
-      (let [match? (= variable (:variable o))]
-        (if match?
+      (cond
+        (= :optional type)
+        (do
+          (log/debug "add-filter-where loop handling optional")
+          (recur (concat (:where where-smt) r) found-var? (conj where* where-smt)))
+
+        (= variable (:variable o))
+        (do
+          (log/debug "add-filter-where loop found match")
           (recur r true (conj where* (assoc where-smt :o {:variable variable
-                                                          :filter   filter-fn-map})))
+                                                          :filter   filter-fn-map}))))
+        :else
+        (do
+          (log/debug "add-filter-where loop default case")
           (recur r found-var? (conj where* where-smt))))
       (if found-var?
         where*
@@ -410,7 +425,7 @@
 
 (defn parse-where
   "Parses where clause"
-  [db {:keys [where] :as _query-map'} supplied-vars context]
+  [db {:keys [where] :as _query-map} supplied-vars context]
   (when-not (sequential? where)
     (throw (ex-info (str "Invalid where clause, must be a vector of tuples and/or maps: " where)
                     {:status 400 :error :db/invalid-query})))
@@ -530,7 +545,7 @@
   (let [{:keys [variable] :as parsed-order-by} (parse-order-by order-by)]
     (when (and variable (not (variable-in-where? variable where)))
       (throw (ex-info (str "Order by specifies a variable, " variable
-                           " that is used in a where statement.")
+                           " that is not used in a where statement.")
                       {:status 400 :error :db/invalid-query})))
     (assoc parsed-query :order-by parsed-order-by)))
 
@@ -559,7 +574,7 @@
 (defn get-limit
   "Extracts limit, if available, and verifies it is a positive integer.
   Uses Integer/max as default if not present."
-  [{:keys [limit opts] :as _query-map'}]
+  [{:keys [limit opts] :as _query-map}]
   (let [limit* (or limit
                    (:limit opts)
                    util/max-integer)]
@@ -571,7 +586,7 @@
 (defn get-offset
   "Extracts offset, if specified, and verifies it is a positive integer.
   Uses 0 as default if not present."
-  [{:keys [offset opts] :as _query-map'}]
+  [{:keys [offset opts] :as _query-map}]
   (let [offset* (or offset
                     (:offset opts)
                     0)]
@@ -583,7 +598,7 @@
 (defn get-depth
   "Extracts depth setting from query, if specified. If not returns
   default depth of 0"
-  [{:keys [depth opts] :as _query-map'}]
+  [{:keys [depth opts] :as _query-map}]
   (let [depth* (or depth
                    (:depth opts)
                    0)]
@@ -595,9 +610,9 @@
 
 (defn get-max-fuel
   "Extracts max-fuel from query if specified, or uses Integer/max a default."
-  [{:keys [fuel max-fuel] :as query-map'}]
+  [{:keys [fuel max-fuel] :as query-map}]
   (when max-fuel
-    (log/info "Deprecated max-fuel used in query: " query-map'))
+    (log/info "Deprecated max-fuel used in query: " query-map))
   (let [max-fuel (cond
                    (number? max-fuel)
                    max-fuel
@@ -838,8 +853,8 @@
                         (remove nil?))
         out-vars-s (into (set out-vars) order-by)
         flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
-        others-out (filter out-vars-s others)               ;; only keep other vars needed in final output
-        ]
+        others-out (filter out-vars-s others)]               ;; only keep other vars needed in final output
+        
     (into [] (concat flake-out others-out))))
 
 
@@ -1118,7 +1133,8 @@
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
   [db {:keys [opts prettyPrint filter context depth
-              orderBy order-by groupBy group-by] :as query-map'} supplied-vars]
+              orderBy order-by groupBy group-by] :as query-map} supplied-vars]
+  (log/debug "parse* query-map:" query-map)
   (let [rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
@@ -1127,20 +1143,26 @@
         json-ld-db?       (= :json-ld (dbproto/-db-type db))
         context*          (when json-ld-db?
                             (if (:js? opts*)
-                              (json-ld/parse-context (get-in db [:schema :context-str]) context)
-                              (json-ld/parse-context (get-in db [:schema :context]) context)))
+                              (json-ld/parse-context
+                                (get-in db [:schema :context-str]) context)
+                              (json-ld/parse-context
+                                (get-in db [:schema :context]) context)))
         order-by*         (or orderBy order-by (:orderBy opts))
         group-by*         (or groupBy group-by (:groupBy opts))
         parsed            (cond-> {:json-ld?      json-ld-db?
                                    :strategy      :legacy
                                    :context       context*
                                    :rel-binding?  rel-binding?
-                                   :where         (parse-where db query-map' supplied-var-keys context*)
-                                   :opts          opts*
-                                   :limit         (get-limit query-map') ;; limit can be a primary key, or within :opts
-                                   :offset        (get-offset query-map') ;; offset can be a primary key, or within :opts
-                                   :depth         (get-depth query-map') ;; for query crawling, default depth to crawl
-                                   :fuel          (get-max-fuel query-map')
+                                   :where         (parse-where db query-map supplied-var-keys context*)
+                                   :opts          (if (not (nil? (:parseJSON opts*)))
+                                                    (-> opts*
+                                                        (assoc :parse-json? (:parseJSON opts*))
+                                                        (dissoc :parseJSON))
+                                                    opts*)
+                                   :limit         (get-limit query-map) ;; limit can be a primary key, or within :opts
+                                   :offset        (get-offset query-map) ;; offset can be a primary key, or within :opts
+                                   :depth         (get-depth query-map) ;; for query crawling, default depth to crawl
+                                   :fuel          (get-max-fuel query-map)
                                    :supplied-vars supplied-var-keys
                                    :pretty-print  (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
                                                     prettyPrint
@@ -1150,7 +1172,7 @@
                                   order-by* (add-order-by order-by*)
                                   group-by* (add-group-by group-by*)
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
-                                  true (json-ld-select/parse query-map' db)
+                                  true (json-ld-select/parse query-map db)
                                   true (add-where-meta))]
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))

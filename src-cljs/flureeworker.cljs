@@ -28,13 +28,12 @@
   "Parses a (nested) JavaScript object into a Clojure map"
   [obj]
   (if (goog.isObject obj)
-    (-> (fn [result key]
-          (let [v (goog.object/get obj key)]
-            (if (= "function" (goog/typeOf v))
-              result
-              (assoc result (keyword key) (obj->clj v)))))
-
-        (reduce {} (.getKeys goog/object obj)))
+    (reduce (fn [result key]
+             (let [v (goog.object/get obj key)]
+               (if (= "function" (goog/typeOf v))
+                 result
+                 (assoc result (keyword key) (obj->clj v)))))
+            {} (goog.object/getKeys obj))
     obj))
 
 

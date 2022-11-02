@@ -1,4 +1,4 @@
-FROM clojure:openjdk-11-tools-deps-1.11.1.1149-slim-bullseye
+FROM clojure:temurin-11-tools-deps-1.11.1.1165-bullseye-slim
 
 RUN mkdir -p /usr/src/flureedb
 WORKDIR /usr/src/flureedb

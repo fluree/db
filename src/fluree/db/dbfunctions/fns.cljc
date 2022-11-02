@@ -1,6 +1,6 @@
 (ns fluree.db.dbfunctions.fns
   (:refer-clojure :exclude [max min get inc dec + - * / quot mod == rem contains? get-in < <= > >=
-                            boolean re-find and or count str nth rand nil? hash-set empty? not uuid subs not=])
+                            boolean re-find and or count str nth first rand nil? hash-set empty? not uuid subs not=])
   (:require [fluree.db.dbfunctions.internal :as fdb]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json]
@@ -23,14 +23,23 @@
   "Coerces args that may be core async channels into values.
   Returns exception instead of args if any exception occurs during resolution."
   [args]
+  ;; This fn looks more complicated than it needs to be at first glance, but other simpler forms
+  ;; I've tried run into go's fn boundary. Obviously something like `reduce` would since you'd be
+  ;; taking from the channel inside the anonymous fn arg. But even `for` exhibits this issue.
+  ;; Possibly because it macroexpands into an anon fn? Not sure. - WSM 2022-09-14
   (go-try
-    (loop [[arg & r] args
-           acc []]
-      (if-not arg
-        acc
-        (if (channel? arg)
-          (recur r (conj acc (<? arg)))
-          (recur r (conj acc arg)))))))
+    ;; This loop is controlled by the arg count b/c valid args can be false, nil, etc. so
+    ;; you don't want to accidentally treat that as an "out of args" condition.
+    (let [arg-count (clojure.core/count args)]
+      (loop [i 0
+             acc []]
+        (if (clojure.core/= i arg-count)
+          acc
+          (let [arg (clojure.core/nth args i)
+                next-i (clojure.core/inc i)]
+            (if (channel? arg)
+              (recur next-i (conj acc (<? arg)))
+              (recur next-i (conj acc arg)))))))))
 
 (defn- stack
   "Returns the current stack."
@@ -69,6 +78,20 @@
           res   (fdb/nth coll key)
           cost  (clojure.core/+ 9 (clojure.core/count coll))
           entry [{:function "nth" :arguments [coll key] :result res} cost]]
+      (add-stack ?ctx entry)
+      res)))
+
+(defn first
+  {:doc "Returns the first item in a collection"
+   :fdb/spec nil
+   :fdb/cost 10}
+  [?ctx coll]
+  (go-try
+    (let [coll (extract coll)
+          coll (if (set? coll) (vec coll) coll)
+          res (fdb/first coll)
+          cost 10
+          entry [{:function "first" :arguments [coll] :result res} cost]]
       (add-stack ?ctx entry)
       res)))
 
@@ -279,7 +302,7 @@
           pred     (extract pred)
           subject' (if (vector? subject)
                      (if (= 1 (clojure.core/count subject))
-                       (first subject)
+                       (clojure.core/first subject)
                        subject)
                      subject)
           res      (cond
@@ -335,7 +358,7 @@
           path     (extract path)
           subject' (if (vector? subject)
                      (if (= 1 (clojure.core/count subject))
-                       (first subject)
+                       (clojure.core/first subject)
                        subject)
                      subject)
           sid?     (int? subject')
@@ -390,7 +413,9 @@
   [?ctx & args]
   (go-try
     (let [args  (<? (coerce-args args))
-          args' (if (clojure.core/and (= 1 (clojure.core/count args)) (coll? (first args))) (first args) args)
+          args' (if (clojure.core/and (= 1 (clojure.core/count args)) (coll? (clojure.core/first args)))
+                  (clojure.core/first args)
+                  args)
           res   (apply fdb/hash-set args')
           cost  (clojure.core/+ 9 (clojure.core/count [args']))
           entry [{:function "hash-set" :arguments [args'] :result res} cost]]
