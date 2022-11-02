@@ -237,8 +237,11 @@
 
 (defn expand-iri
   "Expands an IRI from the db's context."
-  [{:keys [context] :as db} iri]
-  (json-ld/expand-iri iri context))
+  ([{:keys [schema] :as _db} iri]
+   (json-ld/expand-iri iri (:context schema)))
+  ([{:keys [schema] :as _db} iri provided-context]
+   (->> (json-ld/parse-context (:context schema) provided-context)
+        (json-ld/expand-iri iri))))
 
 (defn iri->sid
   "Returns subject id or nil if no match.
@@ -266,9 +269,7 @@
 
                         ;; assume iri
                         (string? ident)
-                        (some-> (<? (query-range/index-range db :post = [const/$iri ident]))
-                                first
-                                flake/s)
+                        (<? (iri->sid db ident))
 
                         ;; assume iri that needs to be expanded (should we allow this, or should it be expanded before getting this far?)
                         (keyword? ident)
@@ -434,6 +435,8 @@
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
   (-p-prop [this property predicate] (graphdb-p-prop this property predicate))
+  (-expand-iri [this compact-iri] (expand-iri this compact-iri))
+  (-expand-iri [this compact-iri context] (expand-iri this compact-iri context))
   (-tag [this tag-id] (graphdb-tag this tag-id))
   (-tag [this tag-id pred] (graphdb-tag this tag-id pred))
   (-tag-id [this tag-name] (graphdb-tag-id this tag-name))

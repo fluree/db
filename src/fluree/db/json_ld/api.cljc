@@ -9,8 +9,9 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.dbproto :as db-proto]
-            [fluree.db.util.log :as log])
-  (:refer-clojure :exclude [merge load]))
+            [fluree.db.util.log :as log]
+            [fluree.db.query.range :as query-range])
+  (:refer-clojure :exclude [merge load range]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -232,3 +233,39 @@
   [db query]
   (let [res-chan (query-api/query-async db query)]
     (promise-wrap res-chan)))
+
+(defn range
+  "Performs a range scan against the specified index using test functions
+  of >=, <=, >, <"
+  ;; TODO - assert index is valid index type
+  ([db index test match]
+   (promise-wrap
+     (query-range/index-range db index test match)))
+  ([db index start-test start-match end-test end-match]
+   (promise-wrap
+     (query-range/index-range db index start-test start-match end-test end-match))))
+
+(defn slice
+  "Like range, but returns all flakes that match the supplied flake parts."
+  [db index match]
+  (promise-wrap
+    (query-range/index-range db index = match)))
+
+(defn expand-iri
+  "Expands given IRI with the default database context, or provided context."
+  ([db compact-iri]
+   (db-proto/-expand-iri db compact-iri))
+  ([db compact-iri context]
+   (db-proto/-expand-iri db compact-iri context)))
+
+(defn internal-id
+  "Returns the internal Fluree integer id for a given IRI.
+  This can be used for doing range scans, slices and for other
+  more advanced needs.
+
+  Returns promise"
+  [db iri]
+  (promise-wrap
+    (->> (expand-iri db iri)
+         (db-proto/-subid db))))
+
