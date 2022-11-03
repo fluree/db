@@ -112,9 +112,7 @@
                          selectOne :selectOne
                          selectDistinct :selectDistinct)
         select-smt (or select selectOne selectDistinct)
-        json-ld?   (= :json-ld (dbproto/-db-type db))
-        multi-subj (when (and (sequential? from)
-                              (or json-ld? (every? util/subj-ident? from)))
+        multi-subj (when (sequential? from)
                      from)
         vars*      (if multi-subj
                      (assoc vars "?__subj" from)
@@ -125,17 +123,14 @@
                      [["?s" "_id" "?__subj"]]
 
                      (string? where)
-                     (if json-ld?
-                       (throw (ex-info "String where queries not allowed for json-ld databases."
-                                       {:status 400 :error :db/invalid-query}))
-                       (cond->> (into-where where)
-                                from (into [["?s" "rdf:type" from]])))
+                     (throw (ex-info "String where queries not allowed for json-ld databases."
+                                     {:status 400 :error :db/invalid-query}))
 
                      ; Single subject - subject _id
                      (number? from)
                      [["?s" "_id" from]]
 
-                     (and json-ld? (or (string? from) (keyword? from)))
+                     (or (string? from) (keyword? from))
                      [["?s" "@id" from]]
 
                      ;; Legacy predicate-based query

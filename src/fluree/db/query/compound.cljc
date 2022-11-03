@@ -130,27 +130,32 @@
 
 (defmethod get-clause-res :tuple
   [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch]
-  (let [out-ch   (async/chan 2)
-        {:keys [s p o idx flake-x-form]} clause
-        {pid :value} p
-        {s-var :variable} s
-        {o-var :variable} o
-        s*       (or (:value s)
-                     (get vars s-var))
-        o*       (or (:value o)
-                     (get vars o-var))
-        opts     (query-range-opts idx t s* pid o*)
-        idx-root (get db idx)
-        novelty  (get-in db [:novelty idx])
-        range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+  (let [out-ch (async/chan 2)]
     (async/go
-      (loop []
-        (let [next-res (async/<! range-ch)]
-          (if next-res
-            (let [next-out (sequence flake-x-form next-res)]
-              (async/>! out-ch next-out)
-              (recur))
-            (async/close! out-ch)))))
+      (let [{:keys [s p o idx flake-x-form]} clause
+            {pid :value} p
+            {s-var :variable, s-val :value} s
+            {o-var :variable} o
+            s*       (if s-val
+                       (if (number? s-val)
+                         s-val
+                         (<? (db-proto/-subid db s-val)))
+                       (get vars s-var))
+            o*       (or (:value o)
+                         (get vars o-var))
+            opts     (query-range-opts idx t s* pid o*)
+            idx-root (get db idx)
+            novelty  (get-in db [:novelty idx])
+            range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+        (if (and s-val (nil? s*))                           ;; this means the iri provided for 's' doesn't exist, close
+          (async/close! out-ch)
+          (loop []
+            (let [next-res (async/<! range-ch)]
+              (if next-res
+                (let [next-out (sequence flake-x-form next-res)]
+                  (async/>! out-ch next-out)
+                  (recur))
+                (async/close! out-ch)))))))
     out-ch))
 
 (defn resolve-where-clause

@@ -899,6 +899,18 @@
                                                   %)))]
     (assoc select :spec spec*)))
 
+(defn update-delete
+  "Updates a delete statement variables with final where clause positions of items."
+  [{:keys [s p o] :as delete} where {group-out-vars :out-vars, :as _group-by}]
+  (let [last-where (last where)
+        out-vars   (or group-out-vars
+                       (:out-vars last-where))
+        {:keys [all]} (:vars last-where)]                   ;; the last where statement has an aggregation of all variables
+    (assoc delete :s (update-position+type s out-vars all)
+                  :p (update-position+type p out-vars all)
+                  :o (update-position+type o out-vars all))))
+
+
 (defn build-order-fn
   "Returns final ordering function that take a single arg, the where results,
   and outputs the sorted where results."
@@ -1091,7 +1103,7 @@
 
 (defn add-where-meta
   "Adds input vars and output vars to each where statement."
-  [{:keys [out-vars where select supplied-vars order-by group-by] :as parsed-query}]
+  [{:keys [out-vars where select delete supplied-vars order-by group-by op-type] :as parsed-query}]
   ;; note: Currently 'p' is always fixed, but that is an imposed limitation - it should be able to be a variable.
   (loop [[{:keys [s p o] :as where-smt} & r] where
          i          0
@@ -1122,12 +1134,36 @@
         (recur r (inc i) vars (conj acc where-smt*)))
       (let [where*    (where-meta-reverse acc out-vars order-by)
             order-by* (update-order-by order-by group-by where*)
-            group-by* (update-group-by group-by where*)
-            select*   (update-select select where* group-by*)]
-        (assoc parsed-query :where where*
-                            :select select*
-                            :order-by order-by*
-                            :group-by group-by*)))))
+            group-by* (update-group-by group-by where*)]
+        (cond-> (assoc parsed-query :where where*
+                                    :order-by order-by*
+                                    :group-by group-by*)
+                (= :select op-type) (assoc :select (update-select select where* group-by*))
+                (= :delete op-type) (assoc :delete (update-delete delete where* group-by*)))))))
+
+(defn parse-delete
+  "Parses delete statement syntax... e.g. from a statement like:
+  {:delete ['?s '?p '?o]
+   :where  [['?s :schema/age 34]
+            ['?s '?p '?o]]}"
+  [{:keys [context] :as parsed-query} {:keys [delete] :as _query-map'} db]
+  (let [[s p o] delete
+        val-map (fn [v iri?]
+                  (if-let [var (q-var->symbol v)]
+                    {:variable var}
+                    {:value (if iri?
+                              (json-ld/expand-iri v context)
+                              v)}))
+        s*      (val-map s true)
+        p*      (let [p* (val-map p true)]
+                  (if-let [p-value (:value p*)]
+                    {:value (pred-id-strict db p-value)}
+                    p*))
+        o*      (val-map o false)]
+    (assoc parsed-query :out-vars (keep :variable [s* p* o*])
+                        :delete {:s s*
+                                 :p p*
+                                 :o o*})))
 
 
 ;; TODO - only capture :select, :where, :limit - need to get others
@@ -1135,7 +1171,17 @@
   [db {:keys [opts prettyPrint filter context depth
               orderBy order-by groupBy group-by] :as query-map} supplied-vars]
   (log/debug "parse* query-map:" query-map)
-  (let [rel-binding?      (sequential? supplied-vars)
+  (let [op-type           (cond
+                            (some #{:select :selectOne :selectReduced :selectDistince} (keys query-map))
+                            :select
+
+                            (contains? query-map :delete)
+                            :delete
+
+                            :else
+                            (throw (ex-info "Invalid query type, not a select or delete type."
+                                            {:status 400 :error :db/invalid-query})))
+        rel-binding?      (sequential? supplied-vars)
         supplied-var-keys (if rel-binding?
                             (-> supplied-vars first keys set)
                             (-> supplied-vars keys set))
@@ -1149,7 +1195,7 @@
                                 (get-in db [:schema :context]) context)))
         order-by*         (or orderBy order-by (:orderBy opts))
         group-by*         (or groupBy group-by (:groupBy opts))
-        parsed            (cond-> {:json-ld?      json-ld-db?
+        parsed            (cond-> {:op-type       op-type
                                    :strategy      :legacy
                                    :context       context*
                                    :rel-binding?  rel-binding?
@@ -1172,7 +1218,8 @@
                                   order-by* (add-order-by order-by*)
                                   group-by* (add-group-by group-by*)
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
-                                  true (json-ld-select/parse query-map db)
+                                  (= :select op-type) (json-ld-select/parse query-map db)
+                                  (= :delete op-type) (parse-delete query-map db)
                                   true (add-where-meta))]
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))

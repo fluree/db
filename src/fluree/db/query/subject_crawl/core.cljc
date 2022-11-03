@@ -17,14 +17,8 @@
 
   This strategy is only deployed if there is a single selection graph crawl,
   so this assumes this case is true in code."
-  [db {:keys [select opts json-ld?] :as _parsed-query}]
-  (if json-ld?
-    (-> select :spec first :spec)
-    (let [select-smt (-> select
-                         :select
-                         first
-                         :selection)]
-      (parse-db db select-smt opts))))
+  [db {:keys [select opts] :as _parsed-query}]
+  (-> select :spec first :spec))
 
 (defn relationship-binding
   [{:keys [collection? vars] :as opts}]
@@ -71,7 +65,7 @@
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
   [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by
-              json-ld? compact-fn opts] :as parsed-query}]
+              compact-fn opts] :as parsed-query}]
   (log/debug "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
         f-where     (first where)
@@ -81,9 +75,7 @@
         cache       (volatile! {})
         fuel-vol    (volatile! 0)
         select-spec (retrieve-select-spec db parsed-query)
-        result-fn   (if json-ld?
-                      (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
-                      (partial legacy-resp/flakes->res db cache fuel-vol fuel select-spec opts))
+        result-fn   (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
                      :collection?   collection?
