@@ -753,9 +753,13 @@
    :fdb/spec nil
    :fdb/cost 10}
   [?ctx x]
-  (let [res (boolean (:delete ?ctx))]
-    (add-stack ?ctx [{:function "?retraction" :arguments "?ctx" :result res} 10])
-    res))
+  (cond (contains? ?ctx :delete)
+        (let [res (:delete ?ctx)
+              entry [{:function "?retraction" :arguments "?ctx" :result res} 10]]
+          (add-stack ?ctx entry)
+          res)
+        :else
+        (raise ?ctx "Cannot access ?retraction from this function interface")))
 
 (defn ?auth_id
   {:doc      "Gets current auth _id."
