@@ -15,7 +15,8 @@
             #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.analytical-parse :as parse]
-            [fluree.db.dbproto :as db-proto]))
+            [fluree.db.dbproto :as db-proto]
+            [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -45,15 +46,22 @@
                             (passthrough-fn in-item))
                 {pid :value} p
                 sid       (nth in-item in-n)
-                opts      (query-range-opts idx t sid pid nil)
-                in-ch     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
-            ;; pull all subject results off chan, push on out-ch
-            (loop []
-              (when-let [next-chunk (async/<! in-ch)]
-                (let [result (cond->> (sequence flake-x-form next-chunk)
-                                      pass-vals (map #(concat % pass-vals)))]
-                  (async/>! out-ch result)
-                  (recur))))
+                sid*      (if (vector? sid)
+                            (let [[sid-val datatype] sid]
+                              ;; in a mixed datatype response (e.g. some IRIs, some strings), need to filter out any non-IRI
+                              (when (= datatype const/$xsd:anyURI)
+                                sid-val))
+                            sid)]
+            (when sid
+              (let [opts  (query-range-opts idx t sid* pid nil)
+                    in-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+                ;; pull all subject results off chan, push on out-ch
+                (loop []
+                  (when-let [next-chunk (async/<! in-ch)]
+                    (let [result (cond->> (sequence flake-x-form next-chunk)
+                                          pass-vals (map #(concat % pass-vals)))]
+                      (async/>! out-ch result)
+                      (recur))))))
             (recur r))
           (async/close! out-ch))))
     out-ch))
