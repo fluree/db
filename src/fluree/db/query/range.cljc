@@ -92,13 +92,11 @@
   [db test parts]
   (go-try
     (let [[s p o t op m] parts
-          s'       (<? (resolve-subid db s))
-          o-ident? (util/pred-ident? o)
-          o'       (if o-ident?
-                     (<? (dbproto/-subid db o))
-                     o)
-          m'       (or m (if (identical? >= test) util/min-integer util/max-integer))
-          dt       (when o-ident? const/$xsd:anyURI)]
+          s' (<? (resolve-subid db s))
+          [o' dt] (if (vector? o)
+                    [(first o) (second o)]
+                    [o nil])
+          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
       (flake/create s' p o' dt t op m'))))
 
 (defn resolved-leaf?

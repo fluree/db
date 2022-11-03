@@ -8,6 +8,7 @@
   (-c-prop [db property collection] "Returns schema property for a collection.")
   (-p-prop [db property predicate] "Returns the property specified for the given predicate.")
   (-class-prop [db property class] "Return class properties")
+  (-expand-iri [db iri] [db iri context])
   ;; following return async chans
   (-tag [db tag-id] [db tag-id pred] "Returns resolved tag, shortens namespace if pred provided.")
   (-tag-id [db tag-name] [db tag-name pred] "Returns the tag sid. If pred provided will namespace tag if not already.")
