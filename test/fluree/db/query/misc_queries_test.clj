@@ -2,17 +2,13 @@
   (:require
     [clojure.string :as str]
     [clojure.test :refer :all]
-    [fluree.db.test-fixtures :as test]
+    [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.util.log :as log]))
 
-
-(use-fixtures :once test/test-system)
-
-
-(deftest s+p+o-full-db-queries
+(deftest ^:integration s+p+o-full-db-queries
   (testing "Query that pulls entire database."
-    (let [conn   test/memory-conn
+    (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
           db     @(fluree/stage
                     ledger

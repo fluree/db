@@ -1,14 +1,12 @@
 (ns fluree.db.transact.delete-test
   (:require [clojure.test :refer :all]
-            [fluree.db.test-fixtures :as test]
+            [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
 
-(use-fixtures :once test/test-system)
-
-(deftest deleting-data
+(deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
-    (let [conn             test/memory-conn
+    (let [conn             (test-utils/create-conn)
           ledger           @(fluree/create conn "tx/delete" {:context {:ex "http://example.org/ns/"}})
           db               @(fluree/stage
                               ledger
