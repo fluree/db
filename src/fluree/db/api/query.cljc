@@ -373,12 +373,8 @@
   Returns core async channel containing result."
   [sources flureeQL]
   (go-try
-    (let [{:keys [select selectOne selectDistinct selectReduced from where construct block prefixes opts t]} flureeQL
-          _             (when-not (->> [select selectOne selectDistinct selectReduced]
-                                       (remove nil?) count (#(= 1 %)))
-                          (throw (ex-info (str "Only one type of select-key (select, selectOne, selectDistinct, selectReduced) allowed. Provided: " (pr-str flureeQL))
-                                          {:status 400
-                                           :error  :db/invalid-query})))
+    (let [{:keys [select selectOne selectDistinct selectReduced construct
+                  from where block prefixes opts t]} flureeQL
           db            (if (async-util/channel? sources)   ;; only support 1 source currently
                           (<? sources)
                           sources)
@@ -394,7 +390,8 @@
           opts*         (assoc opts :sources source-opts
                                     :max-fuel (or (:fuel opts) 1000000)
                                     :fuel fuel)
-          _             (when-not (and (or select selectOne selectDistinct selectReduced construct) (or from where))
+          _             (when-not (and (or select selectOne selectDistinct selectReduced construct)
+                                       (or from where))
                           (throw (ex-info (str "Invalid query.")
                                           {:status 400
                                            :error  :db/invalid-query})))

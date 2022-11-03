@@ -13,7 +13,11 @@
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.datatype :as datatype]
-            [fluree.db.json-ld.shacl :as shacl])
+            [fluree.db.json-ld.shacl :as shacl]
+            [fluree.db.query.analytical-parse :as q-parse]
+            [fluree.db.query.compound :as compound]
+            [clojure.core.async :as async]
+            [fluree.db.dbproto :as db-proto])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -58,19 +62,6 @@
                          (flake/create type-sid const/$iri class-iri const/$xsd:string t true nil)
                          (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
         [class-sids class-flakes]))))
-
-(defn process-retractions
-  "Processes all retractions at once from set of [sid pid] registered
-  in retractions volatile! while creating new flakes."
-  [{:keys [db-before retractions t] :as tx-state}]
-  (go-try
-    (loop [acc []
-           [[sid pid] & r] @retractions]
-      (if sid
-        (->> (<? (query-range/index-range db-before :spot = [sid pid]))
-             (map #(flake/flip-flake % t))
-             (recur r))
-        acc))))
 
 
 (defn- new-pid
@@ -389,9 +380,8 @@
               (vocab/reset-shapes (:schema db-after)))
             db-after))))))
 
-(defn stage
-  "Stages changes, but does not commit.
-  Returns async channel that will contain updated db or exception."
+(defn insert
+  "Performs insert transaction"
   [{:keys [schema] :as db} json-ld opts]
   (go-try
     (let [tx-state (->tx-state db opts)
@@ -404,3 +394,54 @@
                        (validate-rules tx-state)
                        <?)]
       db*)))
+
+;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
+(defn delete
+  "Executes a delete statement"
+  [db max-fuel json-ld]
+  (go-try
+    (let [{:keys [delete] :as parsed-query} (q-parse/parse db json-ld)
+          fuel          (volatile! 0)
+          error-ch      (async/chan)
+          where-ch      (compound/where parsed-query error-ch fuel max-fuel db)
+          where-results (loop [results []]
+                          (if-let [next-res (async/<! where-ch)]
+                            (recur (into results next-res))
+                            results))
+          {:keys [db-before t] :as tx-state} (->tx-state db nil)
+          {:keys [s p o]} delete
+          {s-value :value, s-in-n :in-n} s
+          {p-value :value, p-in-n :in-n} p
+          {o-value :value, o-in-n :in-n} o
+          s-value*      (when s-value
+                          (if (number? s-value)
+                            s-value
+                            (<? (db-proto/-subid db s-value true))))
+          ;; turn the query results into final triples that need to get retracted
+          triples       (mapv (fn [result-item]
+                                [(or s-value* (nth result-item s-in-n))
+                                 (or p-value (nth result-item p-in-n))
+                                 (or o-value (nth result-item o-in-n))])
+                              where-results)
+          flakes        (loop [[triple & r] triples
+                               flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
+                          (if triple
+                            (let [flake (->> (<? (query-range/index-range db-before :spot = triple))
+                                             (map #(flake/flip-flake % t)))]
+                              (recur r (into flakes flake)))
+                            flakes))]
+      (-> flakes
+          (final-db tx-state)
+          <?
+          (validate-rules tx-state)
+          <?))))
+
+
+(defn stage
+  "Stages changes, but does not commit.
+  Returns async channel that will contain updated db or exception."
+  [db json-ld opts]
+  (if (and (contains? json-ld :delete)
+           (contains? json-ld :where))
+    (delete db util/max-integer json-ld)
+    (insert db json-ld opts)))

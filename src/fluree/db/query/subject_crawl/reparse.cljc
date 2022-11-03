@@ -114,10 +114,11 @@
   e.g.
   {:select {?subjects ['*']
    :where [...]}"
-  [parsed-query]
-  (when (and (subject-crawl? parsed-query)
+  [{:keys [op-type order-by group-by] :as parsed-query}]
+  (when (and (= :select op-type)
+             (subject-crawl? parsed-query)
              (simple-subject-crawl? parsed-query)
-             (not (:group-by parsed-query))
-             (not= :variable (some-> parsed-query :order-by :type)))
+             (not group-by)
+             (not= :variable (:type order-by)))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
