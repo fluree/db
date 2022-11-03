@@ -6,7 +6,7 @@
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.util.log :as log]))
 
-(deftest simple-compound-queries
+(deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/compounda")

@@ -4,7 +4,7 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
 
-(deftest retracting-data
+(deftest ^:integration retracting-data
   (testing "Retractions of individual properties and entire subjects."
     (let [conn           (test-utils/create-conn)
           ledger         @(fluree/create conn "tx/retract")

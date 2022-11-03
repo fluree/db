@@ -4,7 +4,7 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
 
-(deftest json-ld-basic-query
+(deftest ^:integration json-ld-basic-query
   (testing "json-ld"
     (let [conn   (test-utils/create-conn)
           movies (test-utils/load-movies conn)
@@ -76,7 +76,7 @@
                                                                                  :rdf/type    [:schema/Person],
                                                                                  :schema/name "Douglas Adams"}}}))))))))
 
-(deftest json-ld-rdf-type-query
+(deftest ^:integration json-ld-rdf-type-query
   (testing "json-ld rdf type queries"
     (let [conn   (test-utils/create-conn)
           movies (test-utils/load-movies conn)
@@ -94,7 +94,7 @@
               "Standard bootstrap data isn't matching."))))))
 
 
-(deftest json-ld-list-order-preservation
+(deftest ^:integration json-ld-list-order-preservation
   (testing "json-ld @container @list option"
     (let [conn   (test-utils/create-conn)
           movies (test-utils/load-movies conn)]

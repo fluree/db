@@ -4,7 +4,7 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
 
-(deftest subclass-test
+(deftest ^:integration subclass-test
   (testing "Subclass queries work."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subclass")

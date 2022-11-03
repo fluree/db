@@ -6,7 +6,7 @@
             [fluree.db.util.core :as util]
             [clojure.string :as str]))
 
-(deftest using-pre-defined-types-as-classes
+(deftest ^:integration using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
     (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "class/testing")
@@ -30,7 +30,7 @@
                :schema/description "Now a new subject uses MyClass as a Class"}])))))
 
 
-(deftest shacl-cardinality-constraints
+(deftest ^:integration shacl-cardinality-constraints
   (testing "shacl minimum and maximum cardinality"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/a")
@@ -88,7 +88,7 @@
           "basic rdf:type query response not correct"))))
 
 
-(deftest shacl-datatype-constraings
+(deftest ^:integration shacl-datatype-constraings
   (testing "shacl datatype errors"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b")
@@ -141,7 +141,7 @@
           "basic rdf:type query response not correct"))))
 
 
-(deftest shacl-closed-shape
+(deftest ^:integration shacl-closed-shape
   (testing "shacl closed shape"
     (let [conn          (test-utils/create-conn)
           ledger        @(fluree/create conn "shacl/c")
