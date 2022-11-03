@@ -12,14 +12,14 @@
   (with-open [r (-> resource-path io/resource io/reader PushbackReader.)]
     (edn/read r)))
 
-(def default-did (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
-
 (defn create-conn
   ([]
    (create-conn {}))
   ([{:keys [context did]
-     :or   {context (load-edn-resource "default_context.edn")
-            did     default-did}}]
+     :or   {context (load-edn-resource "default-context.edn")
+            did     (-> "default-dev-private-key.edn"
+                        load-edn-resource
+                        did/private->did-map)}}]
    @(fluree/connect-memory {:defaults {:context context
                                        :did     did}})))
 
