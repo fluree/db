@@ -1,17 +1,14 @@
 (ns fluree.db.shacl.shacl-basic-test
   (:require [clojure.test :refer :all]
-            [fluree.db.test-fixtures :as test]
+            [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]
             [fluree.db.util.core :as util]
             [clojure.string :as str]))
 
-
-(use-fixtures :once test/test-system)
-
 (deftest using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
-    (let [conn      test/memory-conn
+    (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "class/testing")
           db1       @(fluree/stage
                        ledger
@@ -35,7 +32,7 @@
 
 (deftest shacl-cardinality-constraints
   (testing "shacl minimum and maximum cardinality"
-    (let [conn         test/memory-conn
+    (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/a")
           user-query   {:context {:ex "http://example.org/ns/"}
                         :select  {'?s [:*]}
@@ -93,7 +90,7 @@
 
 (deftest shacl-datatype-constraings
   (testing "shacl datatype errors"
-    (let [conn         test/memory-conn
+    (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b")
           user-query   {:context {:ex "http://example.org/ns/"}
                         :select  {'?s [:*]}
@@ -146,7 +143,7 @@
 
 (deftest shacl-closed-shape
   (testing "shacl closed shape"
-    (let [conn          test/memory-conn
+    (let [conn          (test-utils/create-conn)
           ledger        @(fluree/create conn "shacl/c")
           user-query    {:context {:ex "http://example.org/ns/"}
                          :select  {'?s [:*]}
