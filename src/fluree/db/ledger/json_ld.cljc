@@ -147,31 +147,6 @@
           (recur r db**))
         db*))))
 
-;; TODO - below is just an event handler for indexing service, ultimately pass message to any listeners for the ledger
-(defn update-index
-  "When indexing is complete, updates index market for DB/ledger"
-  [ledger {:keys [t port] :as event-meta}]
-  (async/go
-    (let [indexed-db (async/<! port)
-          {:keys [stats commit]} indexed-db]
-      (log/warn "update-index - meta: " event-meta)
-
-      )
-
-    )
-  )
-
-(defn register-index-watcher
-  [indexer {:keys [id address] :as ledger}]
-  (let [f (fn [{:keys [event] :as event-meta}]
-            (log/debug "Indexing event for ledger" address ":" event)
-            (case event
-              :index-start :TODO
-              :index-end (update-index ledger event-meta)
-              ;; else
-              (log/warn "Other index event: " event-meta)))]
-    (idx-proto/-add-watch indexer id f)))
-
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
@@ -227,7 +202,6 @@
           db            (if bootstrap?
                           (<? (bootstrap/bootstrap blank-db context* (:id did*)))
                           (bootstrap/blank-db blank-db))]
-      (register-index-watcher indexer ledger)
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
       (when include

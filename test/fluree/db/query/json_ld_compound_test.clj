@@ -2,16 +2,13 @@
   (:require
     [clojure.string :as str]
     [clojure.test :refer :all]
-    [fluree.db.test-fixtures :as test]
+    [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.util.log :as log]))
 
-
-(use-fixtures :once test/test-system)
-
-(deftest simple-compound-queries
+(deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
-    (let [conn   test/memory-conn
+    (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/compounda")
           db     @(fluree/stage
                     ledger
@@ -152,17 +149,6 @@
 
 
 
-      ; using sum aggregate function on multicardinality value
-      ;(is (= @(fluree/query db {:context  {:ex "http://example.org/ns/"}
-      ;                          :select   ['?name '(sum ?favNums)]
-      ;                          :where    [['?s :schema/name '?name]
-      ;                                     ['?s :ex/favNums '?favNums]]
-      ;                          :group-by '?name})
-      ;       [["Alice" 127]
-      ;        ["Brian" 7]
-      ;        ["Cam" 15]])
-      ;    "Sums of favNums by person are not accurate.")
-
       ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
       (is (= @(fluree/query db
                             {:context  {:ex "http://example.org/ns/"}
@@ -179,4 +165,3 @@
               [:ex/cam :ex/friend :ex/brian]
               [:ex/cam :ex/friend :ex/alice]])
           "IRIs are resolved from subj ids, whether s, p, or o vals."))))
-
