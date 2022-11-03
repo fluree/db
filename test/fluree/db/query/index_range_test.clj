@@ -2,17 +2,14 @@
   (:require
     [clojure.string :as str]
     [clojure.test :refer :all]
-    [fluree.db.test-fixtures :as test]
+    [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.util.log :as log]
     [fluree.db.flake :as flake]))
 
-
-(use-fixtures :once test/test-system)
-
-(deftest index-range-scans
+(deftest ^:integration index-range-scans
   (testing "Various index range scans using the API."
-    (let [conn    test/memory-conn
+    (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/index-range"
                                   {:context {:ex "http://example.org/ns/"}})
           db      @(fluree/stage
