@@ -786,7 +786,9 @@
       have-s? :spot
       (and have-p? have-o?) :post
       have-p? :psot
-      have-o? :opst)))
+      have-o? :opst
+      ;; if have none, this is an [?s ?p ?o] query for everything
+      :else :spot)))
 
 (defn rearrange-out-vars
   "Puts pass-through vars (passed through from prior where statements)
