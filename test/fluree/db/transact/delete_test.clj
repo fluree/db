@@ -51,7 +51,7 @@
                             {:select '?name
                              :where  [['?s :schema/name '?name]]})
              ["Jane" "Bob"])
-          "Only Jane and Cam should be left in the db.")
+          "Only Jane and Bob should be left in the db.")
 
       (is (= @(fluree/query db-subj-pred-del
                             {:selectOne [:*]
@@ -59,13 +59,13 @@
              {:id          :ex/bob,
               :rdf/type    [:ex/User],
               :schema/name "Bob"})
-          "Only Jane and Cam should be left in the db.")
+          "Bob should no longer have an age property.")
 
       (is (= @(fluree/query db-all-preds
                             {:select '?name
                              :where  [['?s :schema/name '?name]]})
              ["Bob"])
-          "Only Bob doesn't have an email.")
+          "Only Bob should be left, as he is the only one without an email.")
 
       (is (= @(fluree/query db-age-delete
                             {:select '?name

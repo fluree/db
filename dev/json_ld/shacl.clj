@@ -47,7 +47,6 @@
                :schema/name     "John"
                :schema/callSign "j-rock"}))
 
-
   )
 
 
@@ -72,27 +71,23 @@
                                 :did     (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")}}))
 
 
-  (def ledger @(fluree/create ipfs-conn "shacl/b" {}))
+  (def ledger @(fluree/create ipfs-conn "shacl/b" {:context {:ex "http://example.org/ns/"}}))
 
   ;; should work OK
   (def newdb
     @(fluree/stage
        ledger
-       {:context          {:ex "http://example.org/ns/"}
-        :id               :ex/brian,
+       {:id               :ex/brian,
         :type             :ex/User,
         :schema/name      "Brian"
-        :schema/email     "bplatz@flur.ee"
+        :schema/email     "brian@example.org"
         :schema/birthDate "2022-08-17"
         :schema/ssn       "42"}))
 
-  (-> newdb :novelty :spot)
-
   (def newdb2
     @(fluree/stage
-       ledger
-       {:context              {:ex "http://example.org/ns/"}
-        :id                   :ex/UserShape,
+       newdb
+       {:id                   :ex/UserShape,
         :type                 [:sh/NodeShape],
         :sh/targetClass       :ex/User
         :sh/property          [{:sh/path     :schema/name
@@ -110,24 +105,19 @@
         :sh/ignoredProperties [:rdf/type :schema/author]
         :sh/closed            true}))
 
-  (-> newdb2 :novelty :spot)
+
+  @(fluree/query newdb2 {:select {'?s [:* {:sh/property [:*]}]}
+                         :where  [['?s :rdf/type :sh/NodeShape]]})
 
 
-  @(fluree/query newdb2 {:context {:ex "http://example.org/ns/"}
-                         :select  {'?s [:* {:sh/property [:*]}]}
-                         :where   [['?s :rdf/type :sh/NodeShape]]})
-
-
-  @(fluree/query newdb {:context {:ex "http://example.org/ns/"}
-                        :select  {'?s [:*]}
-                        :where   [['?s :rdf/type :ex/User]]})
+  @(fluree/query newdb2 {:select {'?s [:*]}
+                         :where  [['?s :rdf/type :ex/User]]})
 
   ;; should error - no email
   (def db2
     @(fluree/stage
        newdb2
-       {:context     {:ex "http://example.org/ns/"}
-        :id          :ex/john2,
+       {:id          :ex/john2,
         :type        [:ex/User],
         :schema/name "John"}))
 
@@ -135,8 +125,7 @@
   (def db2
     @(fluree/stage
        newdb2
-       {:context      {:ex "http://example.org/ns/"}
-        :id           :ex/john2,
+       {:id           :ex/john2,
         :type         [:ex/User],
         :schema/name  ["John", "Johnny"]
         :schema/email "john@flur.ee"}))
@@ -145,8 +134,7 @@
   (def db2
     @(fluree/stage
        newdb2
-       {:context      {:ex "http://example.org/ns/"}
-        :id           :ex/john3,
+       {:id           :ex/john3,
         :type         [:ex/User],
         :schema/name  45456456
         :schema/email "john@flur.ee"}))
@@ -156,16 +144,14 @@
   (def db2
     @(fluree/stage
        newdb2
-       {:context      {:ex "http://example.org/ns/"}
-        :id           :ex/john2,
+       {:id           :ex/john2,
         :type         [:ex/User],
         :schema/name  "John"
         :schema/email "john@flur.ee"}))
 
 
-  @(fluree/query db2 {:context {:ex "http://example.org/ns/"}
-                      :select  {'?s [:* {:sh/property [:*]}]}
-                      :where   [['?s :rdf/type :ex/User]]})
+  @(fluree/query db2 {:select {'?s [:* {:sh/property [:*]}]}
+                      :where  [['?s :rdf/type :ex/User]]})
 
 
   (-> newdb2 :schema :shapes deref)
@@ -175,20 +161,11 @@
   (def db2
     @(fluree/stage
        newdb2
-       [{:context      {:ex "http://example.org/ns/"}
-         :id           :ex/john2,
+       [{:id           :ex/john2,
          :type         [:ex/User],
          :schema/name  "John"
          :schema/email "john@flur.ee"
          :schema/ssn   "345-12-456b"}]))
-
-
-
-
-
-
-
-
 
 
   (-> @(fluree/commit! newdb {:message "First commit!"
@@ -197,18 +174,3 @@
 
   )
 
-(comment
-  (def flakes-ss (->> (map #(flake/create % (rand-int 2000) 42 const/$xsd:integer -1 true nil) (range 10000))
-                      (apply flake/sorted-set-by flake/cmp-flakes-post)))
-
-  (def from-to (map (fn [x] (let [num  (rand-int 2000)
-                                  from (-> (quot num 5)
-                                           (* 5))
-                                  to   (+ from 4)]
-                              [from to]))
-                    (range 100)))
-
-  (def ffrom (ffirst from-to))
-  (def fto (second (first from-to)))
-
-  )
