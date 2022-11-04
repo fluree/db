@@ -348,6 +348,19 @@
         res)
       (raise ?ctx "Cannot access ?pO from this function interface"))))
 
+(defn ?retraction
+  {:doc "Returns true if there are any retractions."
+   :fdb/spec nil
+   :fdb/cost 10}
+  [?ctx]
+  (cond (clojure.core/contains? ?ctx :delete)
+        (let [res (clojure.core/boolean (:delete ?ctx))
+              entry [{:function "?retraction" :arguments "?ctx" :result res} 10]]
+          (add-stack ?ctx entry)
+          res)
+        :else
+        (raise ?ctx "Cannot access ?retraction from this function interface")))
+
 (defn get-all
   {:doc      "Used to get-all values in a nested result set, or also can follow a subject down the provided path and return a set of all matching subjects."
    :fdb/spec nil
@@ -550,6 +563,33 @@
            limit  (extract limit)
            [res fuel] (<? (fdb/query (:db ?ctx) select from where block limit))
            entry  [{:function "query" :arguments [select from where block] :result res} fuel]]
+       (add-stack ?ctx entry)
+       res))))
+
+(defn query-db-before
+  {:doc      "Executes a query on the db from before the transaction."
+   :fdb/spec nil
+   :fdb/cost "Fuel required for query"}
+  ([?ctx query-map]
+   (go-try
+     (let [query-map (extract query-map)
+           query-map (if (string? query-map)
+                       (json/parse query-map)
+                       query-map)
+           q-res     (<? (fdb/query (:db-before ?ctx) query-map))
+           [res fuel] q-res
+           entry     [{:function "query-db-before" :arguments [query-map] :result res} fuel]]
+       (add-stack ?ctx entry)
+       res)))
+  ([?ctx select from where block limit]
+   (go-try
+     (let [select (extract select)
+           from   (extract from)
+           where  (extract where)
+           block  (extract block)
+           limit  (extract limit)
+           [res fuel] (<? (fdb/query (:db-before ?ctx) select from where block limit))
+           entry  [{:function "query-db-before" :arguments [select from where block] :result res} fuel]]
        (add-stack ?ctx entry)
        res))))
 
