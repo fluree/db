@@ -574,26 +574,24 @@
 (defn get-limit
   "Extracts limit, if available, and verifies it is a positive integer.
   Uses Integer/max as default if not present."
-  [{:keys [limit opts] :as _query-map}]
-  (let [limit* (or limit
-                   (:limit opts)
-                   util/max-integer)]
-    (when-not (pos-int? limit*)
-      (throw (ex-info (str "Invalid query limit specified: " limit*)
-                      {:status 400 :error :db/invalid-query})))
-    limit*))
+  [{:keys [limit]
+    :or   {limit util/max-integer}
+    :as   _query-map}]
+  (when-not (pos-int? limit)
+    (throw (ex-info (str "Invalid query limit specified: " limit)
+                    {:status 400 :error :db/invalid-query})))
+  limit)
 
 (defn get-offset
   "Extracts offset, if specified, and verifies it is a positive integer.
   Uses 0 as default if not present."
-  [{:keys [offset opts] :as _query-map}]
-  (let [offset* (or offset
-                    (:offset opts)
-                    0)]
-    (when-not (and (int? offset*) (>= offset* 0))
-      (throw (ex-info (str "Invalid query offset specified: " offset*)
-                      {:status 400 :error :db/invalid-query})))
-    offset*))
+  [{:keys [offset]
+    :or   {offset 0}
+    :as   _query-map}]
+  (when-not (and (int? offset) (>= offset 0))
+    (throw (ex-info (str "Invalid query offset specified: " offset)
+                    {:status 400 :error :db/invalid-query})))
+  offset)
 
 (defn get-depth
   "Extracts depth setting from query, if specified. If not returns
@@ -856,7 +854,7 @@
         out-vars-s (into (set out-vars) order-by)
         flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
         others-out (filter out-vars-s others)]               ;; only keep other vars needed in final output
-        
+
     (into [] (concat flake-out others-out))))
 
 
@@ -1170,10 +1168,13 @@
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [opts prettyPrint filter context depth
-              orderBy order-by groupBy group-by] :as query-map} supplied-vars]
+  [db query-map supplied-vars]
   (log/debug "parse* query-map:" query-map)
-  (let [op-type           (cond
+  (let [{:keys [opts prettyPrint filter context depth orderBy order-by groupBy
+                group-by]}
+        query-map
+
+        op-type           (cond
                             (some #{:select :selectOne :selectReduced :selectDistince} (keys query-map))
                             :select
 
