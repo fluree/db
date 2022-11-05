@@ -30,8 +30,13 @@
 
 (s/def ::depth nat-int?)
 
+(s/def ::prettyPrint boolean?)
+
+(s/def ::opts (s/keys :opt-un [::prettyPrint]))
+
 (s/def ::query-map
-  (s/keys :req-un [::limit ::offset ::depth ::fuel]))
+  (s/keys :req-un [::limit ::offset ::depth ::fuel]
+          :opt-un [::opts ::prettyPrint]))
 
 (defn normalize
   [qry]
