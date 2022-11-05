@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async]
             [clojure.spec.alpha :as s]
+            [clojure.walk :refer [keywordize-keys]]
             [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]
              :as util]
             [fluree.db.util.log :as log :include-macros true]
@@ -32,7 +33,9 @@
 
 (s/def ::prettyPrint boolean?)
 
-(s/def ::opts (s/keys :opt-un [::prettyPrint]))
+(s/def ::parseJSON boolean?)
+
+(s/def ::opts (s/keys :opt-un [::parseJSON ::prettyPrint]))
 
 (s/def ::query-map
   (s/keys :req-un [::limit ::offset ::depth ::fuel]
@@ -41,6 +44,7 @@
 (defn normalize
   [qry]
   (-> qry
+      (update :opts keywordize-keys)
       (update :limit (fn [lmt]
                        (or lmt util/max-integer)))
       (update :offset (fn [ofs]
