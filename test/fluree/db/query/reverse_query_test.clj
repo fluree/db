@@ -9,25 +9,19 @@
 (deftest ^:integration context-reverse-test
   (testing "Test that the @reverse context values pulls select values back correctly."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/revers" {:context {:ex "http://example.org/ns/"}})
+          ledger @(fluree/create conn "query/reverse" {:context {:ex "http://example.org/ns/"}})
           db     @(fluree/stage
                     ledger
                     [{:id           :ex/brian,
                       :type         :ex/User,
                       :schema/name  "Brian"
-                      :ex/last      "Smith"
-                      :schema/email "brian@example.org"
                       :ex/friend    [:ex/alice]}
                      {:id           :ex/alice,
                       :type         :ex/User,
-                      :schema/name  "Alice"
-                      :ex/last      "Smith"
-                      :schema/email "alice@example.org"}
+                      :schema/name  "Alice"}
                      {:id           :ex/cam,
                       :type         :ex/User,
                       :schema/name  "Cam"
-                      :ex/last      "Jones"
-                      :schema/email "cam@example.org"
                       :ex/friend    [:ex/brian :ex/alice]}])]
 
       (is (= @(fluree/query db {:context   {:friended {:reverse :ex/friend}}
