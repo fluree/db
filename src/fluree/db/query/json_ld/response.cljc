@@ -75,23 +75,36 @@
             acc))))))
 
 (defn crawl-ref-item
-  [db compact-fn ref-flake sub-select cache fuel-vol max-fuel depth-i]
+  [db compact-fn flake-sid sub-select cache fuel-vol max-fuel depth-i]
   (go-try
-    (let [sub-flakes (<? (query-range/index-range db :spot = [(flake/o ref-flake)]))]
+    (let [sub-flakes (<? (query-range/index-range db :spot = [flake-sid]))]
       (<? (flakes->res db cache compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes)))))
 
-(defn crawl-ref
-  "A sub-selection (graph crawl) exists, generate results."
-  [db compact-fn p-flakes sub-select cache fuel-vol max-fuel depth-i]
+
+(defn add-reverse-specs
+  "When @reverse variables are present, crawl for the reverse specs."
+  [db cache compact-fn fuel-vol max-fuel {:keys [reverse] :as select-spec} depth-i flakes]
   (go-try
-    (loop [[next-flake & r] p-flakes
-           acc []]
-      (if next-flake
-        (let [sub-flakes (<? (query-range/index-range db :spot = [(flake/o next-flake)]))
-              res        (<? (flakes->res db cache compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes))]
-          (recur r (conj acc res)))
-        (if (= 1 (count acc))
-          (first acc)
+    (let [sid (flake/s (first flakes))]
+      (loop [[reverse-item & r] (vals reverse)
+             acc {}]
+        (if reverse-item
+          (let [{:keys [id as spec]} reverse-item
+                sub-flakes (<? (query-range/index-range db :opst = [sid id]))
+                result     (loop [[ref-sid & r] (map flake/s sub-flakes)
+                                  acc-item []]
+                             (if ref-sid
+                               (let [result (if spec
+                                              ;; have a sub-selection
+                                              (<? (crawl-ref-item db compact-fn ref-sid spec cache fuel-vol max-fuel (inc depth-i)))
+                                              ;; no sub-selection, just return IRI
+                                              (or (get @cache ref-sid)
+                                                  (<? (cache-sid->iri db cache compact-fn ref-sid))))]
+                                 (recur r (conj acc-item result)))
+                               (if (= 1 (count acc-item))
+                                 (first acc-item)
+                                 acc-item)))]
+            (recur r (assoc acc as result)))
           acc)))))
 
 
@@ -99,7 +112,7 @@
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
-  [db cache compact-fn fuel-vol max-fuel {:keys [wildcard? depth] :as select-spec} depth-i flakes]
+  [db cache compact-fn fuel-vol max-fuel {:keys [wildcard? depth reverse] :as select-spec} depth-i flakes]
   (go-try
     (when (not-empty flakes)
       (loop [[p-flakes & r] (partition-by flake/p flakes)
@@ -139,11 +152,11 @@
                                         (cond
                                           ;; have a specified sub-selection (graph crawl)
                                           (:spec spec)
-                                          (<? (crawl-ref-item db compact-fn f (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
+                                          (<? (crawl-ref-item db compact-fn (flake/o f) (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
 
                                           ;; requested graph crawl depth has not yet been reached
                                           (< depth-i depth)
-                                          (<? (crawl-ref-item db compact-fn f select-spec cache fuel-vol max-fuel (inc depth-i)))
+                                          (<? (crawl-ref-item db compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
 
                                           ;; no sub-selection, just return {@id <iri>} for each ref iri
                                           :else
@@ -159,4 +172,6 @@
             (if v
               (recur r (assoc acc (:as spec) v))
               (recur r acc)))
-          acc)))))
+          (if reverse
+            (merge acc (<? (add-reverse-specs db cache compact-fn fuel-vol max-fuel select-spec depth-i flakes)))
+            acc))))))
