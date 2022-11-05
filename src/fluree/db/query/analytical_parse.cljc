@@ -588,7 +588,7 @@
   [{:keys [offset]
     :or   {offset 0}
     :as   _query-map}]
-  (when-not (and (int? offset) (>= offset 0))
+  (when-not (nat-int? offset)
     (throw (ex-info (str "Invalid query offset specified: " offset)
                     {:status 400 :error :db/invalid-query})))
   offset)
@@ -600,7 +600,7 @@
   (let [depth* (or depth
                    (:depth opts)
                    0)]
-    (when-not (and (int? depth*) (>= depth* 0))
+    (when-not (nat-int? depth*)
       (throw (ex-info (str "Invalid query depth specified: " depth*)
                       {:status 400 :error :db/invalid-query})))
     depth*))
@@ -1175,7 +1175,7 @@
         query-map
 
         op-type           (cond
-                            (some #{:select :selectOne :selectReduced :selectDistince} (keys query-map))
+                            (some #{:select :selectOne :selectReduced :selectDistinct} (keys query-map))
                             :select
 
                             (contains? query-map :delete)
@@ -1196,8 +1196,8 @@
                                 (get-in db [:schema :context-str]) context)
                               (json-ld/parse-context
                                 (get-in db [:schema :context]) context)))
-        order-by*         (or orderBy order-by (:orderBy opts))
-        group-by*         (or groupBy group-by (:groupBy opts))
+        order-by*         (or orderBy order-by)
+        group-by*         (or groupBy group-by)
         parsed            (cond-> {:op-type       op-type
                                    :strategy      :legacy
                                    :context       context*

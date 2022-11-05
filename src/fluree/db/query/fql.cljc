@@ -145,4 +145,4 @@
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)
         (cond-> (async/into [] (ad-hoc-query db* parsed-query))
-                (:selectOne? parsed-query) (first-async))))))
+          (:selectOne? parsed-query) (first-async))))))

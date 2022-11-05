@@ -134,14 +134,17 @@
                             (throw (ex-info (str "Invalid aggregate selection, provided: " fn-str)
                                             {:status 400 :error :db/invalid-query})))
         agg-fn     (if-let [agg-fn (built-in-aggregates fun)]
-                     (if arg (fn [coll] (agg-fn arg coll)) agg-fn)
+                     (if arg
+                       (fn [coll]
+                         (agg-fn arg coll))
+                       agg-fn)
                      (throw (ex-info (str "Invalid aggregate selection function, provided: " fn-str)
                                      {:status 400 :error :db/invalid-query})))
-        [agg-fn variable] (let [distinct? (and (coll? var) (= (first var) 'distinct))
-                                variable  (if distinct? (second var) var)
-                                agg-fn    (if distinct? (fn [coll] (-> coll distinct agg-fn))
-                                                        agg-fn)]
-                            [agg-fn variable])
+        [agg-fn variable] (if (and (coll? var) (= (first var) 'distinct))
+                            [(fn [coll]
+                               (-> coll distinct agg-fn))
+                             (second var)]
+                            [agg-fn var])
         as'        (or as (symbol (str variable "-" fun)))]
     (when-not (and (symbol? variable)
                    (= \? (first (name variable))))
