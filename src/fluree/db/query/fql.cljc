@@ -1,6 +1,8 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async]
             [clojure.spec.alpha :as s]
+            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]
+             :as util]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [vswap!]]
@@ -20,8 +22,28 @@
 (declare query)
 
 
+(s/def ::limit pos-int?)
+
+(s/def ::offset nat-int?)
+
+(s/def ::fuel number?)
+
+(s/def ::depth nat-int?)
+
 (s/def ::query-map
-  (constantly true))
+  (s/keys :req-un [::limit ::offset ::depth ::fuel]))
+
+(defn normalize
+  [qry]
+  (-> qry
+      (update :limit (fn [lmt]
+                       (or lmt util/max-integer)))
+      (update :offset (fn [ofs]
+                        (or ofs 0)))
+      (update :fuel (fn [fl]
+                      (or fl util/max-integer)))
+      (update :depth (fn [dpt]
+                       (or dpt 0)))))
 
 (defn validate
   [qry]
@@ -153,7 +175,7 @@
   (log/debug "Running query:" query-map)
   (if (cache? query-map)
     (cache-query db query-map)
-    (let [parsed-query (q-parse/parse db (validate query-map))
+    (let [parsed-query (q-parse/parse db (-> query-map normalize validate))
           db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)

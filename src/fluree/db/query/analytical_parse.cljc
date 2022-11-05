@@ -570,61 +570,6 @@
                                            :parsed (mapv (fn [sym] {:variable sym}) group-symbols)})
             (not order-by) (add-order-by group-symbols))))
 
-
-(defn get-limit
-  "Extracts limit, if available, and verifies it is a positive integer.
-  Uses Integer/max as default if not present."
-  [{:keys [limit]
-    :or   {limit util/max-integer}
-    :as   _query-map}]
-  (when-not (pos-int? limit)
-    (throw (ex-info (str "Invalid query limit specified: " limit)
-                    {:status 400 :error :db/invalid-query})))
-  limit)
-
-(defn get-offset
-  "Extracts offset, if specified, and verifies it is a positive integer.
-  Uses 0 as default if not present."
-  [{:keys [offset]
-    :or   {offset 0}
-    :as   _query-map}]
-  (when-not (nat-int? offset)
-    (throw (ex-info (str "Invalid query offset specified: " offset)
-                    {:status 400 :error :db/invalid-query})))
-  offset)
-
-(defn get-depth
-  "Extracts depth setting from query, if specified. If not returns
-  default depth of 0"
-  [{:keys [depth opts] :as _query-map}]
-  (let [depth* (or depth
-                   (:depth opts)
-                   0)]
-    (when-not (nat-int? depth*)
-      (throw (ex-info (str "Invalid query depth specified: " depth*)
-                      {:status 400 :error :db/invalid-query})))
-    depth*))
-
-
-(defn get-max-fuel
-  "Extracts max-fuel from query if specified, or uses Integer/max a default."
-  [{:keys [fuel max-fuel] :as query-map}]
-  (when max-fuel
-    (log/info "Deprecated max-fuel used in query: " query-map))
-  (let [max-fuel (cond
-                   (number? max-fuel)
-                   max-fuel
-
-                   (number? fuel)
-                   fuel
-
-                   :else util/max-integer)]
-    (when-not (> max-fuel 0)
-      (throw (ex-info (str "Invalid query fuel specified: " max-fuel)
-                      {:status 400 :error :db/invalid-query})))
-    max-fuel))
-
-
 (defn expand-var-rel-binding
   "Expands a relational bindings vars definition where it was not supplied
   as a vector of maps, but instead a map with one or more vectors as vals.
@@ -1208,10 +1153,10 @@
                                                         (assoc :parse-json? (:parseJSON opts*))
                                                         (dissoc :parseJSON))
                                                     opts*)
-                                   :limit         (get-limit query-map) ;; limit can be a primary key, or within :opts
-                                   :offset        (get-offset query-map) ;; offset can be a primary key, or within :opts
-                                   :depth         (get-depth query-map) ;; for query crawling, default depth to crawl
-                                   :fuel          (get-max-fuel query-map)
+                                   :limit         (:limit query-map) ;; limit can be a primary key, or within :opts
+                                   :offset        (:offset query-map) ;; offset can be a primary key, or within :opts
+                                   :depth         (:depth query-map) ;; for query crawling, default depth to crawl
+                                   :fuel          (:fuel query-map)
                                    :supplied-vars supplied-var-keys
                                    :pretty-print  (if (boolean? prettyPrint) ;; prettyPrint can be a primary key, or within :opts
                                                     prettyPrint
