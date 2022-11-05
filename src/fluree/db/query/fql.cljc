@@ -1,5 +1,6 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async]
+            [clojure.spec.alpha :as s]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :refer [vswap!]]
@@ -18,6 +19,19 @@
 
 (declare query)
 
+
+(s/def ::query-map
+  (constantly true))
+
+(defn validate
+  [qry]
+  (let [qry' (s/conform ::query-map qry)]
+    (if (s/invalid? qry')
+      (throw (ex-info "Invalid Query"
+                      {:status 400
+                       :error  :db/invalid-query
+                       :reason (s/explain ::query-map qry)}))
+      (s/unform ::query-map qry'))))
 
 (defn process-where-item
   [db cache compact-fn fuel-vol fuel where-item spec inVector?]
@@ -133,14 +147,13 @@
     (let [res (<? ch)]
       (first res))))
 
-
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
   (log/debug "Running query:" query-map)
   (if (cache? query-map)
     (cache-query db query-map)
-    (let [parsed-query (q-parse/parse db query-map)
+    (let [parsed-query (q-parse/parse db (validate query-map))
           db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)
