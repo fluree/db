@@ -183,9 +183,8 @@
 
 (defn parse-filter-fn
   "Evals, and returns query function."
-  [filter-fn all-vars]
-  (let [filter-code (safe-read-fn filter-fn)
-        fn-vars     (or (not-empty (get-vars filter-code))
+  [filter-code all-vars]
+  (let [fn-vars     (or (not-empty (get-vars filter-code))
                         (throw (ex-info (str "Filter function must contain a valid variable. Provided: " key)
                                         {:status 400 :error :db/invalid-query})))
         params      (vec fn-vars)
@@ -199,15 +198,12 @@
 
 (defn add-filter
   [{:keys [where] :as parsed-query} filter all-vars]
-  (if-not (sequential? filter)
-    (throw (ex-info (str "Filter clause must be a vector/array, provided: " filter)
-                    {:status 400 :error :db/invalid-query}))
-    (loop [[filter-fn & r] filter
-           parsed-query* parsed-query]
-      (if filter-fn
-        (let [parsed (parse-filter-fn filter-fn all-vars)]
-          (recur r (assoc parsed-query* :where (add-filter-where where parsed))))
-        parsed-query*))))
+  (loop [[filter-fn & r] filter
+         parsed-query* parsed-query]
+    (if filter-fn
+      (let [parsed (parse-filter-fn filter-fn all-vars)]
+        (recur r (assoc parsed-query* :where (add-filter-where where parsed))))
+      parsed-query*)))
 
 (defn parse-binding
   "Parses binding map. Returns a two-tuple of binding maps

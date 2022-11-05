@@ -23,6 +23,14 @@
 (declare query)
 
 
+(defn fn-string?
+  [x]
+  (boolean (re-matches #"^\(.+\)$" x)))
+
+(s/def ::filter-fn (s/and string? fn-string?))
+
+(s/def ::filter (s/coll-of ::filter-fn))
+
 (s/def ::limit pos-int?)
 
 (s/def ::offset nat-int?)
@@ -39,7 +47,7 @@
 
 (s/def ::query-map
   (s/keys :req-un [::limit ::offset ::depth ::fuel]
-          :opt-un [::opts ::prettyPrint]))
+          :opt-un [::opts ::prettyPrint ::filter]))
 
 (defn normalize
   [qry]
@@ -63,6 +71,25 @@
                        :error  :db/invalid-query
                        :reason (s/explain ::query-map qry)}))
       (s/unform ::query-map qry'))))
+
+(def read-fn-str #?(:clj  read-string
+                    :cljs cljs.reader/read-string))
+
+(defn read-fn-safe
+  [fn-str]
+  (try*
+   (read-fn-str fn-str)
+   (catch* e
+           (log/error "Failed parsing:" fn-str "with error message: " (ex-message e))
+           (throw (ex-info (str "Invalid query function: " fn-str)
+                           {:status 400
+                            :error :db/invalid-query})))))
+
+(defn transform
+  [qry]
+  (-> qry
+      (update :filter (fn [fns]
+                        (map read-fn-safe fns)))))
 
 (defn process-where-item
   [db cache compact-fn fuel-vol fuel where-item spec inVector?]
@@ -184,7 +211,7 @@
   (log/debug "Running query:" query-map)
   (if (cache? query-map)
     (cache-query db query-map)
-    (let [parsed-query (q-parse/parse db (-> query-map normalize validate))
+    (let [parsed-query (q-parse/parse db (-> query-map normalize validate transform))
           db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)
