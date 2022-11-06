@@ -99,10 +99,30 @@
   [_]
   (constantly false))
 
+(defmulti where-tuple?
+  count)
+
+(defmethod where-tuple? 2
+  [_]
+  (constantly true))
+
+(defmethod where-tuple? 3
+  [_]
+  (constantly true))
+
+(defmethod where-tuple? 4
+  [_]
+  (constantly true))
+
+(defmethod where-tuple? :default
+  [_]
+  (constantly false))
+
 (s/def ::where (s/coll-of (s/or :map   (s/and map?
                                               single?
                                               (s/multi-spec where-map? first-key))
-                                :tuple sequential?)))
+                                :tuple (s/and sequential?
+                                              (s/multi-spec where-tuple? count)))))
 
 (s/def ::query-map
   (s/keys :req-un [::limit ::offset ::depth ::fuel]

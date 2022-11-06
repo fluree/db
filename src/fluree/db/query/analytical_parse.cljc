@@ -443,14 +443,7 @@
                             4 (if (= "$fdb" (first where-smt)) ;; $fdb refers to default/main db, parse as 3-tuple
                                 (apply parse-where-tuple supplied-vars all-vars context db (rest where-smt))
                                 (apply parse-remote-tuple supplied-vars all-vars context where-smt))
-                            2 (apply parse-binding-tuple where-smt)
-                            ;; else
-                            (if (sequential? (first where-smt))
-                              (throw (ex-info (str "Invalid where clause, it should contain 2, 3 or 4 tuples. "
-                                                   "It appears you have an extra nested vector here: " where-smt)
-                                              {:status 400 :error :db/invalid-query}))
-                              (throw (ex-info (str "Invalid where clause, it should contain 2, 3 or 4 tuples but instead found: " where-smt)
-                                              {:status 400 :error :db/invalid-query}))))]
+                            2 (apply parse-binding-tuple where-smt))]
           (recur r
                  filters
                  hoisted-bind
