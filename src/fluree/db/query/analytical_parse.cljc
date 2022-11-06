@@ -407,9 +407,6 @@
 (defn parse-where
   "Parses where clause"
   [db {:keys [where] :as _query-map} supplied-vars context]
-  (when-not (sequential? where)
-    (throw (ex-info (str "Invalid where clause, must be a vector of tuples and/or maps: " where)
-                    {:status 400 :error :db/invalid-query})))
   (loop [[where-smt & r] where
          filters      []
          hoisted-bind {}                                    ;; bindings whose values are scalars are hoisted to the top level.
