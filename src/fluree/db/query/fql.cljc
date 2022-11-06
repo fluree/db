@@ -94,13 +94,12 @@
 
 (defn validate
   [qry]
-  (let [qry' (s/conform ::query-map qry)]
-    (if (s/invalid? qry')
-      (throw (ex-info "Invalid Query"
-                      {:status 400
-                       :error  :db/invalid-query
-                       :reason (s/explain-data ::query-map qry)}))
-      (s/unform ::query-map qry'))))
+  (if (s/valid? ::query-map qry)
+    qry
+    (throw (ex-info "Invalid Query"
+                    {:status  400
+                     :error   :db/invalid-query
+                     :reasons (s/explain-data ::query-map qry)}))))
 
 (def read-fn-str #?(:clj  read-string
                     :cljs cljs.reader/read-string))
