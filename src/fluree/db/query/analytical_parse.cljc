@@ -244,24 +244,16 @@
        :where (parse-where db {:where clause-val} supplied-vars context)}
 
       :union
-      (if (= 2 (count clause-val))
-        {:type  :union
-         :where (mapv #(parse-where db {:where %} supplied-vars context) clause-val)}
-        (throw (ex-info (str "Invalid where clause, 'union' clause must have exactly two solutions. "
-                             "Each solution must be its own 'where' clause wrapped in a vector")
-                        {:status 400 :error :db/invalid-query})))
+      {:type  :union
+       :where (mapv #(parse-where db {:where %} supplied-vars context) clause-val)}
 
       :bind
-      (if (map? clause-val)
-        (let [bind-map (symbolize-var-keys clause-val)
-              ;; TODO - parse binding fns here and arrange into parsed bind-map
-              [aggregates scalars] (parse-binding bind-map)]
-          {:type       :bind
-           :aggregates aggregates
-           :scalars    scalars})
-        (throw (ex-info (str "Invalid where clause, 'bind' must be a map with binding vars as keys "
-                             "and binding scalars, or aggregates, as values.")
-                        {:status 400 :error :db/invalid-query})))
+      (let [bind-map (symbolize-var-keys clause-val)
+            ;; TODO - parse binding fns here and arrange into parsed bind-map
+            [aggregates scalars] (parse-binding bind-map)]
+        {:type       :bind
+         :aggregates aggregates
+         :scalars    scalars})
 
       :minus                                                ;; negation - SPARQL 1.1, not yet supported
       (throw (ex-info (str "Invalid where clause, Fluree does not yet support the 'minus' operation.")

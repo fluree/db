@@ -65,13 +65,43 @@
   [x]
   (-> x count (= 1)))
 
-(defn supported-where-op?
-  [m]
-  (every? (fn [[k _]]
-            (contains? #{:filter :optional :union :bind :minus} k))
-          m))
+(def first-key
+  (comp key first))
 
-(s/def ::where (s/coll-of (s/or :map   (s/and map? single? supported-where-op?)
+(defmulti where-map?
+  first-key)
+
+(defmethod where-map? :filter
+  [_]
+  (s/map-of keyword? ::filter
+            :count 1))
+
+(defmethod where-map? :optional
+  [_]
+  (s/map-of keyword? ::where
+            :count 1))
+
+(defmethod where-map? :union
+  [_]
+  (s/map-of keyword? (s/coll-of ::where
+                                 :count 2)
+            :count 1))
+
+(defmethod where-map? :bind
+  [_]
+  (s/map-of keyword? map?))
+
+(defmethod where-map? :minus
+  [_]
+  (constantly true))
+
+(defmethod where-map? :default
+  [_]
+  (constantly false))
+
+(s/def ::where (s/coll-of (s/or :map   (s/and map?
+                                              single?
+                                              (s/multi-spec where-map? first-key))
                                 :tuple sequential?)))
 
 (s/def ::query-map
