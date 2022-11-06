@@ -540,17 +540,13 @@
   *note - we could implement more logic to check if group-by is inconsistent with
   order-by"
   [{:keys [where order-by] :as parsed-query} group-by]
-  (let [group-symbols (->> (if (sequential? group-by) group-by [group-by])
-                           (mapv q-var->symbol))]
-    (when-not (every? symbol? group-symbols)
-      (throw (ex-info (str "Group by must only include variable(s), provided: " group-by)
-                      {:status 400 :error :db/invalid-query})))
+  (let [group-symbols (mapv q-var->symbol group-by)]
     (when-not (every? #(variable-in-where? % where) group-symbols)
       (throw (ex-info (str "Group by includes variable(s) not specified in the where clause: " group-by)
                       {:status 400 :error :db/invalid-query})))
     (cond-> (assoc parsed-query :group-by {:input  group-by
                                            :parsed (mapv (fn [sym] {:variable sym}) group-symbols)})
-            (not order-by) (add-order-by group-symbols))))
+      (not order-by) (add-order-by group-symbols))))
 
 (defn expand-var-rel-binding
   "Expands a relational bindings vars definition where it was not supplied

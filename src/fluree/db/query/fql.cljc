@@ -15,12 +15,16 @@
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.constants :as const])
-  (:refer-clojure :exclude [vswap!])
+  (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (declare query)
+
+(defn var?
+  [x]
+  (-> x name first (= \?)))
 
 (defn fn-string?
   [x]
@@ -41,6 +45,8 @@
                                   :desc (s/cat :direction desc?
                                                :field     string-or-symbol?))))
 
+(s/def ::groupBy (s/coll-of (s/and string-or-symbol? var?)))
+
 (s/def ::limit pos-int?)
 
 (s/def ::offset nat-int?)
@@ -57,7 +63,7 @@
 
 (s/def ::query-map
   (s/keys :req-un [::limit ::offset ::depth ::fuel]
-          :opt-un [::opts ::prettyPrint ::filter ::orderBy]))
+          :opt-un [::filter ::orderBy ::groupBy ::opts ::prettyPrint]))
 
 (defn update-if-set
   [m k f]
@@ -80,7 +86,11 @@
       (update-if-set :orderBy (fn [ob]
                                 (if (vector? ob)
                                   ob
-                                  [ob])))))
+                                  [ob])))
+      (update-if-set :groupBy (fn [grp]
+                                (if (sequential? grp)
+                                  grp
+                                  [grp])))))
 
 (defn validate
   [qry]

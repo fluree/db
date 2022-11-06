@@ -143,7 +143,7 @@
                                 :select   ['?name '?favNums]
                                 :where    [['?s :schema/name '?name]
                                            ['?s :ex/favNums '?favNums]]
-                                :group-by '?name})
+                                :groupBy  '?name})
              [["Alice" [9 42 76]] ["Brian" [7]] ["Cam" [5 10]]])
           "Sums of favNums by person are not accurate.")
 
