@@ -61,10 +61,6 @@
 
 (s/def ::groupBy (s/coll-of (s/and string-or-symbol? var?)))
 
-(defn single?
-  [x]
-  (-> x count (= 1)))
-
 (def first-key
   (comp key first))
 
@@ -89,11 +85,13 @@
 
 (defmethod where-map? :bind
   [_]
-  (s/map-of keyword? map?))
+  (s/map-of keyword? map?
+            :count 1))
 
 (defmethod where-map? :minus
   [_]
-  (constantly true))
+  ;; negation - SPARQL 1.1, not yet supported
+  (constantly false))
 
 (defmethod where-map? :default
   [_]
@@ -119,7 +117,6 @@
   (constantly false))
 
 (s/def ::where (s/coll-of (s/or :map   (s/and map?
-                                              single?
                                               (s/multi-spec where-map? first-key))
                                 :tuple (s/and sequential?
                                               (s/multi-spec where-tuple? count)))))

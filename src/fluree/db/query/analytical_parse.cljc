@@ -253,11 +253,7 @@
             [aggregates scalars] (parse-binding bind-map)]
         {:type       :bind
          :aggregates aggregates
-         :scalars    scalars})
-
-      :minus                                                ;; negation - SPARQL 1.1, not yet supported
-      (throw (ex-info (str "Invalid where clause, Fluree does not yet support the 'minus' operation.")
-                      {:status 400 :error :db/invalid-query})))))
+         :scalars    scalars}))))
 
 
 (defn parse-binding-tuple
