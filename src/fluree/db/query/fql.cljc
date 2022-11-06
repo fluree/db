@@ -65,18 +65,18 @@
     (update m k f)
     m))
 
+(defn with-default
+  [x default]
+  (or x default))
+
 (defn normalize
   [qry]
   (-> qry
+      (update :limit with-default util/max-integer)
+      (update :offset with-default 0)
+      (update :fuel with-default util/max-integer)
+      (update :depth with-default 0)
       (update-if-set :opts keywordize-keys)
-      (update :limit (fn [lmt]
-                       (or lmt util/max-integer)))
-      (update :offset (fn [ofs]
-                        (or ofs 0)))
-      (update :fuel (fn [fl]
-                      (or fl util/max-integer)))
-      (update :depth (fn [dpt]
-                       (or dpt 0)))
       (update-if-set :orderBy (fn [ob]
                                 (if (vector? ob)
                                   ob
