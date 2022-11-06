@@ -494,29 +494,15 @@
   (dissoc query-map :vars))
 
 (defn parse-order-by
-  [order-by-clause]
-  (let [throw!           (fn [msg] (throw (ex-info (or msg
-                                                       (str "Invalid orderBy clause: " order-by-clause))
-                                                   {:status 400 :error :db/invalid-query})))
-        order-by-clauses (if (vector? order-by-clause)
-                           order-by-clause
-                           [order-by-clause])
-        clause-maps      (mapv (fn [order-by-clause]
+  [order-by-clauses]
+  (let [clause-maps (mapv (fn [order-by-clause]
                                  (let [[pred order] (cond
-                                                      (string? order-by-clause)
+                                                      (or (string? order-by-clause)
+                                                          (symbol? order-by-clause))
                                                       [order-by-clause :asc]
 
-                                                      (list? order-by-clause)
-                                                      (if (and (= 2 (count order-by-clause))
-                                                               (#{'desc "desc"} (first order-by-clause)))
-                                                        [(second order-by-clause) :desc]
-                                                        (throw "Invalid orderBy, if trying to order in descending order try: (desc ?myvar)"))
-
-                                                      (symbol? order-by-clause)
-                                                      [order-by-clause :asc]
-
-                                                      :else
-                                                      (throw! nil))
+                                                      (seq? order-by-clause)
+                                                      [(second order-by-clause) :desc])
                                        variable (q-var->symbol pred)]
                                    (if variable
                                      {:type     :variable
@@ -526,7 +512,7 @@
                                       :order     order
                                       :predicate pred})))
                                order-by-clauses)]
-    {:input  order-by-clause
+    {:input  order-by-clauses
      :parsed clause-maps}))
 
 

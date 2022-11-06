@@ -22,7 +22,6 @@
 
 (declare query)
 
-
 (defn fn-string?
   [x]
   (boolean (re-matches #"^\(.+\)$" x)))
@@ -30,6 +29,21 @@
 (s/def ::filter-fn (s/and string? fn-string?))
 
 (s/def ::filter (s/coll-of ::filter-fn))
+
+(defn desc?
+  [x]
+  (boolean (#{'desc "desc"} x)))
+
+(defn string-or-symbol?
+  [x]
+  (or (string? x)
+      (symbol? x)))
+
+(s/def ::order-by-clause (s/or :ascending  string-or-symbol?
+                               :descending (s/cat :direction desc?
+                                                  :field     string-or-symbol?)))
+
+(s/def ::orderBy (s/coll-of ::order-by-clause))
 
 (s/def ::limit pos-int?)
 
@@ -47,12 +61,18 @@
 
 (s/def ::query-map
   (s/keys :req-un [::limit ::offset ::depth ::fuel]
-          :opt-un [::opts ::prettyPrint ::filter]))
+          :opt-un [::opts ::prettyPrint ::filter ::orderBy]))
+
+(defn update-if-set
+  [m k f]
+  (if (contains? m k)
+    (update m k f)
+    m))
 
 (defn normalize
   [qry]
   (-> qry
-      (update :opts keywordize-keys)
+      (update-if-set :opts keywordize-keys)
       (update :limit (fn [lmt]
                        (or lmt util/max-integer)))
       (update :offset (fn [ofs]
@@ -60,7 +80,11 @@
       (update :fuel (fn [fl]
                       (or fl util/max-integer)))
       (update :depth (fn [dpt]
-                       (or dpt 0)))))
+                       (or dpt 0)))
+      (update-if-set :orderBy (fn [ob]
+                                (if (vector? ob)
+                                  ob
+                                  [ob])))))
 
 (defn validate
   [qry]
@@ -69,7 +93,7 @@
       (throw (ex-info "Invalid Query"
                       {:status 400
                        :error  :db/invalid-query
-                       :reason (s/explain ::query-map qry)}))
+                       :reason (s/explain-data ::query-map qry)}))
       (s/unform ::query-map qry'))))
 
 (def read-fn-str #?(:clj  read-string
@@ -88,8 +112,8 @@
 (defn transform
   [qry]
   (-> qry
-      (update :filter (fn [fns]
-                        (map read-fn-safe fns)))))
+      (update-if-set :filter (fn [fns]
+                               (map read-fn-safe fns)))))
 
 (defn process-where-item
   [db cache compact-fn fuel-vol fuel where-item spec inVector?]
