@@ -26,9 +26,7 @@
   [x]
   (boolean (re-matches #"^\(.+\)$" x)))
 
-(s/def ::filter-fn (s/and string? fn-string?))
-
-(s/def ::filter (s/coll-of ::filter-fn))
+(s/def ::filter (s/coll-of (s/and string? fn-string?)))
 
 (defn desc?
   [x]
@@ -39,11 +37,9 @@
   (or (string? x)
       (symbol? x)))
 
-(s/def ::order-by-clause (s/or :ascending  string-or-symbol?
-                               :descending (s/cat :direction desc?
-                                                  :field     string-or-symbol?)))
-
-(s/def ::orderBy (s/coll-of ::order-by-clause))
+(s/def ::orderBy (s/coll-of (s/or :asc  string-or-symbol?
+                                  :desc (s/cat :direction desc?
+                                               :field     string-or-symbol?))))
 
 (s/def ::limit pos-int?)
 
