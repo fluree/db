@@ -233,9 +233,6 @@
   a prior where statement.
   "
   [db parsed-where map-clause supplied-vars context]
-  (when (not= 1 (count map-clause))
-    (throw (ex-info (str "Where clause maps can only have one key/val, provided: " map-clause)
-                    {:status 400 :error :db/invalid-query})))
   (let [[clause-type clause-val] (first map-clause)]
     (case clause-type
       :filter
@@ -268,10 +265,6 @@
 
       :minus                                                ;; negation - SPARQL 1.1, not yet supported
       (throw (ex-info (str "Invalid where clause, Fluree does not yet support the 'minus' operation.")
-                      {:status 400 :error :db/invalid-query}))
-
-      ;; else
-      (throw (ex-info (str "Invalid where clause, unsupported where clause operation: " clause-type)
                       {:status 400 :error :db/invalid-query})))))
 
 
@@ -470,11 +463,7 @@
                  filters
                  hoisted-bind
                  all-vars
-                 (conj where* where-smt*)))
-
-        :else
-        (throw (ex-info (str "Invalid where clause, must be a vector of tuples and/or maps: " where)
-                        {:status 400 :error :db/invalid-query})))
+                 (conj where* where-smt*))))
       (let [where+filters (if (seq filters)
                             (reduce (fn [where' filter]
                                       (-> {:where where'}

@@ -22,6 +22,20 @@
 
 (declare query)
 
+(s/def ::limit pos-int?)
+
+(s/def ::offset nat-int?)
+
+(s/def ::fuel number?)
+
+(s/def ::depth nat-int?)
+
+(s/def ::prettyPrint boolean?)
+
+(s/def ::parseJSON boolean?)
+
+(s/def ::opts (s/keys :opt-un [::parseJSON ::prettyPrint]))
+
 (defn var?
   [x]
   (-> x name first (= \?)))
@@ -47,23 +61,22 @@
 
 (s/def ::groupBy (s/coll-of (s/and string-or-symbol? var?)))
 
-(s/def ::limit pos-int?)
+(defn single?
+  [x]
+  (-> x count (= 1)))
 
-(s/def ::offset nat-int?)
+(defn supported-where-op?
+  [m]
+  (every? (fn [[k _]]
+            (contains? #{:filter :optional :union :bind :minus} k))
+          m))
 
-(s/def ::fuel number?)
-
-(s/def ::depth nat-int?)
-
-(s/def ::prettyPrint boolean?)
-
-(s/def ::parseJSON boolean?)
-
-(s/def ::opts (s/keys :opt-un [::parseJSON ::prettyPrint]))
+(s/def ::where (s/coll-of (s/or :map   (s/and map? single? supported-where-op?)
+                                :tuple sequential?)))
 
 (s/def ::query-map
   (s/keys :req-un [::limit ::offset ::depth ::fuel]
-          :opt-un [::filter ::orderBy ::groupBy ::opts ::prettyPrint]))
+          :opt-un [::where ::orderBy ::groupBy ::filter ::opts ::prettyPrint]))
 
 (defn update-if-set
   [m k f]
