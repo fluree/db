@@ -108,7 +108,6 @@
           acc)))))
 
 
-;; TODO - check for @reverse
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
