@@ -44,6 +44,4 @@
               :friended    {:id           :ex/cam,
                             :rdf/type     [:ex/User],
                             :schema/name  "Cam",
-                            :ex/last      "Jones",
-                            :schema/email "cam@example.org",
                             :ex/friend    [{:id :ex/brian} {:id :ex/alice}]}})))))
