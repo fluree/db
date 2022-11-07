@@ -1172,7 +1172,7 @@
 (defn parse*
   [db {:keys [opts prettyPrint filter context depth
               orderBy order-by groupBy group-by] :as query-map} supplied-vars]
-  (log/debug "parse* query-map:" query-map)
+  (log/trace "parse* query-map:" query-map)
   (let [op-type           (cond
                             (some #{:select :selectOne :selectReduced :selectDistince} (keys query-map))
                             :select
