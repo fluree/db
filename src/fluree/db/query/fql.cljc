@@ -50,12 +50,41 @@
 
 (s/def ::filter (s/coll-of ::function))
 
+(defn wildcard?
+  [x]
+  (#{"*" :* '*} x))
+
+(s/def ::wildcard wildcard?)
+
 (defn var?
   [x]
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \?))))
 
 (s/def ::var var?)
+
+(s/def ::ref (s/or :keyword keyword?
+                   :string string?))
+
+(s/def ::selector
+  (s/or :aggregate ::function
+        :var       ::var
+        :wildcard  ::wildcard
+        :pred      ::ref
+        :map       (s/map-of (s/or :var      ::var
+                                   :wildcard ::wildcard
+                                   :ref     ::ref)
+                             ::select
+                             :count 1)))
+
+(s/def ::select (s/or :selector   ::selector
+                      :collection (s/coll-of ::selector)))
+
+(s/def ::selectOne ::select)
+
+(s/def ::selectDistinct ::select)
+
+(s/def ::selectReduced ::select)
 
 (defn asc?
   [x]
@@ -121,8 +150,9 @@
                                 :tuple ::where-tuple)))
 
 (s/def ::query-map
-  (s/keys :opt-un [::where ::orderBy ::groupBy ::filter ::limit ::offset ::fuel
-                   ::depth ::opts ::prettyPrint]))
+  (s/keys :opt-un [::select ::selectOne ::selectDistinct ::selectReduced ::where
+                   ::orderBy ::groupBy ::filter ::limit ::offset ::fuel ::depth
+                   ::opts ::prettyPrint]))
 
 (defn update-if-set
   [m k f]
