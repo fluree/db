@@ -58,13 +58,19 @@
 
 (s/def ::filter (s/coll-of ::function))
 
+(defn asc?
+  [x]
+  (boolean (#{'asc "asc" :asc} x)))
+
 (defn desc?
   [x]
   (boolean (#{'desc "desc" :desc} x)))
 
-(s/def ::ordering (s/or :asc  ::var
-                        :desc (s/cat :direction desc?
-                                     :field     ::var)))
+(s/def ::direction (s/or :asc asc?,  :desc desc?))
+
+(s/def ::ordering (s/or :scalar ::var
+                        :vector (s/cat :direction ::direction
+                                       :field     ::var)))
 
 (s/def ::orderBy (s/or :clause     ::ordering
                        :collection (s/coll-of ::ordering)))
