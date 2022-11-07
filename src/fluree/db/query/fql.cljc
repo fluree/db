@@ -53,8 +53,7 @@
   (and (list? x)
        (-> x first symbol?)))
 
-(s/def ::function (s/or :string fn-string?
-                        :list   fn-list?))
+(s/def ::function (s/or :string fn-string?, :list fn-list?))
 
 (s/def ::filter (s/coll-of ::function))
 
@@ -66,7 +65,7 @@
   [x]
   (boolean (#{'desc "desc" :desc} x)))
 
-(s/def ::direction (s/or :asc asc?,  :desc desc?))
+(s/def ::direction (s/or :asc asc?, :desc desc?))
 
 (s/def ::ordering (s/or :scalar ::var
                         :vector (s/cat :direction ::direction
@@ -81,36 +80,32 @@
 (def first-key
   (comp key first))
 
-(defmulti where-map?
-  first-key)
+(s/def ::where-op #{:filter :optional :union :bind})
 
-(defmethod where-map? :filter
+(defmulti where-map-spec first-key)
+
+(defmethod where-map-spec :filter
   [_]
-  (s/map-of keyword? ::filter
-            :count 1))
+  (s/map-of ::where-op ::filter))
 
-(defmethod where-map? :optional
+(defmethod where-map-spec :optional
   [_]
-  (s/map-of keyword? ::where
-            :count 1))
+  (s/map-of ::where-op ::where))
 
-(defmethod where-map? :union
+(defmethod where-map-spec :union
   [_]
-  (s/map-of keyword? (s/coll-of ::where
-                                 :count 2)
-            :count 1))
+  (s/map-of ::where-op (s/coll-of ::where, :count 2)))
 
-(defmethod where-map? :bind
+(defmethod where-map-spec :bind
   [_]
-  (s/map-of keyword? map?
-            :count 1))
+  (s/map-of ::where-op map?))
 
-(defmethod where-map? :minus
+(defmethod where-map-spec :minus
   [_]
   ;; negation - SPARQL 1.1, not yet supported
   (constantly false))
 
-(defmethod where-map? :default
+(defmethod where-map-spec :default
   [_]
   (constantly false))
 
@@ -133,8 +128,10 @@
   [_]
   (constantly false))
 
-(s/def ::where (s/coll-of (s/or :map   (s/and map?
-                                              (s/multi-spec where-map? first-key))
+(s/def ::where-map (s/and (s/map-of ::where-op map?, :count 1)
+                          (s/multi-spec where-map-spec first-key)))
+
+(s/def ::where (s/coll-of (s/or :map   ::where-map
                                 :tuple (s/and sequential?
                                               (s/multi-spec where-tuple? count)))))
 
