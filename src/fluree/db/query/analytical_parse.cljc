@@ -16,7 +16,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(declare parse-where)
+(declare parse-where parse-where-tuple)
 
 (defn aggregate?
   "Aggregate as positioned in a :select statement"
@@ -247,8 +247,17 @@
        :filter clause-val}
 
       :optional
-      {:type  :optional
-       :where (parse-where db {:where clause-val} supplied-vars context)}
+      (if (vector? (first clause-val))
+        (if (= 1 (count clause-val))
+          ;; single clause, just wrapped in a vector unnecessarily - still support but unwrap
+          (-> (apply parse-where-tuple supplied-vars supplied-vars context db (first clause-val))
+              (assoc :optional? true))
+          ;; multiple optional statements, treat like a sub-query
+          {:type  :optional
+           :where (parse-where db {:where clause-val} supplied-vars context)})
+        ;; single optional statement, treat like a 3-tuple
+        (-> (apply parse-where-tuple supplied-vars supplied-vars context db clause-val)
+            (assoc :optional? true)))
 
       :union
       (if (= 2 (count clause-val))
@@ -1102,12 +1111,51 @@
                     ;; once we retain the previous other ordering, add in any remaining others that might be new
                     (into new-others remaining-others)))}))
 
+(defn add-where-meta-tuple
+  [{:keys [s p o] :as where-smt} prior-vars supplied-vars]
+  (let [s-var       (:variable s)
+        p-var       (:variable p)
+        o-var       (:variable o)
+        s-supplied? (supplied-vars s-var)
+        p-supplied? (supplied-vars p-var)
+        o-supplied? (supplied-vars o-var)
+        s-out?      (and s-var (not s-supplied?))
+        p-out?      (and p-var (not p-supplied?))
+        o-out?      (and o-var (not o-supplied?))
+        flake-vars  [(when s-out? s-var) (when p-out? p-var) (when o-out? o-var)] ;; each var needed coming out of flake in [s p o] position
+        vars        (get-clause-vars flake-vars prior-vars)
+        where-smt*  (cond-> (assoc where-smt
+                              :vars vars
+                              :prior-vars prior-vars)
+                            s-supplied? (assoc-in [:s :supplied?] true)
+                            p-supplied? (assoc-in [:p :supplied?] true)
+                            o-supplied? (assoc-in [:o :supplied?] true))]
+    ;; return signature of all statements is vector of where statements
+    [where-smt* vars]))
+
+
+(defn add-where-meta-optional
+  "Handles optional clause additional parsing."
+  [{:keys [where] :as optional-where-clause} prior-vars supplied-vars]
+  (throw (ex-info (str "Multi-statement optional clauses not yet supported!")
+                  {:status 400 :error :db/invalid-query}))
+  ;; TODO!
+  (let [where*      (loop [[where-smt & r] where
+                           prior-vars prior-vars
+                           acc        []]
+                      (if where-smt
+                        (let [[where-item* prior-vars*] (add-where-meta-tuple where-smt prior-vars supplied-vars)]
+                          (recur r prior-vars* (conj acc where-item*)))
+                        acc))
+        prior-vars* (-> where* last :vars)]
+    [(assoc optional-where-clause :where where*) prior-vars*]))
+
 
 (defn add-where-meta
   "Adds input vars and output vars to each where statement."
   [{:keys [out-vars where select delete supplied-vars order-by group-by op-type] :as parsed-query}]
   ;; note: Currently 'p' is always fixed, but that is an imposed limitation - it should be able to be a variable.
-  (loop [[{:keys [s p o] :as where-smt} & r] where
+  (loop [[where-smt & r] where
          i          0
          prior-vars {:flake-in  []                          ;; variables query will need to execute
                      :flake-out []                          ;; variables query result flakes will output
@@ -1115,25 +1163,10 @@
                      :others    []}                         ;; this is all vars minus the flake vars
          acc        []]
     (if where-smt
-      (let [s-var       (:variable s)
-            p-var       (:variable p)
-            o-var       (:variable o)
-            s-supplied? (supplied-vars s-var)
-            p-supplied? (supplied-vars p-var)
-            o-supplied? (supplied-vars o-var)
-            s-out?      (and s-var (not s-supplied?))
-            p-out?      (and p-var (not p-supplied?))
-            o-out?      (and o-var (not o-supplied?))
-            flake-vars  [(when s-out? s-var) (when p-out? p-var) (when o-out? o-var)] ;; each var needed coming out of flake in [s p o] position
-            vars        (get-clause-vars flake-vars prior-vars)
-            where-smt*  (cond-> (assoc where-smt
-                                  :i i
-                                  :vars vars
-                                  :prior-vars prior-vars)
-                                s-supplied? (assoc-in [:s :supplied?] true)
-                                p-supplied? (assoc-in [:p :supplied?] true)
-                                o-supplied? (assoc-in [:o :supplied?] true))]
-        (recur r (inc i) vars (conj acc where-smt*)))
+      (let [[where-smt* prior-vars] (case (:type where-smt)
+                                      (:class :tuple :iri) (add-where-meta-tuple where-smt prior-vars supplied-vars)
+                                      :optional (add-where-meta-optional where-smt prior-vars supplied-vars))]
+        (recur r (inc i) prior-vars (conj acc where-smt*)))
       (let [where*    (where-meta-reverse acc out-vars order-by)
             order-by* (update-order-by order-by group-by where*)
             group-by* (update-group-by group-by where*)]
