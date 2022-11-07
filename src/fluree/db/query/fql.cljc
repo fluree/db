@@ -38,28 +38,39 @@
 
 (defn var?
   [x]
-  (-> x name first (= \?)))
+  (and (or (string? x) (symbol? x))
+       (-> x name first (= \?))))
+
+(s/def ::var var?)
 
 (defn fn-string?
   [x]
-  (boolean (re-matches #"^\(.+\)$" x)))
+  (and (string? x)
+       (re-matches #"^\(.+\)$" x)))
 
-(s/def ::filter (s/coll-of (s/and string? fn-string?)))
+(defn fn-list?
+  [x]
+  (and (list? x)
+       (-> x first symbol?)))
+
+(s/def ::function (s/or :string fn-string?
+                        :list   fn-list?))
+
+(s/def ::filter (s/coll-of ::function))
 
 (defn desc?
   [x]
-  (boolean (#{'desc "desc"} x)))
+  (boolean (#{'desc "desc" :desc} x)))
 
-(defn string-or-symbol?
-  [x]
-  (or (string? x)
-      (symbol? x)))
+(s/def ::ordering (s/or :asc  ::var
+                        :desc (s/cat :direction desc?
+                                     :field     ::var)))
 
-(s/def ::orderBy (s/coll-of (s/or :asc  string-or-symbol?
-                                  :desc (s/cat :direction desc?
-                                               :field     string-or-symbol?))))
+(s/def ::orderBy (s/or :clause     ::ordering
+                       :collection (s/coll-of ::ordering)))
 
-(s/def ::groupBy (s/coll-of (s/and string-or-symbol? var?)))
+(s/def ::groupBy (s/or :clause     ::var
+                       :collection (s/coll-of ::var)))
 
 (def first-key
   (comp key first))
@@ -122,8 +133,8 @@
                                               (s/multi-spec where-tuple? count)))))
 
 (s/def ::query-map
-  (s/keys :req-un [::limit ::offset ::depth ::fuel]
-          :opt-un [::where ::orderBy ::groupBy ::filter ::opts ::prettyPrint]))
+  (s/keys :opt-un [::where ::orderBy ::groupBy ::filter ::limit ::offset ::fuel
+                   ::depth ::opts ::prettyPrint]))
 
 (defn update-if-set
   [m k f]
@@ -131,26 +142,9 @@
     (update m k f)
     m))
 
-(defn with-default
-  [x default]
-  (or x default))
-
 (defn normalize
   [qry]
-  (-> qry
-      (update :limit with-default util/max-integer)
-      (update :offset with-default 0)
-      (update :fuel with-default util/max-integer)
-      (update :depth with-default 0)
-      (update-if-set :opts keywordize-keys)
-      (update-if-set :orderBy (fn [ob]
-                                (if (vector? ob)
-                                  ob
-                                  [ob])))
-      (update-if-set :groupBy (fn [grp]
-                                (if (sequential? grp)
-                                  grp
-                                  [grp])))))
+  (update-if-set qry :opts keywordize-keys))
 
 (defn validate
   [qry]
@@ -174,9 +168,25 @@
                            {:status 400
                             :error :db/invalid-query})))))
 
+(defn with-default
+  [x default]
+  (or x default))
+
 (defn transform
   [qry]
   (-> qry
+      (update :limit with-default util/max-integer)
+      (update :offset with-default 0)
+      (update :fuel with-default util/max-integer)
+      (update :depth with-default 0)
+      (update-if-set :orderBy (fn [ob]
+                                (if (vector? ob)
+                                  ob
+                                  [ob])))
+      (update-if-set :groupBy (fn [grp]
+                                (if (sequential? grp)
+                                  grp
+                                  [grp])))
       (update-if-set :filter (fn [fns]
                                (map read-fn-safe fns)))))
 
