@@ -36,13 +36,6 @@
 
 (s/def ::opts (s/keys :opt-un [::parseJSON ::prettyPrint]))
 
-(defn var?
-  [x]
-  (and (or (string? x) (symbol? x))
-       (-> x name first (= \?))))
-
-(s/def ::var var?)
-
 (defn fn-string?
   [x]
   (and (string? x)
@@ -56,6 +49,13 @@
 (s/def ::function (s/or :string fn-string?, :list fn-list?))
 
 (s/def ::filter (s/coll-of ::function))
+
+(defn var?
+  [x]
+  (and (or (string? x) (symbol? x) (keyword? x))
+       (-> x name first (= \?))))
+
+(s/def ::var var?)
 
 (defn asc?
   [x]
@@ -109,31 +109,16 @@
   [_]
   (constantly false))
 
-(defmulti where-tuple?
-  count)
-
-(defmethod where-tuple? 2
-  [_]
-  (constantly true))
-
-(defmethod where-tuple? 3
-  [_]
-  (constantly true))
-
-(defmethod where-tuple? 4
-  [_]
-  (constantly true))
-
-(defmethod where-tuple? :default
-  [_]
-  (constantly false))
-
 (s/def ::where-map (s/and (s/map-of ::where-op map?, :count 1)
                           (s/multi-spec where-map-spec first-key)))
 
+(s/def ::where-tuple (s/and sequential?
+                            (s/or :binding (s/coll-of (constantly true), :count 2)
+                                  :local   (s/coll-of (constantly true), :count 3)
+                                  :remote  (s/coll-of (constantly true), :count 4))))
+
 (s/def ::where (s/coll-of (s/or :map   ::where-map
-                                :tuple (s/and sequential?
-                                              (s/multi-spec where-tuple? count)))))
+                                :tuple ::where-tuple)))
 
 (s/def ::query-map
   (s/keys :opt-un [::where ::orderBy ::groupBy ::filter ::limit ::offset ::fuel
