@@ -26,7 +26,8 @@
 
 (s/def ::offset nat-int?)
 
-(s/def ::fuel number?)
+(s/def ::maxFuel number?)
+(s/def ::max-fuel ::maxFuel)
 
 (s/def ::depth nat-int?)
 
@@ -36,7 +37,8 @@
 (s/def ::parseJSON boolean?)
 (s/def ::parse-json ::parseJSON)
 
-(s/def ::opts (s/keys :opt-un [::parseJSON ::parse-json ::prettyPrint ::pretty-print]))
+(s/def ::opts (s/keys :opt-un [::maxFuel ::max-fuel ::parseJSON ::parse-json
+                               ::prettyPrint ::pretty-print]))
 
 (defn fn-string?
   [x]
@@ -158,8 +160,8 @@
 (s/def ::query-map
   (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct
                    ::selectReduced ::select-reduced ::where ::orderBy ::order-by
-                   ::groupBy ::group-by ::filter ::limit ::offset ::fuel ::depth ::opts
-                   ::prettyPrint ::pretty-print]))
+                   ::groupBy ::group-by ::filter ::limit ::offset ::maxFuel ::max-fuel
+                   ::depth ::opts ::prettyPrint ::pretty-print]))
 
 (defn update-if-set
   [m k f]
