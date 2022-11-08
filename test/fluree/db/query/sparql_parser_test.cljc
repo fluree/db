@@ -63,4 +63,5 @@
              (try
                (sparql-to-ad-hoc query)
                "should throw 400, :db/invalid-query"
-               (catch clojure.lang.ExceptionInfo e (ex-data e))))))))
+               (catch #?(:clj clojure.lang.ExceptionInfo
+                         :cljs :default) e (ex-data e))))))))
