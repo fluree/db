@@ -150,9 +150,9 @@
 (s/def ::where-map (s/and (s/map-of ::where-op map?, :count 1)
                           (s/multi-spec where-map-spec first-key)))
 
-(s/def ::where-tuple (s/or :binding (s/coll-of (constantly true), :count 2)
-                           :local   (s/coll-of (constantly true), :count 3)
-                           :remote  (s/coll-of (constantly true), :count 4)))
+(s/def ::where-tuple (s/or :binding (s/coll-of any?, :count 2)
+                           :local   (s/coll-of any?, :count 3)
+                           :remote  (s/coll-of any?, :count 4)))
 
 (s/def ::where (s/coll-of (s/or :map   ::where-map
                                 :tuple ::where-tuple)))
