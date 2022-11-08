@@ -31,10 +31,12 @@
 (s/def ::depth nat-int?)
 
 (s/def ::prettyPrint boolean?)
+(s/def ::pretty-print ::prettyPrint)
 
 (s/def ::parseJSON boolean?)
+(s/def ::parse-json ::parseJSON)
 
-(s/def ::opts (s/keys :opt-un [::parseJSON ::prettyPrint]))
+(s/def ::opts (s/keys :opt-un [::parseJSON ::parse-json ::prettyPrint ::pretty-print]))
 
 (defn fn-string?
   [x]
@@ -81,10 +83,13 @@
                       :collection (s/coll-of ::selector)))
 
 (s/def ::selectOne ::select)
+(s/def ::select-one ::selectOne)
 
 (s/def ::selectDistinct ::select)
+(s/def ::select-distinct ::selectDistinct)
 
 (s/def ::selectReduced ::select)
+(s/def ::select-reduced ::selectReduced)
 
 (defn asc?
   [x]
@@ -102,9 +107,11 @@
 
 (s/def ::orderBy (s/or :clause     ::ordering
                        :collection (s/coll-of ::ordering)))
+(s/def ::order-by ::orderBy)
 
 (s/def ::groupBy (s/or :clause     ::var
                        :collection (s/coll-of ::var)))
+(s/def ::group-by ::groupBy)
 
 (def first-key
   (comp key first))
@@ -141,18 +148,18 @@
 (s/def ::where-map (s/and (s/map-of ::where-op map?, :count 1)
                           (s/multi-spec where-map-spec first-key)))
 
-(s/def ::where-tuple (s/and sequential?
-                            (s/or :binding (s/coll-of (constantly true), :count 2)
-                                  :local   (s/coll-of (constantly true), :count 3)
-                                  :remote  (s/coll-of (constantly true), :count 4))))
+(s/def ::where-tuple (s/or :binding (s/coll-of (constantly true), :count 2)
+                           :local   (s/coll-of (constantly true), :count 3)
+                           :remote  (s/coll-of (constantly true), :count 4)))
 
 (s/def ::where (s/coll-of (s/or :map   ::where-map
                                 :tuple ::where-tuple)))
 
 (s/def ::query-map
-  (s/keys :opt-un [::select ::selectOne ::selectDistinct ::selectReduced ::where
-                   ::orderBy ::groupBy ::filter ::limit ::offset ::fuel ::depth
-                   ::opts ::prettyPrint]))
+  (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct
+                   ::selectReduced ::select-reduced ::where ::orderBy ::order-by
+                   ::groupBy ::group-by ::filter ::limit ::offset ::fuel ::depth ::opts
+                   ::prettyPrint ::pretty-print]))
 
 (defn update-if-set
   [m k f]
