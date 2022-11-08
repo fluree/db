@@ -138,14 +138,16 @@
   [_]
   (s/map-of ::where-op map?))
 
+(def never? (constantly false))
+
 (defmethod where-map-spec :minus
   [_]
   ;; negation - SPARQL 1.1, not yet supported
-  (constantly false))
+  never?)
 
 (defmethod where-map-spec :default
   [_]
-  (constantly false))
+  never?)
 
 (s/def ::where-map (s/and (s/map-of ::where-op map?, :count 1)
                           (s/multi-spec where-map-spec first-key)))
