@@ -9,13 +9,13 @@
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :sha "c22e943a9c4618379759eb9e2ca0cd384e1a1882"}
+                                          :sha "0614a222e0197ca654449ac3b1a1125608d3ec7b"}
 
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
          logback-bundle/core-bundle      {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api             {:mvn/version "2.0.3"}
+         org.slf4j/slf4j-api             {:mvn/version "1.7.36"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}

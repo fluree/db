@@ -66,7 +66,7 @@
   (e) send result into :select graph crawl"
   [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by
               compact-fn opts] :as parsed-query}]
-  (log/debug "Running simple subject crawl query:" parsed-query)
+  (log/trace "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
         f-where     (first where)
         rdf-type?   (= :rdf/type (:type f-where))
@@ -97,7 +97,7 @@
                      :query         parsed-query
                      :result-fn     result-fn
                      :finish-fn     finish-fn}]
-    (log/debug "simple-subject-crawl opts:" opts)
+    (log/trace "simple-subject-crawl opts:" opts)
     (if rel-binding?
       (relationship-binding opts)
       (if collection?

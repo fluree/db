@@ -76,19 +76,26 @@
               pid    (:id spec)
               depth* (if (zero? depth)
                        0
-                       (dec depth))]
-          (assoc acc pid (-> spec
-                             (assoc :spec (expand-selection db context depth* v)
-                                    :as k))))
+                       (dec depth))
+              reverse? (boolean (get-in context [k :reverse]))
+              spec* (-> spec
+                        (assoc :spec (expand-selection db context depth* v)
+                               :as k))]
+          (if reverse?
+            (assoc-in acc [:reverse pid] spec*)
+            (assoc acc pid spec*)))
 
         (#{"*" :* '*} select-item)
         (assoc acc :wildcard? true)
 
         :else
-        (let [iri  (json-ld/expand-iri select-item context)
-              spec (get-in schema [:pred iri])
-              pid  (:id spec)]
-          (assoc acc pid (assoc spec :as select-item)))))
+        (let [iri      (json-ld/expand-iri select-item context)
+              spec     (get-in schema [:pred iri])
+              pid      (:id spec)
+              reverse? (boolean (get-in context [select-item :reverse]))]
+          (if reverse?
+            (assoc-in acc [:reverse pid] (assoc spec :as select-item))
+            (assoc acc pid (assoc spec :as select-item))))))
     {:depth depth} selection))
 
 

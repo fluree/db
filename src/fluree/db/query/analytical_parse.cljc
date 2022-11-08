@@ -1059,7 +1059,7 @@
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
   [db query-map supplied-vars]
-  (log/debug "parse* query-map:" query-map)
+  (log/trace "parse* query-map:" query-map)
   (let [{:keys [opts prettyPrint filter context depth orderBy order-by groupBy
                 group-by]}
         query-map
