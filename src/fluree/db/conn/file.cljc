@@ -14,7 +14,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.storage.core :as storage]
             [fluree.db.indexer.default :as idx-default]
-            [fluree.db.serde.json :as json-serde]
+            [fluree.db.serde.avro :as avro-serde]
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
@@ -211,10 +211,11 @@
   (read [s k]
     (log/error "TODO: file Store/read" k))
   (write [s k data]
-    (let [[_ ledger & r] (str/split k #"_")
-          path (str (local-path s) ledger "/" "indexes" "/" (str/join "/" r))]
-      (write-file path (->bytes data)))
-    (log/error "TODO: file Store/write" k))
+    ;; expects data as byte array
+    (go-try
+      (let [[_ ledger & r] (str/split k #"_")
+            path (str (local-path s) ledger "/" "indexes" "/" (str/join "/" r))]
+        (write-file path data))))
   (rename [s old-key new-key]
     (log/error "TODO: file Store/rename" old-key new-key))
   (delete [s k]
@@ -268,7 +269,7 @@
       (map->FileConnection {:id              conn-id
                             :storage-path    storage-path
                             :ledger-defaults (ledger-defaults defaults)
-                            :serializer      (json-serde/json-serde)
+                            :serializer      (avro-serde/avro-serde)
                             :commit          commit
                             :push            push
                             :parallelism     parallelism

@@ -185,10 +185,10 @@
    (write-db-root db nil))
   ([db custom-ecount]
    (go-try
-     (let [{:keys [conn network ledger-id block t ecount stats spot psot post opst
+     (let [{:keys [conn network commit block t ecount stats spot psot post opst
                    tspo fork fork-block]}
            db
-
+           ledger-id (:id commit)
            db-root-key (ledger-root-key network ledger-id block)
            data        {:ledger-id ledger-id
                         :block     block
