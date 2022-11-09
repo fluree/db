@@ -7,7 +7,7 @@
 
 (deftest sparql-parser-test
   (testing "simple WHERE"
-    (let [query "SELECT ?person \nWHERE {\n    ?person     fd:person/handle    \"jdoe\".\n}"]
+    (let [query "SELECT ?person \nWHERE {\n ?person fd:person/handle \"jdoe\".\n}"]
       (is (= {:prefixes {}	  
               :select ["?person"]
               :where [["$fdb" "?person" "person/handle" "jdoe"]]}
@@ -19,14 +19,14 @@
                   :where [["$fdb" "?person" "person/handle" "jdoe"]]}
                  (sparql-to-ad-hoc prefix-query)))))))
   (testing "two-triple WHERE"
-    (let [query "SELECT ?person ?nums\nWHERE {\n    ?person     fd:person/handle    \"jdoe\";\n                fd:person/favNums    ?nums.\n}"]
+    (let [query "SELECT ?person ?nums\nWHERE {\n ?person fd:person/handle \"jdoe\";\n fd:person/favNums ?nums.\n}"]
       (is (= {:prefixes {}	  
               :select ["?person" "?nums"]
               :where [["$fdb" "?person" "person/handle" "jdoe"]
                       ["$fdb" "?person" "person/favNums" "?nums"]]}
              (sparql-to-ad-hoc query)))))
   (testing "MAX"
-    (let [query "SELECT ?fullName (MAX(?favNums) AS ?max)\nWHERE {\n  ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"]
+    (let [query "SELECT ?fullName (MAX(?favNums) AS ?max)\n WHERE {\n ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"]
       (is (= {:prefixes {}
               :select ["?fullName" "(as (max ?favNums) ?max)"]
               :where [ ["$fdb" "?person" "person/favNums" "?favNums"]
