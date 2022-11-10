@@ -108,10 +108,16 @@
       (is (= 10
              offset))))
   (testing "ORDER BY"
-    (let [query "SELECT ?favNums \n WHERE {\n ?person fd:person/favNums ?favNums\n} ORDER BY DESC(?favNums)"
-          {:keys [orderBy]} (sparql-to-ad-hoc query)]
-      (is (= ["DESC" "?favNums"]
-             orderBy))))
+    (testing "ASC"
+      (let [query "SELECT ?favNums \n WHERE {\n ?person fd:person/favNums ?favNums\n} ORDER BY ASC(?favNums)"
+            {:keys [orderBy]} (sparql-to-ad-hoc query)]
+        (is (= ["ASC" "?favNums"]
+               orderBy))))
+    (testing "DESC"
+      (let [query "SELECT ?favNums \n WHERE {\n ?person fd:person/favNums ?favNums\n} ORDER BY DESC(?favNums)"
+            {:keys [orderBy]} (sparql-to-ad-hoc query)]
+        (is (= ["DESC" "?favNums"]
+               orderBy)))))
   (testing "PRETTY-PRINT"
     (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n PRETTY-PRINT"
           {:keys [prettyPrint]} (sparql-to-ad-hoc query)]
