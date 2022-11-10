@@ -112,11 +112,11 @@
           {:keys [limit]} (sparql-to-ad-hoc query)]
       (is (= 1000 
              limit))))
-  ;;FIXME: invalid query
-  #_(testing "OFFSET"
-    (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n OFFSET 10"]
-      (is (= {}
-             (sparql-to-ad-hoc query)))))
+  (testing "OFFSET"
+    (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n OFFSET 10"
+          {:keys [offset]} (sparql-to-ad-hoc query)]
+      (is (= 10
+             offset))))
   (testing "ORDER BY"
     (let [query "SELECT ?favNums \n WHERE {\n ?person fd:person/favNums ?favNums\n} ORDER BY DESC(?favNums)"
           {:keys [orderBy]} (sparql-to-ad-hoc query)]
