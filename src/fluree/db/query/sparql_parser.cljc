@@ -319,9 +319,8 @@
           :ArgList (handle-arg-list (rest %)))
        iri-or-function))
 
-;; Not part of SPARQL spec, but to add: RAND, STDEV, VARIANCE
 ;; Not part of analytical queries, but part of SPARQL spec: GROUP_CONCAT
-(def supported-aggregates #{"COUNT" "SUM" "MIN" "MAX" "AVG" "SAMPLE" "MEDIAN"})
+(def supported-aggregates #{"COUNT" "SUM" "MIN" "MAX" "AVG" "SAMPLE"})
 
 (defn handle-aggregate
   [aggregate]

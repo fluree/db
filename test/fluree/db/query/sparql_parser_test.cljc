@@ -35,13 +35,7 @@
     (testing "MAX"
       (let [query "SELECT ?fullName (MAX(?favNums) AS ?max)\n WHERE {\n ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
             {:keys [select]} (sparql-to-ad-hoc query)]
-      (is (= ["?fullName" "(as (max ?favNums) ?max)"]
-             select))))
-    ;;FIXME: invalid query 
-    #_(testing "MEDIAN"
-        (let [query  "SELECT ?fullName (MEDIAN(?favNums) AS ?median)\n WHERE {\n ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
-              {:keys [select]} (sparql-to-ad-hoc query)]
-          (is (= ["fullName" "(as (median ?favNums) ?median)"]
+        (is (= ["?fullName" "(as (max ?favNums) ?max)"]
                select))))
     (testing "MIN"
       (let [query  "SELECT ?fullName (MIN(?favNums) AS ?min)\n WHERE {\n ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
@@ -57,11 +51,7 @@
       (let [query  "SELECT ?fullName (SUM(?favNums) AS ?sum)\n WHERE {\n ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
             {:keys [select]} (sparql-to-ad-hoc query)]
         (is (= ["?fullName" "(as (sum ?favNums) ?sum)"]
-               select))) )
-    ;;TODO: not yet supported
-    #_(testing "STDEV")
-    #_(testing "RAND")
-    #_(testing "VARIANCE")))
+               select))))))
 
 (deftest parse-where
   (testing "simple triple"
@@ -135,8 +125,14 @@
              groupBy))
       (is (= "(> (sum ?favNums) 1000)"
              having))))
-  ;;TODO: not yet supported 
-  #_(testing "DISTINCT"))
+  ;;TODO: not yet supported
+  #_(testing "DISTINCT")
+  #_(testing "UNION")
+  #_(testing "FILTER")
+  #_(testing "BIND"))
+
+;; TODO
+#_(deftest supported-functions)
 
 (deftest error
    (testing "invalid query throws expected error"
