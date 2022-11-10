@@ -25,13 +25,13 @@
     (testing "COUNT"
       (let [query "SELECT (COUNT(?friends) AS ?friends)\n WHERE {\n ?friends fd:person/friendsWith \"jdoe\".\n}\n"
             {:keys [select]} (sparql-to-ad-hoc query)]
-      (is (= ["(as (count ?friends) ?friends)"]
-             select))))
+        (is (= ["(as (count ?friends) ?friends)"]
+               select))))
     (testing "COUNT DISTINCT"
       (let [query "SELECT (COUNT(DISTINCT ?handle) AS ?handles)\n WHERE {\n ?person fd:person/handle ?handle.\n}\n"
             {:keys [select]} (sparql-to-ad-hoc query)]
-      (is (= ["(as (count-distinct ?handle) ?handles)"]
-             select))))
+        (is (= ["(as (count-distinct ?handle) ?handles)"]
+               select))))
     (testing "MAX"
       (let [query "SELECT ?fullName (MAX(?favNums) AS ?max)\n WHERE {\n ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
             {:keys [select]} (sparql-to-ad-hoc query)]
@@ -76,7 +76,7 @@
           {:keys [where]} (sparql-to-ad-hoc query)]
       (is (= [["$fdb" "?person" "person/handle" "jdoe"]
               ["$fdb" "?person" "person/fullName" "?fullName"]
-              ["$fdb" "?person" "person/favNums" "?favNums"]] 
+              ["$fdb" "?person" "person/favNums" "?favNums"]]
              where))))
   ;;TODO: not yet supported(?)
   #_(testing "language labels"))
@@ -87,7 +87,7 @@
 (deftest parse-sources
   (testing "wikidata, fluree"
     (let [query "SELECT ?movie ?title\nWHERE {\n  ?user  fdb:person/favMovies ?movie.\n ?movie fdb:movie/title ?title.\n ?wdMovie wd:?label ?title;\n wdt:P840 ?narrative_location;\n wdt:P31 wd:Q11424.\n ?user fdb:person/handle ?handle.\n \n}\n" {:keys [where]} (sparql-to-ad-hoc query)]
-      (is (= ["$fdb" "$fdb" "$wd" "$wd" "$wd" "$fdb"] 
+      (is (= ["$fdb" "$fdb" "$wd" "$wd" "$wd" "$fdb"]
              (mapv first where)))))
   (testing "external"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\nSELECT ?name ?mbox\n WHERE {\n ?x foaf:name ?name.\n?x foaf:mbox ?mbox\n}"
@@ -100,7 +100,7 @@
   (testing "LIMIT"
     (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n LIMIT 1000"
           {:keys [limit]} (sparql-to-ad-hoc query)]
-      (is (= 1000 
+      (is (= 1000
              limit))))
   (testing "OFFSET"
     (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n OFFSET 10"
@@ -135,7 +135,7 @@
 #_(deftest supported-functions)
 
 (deftest error
-   (testing "invalid query throws expected error"
+  (testing "invalid query throws expected error"
     (let [query "SELECT ?person\n WHERE  ?person fd:person/fullName \"jdoe\" "]
       (is (= {:status 400
               :error :db/invalid-query}
