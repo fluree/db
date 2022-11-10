@@ -50,7 +50,9 @@
       (let [query  "SELECT ?fullName (SUM(?favNums) AS ?sum)\n WHERE {\n ?person fd:person/favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
             {:keys [select]} (sparql-to-ad-hoc query)]
         (is (= ["?fullName" "(as (sum ?favNums) ?sum)"]
-               select))))))
+               select))))
+    ;;TODO: not yet supported
+    #_(testing "GROUP_CONCAT")))
 
 (deftest parse-where
   (testing "simple triple"
@@ -77,14 +79,70 @@
               ["$fdb" "?person" "person/fullName" "?fullName"]
               ["$fdb" "?person" "person/favNums" "?favNums"]]
              where))))
+  (testing "UNION"
+    (let [query "SELECT ?person ?age\nWHERE {\n { ?person fdb:person/age 70.\n ?person fdb:person/handle \"dsanchez\". } \n  UNION \n { ?person fdb:person/handle \"anguyen\". } \n ?person fdb:person/age ?age.\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= [{:union
+               [[["$fdb" "?person" "person/age" 70]
+                 ["$fdb" "?person" "person/handle" "dsanchez"]]
+                [["$fdb" "?person" "person/handle" "anguyen"]]]}
+              ["$fdb" "?person" "person/age" "?age"]]
+             where))))
+  (testing "FILTER"
+    (let [query "SELECT ?handle ?num\nWHERE {\n ?person fdb:person/handle ?handle.\n ?person fdb:person/favNums ?num.\n  FILTER ( ?num > 10 ).\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= [["$fdb" "?person" "person/handle" "?handle"]
+              ["$fdb" "?person" "person/favNums" "?num"]
+              {:filter ["(> ?num 10)"]}]
+             where))))
+  (testing "OPTIONAL"
+    (let [query "SELECT ?handle ?num\nWHERE {\n ?person fdb:person/handle ?handle.\n OPTIONAL { ?person fdb:person/favNums ?num. }\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (=[["$fdb" "?person" "person/handle" "?handle"]
+             {:optional [["$fdb" "?person" "person/favNums" "?num"]]}]
+            where)))
+    (testing "multi-clause"
+      (let [query "SELECT ?person ?name ?handle ?favNums \nWHERE {\n  ?person fdb:person/fullName ?name. \n  OPTIONAL { ?person fdb:person/handle ?handle. \n ?person fdb:person/favNums ?favNums. }\n}"
+            {:keys [where]} (sparql-to-ad-hoc query)]
+        (is (= [["$fdb" "?person" "person/fullName" "?name"]
+                {:optional
+                 [["$fdb" "?person" "person/handle" "?handle"]
+                  ["$fdb" "?person" "person/favNums" "?favNums"]]}]
+               where))))
+    (testing "OPTIONAL + FILTER"
+      (let [query "SELECT ?handle ?num\nWHERE {\n  ?person fdb:person/handle ?handle.\n  OPTIONAL { ?person fdb:person/favNums ?num. \n FILTER( ?num > 10 )\n }\n}"
+            {:keys [where]} (sparql-to-ad-hoc query)]
+        (is (= [["$fdb" "?person" "person/handle" "?handle"]
+                {:optional
+                 [["$fdb" "?person" "person/favNums" "?num"]
+                  {:filter ["(> ?num 10)"]}]}]
+               where)))))
+  (testing "VALUES"
+    (let [query "SELECT ?handle\nWHERE {\n VALUES ?handle { \"dsanchez\" }\n ?person fdb:person/handle ?handle.\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= [{:bind {"?handle" "dsanchez"}}
+              ["$fdb" "?person" "person/handle" "?handle"]]
+             where))))
+  (testing "BIND"
+    (let [query "SELECT ?person ?handle\nWHERE {\n BIND (\"dsanchez\" AS ?handle)\n  ?person fdb:person/handle ?handle.\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= [{:bind {"?handle" "dsanchez"}}
+              ["$fdb" "?person" "person/handle" "?handle"]]
+             where)))
+    (let [query "SELECT ?hash\nWHERE {\n  ?s fdb:_block/number ?bNum.\n  BIND (MAX(?bNum) AS ?maxBlock)\n  ?s fdb:_block/number ?maxBlock.\n  ?s fdb:_block/hash ?hash.\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= [["$fdb" "?s" "_block/number" "?bNum"]
+              {:bind {"?maxBlock" "#(max ?bNum)"}}
+              ["$fdb" "?s" "_block/number" "?maxBlock"]
+              ["$fdb" "?s" "_block/hash" "?hash"]]
+             where))))
+
   ;;TODO: not yet supported
   #_(testing "language labels"))
 
-;;TODO: not yet supported
-#_(deftest parse-optional)
 
 (deftest parse-sources
-  (testing "wikidata, fluree"
+  (testing "wikidata, current fluree"
     (let [query "SELECT ?movie ?title\nWHERE {\n  ?user  fdb:person/favMovies ?movie.\n ?movie fdb:movie/title ?title.\n ?wdMovie wd:?label ?title;\n wdt:P840 ?narrative_location;\n wdt:P31 wd:Q11424.\n ?user fdb:person/handle ?handle.\n \n}\n" {:keys [where]} (sparql-to-ad-hoc query)]
       (is (= ["$fdb" "$fdb" "$wd" "$wd" "$wd" "$fdb"]
              (mapv first where)))))
@@ -92,6 +150,11 @@
     (let [query "SELECT ?person\nWHERE {\n  ?person fullText:person/handle \"jdoe\".\n}"
           {:keys [where]} (sparql-to-ad-hoc query)]
       (is (= ["$fdb"]
+             (mapv first where)))))
+  (testing "fluree blocks"
+    (let [query "SELECT ?nums\nWHERE {\n ?person fd4:person/handle \"zsmith\";\n fd4:person/favNums ?nums;\n fd5:person/favNums  ?nums.\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= ["$fdb4" "$fdb4" "$fdb5"]
              (mapv first where)))))
   (testing "external"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\nSELECT ?name ?mbox\n WHERE {\n ?x foaf:name ?name.\n?x foaf:mbox ?mbox\n}"
@@ -135,16 +198,36 @@
              groupBy))
       (is (= "(> (sum ?favNums) 1000)"
              having))))
-  ;;TODO: not yet supported
-  #_(testing "DISTINCT")
-  #_(testing "UNION")
-  #_(testing "FILTER")
-  #_(testing "BIND"))
+  (testing "mutiple GROUP BY"
+    (let [query "SELECT ?handle\nWHERE {\n ?person fdb:person/handle ?handle.\n}\nGROUP BY ?person ?handle"
+          {:keys [groupBy]} (sparql-to-ad-hoc query)]
+      (is (= ["?person" "?handle"]
+             groupBy))))
+  (testing "DISTINCT"
+    (let [query "SELECT DISTINCT ?person ?fullName \nWHERE {\n ?person fd:person/fullName ?fullName \n}"
+          {:keys [selectDistinct]} (sparql-to-ad-hoc query)]
+      (is (= ["?person" "?fullName"]
+             selectDistinct)))))
+
+(deftest parse-recursive
+  (let [query "SELECT ?followHandle\nWHERE {\n ?person fdb:person/handle \"anguyen\".\n ?person fdb:person/follows+ ?follows.\n ?follows fdb:person/handle ?followHandle.\n}"
+        {:keys [where]} (sparql-to-ad-hoc query)]
+    (is (= [["$fdb" "?person" "person/handle" "anguyen"]
+            ["$fdb" "?person" "person/follows+" "?follows"]
+            ["$fdb" "?follows" "person/handle" "?followHandle"]]
+           where)))
+  (testing "depth"
+    (let [query "SELECT ?followHandle\nWHERE {\n ?person fdb:person/handle \"anguyen\".\n ?person fdb:person/follows+3 ?follows.\n ?follows fdb:person/handle ?followHandle.\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= [["$fdb" "?person" "person/handle" "anguyen"]
+              ["$fdb" "?person" "person/follows+3" "?follows"]
+              ["$fdb" "?follows" "person/handle" "?followHandle"]]
+             where)))))
 
 ;; TODO
-#_(deftest supported-functions)
+#_(deftest parse-functions)
 
-(deftest error
+(deftest parsing-error
   (testing "invalid query throws expected error"
     (let [query "SELECT ?person\n WHERE  ?person fd:person/fullName \"jdoe\" "]
       (is (= {:status 400
