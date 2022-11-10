@@ -1192,7 +1192,6 @@
 (defn add-where-meta-union
   "Handles union clause additional parsing."
   [{:keys [where] :as union-where-clause} prior-vars supplied-vars]
-  (log/warn "union-where-clause: " union-where-clause)
   (let [[union1 union2] where
         [union1* union-1-vars] (add-nested-where union1 prior-vars supplied-vars)
         [union2* union-2-vars] (add-nested-where union2 prior-vars supplied-vars)]
