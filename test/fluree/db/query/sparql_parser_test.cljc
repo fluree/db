@@ -88,6 +88,11 @@
     (let [query "SELECT ?movie ?title\nWHERE {\n  ?user  fdb:person/favMovies ?movie.\n ?movie fdb:movie/title ?title.\n ?wdMovie wd:?label ?title;\n wdt:P840 ?narrative_location;\n wdt:P31 wd:Q11424.\n ?user fdb:person/handle ?handle.\n \n}\n" {:keys [where]} (sparql-to-ad-hoc query)]
       (is (= ["$fdb" "$fdb" "$wd" "$wd" "$wd" "$fdb"]
              (mapv first where)))))
+  (testing "fullText"
+    (let [query "SELECT ?person\nWHERE {\n  ?person fullText:person/handle \"jdoe\".\n}"
+          {:keys [where]} (sparql-to-ad-hoc query)]
+      (is (= ["$fdb"]
+             (mapv first where)))))
   (testing "external"
     (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\nSELECT ?name ?mbox\n WHERE {\n ?x foaf:name ?name.\n?x foaf:mbox ?mbox\n}"
           {:keys [prefixes where]} (sparql-to-ad-hoc query)]
