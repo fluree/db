@@ -251,7 +251,7 @@
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of '1' and increment from there."
-  [conn latest-commit through-t]
+  [conn latest-commit]
   (go-try
     (loop [commit  latest-commit
            last-t  nil
@@ -278,7 +278,7 @@
                            :commit-data (if (> (count (str commit)) 500)
                                           (str (subs (str commit) 0 500) "...")
                                           (str commit))})))
-        (if (>= through-t commit-t)
+        (if (= 1 commit-t)
           commits*
           (let [commit-data (<? (read-commit conn prev-commit-addr))
                 [commit proof] (parse-commit commit-data)]
@@ -292,7 +292,7 @@
   [{:keys [ledger] :as db} latest-commit merged-db?]
   (go-try
     (let [{:keys [conn]} ledger
-          commits (<? (trace-commits conn latest-commit 1))]
+          commits (<? (trace-commits conn latest-commit))]
       (loop [[commit & r] commits
              db* db]
         (if commit
@@ -317,7 +317,7 @@
           commit-t   (commit-data/t commit-map)]
       (if (= commit-t index-t)
         db-base*                                            ;; if index-t is same as latest commit, no additional commits to load
-        (loop [[commit & r] (<? (trace-commits conn latest-commit (inc (or index-t 0)))) ;; TODO - can load in parallel
+        (loop [[commit & r] (<? (trace-commits conn latest-commit)) ;; TODO - can load in parallel
                db* db-base*]
           (if commit
             (let [new-db (<? (merge-commit conn db* commit merged-db?))]
