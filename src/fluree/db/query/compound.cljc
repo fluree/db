@@ -121,12 +121,7 @@
           ;; wait for operation to finish
           (do
             (async/<!
-              (case type
-                (:class :tuple :iri) (where-clause-tuple-chunk db next-in out-ch error-ch clause t)
-                :optional :TODO
-                :union (let [[union1 union2] (:where clause)]
-                         (where-clause-tuple-chunk db next-in out-ch error-ch (first union1) t)
-                         (where-clause-tuple-chunk db next-in out-ch error-ch (first union2) t))))
+              (where-clause-tuple-chunk db next-in out-ch error-ch clause t))
             (recur))
           ;; no more input results, close out channel
           (async/close! out-ch))))
@@ -203,6 +198,25 @@
                 (async/close! out-ch)))))))
     out-ch))
 
+(defn process-union
+  [db prev-chan error-ch clause t]
+  (let [out-ch (async/chan)]
+    (async/go
+      (let [[union1 union2] (:where clause)
+            ;; at least for consistent results, a union must drain the previous
+            ;; chan and then process the identical inputs into the first, then
+            ;; second union statement. An alternative would be to create a multi
+            ;; chan and keep the streaming protocol, but the output would be in an inconsistent order
+            drained   (<? (async/into [] prev-chan))
+            u1-ch     (async/to-chan! drained)
+            u2-ch     (async/to-chan! drained)
+            union1-ch (where-clause-chan db u1-ch error-ch (first union1) t)
+            _         (async/pipe union1-ch out-ch false)
+            union2-ch (where-clause-chan db u2-ch error-ch (first union2) t)]
+        (async/pipe union2-ch out-ch)))
+    out-ch))
+
+
 (defn resolve-where-clause
   [{:keys [t] :as db} {:keys [where vars] :as _parsed-query} error-ch fuel max-fuel]
   (let [initial-chan (get-clause-res db nil (first where) t vars fuel max-fuel error-ch)]
@@ -210,7 +224,10 @@
            prev-chan initial-chan]
       ;; TODO - get 't' from query!
       (if clause
-        (let [out-chan (where-clause-chan db prev-chan error-ch clause t)]
+        (let [out-chan (case (:type clause)
+                         (:class :tuple :iri) (where-clause-chan db prev-chan error-ch clause t)
+                         :optional :TODO
+                         :union (process-union db prev-chan error-ch clause t))]
           (recur r out-chan))
         prev-chan))))
 

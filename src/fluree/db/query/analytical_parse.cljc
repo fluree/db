@@ -1200,7 +1200,7 @@
                       {:status 400 :error :db/invalid-query})))
     (assoc union-where-clause :where [union1* union2*]
                               :prior-vars prior-vars
-                              :vars union-1-vars)))
+                              :vars union-2-vars)))
 
 
 (defn add-where-meta
