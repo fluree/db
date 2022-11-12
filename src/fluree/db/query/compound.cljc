@@ -200,20 +200,20 @@
 
 (defn process-union
   [db prev-chan error-ch clause t]
-  (let [out-ch (async/chan)]
+  (let [out-ch (async/chan 2)
+        [union1 union2] (:where clause)]
     (async/go
-      (let [[union1 union2] (:where clause)
-            ;; at least for consistent results, a union must drain the previous
-            ;; chan and then process the identical inputs into the first, then
-            ;; second union statement. An alternative would be to create a multi
-            ;; chan and keep the streaming protocol, but the output would be in an inconsistent order
-            drained   (<? (async/into [] prev-chan))
-            u1-ch     (async/to-chan! drained)
-            u2-ch     (async/to-chan! drained)
-            union1-ch (where-clause-chan db u1-ch error-ch (first union1) t)
-            _         (async/pipe union1-ch out-ch false)
-            union2-ch (where-clause-chan db u2-ch error-ch (first union2) t)]
-        (async/pipe union2-ch out-ch)))
+      (loop []
+        (if-let [next-in (async/<! prev-chan)]
+          ;; wait for operation to finish
+          (do
+            (async/<!
+              (where-clause-tuple-chunk db next-in out-ch error-ch (first union1) t))
+            (async/<!
+              (where-clause-tuple-chunk db next-in out-ch error-ch (first union2) t))
+            (recur))
+          ;; no more input results, close out channel
+          (async/close! out-ch))))
     out-ch))
 
 
