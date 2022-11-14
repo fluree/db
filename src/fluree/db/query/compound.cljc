@@ -1,20 +1,12 @@
 (ns fluree.db.query.compound
-  (:require [clojure.set :as set]
-            [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async]
-            #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.time-travel :as time-travel]
+  (:require [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [clojure.core.async :as async :refer [<!]]
             [fluree.db.util.core :as util]
             [fluree.db.flake :as flake]
-            [fluree.db.query.analytical-wikidata :as wikidata]
-            [fluree.db.query.analytical-filter :as filter]
-            [fluree.db.query.union :as union]
             [clojure.string :as str]
             [fluree.db.util.log :as log :include-macros true]
             #?(:cljs [cljs.reader])
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.query.analytical-parse :as parse]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.constants :as const]))
 
@@ -35,9 +27,8 @@
 
 
 (defn next-chunk-s
-  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p idx t flake-x-form passthrough-fn]
-  (let [out-ch   (async/chan)
-        idx-root (get db idx)
+  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p idx t flake-x-form passthrough-fn out-ch]
+  (let [idx-root (get db idx)
         novelty  (get-in db [:novelty idx])]
     (async/go
       (loop [[in-item & r] next-in]
@@ -53,50 +44,32 @@
                                 sid-val))
                             sid)]
             (when sid
-              (let [opts  (query-range-opts idx t sid* pid nil)
-                    in-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+              (let [xfs   (cond-> [flake-x-form]
+                            pass-vals (conj (map #(concat % pass-vals))))
+                    xf    (apply comp xfs)
+                    opts  (-> (query-range-opts idx t sid* pid nil)
+                              (assoc :flake-xf xf))
+                    results (async/<! (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
+                                           (async/reduce into [])))]
                 ;; pull all subject results off chan, push on out-ch
-                (loop [interim-results nil]
-                  (if-let [next-chunk (async/<! in-ch)]
-                    (if (seq next-chunk)
-                      ;; calc interim results
-                      (let [result (cond->> (sequence flake-x-form next-chunk)
-                                            pass-vals (map #(concat % pass-vals)))]
-                        (recur (if interim-results
-                                 (into interim-results result)
-                                 result)))
-                      ;; empty result set
-                      (or interim-results
-                          (when optional?
-                            (cond->> (sequence flake-x-form [(flake/parts->Flake [sid* pid])])
-                                     pass-vals (map #(concat % pass-vals))
-                                     true (async/>! out-ch)))))
-                    (async/>! out-ch interim-results)))))
+                (if (seq results)
+                  (async/>! out-ch results)
+                  (when optional?
+                    (async/>! out-ch (sequence xf [(flake/parts->Flake [sid* pid])]))))))
             (recur r))
           (async/close! out-ch))))
     out-ch))
 
-
-(defn get-chan
-  [db prev-chan error-ch clause t]
-  (let [out-ch (async/chan 2)
-        {:keys [s p o idx flake-x-form passthrough-fn optional?]} clause
-        {s-var :variable, s-in-n :in-n} s
-        {o-var :variable, o-in-n :in-n} o]
-    (async/go
-      (loop []
-        (if-let [next-in (async/<! prev-chan)]
-          (let []
-            (if s-in-n
-              (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
-                (loop []
-                  (when-let [next-s (async/<! s-vals-chan)]
-                    (async/>! out-ch next-s)
-                    (recur)))))
-            (recur))
-          (async/close! out-ch))))
-    out-ch))
-
+(defn refine-results
+  [result-ch {:keys [t] :as db} error-ch clause]
+  (let [{:keys [s p idx flake-x-form passthrough-fn optional?]} clause]
+    (if (:in-n s)
+      (let [refine-next-chunk (fn [next-in ch]
+                              (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn ch))
+            refined-ch (async/chan 2)]
+        (async/pipeline-async 2 refined-ch refine-next-chunk result-ch)
+        refined-ch)
+      result-ch)))
 
 (defmulti get-clause-res (fn [_ _ {:keys [type] :as _clause} _ _ _ _ _]
                            type))
@@ -153,31 +126,22 @@
                        (get vars s-var))
             o*       (or (:value o)
                          (get vars o-var))
-            opts     (query-range-opts idx t s* pid o*)
+            opts     (-> (query-range-opts idx t s* pid o*)
+                         (assoc :flake-xf flake-x-form))
             idx-root (get db idx)
             novelty  (get-in db [:novelty idx])
             range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
         (if (and s-val (nil? s*))                           ;; this means the iri provided for 's' doesn't exist, close
           (async/close! out-ch)
-          (loop []
-            (let [next-res (async/<! range-ch)]
-              (if next-res
-                (let [next-out (sequence flake-x-form next-res)]
-                  (async/>! out-ch next-out)
-                  (recur))
-                (async/close! out-ch)))))))
+          (async/pipe range-ch out-ch))))
     out-ch))
 
 (defn resolve-where-clause
   [{:keys [t] :as db} {:keys [where vars] :as _parsed-query} error-ch fuel max-fuel]
   (let [initial-chan (get-clause-res db nil (first where) t vars fuel max-fuel error-ch)]
-    (loop [[clause & r] (rest where)
-           prev-chan initial-chan]
-      ;; TODO - get 't' from query!
-      (if clause
-        (let [out-chan (get-chan db prev-chan error-ch clause t)]
-          (recur r out-chan))
-        prev-chan))))
+    (reduce (fn [result-ch clause]
+              (refine-results result-ch db error-ch clause))
+            initial-chan (rest where))))
 
 (defn order+group-results
   "Ordering must first consume all results and then sort."
