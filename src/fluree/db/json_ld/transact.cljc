@@ -16,7 +16,7 @@
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.query.analytical-parse :as q-parse]
             [fluree.db.query.compound :as compound]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [<!]]
             [fluree.db.dbproto :as db-proto])
   (:refer-clojure :exclude [vswap!]))
 
@@ -403,11 +403,7 @@
     (let [{:keys [delete] :as parsed-query} (q-parse/parse db json-ld)
           fuel          (volatile! 0)
           error-ch      (async/chan)
-          where-ch      (compound/where parsed-query error-ch fuel max-fuel db)
-          where-results (loop [results []]
-                          (if-let [next-res (async/<! where-ch)]
-                            (recur (into results next-res))
-                            results))
+          where-results (<! (compound/where db parsed-query fuel max-fuel error-ch))
           {:keys [db-before t] :as tx-state} (->tx-state db nil)
           {:keys [s p o]} delete
           {s-value :value, s-in-n :in-n} s

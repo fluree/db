@@ -156,9 +156,10 @@
 
 
 (defn where
-  [parsed-query error-ch fuel max-fuel db]
+  [db parsed-query fuel max-fuel error-ch]
   (let [{:keys [order-by group-by]} parsed-query
-        where-results (resolve-where-clause db parsed-query error-ch fuel max-fuel)
+        where-results (->> (resolve-where-clause db parsed-query error-ch fuel max-fuel)
+                           (async/reduce into []))
         out-ch        (cond-> where-results
-                              order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
+                        order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
     out-ch))
