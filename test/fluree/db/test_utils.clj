@@ -31,3 +31,11 @@
         commit1   @(fluree/commit! stage1-db {:message "First commit!"
                                               :push?   true})]
     ledger))
+
+(defn load-people
+  [conn]
+  (let [ledger @(fluree/create conn "test/people")
+        people (load-edn-resource "people.edn")
+        staged @(fluree/stage ledger people)
+        commit @(fluree/commit! staged {:message "Adding people", :push? true})]
+    ledger))

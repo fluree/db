@@ -25,7 +25,7 @@
     (loop [[spec-item & r'] spec
            result-item []]
       (if spec-item
-        (let [{:keys [selection in-n iri? o-var? grouped?]} spec-item
+        (let [{:keys [selection in-n iri? o-var? grouped? function]} spec-item
               value  (nth where-item in-n)
               value* (cond
                        ;; there is a sub-selection (graph crawl)
@@ -34,9 +34,9 @@
                          (<? (json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel (:spec spec-item) 0 flakes)))
 
                        grouped?
-                       (if o-var?
-                         (mapv first value)
-                         value)
+                       (cond->> value
+                         o-var?   (mapv first)
+                         function function)
 
                        ;; subject id coming it, we know it is an IRI so resolve here
                        iri?
