@@ -403,7 +403,7 @@
     (let [{:keys [delete] :as parsed-query} (q-parse/parse db json-ld)
           fuel          (volatile! 0)
           error-ch      (async/chan)
-          where-ch      (compound/where parsed-query error-ch fuel max-fuel db)
+          where-ch      (compound/where db parsed-query fuel max-fuel error-ch)
           where-results (loop [results []]
                           (if-let [next-res (async/<! where-ch)]
                             (recur (into results next-res))

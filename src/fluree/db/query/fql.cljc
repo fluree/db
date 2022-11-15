@@ -88,15 +88,26 @@
               (recur))
             (async/close! out-ch)))))))
 
+(defn order+group-results
+  "Ordering must first consume all results and then sort."
+  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by} {:keys [grouping-fn] :as _group-by}]
+  (async/go
+    (let [results (loop [results []]
+                    (if-let [next-res (async/<! results-ch)]
+                      (recur (into results next-res))
+                      results))]
+      (cond-> (sort comparator results)
+        grouping-fn grouping-fn))))
 
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
-  [db {:keys [fuel] :as parsed-query}]
+  [db {:keys [fuel order-by group-by] :as parsed-query}]
   (let [out-ch (async/chan)]
     (let [max-fuel fuel
           fuel     (volatile! 0)
           error-ch (async/chan)
-          where-ch (compound/where parsed-query error-ch fuel max-fuel db)]
+          where-ch (cond-> (compound/where db parsed-query fuel max-fuel error-ch)
+                     order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
       (process-select-results db out-ch where-ch error-ch parsed-query))
     out-ch))
 
