@@ -143,23 +143,7 @@
               (refine-results result-ch db error-ch clause))
             initial-chan (rest where))))
 
-(defn order+group-results
-  "Ordering must first consume all results and then sort."
-  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by} {:keys [grouping-fn] :as _group-by}]
-  (async/go
-    (let [results (loop [results []]
-                    (if-let [next-res (async/<! results-ch)]
-                      (recur (into results next-res))
-                      results))]
-      (cond-> (sort comparator results)
-              grouping-fn grouping-fn))))
-
-
 (defn where
   [db parsed-query fuel max-fuel error-ch]
-  (let [{:keys [order-by group-by]} parsed-query
-        where-results (->> (resolve-where-clause db parsed-query error-ch fuel max-fuel)
-                           (async/reduce into []))
-        out-ch        (cond-> where-results
-                        order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
-    out-ch))
+  (->> (resolve-where-clause db parsed-query error-ch fuel max-fuel)
+       (async/reduce into [])))
