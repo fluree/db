@@ -1,5 +1,5 @@
 (ns fluree.db.query.aggregate-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
