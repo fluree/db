@@ -241,18 +241,18 @@
 
 (defn- coerce-int-fn
   "Returns a fn for coercing int-like values (e.g. short, long) from strings and
-  integers. Arguments are CLJ-only parse and cast fns (CLJS is always the same
-  because in JS it's all just Numbers)."
-  [parse cast]
+  integers. Arguments are CLJ-only parse-str and cast-num fns (CLJS is always
+  the same because in JS it's all just Numbers)."
+  [parse-str cast-num]
   (fn [value]
     (cond
       (string? value)
-      #?(:clj  (try (parse value) (catch Exception _ nil))
+      #?(:clj  (try (parse-str value) (catch Exception _ nil))
          :cljs (when-not (str/includes? value ".")
                  (let [n (js/parseInt value)] (if (js/Number.isNaN n) nil n))))
 
       (integer? value)
-      #?(:clj (try (cast value) (catch Exception _ nil)) :cljs value)
+      #?(:clj (try (cast-num value) (catch Exception _ nil)) :cljs value)
 
       :else nil)))
 
