@@ -361,8 +361,8 @@
       ;; different data types, not comparable
       :else
       (cmp-dt dt1 dt2))
-    0)
-  )
+    0))
+
 
 (defn cmp-op
   [op1 op2]
