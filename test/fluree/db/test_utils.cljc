@@ -2,7 +2,8 @@
   (:require [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]
-            [fluree.resource #?(:clj :refer :cljs :refer-macros) [inline-edn-resource]]))
+            #?(:clj [fluree.resource :refer [inline-edn-resource]]))
+  #?(:cljs (:require-macros [fluree.resource :refer [inline-edn-resource]])))
 
 (def default-context
   (inline-edn-resource "default-context.edn"))
