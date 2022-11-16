@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [<! >! go]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :refer [vswap!]]
+            [fluree.db.util.core :refer [vswap! try* catch*]]
             [fluree.db.query.analytical-parse :as q-parse]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
@@ -20,46 +20,50 @@
 
 
 (defn process-where-item
-  [db cache compact-fn fuel-vol fuel where-item spec inVector?]
-  (go-try
-    (loop [[spec-item & r'] spec
-           result-item []]
-      (if spec-item
-        (let [{:keys [selection in-n iri? o-var? grouped? function]} spec-item
-              value  (nth where-item in-n)
-              value* (cond
-                       ;; there is a sub-selection (graph crawl)
-                       selection
-                       (let [flakes (<? (query-range/index-range db :spot = [value]))]
-                         (<? (json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel (:spec spec-item) 0 flakes)))
+  [db cache compact-fn fuel-vol fuel where-item spec inVector? error-ch]
+  (go
+    (try*
+     (loop [[spec-item & r'] spec
+            result-item []]
+       (if spec-item
+         (let [{:keys [selection in-n iri? o-var? grouped? function]} spec-item
+               value  (nth where-item in-n)
+               value* (cond
+                        ;; there is a sub-selection (graph crawl)
+                        selection
+                        (let [flakes (<? (query-range/index-range db :spot = [value]))]
+                          (<? (json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel (:spec spec-item) 0 flakes)))
 
-                       grouped?
-                       (cond->> value
-                         o-var?   (mapv first)
-                         function function)
+                        grouped?
+                        (cond->> value
+                          o-var?   (mapv first)
+                          function function)
 
-                       ;; subject id coming it, we know it is an IRI so resolve here
-                       iri?
-                       (or (get @cache value)
-                           (let [c-iri (<? (db-proto/-iri db value compact-fn))]
-                             (vswap! cache assoc value c-iri)
-                             c-iri))
+                        ;; subject id coming it, we know it is an IRI so resolve here
+                        iri?
+                        (or (get @cache value)
+                            (let [c-iri (<? (db-proto/-iri db value compact-fn))]
+                              (vswap! cache assoc value c-iri)
+                              c-iri))
 
-                       o-var?
-                       (let [[val datatype] value]
-                         (if (= const/$xsd:anyURI datatype)
-                           (or (get @cache val)
-                               (let [c-iri (<? (db-proto/-iri db val compact-fn))]
-                                 (vswap! cache assoc val c-iri)
-                                 c-iri))
-                           val))
+                        o-var?
+                        (let [[val datatype] value]
+                          (if (= const/$xsd:anyURI datatype)
+                            (or (get @cache val)
+                                (let [c-iri (<? (db-proto/-iri db val compact-fn))]
+                                  (vswap! cache assoc val c-iri)
+                                  c-iri))
+                            val))
 
-                       :else
-                       value)]
-          (recur r' (conj result-item value*)))
-        (if inVector?
-          result-item
-          (first result-item))))))
+                        :else
+                        value)]
+           (recur r' (conj result-item value*)))
+         (if inVector?
+           result-item
+           (first result-item))))
+     (catch* e
+             (log/error e "Error processing query")
+             (>! error-ch e)))))
 
 
 (defn process-select-results
@@ -82,7 +86,7 @@
                                         (map group-finish-fn where-items)
                                         where-items)]
                 (if where-item
-                  (let [where-result (<? (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector?))]
+                  (let [where-result (<! (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector? error-ch))]
                     (async/>! out-ch where-result)
                     (recur r))))
               (recur))
