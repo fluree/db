@@ -4,30 +4,37 @@
             [fluree.db.util.log :as log]
             [fluree.resource #?(:clj :refer :cljs :refer-macros) [inline-edn-resource]]))
 
+(def default-context
+  (inline-edn-resource "default-context.edn"))
+
+(def default-private-key
+  (inline-edn-resource "default-dev-private-key.edn"))
+
+(def movies
+  (inline-edn-resource "movies.edn"))
+
+(def people
+  (inline-edn-resource "people.edn"))
+
 (defn create-conn
   ([]
    (create-conn {}))
   ([{:keys [context did]
-     :or   {context (inline-edn-resource "default-context.edn")
-            did     (-> "default-dev-private-key.edn"
-                        inline-edn-resource
-                        did/private->did-map)}}]
+     :or   {context default-context
+            did     (did/private->did-map default-private-key)}}]
    @(fluree/connect-memory {:defaults {:context context
                                        :did     did}})))
 
 (defn load-movies
   [conn]
-  (let [ledger    @(fluree/create conn "test/movies")
-        movies    (inline-edn-resource "movies.edn")
-        stage1-db @(fluree/stage ledger movies)
-        commit1   @(fluree/commit! stage1-db {:message "First commit!"
-                                              :push?   true})]
+  (let [ledger @(fluree/create conn "test/movies")
+        staged @(fluree/stage ledger movies)
+        commit @(fluree/commit! staged {:message "First commit!", :push? true})]
     ledger))
 
 (defn load-people
   [conn]
   (let [ledger @(fluree/create conn "test/people")
-        people (inline-edn-resource "people.edn")
         staged @(fluree/stage ledger people)
         commit @(fluree/commit! staged {:message "Adding people", :push? true})]
     ledger))
