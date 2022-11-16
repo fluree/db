@@ -755,7 +755,7 @@
   (let [n (count extraction-positions)
         [n1 n2 n3 n4 n5 & _r] extraction-positions]
     (case n
-      0 nil
+      0 (fn [_] [])
       1 (fn [input-item]
           [(nth input-item n1)])
       2 (fn [input-item]
@@ -777,8 +777,39 @@
   Optimized for several arity."
   [out-vars {:keys [others] :as _vars} in-vars]
   (let [passthrough-vars (filter (set others) out-vars)     ;; only keep output vars in 'others'
-        passthrough-pos  (mapv #(util/index-of in-vars %) passthrough-vars)]
+        passthrough-pos  (keep #(when-let [pass-pos (util/index-of in-vars %)]
+                                  pass-pos) passthrough-vars)]
     (build-vec-extraction-fn passthrough-pos)))
+
+(defn gen-nils-fn
+  "When we need to output nil values related to a union statement
+  we need a function to rearrange the output variables and inject nils into
+  the correct locations.
+
+  This isn't incredible efficient, but generally union statements will use the
+  same output variables and therefore not have to sub in 'nil' values - so it
+  is not expected this is a heavily used capability."
+  [out-vars {:keys [nils] :as _vars}]
+  (let [nils-pos (sort (map #(util/index-of out-vars %) nils))
+        output-n (count out-vars)]
+    (fn [out-vals]
+      (mapv
+        (fn [out-val]
+          (loop [i         0
+                 next-nil  (first nils-pos)
+                 rest-nils (rest nils-pos)
+                 out-val   out-val
+                 acc       []]
+            (if (< i output-n)
+              (if (= i next-nil)
+                (recur (inc i) (first rest-nils) (rest rest-nils)
+                       out-val
+                       (conj acc nil))
+                (recur (inc i) next-nil rest-nils
+                       (rest out-val)
+                       (conj acc (first out-val))))
+              acc)))
+        out-vals))))
 
 (defn get-idx
   [{s-variable :variable, s-supplied? :supplied?, s-in? :in-n}
@@ -856,17 +887,16 @@
 
   There could be an order-by or group-by var not included in the select statement, so
   those must get added into the results here - note group-by without order-by will create an order-by"
-  [out-vars {:keys [flake-out others all] :as _vars} {:keys [parsed] :as _order-by}]
-  (when-let [illegal-var (some #(when-not (contains? all %) %) out-vars)]
+  [select-out-vars {:keys [flake-out others all nils] :as _vars} {:keys [parsed] :as _order-by}]
+  (when-let [illegal-var (some #(when-not (contains? all %) %) select-out-vars)]
     (throw (ex-info (str "Variable " illegal-var " used in select statement but does not exist in the query.")
                     {:status 400 :error :db/invalid-query})))
   (let [order-by   (->> (map :variable parsed)
                         (remove nil?))
-        out-vars-s (into (set out-vars) order-by)
+        out-vars-s (into (set select-out-vars) order-by)
         flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
         others-out (filter out-vars-s others)]              ;; only keep other vars needed in final output
-
-    (into [] (concat flake-out others-out))))
+    (into [] (concat flake-out others-out nils))))
 
 
 (defn where-clause-reverse-tuple
@@ -882,7 +912,9 @@
         p*             (update-positions p in-vars)
         o*             (update-positions o in-vars)
         flake-x-form   (gen-x-form out-vars s* p* o*)
-        passthrough-fn (gen-passthrough-fn out-vars vars in-vars)]
+        passthrough-fn (gen-passthrough-fn out-vars vars in-vars)
+        nils-fn        (when (:nils vars)
+                         (gen-nils-fn out-vars vars))]
     (-> where-clause
         (assoc :in-vars in-vars
                :out-vars out-vars
@@ -890,13 +922,18 @@
                :o o*
                :idx (get-idx s* p o*)
                :flake-x-form flake-x-form
-               :passthrough-fn passthrough-fn)
+               :passthrough-fn passthrough-fn
+               :nils-fn nils-fn)
         ;; note, we could also dissoc :vars as they are no longer needed, but retain for now to help debug query parsing
         (dissoc :prior-vars))))
 
 
 (defn where-clause-reverse-union
-  "For union statements, need to process each of the two union where clauses."
+  "For union statements, need to process each of the two union where clauses.
+  Unions acts as an 'or', and can include different variables or the same.
+
+  If unions use different variables, the variables one statement uses output
+  as 'nil' in the other."
   [{:keys [where] :as union-clause} out-vars]
   (let [[union1 union2] where
         union1* (where-meta-reverse union1 out-vars)
@@ -907,6 +944,16 @@
                         :out-vars out-vars)))
 
 (defn where-meta-reverse
+  "Goes through where statements once more but in reverse.
+   Now that all variables for each statement are known, we
+   need to output only the needed vars for each statement and
+   order those output vars in as efficient manner as possible.
+
+   The ordering allows the output tuples of each statement to be a:
+   (concat <flake-vars-needing-output> <vars-from-prior-statements-needing-output>)
+   where you can think of each of these two sequences as an x-form of their inputs.
+   In the case of the first statement an x-form of the flake output from the index-range
+   call, in the second statement an x-form of the prior step's output."
   [where last-out-vars]
   (loop [[{:keys [type] :as clause} & r] (reverse where)
          out-vars last-out-vars
@@ -1189,18 +1236,53 @@
                                  :prior-vars prior-vars
                                  :vars vars)))
 
+(defn merge-union-vars
+  "Unions act as 'or'. If they use difference variables, their output
+  needs to be unified - so we need to output 'nil' for any variable used
+  in one statement but not the other.
+
+  Here we identify different variables, and add any vars that should output
+  nil in the final step into [:vars :nil], and also merge together all the
+  variables used across both union statements into a single [:vars :all].
+
+  For reference, the :vars value of each last union statement will end up looking
+  like this after this step:
+  {:flake-in (?s),
+   :flake-out [?s nil ?email1], ;; always as an [s p o] tuple, nil means the var need not be output
+   :all {?s :s, ?email1 :o, ?email2 :o}, ;; <<< this will be a merge of both union1 & union2
+   :others [],
+   :nils #{?email2}} ;; <<< this will be the vars in the statement that should output nil vals
+  "
+  [union1 union2]
+  (let [u1-last     (last union1)
+        u2-last     (last union2)
+        u1-all-vars (-> u1-last :vars :all)
+        u2-all-vars (-> u2-last :vars :all)
+        u1-vars-set (-> u1-all-vars keys set)
+        u2-vars-set (-> u2-all-vars keys set)
+        u1-unique   (reduce disj u1-vars-set u2-vars-set)
+        u2-unique   (reduce disj u2-vars-set u1-vars-set)
+        all-vars    (merge u1-all-vars u2-all-vars)
+        u1-last*    (-> u1-last
+                        (assoc-in [:vars :nils] u2-unique)
+                        (assoc-in [:vars :all] all-vars))
+        u2-last*    (-> u2-last
+                        (assoc-in [:vars :nils] u1-unique)
+                        (assoc-in [:vars :all] all-vars))]
+    [(-> union1 butlast vec (conj u1-last*))
+     (-> union2 butlast vec (conj u2-last*))]))
+
+
 (defn add-where-meta-union
   "Handles union clause additional parsing."
   [{:keys [where] :as union-where-clause} prior-vars supplied-vars]
   (let [[union1 union2] where
-        [union1* union-1-vars] (add-nested-where union1 prior-vars supplied-vars)
-        [union2* union-2-vars] (add-nested-where union2 prior-vars supplied-vars)]
-    (when (not= union-1-vars union-2-vars)
-      (throw (ex-info (str "Union clauses should be outputting the same variables.")
-                      {:status 400 :error :db/invalid-query})))
-    (assoc union-where-clause :where [union1* union2*]
+        [union1* _] (add-nested-where union1 prior-vars supplied-vars)
+        [union2* _] (add-nested-where union2 prior-vars supplied-vars)
+        [union1** union2**] (merge-union-vars union1* union2*)]
+    (assoc union-where-clause :where [union1** union2**]
                               :prior-vars prior-vars
-                              :vars union-2-vars)))
+                              :vars (-> union2** last :vars))))
 
 
 (defn add-where-meta

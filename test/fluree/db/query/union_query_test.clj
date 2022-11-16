@@ -48,4 +48,26 @@
              [["Cam" "cam@example.org"]
               ["Alice" "alice@example.org"]
               ["Brian" "brian@example.org"]])
-          "Emails for all 3 users should return, even though some are :schema/email and others :ex/email"))))
+          "Emails for all 3 users should return, even though some are :schema/email and others :ex/email")
+
+      ;; basic union that uses different variables for output
+      (is (= @(fluree/query db {:select ['?s '?email1 '?email2]
+                                :where  [['?s :rdf/type :ex/User]
+                                         {:union [[['?s :ex/email '?email1]]
+                                                  [['?s :schema/email '?email2]]]}]})
+             [[:ex/cam "cam@example.org" nil]
+              [:ex/alice nil "alice@example.org"]
+              [:ex/brian nil "brian@example.org"]])
+          "Emails for all 3 users should return, even though some are :schema/email and others :ex/email")
+
+      ;; basic union that uses different variables for output
+      #_(is (= @(fluree/query db {:select ['?name '?email1 '?email1]
+                                :where  [['?s :rdf/type :ex/User]
+                                         ['?s :schema/name '?name]
+                                         {:union [[['?s :ex/email '?email1]]
+                                                  [['?s :schema/email '?email2]]]}]})
+             [["Cam" "cam@example.org"]
+              ["Alice" "alice@example.org"]
+              ["Brian" "brian@example.org"]])
+          "Emails for all 3 users should return, even though some are :schema/email and others :ex/email")
+      )))

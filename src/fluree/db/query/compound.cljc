@@ -66,6 +66,8 @@
                       ;; empty result set
                       (or interim-results
                           (when optional?
+                            ;; for optional results, we need to output nil if nothing found
+                            ;; we generate a 'nil' value flake with the correct sid and pid so vars always get output correctly
                             (cond->> (sequence flake-x-form [(flake/parts->Flake [sid* pid])])
                                      pass-vals (map #(concat % pass-vals))
                                      true (async/>! out-ch)))))
@@ -78,7 +80,7 @@
 (defn get-chan
   [db prev-chan error-ch clause t]
   (let [out-ch (async/chan 2)
-        {:keys [type s p o idx flake-x-form passthrough-fn optional?]} clause
+        {:keys [type s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
         {o-var :variable, o-in-n :in-n} o]
     (async/go
@@ -89,7 +91,9 @@
               (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
                 (loop []
                   (when-let [next-s (async/<! s-vals-chan)]
-                    (async/>! out-ch next-s)
+                    (async/>! out-ch (if nils-fn
+                                       (nils-fn next-s)
+                                       next-s))
                     (recur)))))
             (recur))
           (async/close! out-ch))))
@@ -98,7 +102,7 @@
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
   [db next-in out-ch error-ch clause t]
-  (let [{:keys [s p o idx flake-x-form passthrough-fn optional?]} clause
+  (let [{:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
         {o-var :variable, o-in-n :in-n} o]
     (async/go
@@ -106,7 +110,9 @@
         (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
           (loop []
             (when-let [next-s (async/<! s-vals-chan)]
-              (async/>! out-ch next-s)
+              (async/>! out-ch (if nils-fn
+                                 (nils-fn next-s)
+                                 next-s))
               (recur))))))))
 
 

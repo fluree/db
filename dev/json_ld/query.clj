@@ -1,9 +1,5 @@
 (ns json-ld.query
-  (:require [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.api :as fdb]
-            [fluree.db.db.json-ld :as jld-db]
-            [fluree.db.json-ld.transact :as jld-tx]
-            [clojure.core.async :as async]
+  (:require [clojure.core.async :as async]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.async :refer [<?? go-try channel?]]
@@ -11,16 +7,13 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.did :as did]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
             [fluree.db.indexer.default :as indexer]
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]
             [criterium.core :as criterium]
-            [clojure.data.avl :as avl]
-            [clojure.tools.reader.edn :as edn]))
+            [fluree.db.query.analytical-parse :as q-parse]))
 
 
 
@@ -64,27 +57,79 @@
          :schema/name  "Alice"
          :ex/last      "Smith"
          :schema/email "alice@example.org"
+         :ex/favColor  "Green"
          :schema/age   42
          :ex/favNums   [42, 76, 9]
          :ex/scores    [102 92.5 90]}
-        {:id           :ex/cam,
-         :type         :ex/User,
-         :schema/name  "Cam"
-         :ex/last      "Jones"
-         :schema/email "cam@example.org"
-         :schema/age   34
-         :ex/favNums   [5, 10]
-         :ex/scores    [97.2 100 80]
-         :ex/friend    [:ex/brian :ex/alice]}]))
+        {:id          :ex/cam,
+         :type        :ex/User,
+         :schema/name "Cam"
+         :ex/last     "Jones"
+         :ex/email    "cam@example.org"
+         :schema/age  34
+         :ex/favNums  [5, 10]
+         :ex/scores   [97.2 100 80]
+         :ex/friend   [:ex/brian :ex/alice]}]))
 
-  ;@fluree.db.query.fql/LAST-PARSED
+  @fluree.db.query.fql/LAST-PARSED
+
+
+  @(fluree/query db {:select ['?s '?email1 '?email2]
+                     :where  [['?s :rdf/type :ex/User]
+                              {:union [[['?s :ex/email '?email1]]
+                                       [['?s :schema/email '?email2]]]}]})
+
+  @(fluree/query db {:select ['?s '?email1 '?email2]
+                     :where  [['?s :rdf/type :ex/User]
+                              {:union [[['?s :ex/email '?email1]]
+                                       [['?s :schema/email '?email2]]]}]})
+
+
+  @(fluree/query db {:select ['?s '?email1 '?email2]
+                     :where  [['?s :rdf/type :ex/User]
+                              {:optional ['?s :ex/email '?email1]}
+                              {:optional ['?s :schema/email '?email2]}]})
+
+
+  @(fluree/query db {:select ['?email]
+                     :where  [['?s :rdf/type :ex/User]
+                              ;['?s :schema/name '?name]
+                              {:union [[['?s :ex/email '?email]]
+                                       [['?s :schema/email '?email]]]}]})
+
+  @(fluree/query db {:select ['?name '?email]
+                     :where  [['?s :rdf/type :ex/User]
+                              ['?s :schema/name '?name]
+                              ['?s :ex/email '?email]]})
+
+  @(fluree/query db {:select ['?name '?favColor '?age]
+                     :where  [['?s :rdf/type :ex/User]
+                              ['?s :schema/name '?name]
+                              {:optional ['?s :ex/favColor '?favColor]}
+                              ['?s :schema/age '?age]]})
+
+
+  @(fluree/query db {:context {:friended {:reverse :ex/friend}}
+                     :select  [:schema/name :friended]
+                     :from    :ex/brian})
+
+  @(fluree/query db {:context {:friended {:reverse :ex/friend}}
+                     :select  [:schema/name {:friended [:*]}]
+                     :from    :ex/brian})
+
+  @(fluree/query db {:context {:friended {"@reverse" :ex/friend}}
+                     :select  ['?friend]
+                     :where   [['?s :schema/name "Cam"]
+                               ['?s :ex/friend '?friend]]})
+
+  @(fluree/query db {:select ['?friend]
+                     :where  [['?s :schema/name "Cam"]
+                              ['?s :ex/friend '?friend]]})
 
 
   @(fluree/query db
                  {:select ['?s '?p '?o]
-                  :where  [['?s :schema/age 34]
-                           ['?s '?p '?o]]})
-
+                  :where  [['?s '?p '?o]]})
 
   @(fluree/query db {:select   ['?name '?last '(sum ?favNums)]
                      :where    [['?s :schema/name '?name]
@@ -143,6 +188,5 @@
                      :from   :ex/brian})
 
   @(fluree/query db {:select {'?s [:* {:ex/friend [:*]}]}
-                     :where  [['?s :rdf/type :ex/User]]})
+                     :where  [['?s :rdf/type :ex/User]]}))
 
-  )
