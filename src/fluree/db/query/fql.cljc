@@ -69,28 +69,23 @@
 (defn process-select-results
   "Processes where results into final shape of specified select statement."
   [db out-ch where-ch error-ch {:keys [select fuel compact-fn group-by] :as _parsed-query}]
-  (go-try
-    (let [{:keys [spec inVector?]} select
-          cache    (volatile! {})
-          fuel-vol (volatile! 0)
-          {:keys [group-finish-fn]} group-by]
-      (loop []
-        (let [where-items (async/alt!
-                            error-ch ([e]
-                                      (throw e))
-                            where-ch ([result-chunk]
-                                      result-chunk))]
-          (if where-items
-            (do
-              (loop [[where-item & r] (if group-finish-fn   ;; note - this could be added to the chan as a transducer - however as all results are in one big, sorted chunk I don't expect any performance benefit
-                                        (map group-finish-fn where-items)
-                                        where-items)]
-                (if where-item
-                  (let [where-result (<! (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector? error-ch))]
-                    (async/>! out-ch where-result)
-                    (recur r))))
-              (recur))
-            (async/close! out-ch)))))))
+  (let [{:keys [spec inVector?]} select
+        cache    (volatile! {})
+        fuel-vol (volatile! 0)
+        {:keys [group-finish-fn]} group-by
+        finish-xf (if group-finish-fn
+                    (map group-finish-fn)
+                    (map identity))
+        process-xf (comp cat finish-xf)
+        process-ch (async/chan 2 process-xf)]
+    (->> process-ch
+         (async/pipe where-ch)
+         (async/pipeline-async 2
+                               out-ch
+                               (fn [where-item ch]
+                                 (async/pipe (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector? error-ch)
+                                             ch))))
+    out-ch))
 
 (defn order+group-results
   "Ordering must first consume all results and then sort."
