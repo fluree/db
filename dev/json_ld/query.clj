@@ -74,8 +74,9 @@
   @fluree.db.query.fql/LAST-PARSED
 
 
-  @(fluree/query db {:select ['?s '?email1 '?email2]
+  @(fluree/query db {:select ['?name '?email1 '?email2]
                      :where  [['?s :rdf/type :ex/User]
+                              ['?s :schema/name '?name]
                               {:union [[['?s :ex/email '?email1]]
                                        [['?s :schema/email '?email2]]]}]})
 
