@@ -4,7 +4,7 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
 
-#_(deftest ^:integration aggregates-test
+(deftest ^:integration aggregates-test
   (testing "aggregate queries"
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
