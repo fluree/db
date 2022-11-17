@@ -6,11 +6,12 @@
     "bufferutil": "^4.0.7",
     "form-data": "^4.0.0",
     "js-sha3": "^0.8.0",
+    "jsonld": "^8.1.0",
     "scrypt-js": "^3.0.1",
+    "seedrandom": "^3.0.5",
     "source-map-support": "^0.5.21",
     "utf-8-validate": "^5.0.10",
-    "ws": "^8.8.0",
-    "seedrandom": "^3.0.5"
+    "ws": "^8.8.0"
   },
   "browser": {
     "ws": false

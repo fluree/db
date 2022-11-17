@@ -66,5 +66,5 @@
     (when (not= pubkey-header secp256k1-pub)
       (throw (ex-info (str "The multicodec header " (pr-str pubkey-header) " does not map to a supported multicodec encoding."
                            {:value multicodec
-                            :header pubkey-header})))
-      pubkey)))
+                            :header pubkey-header}))))
+    pubkey))
