@@ -1225,9 +1225,9 @@
         context*          (when json-ld-db?
                             (if (:js? opts*)
                               (json-ld/parse-context
-                                (get-in db [:schema :context-str]) context)
+                                (get-in db [:schema :context-str]) (or context (get query-map "@context")))
                               (json-ld/parse-context
-                                (get-in db [:schema :context]) context)))
+                                (get-in db [:schema :context]) (or context (get query-map "@context")))))
         order-by*         (or orderBy order-by (:orderBy opts))
         group-by*         (or groupBy group-by (:groupBy opts))
         parsed            (cond-> {:op-type       op-type
