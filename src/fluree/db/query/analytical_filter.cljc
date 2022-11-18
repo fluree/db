@@ -177,8 +177,8 @@
 (defn extract-combined-filter
   [filter-maps]
   (some->> filter-maps
-      (mapv :function)
-      (apply every-pred))) 
+      (map :function)
+      (apply every-pred)))
 
 (defmacro coalesce
   "Evaluates args in order. The result of the first arg not to return error gets returned."
