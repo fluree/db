@@ -452,7 +452,11 @@
                        where*)))
 
             :filter
-            (recur r (into filters (:filter where-map)) hoisted-bind all-vars where*)
+            (let [{:keys [filter]} where-map]
+              (if-not (sequential? filter)
+                (throw (ex-info (str "Filter clause must be a vector/array, provided: " filter)
+                                {:status 400 :error :db/invalid-query}))
+                (recur r (into filters filter) hoisted-bind all-vars where*)))
 
             ;; else
             (recur r filters hoisted-bind all-vars (conj where* where-map))))
