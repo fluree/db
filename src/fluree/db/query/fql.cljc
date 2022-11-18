@@ -87,14 +87,55 @@
                                              ch))))
     out-ch))
 
+
+(defn group-results
+  [partition-fn result-ch]
+  (if partition-fn
+    (let [group-ch (async/reduce (fn [groups result-chunk]
+                                   (reduce (fn [grps result]
+                                             (let [grp-key (partition-fn result)]
+                                               (update grps grp-key
+                                                       (fn [grp]
+                                                         (-> grp
+                                                             (or [])
+                                                             (conj result))))))
+                                           groups result-chunk))
+                                 {} result-ch)]
+      (async/pipe group-ch (async/chan 1 (comp (mapcat vals)
+                                               (map (fn [vs]
+                                                      (println "grouped val:" vs)
+                                                      vs))))))
+    (async/reduce into [] result-ch)))
+
+
+(defn compare-by-first
+  [cmp]
+  (fn [x y]
+    (cmp (first x) (first y))))
+
+(defn sort-groups
+  [result-cmp groups]
+  (let [group-cmp (compare-by-first result-cmp)]
+    (->> groups
+         (map (partial sort result-cmp)) ; sort results in each group
+         (sort group-cmp))))             ; then sort all the groups
+
+(defn order-result-groups
+  [cmp group-ch]
+  (if cmp
+    (let [group-coll-ch (async/into [] group-ch)
+          sort-xf       (comp (map (partial sort-groups cmp))
+                              cat)
+          sorted-ch     (async/chan 1 sort-xf)]
+      (async/pipe group-coll-ch sorted-ch))
+    group-ch))
+
+
 (defn order+group-results
   "Ordering must first consume all results and then sort."
-  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by} {:keys [grouping-fn] :as _group-by}]
+  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by} {:keys [partition-fn grouping-fn] :as _group-by}]
   (async/go
-    (let [results (loop [results []]
-                    (if-let [next-res (async/<! results-ch)]
-                      (recur (into results next-res))
-                      results))]
+    (let [results (<! (async/reduce into [] results-ch))]
       (cond-> (sort comparator results)
         grouping-fn grouping-fn))))
 
@@ -102,13 +143,28 @@
   "Legacy ad-hoc query processor"
   [db {:keys [fuel order-by group-by] :as parsed-query}]
   (let [out-ch (async/chan)]
-    (let [max-fuel fuel
-          fuel     (volatile! 0)
-          error-ch (async/chan)
-          where-ch (cond-> (compound/where db parsed-query fuel max-fuel error-ch)
-                     order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
+    (let [max-fuel  fuel
+          fuel      (volatile! 0)
+          partition (:partition-fn group-by)
+          cmp       (:comparator order-by)
+          error-ch  (async/chan)
+          where-ch  (->> (compound/where db parsed-query fuel max-fuel error-ch)
+                         (group-results partition)
+                         (order-result-groups cmp))]
       (process-select-results db out-ch where-ch error-ch parsed-query))
     out-ch))
+
+;; (defn- ad-hoc-query
+;;   "Legacy ad-hoc query processor"
+;;   [db {:keys [fuel order-by group-by] :as parsed-query}]
+;;   (let [out-ch (async/chan)]
+;;     (let [max-fuel fuel
+;;           fuel     (volatile! 0)
+;;           error-ch (async/chan)
+;;           where-ch (cond-> (compound/where db parsed-query fuel max-fuel error-ch)
+;;                      order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
+;;       (process-select-results db out-ch where-ch error-ch parsed-query))
+;;     out-ch))
 
 
 (defn cache-query

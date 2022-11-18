@@ -577,7 +577,7 @@
                       {:status 400 :error :db/invalid-query})))
     (cond-> (assoc parsed-query :group-by {:input  group-by
                                            :parsed (mapv (fn [sym] {:variable sym}) group-symbols)})
-            (not order-by) (add-order-by group-symbols))))
+            #_#_(not order-by) (add-order-by group-symbols))))
 
 
 (defn get-limit
@@ -865,7 +865,7 @@
         out-vars-s (into (set out-vars) order-by)
         flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
         others-out (filter out-vars-s others)]               ;; only keep other vars needed in final output
-        
+
     (into [] (concat flake-out others-out))))
 
 
@@ -1082,6 +1082,8 @@
       (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
                        :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions)) ;; these are the variable names in the output that are grouped
                        :grouping-fn grouping-fn
+                       :partition-fn partition-fn
+                       :grouped-vals-fn grouped-vals-fn
                        :group-finish-fn group-finish-fn))))
 
 
