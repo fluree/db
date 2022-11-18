@@ -21,7 +21,8 @@
 (defn query-range-opts
   [idx t s p o]
   (let [start-flake (flake/create s p o nil nil nil util/min-integer)
-        end-flake   (flake/create s p o nil nil nil util/max-integer)]
+        end-flake   (flake/create s p o nil nil nil util/max-integer)
+        get-filter #(get-in % [:filter :function])]
     {:idx         idx
      :from-t      t
      :to-t        t
@@ -29,11 +30,11 @@
      :start-flake start-flake
      :end-test    <=
      :end-flake   end-flake
-     :object-fn   nil}))
+     :object-fn (get-filter o)}))
 
 
 (defn next-chunk-s
-  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p idx t flake-x-form passthrough-fn]
+  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p o idx t flake-x-form passthrough-fn]
   (let [out-ch   (async/chan)
         idx-root (get db idx)
         novelty  (get-in db [:novelty idx])]
@@ -51,7 +52,7 @@
                                 sid-val))
                             sid)]
             (when sid
-              (let [opts  (query-range-opts idx t sid* pid nil)
+              (let [opts  (query-range-opts idx t sid* pid o)
                     in-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
                 ;; pull all subject results off chan, push on out-ch
                 (loop [interim-results nil]
@@ -85,7 +86,7 @@
         {o-var :variable, o-in-n :in-n} o]
     (async/go
       (when s-in-n
-        (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
+        (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p o idx t flake-x-form passthrough-fn)]
           (loop []
             (when-let [next-s (async/<! s-vals-chan)]
               (async/>! out-ch (if nils-fn

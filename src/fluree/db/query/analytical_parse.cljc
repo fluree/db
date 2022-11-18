@@ -193,7 +193,7 @@
         [fun _] (filter/extract-filter-fn filter-code fn-vars)]
     {:variable o-var
      :params   params
-     :fn-str   (str "(fn " params " " fun)
+     :fn-str   (str "(fn " params " " fun ")")
      :function (filter/make-executable params fun)}))
 
 
