@@ -77,28 +77,6 @@
     out-ch))
 
 
-(defn get-chan
-  [db prev-chan error-ch clause t]
-  (let [out-ch (async/chan 2)
-        {:keys [type s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
-        {s-var :variable, s-in-n :in-n} s
-        {o-var :variable, o-in-n :in-n} o]
-    (async/go
-      (loop []
-        (if-let [next-in (async/<! prev-chan)]
-          (let []
-            (if s-in-n
-              (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
-                (loop []
-                  (when-let [next-s (async/<! s-vals-chan)]
-                    (async/>! out-ch (if nils-fn
-                                       (nils-fn next-s)
-                                       next-s))
-                    (recur)))))
-            (recur))
-          (async/close! out-ch))))
-    out-ch))
-
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
   [db next-in out-ch error-ch clause t]
