@@ -135,7 +135,8 @@
         (do
           (log/debug "add-filter-where loop found match")
           (recur r true (conj where* (assoc where-smt :o {:variable variable
-                                                          :filter   filter-fn-map}))))
+                                                          :filter   (conj (or (:filter o) [])
+                                                                          filter-fn-map)}))))
         :else
         (do
           (log/debug "add-filter-where loop default case")
@@ -196,18 +197,10 @@
      :fn-str   (str "(fn " params " " fun ")")
      :function (filter/make-executable params fun)}))
 
-
 (defn add-filter
-  [{:keys [where] :as parsed-query} filter all-vars]
-  (if-not (sequential? filter)
-    (throw (ex-info (str "Filter clause must be a vector/array, provided: " filter)
-                    {:status 400 :error :db/invalid-query}))
-    (loop [[filter-fn & r] filter
-           parsed-query* parsed-query]
-      (if filter-fn
-        (let [parsed (parse-filter-fn filter-fn all-vars)]
-          (recur r (assoc parsed-query* :where (add-filter-where where parsed))))
-        parsed-query*))))
+  [{:keys [where] :as parsed-query} filter-fn all-vars]
+  (let [parsed-filter-fn (parse-filter-fn filter-fn all-vars)]
+    (assoc parsed-query :where (add-filter-where where parsed-filter-fn))))
 
 (defn parse-binding
   "Parses binding map. Returns a two-tuple of binding maps
@@ -459,7 +452,7 @@
                        where*)))
 
             :filter
-            (recur r (conj filters (:filter where-map)) hoisted-bind all-vars where*)
+            (recur r (into filters (:filter where-map)) hoisted-bind all-vars where*)
 
             ;; else
             (recur r filters hoisted-bind all-vars (conj where* where-map))))

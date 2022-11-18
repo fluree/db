@@ -19,10 +19,9 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn query-range-opts
-  [idx t s p o]
+  [idx t s p {:keys [filter] :as o}]
   (let [start-flake (flake/create s p o nil nil nil util/min-integer)
-        end-flake   (flake/create s p o nil nil nil util/max-integer)
-        get-filter #(get-in % [:filter :function])]
+        end-flake   (flake/create s p o nil nil nil util/max-integer)]
     {:idx         idx
      :from-t      t
      :to-t        t
@@ -30,7 +29,7 @@
      :start-flake start-flake
      :end-test    <=
      :end-flake   end-flake
-     :object-fn (get-filter o)}))
+     :object-fn (filter/extract-combined-filter filter)}))
 
 
 (defn next-chunk-s
