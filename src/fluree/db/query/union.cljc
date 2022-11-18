@@ -1,218 +1,102 @@
 (ns fluree.db.query.union
-  (:require [fluree.db.util.core :as util]))
+  (:require [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log :include-macros true]))
+
+(defn merge-vars
+  "Unions act as 'or'. If they use different variables, their output
+  needs to be unified - so we need to output 'nil' for any variable used
+  in one statement but not the other.
+
+  Here we identify different variables between the two union clauses,
+  and add any vars that should output 'nil' into the *last* where clause
+  of each union, placed into [:vars :nil]. We do not affect any other where
+  clauses in the union (if there are more than one).
+
+  We also merge together all the variables used across both union
+  statements into a single [:vars :all].
+
+  For reference, the :vars value of each last union statement will end up looking
+  like this after this step:
+  {:flake-in (?s),
+   :flake-out [?s nil ?email1], ;; always as an [s p o] tuple, nil means the var need not be output
+   :all {?s :s, ?email1 :o, ?email2 :o}, ;; <<< this will be a merge of both union1 & union2
+   :others [],
+   :nils #{?email2}} ;; <<< this will be the vars in the statement that should output nil vals
+  "
+  [union1 union2]
+  (let [u1-last     (last union1)
+        u2-last     (last union2)
+        u1-all-vars (-> u1-last :vars :all)
+        u2-all-vars (-> u2-last :vars :all)
+        u1-vars-set (-> u1-all-vars keys set)
+        u2-vars-set (-> u2-all-vars keys set)
+        u1-unique   (reduce disj u1-vars-set u2-vars-set)
+        u2-unique   (reduce disj u2-vars-set u1-vars-set)
+        all-vars    (merge u1-all-vars u2-all-vars)
+        u1-last*    (-> u1-last
+                        (assoc-in [:vars :nils] u2-unique)
+                        (assoc-in [:vars :all] all-vars))
+        u2-last*    (-> u2-last
+                        (assoc-in [:vars :nils] u1-unique)
+                        (assoc-in [:vars :all] all-vars))]
+    ;; replace updated 'last' where statement for each union clause
+    [(-> union1 butlast vec (conj u1-last*))
+     (-> union2 butlast vec (conj u2-last*))]))
 
 
-(defn intersecting-keys-tuples
-  [a-tuples b-tuples]
-  (let [a-keys (-> a-tuples :headers set)
-        b-keys (-> b-tuples :headers)]
-    (reduce (fn [acc key]
-              (if (a-keys key)
-                (conj acc key)
-                acc))
-            [] b-keys)))
+(defn gen-nils-fn
+  "When we need to output nil values related to a union statement
+  we need a function to rearrange the output variables and inject nils into
+  the correct locations.
+
+  This isn't incredible efficient, but generally union statements will use the
+  same output variables and therefore not have to sub in 'nil' values - so it
+  is not expected this is a heavily used capability."
+  [out-vars {:keys [nils] :as _vars}]
+  (let [nils-pos (sort (map #(util/index-of out-vars %) nils))
+        output-n (count out-vars)]
+    (fn [out-vals]
+      (mapv
+        (fn [out-val]
+          (loop [i         0
+                 next-nil  (first nils-pos)
+                 rest-nils (rest nils-pos)
+                 out-val   out-val
+                 acc       []]
+            (if (< i output-n)
+              (if (= i next-nil)
+                (recur (inc i) (first rest-nils) (rest rest-nils)
+                       out-val
+                       (conj acc nil))
+                (recur (inc i) next-nil rest-nils
+                       (rest out-val)
+                       (conj acc (first out-val))))
+              acc)))
+        out-vals))))
 
 
-(defn find-match+row-nums
-  "Given a single tuple from A, a-idxs, b-idxs, b-not-idxs, and b-tuples, return any tuples in b that match.
-  Along with their row-numbers"
-  [a-tuple a-idxs b-tuples b-idxs b-not-idxs]
-  (let [a-tuple-part (map #(nth a-tuple %) a-idxs)]
-    (reduce-kv (fn [[acc b-rows] row b-tuple]
-                 (if (= a-tuple-part (map #(nth b-tuple %) b-idxs))
-                   [(conj (or acc []) (concat a-tuple (map #(nth b-tuple %) b-not-idxs))) (conj b-rows row)]
-                   [acc b-rows]))
-               [nil #{}] (into [] b-tuples))))
+(defn order-out-vars
+  "In the case of a :union, we want to ensure the final output variables for flakes for each
+  union statement come before any passthrough variables.
 
+  This helps ensure minimal output rearrangement when we inject nil values - we can
+  still assume passthrough variables will all be at the end of the output and flake
+  variables (for both unions) will be at the beginning of the variables.
 
-(defn nil-pad-tuples
-  "Pads n columns with nil values on either left or right hand side of tuples"
-  [tuples pad-n side]
-  (let [pad-seq (->> (repeat nil)                           ;; infinite list of nil values
-                     (take pad-n)                           ;; take on n number as per padding
-                     repeat)]                               ;; make resulting padded list infinite
-    (doall
-      (case side
-        :right (map concat tuples pad-seq)
-        :left (map concat pad-seq tuples)))))
-
-
-(defn non-intersecting
-  "Non-intersecting means there are no common variable bindings between the two tuples.
-  The result of this operation can be quite fast as it is just a concatenation of all results with
-  null values all columns that are not in each result set respectively."
-  [a-tuples b-tuples]
-  (let [a-headers (:headers a-tuples)
-        b-headers (:headers b-tuples)
-        c-tuples  (concat (nil-pad-tuples (:tuples a-tuples) (count b-headers) :right)
-                          (nil-pad-tuples (:tuples b-tuples) (count a-headers) :left))]
-    {:headers (concat a-headers b-headers)
-     :vars    (merge (:vars a-tuples) (:vars b-tuples))
-     :tuples  c-tuples}))
-
-
-(defn tuple-positions
-  "Returns a list containing the tuple-index for each provided subset header based on tuple headers.
-  i.e. if the tuple headers are (?x ?y ?z ?c) and the subset headers given is (?c ?y), it will
-  return (3 1) as the respective index points for those tuples."
-  [all-headers subset-headers]
-  (map #(util/index-of all-headers %) subset-headers))
-
-
-(defn all-intersecting
-  "Case where every variable is intersecting in union of two tuple sets."
-  [a-tuples b-tuples]
-  (let [a-headers (:headers a-tuples)
-        b-headers (:headers b-tuples)
-        a-data    (:tuples a-tuples)
-        b-data    (if (= a-headers b-headers)
-                    (:tuples b-tuples)                      ;; variable ordering is identical, no need to re-sort
-                    (let [positions (tuple-positions b-headers a-headers)]
-                      (map #(map (fn [i] (get % i)) positions) (:tuples b-tuples))))
-        b-pos-map (apply hash-map (interleave b-data (range)))
-        c-data    (loop [a-items    a-data
-                         b-pos-map* b-pos-map]
-                    (if (empty? a-items)
-                      (concat a-data (->> b-pos-map* (sort-by val) keys))
-                      (->> (first a-items)
-                           (dissoc b-pos-map*)
-                           (recur (rest a-items)))))]
-    {:headers a-headers
-     :vars    (merge (:vars a-tuples) (:vars b-tuples))
-     :tuples  c-data}))
-
-
-(defn- b-data-map
-  "For situation where just some variables in a union intersect between the a-tuples and b-tuples,
-  creates a map of b-tuples where key is intersecting variables for fast lookup, and value is a
-  *list* of map(s) of original tuple along with :idx which is the original order (row number) of b-tuples
-  to ensure consistent ordering.
-
-  There can be multiple matches in b-tuples for a key, as the other non-matching variables differ.
-
-  Matches between a-tuples and b-tuples will remove entries from this map and merge results, entries
-  remaining in this map will be items in b-tuples that did not match a-tuples."
-  [b-common-idx b-data]
-  (loop [b-data* b-data
-         i       0
-         acc     {}]
-    (if (empty? b-data*)
-      acc
-      (let [tuple  (vec (first b-data*))
-            common (map #(get tuple %) b-common-idx)]
-        (recur (rest b-data*)
-               (inc i)
-               (update acc common conj {:idx   i
-                                        :tuple tuple}))))))
-
-
-(defn flatten-b-data-map
-  "Takes a b-data map as per above and re-flattens it into a list of tuples in the original order.
-
-  This is used after removing matching entries in b-data-map, so this will often end up being a subset
-  of the original b-data-map."
-  [b-data-map]
-  (->> (vals b-data-map)
-       (apply concat)
-       (sort-by :idx)
-       (map :tuple)))
-
-
-(defn intersecting
-  "With common-headers already calculated, takes a list of headers and returns a
-   3-tuple of:
-    - common indexes, i.e (3, 1)
-    - not common indexes, i.e. (0, 2)
-    - not common headers, i.e. (?x, ?y)"
-  [common-headers headers]
-  (let [common-key?    (into #{} common-headers)
-        not-common     (filter #(not (common-key? %)) headers)
-        common-idx     (tuple-positions headers common-headers)
-        not-common-idx (tuple-positions headers not-common)]
-    [common-idx not-common-idx not-common]))
-
-
-(defn- pad-b-tuples
-  "B-tuples that do not match and get merged with an a-tuple must be concatenated to the
-  list in the order of the combined tuple headers. This will take a list of b-tuples and
-  put nil values into all columns that are unique to a.
-
-  If a-headers were [?x ?y ?z] and b-headers were [?y ?a ?b] the combined headers will be:
-  [?x ?y ?z ?a ?b]
-
-  Because these are b-only values, ?x and ?z will always be nil.
-  If we have a b-tuple of [42 36 49] we'd want a final result of [nil 42 nil 36 49]"
-  [b-tuples a-headers a-common-idx b-common-idx b-only-idx]
-  (let [a-nil-pad      (vec (repeat (count a-headers) nil)) ;; tuple of a-headers length with all nil vals
-        a->b-positions (partition 2 (interleave a-common-idx b-common-idx))] ;; for common indexes, tuples of position in a-header to position in b-header
-    (map
-      (fn [b-tuple]
-        (let [a-headers-merged (reduce
-                                 (fn [acc [a-idx b-idx]]
-                                   (assoc acc a-idx (get b-tuple b-idx)))
-                                 a-nil-pad
-                                 a->b-positions)]
-          (concat
-            a-headers-merged
-            (map #(get b-tuple %) b-only-idx))))
-      b-tuples)))
-
-
-(defn some-intersecting
-  "Some headers from a and/or b tuples intersect. Need to build out all columns.
-  Where common values exist for intersecting headers, merge into more complete rows.
-  Otherwise pad superset of headers as results with nil values for both a and b as
-  applicable."
-  [common-headers a-tuples b-tuples]
-  (let [a-headers    (:headers a-tuples)
-        b-headers    (:headers b-tuples)
-        a-data       (:tuples a-tuples)
-        b-data       (:tuples b-tuples)
-        a-common-idx (map #(util/index-of (:headers a-tuples) %) common-headers)
-        [b-common-idx b-only-idx b-only-headers] (intersecting common-headers b-headers)
-        b-pos-map    (b-data-map b-common-idx b-data)
-        b-nil-pad    (repeat (count b-only-headers) nil)
-        c-data       (loop [a-data*    a-data
-                            b-pos-map* b-pos-map
-                            acc        []]
-                       (if (empty? a-data*)
-                         (concat acc (-> b-pos-map*
-                                         flatten-b-data-map
-                                         (pad-b-tuples a-headers a-common-idx b-common-idx b-only-idx)))
-                         (let [a-item    (vec (first a-data*))
-                               match-key (map #(get a-item %) a-common-idx)]
-                           (if-let [b-matches (get b-pos-map* match-key)]
-                             (recur (rest a-data*)
-                                    (dissoc b-pos-map* match-key)
-                                    (reduce
-                                      (fn [acc* b-match]
-                                        (conj acc*
-                                              (concat a-item
-                                                      (map #(get (:tuple b-match) %) b-only-idx))))
-                                      acc b-matches))
-                             (recur (rest a-data*)
-                                    b-pos-map*
-                                    (conj acc (concat a-item
-                                                      b-nil-pad)))))))]
-    {:headers (concat a-headers b-only-headers)
-     :vars    (merge (:vars a-tuples) (:vars b-tuples))
-     :tuples  c-data}))
-
-
-(defn results
-  "Returns union (outer join) results of two statements."
-  [a-tuples b-tuples]
-  (let [common-keys   (intersecting-keys-tuples a-tuples b-tuples)
-        intersections (cond
-                        ;; no overlapping variables, will just create a big list with all columns + nils for non-values
-                        (zero? (count common-keys)) :none
-                        ;; every variable overlaps, just need to merge the two. Retain ordering consistency by always using a-tuples first
-                        (= (count common-keys)
-                           (count (:headers a-tuples))
-                           (count (:headers b-tuples))) :all
-                        ;; only some of the variables intersect, need to apply more granular approach
-                        :else :some)]
-    (case intersections
-      :none (non-intersecting a-tuples b-tuples)
-      :all (all-intersecting a-tuples b-tuples)
-      :some (some-intersecting common-keys a-tuples b-tuples))))
+  Nil values could be anywhere."
+  [select-out-vars union-clause {:keys [parsed] :as _order-by}]
+  (let [[union1 union2] (:where union-clause)
+        {u1-flake-out :flake-out} (:vars (last union1))
+        {u2-flake-out :flake-out, u2-others :others, u2-all :all} (:vars (last union2))
+        _              (when-let [illegal-var (some #(when-not (contains? u2-all %) %) select-out-vars)]
+                         (throw (ex-info (str "Variable " illegal-var " used in select statement but does not exist in the query.")
+                                         {:status 400 :error :db/invalid-query})))
+        order-by       (->> (map :variable parsed)
+                            (remove nil?))
+        out-vars-s     (into (set select-out-vars) order-by)
+        u2-flake-vars  (filter out-vars-s u2-flake-out)     ;; only keep flake-out vars needed in final output
+        u1-flake-vars  (filter out-vars-s u1-flake-out)
+        ;; concatenate into union2's flake variables only union1 flake variables that are not duplicates
+        all-flake-vars (concat u2-flake-vars (remove (set u2-flake-vars) u1-flake-vars))
+        u2-others-vars (filter out-vars-s u2-others)]       ;; only keep other vars needed in final output
+    (into [] (concat all-flake-vars u2-others-vars))))
