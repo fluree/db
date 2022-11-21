@@ -73,8 +73,7 @@
                     (map identity))
         process-xf (comp cat finish-xf)
         process-ch (async/chan 2 process-xf)]
-    (->> process-ch
-         (async/pipe where-ch)
+    (->> (async/pipe where-ch process-ch)
          (async/pipeline-async 2
                                out-ch
                                (fn [where-item ch]
@@ -96,10 +95,7 @@
                                                              (conj result))))))
                                            groups result-chunk))
                                  {} result-ch)]
-      (async/pipe group-ch (async/chan 1 (comp (mapcat vals)
-                                               (map (fn [vs]
-                                                      (println "grouped val:" vs)
-                                                      vs))))))
+      (async/pipe group-ch (async/chan 1 (mapcat vals))))
     (async/reduce into [] result-ch)))
 
 
