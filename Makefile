@@ -47,7 +47,7 @@ install: target/fluree-db.jar
 	clojure -T:build install
 
 deploy: target/fluree-db.jar
-	clojure -M:deploy
+	clojure -T:build deploy
 
 js-packages/nodejs/flureenjs.js: out/flureenjs.js
 	cp $< $@

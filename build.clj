@@ -1,5 +1,6 @@
 (ns build
-  (:require [clojure.tools.build.api :as b]))
+  (:require [clojure.tools.build.api :as b]
+            [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'com.fluree/db)
 (def version "2.0.0-beta2")
@@ -42,3 +43,8 @@
                                        "/blob/v{version}/{filepath}#L{line}")}
                      output-path (assoc :output-path output-path))]
     (b/process {:command-args ["clojure" "-X:docs" (pr-str opts)]})))
+
+(defn deploy [_]
+  (dd/deploy {:installer :remote
+              :artifact  jar-file
+              :pom-file  (b/pom-path {:lib lib, :class-dir class-dir})}))
