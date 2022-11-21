@@ -12,8 +12,8 @@
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
-         logback-bundle/core-bundle      {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api             {:mvn/version "2.0.3"}
+         ch.qos.logback/logback-classic  {:mvn/version "1.4.4"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.4"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -36,13 +36,13 @@
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
          ;; smartfunctions
-         org.babashka/sci                {:mvn/version "0.5.34"}}
+         org.babashka/sci                {:mvn/version "0.5.36"}}
 
  :paths ["src" "resources"]
 
  :aliases
  {:build
-  {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.3" :git/sha "0d20256"}}
+  {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.5" :git/sha "b73ff34"}}
    :ns-default build}
 
   :dev
@@ -66,7 +66,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.70.1086"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.71.1119"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -118,5 +118,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.10.14"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.11.02"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
