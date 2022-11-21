@@ -11,6 +11,6 @@
   },
   "keywords" : [ "fluree", "flureeworker", "react", "javascript", "service worker" ],
   "author" : "Fluree PBC (https://flur.ee)",
-  "version" : null,
+  "version" : "2.0.0-beta2",
   "main" : "flureeworker.js"
 }
