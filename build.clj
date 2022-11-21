@@ -48,3 +48,10 @@
   (dd/deploy {:installer :remote
               :artifact  jar-file
               :pom-file  (b/pom-path {:lib lib, :class-dir class-dir})}))
+
+(defn sync-package-json [{:keys [target node?]}]
+  (let [node-arg (when node? "--node")
+        cmd-args (remove nil? ["bb" "run" "sync-package-json" version
+                               (str target) node-arg])]
+    (println "cmd args:" (pr-str cmd-args))
+    (b/process {:command-args cmd-args})))
