@@ -8,14 +8,13 @@
 
 (defn run
   [& args]
-  (let [deps-edn (-> "deps.edn" slurp edn/read-string)
-        version (-> deps-edn :aliases :mvn/version)
-        target-package-json-file (first args)
+  (let [version (first args)
+        target-package-json-file (second args)
         target-package-json (-> target-package-json-file slurp (json/parse-string true))
         write-package-json #(spit target-package-json-file %)
         pretty-printer (json/create-pretty-printer
                          json/default-pretty-print-options)
-        sync-js-deps? (= "--node" (second args))
+        sync-js-deps? (and (> 2 (count args)) (= "--node" (nth args 2)))
         sync-js-deps #(if sync-js-deps?
                         (assoc % :dependencies (js-deps))
                         %)]

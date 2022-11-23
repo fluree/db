@@ -81,7 +81,9 @@
   [db query]
   (let [query* (->> (js->clj query :keywordize-keys false)
                     (reduce-kv (fn [acc k v]
-                                   (assoc acc (keyword k) v))
+                                   (assoc acc (if (str/starts-with? k "@")
+                                                k
+                                                (keyword k)) v))
                                {}))]
        (.then (fluree/query db (assoc-in query* [:opts :js?] true))
               (fn [result] (clj->js result)))))

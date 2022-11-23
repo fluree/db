@@ -1,4 +1,5 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
+         org.clojure/clojurescript       {:mvn/version "1.11.60"}
          org.clojure/core.async          {:mvn/version "1.6.673"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
@@ -9,8 +10,7 @@
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :sha "edb189ce94282b1ea27fd04bb999c91f1492bf4b"}
-
+                                          :sha     "edb189ce94282b1ea27fd04bb999c91f1492bf4b"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
@@ -45,14 +45,16 @@
 
  :aliases
  {:build
-  {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.3" :git/sha "0d20256"}}
+  {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.5"
+                                               :git/sha "b73ff34"}
+                slipset/deps-deploy {:mvn/version "0.2.0"}}
    :ns-default build}
 
   :dev
   {:extra-paths ["dev" "test" "dev-resources" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs {:mvn/version "2.20.7"}}}
+                 thheller/shadow-cljs              {:mvn/version "2.20.7"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources"]

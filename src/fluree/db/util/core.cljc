@@ -26,9 +26,10 @@
 #?(:clj
    (defmacro if-cljs
      "Return then if we are generating cljs code and else for Clojure code.
-   https://groups.google.com/d/msg/clojurescript/iBY5HaQda4A/w1lAQi9_AwsJ"
+     https://groups.google.com/d/msg/clojurescript/iBY5HaQda4A/w1lAQi9_AwsJ"
      [then else]
      (if (cljs-env? &env) then else)))
+
 
 #?(:clj
    (defmacro try-catchall
@@ -337,18 +338,26 @@
           ~(emit gexpr clauses)))))
 
 #?(:clj
+   (defn- eval-dispatch
+     [d]
+     (if (list? d)
+       (map eval d)
+       (eval d))))
+
+#?(:clj
    (defmacro case+
      "Same as case, but evaluates dispatch values, needed for referring to
-   class and def'ed constants as well as java.util.Enum instances."
+     class and def'ed constants as well as java.util.Enum instances.
+
+     NB: Don't use this in CLJS if your dispatch values are :const.
+         CLJS (but not CLJ sadly) inlines these and they work fine
+         with regular old cljs.core/case. Or check out const-case if you want a
+         macro that does the best thing with :const values in both CLJ & CLJS."
      [value & clauses]
      (let [clauses       (partition 2 2 nil clauses)
-           default       (when (-> clauses last count (== 1))
+           default       (when (-> clauses last count (= 1))
                            (last clauses))
-           clauses       (if default (drop-last clauses) clauses)
-           eval-dispatch (fn [d]
-                           (if (list? d)
-                             (map eval d)
-                             (eval d)))]
+           clauses       (if default (drop-last clauses) clauses)]
        (if-cljs
          `(condp = ~value
             ~@(concat clauses default))

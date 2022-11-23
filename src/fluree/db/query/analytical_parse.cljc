@@ -1,6 +1,5 @@
 (ns fluree.db.query.analytical-parse
   (:require [clojure.string :as str]
-            #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.dbproto :as dbproto]
@@ -12,11 +11,12 @@
             [fluree.db.flake :as flake]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate safe-read-fn built-in-aggregates]]
             [clojure.set :as set]
+            [fluree.db.query.union :as union]
             [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(declare parse-where parse-where-tuple)
+(declare parse-where parse-where-tuple where-meta-reverse)
 
 (defn aggregate?
   "Aggregate as positioned in a :select statement"
@@ -724,6 +724,8 @@
           (assoc :o-var? true)))
 
 (defn gen-x-form
+  "Returns x-form function that take flakes as an input and returns out
+  only the needed variables from the flake based on the query's processing needs."
   [out-vars {s-variable :variable} {p-variable :variable} {o-variable :variable}]
   (let [s-var? (util/index-of out-vars s-variable)
         p-var? (util/index-of out-vars p-variable)
@@ -752,18 +754,21 @@
 
 (defn build-vec-extraction-fn
   [extraction-positions]
-  (when (seq extraction-positions)
-    (fn [input-item]
-      (mapv (partial nth input-item)
-            extraction-positions))))
+  (fn [input-item]
+    (mapv (partial nth input-item)
+          extraction-positions)))
 
 (defn gen-passthrough-fn
   "Transforms input variables into required passthrough variables.
-  Optimized for several arity."
+  Optimized for several arity.
+
+  Passthrough variables should retain output order across where statements."
   [out-vars {:keys [others] :as _vars} in-vars]
   (let [passthrough-vars (filter (set others) out-vars)     ;; only keep output vars in 'others'
-        passthrough-pos  (mapv #(util/index-of in-vars %) passthrough-vars)]
+        passthrough-pos  (keep #(when-let [pass-pos (util/index-of in-vars %)]
+                                  pass-pos) passthrough-vars)]
     (build-vec-extraction-fn passthrough-pos)))
+
 
 (defn get-idx
   [{s-variable :variable, s-supplied? :supplied?, s-in? :in-n}
@@ -841,41 +846,83 @@
 
   There could be an order-by or group-by var not included in the select statement, so
   those must get added into the results here - note group-by without order-by will create an order-by"
-  [out-vars {:keys [flake-out others all] :as _vars} {:keys [parsed] :as _order-by}]
-  (when-let [illegal-var (some #(when-not (contains? all %) %) out-vars)]
+  [select-out-vars {:keys [vars] :as _where-clause} {:keys [parsed] :as _order-by}]
+  (when-let [illegal-var (some #(when-not (contains? (:all vars) %) %) select-out-vars)]
     (throw (ex-info (str "Variable " illegal-var " used in select statement but does not exist in the query.")
                     {:status 400 :error :db/invalid-query})))
-  (let [order-by   (->> (map :variable parsed)
+  (let [{:keys [flake-out others nils]} vars
+        order-by   (->> (map :variable parsed)
                         (remove nil?))
-        out-vars-s (into (set out-vars) order-by)
+        out-vars-s (into (set select-out-vars) order-by)
         flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
-        others-out (filter out-vars-s others)]               ;; only keep other vars needed in final output
+        others-out (filter out-vars-s others)]              ;; only keep other vars needed in final output
+    (into [] (concat flake-out others-out nils))))
 
-    (into [] (concat flake-out others-out))))
+(defn where-clause-reverse-tuple
+  "When doing a final pass of the where clause in reverse, we calculate the variable output
+  needed for each clause (starting with the :select output) and pass it into the next
+  statement.
 
+  Functions are created to take flake output from the step and output just the flake vars needed
+  while also ensuring any non-flake output that must be passed through this step is taken."
+  [{:keys [s p o vars prior-vars] :as where-clause} out-vars]
+  (let [in-vars        (get-in-vars out-vars vars prior-vars)
+        s*             (update-positions s in-vars)
+        p*             (update-positions p in-vars)
+        o*             (update-positions o in-vars)
+        flake-x-form   (gen-x-form out-vars s* p* o*)
+        passthrough-fn (gen-passthrough-fn out-vars vars in-vars)
+        nils-fn        (when (:nils vars)
+                         (union/gen-nils-fn out-vars vars))]
+    (-> where-clause
+        (assoc :in-vars in-vars
+               :out-vars out-vars
+               :s s*
+               :o o*
+               :idx (get-idx s* p o*)
+               :flake-x-form flake-x-form
+               :passthrough-fn passthrough-fn
+               :nils-fn nils-fn)
+        ;; note, we could also dissoc :vars as they are no longer needed, but retain for now to help debug query parsing
+        (dissoc :prior-vars))))
+
+
+(defn where-clause-reverse-union
+  "For union statements, need to process each of the two union where clauses.
+  Unions acts as an 'or', and can include different variables or the same.
+
+  If unions use different variables, the variables one statement uses output
+  as 'nil' in the other."
+  [{:keys [where] :as union-clause} out-vars]
+  (let [[union1 union2] where
+        union1* (where-meta-reverse union1 out-vars)
+        union2* (where-meta-reverse union2 out-vars)]
+    (assoc union-clause :where [union1* union2*]
+                        ;; union1 and union2 should have the identical vars, so just pick one for latest :in-vars
+                        :in-vars (-> union1* first :in-vars)
+                        :out-vars out-vars)))
 
 (defn where-meta-reverse
-  [where select-out-vars order-by]
-  (loop [[{:keys [s p o vars prior-vars] :as clause} & r] (reverse where)
-         out-vars (order-out-vars select-out-vars vars order-by)
+  "Goes through where statements once more but in reverse.
+   Now that all variables for each statement are known, we
+   need to output only the needed vars for each statement and
+   order those output vars in as efficient manner as possible.
+
+   The ordering allows the output tuples of each statement to be a:
+   (concat <flake-vars-needing-output> <vars-from-prior-statements-needing-output>)
+   where you can think of each of these two sequences as an x-form of their inputs.
+   In the case of the first statement an x-form of the flake output from the index-range
+   call, in the second statement an x-form of the prior step's output."
+  [where last-out-vars]
+  (loop [[{:keys [type] :as clause} & r] (reverse where)
+         out-vars last-out-vars
          acc      []]
     (if clause
-      (let [in-vars        (get-in-vars out-vars vars prior-vars)
-            s*             (update-positions s in-vars)
-            p*             (update-positions p in-vars)
-            o*             (update-positions o in-vars)
-            flake-x-form   (gen-x-form out-vars s* p* o*)
-            passthrough-fn (gen-passthrough-fn out-vars vars in-vars)
-            clause*        (-> clause
-                               (assoc :in-vars in-vars
-                                      :out-vars out-vars
-                                      :s s*
-                                      :o o*
-                                      :idx (get-idx s* p o*)
-                                      :flake-x-form flake-x-form
-                                      :passthrough-fn passthrough-fn)
-                               (dissoc :prior-vars))]       ;; note, we could also dissoc :vars as they are no longer needed, but retain for now to help debug query parsing
-        (recur r in-vars (conj acc clause*)))
+      (let [clause* (case type
+                      (:class :tuple :iri) (where-clause-reverse-tuple clause out-vars)
+                      :optional (throw (ex-info "OPTIONAL - TODO" {}))
+                      :union (where-clause-reverse-union clause out-vars))]
+        (recur r (:in-vars clause*) (conj acc clause*)))
       (into [] (reverse acc)))))
 
 
@@ -1116,24 +1163,49 @@
                             p-supplied? (assoc-in [:p :supplied?] true)
                             o-supplied? (assoc-in [:o :supplied?] true))]
     ;; return signature of all statements is vector of where statements
-    [where-smt* vars]))
+    where-smt*))
 
+(defn add-nested-where
+  "Optional and Union query statements have nested tuple where clauses where each
+  statement must be parsed, then only the last 'vars' from the last statement
+   needs to be passed back to the standard query processing.
+
+   This function does that interim processing.
+
+   Returns two-tuple of where statement further processed, and the last vars from the last where."
+  [where prior-vars supplied-vars]
+  (let [where* (loop [[where-smt & r] where
+                      prior-vars prior-vars
+                      acc        []]
+                 (if where-smt
+                   (let [where-item* (add-where-meta-tuple where-smt prior-vars supplied-vars)]
+                     (recur r (:vars where-item*) (conj acc where-item*)))
+                   acc))
+        vars   (-> where* last :vars)]
+    [where* vars]))
 
 (defn add-where-meta-optional
   "Handles optional clause additional parsing."
   [{:keys [where] :as optional-where-clause} prior-vars supplied-vars]
   (throw (ex-info (str "Multi-statement optional clauses not yet supported!")
                   {:status 400 :error :db/invalid-query}))
-  ;; TODO!
-  (let [where*      (loop [[where-smt & r] where
-                           prior-vars prior-vars
-                           acc        []]
-                      (if where-smt
-                        (let [[where-item* prior-vars*] (add-where-meta-tuple where-smt prior-vars supplied-vars)]
-                          (recur r prior-vars* (conj acc where-item*)))
-                        acc))
-        prior-vars* (-> where* last :vars)]
-    [(assoc optional-where-clause :where where*) prior-vars*]))
+  ;; TODO! - parsing here should be working OK but need to implement logic
+  (let [[where* vars] (add-nested-where where prior-vars supplied-vars)]
+    (assoc optional-where-clause :where where*
+                                 :prior-vars prior-vars
+                                 :vars vars)))
+
+
+(defn add-where-meta-union
+  "Handles union clause additional parsing."
+  [{:keys [where] :as union-where-clause} prior-vars supplied-vars]
+  (let [[union1 union2] where
+        [union1* _] (add-nested-where union1 prior-vars supplied-vars)
+        [union2* _] (add-nested-where union2 prior-vars supplied-vars)
+        [union1** union2**] (union/merge-vars union1* union2*)]
+    (assoc union-where-clause :where [union1** union2**]
+                              :prior-vars prior-vars
+                              :vars (-> union2** last :vars))))
 
 
 (defn add-where-meta
@@ -1146,15 +1218,20 @@
                      :flake-out []                          ;; variables query result flakes will output
                      :all       {}                          ;; cascading set of all variables used in statements through current one
                      :others    []}                         ;; this is all vars minus the flake vars
-         acc        []]
+         where*     []]
     (if where-smt
-      (let [[where-smt* prior-vars] (case (:type where-smt)
-                                      (:class :tuple :iri) (add-where-meta-tuple where-smt prior-vars supplied-vars)
-                                      :optional (add-where-meta-optional where-smt prior-vars supplied-vars))]
-        (recur r (inc i) prior-vars (conj acc where-smt*)))
-      (let [where*    (where-meta-reverse acc out-vars order-by)
-            order-by* (update-order-by order-by group-by where*)
-            group-by* (update-group-by group-by where*)]
+      (let [where-smt* (case (:type where-smt)
+                         (:class :tuple :iri) (add-where-meta-tuple where-smt prior-vars supplied-vars)
+                         :optional (add-where-meta-optional where-smt prior-vars supplied-vars)
+                         :union (add-where-meta-union where-smt prior-vars supplied-vars))]
+        (recur r (inc i) (:vars where-smt*) (conj where* where-smt*)))
+      (let [last-clause     (last where*)
+            select-out-vars (if (= :union (:type last-clause))
+                              (union/order-out-vars out-vars last-clause order-by)
+                              (order-out-vars out-vars last-clause order-by))
+            where*          (where-meta-reverse where* select-out-vars)
+            order-by*       (update-order-by order-by group-by where*)
+            group-by*       (update-group-by group-by where*)]
         (cond-> (assoc parsed-query :where where*
                                     :order-by order-by*
                                     :group-by group-by*)
@@ -1210,9 +1287,9 @@
         context*          (when json-ld-db?
                             (if (:js? opts*)
                               (json-ld/parse-context
-                                (get-in db [:schema :context-str]) context)
+                                (get-in db [:schema :context-str]) (or context (get query-map "@context")))
                               (json-ld/parse-context
-                                (get-in db [:schema :context]) context)))
+                                (get-in db [:schema :context]) (or context (get query-map "@context")))))
         order-by*         (or orderBy order-by (:orderBy opts))
         group-by*         (or groupBy group-by (:groupBy opts))
         parsed            (cond-> {:op-type       op-type

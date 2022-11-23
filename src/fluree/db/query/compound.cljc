@@ -1,13 +1,11 @@
 (ns fluree.db.query.compound
-  (:require [clojure.set :as set]
-            [fluree.db.query.range :as query-range]
+  (:require [fluree.db.query.range :as query-range]
             [clojure.core.async :as async]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.util.core :as util]
             [fluree.db.flake :as flake]
-            [fluree.db.query.analytical-wikidata :as wikidata]
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.union :as union]
             [clojure.string :as str]
@@ -68,6 +66,8 @@
                       ;; empty result set
                       (or interim-results
                           (when optional?
+                            ;; for optional results, we need to output nil if nothing found
+                            ;; we generate a 'nil' value flake with the correct sid and pid so vars always get output correctly
                             (cond->> (sequence flake-x-form [(flake/parts->Flake [sid* pid])])
                                      pass-vals (map #(concat % pass-vals))
                                      true (async/>! out-ch)))))
@@ -80,7 +80,7 @@
 (defn get-chan
   [db prev-chan error-ch clause t]
   (let [out-ch (async/chan 2)
-        {:keys [s p o idx flake-x-form passthrough-fn optional?]} clause
+        {:keys [type s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
         {o-var :variable, o-in-n :in-n} o]
     (async/go
@@ -91,9 +91,45 @@
               (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
                 (loop []
                   (when-let [next-s (async/<! s-vals-chan)]
-                    (async/>! out-ch next-s)
+                    (async/>! out-ch (if nils-fn
+                                       (nils-fn next-s)
+                                       next-s))
                     (recur)))))
             (recur))
+          (async/close! out-ch))))
+    out-ch))
+
+(defn where-clause-tuple-chunk
+  "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
+  [db next-in out-ch error-ch clause t]
+  (let [{:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
+        {s-var :variable, s-in-n :in-n} s
+        {o-var :variable, o-in-n :in-n} o]
+    (async/go
+      (when s-in-n
+        (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
+          (loop []
+            (when-let [next-s (async/<! s-vals-chan)]
+              (async/>! out-ch (if nils-fn
+                                 (nils-fn next-s)
+                                 next-s))
+              (recur))))))))
+
+
+(defn where-clause-chan
+  "Takes next where clause and returns and output channel with chunked results."
+  [db prev-chan error-ch clause t]
+  (let [out-ch (async/chan 2)
+        {:keys [type]} clause]
+    (async/go
+      (loop []
+        (if-let [next-in (async/<! prev-chan)]
+          ;; wait for operation to finish
+          (do
+            (async/<!
+              (where-clause-tuple-chunk db next-in out-ch error-ch clause t))
+            (recur))
+          ;; no more input results, close out channel
           (async/close! out-ch))))
     out-ch))
 
@@ -168,6 +204,25 @@
                 (async/close! out-ch)))))))
     out-ch))
 
+(defn process-union
+  [db prev-chan error-ch clause t]
+  (let [out-ch (async/chan 2)
+        [union1 union2] (:where clause)]
+    (async/go
+      (loop []
+        (if-let [next-in (async/<! prev-chan)]
+          ;; wait for operation to finish
+          (do
+            (async/<!
+              (where-clause-tuple-chunk db next-in out-ch error-ch (first union1) t))
+            (async/<!
+              (where-clause-tuple-chunk db next-in out-ch error-ch (first union2) t))
+            (recur))
+          ;; no more input results, close out channel
+          (async/close! out-ch))))
+    out-ch))
+
+
 (defn resolve-where-clause
   [{:keys [t] :as db} {:keys [where vars] :as _parsed-query} error-ch fuel max-fuel]
   (let [initial-chan (get-clause-res db nil (first where) t vars fuel max-fuel error-ch)]
@@ -175,7 +230,10 @@
            prev-chan initial-chan]
       ;; TODO - get 't' from query!
       (if clause
-        (let [out-chan (get-chan db prev-chan error-ch clause t)]
+        (let [out-chan (case (:type clause)
+                         (:class :tuple :iri) (where-clause-chan db prev-chan error-ch clause t)
+                         :optional :TODO
+                         :union (process-union db prev-chan error-ch clause t))]
           (recur r out-chan))
         prev-chan))))
 

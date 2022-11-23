@@ -1,6 +1,7 @@
 .PHONY: all deps jar install deploy nodejs browser webworker cljtest \
         cljs-browser-test cljs-node-test cljstest test eastwood ci clean \
-        js-packages publish-nodejs publish-browser publish-webworker publish-js
+        js-packages sync-package-json publish-nodejs publish-browser \
+        publish-webworker publish-js
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -47,31 +48,39 @@ install: target/fluree-db.jar
 	clojure -T:build install
 
 deploy: target/fluree-db.jar
-	clojure -M:deploy
+	clojure -T:build deploy
+
+js-packages/nodejs/package.json: package.json
+	clojure -T:build sync-package-json :target $(@D)/package.json :node? true
+
+js-packages/browser/package.json: package.json
+	clojure -T:build sync-package-json :target $(@D)/package.json
+
+js-packages/webworker/package.json: package.json
+	clojure -T:build sync-package-json :target $(@D)/package.json
 
 js-packages/nodejs/flureenjs.js: out/flureenjs.js
 	cp $< $@
-	bb run sync-package-json $(@D)/package.json --node
 
 js-packages/browser/flureedb.js: out/flureedb.js
 	cp $< $@
-	bb run sync-package-json $(@D)/package.json
 
 js-packages/webworker/flureeworker.js: out/flureeworker.js
 	cp $< $@
-	bb run sync-package-json $(@D)/package.json
 
 js-packages: js-packages/nodejs/flureenjs.js js-packages/browser/flureedb.js js-packages/webworker/flureeworker.js
 
+sync-package-json: js-packages/nodejs/package.json js-packages/browser/package.json js-packages/webworker/package.json
+
 NPM_TAG ?= latest
 
-publish-nodejs: js-packages/nodejs/flureenjs.js
+publish-nodejs: js-packages/nodejs/flureenjs.js js-packages/nodejs/package.json
 	cd $(<D) && npm publish --tag $(NPM_TAG)
 
-publish-browser: js-packages/browser/flureedb.js
+publish-browser: js-packages/browser/flureedb.js js-packages/browser/package.json
 	cd $(<D) && npm publish --tag $(NPM_TAG)
 
-publish-webworker: js-packages/webworker/flureeworker.js
+publish-webworker: js-packages/webworker/flureeworker.js js-packages/webworker/package.json
 	cd $(<D) && npm publish --tag $(NPM_TAG)
 
 publish-js: publish-nodejs publish-browser publish-webworker

@@ -66,3 +66,21 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 * `make cljs-node-test` - run CLJS tests in NodeJS
 * `make nodejs-test` - run node package in node
 * `make browser-test` - run browser package in headless Chrome
+
+### CLJS REPL
+
+In order to get a Node or web browser CLJS REPL running, you need to do the
+following:
+
+1. Run `npx shadow-cljs watch flureenjs` (or `flureedb` for a browser REPL)
+2. (Node only) Run `node out/nodejs/flureenjs.js` in a separate shell
+3. (browser only) Connect to `http://localhost:9630/` in your browser 
+    1. This seems currently broken though. It first gets stuck at
+       "shadow-cljs Loading..." with an "unknown route" error in the JS console.
+       If you reload that seems to resolve. But even once the dashboard loads
+       and you connect a REPL, it says "No available JS runtime."
+4. Connect an nREPL to the port specified in `.shadow-cljs/nrepl.port`
+5. Inside that REPL run `(shadow/repl :flureenjs)` (or `:flureedb` for a browser
+   REPL)
+6. Try running something CLJS-specific to ensure you've got a working CLJS REPL
+    1. For example: `(js/parseInt "42")`
