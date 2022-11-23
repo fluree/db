@@ -1030,11 +1030,9 @@
   "Updates group-by, if applicable, with final where clause positions of items."
   [{:keys [parsed] :as group-by} where]
   (when group-by
-    (log/info "where:" where)
     (let [{:keys [out-vars all] :as _last-where} (last where)
           parsed*               (mapv #(update-position+type % out-vars all) parsed)
           group-by*             (assoc group-by :parsed parsed*)
-          _ (log/info "parsed*:" parsed*)
           grouped-positions     (mapv :in-n parsed*)        ;; returns 'n' positions of values used for grouping
           partition-fn          (build-vec-extraction-fn grouped-positions) ;; returns fn containing only grouping vals, used like a 'partition-by' fn
           grouped-val-positions (filterv                    ;; returns 'n' positions of values that are being grouped
