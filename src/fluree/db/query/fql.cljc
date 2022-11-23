@@ -61,6 +61,17 @@
           result-item
           (first result-item))))))
 
+(defn collect-groups
+  [group-results]
+  (let [grouped        (pop group-results)
+        grouped-block  (peek group-results)
+        value-groups   (repeatedly #(transient []))]
+    (->> grouped-block
+         (reduce (fn [grps result]
+                   (map conj! grps result))
+                 value-groups)
+         (mapv persistent!)
+         (into grouped))))
 
 (defn process-select-results
   "Processes where results into final shape of specified select statement."
@@ -68,8 +79,7 @@
   (go-try
     (let [{:keys [spec inVector?]} select
           cache    (volatile! {})
-          fuel-vol (volatile! 0)
-          {:keys [group-finish-fn]} group-by]
+          fuel-vol (volatile! 0)]
       (loop []
         (let [where-items (async/alt!
                             error-ch ([e]
@@ -78,8 +88,8 @@
                                       result-chunk))]
           (if where-items
             (do
-              (loop [[where-item & r] (if group-finish-fn   ;; note - this could be added to the chan as a transducer - however as all results are in one big, sorted chunk I don't expect any performance benefit
-                                        (map group-finish-fn where-items)
+              (loop [[where-item & r] (if group-by   ;; note - this could be added to the chan as a transducer - however as all results are in one big, sorted chunk I don't expect any performance benefit
+                                        (map collect-groups where-items)
                                         where-items)]
                 (if where-item
                   (let [where-result (<? (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector?))]

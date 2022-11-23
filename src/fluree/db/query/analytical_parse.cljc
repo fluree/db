@@ -1004,30 +1004,6 @@
           comparator (build-order-fn order-by*)]
       (assoc order-by* :comparator comparator))))
 
-
-(defn grouped-vals-result
-  [group-results]
-  (let [grouped        (pop group-results)
-        grouped-block  (peek group-results)
-        value-groups   (repeatedly #(transient []))]
-    (->> grouped-block
-         (reduce (fn [grps result]
-                   (map conj! grps result))
-                 value-groups)
-         (mapv persistent!)
-         (into grouped))))
-
-(defn grouped-vals-result-fn
-  "Returns grouped results in a consolidated vector.
-  e.g. [[:a :b :c] [:a1 :b1 :c1] [:a2 :b2 :c2] [:a3 :b3 :c3]] will turn into:
-  ==>  [[:a :a1 :a2 :a3] [:b :b1 :b2 :b3] [:c :c1 :c2 :c3]
-
-  The optimized case-specific versions are > 50% faster than the less optimized"
-  [extraction-positions]
-  (fn [group-results]
-    (grouped-vals-result group-results)))
-
-
 (defn lazy-group-by
   "Returns lazily parsed results from group-by.
   Even though the query results must be fully realized through sorting,
@@ -1070,12 +1046,10 @@
           grouping-fn           (fn [results]
                                   (lazy-group-by partition-fn grouped-vals-fn results))
           ;; group-finish-fn takes final results and merges results together
-          group-finish-fn       (grouped-vals-result-fn grouped-val-positions)
           grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
       (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
                        :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions)) ;; these are the variable names in the output that are grouped
-                       :grouping-fn grouping-fn
-                       :group-finish-fn group-finish-fn))))
+                       :grouping-fn grouping-fn))))
 
 
 (defn get-clause-vars
