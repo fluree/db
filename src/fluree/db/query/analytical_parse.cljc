@@ -1006,12 +1006,10 @@
 
 
 (defn grouped-vals-result
-  [group-results extraction-positions]
-  (let [position-count (count extraction-positions)
-        grouped        (pop group-results)
+  [group-results]
+  (let [grouped        (pop group-results)
         grouped-block  (peek group-results)
-        value-groups   (->> (repeat position-count [])
-                            (map transient))]
+        value-groups   (repeatedly #(transient []))]
     (->> grouped-block
          (reduce (fn [grps result]
                    (map conj! grps result))
@@ -1027,7 +1025,7 @@
   The optimized case-specific versions are > 50% faster than the less optimized"
   [extraction-positions]
   (fn [group-results]
-    (grouped-vals-result group-results extraction-positions)))
+    (grouped-vals-result group-results)))
 
 
 (defn lazy-group-by
