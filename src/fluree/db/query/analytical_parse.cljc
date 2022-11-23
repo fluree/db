@@ -752,25 +752,10 @@
 
 (defn build-vec-extraction-fn
   [extraction-positions]
-  (let [n (count extraction-positions)
-        [n1 n2 n3 n4 n5 & _r] extraction-positions]
-    (case n
-      0 nil
-      1 (fn [input-item]
-          [(nth input-item n1)])
-      2 (fn [input-item]
-          [(nth input-item n1) (nth input-item n2)])
-      3 (fn [input-item]
-          [(nth input-item n1) (nth input-item n2) (nth input-item n3)])
-      4 (fn [input-item]
-          [(nth input-item n1) (nth input-item n2) (nth input-item n3) (nth input-item n4)])
-      5 (fn [input-item]
-          [(nth input-item n1) (nth input-item n2) (nth input-item n3) (nth input-item n4) (nth input-item n5)])
-      ;; else - less optimized, handle all other cases
-      (fn [input-item]
-        (mapv (fn [n]
-                (nth input-item n))
-              extraction-positions)))))
+  (when (seq extraction-positions)
+    (fn [input-item]
+      (mapv (partial nth input-item)
+            extraction-positions))))
 
 (defn gen-passthrough-fn
   "Transforms input variables into required passthrough variables.
@@ -865,7 +850,7 @@
         out-vars-s (into (set out-vars) order-by)
         flake-out  (filter out-vars-s flake-out)            ;; only keep flake-out vars needed in final output
         others-out (filter out-vars-s others)]               ;; only keep other vars needed in final output
-        
+
     (into [] (concat flake-out others-out))))
 
 
