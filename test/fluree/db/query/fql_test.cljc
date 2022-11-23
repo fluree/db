@@ -17,9 +17,9 @@
                                  [?s :schema/age ?age]
                                  [?s :ex/favNums ?favNums]]
                       :group-by ?name}
-            subject @(fluree/query db qry)])
-      (is (= [["Alice" "alice@example.org" 50 [9 42 76]]
-              ["Brian" "brian@example.org" 50 [7]]
-              ["Cam" "cam@example.org" 34 [5 10]]]
-             subject)
-          "returns grouped results"))))
+            subject @(fluree/query db qry)]
+        (is (= [["Alice" "alice@example.org" 50 [9 42 76]]
+                ["Brian" "brian@example.org" 50 [7]]
+                ["Cam" "cam@example.org" 34 [5 10]]]
+               subject)
+            "returns grouped results")))))
