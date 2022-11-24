@@ -542,7 +542,17 @@
 ;; here: https://developers.flur.ee/docs/concepts/analytical-queries/inner-joins-in-fluree/#recursion
 (def ^:const default-recursion-depth 100)
 
-(defn recursion-predicate
+(defn as-predicate-name
+  [predicate]
+  (re-find #"[^\+]*" predicate))
+
+(defn recursion-predicate?
+  [x]
+  (->> x
+       (re-find #"\+")
+       boolean))
+
+(defn as-recursion-predicate
   "A predicate that ends in a '+', or a '+' with some integer afterwards is a recursion
   predicate. e.g.: person/follows+3
 
@@ -570,7 +580,7 @@
         rdf-type?  (or (= "rdf:type" p)
                        (= "a" p))
         _id?       (= "_id" p)
-        [recur-pred recur-n] (recursion-predicate p)
+        [recur-pred recur-n] (as-recursion-predicate p)
         s*         (value-type-map s true)
         p*         (cond
                      fulltext? #?(:clj  (full-text/parse-domain p)

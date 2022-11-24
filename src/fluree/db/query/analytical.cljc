@@ -22,7 +22,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn variable? [form]
+(defn as-variable [form]
   (when (and (or (string? form) (keyword? form) (symbol? form)) (= (first (name form)) \?))
     (symbol form)))
 
@@ -40,25 +40,31 @@
 
 (defn get-vars
   [filter-code]
-  (some #(or (variable? %) (when (coll? %) (get-vars %))) filter-code))
+  (some #(or (as-variable %) (when (coll? %) (get-vars %))) filter-code))
 
 (defn clause->rel
-  "Given any interm-vars, such as {?article 351843720901583}
-  and an fdb clause, such as  [\"?article\", \"articles/leadInstitutionOrg\", \"?org\"],
+  "Given any interm-vars, such as {?article 351843720901583} and an fdb clause,
+  such as [\"?article\", \"articles/leadInstitutionOrg\", \"?org\"],
 
 
   Returns a map with the following keys:
 
-  - search - a vector that will be passed to query-range/search, i.e. [ nil \"articles/leadInstitutionOrg\" nil ]
-  - rel - a map with any variables (that are not present in interm-vars) and their idx, i.e. {?org 2}
-  - opts - search opts, currently recur, if the predicate is recurred, and object-fn, if there is an object function.
- "
+  - search: a vector that will be passed to query-range/search,
+            i.e. [ nil \"articles/leadInstitutionOrg\" nil ]
+
+  - rel:    a map with any variables (that are not present in interm-vars)
+            and their index, i.e. {?org 2}
+
+  - opts:   search opts, currently recur, if the predicate is recurred,
+            and object-fn, if there is an object function."
   [db interm-vars clause]
   (reduce-kv (fn [acc idx key]
-               (let [key-as-var   (variable? key)
+               (let [key-as-var   (as-variable key)
                      static-value (get interm-vars key-as-var)]
-                 (when (and (= idx 1) (not key-as-var) (not= "_id" key)
-                            (not (dbproto/-p-prop db :name (re-find #"[_a-zA-Z0-9/]*" key))))
+                 (when (and (= idx 1)
+                            (not key-as-var)
+                            (not= "_id" key)
+                            (not (dbproto/-p-prop db :name (parse/as-predicate-name key))))
                    (throw (ex-info (str "Invalid predicate provided: " key)
                                    {:status 400
                                     :error  :db/invalid-query})))
@@ -82,11 +88,8 @@
                              (assoc-in [:opts :object-fn] filter-fn)
                              (assoc-in [:rel var] idx)))
 
-                       (and (= idx 1) (re-find #"\+" key))
-                       (let [[pred recur-amt] (str/split key #"\+")
-                             recur-amt (if recur-amt
-                                         (or (safe-read-string recur-amt) 100)
-                                         100)]
+                       (and (= idx 1) (parse/recursion-predicate? key))
+                       (let [[pred recur-amt] (parse/as-recursion-predicate key)]
                          (-> acc
                              (update :search #(conj % pred))
                              (assoc-in [:opts :recur] recur-amt)))
@@ -95,7 +98,8 @@
                        (update acc :search #(conj % (safe-read-string key)))
 
                        :else
-                       (update acc :search #(conj % key))))) {:search [] :rel {} :opts {}} clause))
+                       (update acc :search #(conj % key)))))
+             {:search [] :rel {} :opts {}} clause))
 
 (defn transform-tuples-to-idxs
   "Returns an updated list of tuples that only contains tuple indexes from idx.
@@ -108,7 +112,7 @@
 (defn clause->keys
   [clause]
   (reduce (fn [acc var]
-            (if-let [var (variable? var)]
+            (if-let [var (as-variable var)]
               (conj acc var) acc))
           [] clause))
 
@@ -138,7 +142,7 @@
   The return value would be: [3 1]"
   [vars headers]
   (reduce (fn [acc var-smt]
-            (if-let [var (or (variable? var-smt)
+            (if-let [var (or (as-variable var-smt)
                              (:variable var-smt))]
               (conj acc (util/index-of headers var))
               (throw
@@ -372,17 +376,17 @@
                 tuples      (transform-tuples-to-idxs (vals rel) res')
                 tuples'     (if recur-depth
                               (let [clause-1st (first clause')
-                                    var-first? (variable? (first clause))
+                                    var-first? (as-variable (first clause))
                                     predicate  (nth clause' 1)
 
                                     ;; Potentially, predicate could have been a variable and previous
                                     ;; where-items resolved it, but we can only handle one resolve
                                     ;; predicate here.
-                                    _          (when (variable? predicate)
+                                    _          (when (as-variable predicate)
                                                  (throw (ex-info (str "Cannot use predicate recursion when predicate is variable. Provided: " clause')
                                                                  {:status 400
                                                                   :error  :db/invalid-query})))
-                                    _          (when-not (variable? (nth clause 2))
+                                    _          (when-not (as-variable (nth clause 2))
                                                  (throw (ex-info (str "Cannot use predicate recursion when object is not a variable. Provided: " clause')
                                                                  {:status 400
                                                                   :error  :db/invalid-query})))
@@ -413,7 +417,7 @@
                               :error  :db/invalid-query}))
              (let [lang (-> db :settings :language (or :default))
                    [var search search-param] clause
-                   var  (variable? var)]
+                   var  (as-variable var)]
                (with-open [^Closeable store (full-text/open-storage conn network ledger-id lang)]
                  (full-text/search store db [var search search-param]))))))
 
@@ -424,8 +428,8 @@
 
 (defn collection->tuples
   [db res clause]
-  (go-try (let [subject-var (variable? (first clause))
-                object-var  (variable? (last clause))]
+  (go-try (let [subject-var (as-variable (first clause))
+                object-var  (as-variable (last clause))]
             (cond (and subject-var object-var)
                   (throw (ex-info "When using rdf:type, either a subject or a type (collection) must be specified."
                                   {:status 400
@@ -773,7 +777,7 @@
 (defn bind-clause->vars
   [res clause]
   (let [[k v] clause
-        k         (variable? k)
+        k         (as-variable k)
         _         (when-not k (throw (ex-info (str "Invalid intermediate aggregate value. Provided: " clause)
                                               {:status 400 :error :db/invalid-query})))
         {:keys [headers vars]} res
