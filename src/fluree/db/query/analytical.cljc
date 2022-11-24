@@ -66,8 +66,8 @@
                             (not= "_id" key)
                             (not (dbproto/-p-prop db :name (parse/as-predicate-name key))))
                    (throw (ex-info (str "Invalid predicate provided: " key)
-                                                 {:status 400
-                                                  :error  :db/invalid-query})))
+                                   {:status 400
+                                    :error  :db/invalid-query})))
                  (cond static-value
                        (update acc :search #(conj % static-value))
 
