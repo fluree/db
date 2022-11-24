@@ -17,6 +17,7 @@
             [fluree.db.constants :as const]
             [fluree.db.query.schema :as schema]
             [clojure.string :as str]
+            [criterium.core :refer [bench]]
     ;cljs
             [figwheel-sidecar.repl-api :as ra]))
 

@@ -1,5 +1,6 @@
 (ns build
-  (:require [clojure.tools.build.api :as b]))
+  (:require [clojure.tools.build.api :as b]
+            [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'com.fluree/db)
 (def version "3.0.0-alpha1")
@@ -42,3 +43,15 @@
                                        "/blob/v{version}/{filepath}#L{line}")}
                      output-path (assoc :output-path output-path))]
     (b/process {:command-args ["clojure" "-X:docs" (pr-str opts)]})))
+
+(defn deploy [_]
+  (dd/deploy {:installer :remote
+              :artifact  jar-file
+              :pom-file  (b/pom-path {:lib lib, :class-dir class-dir})}))
+
+(defn sync-package-json [{:keys [target node?]}]
+  (let [node-arg (when node? "--node")
+        cmd-args (remove nil? ["bb" "run" "sync-package-json" version
+                               (str target) node-arg])]
+    (println "cmd args:" (pr-str cmd-args))
+    (b/process {:command-args cmd-args})))
