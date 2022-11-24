@@ -1034,10 +1034,10 @@
       0 nil
       1 (fn [group-results]
           (let [grouped (pop group-results)]
-            (conj grouped (mapv first (last group-results)))))
+            (conj grouped (mapv first (peek group-results)))))
       2 (fn [group-results]
           (let [grouped       (pop group-results)
-                grouped-block (last group-results)]
+                grouped-block (peek group-results)]
             (loop [grouped-block grouped-block
                    r1-acc        (transient [])
                    r2-acc        (transient [])]
