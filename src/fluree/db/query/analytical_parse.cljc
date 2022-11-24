@@ -1048,42 +1048,50 @@
                       (conj (persistent! r1-acc))
                       (conj (persistent! r2-acc))))))))
       3 (fn [group-results]
-          (loop [group-results group-results
-                 r1-acc        (transient [])
-                 r2-acc        (transient [])
-                 r3-acc        (transient [])]
-            (let [[r1 r2 r3] (first group-results)]
-              (if r1
-                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3))
-                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc)]))))
+          (let [grouped       (pop group-results)
+                grouped-block (peek group-results)]
+            (loop [grouped-block grouped-block
+                   r1-acc        (transient [])
+                   r2-acc        (transient [])
+                   r3-acc        (transient [])]
+              (let [[r1 r2 r3] (first grouped-block)]
+                (if r1
+                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3))
+                  (into grouped [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc)]))))))
       4 (fn [group-results]
-          (loop [group-results group-results
-                 r1-acc        (transient [])
-                 r2-acc        (transient [])
-                 r3-acc        (transient [])
-                 r4-acc        (transient [])]
-            (let [[r1 r2 r3 r4] (first group-results)]
-              (if r1
-                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4))
-                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc)]))))
+          (let [grouped       (pop group-results)
+                grouped-block (peek group-results)]
+            (loop [grouped-block grouped-block
+                   r1-acc        (transient [])
+                   r2-acc        (transient [])
+                   r3-acc        (transient [])
+                   r4-acc        (transient [])]
+              (let [[r1 r2 r3 r4] (first grouped-block)]
+                (if r1
+                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4))
+                  (into grouped [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc)]))))))
       5 (fn [group-results]
-          (loop [group-results group-results
-                 r1-acc        (transient [])
-                 r2-acc        (transient [])
-                 r3-acc        (transient [])
-                 r4-acc        (transient [])
-                 r5-acc        (transient [])]
-            (let [[r1 r2 r3 r4 r5] (first group-results)]
-              (if r1
-                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4) (conj! r5-acc r5))
-                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc) (persistent! r5-acc)]))))
+          (let [grouped       (pop group-results)
+                grouped-block (peek group-results)]
+            (loop [grouped-block grouped-block
+                   r1-acc        (transient [])
+                   r2-acc        (transient [])
+                   r3-acc        (transient [])
+                   r4-acc        (transient [])
+                   r5-acc        (transient [])]
+              (let [[r1 r2 r3 r4 r5] (first grouped-block)]
+                (if r1
+                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4) (conj! r5-acc r5))
+                  (into grouped [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc) (persistent! r5-acc)]))))))
       ;; else - less optimized, handle all other cases
       (fn [group-results]
         ;; note: args are returned here in a list which should be OK downstream.
         ;; If turned into a vector, benchmarking shows time doubles.
         ;; A more complex fn using a reducer with transients is about equal in time to what is here.
         ;; If we must move to using vector in result sets, then performance-wise it will make more sense
-        (apply mapv (fn [& args] args) group-results)))))
+        (let [grouped       (pop group-results)
+              grouped-block (peek group-results)]
+          (apply mapv (fn [& args] args) group-results))))))
 
 
 (defn lazy-group-by
