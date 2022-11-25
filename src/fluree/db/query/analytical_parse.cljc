@@ -1009,7 +1009,7 @@
 
 (defn update-order-by
   "Updates order-by, if applicable, with final where clause positions of items."
-  [{:keys [parsed] :as order-by} group-by where]
+  [{:keys [parsed] :as order-by} where]
   (when order-by
     (let [{:keys [out-vars vars] :as _last-where} (last where)
           parsed*    (mapv #(update-position+type % out-vars (:all vars)) parsed)
@@ -1253,7 +1253,7 @@
                               (union/order-out-vars out-vars last-clause order-by)
                               (order-out-vars out-vars last-clause order-by))
             where*          (where-meta-reverse where* select-out-vars)
-            order-by*       (update-order-by order-by group-by where*)
+            order-by*       (update-order-by order-by where*)
             group-by*       (update-group-by group-by where*)]
         (cond-> (assoc parsed-query :where where*
                                     :order-by order-by*
