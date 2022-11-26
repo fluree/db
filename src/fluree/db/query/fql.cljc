@@ -127,15 +127,6 @@
       (async/pipe group-coll-ch sorted-ch))
     group-ch))
 
-
-(defn order+group-results
-  "Ordering must first consume all results and then sort."
-  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by} {:keys [partition-fn grouping-fn] :as _group-by}]
-  (async/go
-    (let [results (<! (async/reduce into [] results-ch))]
-      (cond-> (sort comparator results)
-        grouping-fn grouping-fn))))
-
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
   [db {:keys [fuel order-by group-by] :as parsed-query}]
@@ -151,19 +142,6 @@
                           (order-result-groups cmp))]
       (process-select-results db out-ch where-ch error-ch parsed-query))
     out-ch))
-
-;; (defn- ad-hoc-query
-;;   "Legacy ad-hoc query processor"
-;;   [db {:keys [fuel order-by group-by] :as parsed-query}]
-;;   (let [out-ch (async/chan)]
-;;     (let [max-fuel fuel
-;;           fuel     (volatile! 0)
-;;           error-ch (async/chan)
-;;           where-ch (cond-> (compound/where db parsed-query fuel max-fuel error-ch)
-;;                      order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
-;;       (process-select-results db out-ch where-ch error-ch parsed-query))
-;;     out-ch))
-
 
 (defn cache-query
   "Returns already cached query from cache if available, else

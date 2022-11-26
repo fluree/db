@@ -1092,29 +1092,6 @@
               grouped-block (peek group-results)]
           (apply mapv (fn [& args] args) group-results))))))
 
-
-(defn lazy-group-by
-  "Returns lazily parsed results from group-by.
-  Even though the query results must be fully realized through sorting,
-  a pre-requisite of grouping, the grouping itself can be lazy which will
-  help with large result sets that have a 'limit'."
-  [grouping-fn grouped-vals-fn results]
-  (lazy-seq
-    (when-let [results* (seq results)]
-      (let [fst  (first results*)
-            fv   (grouping-fn fst)
-            fres (grouped-vals-fn fst)
-            [next-chunk rest-results] (loop [rest-results (rest results*)
-                                             acc          [fres]]
-                                        (let [result (first rest-results)]
-                                          (if result
-                                            (if (= fv (grouping-fn result))
-                                              (recur (next rest-results) (conj acc (grouped-vals-fn result)))
-                                              [(conj fv acc) rest-results])
-                                            [(conj fv acc) nil])))]
-        (cons next-chunk (lazy-group-by grouping-fn grouped-vals-fn (lazy-seq rest-results)))))))
-
-
 (defn update-group-by
   "Updates group-by, if applicable, with final where clause positions of items."
   [{:keys [parsed] :as group-by} where]
@@ -1128,16 +1105,11 @@
                                   (complement (set grouped-positions))
                                   (range (count out-vars)))
           grouped-vals-fn       (build-vec-extraction-fn grouped-val-positions) ;; returns fn containing only values being grouped (excludes grouping vals)
-          ;; grouping fn takes sorted results, and partitions results by group-by vars returning only the values being grouped.
-          ;; we don't yet merge all results together as that work is unnecessary if using an offset, or limit
-          grouping-fn           (fn [results]
-                                  (lazy-group-by partition-fn grouped-vals-fn results))
           ;; group-finish-fn takes final results and merges results together
           group-finish-fn       (grouped-vals-result-fn grouped-val-positions)
           grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
       (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
                        :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions)) ;; these are the variable names in the output that are grouped
-                       :grouping-fn grouping-fn
                        :partition-fn partition-fn
                        :grouped-vals-fn grouped-vals-fn
                        :group-finish-fn group-finish-fn))))
