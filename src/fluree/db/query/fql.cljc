@@ -73,11 +73,10 @@
         cache    (volatile! {})
         fuel-vol (volatile! 0)
         {:keys [group-finish-fn]} group-by
-        finish-xf (if group-finish-fn
-                    (map group-finish-fn)
-                    (map identity))
-        process-xf (comp cat finish-xf)
-        process-ch (async/chan 2 process-xf)]
+        finish-group-xf (if group-finish-fn
+                          (map group-finish-fn)
+                          (map identity))
+        process-ch (async/chan 2 finish-group-xf)]
     (->> (async/pipe where-ch process-ch)
          (async/pipeline-async 2
                                out-ch
@@ -88,8 +87,8 @@
 
 
 (defn group-results
-  [partition-fn result-ch]
-  (if partition-fn
+  [partition-fn grouped-vals-fn result-ch]
+  (if (and partition-fn grouped-vals-fn)
     (let [group-ch (async/reduce (fn [groups result-chunk]
                                    (reduce (fn [grps result]
                                              (let [grp-key (partition-fn result)]
@@ -97,10 +96,12 @@
                                                        (fn [grp]
                                                          (-> grp
                                                              (or [])
-                                                             (conj result))))))
+                                                             (conj (grouped-vals-fn result)))))))
                                            groups result-chunk))
                                  {} result-ch)]
-      (async/pipe group-ch (async/chan 1 (mapcat vals))))
+      (async/pipe group-ch (async/chan 1 (comp cat
+                                               (map (fn [[grp-key grp-vals]]
+                                                      (conj grp-key grp-vals)))))))
     (async/reduce into [] result-ch)))
 
 
@@ -139,14 +140,15 @@
   "Legacy ad-hoc query processor"
   [db {:keys [fuel order-by group-by] :as parsed-query}]
   (let [out-ch (async/chan)]
-    (let [max-fuel  fuel
-          fuel      (volatile! 0)
-          partition (:partition-fn group-by)
-          cmp       (:comparator order-by)
-          error-ch  (async/chan)
-          where-ch  (->> (compound/where db parsed-query fuel max-fuel error-ch)
-                         (group-results partition)
-                         (order-result-groups cmp))]
+    (let [max-fuel   fuel
+          fuel       (volatile! 0)
+          partition  (:partition-fn group-by)
+          group-vals (:grouped-vals-fn group-by)
+          cmp        (:comparator order-by)
+          error-ch   (async/chan)
+          where-ch   (->> (compound/where db parsed-query fuel max-fuel error-ch)
+                          (group-results partition group-vals)
+                          (order-result-groups cmp))]
       (process-select-results db out-ch where-ch error-ch parsed-query))
     out-ch))
 
