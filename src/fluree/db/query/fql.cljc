@@ -85,23 +85,33 @@
                                              ch))))
     out-ch))
 
+(defn extract-vals
+  [input positions]
+  (mapv (partial nth input)
+        positions))
+
+(defn add-group-values
+  [group values]
+  (-> group
+      (or [])
+      (conj values)))
 
 (defn group-results
-  [partition-fn grouped-vals-fn result-ch]
-  (if (and partition-fn grouped-vals-fn)
-    (let [group-ch (async/reduce (fn [groups result-chunk]
-                                   (reduce (fn [grps result]
-                                             (let [grp-key (partition-fn result)]
-                                               (update grps grp-key
-                                                       (fn [grp]
-                                                         (-> grp
-                                                             (or [])
-                                                             (conj (grouped-vals-fn result)))))))
+  [{:keys [parsed out-vars] :as group-by} result-ch]
+  (if-let [grouping-positions (not-empty (mapv :in-n parsed))] ; returns 'n' positions of values used for grouping
+    (let [grouped-positions (filterv                    ; returns 'n' positions of values that are being grouped
+                             (complement (set grouping-positions))
+                             (range (count out-vars)))
+          group-ch (async/reduce (fn [groups result-chunk]
+                                   (reduce (fn [groups result]
+                                             (let [group-key  (extract-vals result grouping-positions)
+                                                   group-vals (extract-vals result grouped-positions)]
+                                               (update groups group-key add-group-values group-vals)))
                                            groups result-chunk))
                                  {} result-ch)]
       (async/pipe group-ch (async/chan 1 (comp cat
-                                               (map (fn [[grp-key grp-vals]]
-                                                      (conj grp-key grp-vals)))))))
+                                               (map (fn [[group-key group]]
+                                                      (conj group-key group)))))))
     (async/reduce into [] result-ch)))
 
 
@@ -138,7 +148,7 @@
           cmp        (:comparator order-by)
           error-ch   (async/chan)
           where-ch   (->> (compound/where db parsed-query fuel max-fuel error-ch)
-                          (group-results partition group-vals)
+                          (group-results group-by)
                           (order-result-groups cmp))]
       (process-select-results db out-ch where-ch error-ch parsed-query))
     out-ch))

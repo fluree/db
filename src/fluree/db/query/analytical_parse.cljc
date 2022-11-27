@@ -1100,18 +1100,14 @@
           parsed*               (mapv #(update-position+type % out-vars all) parsed)
           group-by*             (assoc group-by :parsed parsed*)
           grouped-positions     (mapv :in-n parsed*)        ;; returns 'n' positions of values used for grouping
-          partition-fn          (build-vec-extraction-fn grouped-positions) ;; returns fn containing only grouping vals, used like a 'partition-by' fn
           grouped-val-positions (filterv                    ;; returns 'n' positions of values that are being grouped
                                   (complement (set grouped-positions))
                                   (range (count out-vars)))
-          grouped-vals-fn       (build-vec-extraction-fn grouped-val-positions) ;; returns fn containing only values being grouped (excludes grouping vals)
           ;; group-finish-fn takes final results and merges results together
           group-finish-fn       (grouped-vals-result-fn grouped-val-positions)
           grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
       (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
                        :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions)) ;; these are the variable names in the output that are grouped
-                       :partition-fn partition-fn
-                       :grouped-vals-fn grouped-vals-fn
                        :group-finish-fn group-finish-fn))))
 
 
