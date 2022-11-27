@@ -72,18 +72,13 @@
   (let [{:keys [spec inVector?]} select
         cache    (volatile! {})
         fuel-vol (volatile! 0)
-        {:keys [group-finish-fn]} group-by
-        finish-group-xf (if group-finish-fn
-                          (map group-finish-fn)
-                          (map identity))
-        process-ch (async/chan 2 finish-group-xf)
-        out-ch     (async/chan)]
-    (->> (async/pipe where-ch process-ch)
-         (async/pipeline-async 2
-                               out-ch
-                               (fn [where-item ch]
-                                 (async/pipe (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector? error-ch)
-                                             ch))))
+        out-ch   (async/chan)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [where-item ch]
+                            (async/pipe (process-where-item db cache compact-fn fuel-vol fuel where-item spec inVector? error-ch)
+                                        ch))
+                          where-ch)
     out-ch))
 
 (defn extract-vals
@@ -92,28 +87,38 @@
         positions))
 
 (defn add-group-values
-  [group values]
-  (-> group
-      (or [])
-      (conj values)))
+  [groups grouped-vals]
+  (if groups
+    (mapv conj groups grouped-vals)
+    (mapv vector grouped-vals)))
 
-(defn group-results
-  [{:keys [parsed out-vars] :as group-by} result-chunk-ch]
-  (if-let [grouping-positions (not-empty (mapv :in-n parsed))] ; returns 'n' positions of values used for grouping
-    (let [grouped-positions (filterv                    ; returns 'n' positions of values that are being grouped
-                             (complement (set grouping-positions))
-                             (range (count out-vars)))
-          group-ch (async/transduce cat
-                                    (completing (fn [groups result]
-                                                  (let [group-key  (extract-vals result grouping-positions)
-                                                        group-vals (extract-vals result grouped-positions)]
-                                                    (update groups group-key add-group-values group-vals))))
-                                    {} result-chunk-ch)]
-      (async/pipe group-ch (async/chan 1 (comp cat
-                                               (map (fn [[group-key group]]
-                                                      (conj group-key group)))))))
+(defn group-result
+  [grouping-positions grouped-positions group-map result]
+  (let [group-key    (extract-vals result grouping-positions)
+        grouped-vals (extract-vals result grouped-positions)]
+    (update group-map group-key add-group-values grouped-vals)))
+
+(defn unwind-group-map
+  [group-map]
+  (->> group-map
+       (reduce-kv (fn [result-groups group-key grouped-vals]
+                    (let [result-group (into group-key grouped-vals)]
+                      (conj result-groups result-group)))
+                  [])))
+
+(defn group-result-chunks
+  [grouping-positions grouped-positions result-chunk-ch]
+  (async/transduce cat ; turn the sequence of result-chunks into a sequence of individual results
+                   (completing (partial group-result grouping-positions grouped-positions)
+                               unwind-group-map)
+                   {} result-chunk-ch))
+
+(defn group
+  [{:keys [grouping-positions grouped-val-positions parsed] :as group-by} result-chunk-ch]
+  (if (not-empty grouping-positions) ; returns 'n' positions of values used for grouping
+    (async/pipe (group-result-chunks grouping-positions grouped-val-positions result-chunk-ch)
+                (async/chan 1 cat))
     (async/reduce into [] result-chunk-ch)))
-
 
 (defn compare-by-first
   [cmp]
@@ -142,9 +147,9 @@
   [db {:keys [fuel order-by group-by] :as parsed-query}]
   (let [max-fuel fuel
         fuel     (volatile! 0)
-        error-ch (async/chan) ]
+        error-ch (async/chan)]
     (->> (compound/where db parsed-query fuel max-fuel error-ch)
-         (group-results group-by)
+         (group group-by)
          (order-result-groups order-by)
          (process-select-results db parsed-query error-ch))))
 

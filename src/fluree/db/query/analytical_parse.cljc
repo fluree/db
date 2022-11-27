@@ -1104,11 +1104,12 @@
                                   (complement (set grouped-positions))
                                   (range (count out-vars)))
           ;; group-finish-fn takes final results and merges results together
-          group-finish-fn       (grouped-vals-result-fn grouped-val-positions)
           grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
-      (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
-                       :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions)) ;; these are the variable names in the output that are grouped
-                       :group-finish-fn group-finish-fn))))
+      (assoc group-by*
+             :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
+             :grouping-positions    grouped-positions
+             :grouped-val-positions grouped-val-positions
+             :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions))))))
 
 
 (defn get-clause-vars
