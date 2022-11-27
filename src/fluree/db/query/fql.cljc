@@ -68,7 +68,7 @@
 
 (defn process-select-results
   "Processes where results into final shape of specified select statement."
-  [db out-ch where-ch error-ch {:keys [select fuel compact-fn group-by] :as _parsed-query}]
+  [db {:keys [select fuel compact-fn group-by] :as _parsed-query} error-ch where-ch]
   (let [{:keys [spec inVector?]} select
         cache    (volatile! {})
         fuel-vol (volatile! 0)
@@ -76,7 +76,8 @@
         finish-group-xf (if group-finish-fn
                           (map group-finish-fn)
                           (map identity))
-        process-ch (async/chan 2 finish-group-xf)]
+        process-ch (async/chan 2 finish-group-xf)
+        out-ch     (async/chan)]
     (->> (async/pipe where-ch process-ch)
          (async/pipeline-async 2
                                out-ch
@@ -128,8 +129,8 @@
          (sort group-cmp))))             ; then sort all the groups
 
 (defn order-result-groups
-  [cmp group-ch]
-  (if cmp
+  [order-by group-ch]
+  (if-let [cmp (:comparator order-by)]
     (let [group-coll-ch (async/into [] group-ch)
           sort-xf       (comp (map (partial sort-groups cmp))
                               cat)
@@ -140,18 +141,13 @@
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
   [db {:keys [fuel order-by group-by] :as parsed-query}]
-  (let [out-ch (async/chan)]
-    (let [max-fuel   fuel
-          fuel       (volatile! 0)
-          partition  (:partition-fn group-by)
-          group-vals (:grouped-vals-fn group-by)
-          cmp        (:comparator order-by)
-          error-ch   (async/chan)
-          where-ch   (->> (compound/where db parsed-query fuel max-fuel error-ch)
-                          (group-results group-by)
-                          (order-result-groups cmp))]
-      (process-select-results db out-ch where-ch error-ch parsed-query))
-    out-ch))
+  (let [max-fuel fuel
+        fuel     (volatile! 0)
+        error-ch (async/chan) ]
+    (->> (compound/where db parsed-query fuel max-fuel error-ch)
+         (group-results group-by)
+         (order-result-groups order-by)
+         (process-select-results db parsed-query error-ch))))
 
 (defn cache-query
   "Returns already cached query from cache if available, else
