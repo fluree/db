@@ -1,4 +1,5 @@
 (ns fluree.db.util.core
+  (:refer-clojure :exclude [random-uuid])
   (:require [clojure.string :as str]
             #?@(:clj [[fluree.db.util.clj-exceptions :as clj-exceptions]
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
