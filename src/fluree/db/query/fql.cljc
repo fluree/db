@@ -98,22 +98,21 @@
       (conj values)))
 
 (defn group-results
-  [{:keys [parsed out-vars] :as group-by} result-ch]
+  [{:keys [parsed out-vars] :as group-by} result-chunk-ch]
   (if-let [grouping-positions (not-empty (mapv :in-n parsed))] ; returns 'n' positions of values used for grouping
     (let [grouped-positions (filterv                    ; returns 'n' positions of values that are being grouped
                              (complement (set grouping-positions))
                              (range (count out-vars)))
-          group-ch (async/reduce (fn [groups result-chunk]
-                                   (reduce (fn [groups result]
-                                             (let [group-key  (extract-vals result grouping-positions)
-                                                   group-vals (extract-vals result grouped-positions)]
-                                               (update groups group-key add-group-values group-vals)))
-                                           groups result-chunk))
-                                 {} result-ch)]
+          group-ch (async/transduce cat
+                                    (completing (fn [groups result]
+                                                  (let [group-key  (extract-vals result grouping-positions)
+                                                        group-vals (extract-vals result grouped-positions)]
+                                                    (update groups group-key add-group-values group-vals))))
+                                    {} result-chunk-ch)]
       (async/pipe group-ch (async/chan 1 (comp cat
                                                (map (fn [[group-key group]]
                                                       (conj group-key group)))))))
-    (async/reduce into [] result-ch)))
+    (async/reduce into [] result-chunk-ch)))
 
 
 (defn compare-by-first
