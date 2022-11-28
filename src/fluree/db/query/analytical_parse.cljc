@@ -1024,78 +1024,6 @@
           comparator (build-order-fn order-by*)]
       (assoc order-by* :comparator comparator))))
 
-
-(defn grouped-vals-result-fn
-  "Returns grouped results in a consolidated vector.
-  e.g. [[:a :b :c] [:a1 :b1 :c1] [:a2 :b2 :c2] [:a3 :b3 :c3]] will turn into:
-  ==>  [[:a :a1 :a2 :a3] [:b :b1 :b2 :b3] [:c :c1 :c2 :c3]
-
-  The optimized case-specific versions are > 50% faster than the less optimized"
-  [extraction-positions]
-  (let [n-positions (count extraction-positions)]
-    (case n-positions
-      0 nil
-      1 (fn [group-results]
-          (let [grouped (pop group-results)]
-            (conj grouped (mapv first (peek group-results)))))
-      2 (fn [group-results]
-          (let [grouped       (pop group-results)
-                grouped-block (peek group-results)]
-            (loop [grouped-block grouped-block
-                   r1-acc        (transient [])
-                   r2-acc        (transient [])]
-              (let [[r1 r2] (first grouped-block)]
-                (if r1
-                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2))
-                  (-> grouped
-                      (conj (persistent! r1-acc))
-                      (conj (persistent! r2-acc))))))))
-      3 (fn [group-results]
-          (let [grouped       (pop group-results)
-                grouped-block (peek group-results)]
-            (loop [grouped-block grouped-block
-                   r1-acc        (transient [])
-                   r2-acc        (transient [])
-                   r3-acc        (transient [])]
-              (let [[r1 r2 r3] (first grouped-block)]
-                (if r1
-                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3))
-                  (into grouped [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc)]))))))
-      4 (fn [group-results]
-          (let [grouped       (pop group-results)
-                grouped-block (peek group-results)]
-            (loop [grouped-block grouped-block
-                   r1-acc        (transient [])
-                   r2-acc        (transient [])
-                   r3-acc        (transient [])
-                   r4-acc        (transient [])]
-              (let [[r1 r2 r3 r4] (first grouped-block)]
-                (if r1
-                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4))
-                  (into grouped [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc)]))))))
-      5 (fn [group-results]
-          (let [grouped       (pop group-results)
-                grouped-block (peek group-results)]
-            (loop [grouped-block grouped-block
-                   r1-acc        (transient [])
-                   r2-acc        (transient [])
-                   r3-acc        (transient [])
-                   r4-acc        (transient [])
-                   r5-acc        (transient [])]
-              (let [[r1 r2 r3 r4 r5] (first grouped-block)]
-                (if r1
-                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4) (conj! r5-acc r5))
-                  (into grouped [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc) (persistent! r5-acc)]))))))
-      ;; else - less optimized, handle all other cases
-      (fn [group-results]
-        ;; note: args are returned here in a list which should be OK downstream.
-        ;; If turned into a vector, benchmarking shows time doubles.
-        ;; A more complex fn using a reducer with transients is about equal in time to what is here.
-        ;; If we must move to using vector in result sets, then performance-wise it will make more sense
-        (let [grouped       (pop group-results)
-              grouped-block (peek group-results)]
-          (apply mapv (fn [& args] args) group-results))))))
-
 (defn update-group-by
   "Updates group-by, if applicable, with final where clause positions of items."
   [{:keys [parsed] :as group-by} where]
@@ -1107,7 +1035,6 @@
           grouped-val-positions (filterv                    ;; returns 'n' positions of values that are being grouped
                                   (complement (set grouped-positions))
                                   (range (count out-vars)))
-          ;; group-finish-fn takes final results and merges results together
           grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
       (assoc group-by*
              :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
