@@ -12,7 +12,7 @@
           qry    '{:context {:ex "http://example.org/ns/"}
                    :select  [?name (count ?favNums)]
                    :where   [[?s :schema/name ?name]
-                              [?s :ex/favNums ?favNums]]}]
+                             [?s :ex/favNums ?favNums]]}]
       (testing "with explicit grouping"
         (let [qry    '{:context {:ex "http://example.org/ns/"}
                        :select  [?name (count ?favNums)]
