@@ -336,14 +336,13 @@
   [sources flureeQL]
   (go-try
     (let [{:keys [select selectOne selectDistinct selectReduced construct
-                  from where block prefixes opts t]} flureeQL
+                  from where prefixes opts t]} flureeQL
           db            (if (async-util/channel? sources)   ;; only support 1 source currently
                           (<? sources)
                           sources)
-          db*           (cond
-                          t (<? (time-travel/as-of db t))
-                          block (<? (time-travel/as-of-block db block))
-                          :else db)
+          db*           (if t
+                          (<? (time-travel/as-of db t))
+                          db)
           source-opts   (if prefixes
                           (get-sources (:conn db*) (:network db*) (:auth-id db*) prefixes)
                           {})

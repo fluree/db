@@ -1,12 +1,14 @@
 (ns fluree.db.time-travel
   (:require [clojure.core.async :as async]
             [clojure.string :as string]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try into?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]))
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -143,6 +145,29 @@
                         {:status 400
                          :error  :db/invalid-time}))))))
 
+(defn datetime->t
+  "Takes an ISO-8601 datetime string and returns a core.async channel with the
+  latest 't' value that is not more recent than that datetime."
+  [db datetime]
+  (go-try
+    (log/debug "datetime->t db:" (pr-str db))
+    (let [epoch-datetime (util/str->epoch-ms datetime)
+          flakes (some-> db
+                         dbproto/-rootdb
+                         (query-range/index-range :post
+                                                  > [const/$_commit:time 0]
+                                                  < [const/$_commit:time epoch-datetime])
+                         <?)]
+      (log/debug "datetime->t index-range:" (pr-str flakes)
+                 #_(keep #(when (some (fn [v] (= v const/$_commit:time)) %)
+                            %) flakes))
+      (when (empty? flakes)
+        (throw (ex-info (str "There is no data as of " datetime)
+                        {:status 400, :error :db/invalid-query})))
+      (let [flake (apply max-key flake/s flakes)]
+        (log/debug "datetime->t max flake:" (pr-str flake))
+        (flake/t flake)))))
+
 (defn as-of
   "Gets database as of a specific moment. Resolves 't' value provided to internal Fluree indexing
   negative 't' long integer value."
@@ -151,14 +176,16 @@
     (async/go
       (try*
         (let [t* (cond
+                   (string? t)  (<? (datetime->t db t)) ; ISO-8601 datetime
                    (pos-int? t) (- t)
                    (neg-int? t) t
                    :else (throw (ex-info (str "Time travel to t value of: " t " not yet supported.")
                                          {:status 400 :error :db/invalid-query})))]
+          (log/debug "as-of t:" t*)
           (async/put! pc (assoc db :t t*)))
         (catch* e
-                ;; return exception into promise-chan
-                (async/put! pc e))))
+          ;; return exception into promise-chan
+          (async/put! pc e))))
     pc))
 
 

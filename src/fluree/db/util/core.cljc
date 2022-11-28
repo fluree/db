@@ -4,7 +4,8 @@
                       [fluree.db.util.cljs-exceptions :as cljs-exceptions]]))
   #?(:cljs (:require-macros [fluree.db.util.core :refer [case+]]))
   #?(:clj (:import (java.util UUID Date)
-                   (java.time Instant)
+                   (java.time Instant OffsetDateTime ZoneId)
+                   (java.time.format DateTimeFormatter)
                    (java.net URLEncoder URLDecoder)))
   (:refer-clojure :exclude [vswap!]))
 
@@ -216,6 +217,16 @@
       (throw (ex-info (str "Invalid time string. Ensure format is ISO-8601 compatible. Provided: " (pr-str time-str))
                       {:status 400
                        :error  :db/invalid-time})))))
+
+(defn epoch-ms->iso-8601-str
+  "Takes milliseconds since the epoch and returns an ISO-8601 formatted string
+  for that datetime. Optionally takes a ZoneId string (e.g. 'America/Denver')."
+  ([millis] (epoch-ms->iso-8601-str millis "Z"))
+  ([millis zone-id]
+   #?(:clj  (-> millis Instant/ofEpochMilli
+                (OffsetDateTime/ofInstant (ZoneId/of zone-id))
+                (.format DateTimeFormatter/ISO_OFFSET_DATE_TIME))
+      :cljs (-> millis js/Date. .toISOString))))
 
 (defn trunc
   "Truncate string s to n characters."
