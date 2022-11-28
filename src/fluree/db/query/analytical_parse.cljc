@@ -1286,7 +1286,7 @@
               orderBy order-by groupBy group-by] :as query-map} supplied-vars]
   (log/trace "parse* query-map:" query-map)
   (let [op-type           (cond
-                            (some #{:select :selectOne :selectReduced :selectDistince} (keys query-map))
+                            (some #{:select :selectOne :selectReduced :selectDistinct} (keys query-map))
                             :select
 
                             (contains? query-map :delete)
