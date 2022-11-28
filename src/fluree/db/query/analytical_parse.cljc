@@ -144,8 +144,7 @@
       (if found-var?
         where*
         (throw (ex-info (str "Filter function uses variable: " variable
-                             " however that variable is not used in a where statement "
-                             "or was already used in another filter function.")
+                             " however that variable is not used in a where statement ")
                         {:status 400 :error :db/invalid-query}))))))
 
 (defn get-vars
