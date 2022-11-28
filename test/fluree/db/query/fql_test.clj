@@ -16,7 +16,8 @@
                                  [?s :schema/email ?email]
                                  [?s :schema/age ?age]
                                  [?s :ex/favNums ?favNums]]
-                      :group-by ?name}
+                      :group-by ?name
+                      :order-by ?name}
             subject @(fluree/query db qry)]
         (is (= [["Alice"
                  ["alice@example.org" "alice@example.org" "alice@example.org"]

@@ -116,42 +116,26 @@
 (defn group
   [{:keys [grouping-positions grouped-val-positions] :as _group-by} {:keys [spec] :as select} result-chunk-ch]
   (if (not-empty grouping-positions) ; returns 'n' positions of values used for grouping
-    (async/pipe (group-result-chunks grouping-positions grouped-val-positions result-chunk-ch)
-                (async/chan 1 cat))
+    (group-result-chunks grouping-positions grouped-val-positions result-chunk-ch)
     (if-let [aggregated-val-positions (->> spec
                                            (into [] (comp (filter :grouped?)
                                                           (map :in-n)))
                                            not-empty)]
-      (async/pipe (group-result-chunks [] aggregated-val-positions result-chunk-ch)
-                  (async/chan 1 cat))
+      (group-result-chunks [] aggregated-val-positions result-chunk-ch)
       (async/reduce into [] result-chunk-ch))))
 
-(defn compare-by-first
-  [cmp]
-  (fn [x y]
-    (cmp (first x) (first y))))
-
-(defn sort-groups
-  [result-cmp groups]
-  (let [group-cmp (compare-by-first result-cmp)]
-    (->> groups
-         (map (partial sort result-cmp)) ; sort results in each group
-         (sort group-cmp))))             ; then sort all the groups
-
-(defn order-result-groups
+(defn order
   [order-by group-ch]
   (if-let [cmp (:comparator order-by)]
-    (let [group-coll-ch (async/into [] group-ch)
-          sort-xf       (comp (map (partial sort-groups cmp))
-                              cat)
-          sorted-ch     (async/chan 1 sort-xf)]
-      (async/pipe group-coll-ch sorted-ch))
-    group-ch))
+    (async/pipe group-ch
+                (async/chan 1 (comp (map (partial sort cmp))
+                                    cat)))
+    (async/pipe group-ch
+                (async/chan 1 cat))))
 
 (defn- ad-hoc-query
   "Legacy ad-hoc query processor"
   [db {:keys [fuel order-by group-by select] :as parsed-query}]
-  (log/info "running query with select:" select)
   (let [max-fuel fuel
         fuel     (volatile! 0)
 
@@ -161,7 +145,7 @@
         error-ch (async/chan)]
     (->> (compound/where db parsed-query fuel max-fuel error-ch)
          (group group-by select)
-         (order-result-groups order-by)
+         (order order-by)
          (process-select-results db parsed-query error-ch))))
 
 (defn cache-query
