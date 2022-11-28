@@ -18,7 +18,6 @@
             [fluree.db.query.http-signatures :as http-signatures]
             [fluree.db.operations :as ops]
             [fluree.db.permissions :as permissions]
-            [fluree.db.query.block :as query-block]
             [fluree.db.query.graphql-parser :as graphql]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql-parser :as sparql-parser]
@@ -928,77 +927,6 @@
 ;; Queries
 ;;
 ;; ======================================
-(defn ^:export blockRangeWithTxn
-  "Returns a Promise that will eventually contain transaction information for blocks from
-   start block (inclusive) to end if provided (exclusive). Each block is a separate map,
-   containing keys :block :tx"
-  ([conn ledger block-map] (blockRangeWithTxn conn ledger block-map nil))
-  ([conn ledger block-map opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [clj-opts  (-> opts
-                               (js->clj :keywordize-keys true))
-                 block-map (js->clj block-map :keywordize-keys true)
-                 {:keys [start end]} block-map
-                 db-chan   (async/<! (-db-instance conn ledger clj-opts))
-                 db-blocks (<? (query-block/block-range db-chan start end clj-opts))
-                 result    (query-range/block-with-tx-data db-blocks)]
-             (resolve (clj->js result)))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
-
-(defn ^:export blockQuery
-  ([conn ledger query-map] (blockQuery conn ledger query-map nil))
-  ([conn ledger query-map opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [query-map* (js->clj query-map :keywordize-keys true)
-                 clj-opts   (merge (:opts query-map*)
-                                   (when opts (js->clj opts :keywordize-keys true)))
-                 _          (conn-handler/check-connection conn clj-opts)
-                 auth-id    (or (:auth clj-opts)
-                                (:auth-id clj-opts)
-                                (some->> (:jwt clj-opts)
-                                         (conn-handler/validate-token conn)
-                                         :auth))
-                 result*    (<? (query/block-query-async
-                                  conn ledger
-                                  (update query-map* :opts merge (merge clj-opts (util/without-nils {:auth auth-id})))))]
-             (resolve (clj->js result*)))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
-
-(defn ^:export blockRange
-  "Returns a promise containing blocks from start (inclusive)
-   to end if provided (exclusive).
-
-   Each block is a separate map, containing keys :block, :t and :flakes."
-  ([db start] (blockRange db start nil nil))
-  ([db start end] (blockRange db start end nil))
-  ([db start end opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (-> opts
-               (js->clj :keywordize-keys true)
-               (as-> clj-opts (query-block/block-range (<? db) start end clj-opts))
-               <?
-               (query/block-Flakes->vector)
-               clj->js
-               (resolve))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
 
 (defn ^:export collectionFlakes
   "Returns spot index range for only the requested collection."

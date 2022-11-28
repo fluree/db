@@ -12,8 +12,6 @@
             [fluree.db.flake :as flake]
             [fluree.db.graphdb :as graphdb]
             [fluree.db.operations :as ops]
-            [fluree.db.query.block :as query-block]
-            [fluree.db.query.fql :as fql]
             [fluree.db.query.graphql-parser :as graphql]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql-parser :as sparql]
@@ -631,30 +629,6 @@
 ;; ======================================
 
 
-(defn block-range
-  "Returns a core async channel of blocks from start block (inclusive) to end if provided (exclusive).
-  Each block is a separate map, containing keys :block, :t and :flakes.
-  Channel is lazy, continue to take! values as needed."
-  ([db start] (block-range db start nil nil))
-  ([db start end] (block-range db start end nil))
-  ([db start end opts]
-   (query-block/block-range db start end opts)))
-
-(defn block-range-with-txn-async
-  "Returns a core async channel of blocks from start block (inclusive) to end if provided (exclusive).
-   Each block is a separate map, containing keys :block, :t, :flakes and :txn"
-  [conn ledger block-map]
-  (go-try
-    (let [[network ledger-id] (session/resolve-ledger conn ledger)
-          {:keys [start end opts]} block-map
-          auth-id   (:auth opts)
-          db-chan   (->
-                      (<? (db conn ledger {:auth (when auth-id ["_auth/id" auth-id])}))
-                      (assoc :conn conn :network network :ledger-id ledger-id))
-          db-blocks (<? (query-block/block-range db-chan start end opts))
-          result    (query-range/block-with-tx-data db-blocks)]
-      result)))
-
 (defn query-async
   "Execute a query against a database source, or optionally
   additional sources if the query spans multiple data sets.
@@ -793,26 +767,6 @@
   [db query-map]
   (query-api/resolve-block-range db query-map))
 
-
-(defn block-query-async
-  "Given a map with a `:block` with a block number value, return a channel that will receive the raw flakes contained in that block.
-
-  Can also specify `:pretty-print` `true` in the query map to receive the flakes as a map with predicate names."
-  [conn ledger query-map]
-  (query-api/block-query-async conn ledger query-map))
-
-(defn block-query
-  "Given a map with a `:block` with a block number value, return a promise of the raw flakes contained in that block.
-
-  Can also specify `:pretty-print` `true` in the query map to receive the flakes as a map with predicate names."
-  [conn ledger query-map]
-  (let [p (promise)]
-    (go
-      (try
-        (deliver p (<? (block-query-async conn ledger query-map)))
-        (catch Exception e
-          (deliver p e))))
-    p))
 
 (defn get-history-pattern
   "INTERNAL USE ONLY"
@@ -957,11 +911,6 @@
                                              (dissoc :type)
                                              (assoc :opts opts))))
 
-          (= :block (:type parsed-gql-query))
-          (<? (block-query-async conn db-name (-> parsed-gql-query
-                                                  (dissoc :type)
-                                                  (assoc :opts opts))))
-
           (:tx parsed-gql-query)
           (<? (transact-async conn db-name (:tx parsed-gql-query) opts))
 
@@ -1074,22 +1023,6 @@
    (session/db conn ledger nil))
   ([conn ledger opts]
    (ledger-api/db conn ledger opts)))
-
-(defn get-db-at-block
-  "Returns a channel with queryable database value from the given block number."
-  [conn ledger block every-n-sec]
-  (let [db-chan (async/promise-chan)]
-    (go-try
-      (loop [n 1]
-        (let [root-db  (<? (session/db conn ledger nil))
-              db-block (:block root-db)
-              done?    (>= db-block block)]
-          (if done?
-            (async/put! db-chan root-db)
-            (do (<? (async/timeout (* every-n-sec 1000)))
-                (recur (inc n)))))))
-    db-chan))
-
 
 (defn resolve-ledger
   "INTERNAL USE ONLY
@@ -1280,18 +1213,6 @@
   "Returns true or false if ledger is in a 'ready' status."
   [conn ledger]
   (async/<!! (ledger-ready?-async conn ledger)))
-
-
-(defn latest-block
-  "Returns latest block (positive integer) for a local ledger. Will bring the ledger locally if not
-  already local."
-  [conn ledger]
-  (let [p (promise)]
-    (async/go
-      (let [latest-db (async/<! (db conn ledger))
-            block     (:block latest-db)]
-        (deliver p block)))
-    p))
 
 
 (defn latest-t

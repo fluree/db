@@ -6,7 +6,6 @@
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
-            [fluree.db.query.block :as query-block]
             [fluree.db.session :as session]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.permissions :as permissions]
@@ -200,43 +199,6 @@
       (if (first rest-blocks)
         (recur fuel cache (first rest-blocks) (rest rest-blocks) acc')
         acc'))))
-
-
-(defn block-range
-  "Returns a core async channel of blocks from start block (inclusive) to end if provided (exclusive).
-  Each block is a separate map, containing keys :block, :t and :flakes.
-  Channel is lazy, continue to take! values as needed."
-  ([db start] (block-range db start nil nil))
-  ([db start end] (block-range db start end nil))
-  ([db start end opts]
-   (query-block/block-range db start end opts)))
-
-
-(defn block-query-async
-  [conn ledger {:keys [opts] :as query}]
-  (go-try
-    (let [query-map     (dissoc query :opts)
-          auth-id       (:auth opts)
-          start #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
-          db            (<? (db conn ledger {:auth (when auth-id ["_auth/id" auth-id])}))
-          [block-start block-end] (<? (resolve-block-range db query-map))
-          result        (if (= '(:block) (keys (dissoc query-map :pretty-print :opts :prettyPrint)))
-                          (<? (block-range db block-start block-end opts))
-                          (throw (ex-info (str "Block query not properly formatted. It must only have a block key. Provided "
-                                               (pr-str query-map))
-                                          {:status 400
-                                           :error  :db/invalid-query})))
-          result'       (if (or (:prettyPrint query-map) (:pretty-print query-map))
-                          (<? (format-blocks-resp-pretty db result))
-                          result)]
-      (if (:meta opts)
-        {:status 200
-         :result (if (sequential? result')
-                   (doall result')
-                   result')
-         :fuel   100
-         :time   (util/response-time-formatted start)}
-        result'))))
 
 
 (defn get-history-pattern
@@ -495,7 +457,4 @@
     (case query-type
       :standard (query-async source flureeQL)
       :history (history-query-async source flureeQL)
-      :block (let [conn   (:conn source)
-                   ledger (keyword (:network source) (:ledger-id source))]
-               (block-query-async conn ledger flureeQL))
       :multi (multi-query-async source flureeQL))))
