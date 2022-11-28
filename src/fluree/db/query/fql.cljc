@@ -100,11 +100,10 @@
 
 (defn unwind-group-map
   [group-map]
-  (->> group-map
-       (reduce-kv (fn [result-groups group-key grouped-vals]
-                    (let [result-group (into group-key grouped-vals)]
-                      (conj result-groups result-group)))
-                  [])))
+  (reduce-kv (fn [result-groups group-key grouped-vals]
+               (let [result-group (into group-key grouped-vals)]
+                 (conj result-groups result-group)))
+             [] group-map))
 
 (defn group-result-chunks
   [grouping-positions grouped-positions result-chunk-ch]

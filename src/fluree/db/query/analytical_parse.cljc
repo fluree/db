@@ -575,8 +575,8 @@
     (when-not (every? #(variable-in-where? % where) group-symbols)
       (throw (ex-info (str "Group by includes variable(s) not specified in the where clause: " group-by)
                       {:status 400 :error :db/invalid-query})))
-    (cond-> (assoc parsed-query :group-by {:input  group-by
-                                           :parsed (mapv (fn [sym] {:variable sym}) group-symbols)}))))
+    (assoc parsed-query :group-by {:input  group-by
+                                   :parsed (mapv (fn [sym] {:variable sym}) group-symbols)})))
 
 
 (defn get-limit
