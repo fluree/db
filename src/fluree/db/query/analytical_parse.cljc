@@ -1187,7 +1187,7 @@
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [opts prettyPrint filter context depth
+  [db {:keys [opts prettyPrint context depth
               orderBy order-by groupBy group-by] :as query-map} supplied-vars]
   (log/trace "parse* query-map:" query-map)
   (let [op-type           (cond
@@ -1233,7 +1233,6 @@
                                                     prettyPrint
                                                     (:prettyPrint opts))
                                    :compact-fn    (json-ld/compact-fn context*)}
-                                  filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
                                   order-by* (add-order-by order-by*)
                                   group-by* (add-group-by group-by*)
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
