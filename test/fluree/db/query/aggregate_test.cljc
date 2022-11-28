@@ -19,11 +19,14 @@
                        :where   [[?s :schema/name ?name]
                                  [?s :ex/favNums ?favNums]]
                        group-by ?name}
-              subject @(fluree/query db grouped-qry)]
-          (is (= [[3]] subject)
+              subject @(fluree/query db qry)]
+          (is (= [["Alice" 3] ["Brian" 1] ["Cam" 2]]
+                 subject)
               "aggregates bindings within each group")))
       (testing "with implicit grouping"
         (let [qry '{:context {:ex "http://example.org/ns/"}
                     :select  [(count ?name)]
                     :where   [[?s :schema/name ?name]]}
-              subject @])))))
+              subject @(fluree/query db qry)]
+          (is (= [[3]] subject)
+              "aggregates bindings for all results"))))))
