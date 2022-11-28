@@ -947,13 +947,15 @@
 
   If group-by is used, grouping can re-order output so utilize out-vars from that
   as opposed to the last where statement."
-  [{:keys [spec] :as select} where {group-out-vars :out-vars, grouped-vars :grouped-vars, :as _group-by}]
+  [{:keys [aggregates spec] :as select} where {group-out-vars :out-vars :as group-by}]
   (let [last-where (last where)
         out-vars   (or group-out-vars
                        (:out-vars last-where))
+        grouped-vars (set/union (:grouped-vars group-by)
+                                (into #{} (map :variable) aggregates))
         {:keys [all]} (:vars last-where)                    ;; the last where statement has an aggregation of all variables
         spec*      (cond->> (mapv #(update-position+type % out-vars all) spec)
-                            grouped-vars (mapv #(if (grouped-vars (:variable %))
+                            grouped-vars (mapv #(if (contains? grouped-vars (:variable %))
                                                   (assoc % :grouped? true)
                                                   %)))]
     (assoc select :spec spec*)))
