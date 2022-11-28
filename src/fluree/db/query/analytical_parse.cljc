@@ -575,9 +575,8 @@
     (when-not (every? #(variable-in-where? % where) group-symbols)
       (throw (ex-info (str "Group by includes variable(s) not specified in the where clause: " group-by)
                       {:status 400 :error :db/invalid-query})))
-    (cond-> (assoc parsed-query :group-by {:input  group-by
-                                           :parsed (mapv (fn [sym] {:variable sym}) group-symbols)})
-            (not order-by) (add-order-by group-symbols))))
+    (assoc parsed-query :group-by {:input  group-by
+                                   :parsed (mapv (fn [sym] {:variable sym}) group-symbols)})))
 
 
 (defn get-limit
@@ -948,13 +947,15 @@
 
   If group-by is used, grouping can re-order output so utilize out-vars from that
   as opposed to the last where statement."
-  [{:keys [spec] :as select} where {group-out-vars :out-vars, grouped-vars :grouped-vars, :as _group-by}]
+  [{:keys [aggregates spec] :as select} where {group-out-vars :out-vars :as group-by}]
   (let [last-where (last where)
         out-vars   (or group-out-vars
                        (:out-vars last-where))
+        grouped-vars (set/union (:grouped-vars group-by)
+                                (into #{} (map :variable) aggregates))
         {:keys [all]} (:vars last-where)                    ;; the last where statement has an aggregation of all variables
         spec*      (cond->> (mapv #(update-position+type % out-vars all) spec)
-                            grouped-vars (mapv #(if (grouped-vars (:variable %))
+                            grouped-vars (mapv #(if (contains? grouped-vars (:variable %))
                                                   (assoc % :grouped? true)
                                                   %)))]
     (assoc select :spec spec*)))
@@ -1013,100 +1014,15 @@
 
 (defn update-order-by
   "Updates order-by, if applicable, with final where clause positions of items."
-  [{:keys [parsed] :as order-by} group-by where]
+  [{:keys [parsed] :as order-by} {group-out-vars :out-vars, :as _group-by} where]
   (when order-by
-    (let [{:keys [out-vars vars] :as _last-where} (last where)
+    (let [{:keys [vars] :as last-where} (last where)
+          out-vars   (or group-out-vars
+                         (:out-vars last-where))
           parsed*    (mapv #(update-position+type % out-vars (:all vars)) parsed)
           order-by*  (assoc order-by :parsed parsed*)
           comparator (build-order-fn order-by*)]
       (assoc order-by* :comparator comparator))))
-
-
-(defn grouped-vals-result-fn
-  "Returns grouped results in a consolidated vector.
-  e.g. [[:a :b :c] [:a1 :b1 :c1] [:a2 :b2 :c2] [:a3 :b3 :c3]] will turn into:
-  ==>  [[:a :a1 :a2 :a3] [:b :b1 :b2 :b3] [:c :c1 :c2 :c3]
-
-  The optimized case-specific versions are > 50% faster than the less optimized"
-  [extraction-positions]
-  (let [n-positions (count extraction-positions)]
-    (case n-positions
-      0 nil
-      1 (fn [group-results]
-          (let [grouped (pop group-results)]
-            (conj grouped (mapv first (last group-results)))))
-      2 (fn [group-results]
-          (let [grouped       (pop group-results)
-                grouped-block (last group-results)]
-            (loop [grouped-block grouped-block
-                   r1-acc        (transient [])
-                   r2-acc        (transient [])]
-              (let [[r1 r2] (first grouped-block)]
-                (if r1
-                  (recur (rest grouped-block) (conj! r1-acc r1) (conj! r2-acc r2))
-                  (-> grouped
-                      (conj (persistent! r1-acc))
-                      (conj (persistent! r2-acc))))))))
-      3 (fn [group-results]
-          (loop [group-results group-results
-                 r1-acc        (transient [])
-                 r2-acc        (transient [])
-                 r3-acc        (transient [])]
-            (let [[r1 r2 r3] (first group-results)]
-              (if r1
-                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3))
-                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc)]))))
-      4 (fn [group-results]
-          (loop [group-results group-results
-                 r1-acc        (transient [])
-                 r2-acc        (transient [])
-                 r3-acc        (transient [])
-                 r4-acc        (transient [])]
-            (let [[r1 r2 r3 r4] (first group-results)]
-              (if r1
-                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4))
-                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc)]))))
-      5 (fn [group-results]
-          (loop [group-results group-results
-                 r1-acc        (transient [])
-                 r2-acc        (transient [])
-                 r3-acc        (transient [])
-                 r4-acc        (transient [])
-                 r5-acc        (transient [])]
-            (let [[r1 r2 r3 r4 r5] (first group-results)]
-              (if r1
-                (recur (rest group-results) (conj! r1-acc r1) (conj! r2-acc r2) (conj! r3-acc r3) (conj! r4-acc r4) (conj! r5-acc r5))
-                [(persistent! r1-acc) (persistent! r2-acc) (persistent! r3-acc) (persistent! r4-acc) (persistent! r5-acc)]))))
-      ;; else - less optimized, handle all other cases
-      (fn [group-results]
-        ;; note: args are returned here in a list which should be OK downstream.
-        ;; If turned into a vector, benchmarking shows time doubles.
-        ;; A more complex fn using a reducer with transients is about equal in time to what is here.
-        ;; If we must move to using vector in result sets, then performance-wise it will make more sense
-        (apply mapv (fn [& args] args) group-results)))))
-
-
-(defn lazy-group-by
-  "Returns lazily parsed results from group-by.
-  Even though the query results must be fully realized through sorting,
-  a pre-requisite of grouping, the grouping itself can be lazy which will
-  help with large result sets that have a 'limit'."
-  [grouping-fn grouped-vals-fn results]
-  (lazy-seq
-    (when-let [results* (seq results)]
-      (let [fst  (first results*)
-            fv   (grouping-fn fst)
-            fres (grouped-vals-fn fst)
-            [next-chunk rest-results] (loop [rest-results (rest results*)
-                                             acc          [fres]]
-                                        (let [result (first rest-results)]
-                                          (if result
-                                            (if (= fv (grouping-fn result))
-                                              (recur (next rest-results) (conj acc (grouped-vals-fn result)))
-                                              [(conj fv acc) rest-results])
-                                            [(conj fv acc) nil])))]
-        (cons next-chunk (lazy-group-by grouping-fn grouped-vals-fn (lazy-seq rest-results)))))))
-
 
 (defn update-group-by
   "Updates group-by, if applicable, with final where clause positions of items."
@@ -1116,22 +1032,15 @@
           parsed*               (mapv #(update-position+type % out-vars all) parsed)
           group-by*             (assoc group-by :parsed parsed*)
           grouped-positions     (mapv :in-n parsed*)        ;; returns 'n' positions of values used for grouping
-          partition-fn          (build-vec-extraction-fn grouped-positions) ;; returns fn containing only grouping vals, used like a 'partition-by' fn
           grouped-val-positions (filterv                    ;; returns 'n' positions of values that are being grouped
                                   (complement (set grouped-positions))
                                   (range (count out-vars)))
-          grouped-vals-fn       (build-vec-extraction-fn grouped-val-positions) ;; returns fn containing only values being grouped (excludes grouping vals)
-          ;; grouping fn takes sorted results, and partitions results by group-by vars returning only the values being grouped.
-          ;; we don't yet merge all results together as that work is unnecessary if using an offset, or limit
-          grouping-fn           (fn [results]
-                                  (lazy-group-by partition-fn grouped-vals-fn results))
-          ;; group-finish-fn takes final results and merges results together
-          group-finish-fn       (grouped-vals-result-fn grouped-val-positions)
           grouped-out-vars      (into (mapv :variable parsed) (map #(nth out-vars %) grouped-val-positions))]
-      (assoc group-by* :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
-                       :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions)) ;; these are the variable names in the output that are grouped
-                       :grouping-fn grouping-fn
-                       :group-finish-fn group-finish-fn))))
+      (assoc group-by*
+             :out-vars grouped-out-vars           ;; grouping can change output variable ordering, as all grouped vars come first then groupings appended to end
+             :grouping-positions    grouped-positions
+             :grouped-val-positions grouped-val-positions
+             :grouped-vars (into #{} (map #(nth out-vars %) grouped-val-positions))))))
 
 
 (defn get-clause-vars
@@ -1247,8 +1156,8 @@
                               (union/order-out-vars out-vars last-clause order-by)
                               (order-out-vars out-vars last-clause order-by))
             where*          (where-meta-reverse where* select-out-vars)
-            order-by*       (update-order-by order-by group-by where*)
-            group-by*       (update-group-by group-by where*)]
+            group-by*       (update-group-by group-by where*)
+            order-by*       (update-order-by order-by group-by* where*)]
         (cond-> (assoc parsed-query :where where*
                                     :order-by order-by*
                                     :group-by group-by*)
