@@ -135,7 +135,8 @@
         (do
           (log/debug "add-filter-where loop found match")
           (recur r true (conj where* (assoc where-smt :o {:variable variable
-                                                          :filter   filter-fn-map}))))
+                                                          :filter   (conj (or (:filter o) [])
+                                                                          filter-fn-map)}))))
         :else
         (do
           (log/debug "add-filter-where loop default case")
@@ -143,8 +144,7 @@
       (if found-var?
         where*
         (throw (ex-info (str "Filter function uses variable: " variable
-                             " however that variable is not used in a where statement "
-                             "or was already used in another filter function.")
+                             " however that variable is not used in a where statement ")
                         {:status 400 :error :db/invalid-query}))))))
 
 (defn get-vars
@@ -193,21 +193,13 @@
         [fun _] (filter/extract-filter-fn filter-code fn-vars)]
     {:variable o-var
      :params   params
-     :fn-str   (str "(fn " params " " fun)
+     :fn-str   (str "(fn " params " " fun ")")
      :function (filter/make-executable params fun)}))
 
-
 (defn add-filter
-  [{:keys [where] :as parsed-query} filter all-vars]
-  (if-not (sequential? filter)
-    (throw (ex-info (str "Filter clause must be a vector/array, provided: " filter)
-                    {:status 400 :error :db/invalid-query}))
-    (loop [[filter-fn & r] filter
-           parsed-query* parsed-query]
-      (if filter-fn
-        (let [parsed (parse-filter-fn filter-fn all-vars)]
-          (recur r (assoc parsed-query* :where (add-filter-where where parsed))))
-        parsed-query*))))
+  [{:keys [where] :as parsed-query} filter-fn all-vars]
+  (let [parsed-filter-fn (parse-filter-fn filter-fn all-vars)]
+    (assoc parsed-query :where (add-filter-where where parsed-filter-fn))))
 
 (defn parse-binding
   "Parses binding map. Returns a two-tuple of binding maps
@@ -459,7 +451,11 @@
                        where*)))
 
             :filter
-            (recur r (conj filters (:filter where-map)) hoisted-bind all-vars where*)
+            (let [{:keys [filter]} where-map]
+              (if-not (sequential? filter)
+                (throw (ex-info (str "Filter clause must be a vector/array, provided: " filter)
+                                {:status 400 :error :db/invalid-query}))
+                (recur r (into filters filter) hoisted-bind all-vars where*)))
 
             ;; else
             (recur r filters hoisted-bind all-vars (conj where* where-map))))
@@ -1191,11 +1187,11 @@
 
 ;; TODO - only capture :select, :where, :limit - need to get others
 (defn parse*
-  [db {:keys [opts prettyPrint filter context depth
+  [db {:keys [opts prettyPrint context depth
               orderBy order-by groupBy group-by] :as query-map} supplied-vars]
   (log/trace "parse* query-map:" query-map)
   (let [op-type           (cond
-                            (some #{:select :selectOne :selectReduced :selectDistince} (keys query-map))
+                            (some #{:select :selectOne :selectReduced :selectDistinct} (keys query-map))
                             :select
 
                             (contains? query-map :delete)
@@ -1237,7 +1233,6 @@
                                                     prettyPrint
                                                     (:prettyPrint opts))
                                    :compact-fn    (json-ld/compact-fn context*)}
-                                  filter (add-filter filter supplied-var-keys) ;; note, filter maps can/should also be inside :where clause
                                   order-by* (add-order-by order-by*)
                                   group-by* (add-group-by group-by*)
                                   true (consolidate-ident-vars) ;; add top-level :ident-vars consolidating all where clause's :ident-vars
