@@ -93,34 +93,35 @@
 
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
-  [db next-in clause t error-ch out-ch]
-  (let [{:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
+  [db next-in clause t error-ch]
+  (let [out-ch (async/chan 2)
+        {:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
         {o-var :variable, o-in-n :in-n} o]
     (async/go
       (when s-in-n
         (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
           (loop []
-            (when-let [next-s (async/<! s-vals-chan)]
-              (async/>! out-ch (if nils-fn
-                                 (nils-fn next-s)
-                                 next-s))
-              (recur))))))))
+            (if-let [next-s (async/<! s-vals-chan)]
+              (do (async/>! out-ch (if nils-fn
+                                     (nils-fn next-s)
+                                     next-s))
+                  (recur))
+              (async/close! out-ch))))))
+    out-ch))
 
 
 (defn where-clause-chan
   "Takes next where clause and returns and output channel with chunked results."
   [db clause t prev-chan error-ch]
   (let [out-ch (async/chan 2)]
-    (async/go-loop []
-      (if-let [next-in (async/<! prev-chan)]
-        ;; wait for operation to finish
-        (do
-          (async/<!
-           (where-clause-tuple-chunk db next-in clause t error-ch out-ch))
-          (recur))
-        ;; no more input results, close out channel
-        (async/close! out-ch)))
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [next-in ch]
+                            (async/pipe (where-clause-tuple-chunk db next-in clause t
+                                                                  error-ch)
+                                        ch))
+                          prev-chan)
     out-ch))
 
 
@@ -198,18 +199,14 @@
   [db prev-chan error-ch clause t]
   (let [out-ch (async/chan 2)
         [union1 union2] (:where clause)]
-    (async/go
-      (loop []
-        (if-let [next-in (async/<! prev-chan)]
-          ;; wait for operation to finish
-          (do
-            (async/<!
-              (where-clause-tuple-chunk db next-in (first union1) t error-ch out-ch))
-            (async/<!
-              (where-clause-tuple-chunk db next-in (first union2) t error-ch out-ch))
-            (recur))
-          ;; no more input results, close out channel
-          (async/close! out-ch))))
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [next-in ch]
+                            (let [ch1 (where-clause-tuple-chunk db next-in (first union1) t error-ch)
+                                  ch2 (where-clause-tuple-chunk db next-in (first union2) t error-ch)]
+                              (-> (async/merge [ch1 ch2])
+                                  (async/pipe ch))))
+                          prev-chan)
     out-ch))
 
 
