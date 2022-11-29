@@ -132,14 +132,19 @@
   map. The result of the transformation will be a stream of collections of
   flakes from the leaf nodes in the input stream, with one flake collection for
   each input leaf."
-  [{:keys [start-flake start-test end-flake end-test] :as opts}]
-  (comp (map :flakes)
-        (map (fn [flakes]
-               (flake/subrange flakes
-                               start-test start-flake
-                               end-test end-flake)))
-        (map (fn [flakes]
-               (into [] (query-filter opts) flakes)))))
+  [{:keys [start-flake start-test end-flake end-test flake-xf] :as opts}]
+  (let [query-xf (comp (map :flakes)
+                       (map (fn [flakes]
+                              (flake/subrange flakes
+                                              start-test start-flake
+                                              end-test end-flake)))
+                       (map (fn [flakes]
+                              (into [] (query-filter opts) flakes))))]
+    (if flake-xf
+      (let [slice-xf (map (fn [flakes]
+                            (into [] flake-xf flakes)))]
+        (comp query-xf slice-xf))
+      query-xf)))
 
 (defn resolve-flake-slices
   "Returns a channel that will contain a stream of chunked flake collections that
