@@ -43,27 +43,21 @@
                                 sid-val))
                             sid)]
             (when sid
-              (let [opts  (query-range-opts idx t sid* pid nil)
-                    in-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+              (let [xfs   (cond-> [flake-x-form]
+                            pass-vals (conj (map #(concat % pass-vals))))
+                    xf    (apply comp xfs)
+                    opts  (-> (query-range-opts idx t sid* pid nil)
+                              (assoc :flake-xf xf))
+                    result-ch (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
+                                   (async/reduce into []))
+                    results (async/<! (async/pipe result-ch
+                                                  (async/chan 1 (map (fn [res]
+                                                                       (if (and (empty? res)
+                                                                                optional?)
+                                                                         (into [] xf [(flake/parts->Flake [sid* pid])])
+                                                                         res))))))]
                 ;; pull all subject results off chan, push on out-ch
-                (loop [interim-results nil]
-                  (if-let [next-chunk (async/<! in-ch)]
-                    (if (seq next-chunk)
-                      ;; calc interim results
-                      (let [result (cond->> (sequence flake-x-form next-chunk)
-                                            pass-vals (map #(concat % pass-vals)))]
-                        (recur (if interim-results
-                                 (into interim-results result)
-                                 result)))
-                      ;; empty result set
-                      (or interim-results
-                          (when optional?
-                            ;; for optional results, we need to output nil if nothing found
-                            ;; we generate a 'nil' value flake with the correct sid and pid so vars always get output correctly
-                            (cond->> (sequence flake-x-form [(flake/parts->Flake [sid* pid])])
-                                     pass-vals (map #(concat % pass-vals))
-                                     true (async/>! out-ch)))))
-                    (async/>! out-ch interim-results)))))
+                (async/>! out-ch results)))
             (recur r))
           (async/close! out-ch))))
     out-ch))
