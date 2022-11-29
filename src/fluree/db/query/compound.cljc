@@ -139,6 +139,7 @@
       (let [{:keys [s p o idx flake-x-form]} clause
             {pid :value} p
             {s-var :variable, s-val :value} s
+            {o-var :variable} o
             s*       (if s-val
                        (if (number? s-val)
                          s-val
@@ -149,17 +150,12 @@
           (let [{o-var :variable} o
                 o*       (or (:value o)
                              (get vars o-var))
-                opts     (query-range-opts idx t s* pid o*)
+                opts     (-> (query-range-opts idx t s* pid o*)
+                             (assoc :flake-xf flake-x-form))
                 idx-root (get db idx)
                 novelty  (get-in db [:novelty idx])
                 range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
-            (loop []
-              (let [next-res (async/<! range-ch)]
-                (if next-res
-                  (let [next-out (sequence flake-x-form next-res)]
-                    (async/>! out-ch next-out)
-                    (recur))
-                  (async/close! out-ch))))))))
+            (async/pipe range-ch out-ch)))))
     out-ch))
 
 (defn process-union
