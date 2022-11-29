@@ -94,18 +94,18 @@
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
   [db next-in clause t error-ch]
-  (let [out-ch (async/chan 2)
-        {:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
+  (let [{:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
-        {o-var :variable, o-in-n :in-n} o]
+        {o-var :variable, o-in-n :in-n} o
+        out-ch (if nils-fn
+                 (async/chan 2 (map nils-fn))
+                 (async/chan 2))]
     (async/go
       (when s-in-n
         (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
           (loop []
             (if-let [next-s (async/<! s-vals-chan)]
-              (do (async/>! out-ch (if nils-fn
-                                     (nils-fn next-s)
-                                     next-s))
+              (do (async/>! out-ch next-s)
                   (recur))
               (async/close! out-ch))))))
     out-ch))
