@@ -100,14 +100,10 @@
         out-ch (if nils-fn
                  (async/chan 2 (map nils-fn))
                  (async/chan 2))]
-    (async/go
-      (when s-in-n
-        (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
-          (loop []
-            (if-let [next-s (async/<! s-vals-chan)]
-              (do (async/>! out-ch next-s)
-                  (recur))
-              (async/close! out-ch))))))
+    (if s-in-n
+      (let [s-vals-ch (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
+        (async/pipe s-vals-ch out-ch))
+      (async/close! out-ch))
     out-ch))
 
 
