@@ -20,14 +20,15 @@
                       v
                       (when-let [variable (:variable o)]
                         (get vars variable)))
+        p*          (:value p)
         idx*        (if (nil? o*)
                       :psot
                       idx)
         [fflake lflake] (case idx*
-                          :post [(flake/create nil p o* nil nil nil util/min-integer)
-                                 (flake/create nil p o* nil nil nil util/max-integer)]
-                          :psot [(flake/create nil p nil nil nil nil util/min-integer)
-                                 (flake/create nil p nil nil nil nil util/max-integer)])
+                          :post [(flake/create nil p* o* nil nil nil util/min-integer)
+                                 (flake/create nil p* o* nil nil nil util/max-integer)]
+                          :psot [(flake/create nil p* nil nil nil nil util/min-integer)
+                                 (flake/create nil p* nil nil nil nil util/max-integer)])
         filter-fn   (cond
                       (and o* (= :psot idx*))
                       #(= o* (flake/o %))
