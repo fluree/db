@@ -57,14 +57,14 @@
         prefix                (str (first multibase-value))
         base-key              (subs multibase-value 1)
         _                     (when (not= prefix base58btc)
-                                (throw (ex-info (str "The prefix " (pr-str prefix) " does not map to a supported multibase encoding."
-                                                     {:value multibase-value
-                                                      :prefix prefix}))))
+                                (throw (ex-info (str "The prefix " (pr-str prefix) " does not map to a supported multibase encoding.")
+                                                {:value multibase-value
+                                                 :prefix prefix})))
         multicodec            (alphabase/bytes->hex (base58/decode base-key))
         pubkey-header         (subs multicodec 0 2)
         pubkey                (subs multicodec 2)]
     (when (not= pubkey-header secp256k1-pub)
-      (throw (ex-info (str "The multicodec header " (pr-str pubkey-header) " does not map to a supported multicodec encoding."
-                           {:value multicodec
-                            :header pubkey-header}))))
+      (throw (ex-info (str "The multicodec header " (pr-str pubkey-header) " does not map to a supported multicodec encoding.")
+                      {:value multicodec
+                       :header pubkey-header})))
     pubkey))
