@@ -139,27 +139,27 @@
       (let [{:keys [s p o idx flake-x-form]} clause
             {pid :value} p
             {s-var :variable, s-val :value} s
-            {o-var :variable} o
             s*       (if s-val
                        (if (number? s-val)
                          s-val
                          (<? (dbproto/-subid db s-val)))
-                       (get vars s-var))
-            o*       (or (:value o)
-                         (get vars o-var))
-            opts     (query-range-opts idx t s* pid o*)
-            idx-root (get db idx)
-            novelty  (get-in db [:novelty idx])
-            range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
-        (if (and s-val (nil? s*))                           ;; this means the iri provided for 's' doesn't exist, close
+                       (get vars s-var))]
+        (if (and s-val (nil? s*)) ; this means the iri provided for 's' doesn't exist, close
           (async/close! out-ch)
-          (loop []
-            (let [next-res (async/<! range-ch)]
-              (if next-res
-                (let [next-out (sequence flake-x-form next-res)]
-                  (async/>! out-ch next-out)
-                  (recur))
-                (async/close! out-ch)))))))
+          (let [{o-var :variable} o
+                o*       (or (:value o)
+                             (get vars o-var))
+                opts     (query-range-opts idx t s* pid o*)
+                idx-root (get db idx)
+                novelty  (get-in db [:novelty idx])
+                range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+            (loop []
+              (let [next-res (async/<! range-ch)]
+                (if next-res
+                  (let [next-out (sequence flake-x-form next-res)]
+                    (async/>! out-ch next-out)
+                    (recur))
+                  (async/close! out-ch))))))))
     out-ch))
 
 (defn process-union
