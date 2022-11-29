@@ -1,19 +1,11 @@
 (ns fluree.db.query.compound
   (:require [fluree.db.query.range :as query-range]
             [clojure.core.async :as async]
-            #?(:clj [fluree.db.full-text :as full-text])
-            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.util.core :as util]
             [fluree.db.flake :as flake]
-            [fluree.db.query.analytical-filter :as filter]
-            [fluree.db.query.union :as union]
-            [clojure.string :as str]
             [fluree.db.util.log :as log :include-macros true]
-            #?(:cljs [cljs.reader])
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.query.analytical-parse :as parse]
-            [fluree.db.dbproto :as db-proto]
             [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -101,7 +93,7 @@
 
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
-  [db next-in out-ch error-ch clause t]
+  [db next-in clause t error-ch out-ch]
   (let [{:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
         {o-var :variable, o-in-n :in-n} o]
@@ -118,19 +110,17 @@
 
 (defn where-clause-chan
   "Takes next where clause and returns and output channel with chunked results."
-  [db prev-chan error-ch clause t]
-  (let [out-ch (async/chan 2)
-        {:keys [type]} clause]
-    (async/go
-      (loop []
-        (if-let [next-in (async/<! prev-chan)]
-          ;; wait for operation to finish
-          (do
-            (async/<!
-              (where-clause-tuple-chunk db next-in out-ch error-ch clause t))
-            (recur))
-          ;; no more input results, close out channel
-          (async/close! out-ch))))
+  [db clause t prev-chan error-ch]
+  (let [out-ch (async/chan 2)]
+    (async/go-loop []
+      (if-let [next-in (async/<! prev-chan)]
+        ;; wait for operation to finish
+        (do
+          (async/<!
+           (where-clause-tuple-chunk db next-in clause t error-ch out-ch))
+          (recur))
+        ;; no more input results, close out channel
+        (async/close! out-ch)))
     out-ch))
 
 
@@ -148,7 +138,7 @@
                         (get vars s-var))
         o*          (or (:value o)
                         (get vars o-var))
-        subclasses  (db-proto/-class-prop db :subclasses o*)
+        subclasses  (dbproto/-class-prop db :subclasses o*)
         all-classes (into [o*] subclasses)
         idx-root    (get db idx)
         novelty     (get-in db [:novelty idx])]
@@ -185,7 +175,7 @@
             s*       (if s-val
                        (if (number? s-val)
                          s-val
-                         (<? (db-proto/-subid db s-val)))
+                         (<? (dbproto/-subid db s-val)))
                        (get vars s-var))
             o*       (or (:value o)
                          (get vars o-var))
@@ -214,9 +204,9 @@
           ;; wait for operation to finish
           (do
             (async/<!
-              (where-clause-tuple-chunk db next-in out-ch error-ch (first union1) t))
+              (where-clause-tuple-chunk db next-in (first union1) t error-ch out-ch))
             (async/<!
-              (where-clause-tuple-chunk db next-in out-ch error-ch (first union2) t))
+              (where-clause-tuple-chunk db next-in (first union2) t error-ch out-ch))
             (recur))
           ;; no more input results, close out channel
           (async/close! out-ch))))
@@ -231,7 +221,7 @@
       ;; TODO - get 't' from query!
       (if clause
         (let [out-chan (case (:type clause)
-                         (:class :tuple :iri) (where-clause-chan db prev-chan error-ch clause t)
+                         (:class :tuple :iri) (where-clause-chan db clause t  prev-chan error-ch)
                          :optional :TODO
                          :union (process-union db prev-chan error-ch clause t))]
           (recur r out-chan))
