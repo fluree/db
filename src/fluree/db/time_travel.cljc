@@ -82,7 +82,7 @@
   [db time-str]
   (go-try
     (let [block (cond
-                  (pos-int? time-str)                       ;; assume a block number, don't modify
+                  (pos-int? time-str) ;; assume a block number, don't modify
                   time-str
 
                   ; If string start with P - it's a duration
@@ -126,16 +126,16 @@
   (go-try
     (let [latest-db (<? (dbproto/-latest-db db))]
       (cond
-        (pos-int? block-or-t-or-time)     ;; specified block
+        (pos-int? block-or-t-or-time) ;; specified block
         (try*
           (<? (block-to-t latest-db block-or-t-or-time))
           ;; exception if block doesn't exist... use latest 't'
           (catch* _ (:t latest-db)))
 
-        (neg-int? block-or-t-or-time)     ;; specified tx identifier
+        (neg-int? block-or-t-or-time) ;; specified tx identifier
         block-or-t-or-time
 
-        (string? block-or-t-or-time)      ;; ISO 8601-string
+        (string? block-or-t-or-time) ;; ISO 8601-string
         (if (= "P" (str (get block-or-t-or-time 0))) ; If string start with P - it's a duration
           (<? (time-to-t latest-db (duration-parse block-or-t-or-time)))
           (<? (time-to-t latest-db block-or-t-or-time)))
@@ -152,14 +152,12 @@
   (go-try
     (log/debug "datetime->t db:" (pr-str db))
     (let [epoch-datetime (util/str->epoch-ms datetime)
-          current-time #?(:clj (System/currentTimeMillis)
-                          :cljs (js/Date.now))
-          flakes (some-> db
-                         dbproto/-rootdb
-                         (query-range/index-range :post
-                                                  >= [const/$_commit:time epoch-datetime]
-                                                  <  [const/$_commit:time current-time])
-                         <?)]
+          flakes         (some-> db
+                                 dbproto/-rootdb
+                                 (query-range/index-range :post
+                                                          >= [const/$_commit:time epoch-datetime]
+                                                          < [const/$_commit:time (util/current-time-millis)])
+                                 <?)]
       (log/debug "datetime->t index-range:" (pr-str flakes))
       (if (empty? flakes)
         (:t db)
@@ -173,7 +171,7 @@
     (async/go
       (try*
         (let [t* (cond
-                   (string? t)  (<? (datetime->t db t)) ; ISO-8601 datetime
+                   (string? t) (<? (datetime->t db t)) ; ISO-8601 datetime
                    (pos-int? t) (- t)
                    (neg-int? t) t
                    :else (throw (ex-info (str "Time travel to t value of: " t " not yet supported.")
@@ -199,6 +197,6 @@
           (async/put! pc (assoc db :t t
                                    :block block)))
         (catch* e
-                ;; return exception into promise-chan
-                (async/put! pc e))))
+          ;; return exception into promise-chan
+          (async/put! pc e))))
     pc))
