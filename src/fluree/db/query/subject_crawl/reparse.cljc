@@ -112,7 +112,7 @@
 (defn re-parse-as-simple-subj-crawl
   "Returns true if query contains a single subject crawl.
   e.g.
-  {:select {?subjects ['*']
+  {:select {?subjects ['*']}
    :where [...]}"
   [{:keys [op-type order-by group-by] :as parsed-query}]
   (when (and (= :select op-type)
