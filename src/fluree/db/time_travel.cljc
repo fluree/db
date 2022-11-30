@@ -155,18 +155,13 @@
           flakes (some-> db
                          dbproto/-rootdb
                          (query-range/index-range :post
-                                                  > [const/$_commit:time 0]
-                                                  < [const/$_commit:time epoch-datetime])
+                                                  >= [const/$_commit:time epoch-datetime]
+                                                  <  [const/$_commit:time (System/currentTimeMillis)])
                          <?)]
-      (log/debug "datetime->t index-range:" (pr-str flakes)
-                 #_(keep #(when (some (fn [v] (= v const/$_commit:time)) %)
-                            %) flakes))
-      (when (empty? flakes)
-        (throw (ex-info (str "There is no data as of " datetime)
-                        {:status 400, :error :db/invalid-query})))
-      (let [flake (apply max-key flake/s flakes)]
-        (log/debug "datetime->t max flake:" (pr-str flake))
-        (flake/t flake)))))
+      (log/debug "datetime->t index-range:" (pr-str flakes))
+      (if (empty? flakes)
+        (:t db)
+        (-> flakes first flake/t inc)))))
 
 (defn as-of
   "Gets database as of a specific moment. Resolves 't' value provided to internal Fluree indexing
