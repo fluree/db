@@ -41,7 +41,13 @@
                         :where  '[[?s :rdf/type :schema/Movie]]}
           one-movie    @(fluree/query db (assoc base-query :t one-loaded))
           three-movies @(fluree/query db (assoc base-query :t three-loaded))
-          all-movies   @(fluree/query db (assoc base-query :t after))]
+          all-movies   @(fluree/query db (assoc base-query :t after))
+          too-early    @(fluree/query db (assoc base-query
+                                           :t (util/epoch-ms->iso-8601-str
+                                                (- start (* 24 60 60 1000)))))]
       (is (= 1 (count one-movie)))
       (is (= 3 (count three-movies)))
-      (is (= 4 (count all-movies))))))
+      (is (= 4 (count all-movies)))
+      (is (util/exception? too-early))
+      (is (re-matches #"There is no data as of .+" (ex-message too-early))))))
+

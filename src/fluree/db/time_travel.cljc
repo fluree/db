@@ -166,7 +166,11 @@
       (log/debug "datetime->t index-range:" (pr-str flakes))
       (if (empty? flakes)
         (:t db)
-        (-> flakes first flake/t inc)))))
+        (let [t (-> flakes first flake/t inc)]
+          (if (zero? t)
+            (throw (ex-info (str "There is no data as of " datetime)
+                            {:status 400, :error :db/invalid-query}))
+            t))))))
 
 (defn as-of
   "Gets database as of a specific moment. Resolves 't' value provided to internal Fluree indexing
