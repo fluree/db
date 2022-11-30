@@ -32,6 +32,7 @@
                    :ex/last     "Jones"
                    :schema/email    "cam@example.org"
                    :schema/age  34
+                   :ex/favColor "Blue"
                    :ex/favNums  [5, 10]
                    :ex/friend   [:ex/brian :ex/alice]}
                   {:id          :ex/david,
@@ -65,5 +66,47 @@
                                          ['?s :schema/age '?age]
                                          ['?s :schema/name '?name]
                                          ['?s :ex/last '?last]
-                                         {:filter ["(> ?age 45)", "(strEnds ?last \"ith\")"]}]}))))))
+                                         {:filter ["(> ?age 45)", "(strEnds ?last \"ith\")"]}]}))))
+    (testing "simple-subject-crawl"
+      (is (= [{:id :ex/david,
+	      :rdf/type [:ex/User],
+	      :schema/name "David",
+	      :ex/last "Jones",
+               :schema/email "david@example.org",
+               :schema/age 46,
+               :ex/favNums [15 70],
+               :ex/friend {:id :ex/cam}}
+              {:id :ex/brian,
+               :rdf/type [:ex/User],
+               :schema/name "Brian",
+               :ex/last "Smith",
+               :schema/email "brian@example.org",
+               :schema/age 50,
+               :ex/favNums 7}]
+               @(fluree/query db {:select {"?s" ["*"]}
+                                  :where  [["?s" :schema/age "?age"]
+                                           {:filter ["(> ?age 45)"]}]})))
+      (is (= [{:id :ex/david,
+               :rdf/type [:ex/User],
+               :schema/name "David",
+               :ex/last "Jones",
+               :schema/email "david@example.org",
+               :schema/age 46,
+               :ex/favNums [15 70],
+               :ex/friend {:id :ex/cam}}]
+             @(fluree/query db {:select {"?s" ["*"]}
+                                :where  [["?s" :schema/age "?age"]
+                                         {:filter ["(> ?age 45)", "(< ?age 50)"]}]})))
+      (is (= [{:rdf/type [:ex/User]
+               :schema/email "cam@example.org"
+               :ex/favNums [5 10]
+               :schema/age 34
+               :ex/last "Jones"
+               :schema/name "Cam"
+               :id :ex/cam
+               :ex/friend [{:id :ex/brian} {:id :ex/alice}]
+               :ex/favColor "Blue"}]
+             @(fluree/query db {:select {"?s" ["*"]}
+                                :where  [["?s" :ex/favColor "?color"]
+                                           {:filter ["(strStarts ?color \"B\")"]}]}))))))
 
