@@ -152,13 +152,13 @@
   (go-try
     (log/debug "datetime->t db:" (pr-str db))
     (let [epoch-datetime (util/str->epoch-ms datetime)
-          flakes         (some-> db
-                                 dbproto/-rootdb
-                                 (query-range/index-range
-                                   :post
-                                   > [const/$_commit:time epoch-datetime]
-                                   < [const/$_commit:time (util/current-time-millis)])
-                                 <?)]
+          flakes         (-> db
+                             dbproto/-rootdb
+                             (query-range/index-range
+                               :post
+                               > [const/$_commit:time epoch-datetime]
+                               < [const/$_commit:time (util/current-time-millis)])
+                             <?)]
       (log/debug "datetime->t index-range:" (pr-str flakes))
       (if (empty? flakes)
         (:t db)
