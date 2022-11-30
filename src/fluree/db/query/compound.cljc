@@ -4,6 +4,7 @@
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.util.core :as util]
             [fluree.db.flake :as flake]
+            [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]))
@@ -11,7 +12,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn query-range-opts
-  [idx t s p o]
+  [idx t s p {:keys [filter] :as o}]
   (let [start-flake (flake/create s p o nil nil nil util/min-integer)
         end-flake   (flake/create s p o nil nil nil util/max-integer)]
     {:idx         idx
@@ -21,11 +22,11 @@
      :start-flake start-flake
      :end-test    <=
      :end-flake   end-flake
-     :object-fn   nil}))
+     :object-fn (filter/extract-combined-filter filter)}))
 
 
 (defn process-in-item
-  [{:keys [conn] :as db} in-item in-n idx idx-root t novelty passthrough-fn p flake-x-form optional? error-ch out-ch]
+  [{:keys [conn] :as db} in-item in-n idx idx-root t novelty passthrough-fn p o flake-x-form optional? error-ch out-ch]
   (async/go
     (let [pass-vals (when passthrough-fn
                       (passthrough-fn in-item))
@@ -41,7 +42,7 @@
         (let [xfs   (cond-> [flake-x-form]
                       pass-vals (conj (map #(concat % pass-vals))))
               xf    (apply comp xfs)
-              opts  (-> (query-range-opts idx t sid* pid nil)
+              opts  (-> (query-range-opts idx t sid* pid o)
                         (assoc :flake-xf xf)) ]
           (async/pipe (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
                            (async/transduce cat
@@ -56,14 +57,14 @@
         (async/close! out-ch)))))
 
 (defn next-chunk-s
-  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p idx t flake-x-form passthrough-fn]
+  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p o idx t flake-x-form passthrough-fn]
   (let [out-ch   (async/chan)
         idx-root (get db idx)
         novelty  (get-in db [:novelty idx])]
     (async/pipeline-async 2
                           out-ch
                           (fn [in-item ch]
-                            (process-in-item db in-item in-n idx idx-root t novelty passthrough-fn p flake-x-form
+                            (process-in-item db in-item in-n idx idx-root t novelty passthrough-fn p o flake-x-form
                                              optional? error-ch ch))
                           (async/to-chan! next-in))
     out-ch))
@@ -78,7 +79,7 @@
                  (async/chan 2 (map nils-fn))
                  (async/chan 2))]
     (if s-in-n
-      (let [s-vals-ch (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
+      (let [s-vals-ch (next-chunk-s db error-ch next-in optional? s p o idx t flake-x-form passthrough-fn)]
         (async/pipe s-vals-ch out-ch))
       (async/close! out-ch))
     out-ch))
