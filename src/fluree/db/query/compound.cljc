@@ -24,6 +24,11 @@
      :end-flake   end-flake
      :object-fn (filter/extract-combined-filter filter)}))
 
+(defn with-optional
+  [res xf sid pid]
+  (if (empty? res)
+    (into [] xf [(flake/parts->Flake [sid pid])])
+    res))
 
 (defn process-in-item
   [{:keys [conn] :as db} in-item in-n idx idx-root t novelty passthrough-fn p o flake-x-form optional? error-ch out-ch]
@@ -48,10 +53,8 @@
                            (async/transduce cat
                                             (completing conj
                                                         (fn [res]
-                                                          (if (and (empty? res)
-                                                                   optional?)
-                                                            (into [] xf [(flake/parts->Flake [sid* pid])])
-                                                            res)))
+                                                          (cond-> res
+                                                            optional? (with-optional xf sid* pid))))
                                             []))
                       out-ch))
         (async/close! out-ch)))))
