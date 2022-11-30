@@ -89,14 +89,12 @@
   ([conn pause]
    (let [ledger @(fluree/create conn "test/movies")]
      (doseq [movie movies]
-       (println "staging" (get movie "name") "at"
-                (util/epoch-ms->iso-8601-str (System/currentTimeMillis)))
        (let [staged @(fluree/stage ledger movie)]
-         (println "committing" (get movie "name") "at"
-                  (util/epoch-ms->iso-8601-str (System/currentTimeMillis)))
          @(fluree/commit! staged {:message (str "Commit " (get movie "name"))
                                   :push? true}))
-       #?(:clj (Thread/sleep ^long pause)))
+       #?(:clj (Thread/sleep ^long pause)
+          :cljs (let [p (js/Promise. (fn [res] (js/setTimeout res pause)))]
+                  (js/await p))))
      ledger)))
 
 (defn load-people
