@@ -37,23 +37,23 @@
                         (when (= datatype const/$xsd:anyURI)
                           sid-val))
                       sid)]
-      (when sid
+      (if sid
         (let [xfs   (cond-> [flake-x-form]
                       pass-vals (conj (map #(concat % pass-vals))))
               xf    (apply comp xfs)
               opts  (-> (query-range-opts idx t sid* pid nil)
-                        (assoc :flake-xf xf))
-              result-ch (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
-                             (async/reduce into []))
-              results (async/<! (async/pipe result-ch
-                                            (async/chan 1 (map (fn [res]
-                                                                 (if (and (empty? res)
-                                                                          optional?)
-                                                                   (into [] xf [(flake/parts->Flake [sid* pid])])
-                                                                   res))))))]
-          ;; pull all subject results off chan, push on out-ch
-          (async/>! out-ch results)))
-      (async/close! out-ch))))
+                        (assoc :flake-xf xf)) ]
+          (async/pipe (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
+                           (async/transduce cat
+                                            (completing conj
+                                                        (fn [res]
+                                                          (if (and (empty? res)
+                                                                   optional?)
+                                                            (into [] xf [(flake/parts->Flake [sid* pid])])
+                                                            res)))
+                                            []))
+                      out-ch))
+        (async/close! out-ch)))))
 
 (defn next-chunk-s
   [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p idx t flake-x-form passthrough-fn]
