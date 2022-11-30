@@ -1,8 +1,6 @@
 (ns fluree.db.test-utils
   (:require [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (def default-context
   {:id     "@id"
@@ -92,9 +90,7 @@
        (let [staged @(fluree/stage ledger movie)]
          @(fluree/commit! staged {:message (str "Commit " (get movie "name"))
                                   :push? true}))
-       #?(:clj (Thread/sleep ^long pause)
-          :cljs (let [p (js/Promise. (fn [res] (js/setTimeout res pause)))]
-                  (js/await p))))
+       #?(:clj (Thread/sleep ^long pause)))
      ledger)))
 
 (defn load-people
