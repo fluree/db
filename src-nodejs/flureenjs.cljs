@@ -352,35 +352,6 @@
 ;; Listeners
 ;;
 ;; ======================================
-(defn blockEventToMap
-  "Takes block event data from (listen...) and adds an :added and
-  :retracted key containing maps of data organized by subject
-  and containing full predicate names."
-  [conn ledger block-event]
-  (js/Promise.
-    (fn [resolve reject]
-      (async/go
-        (try
-          (let [db     (<? (-db-instance conn ledger))
-                {add true retract false} (group-by #(nth % 4) (:flakes block-event))
-                to-map (fn [flakes]
-                         (let [by-subj (group-by first flakes)]
-                           (reduce-kv (fn [acc sid flakes]
-                                        (conj acc
-                                              (reduce (fn [m flake]
-                                                        (let [p-schema (get-in db [:schema :pred (second flake)])
-                                                              v        (nth flake 2)]
-                                                          (if (:multi p-schema)
-                                                            (update m (:name p-schema) conj v)
-                                                            (assoc m (:name p-schema) v))))
-                                                      {"_id" sid} flakes)))
-                                      [] by-subj)))]
-            (resolve (assoc block-event :added (to-map add)
-                                        :retracted (to-map retract))))
-          (catch :default e
-            (log/error e)
-            (reject e)))))))
-
 
 (defn ^:export listen
   "Listens to all events of a given ledger. Supply a ledger identity,
@@ -976,10 +947,6 @@
                                                                         (dissoc :type)
                                                                         (assoc :opts clj-opts))))
 
-                                  (= :block (:type parsed-query))
-                                  (<? (query/block-query-async conn ledger (-> parsed-query
-                                                                               (dissoc :type)
-                                                                               (assoc :opts clj-opts))))
 
                                   (:tx parsed-query)
                                   (<? (fdb-js/transact-async conn ledger (:tx parsed-query) clj-opts))

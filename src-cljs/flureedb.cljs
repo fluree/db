@@ -457,31 +457,6 @@
 ;; Queries
 ;;
 ;; ======================================
-(defn ^:export block-query
-  ([conn ledger query-map] (block-query conn ledger query-map nil))
-  ([conn ledger query-map opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [query-map*  (js->clj query-map :keywordize-keys true)
-                 opts        (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 _           (conn-handler/check-connection conn opts)
-                 private-key (:private-key opts)
-                 auth-id     (or (:auth opts) (:auth-id opts))
-                 jwt         (:jwt opts)
-                 db          (when (nil? private-key)
-                               (<? (fdb-js/db conn ledger {:auth (when auth-id ["_auth/id" auth-id])
-                                                           :jwt  jwt})))
-                 result*     (if (nil? private-key)
-                               (<? (fdb-js/block-query-async db query-map* opts))
-                               (<? (fdb-js/signed-query-async conn ledger query-map* (assoc-in opts [:action] :block))))]
-             (resolve (clj->js result*)))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
-
 (defn ^:export history-query
   [sources query-map]
   (js/Promise.
@@ -587,9 +562,6 @@
 
 (def ^:export flureedb
   #js {:authenticate authenticate
-       :block_query block-query
-       :block_range block-range
-       :block_range_with_txn block-range-with-txn
        :close close
        :close_listener close-listener
        :connect connect

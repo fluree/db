@@ -5,10 +5,6 @@ const path = require("path");
 test("expect all flureenjs functions to be defined", () => {
   expect(Object.keys(flureenjs).sort()).toStrictEqual([
     "accountId",
-    "blockEventToMap",
-    "blockQuery",
-    "blockRange",
-    "blockRangeWithTxn",
     "close",
     "closeListener",
     "collectionFlakes",
