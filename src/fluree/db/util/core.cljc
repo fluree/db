@@ -99,7 +99,7 @@
   "Returns current time in epoch milliseonds for closure/script"
   []
   #?(:clj  (System/currentTimeMillis)
-     :cljs (.getTime (js/Date.))))
+     :cljs (js/Date.now)))
 
 (defn current-time-iso
   "Returns current time as string for ISO-8601 format"
