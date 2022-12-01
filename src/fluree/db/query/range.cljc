@@ -487,34 +487,3 @@
                (if (= type "tx")
                  (conj result* {:db db :tx tx :nonce nonce :auth auth :expire expire})
                  result*))))))
-
-(defn block-with-tx-data
-  "Returns block data as a map, with the following keys:
-  1. block - block number
-  2. t - fluree \"time\" since ledger creation
-  3. sigs - List of transactor signatures that signed this block
-  4. instant - instant this block was created, per the transactor.
-  5. hash - hash of current block
-  6. prev-hash - hash of previous block, if relevant
-  7. flakes - list of flakes comprising block
-  8. txn - list of transactions in block
-  "
-  [blocks]
-  (loop [[block' & r] blocks result* []]
-    (if (nil? block')
-      result*
-      (let [{:keys [block t flakes]} block'
-            prev-hash   (some #(when (= (flake/p %) const/$_block:prevHash) (flake/o %)) flakes)
-            hash        (some #(when (= (flake/p %) const/$_block:hash) (flake/o %)) flakes)
-            instant     (some #(when (= (flake/p %) const/$_block:instant) (flake/o %)) flakes)
-            sigs        (some #(when (= (flake/p %) const/$_block:sigs) (flake/o %)) flakes)
-            txn-flakes  (filter #(= (flake/p %) const/$_tx:tx) flakes)
-            txn-flakes' (txn-from-flakes txn-flakes)]
-        (recur r (conj result* {:block     block
-                                :t         t
-                                :hash      hash
-                                :prev-hash prev-hash
-                                :instant   instant
-                                :sigs      sigs
-                                :flakes    flakes
-                                :txn       txn-flakes'}))))))

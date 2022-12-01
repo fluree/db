@@ -517,7 +517,6 @@
           (catch* e
                   (log/error e "Error encountered creating index for db: " db ". "
                              "Indexing stopped.")))))
-
     port))
 
 
@@ -556,8 +555,8 @@
 
 (defn add-update-commit-fn
   [state-atom branch f]
-  (swap! state-atom assoc-in [:commit-fn branch] f)
-  )
+  (swap! state-atom assoc-in [:commit-fn branch] f))
+
 
 
 (defrecord IndexerDefault [reindex-min-bytes reindex-max-bytes state-atom]

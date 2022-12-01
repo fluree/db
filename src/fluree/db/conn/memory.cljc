@@ -121,7 +121,7 @@
     (log/info "Closing memory connection" id)
     (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
-  (-method [_] :ipfs)
+  (-method [_] :memory)
   (-parallelism [_] parallelism)
   (-id [_] id)
   (-context [_] (:context ledger-defaults))

@@ -291,7 +291,7 @@
                        (flake/create const/$_block:transactions const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
                        ;(flake/create const/$_block:prevHash const/$iri const/iri-previous const/$xsd:anyURI t true nil)
                        ;(flake/create const/$_block:prevHash const/$rdf:type const/$iri  const/$xsd:anyURIt true nil)
-                       (flake/create const/$_block:instant const/$iri const/iri-time const/$xsd:anyURI t true nil)
+                       (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:anyURI t true nil)
                        (flake/create const/$_block:ledgers const/$iri const/iri-message const/$xsd:anyURI t true nil) ;; reused $_block:ledgers as commit message
                        (flake/create const/$_block:number const/$iri const/iri-tag const/$xsd:anyURI t true nil) ;; reused $_block:number as commit tags
                        (flake/create const/$_block:sigs const/$iri const/iri-issuer const/$xsd:anyURI t true nil)
@@ -305,6 +305,7 @@
     (let [last-sid       (volatile! (jld-ledger/last-commit-sid db))
           next-sid       (fn [] (vswap! last-sid inc))
           {:keys [message tag time id data previous issuer]} commit
+          epoch-time (util/str->epoch-ms time)
           {db-id :id, db-address :address, db-t :t} data
           t              (- db-t)
           db*            (if (= 1 db-t)
@@ -336,7 +337,7 @@
                                   ;; link db to associated commit meta
                                   (flake/create t const/$_block:transactions commit-sid const/$xsd:anyURI t true nil)
                                   ;; commit flakes below
-                                  (flake/create commit-sid const/$_block:instant time const/$xsd:dateTime t true nil)]
+                                  (flake/create commit-sid const/$_commit:time epoch-time const/$xsd:dateTime t true nil)]
                                  ;; if address for db exists
                                  db-address (into [(flake/create t const/$_block:hash db-address-sid const/$xsd:anyURI t true nil)
                                                    (flake/create db-address-sid const/$iri db-address const/$xsd:string t true nil)])

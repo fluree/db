@@ -157,8 +157,6 @@
         _                      (log/info "Query bench results: " query-bench)
         analytical-query-bench (test-queries myDb fdb/query analytical-query-coll)
         _                      (log/info "Analytical query bench results: " analytical-query-bench)
-        block-query-bench      (test-queries myDb fdb/block-query-async block-query-coll)
-        _                      (log/info "Block query bench results: " block-query-bench)
         history-query-bench    (test-queries myDb fdb/history-query-async history-query-coll)
         _                      (log/info "History query bench results" history-query-bench)
         sparql-query-bench     (test-queries myDb fdb/sparql-async sparql-query-coll)
@@ -179,10 +177,11 @@
         res                    (reduce (fn [acc res] (assoc acc (-> (:issued res)
                                                                     (str/replace #"\s+" " "))
                                                                 (dissoc res :issued)))
-                                       {} (concat query-bench analytical-query-bench block-query-bench
-                                                  history-query-bench sparql-query-bench graphql-query-bench
-                                                  multi-query-bench add-data-bench
-                                                  add-update-bench add-delete-bench))]
+                                       {} (concat query-bench analytical-query-bench
+                                                  history-query-bench sparql-query-bench
+                                                  graphql-query-bench multi-query-bench
+                                                  add-data-bench add-update-bench
+                                                  add-delete-bench))]
     res))
 
 (defn compare-results
