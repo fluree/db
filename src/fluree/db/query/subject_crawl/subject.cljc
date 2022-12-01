@@ -1,6 +1,7 @@
 (ns fluree.db.query.subject-crawl.subject
   (:require [clojure.core.async :refer [<! >!] :as async]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
@@ -34,7 +35,7 @@
                       #(= o* (flake/o %))
 
                       (:filter o)
-                      (let [f (get-in o [:filter :function])]
+                      (let [f (filter/extract-combined-filter (:filter o))]
                         #(-> % flake/o f)))
         return-chan (async/chan 10 (comp (map flake/s)
                                          (dedupe)))]
