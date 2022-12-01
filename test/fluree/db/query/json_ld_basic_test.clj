@@ -121,3 +121,137 @@
                  {:id      "list-test2"
                   :ex/list [42 2 88 1]})
               "Order of query result is different from transaction."))))))
+
+(deftest ^:integration simple-subject-crawl-test
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "query/simple-subject-crawl" {:context {:ex "http://example.org/ns/"}})
+        db     @(fluree/stage
+                 ledger
+                 [{:id           :ex/brian,
+                   :type         :ex/User,
+                   :schema/name  "Brian"
+                   :ex/last      "Smith"
+                   :schema/email "brian@example.org"
+                   :schema/age   50
+                   :ex/favNums   7}
+                  {:id           :ex/alice,
+                   :type         :ex/User,
+                   :schema/name  "Alice"
+                   :ex/last      "Smith"
+                   :schema/email "alice@example.org"
+                   :ex/favColor  "Green"
+                   :schema/age   42
+                   :ex/favNums   [42, 76, 9]}
+                  {:id          :ex/cam,
+                   :type        :ex/User,
+                   :schema/name "Cam"
+                   :ex/last     "Jones"
+                   :schema/email    "cam@example.org"
+                   :schema/age  34
+                   :ex/favColor "Blue"
+                   :ex/favNums  [5, 10]
+                   :ex/friend   [:ex/brian :ex/alice]}
+                  {:id          :ex/david,
+                   :type        :ex/User,
+                   :schema/name "David"
+                   :ex/last     "Jones"
+                   :schema/email    "david@example.org"
+                   :schema/age  46
+                   :ex/favNums  [15 70]
+                   :ex/friend   [:ex/cam]}])]
+    (testing "using `from`"
+      (is (= [{:id :ex/brian,
+               :rdf/type [:ex/User]
+               :schema/name "Brian"
+               :ex/last "Smith"
+               :schema/email "brian@example.org"
+               :schema/age 50
+               :ex/favNums 7}]
+             @(fluree/query db {:select [:*]
+                                :from :ex/brian}))))
+    (testing "using `where`"
+      (testing "id"
+        (is (= [{:id :ex/brian,
+                 :rdf/type [:ex/User]
+                 :schema/name "Brian"
+                 :ex/last "Smith"
+                 :schema/email "brian@example.org"
+                 :schema/age 50
+                 :ex/favNums 7}]
+               @(fluree/query db {:select {"?s" ["*"]}
+                                  :where  [["?s" :id :ex/brian]]}))))
+      (testing "iri"
+        (is (= [{:id :ex/david
+                 :rdf/type [:ex/User]
+                 :schema/name "David"
+                 :ex/last "Jones"
+                 :schema/email "david@example.org"
+                 :schema/age 46
+                 :ex/favNums [15 70]
+                 :ex/friend {:id :ex/cam}}
+                {:rdf/type [:ex/User]
+                 :schema/email "cam@example.org"
+                 :ex/favNums [5 10]
+                 :schema/age 34
+                 :ex/last "Jones"
+                 :schema/name "Cam"
+                 :id :ex/cam
+                 :ex/friend [{:id :ex/brian} {:id :ex/alice}]
+                 :ex/favColor "Blue"}
+                {:id :ex/alice
+                 :rdf/type [:ex/User]
+                 :schema/name "Alice"
+                 :ex/last "Smith"
+                 :schema/email "alice@example.org"
+                 :schema/age 42
+                 :ex/favNums [9 42 76]
+                 :ex/favColor "Green"}
+                {:id :ex/brian
+                 :rdf/type [:ex/User]
+                 :schema/name "Brian"
+                 :ex/last "Smith"
+                 :schema/email "brian@example.org"
+                 :schema/age 50
+                 :ex/favNums 7}]
+               @(fluree/query db {:select {"?s" ["*"]}
+                                  :where  [["?s" :type :ex/User]]}))))
+      (testing "tuple"
+        (is (= [{:id :ex/alice
+                 :rdf/type [:ex/User]
+                 :schema/name "Alice"
+                 :ex/last "Smith"
+                 :schema/email "alice@example.org"
+                 :schema/age 42
+                 :ex/favNums [9 42 76]
+                 :ex/favColor "Green"}]
+               @(fluree/query db {:select {"?s" ["*"]}
+                                  :where  [["?s" :schema/name "Alice"]]})))
+        (is (= [{:rdf/type [:ex/User]
+                 :schema/email "cam@example.org"
+                 :ex/favNums [5 10]
+                 :schema/age 34
+                 :ex/last "Jones"
+                 :schema/name "Cam"
+                 :id :ex/cam
+                 :ex/friend [{:id :ex/brian} {:id :ex/alice}]
+                 :ex/favColor "Blue"}
+                {:id :ex/alice
+                 :rdf/type [:ex/User]
+                 :schema/name "Alice"
+                 :ex/last "Smith"
+                 :schema/email "alice@example.org"
+                 :schema/age 42
+                 :ex/favNums [9 42 76]
+                 :ex/favColor "Green"}]
+               @(fluree/query db {:select {"?s" ["*"]}
+                                  :where  [["?s" :ex/favColor "?color"]]})))
+        (is (= [{:id :ex/alice
+                 :rdf/type [:ex/User]
+                 :schema/name "Alice"
+                 :ex/last "Smith"
+                 :schema/email "alice@example.org"
+                 :schema/age 42
+                 :ex/favNums [9 42 76]
+                 :ex/favColor "Green"}]
+               @(fluree/query db {:select {"?s" ["*"]}
+                                  :where  [["?s" :schema/age 42]]})))))))

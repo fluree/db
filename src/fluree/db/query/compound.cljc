@@ -19,7 +19,7 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn query-range-opts
-  [idx t s p o]
+  [idx t s p {:keys [filter] :as o}]
   (let [start-flake (flake/create s p o nil nil nil util/min-integer)
         end-flake   (flake/create s p o nil nil nil util/max-integer)]
     {:idx         idx
@@ -29,11 +29,11 @@
      :start-flake start-flake
      :end-test    <=
      :end-flake   end-flake
-     :object-fn   nil}))
+     :object-fn (filter/extract-combined-filter filter)}))
 
 
 (defn next-chunk-s
-  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p idx t flake-x-form passthrough-fn]
+  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p o idx t flake-x-form passthrough-fn]
   (let [out-ch   (async/chan)
         idx-root (get db idx)
         novelty  (get-in db [:novelty idx])]
@@ -51,7 +51,7 @@
                                 sid-val))
                             sid)]
             (when sid
-              (let [opts  (query-range-opts idx t sid* pid nil)
+              (let [opts  (query-range-opts idx t sid* pid o)
                     in-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
                 ;; pull all subject results off chan, push on out-ch
                 (loop [interim-results nil]
@@ -77,28 +77,6 @@
     out-ch))
 
 
-(defn get-chan
-  [db prev-chan error-ch clause t]
-  (let [out-ch (async/chan 2)
-        {:keys [type s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
-        {s-var :variable, s-in-n :in-n} s
-        {o-var :variable, o-in-n :in-n} o]
-    (async/go
-      (loop []
-        (if-let [next-in (async/<! prev-chan)]
-          (let []
-            (if s-in-n
-              (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
-                (loop []
-                  (when-let [next-s (async/<! s-vals-chan)]
-                    (async/>! out-ch (if nils-fn
-                                       (nils-fn next-s)
-                                       next-s))
-                    (recur)))))
-            (recur))
-          (async/close! out-ch))))
-    out-ch))
-
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
   [db next-in out-ch error-ch clause t]
@@ -107,7 +85,7 @@
         {o-var :variable, o-in-n :in-n} o]
     (async/go
       (when s-in-n
-        (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p idx t flake-x-form passthrough-fn)]
+        (let [s-vals-chan (next-chunk-s db error-ch next-in optional? s p o idx t flake-x-form passthrough-fn)]
           (loop []
             (when-let [next-s (async/<! s-vals-chan)]
               (async/>! out-ch (if nils-fn
@@ -223,8 +201,8 @@
     out-ch))
 
 
-(defn resolve-where-clause
-  [{:keys [t] :as db} {:keys [where vars] :as _parsed-query} error-ch fuel max-fuel]
+(defn where
+  [{:keys [t] :as db} {:keys [where vars] :as _parsed-query} fuel max-fuel error-ch]
   (let [initial-chan (get-clause-res db nil (first where) t vars fuel max-fuel error-ch)]
     (loop [[clause & r] (rest where)
            prev-chan initial-chan]
@@ -236,23 +214,3 @@
                          :union (process-union db prev-chan error-ch clause t))]
           (recur r out-chan))
         prev-chan))))
-
-(defn order+group-results
-  "Ordering must first consume all results and then sort."
-  [results-ch error-ch fuel max-fuel {:keys [comparator] :as _order-by} {:keys [grouping-fn] :as _group-by}]
-  (async/go
-    (let [results (loop [results []]
-                    (if-let [next-res (async/<! results-ch)]
-                      (recur (into results next-res))
-                      results))]
-      (cond-> (sort comparator results)
-              grouping-fn grouping-fn))))
-
-
-(defn where
-  [parsed-query error-ch fuel max-fuel db]
-  (let [{:keys [order-by group-by]} parsed-query
-        where-results (resolve-where-clause db parsed-query error-ch fuel max-fuel)
-        out-ch        (cond-> where-results
-                              order-by (order+group-results error-ch fuel max-fuel order-by group-by))]
-    out-ch))

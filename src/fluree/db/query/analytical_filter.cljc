@@ -174,6 +174,12 @@
 
                   :else acc)) [] filters))
 
+(defn extract-combined-filter
+  [filter-maps]
+  (some->> filter-maps
+      (map :function)
+      (apply every-pred)))
+
 (defmacro coalesce
   "Evaluates args in order. The result of the first arg not to return error gets returned."
   ([] (throw (ex-info "COALESCE evaluation failed on all forms." {:status 400 :error :db/invalid-query})))
