@@ -83,15 +83,13 @@
                                        :did     did}})))
 
 (defn load-movies
-  ([conn] (load-movies conn 0))
-  ([conn pause]
-   (let [ledger @(fluree/create conn "test/movies")]
-     (doseq [movie movies]
-       (let [staged @(fluree/stage ledger movie)]
-         @(fluree/commit! staged {:message (str "Commit " (get movie "name"))
-                                  :push? true}))
-       #?(:clj (Thread/sleep ^long pause)))
-     ledger)))
+  [conn]
+  (let [ledger @(fluree/create conn "test/movies")]
+    (doseq [movie movies]
+      (let [staged @(fluree/stage ledger movie)]
+        @(fluree/commit! staged {:message (str "Commit " (get movie "name"))
+                                 :push? true})))
+    ledger))
 
 (defn load-people
   [conn]

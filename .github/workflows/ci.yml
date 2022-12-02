@@ -8,7 +8,7 @@ on:
 jobs:
   test:
     name: Run tests & build Docker image
-    runs-on: [self-hosted, docker]
+    runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
       - uses: docker/setup-buildx-action@v2.2.1
