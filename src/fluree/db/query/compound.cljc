@@ -11,19 +11,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn query-range-opts
-  [idx t s p {:keys [filter] :as o}]
-  (let [start-flake (flake/create s p o nil nil nil util/min-integer)
-        end-flake   (flake/create s p o nil nil nil util/max-integer)]
-    {:idx         idx
-     :from-t      t
-     :to-t        t
-     :start-test  >=
-     :start-flake start-flake
-     :end-test    <=
-     :end-flake   end-flake
-     :object-fn (filter/extract-combined-filter filter)}))
-
 (defn resolve-flake-range
   [{:keys [conn] :as db} idx t s p o flake-xf error-ch]
   (let [idx-root    (get db idx)
@@ -48,29 +35,31 @@
     (into [] xf [(flake/parts->Flake [sid pid])])
     res))
 
+(defn parse-sid
+  [sid]
+  (if (vector? sid)
+    (let [[sid-val datatype] sid]
+      ;; in a mixed datatype response (e.g. some IRIs, some strings), need to
+      ;; filter out any non-IRI
+      (when (= datatype const/$xsd:anyURI)
+        sid-val))
+    sid))
+
 (defn process-in-item
   [{:keys [conn] :as db} in-item in-n idx t passthrough-fn p o flake-x-form optional? error-ch out-ch]
   (async/go
-    (let [pass-vals (when passthrough-fn
-                      (passthrough-fn in-item))
-          {pid :value} p
-          sid       (nth in-item in-n)
-          sid*      (if (vector? sid)
-                      (let [[sid-val datatype] sid]
-                        ;; in a mixed datatype response (e.g. some IRIs, some strings), need to filter out any non-IRI
-                        (when (= datatype const/$xsd:anyURI)
-                          sid-val))
-                      sid)]
-      (if sid
-        (let [xfs   (cond-> [flake-x-form]
-                      pass-vals (conj (map #(concat % pass-vals))))
-              xf    (apply comp xfs)]
-          (async/pipe (->> (resolve-flake-range db idx t sid* pid o xf error-ch)
+    (let [{pid :value} p]
+      (if-let [sid (some-> in-item (nth in-n) parse-sid)]
+        (let [xfs (cond-> [flake-x-form]
+                    passthrough-fn (conj (map (fn [result]
+                                                (concat result (passthrough-fn in-item))))))
+              xf  (apply comp xfs)]
+          (async/pipe (->> (resolve-flake-range db idx t sid pid o xf error-ch)
                            (async/transduce cat
                                             (completing conj
                                                         (fn [res]
                                                           (cond-> res
-                                                            optional? (with-optional xf sid* pid))))
+                                                            optional? (with-optional xf sid pid))))
                                             []))
                       out-ch))
         (async/close! out-ch)))))
