@@ -145,7 +145,10 @@
         subclasses  (dbproto/-class-prop db :subclasses o*)
         all-classes (into [o*] subclasses)
 
-        out-ch (async/chan 2 (with-distinct-subjects))]
+        out-xfs (cond-> [(with-distinct-subjects)]
+                  flake-x-form (conj (map (fn [flakes]
+                                            (sequence flake-x-form flakes)))))
+        out-ch (async/chan 2 (apply comp out-xfs))]
 
     (->> (async/to-chan! all-classes)
          (async/pipeline-async 2
