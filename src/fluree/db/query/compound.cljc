@@ -54,14 +54,15 @@
                     passthrough-fn (conj (map (fn [result]
                                                 (concat result (passthrough-fn in-item))))))
               xf  (apply comp xfs)]
-          (async/pipe (->> (resolve-flake-range db idx t sid pid o xf error-ch)
-                           (async/transduce cat
-                                            (completing conj
-                                                        (fn [res]
-                                                          (cond-> res
-                                                            optional? (with-optional xf sid pid))))
-                                            []))
-                      out-ch))
+          (async/pipe
+           (async/transduce cat
+                            (completing conj
+                                        (fn [res]
+                                          (cond-> res
+                                            optional? (with-optional xf sid pid))))
+                            []
+                            (resolve-flake-range db idx t sid pid o xf error-ch))
+           out-ch))
         (async/close! out-ch)))))
 
 (defn next-chunk-s
@@ -130,17 +131,17 @@
         ([result]
          (xf result))))))
 
+(defn get-value
+  [var values]
+  (or (:value var)
+      (get values (:variable var))))
+
 (defmethod get-clause-res :class
   [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch]
   (let [{:keys [s p o idx flake-x-form]} clause
-        {pid :value} p
-        {s-var :variable} s
-        {o-var :variable} o
-
-        s* (or (:value s)
-               (get vars s-var))
-        o* (or (:value o)
-               (get vars o-var))
+        s*  (get-value s vars)
+        pid (get-value p vars)
+        o*  (get-value o vars)
 
         subclasses  (dbproto/-class-prop db :subclasses o*)
         all-classes (into [o*] subclasses)
@@ -150,13 +151,13 @@
                                             (sequence flake-x-form flakes)))))
         out-ch (async/chan 2 (apply comp out-xfs))]
 
-    (->> (async/to-chan! all-classes)
-         (async/pipeline-async 2
-                               out-ch
-                               (fn [cls ch]
-                                 (async/pipe (resolve-flake-range db idx t s* pid cls
-                                                                  nil error-ch)
-                                             ch))))
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [cls ch]
+                            (async/pipe (resolve-flake-range db idx t s* pid cls
+                                                             nil error-ch)
+                                        ch))
+                          (async/to-chan! all-classes))
     out-ch))
 
 (defmethod get-clause-res :tuple
@@ -164,9 +165,7 @@
   (let [out-ch (async/chan 2)]
     (async/go
       (let [{:keys [s p o idx flake-x-form]} clause
-            {pid :value} p
             {s-var :variable, s-val :value} s
-            {o-var :variable} o
             s*       (if s-val
                        (if (number? s-val)
                          s-val
@@ -174,11 +173,10 @@
                        (get vars s-var))]
         (if (and s-val (nil? s*)) ; this means the iri provided for 's' doesn't exist, close
           (async/close! out-ch)
-          (let [{o-var :variable} o
-                o*       (or (:value o)
-                             (get vars o-var))
-                range-ch (resolve-flake-range db idx t s* pid o* flake-x-form error-ch)]
-            (async/pipe range-ch out-ch)))))
+          (let [pid (get-value p vars)
+                o*  (get-value o vars)]
+            (async/pipe (resolve-flake-range db idx t s* pid o* flake-x-form error-ch)
+                        out-ch)))))
     out-ch))
 
 (defn process-union
