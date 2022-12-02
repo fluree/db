@@ -6,6 +6,33 @@
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.util.log :as log]))
 
+(deftest ^:integration select-sid
+  (testing "Select index's subject id in query using special keyword"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "query/subid" {:context {:ex "http://example.org/ns/"}})
+          db     @(fluree/stage
+                    ledger
+                    {:graph [{:id          :ex/alice,
+                              :type        :ex/User,
+                              :schema/name "Alice"}
+                             {:id           :ex/bob,
+                              :type         :ex/User,
+                              :schema/name  "Bob"
+                              :ex/favArtist {:id          :ex/picasso
+                                             :schema/name "Picasso"}}]})]
+      (is (= @(fluree/query db {:select {'?s [:_id :* {:ex/favArtist [:_id :schema/name]}]}
+                                :where  [['?s :type :ex/User]]})
+             [{:_id          211106232532999,
+               :id           :ex/bob,
+               :rdf/type     [:ex/User],
+               :schema/name  "Bob",
+               :ex/favArtist {:_id         211106232533000
+                              :schema/name "Picasso"}}
+              {:_id         211106232532998,
+               :id          :ex/alice,
+               :rdf/type    [:ex/User],
+               :schema/name "Alice"}])))))
+
 (deftest ^:integration s+p+o-full-db-queries
   (testing "Query that pulls entire database."
     (let [conn   (test-utils/create-conn)
