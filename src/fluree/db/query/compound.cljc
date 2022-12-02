@@ -153,8 +153,8 @@
     (->> (async/to-chan! all-classes)
          (async/pipeline-async 2
                                out-ch
-                               (fn [class ch]
-                                 (async/pipe (resolve-flake-range db idx t s* pid class
+                               (fn [cls ch]
+                                 (async/pipe (resolve-flake-range db idx t s* pid cls
                                                                   nil error-ch)
                                              ch))))
     out-ch))
