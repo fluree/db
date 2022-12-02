@@ -24,6 +24,24 @@
      :end-flake   end-flake
      :object-fn (filter/extract-combined-filter filter)}))
 
+(defn resolve-flake-range
+  [{:keys [conn] :as db} idx t s p o flake-xf error-ch]
+  (let [idx-root    (get db idx)
+        novelty     (get-in db [:novelty idx])
+        start-flake (flake/create s p o nil nil nil util/min-integer)
+        end-flake   (flake/create s p o nil nil nil util/max-integer)
+        obj-filter  (some-> o :filter filter/extract-combined-filter)
+        opts        (cond-> {:idx         idx
+                             :from-t      t
+                             :to-t        t
+                             :start-test  >=
+                             :start-flake start-flake
+                             :end-test    <=
+                             :end-flake   end-flake}
+                      obj-filter (assoc :object-fn obj-filter)
+                      flake-xf   (assoc :flake-xf flake-xf))]
+    (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
+
 (defn with-optional
   [res xf sid pid]
   (if (empty? res)
@@ -46,10 +64,8 @@
       (if sid
         (let [xfs   (cond-> [flake-x-form]
                       pass-vals (conj (map #(concat % pass-vals))))
-              xf    (apply comp xfs)
-              opts  (-> (query-range-opts idx t sid* pid o)
-                        (assoc :flake-xf xf)) ]
-          (async/pipe (->> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
+              xf    (apply comp xfs)]
+          (async/pipe (->> (resolve-flake-range db idx t sid* pid o xf error-ch)
                            (async/transduce cat
                                             (completing conj
                                                         (fn [res]
@@ -117,23 +133,19 @@
         o*          (or (:value o)
                         (get vars o-var))
         subclasses  (dbproto/-class-prop db :subclasses o*)
-        all-classes (into [o*] subclasses)
-        idx-root    (get db idx)
-        novelty     (get-in db [:novelty idx])]
+        all-classes (into [o*] subclasses)]
     (async/go
       (loop [[next-class & rest-classes] all-classes
              all-seen #{}]
         (if next-class
-          (let [class-opts (query-range-opts idx t s* pid next-class)
-                class-chan (query-range/resolve-flake-slices conn idx-root novelty error-ch class-opts)
+          (let [class-chan (resolve-flake-range db idx t s* pid next-class nil error-ch)
                 ;; exhaust class, return all seen sids for the class
                 class-seen (loop [class-seen []]
                              (let [next-res (async/<! class-chan)]
                                (if next-res
-                                 (let [next-res* (remove #(all-seen (flake/s %)) next-res)
-                                       next-out  (sequence flake-x-form next-res*)]
-                                   (when (seq next-out)
-                                     (async/>! out-ch next-out))
+                                 (let [next-res* (remove #(all-seen (flake/s %)) next-res)]
+                                   (when (seq next-res*)
+                                     (async/>! out-ch next-res*))
                                    (recur (conj class-seen (mapv flake/s next-res*))))
                                  class-seen)))]
             ;; integrate class-seen into all-seen
@@ -160,11 +172,7 @@
           (let [{o-var :variable} o
                 o*       (or (:value o)
                              (get vars o-var))
-                opts     (-> (query-range-opts idx t s* pid o*)
-                             (assoc :flake-xf flake-x-form))
-                idx-root (get db idx)
-                novelty  (get-in db [:novelty idx])
-                range-ch (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)]
+                range-ch (resolve-flake-range db idx t s* pid o* flake-x-form error-ch)]
             (async/pipe range-ch out-ch)))))
     out-ch))
 

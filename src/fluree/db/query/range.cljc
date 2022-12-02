@@ -142,7 +142,7 @@
                               (into [] (query-filter opts) flakes))))]
     (if flake-xf
       (let [slice-xf (map (fn [flakes]
-                            (into [] flake-xf flakes)))]
+                            (sequence flake-xf flakes)))]
         (comp query-xf slice-xf))
       query-xf)))
 
