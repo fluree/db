@@ -38,10 +38,6 @@
    :closure-defines {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}
    :exports   {:accountId             flureenjs/accountId
-               :blockEventToMap       flureenjs/blockEventToMap
-               :blockQuery            flureenjs/blockQuery
-               :blockRange            flureenjs/blockRange
-               :blockRangeWithTxn     flureenjs/blockRangeWithTxn
                :close                 flureenjs/close
                :closeListener         flureenjs/closeListener
                :collectionFlakes      flureenjs/collectionFlakes

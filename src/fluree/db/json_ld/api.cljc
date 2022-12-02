@@ -112,7 +112,7 @@
   fluree:ipfs://Qmaq4ip1bJq6255S5PhU8veo6gxaq2yyucKZmJkV1WW8YG
   fluree:ipns://k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2
   fluree:ipns://my.dns.com/movies/top-rated
-  fluree:local://my/db
+  fluree:file://my/db
   fluree:s3:...."
   ([address]
    ;; TODO - when given an address only, can create or retrieve from cache a conn
@@ -124,26 +124,26 @@
 
 (defn index
   "Performs indexing operation on the specified ledger"
-  [ledger]
-  )
+  [ledger])
+
 
 ;; MAYBE CHALLENGE?
 (defn validate
   "Validates a ledger, checks block integrity along with signatures."
-  []
+  [])
 
-  )
+
 
 (defn pull
   "Checks name service for ledger and pulls latest version locally."
-  []
-  )
+  [])
+
 
 
 (defn combine
   "Combines multiple ledgers into a new, read-only ledger."
-  []
-  )
+  [])
+
 
 
 ;; mutations
@@ -195,26 +195,26 @@
 (defn push
   "Pushes all commits since last push to a naming service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
   Depending on consensus requirements for a Fluree Network, will accept or reject push as newest update."
-  []
-  )
+  [])
+
 
 
 (defn squash
   "Squashes multiple unpublished commits into a single unpublished commit"
-  []
-  )
+  [])
+
 
 
 (defn merge
   "Merges changes from one branch into another branch."
-  []
-  )
+  [])
+
 
 
 (defn branch
   "Creates a new branch of a given ledger"
-  []
-  )
+  [])
+
 
 ;; db operations
 

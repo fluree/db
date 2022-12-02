@@ -1,7 +1,6 @@
 (ns fluree.db.test-utils
   (:require [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (def default-context
   {:id     "@id"
@@ -19,19 +18,36 @@
   "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")
 
 (def movies
-  {"@context"                  "https://schema.org",
-   "id"                        "https://www.wikidata.org/wiki/Q836821",
-   "type"                      ["Movie"],
-   "name"                      "The Hitchhiker's Guide to the Galaxy",
-   "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
-   "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
-   "isBasedOn"                 {"id"     "https://www.wikidata.org/wiki/Q3107329",
-                                "type"   "Book",
-                                "name"   "The Hitchhiker's Guide to the Galaxy",
-                                "isbn"   "0-330-25864-8",
-                                "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
-                                          "@type" "Person"
-                                          "name"  "Douglas Adams"}}})
+  [{"@context"                  "https://schema.org",
+    "id"                        "https://www.wikidata.org/wiki/Q836821",
+    "type"                      ["Movie"],
+    "name"                      "The Hitchhiker's Guide to the Galaxy",
+    "disambiguatingDescription" "2005 British-American comic science fiction film directed by Garth Jennings",
+    "titleEIDR"                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
+    "isBasedOn"                 {"id"     "https://www.wikidata.org/wiki/Q3107329",
+                                 "type"   "Book",
+                                 "name"   "The Hitchhiker's Guide to the Galaxy",
+                                 "isbn"   "0-330-25864-8",
+                                 "author" {"@id"   "https://www.wikidata.org/wiki/Q42"
+                                           "@type" "Person"
+                                           "name"  "Douglas Adams"}}}
+   {"@context"                  "https://schema.org",
+    "id"                        "https://www.wikidata.org/wiki/Q91540",
+    "type"                      ["Movie"],
+    "name"                      "Back to the Future",
+    "disambiguatingDescription" "1985 film by Robert Zemeckis",
+    "titleEIDR"                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
+    "followedBy"                {"id"         "https://www.wikidata.org/wiki/Q109331"
+                                 "type"       "Movie"
+                                 "name"       "Back to the Future Part II"
+                                 "titleEIDR"  "10.5240/5DA5-C386-2911-7E2B-1782-L"
+                                 "followedBy" {"id" "https://www.wikidata.org/wiki/Q230552"}}}
+   {"@context"                  "https://schema.org"
+    "id"                        "https://www.wikidata.org/wiki/Q230552"
+    "type"                      ["Movie"]
+    "name"                      "Back to the Future Part III"
+    "disambiguatingDescription" "1990 film by Robert Zemeckis"
+    "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}])
 
 (def people
   [{:context      {:ex "http://example.org/ns/"}
@@ -67,11 +83,15 @@
                                        :did     did}})))
 
 (defn load-movies
-  [conn]
-  (let [ledger @(fluree/create conn "test/movies")
-        staged @(fluree/stage ledger movies)
-        commit @(fluree/commit! staged {:message "First commit!", :push? true})]
-    ledger))
+  ([conn] (load-movies conn 0))
+  ([conn pause]
+   (let [ledger @(fluree/create conn "test/movies")]
+     (doseq [movie movies]
+       (let [staged @(fluree/stage ledger movie)]
+         @(fluree/commit! staged {:message (str "Commit " (get movie "name"))
+                                  :push? true}))
+       #?(:clj (Thread/sleep ^long pause)))
+     ledger)))
 
 (defn load-people
   [conn]

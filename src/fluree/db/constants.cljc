@@ -41,7 +41,7 @@
 (def ^:const $iri 0)
 
 ;; system collection ids
-(def ^:const $_tx -1)                                       ;; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
+(def ^:const $_tx -1) ; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
 (def ^:const $_predicate 0)
 (def ^:const $_collection 1)
 (def ^:const $_shard 2)
@@ -65,7 +65,7 @@
 (def ^:const $_block:prevHash 52)
 (def ^:const $_block:transactions 53)                        ;; JSON-LD: turning into commit id ref
 (def ^:const $_block:ledgers 54)                             ;; JSON-LD - reuse as commit message
-(def ^:const $_block:instant 55)                             ;; JSON-LD: turning into commit timestamp
+(def ^:const $_commit:time 55)
 (def ^:const $_block:number 56)                              ;; JSON-LD: reuse as commit tag(s)
 (def ^:const $_block:sigs 57)                                ;; JSON-LD: turning into signer of commit
 

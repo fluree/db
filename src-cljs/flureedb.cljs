@@ -1,17 +1,12 @@
 (ns flureedb
   (:require [clojure.string :as str]
             [clojure.core.async :refer [go <!] :as async]
-            [alphabase.core :as alphabase]
             [fluree.crypto :as crypto]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.graphdb :as graphdb]
             [fluree.db.api.query :as q]
             [fluree.db.api.ledger :as ledger]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.operations :as ops]
-            [fluree.db.query.fql :as fql]
-            [fluree.db.query.block :as query-block]
-            [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
@@ -462,75 +457,6 @@
 ;; Queries
 ;;
 ;; ======================================
-(defn ^:export block-range
-  "Returns a Promise that will eventually contain blocks from start block (inclusive)
-  to end if provided (inclusive). Each block is a separate map, containing keys :block,
-  :t and :flakes."
-  ([conn ledger start] (block-range conn ledger start start nil))
-  ([conn ledger start end] (block-range conn ledger start end nil))
-  ([conn ledger start end opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [opts    (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 ;_       (conn-handler/check-connection conn opts) ;fdb-js/db performs this check
-                 db-chan (<? (fdb-js/db conn ledger opts))
-                 result  (<? (query-block/block-range db-chan start end opts))]
-             (resolve (clj->js result)))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
-
-(defn ^:export block-range-with-txn
-  "Returns a Promise that will eventually contain transaction information for blocks from
-   start block (inclusive) to end if provided (exclusive). Each block is a separate map,
-   containing keys :block :tx"
-  ([conn ledger block-map] (block-range-with-txn conn ledger block-map nil))
-  ([conn ledger block-map opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [opts      (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 ;_         (conn-handler/check-connection conn opts) ;fdb-js/db performs this check
-                 block-map (js->clj block-map :keywordize-keys true)
-                 {:keys [start end]} block-map
-                 db-chan   (<? (fdb-js/db conn ledger opts))
-                 db-blocks (<? (query-block/block-range db-chan start end opts))
-                 result    (query-range/block-with-tx-data db-blocks)]
-             (resolve (clj->js result)))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
-
-(defn ^:export block-query
-  ([conn ledger query-map] (block-query conn ledger query-map nil))
-  ([conn ledger query-map opts]
-   (js/Promise.
-     (fn [resolve reject]
-       (async/go
-         (try
-           (let [query-map*  (js->clj query-map :keywordize-keys true)
-                 opts        (when-not (nil? opts) (js->clj opts :keywordize-keys true))
-                 _           (conn-handler/check-connection conn opts)
-                 private-key (:private-key opts)
-                 auth-id     (or (:auth opts) (:auth-id opts))
-                 jwt         (:jwt opts)
-                 db          (when (nil? private-key)
-                               (<? (fdb-js/db conn ledger {:auth (when auth-id ["_auth/id" auth-id])
-                                                           :jwt  jwt})))
-                 result*     (if (nil? private-key)
-                               (<? (fdb-js/block-query-async db query-map* opts))
-                               (<? (fdb-js/signed-query-async conn ledger query-map* (assoc-in opts [:action] :block))))]
-             (resolve (clj->js result*)))
-           (catch :default e
-             (log/error e)
-             (reject e))))))))
-
-
 (defn ^:export history-query
   [sources query-map]
   (js/Promise.
@@ -636,9 +562,6 @@
 
 (def ^:export flureedb
   #js {:authenticate authenticate
-       :block_query block-query
-       :block_range block-range
-       :block_range_with_txn block-range-with-txn
        :close close
        :close_listener close-listener
        :connect connect

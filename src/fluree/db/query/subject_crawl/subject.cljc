@@ -1,6 +1,7 @@
 (ns fluree.db.query.subject-crawl.subject
   (:require [clojure.core.async :refer [<! >!] :as async]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.query.analytical-filter :as filter]
             [fluree.db.query.range :as query-range]
             [fluree.db.index :as index]
             [fluree.db.flake :as flake]
@@ -20,20 +21,21 @@
                       v
                       (when-let [variable (:variable o)]
                         (get vars variable)))
+        p*          (:value p)
         idx*        (if (nil? o*)
                       :psot
                       idx)
         [fflake lflake] (case idx*
-                          :post [(flake/create nil p o* nil nil nil util/min-integer)
-                                 (flake/create nil p o* nil nil nil util/max-integer)]
-                          :psot [(flake/create nil p nil nil nil nil util/min-integer)
-                                 (flake/create nil p nil nil nil nil util/max-integer)])
+                          :post [(flake/create nil p* o* nil nil nil util/min-integer)
+                                 (flake/create nil p* o* nil nil nil util/max-integer)]
+                          :psot [(flake/create nil p* nil nil nil nil util/min-integer)
+                                 (flake/create nil p* nil nil nil nil util/max-integer)])
         filter-fn   (cond
                       (and o* (= :psot idx*))
                       #(= o* (flake/o %))
 
                       (:filter o)
-                      (let [f (get-in o [:filter :function])]
+                      (let [f (filter/extract-combined-filter (:filter o))]
                         #(-> % flake/o f)))
         return-chan (async/chan 10 (comp (map flake/s)
                                          (dedupe)))]

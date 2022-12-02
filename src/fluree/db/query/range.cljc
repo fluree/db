@@ -89,15 +89,12 @@
     out))
 
 (defn resolve-match-flake
-  [db test parts]
-  (go-try
-    (let [[s p o t op m] parts
-          s' (<? (resolve-subid db s))
-          [o' dt] (if (vector? o)
-                    [(first o) (second o)]
-                    [o nil])
-          m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
-      (flake/create s' p o' dt t op m'))))
+  [test s p o t op m]
+  (let [[o' dt] (if (vector? o)
+                  [(first o) (second o)]
+                  [o nil])
+        m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
+    (flake/create s p o' dt t op m')))
 
 (defn resolved-leaf?
   [node]
@@ -290,12 +287,11 @@
           :or   {from-t t, to-t t}}
          opts
 
-         idx-compare (get-in db [:comparators idx])
          start-parts (match->flake-parts db idx start-match)
          end-parts   (match->flake-parts db idx end-match)]
      (go-try
-      (let [start-flake (<? (resolve-match-flake db start-test start-parts))
-            end-flake   (<? (resolve-match-flake db end-test end-parts))
+      (let [start-flake (apply resolve-match-flake db start-test start-parts)
+            end-flake   (apply resolve-match-flake db end-test end-parts)
             error-ch    (chan)
             range-ch    (index-range* db
                                       error-ch
@@ -335,9 +331,7 @@
    (index-range db idx start-test start-match end-test end-match {}))
   ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match
     {:keys [object-fn] :as opts}]
-   (let [idx-compare (get-in db [:comparators idx])
-
-         [s1 p1 o1 t1 op1 m1]
+   (let [[s1 p1 o1 t1 op1 m1]
          (match->flake-parts db idx start-match)
 
          [s2 p2 o2 t2 op2 m2]
@@ -350,25 +344,29 @@
                                [[o1 o2] object-fn])]
 
      (go-try
-      (let [start-flake (<? (resolve-match-flake db start-test [s1 p1 o1 t1 op1 m1]))
-            end-flake   (<? (resolve-match-flake db end-test [s2 p2 o2 t2 op2 m2]))
-            error-ch    (chan)
-            range-ch    (index-range* db
-                                      error-ch
-                                      (assoc opts
-                                             :idx         idx
-                                             :from-t      t
-                                             :to-t        t
-                                             :start-test  start-test
-                                             :start-flake start-flake
-                                             :end-test    end-test
-                                             :end-flake   end-flake
-                                             :object-fn   object-fn))]
-        (async/alt!
-          error-ch ([e]
-                    (throw e))
-          range-ch ([idx-range]
-                    idx-range)))))))
+       (let [start-flake (if (or (number? s1) (nil? s1))
+                           (resolve-match-flake start-test s1 p1 o1 t1 op1 m1)
+                           (resolve-match-flake start-test (<? (resolve-subid db s1)) p1 o1 t1 op1 m1))
+             end-flake   (if (or (number? s2) (nil? s2))
+                           (resolve-match-flake end-test s2 p2 o2 t2 op2 m2)
+                           (resolve-match-flake end-test (<? (resolve-subid db 2)) p2 o2 t2 op2 m2))
+             error-ch    (chan)
+             range-ch    (index-range* db
+                                       error-ch
+                                       (assoc opts
+                                         :idx idx
+                                         :from-t t
+                                         :to-t t
+                                         :start-test start-test
+                                         :start-flake start-flake
+                                         :end-test end-test
+                                         :end-flake end-flake
+                                         :object-fn object-fn))]
+         (async/alt!
+           error-ch ([e]
+                     (throw e))
+           range-ch ([idx-range]
+                     idx-range)))))))
 
 (defn non-nil-non-boolean?
   [o]
@@ -492,34 +490,3 @@
                (if (= type "tx")
                  (conj result* {:db db :tx tx :nonce nonce :auth auth :expire expire})
                  result*))))))
-
-(defn block-with-tx-data
-  "Returns block data as a map, with the following keys:
-  1. block - block number
-  2. t - fluree \"time\" since ledger creation
-  3. sigs - List of transactor signatures that signed this block
-  4. instant - instant this block was created, per the transactor.
-  5. hash - hash of current block
-  6. prev-hash - hash of previous block, if relevant
-  7. flakes - list of flakes comprising block
-  8. txn - list of transactions in block
-  "
-  [blocks]
-  (loop [[block' & r] blocks result* []]
-    (if (nil? block')
-      result*
-      (let [{:keys [block t flakes]} block'
-            prev-hash   (some #(when (= (flake/p %) const/$_block:prevHash) (flake/o %)) flakes)
-            hash        (some #(when (= (flake/p %) const/$_block:hash) (flake/o %)) flakes)
-            instant     (some #(when (= (flake/p %) const/$_block:instant) (flake/o %)) flakes)
-            sigs        (some #(when (= (flake/p %) const/$_block:sigs) (flake/o %)) flakes)
-            txn-flakes  (filter #(= (flake/p %) const/$_tx:tx) flakes)
-            txn-flakes' (txn-from-flakes txn-flakes)]
-        (recur r (conj result* {:block     block
-                                :t         t
-                                :hash      hash
-                                :prev-hash prev-hash
-                                :instant   instant
-                                :sigs      sigs
-                                :flakes    flakes
-                                :txn       txn-flakes'}))))))

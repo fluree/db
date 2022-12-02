@@ -4,7 +4,6 @@
             [fluree.crypto :as crypto]
             [fluree.db.flake :as flake]
             [fluree.db.operations :as ops]
-            [fluree.db.query.block :as query-block]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.fql :as fql]
             [fluree.db.session :as session]
@@ -402,43 +401,6 @@
 ;; Queries - Block, History, Multi-
 ;;
 ;; ======================================
-(defn block-query-async
-  "Returns an asynchronous channel that eventually returns the results or an error.
-  "
-  ([db query-map] (block-query-async db query-map nil))
-  ([db query-map opts]
-   (async/go
-     (try
-       (let [start   (util/current-time-millis)
-             {:keys [network db-id]} db
-             range   (<? (resolve-block-range db query-map))
-             _       (when
-                       (and (map? range) (:error range))
-                       (let [msg (or (:message range)
-                                     (str "Unknown error attempting to resolve block range for ledger " network "/" db-id))]
-                         (throw (ex-info msg range))))
-             [block-start block-end] range
-             result  (if (= '(:block) (keys (dissoc query-map :pretty-print)))
-                       (<? (query-block/block-range db block-start block-end opts))
-                       (throw (ex-info (str "Block query not properly formatted. It must only have a block key. Provided "
-                                            (pr-str query-map))
-                                       {:status 400
-                                        :error  :db/invalid-query})))
-             result' (if (:pretty-print query-map)
-                       (<? (format-block-resp-pretty db result))
-                       result)
-             result* (if (:meta opts)
-                       {:status 200
-                        :result (if (sequential? result')
-                                  (doall result')
-                                  result')
-                        :fuel   100
-                        :time   (util/response-time-formatted start)}
-                       result')]
-         result*)
-       (catch :default e
-         (log/error e)
-         (assoc (ex-data e) :message (ex-message e)))))))
 
 (defn history-query-async
   ([sources query-map] (history-query-async sources query-map nil))

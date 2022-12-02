@@ -10,12 +10,12 @@
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :sha     "edb189ce94282b1ea27fd04bb999c91f1492bf4b"}
+                                          :sha     "2e69362f611def8cc6793c6ddf24e4671fb6f397"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
-         logback-bundle/core-bundle      {:mvn/version "0.3.0"}
-         org.slf4j/slf4j-api             {:mvn/version "1.7.36"}
+         ch.qos.logback/logback-classic  {:mvn/version "1.4.5"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.5"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -55,7 +55,7 @@
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.20.7"}}}
+                 thheller/shadow-cljs              {:mvn/version "2.20.12"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources"]
@@ -99,5 +99,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.10.14"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.11.02"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
