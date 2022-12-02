@@ -49,7 +49,7 @@
     res))
 
 (defn process-in-item
-  [{:keys [conn] :as db} in-item in-n idx idx-root t novelty passthrough-fn p o flake-x-form optional? error-ch out-ch]
+  [{:keys [conn] :as db} in-item in-n idx t passthrough-fn p o flake-x-form optional? error-ch out-ch]
   (async/go
     (let [pass-vals (when passthrough-fn
                       (passthrough-fn in-item))
@@ -77,14 +77,12 @@
 
 (defn next-chunk-s
   [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p o idx t flake-x-form passthrough-fn]
-  (let [out-ch   (async/chan)
-        idx-root (get db idx)
-        novelty  (get-in db [:novelty idx])]
+  (let [out-ch   (async/chan)]
     (async/pipeline-async 2
                           out-ch
                           (fn [in-item ch]
-                            (process-in-item db in-item in-n idx idx-root t novelty passthrough-fn p o flake-x-form
-                                             optional? error-ch ch))
+                            (process-in-item db in-item in-n idx t passthrough-fn p o
+                                             flake-x-form optional? error-ch ch))
                           (async/to-chan! next-in))
     out-ch))
 
