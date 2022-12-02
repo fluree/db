@@ -108,37 +108,52 @@
 (defmulti get-clause-res (fn [_ _ {:keys [type] :as _clause} _ _ _ _ _]
                            type))
 
+(defn with-distinct-subjects
+  []
+  (fn [xf]
+    (let [seen (volatile! #{})]
+      (fn
+        ([]
+         (xf))
+
+        ([result flake-chunk]
+         (let [seen-before @seen]
+           (if-let [flakes (->> flake-chunk
+                                (remove (fn [f]
+                                          (contains? seen-before
+                                                     (flake/s f))))
+                                seq)]
+             (do (vswap! seen into (map flake/s) flakes)
+                 (xf result flakes))
+             result)))
+
+        ([result]
+         (xf result))))))
+
 (defmethod get-clause-res :class
   [{:keys [conn] :as db} prev-chan clause t vars fuel max-fuel error-ch]
-  (let [out-ch      (async/chan 2)
-        {:keys [s p o idx flake-x-form]} clause
+  (let [{:keys [s p o idx flake-x-form]} clause
         {pid :value} p
         {s-var :variable} s
         {o-var :variable} o
-        s*          (or (:value s)
-                        (get vars s-var))
-        o*          (or (:value o)
-                        (get vars o-var))
+
+        s* (or (:value s)
+               (get vars s-var))
+        o* (or (:value o)
+               (get vars o-var))
+
         subclasses  (dbproto/-class-prop db :subclasses o*)
-        all-classes (into [o*] subclasses)]
-    (async/go
-      (loop [[next-class & rest-classes] all-classes
-             all-seen #{}]
-        (if next-class
-          (let [class-chan (resolve-flake-range db idx t s* pid next-class nil error-ch)
-                ;; exhaust class, return all seen sids for the class
-                class-seen (loop [class-seen []]
-                             (let [next-res (async/<! class-chan)]
-                               (if next-res
-                                 (let [next-res* (remove #(all-seen (flake/s %)) next-res)]
-                                   (when (seq next-res*)
-                                     (async/>! out-ch next-res*))
-                                   (recur (conj class-seen (mapv flake/s next-res*))))
-                                 class-seen)))]
-            ;; integrate class-seen into all-seen
-            ;; class-seen will be a vector of lists of subject ids [(123 456) (45) (7 9 34) ...]
-            (recur rest-classes (reduce #(into %1 %2) all-seen class-seen)))
-          (async/close! out-ch))))
+        all-classes (into [o*] subclasses)
+
+        out-ch (async/chan 2 (with-distinct-subjects))]
+
+    (->> (async/to-chan! all-classes)
+         (async/pipeline-async 2
+                               out-ch
+                               (fn [class ch]
+                                 (async/pipe (resolve-flake-range db idx t s* pid class
+                                                                  nil error-ch)
+                                             ch))))
     out-ch))
 
 (defmethod get-clause-res :tuple
