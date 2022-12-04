@@ -185,7 +185,9 @@
                           did
                           (ledger-proto/-did ledger))
         ctx-used-atom (atom {})
-        compact-fn    (json-ld/compact-fn context* ctx-used-atom)]
+        compact-fn    (json-ld/compact-fn context* ctx-used-atom)
+        commit-time   (util/current-time-iso)]
+    (log/debug "Committing t" t "at" commit-time)
     {:alias          (ledger-proto/-alias ledger)
      :push?          (not (false? push?))
      :t              (- t)
@@ -193,7 +195,7 @@
      :prev-commit    (:address commit)
      :prev-dbid      (:dbid commit)
      :ledger-address nil                                    ;; TODO
-     :time           (util/current-time-iso)
+     :time           commit-time
      :context        context*
      :private        private*
      :did            did*
