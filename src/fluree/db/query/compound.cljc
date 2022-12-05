@@ -78,16 +78,15 @@
 
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
-  [db next-in clause t error-ch]
+  [db next-in clause t error-ch out-ch]
   (let [{:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
-        {o-var :variable, o-in-n :in-n} o
-        out-ch (if nils-fn
-                 (async/chan 2 (map nils-fn))
-                 (async/chan 2))]
+        {o-var :variable, o-in-n :in-n} o]
     (if s-in-n
       (let [s-vals-ch (next-chunk-s db error-ch next-in optional? s p o idx t flake-x-form passthrough-fn)]
-        (async/pipe s-vals-ch out-ch))
+        (if nils-fn
+          (async/pipeline 2 out-ch (map nils-fn) s-vals-ch)
+          (async/pipe s-vals-ch out-ch)))
       (async/close! out-ch))
     out-ch))
 
@@ -179,17 +178,36 @@
                         out-ch)))))
     out-ch))
 
-(defn process-union
-  [db prev-chan error-ch clause t]
-  (let [out-ch (async/chan 2)
-        [union1 union2] (:where clause)]
+(defn where-clause-chan
+  "Takes next where clause and returns and output channel with chunked results."
+  [db clause t prev-chan error-ch]
+  (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [next-in ch]
-                            (let [ch1 (where-clause-tuple-chunk db next-in (first union1) t error-ch)
-                                  ch2 (where-clause-tuple-chunk db next-in (first union2) t error-ch)]
-                              (-> (async/merge [ch1 ch2])
-                                  (async/pipe ch))))
+                            (where-clause-tuple-chunk db next-in clause t
+                                                      error-ch ch))
+                          prev-chan)
+    out-ch))
+
+(defn merge-clauses
+  [db next-in clause1 clause2 t error-ch out-ch]
+  (->> [clause1 clause2]
+       async/to-chan!
+       (async/pipeline-async 2
+                             out-ch
+                             (fn [clause ch]
+                               (where-clause-tuple-chunk db next-in clause t
+                                                         error-ch ch)))))
+
+(defn process-union
+  [db prev-chan error-ch clause t]
+  (let [out-ch (async/chan 2)
+        [union1 union2] (->> clause :where (map first))]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [next-in ch]
+                            (merge-clauses db next-in union1 union2 t error-ch ch))
                           prev-chan)
     out-ch))
 
