@@ -14,8 +14,8 @@
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from connection service")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
-  (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger")
-  )
+  (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))
+
 
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")

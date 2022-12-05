@@ -28,7 +28,7 @@
 (defn file-address
   "Turn a path into a fluree file address."
   [path]
-  (str "fluree:file:" path))
+  (str "fluree:file://" path))
 
 (defn local-path
   [conn]
@@ -183,7 +183,8 @@
   (-push [conn head-path commit-data] (async/go (push conn head-path commit-data)))
   (-lookup [conn head-address] (async/go (file-address (read-address conn head-address))))
   (-address [conn ledger-alias {:keys [branch] :as _opts}]
-    (async/go (file-address (str ledger-alias (when branch (str "/" (name branch))) "/head"))))
+    (let [branch (if branch (name branch) "main")]
+      (async/go (file-address (str ledger-alias "/" branch "/head")))))
 
   conn-proto/iConnection
   (-close [_]

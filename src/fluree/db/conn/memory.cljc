@@ -114,7 +114,7 @@
                                         head-commit-address)
                                    {:status 500 :error :db/invalid-ledger}))))))
   (-address [_ ledger-alias {:keys [branch] :as _opts}]
-    (async/go (memory-address (str ledger-alias "/" (name branch) "/" "HEAD"))))
+    (async/go (memory-address (str ledger-alias "/" (name branch) "/head"))))
 
   conn-proto/iConnection
   (-close [_]
