@@ -190,9 +190,9 @@
                           prev-chan)
     out-ch))
 
-(defn merge-clauses
-  [db next-in clause1 clause2 t error-ch out-ch]
-  (->> [clause1 clause2]
+(defn concat-clauses
+  [db t next-in clauses error-ch out-ch]
+  (->> clauses
        async/to-chan!
        (async/pipeline-async 2
                              out-ch
@@ -207,7 +207,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [next-in ch]
-                            (merge-clauses db next-in union1 union2 t error-ch ch))
+                            (concat-clauses db t next-in [union1 union2] error-ch ch))
                           prev-chan)
     out-ch))
 
