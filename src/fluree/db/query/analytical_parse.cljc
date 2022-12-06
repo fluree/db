@@ -1109,8 +1109,6 @@
 (defn add-where-meta-optional
   "Handles optional clause additional parsing."
   [{:keys [where] :as optional-where-clause} prior-vars supplied-vars]
-  (throw (ex-info (str "Multi-statement optional clauses not yet supported!")
-                  {:status 400 :error :db/invalid-query}))
   ;; TODO! - parsing here should be working OK but need to implement logic
   (let [[where* vars] (add-nested-where where prior-vars supplied-vars)]
     (assoc optional-where-clause :where where*
