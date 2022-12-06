@@ -239,17 +239,11 @@
        :filter clause-val}
 
       :optional
-      (if (vector? (first clause-val))
-        (if (= 1 (count clause-val))
-          ;; single clause, just wrapped in a vector unnecessarily - still support but unwrap
-          (-> (apply parse-where-tuple supplied-vars supplied-vars context db (first clause-val))
-              (assoc :optional? true))
-          ;; multiple optional statements, treat like a sub-query
-          {:type  :optional
-           :where (parse-where db {:where clause-val} supplied-vars context)})
-        ;; single optional statement, treat like a 3-tuple
-        (-> (apply parse-where-tuple supplied-vars supplied-vars context db clause-val)
-            (assoc :optional? true)))
+      (let [clauses (if (-> clause-val first vector?)
+                      clause-val
+                      [clause-val])]
+        {:type :optional
+         :where (parse-where db {:where clauses} supplied-vars context)})
 
       :union
       (if (= 2 (count clause-val))
