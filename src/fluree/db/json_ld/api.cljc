@@ -2,8 +2,9 @@
   (:require [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.platform :as platform]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.query :as query-api]
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
@@ -20,8 +21,8 @@
   [port]
   #?(:clj
      (let [p (promise)]
-       (async/go
-         (let [res (async/<! port)]
+       (go
+         (let [res (<! port)]
            (when (util/exception? res)
              (log/error res))
            (deliver p res)))
@@ -29,8 +30,8 @@
      :cljs
      (js/Promise.
        (fn [resolve reject]
-         (async/go
-           (let [res (async/<! port)]
+         (go
+           (let [res (<! port)]
              (if (util/exception? res)
                (reject res)
                (resolve res))))))))
@@ -107,7 +108,7 @@
    (let [res-ch (jld-ledger/create conn ledger-alias opts)]
      (promise-wrap res-ch))))
 
-(defn load
+(defn load-from-address
   "Loads a ledger defined with a Fluree address, e.g.:
   fluree:ipfs://Qmaq4ip1bJq6255S5PhU8veo6gxaq2yyucKZmJkV1WW8YG
   fluree:ipns://k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2
@@ -121,6 +122,34 @@
   ([conn address]
    (promise-wrap
      (jld-ledger/load conn address))))
+
+(defn alias->address
+  "Returns a core.async channel with the connection-specific address of the
+  given ledger-alias."
+  [conn ledger-alias]
+  (conn-proto/-address conn ledger-alias nil))
+
+(defn load
+  "Loads an existing ledger by its alias (which will be converted to a
+  connection-specific address first)."
+  [conn ledger-alias]
+  (promise-wrap
+    (go
+      (let [address (<! (alias->address conn ledger-alias))]
+        (log/debug "Loading ledger from" address)
+        (<! (jld-ledger/load conn address))))))
+
+(defn load-if-exists
+  "Attempts to load ledger-alias, returning a promise containing nil if it
+  doesn't exist, the ledger otherwise."
+  [conn ledger-alias]
+  (promise-wrap
+    (go
+      (let [address (<! (alias->address conn ledger-alias))
+            _ (log/debug "Attempting to load ledger from" address)
+            attempt (<! (jld-ledger/load conn address))]
+        (when-not (util/exception? attempt)
+          attempt)))))
 
 (defn index
   "Performs indexing operation on the specified ledger"
