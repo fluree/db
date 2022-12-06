@@ -929,7 +929,7 @@
                       :optional (throw (ex-info "OPTIONAL - TODO" {}))
                       :union (where-clause-reverse-union clause out-vars))]
         (recur r (:in-vars clause*) (conj acc clause*)))
-      (into [] (reverse acc)))))
+      (into [] (rseq acc)))))
 
 
 (defn update-select
