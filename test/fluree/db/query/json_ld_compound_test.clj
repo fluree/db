@@ -25,6 +25,7 @@
                       :schema/name  "Alice"
                       :schema/email "alice@example.org"
                       :schema/age   50
+                      :ex/favColor  "Green"
                       :ex/favNums   [42, 76, 9]}
                      {:context      {:ex "http://example.org/ns/"}
                       :id           :ex/cam,
@@ -61,6 +62,7 @@
               [50 {:id           :ex/alice,
                    :rdf/type     [:ex/User],
                    :schema/name  "Alice",
+                   :ex/favColor  "Green"
                    :schema/email "alice@example.org",
                    :schema/age   50,
                    :ex/favNums   [9, 42, 76]}]]))
@@ -165,4 +167,48 @@
               [:ex/cam :ex/favNums 10]
               [:ex/cam :ex/friend :ex/brian]
               [:ex/cam :ex/friend :ex/alice]])
-          "IRIs are resolved from subj ids, whether s, p, or o vals."))))
+          "IRIs are resolved from subj ids, whether s, p, or o vals.")
+      (testing "object->subject joins"
+        (is (= [{:id :ex/cam,
+                 :rdf/type [:ex/User],
+                 :schema/name "Cam",
+                 :schema/email "cam@example.org",
+                 :schema/age 34,
+                 :ex/favNums [5 10],
+                 :ex/friend
+                 [{:id :ex/alice,
+                   :rdf/type [:ex/User],
+                   :schema/name "Alice",
+                   :schema/email "alice@example.org",
+                   :schema/age 50,
+                   :ex/favNums [9 42 76],
+                   :ex/favColor "Green"}]}] 
+               @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                                  :select {'?s ["*", {:ex/friend ["*"]}]}
+                                  :where [['?s :ex/friend '?o]
+                                          ['?o :ex/favColor '?color]]})))
+        (testing "results are not sensitive to clause order"
+          (let [join @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                                        :select {'?s ["*" {:ex/friend ["*"]}]}
+                                        :where [['?s :ex/friend '?o]
+                                                ['?o :schema/name "Alice"]]})
+                join-clauses-swapped @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                                                        :select {'?s ["*" {:ex/friend ["*"]}]}
+                                                        :where [['?o :schema/name "Alice"]
+                                                                ['?s :ex/friend '?o]]})]
+            (is (= [{:id :ex/cam,
+                     :rdf/type [:ex/User],
+                     :schema/name "Cam",
+                     :schema/email "cam@example.org",
+                     :schema/age 34,
+                     :ex/favNums [5 10],
+                     :ex/friend
+                     [{:id :ex/alice,
+                       :rdf/type [:ex/User],
+                       :schema/name "Alice",
+                       :schema/email "alice@example.org",
+                       :schema/age 50,
+                       :ex/favNums [9 42 76],
+                       :ex/favColor "Green"}]}]
+                   join
+                   join-clauses-swapped))))))))
