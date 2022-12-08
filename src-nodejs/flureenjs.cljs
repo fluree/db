@@ -55,9 +55,13 @@
   ([conn ledger-alias] (fluree/create conn ledger-alias))
   ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
 
+(defn ^:export jldLoadFromAddress
+  ([address] (fluree/load-from-address address))
+  ([conn address] (fluree/load-from-address conn address)))
+
 (defn ^:export jldLoad
-  ([address] (fluree/load address))
-  ([conn address] (fluree/load conn address)))
+  [conn ledger-alias]
+  (fluree/load conn ledger-alias))
 
 (defn ^:export jldStage
   ([db-or-ledger json-ld] (fluree/stage db-or-ledger (js->clj json-ld)))
