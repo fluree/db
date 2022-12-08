@@ -721,10 +721,10 @@
 (defn gen-x-form
   "Returns x-form function that take flakes as an input and returns out
   only the needed variables from the flake based on the query's processing needs."
-  [out-vars {s-variable :variable} {p-variable :variable} {o-variable :variable}]
-  (let [s-var? (util/index-of out-vars s-variable)
-        p-var? (util/index-of out-vars p-variable)
-        o-var? (util/index-of out-vars o-variable)]
+  [out-vars join-vars {s-variable :variable} {p-variable :variable} {o-variable :variable}]
+  (let [s-var? (or (util/index-of out-vars s-variable) (util/index-of join-vars s-variable))
+        p-var? (or (util/index-of out-vars p-variable) (util/index-of join-vars p-variable))
+        o-var? (or (util/index-of out-vars o-variable) (util/index-of join-vars o-variable))]
     (cond
       (and s-var? p-var? o-var?)
       (map (fn [f] [(flake/s f) (flake/p f) [(flake/o f) (flake/dt f)]]))
@@ -870,6 +870,24 @@
     (into [] (concat flake-out others-out nils))))
 
 
+(defn get-subj->obj-join-vars 
+  "Finds subject vars that are meant to join on prior clause's
+  object vars, but are not listed as `out-vars`.
+
+  This can happen when:
+  - this is the final clause, and its `out-vars` are initialized to
+  the `select` statement vars, and
+  - this clause does not reference any `select` statement vars
+
+  We need to surface these vars so that flake-x-form for this clause
+  will select the correct flake parts."
+  [{s-var :variable} {p-var :variable} {o-var :variable} prior-vars out-vars]
+  (let [s-var-not-in-out-vars? (not (contains? (into #{} out-vars) s-var))
+        {prior-all :all} prior-vars]
+    (cond-> []
+      (and s-var-not-in-out-vars?
+           (= :o (get prior-all s-var))) (conj s-var)))) 
+
 (defn where-clause-reverse-tuple
   "When doing a final pass of the where clause in reverse, we calculate the variable output
   needed for each clause (starting with the :select output) and pass it into the next
@@ -879,16 +897,18 @@
   while also ensuring any non-flake output that must be passed through this step is taken."
   [{:keys [s p o vars prior-vars] :as where-clause} out-vars]
   (let [in-vars        (get-in-vars out-vars vars prior-vars)
+        join-vars      (get-subj->obj-join-vars s p o prior-vars out-vars)
         s*             (update-positions s in-vars)
         p*             (update-positions p in-vars)
         o*             (update-positions o in-vars)
-        flake-x-form   (gen-x-form out-vars s* p* o*)
+        flake-x-form   (gen-x-form out-vars join-vars s* p* o*)
         passthrough-fn (gen-passthrough-fn out-vars vars in-vars)
         nils-fn        (when (:nils vars)
                          (union/gen-nils-fn out-vars vars))]
     (-> where-clause
         (assoc :in-vars in-vars
                :out-vars out-vars
+               :join-vars join-vars ;;note: just here for debugging
                :s s*
                :o o*
                :idx (get-idx s* p o*)

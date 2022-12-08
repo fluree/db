@@ -45,7 +45,7 @@
          {select-spec :spec}     select
          [where1 where2 where3] where]
      (is (= :legacy (:strategy parsed)))
-     (testing "correspondences" 
+     (testing "in-var/out-var correspondences" 
        (is (= []
               (:in-vars where1)))
        (is (= (:out-vars where1)
@@ -85,3 +85,51 @@
                  :others ['?s]}
                 (:vars where3)))))))
 
+(deftest subject->object-joins
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "query/parse")
+        db     @(fluree/stage
+                 ledger
+                 [{:context      {:ex "http://example.org/ns/"}
+                   :id           :ex/brian,
+                   :type         :ex/User,
+                   :schema/name  "Brian"
+                   :schema/email "brian@example.org"
+                   :schema/age   50
+                   :ex/favNums   7}
+                  {:context      {:ex "http://example.org/ns/"}
+                   :id           :ex/alice,
+                   :type         :ex/User,
+                   :schema/name  "Alice"
+                   :schema/email "alice@example.org"
+                   :schema/age   50
+                   :ex/favColor  "Green"
+                   :ex/favNums   [42, 76, 9]}
+                  {:context      {:ex "http://example.org/ns/"}
+                   :id           :ex/cam,
+                   :type         :ex/User,
+                   :schema/name  "Cam"
+                   :schema/email "cam@example.org"
+                   :schema/age   34
+                   :ex/favNums   [5, 10]
+                   :ex/friend    [:ex/brian :ex/alice]}])]
+    (let [parsed (ap/parse db  {:context {:ex "http://example.org/ns/"}
+                                :select {'?s ["*", {:ex/friend ["*"]}]}
+                                :where [['?s :ex/friend '?o]
+                                        ['?o :schema/name "Alice"]]})
+          {:keys [select where]} parsed
+          [where1 where2] where
+          {select-spec :spec} select]
+      (testing "flake-x-forms are non-nil "
+        (is (:flake-x-form where1))
+        (is (:flake-x-form where2)))
+      (testing "join-vars"
+        (is (= [] (:join-vars where1)))
+        (is (= ['?o] (:join-vars where2))))
+      (testing "in-var/out-var correspondences" 
+        (is (= []
+               (:in-vars where1)))
+        (is (= (:out-vars where1)
+               (:in-vars where2)))
+        (is (= (set (:out-vars where2)) 
+               (set (map :variable select-spec))))))))
