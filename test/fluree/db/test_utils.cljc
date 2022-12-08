@@ -1,6 +1,8 @@
 (ns fluree.db.test-utils
   (:require [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.json-ld.api :as fluree]
+            #?@(:cljs [[clojure.core.async :refer [go]]
+                       [clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
   {:id     "@id"
@@ -79,8 +81,9 @@
   ([{:keys [context did]
      :or   {context default-context
             did     (did/private->did-map default-private-key)}}]
-   @(fluree/connect-memory {:defaults {:context context
-                                       :did     did}})))
+   (let [conn-p (fluree/connect-memory {:defaults {:context context
+                                                   :did     did}})]
+     #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies
   ([conn] (load-movies conn 0))

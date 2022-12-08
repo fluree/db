@@ -129,7 +129,7 @@
     (ls "http://127.0.0.1:5001/" "/ipns/k51qzi5uqu5dllaos3uy3sx0o8gw221tyaiu2qwmgdzy5lofij0us0h4ai41az"))
 
   (clojure.core.async/<!!
-    (add "http://127.0.0.1:5001/" {:hi "there" :im "blahhere"})
-    )
+    (add "http://127.0.0.1:5001/" {:hi "there" :im "blahhere"})))
 
-  )
+
+

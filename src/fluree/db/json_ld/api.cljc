@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.api
-  (:require [fluree.db.conn.ipfs :as ipfs-conn]
+  (:require [clojure.string :as str]
+            [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.proto :as conn-proto]
@@ -12,7 +13,7 @@
             [fluree.db.dbproto :as db-proto]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range])
-  (:refer-clojure :exclude [merge load range]))
+  (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -81,6 +82,11 @@
   [opts]
   (connect (assoc opts :method :memory)))
 
+(defn address?
+  "Returns true if the argument is a full ledger address, false if it is just an
+  alias."
+  [ledger-alias-or-address]
+  (str/starts-with? ledger-alias-or-address "fluree:"))
 
 (defn create
   "Creates a new json-ld ledger. A connection (conn)
@@ -127,6 +133,7 @@
   "Returns a core.async channel with the connection-specific address of the
   given ledger-alias."
   [conn ledger-alias]
+  (log/debug "Looking up address for ledger alias" ledger-alias)
   (conn-proto/-address conn ledger-alias nil))
 
 (defn load
@@ -139,17 +146,17 @@
         (log/debug "Loading ledger from" address)
         (<! (jld-ledger/load conn address))))))
 
-(defn load-if-exists
-  "Attempts to load ledger-alias, returning a promise containing nil if it
-  doesn't exist, the ledger otherwise."
-  [conn ledger-alias]
+(defn exists?
+  "Returns a promise with true if the ledger alias or address exists, false
+  otherwise."
+  [conn ledger-alias-or-address]
   (promise-wrap
     (go
-      (let [address (<! (alias->address conn ledger-alias))
-            _ (log/debug "Attempting to load ledger from" address)
-            attempt (<! (jld-ledger/load conn address))]
-        (when-not (util/exception? attempt)
-          attempt)))))
+      (let [address (if (address? ledger-alias-or-address)
+                      ledger-alias-or-address
+                      (<! (alias->address conn ledger-alias-or-address)))]
+        (log/debug "exists? - ledger address:" address)
+        (<! (conn-proto/-exists? conn address))))))
 
 (defn index
   "Performs indexing operation on the specified ledger"
