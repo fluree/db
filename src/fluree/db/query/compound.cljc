@@ -45,7 +45,11 @@
         sid-val))
     sid))
 
-(defn process-in-item
+#_(fn [res]
+    (cond-> res
+      optional? (with-optional xf sid pid)))
+
+(defn process-result-item
   [{:keys [conn] :as db} in-item in-n idx t passthrough-fn p o flake-x-form optional? error-ch out-ch]
   (let [{pid :value} p]
     (if-let [sid (some-> in-item (nth in-n) parse-sid)]
@@ -59,24 +63,24 @@
       (async/close! out-ch))))
 
 (defn next-chunk-s
-  [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p o idx t flake-x-form passthrough-fn]
+  [{:keys [conn] :as db} error-ch next-result optional? {:keys [in-n] :as s} p o idx t flake-x-form passthrough-fn]
   (let [out-ch   (async/chan)]
     (async/pipeline-async 2
                           out-ch
                           (fn [in-item ch]
-                            (process-in-item db in-item in-n idx t passthrough-fn p o
+                            (process-result-item db in-item in-n idx t passthrough-fn p o
                                              flake-x-form optional? error-ch ch))
-                          (async/to-chan! next-in))
+                          (async/to-chan! next-result))
     out-ch))
 
 (defn where-clause-tuple-chunk
   "Processes a chunk of input to a tuple where clause, and pushes output to out-chan."
-  [db next-in clause t error-ch out-ch]
+  [db next-result clause t error-ch out-ch]
   (let [{:keys [s p o idx flake-x-form passthrough-fn optional? nils-fn]} clause
         {s-var :variable, s-in-n :in-n} s
         {o-var :variable, o-in-n :in-n} o]
     (if s-in-n
-      (let [s-vals-ch (next-chunk-s db error-ch next-in optional? s p o idx t flake-x-form passthrough-fn)]
+      (let [s-vals-ch (next-chunk-s db error-ch next-result optional? s p o idx t flake-x-form passthrough-fn)]
         (if nils-fn
           (async/pipeline 2 out-ch (map nils-fn) s-vals-ch)
           (async/pipe s-vals-ch out-ch)))
@@ -84,17 +88,17 @@
     out-ch))
 
 
-(defn where-clause-chan
-  "Takes next where clause and returns and output channel with chunked results."
-  [db clause t prev-chan error-ch]
-  (let [out-ch (async/chan 2)]
+(defn refine-results
+  ""
+  [db clause t result-chan error-ch]
+  (let [refined-ch (async/chan 2)]
     (async/pipeline-async 2
-                          out-ch
-                          (fn [next-in ch]
-                            (where-clause-tuple-chunk db next-in clause t
+                          refined-ch
+                          (fn [next-result ch]
+                            (where-clause-tuple-chunk db next-result clause t
                                                       error-ch ch))
-                          prev-chan)
-    out-ch))
+                          result-chan)
+    refined-ch))
 
 (defmulti get-clause-res (fn [_ _ {:keys [type] :as _clause} _ _ _ _ _]
                            type))
@@ -172,13 +176,13 @@
     out-ch))
 
 (defn concat-clauses
-  [db t next-in clauses error-ch out-ch]
+  [db t next-result clauses error-ch out-ch]
   (->> clauses
        async/to-chan!
        (async/pipeline-async 2
                              out-ch
                              (fn [clause ch]
-                               (where-clause-tuple-chunk db next-in clause t
+                               (where-clause-tuple-chunk db next-result clause t
                                                          error-ch ch)))))
 
 (defn process-union
@@ -187,8 +191,8 @@
         [union1 union2] (->> clause :where (map first))]
     (async/pipeline-async 2
                           out-ch
-                          (fn [next-in ch]
-                            (concat-clauses db t next-in [union1 union2] error-ch ch))
+                          (fn [next-result ch]
+                            (concat-clauses db t next-result [union1 union2] error-ch ch))
                           prev-chan)
     out-ch))
 
@@ -201,7 +205,7 @@
       ;; TODO - get 't' from query!
       (if clause
         (let [out-chan (case (:type clause)
-                         (:class :tuple :iri) (where-clause-chan db clause t  prev-chan error-ch)
+                         (:class :tuple :iri) (refine-results db clause t  prev-chan error-ch)
                          :optional :TODO
                          :union (process-union db prev-chan error-ch clause t))]
           (recur r out-chan))
