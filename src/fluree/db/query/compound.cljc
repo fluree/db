@@ -100,6 +100,8 @@
                            type))
 
 (defn with-distinct-subjects
+  "Returns a transducer that filters a stream of flake chunks by removing any
+  flakes from each chunk with subjects appearing in previous chunks."
   []
   (fn [xf]
     (let [seen (volatile! #{})]
