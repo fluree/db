@@ -98,12 +98,10 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [next-in ch]
-                            (async/pipe (where-clause-tuple-chunk db next-in clause t
-                                                                  error-ch)
-                                        ch))
+                            (where-clause-tuple-chunk db next-in clause t
+                                                      error-ch ch))
                           prev-chan)
     out-ch))
-
 
 (defmulti get-clause-res (fn [_ _ {:keys [type] :as _clause} _ _ _ _ _]
                            type))
@@ -176,18 +174,6 @@
                 o*  (get-value o vars)]
             (async/pipe (resolve-flake-range db idx t s* pid o* flake-x-form error-ch)
                         out-ch)))))
-    out-ch))
-
-(defn where-clause-chan
-  "Takes next where clause and returns and output channel with chunked results."
-  [db clause t prev-chan error-ch]
-  (let [out-ch (async/chan 2)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [next-in ch]
-                            (where-clause-tuple-chunk db next-in clause t
-                                                      error-ch ch))
-                          prev-chan)
     out-ch))
 
 (defn concat-clauses
