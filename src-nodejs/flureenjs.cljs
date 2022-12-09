@@ -55,6 +55,10 @@
   ([conn ledger-alias] (fluree/create conn ledger-alias))
   ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
 
+(defn ^:export jldExists
+  [conn alias-or-address]
+  (fluree/exists? conn alias-or-address))
+
 (defn ^:export jldLoadFromAddress
   ([address] (fluree/load-from-address address))
   ([conn address] (fluree/load-from-address conn address)))
