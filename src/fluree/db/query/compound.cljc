@@ -54,13 +54,7 @@
                                               (concat result (passthrough-fn in-item))))))
             xf  (apply comp xfs)]
         (async/pipe
-         (async/transduce cat
-                          (completing conj
-                                      (fn [res]
-                                        (cond-> res
-                                          optional? (with-optional xf sid pid))))
-                          []
-                          (resolve-flake-range db idx t sid pid o xf error-ch))
+         (async/reduce into [] (resolve-flake-range db idx t sid pid o xf error-ch))
          out-ch))
       (async/close! out-ch))))
 
