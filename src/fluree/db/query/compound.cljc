@@ -47,23 +47,22 @@
 
 (defn process-in-item
   [{:keys [conn] :as db} in-item in-n idx t passthrough-fn p o flake-x-form optional? error-ch out-ch]
-  (async/go
-    (let [{pid :value} p]
-      (if-let [sid (some-> in-item (nth in-n) parse-sid)]
-        (let [xfs (cond-> [flake-x-form]
-                    passthrough-fn (conj (map (fn [result]
-                                                (concat result (passthrough-fn in-item))))))
-              xf  (apply comp xfs)]
-          (async/pipe
-           (async/transduce cat
-                            (completing conj
-                                        (fn [res]
-                                          (cond-> res
-                                            optional? (with-optional xf sid pid))))
-                            []
-                            (resolve-flake-range db idx t sid pid o xf error-ch))
-           out-ch))
-        (async/close! out-ch)))))
+  (let [{pid :value} p]
+    (if-let [sid (some-> in-item (nth in-n) parse-sid)]
+      (let [xfs (cond-> [flake-x-form]
+                  passthrough-fn (conj (map (fn [result]
+                                              (concat result (passthrough-fn in-item))))))
+            xf  (apply comp xfs)]
+        (async/pipe
+         (async/transduce cat
+                          (completing conj
+                                      (fn [res]
+                                        (cond-> res
+                                          optional? (with-optional xf sid pid))))
+                          []
+                          (resolve-flake-range db idx t sid pid o xf error-ch))
+         out-ch))
+      (async/close! out-ch))))
 
 (defn next-chunk-s
   [{:keys [conn] :as db} error-ch next-in optional? {:keys [in-n] :as s} p o idx t flake-x-form passthrough-fn]
