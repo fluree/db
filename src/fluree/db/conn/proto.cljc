@@ -14,8 +14,8 @@
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from connection service")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
-  (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger")
-  )
+  (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))
+
 
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
@@ -27,4 +27,5 @@
   (-subscribe [conn ledger] "Creates a subscription to nameservice(s) for ledger events")
   (-lookup [conn ledger-address] "Performs lookup operation on ledger address and returns latest commit address")
   (-alias [conn ledger-address] "Given a ledger address, returns ledger's default alias name else nil, if not avail")
-  (-address [conn ledger-alias key] "Returns address/iri for provided ledger alias specific to the connection type"))
+  (-address [conn ledger-alias key] "Returns address/iri for provided ledger alias specific to the connection type")
+  (-exists? [conn ledger-address] "Returns true if ledger exists (must have had at least one commit), false otherwise"))

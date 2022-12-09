@@ -85,6 +85,6 @@
 (comment
   #?(:cljs
 
-     (cljs.test/run-tests)
-     )
+     (cljs.test/run-tests))
+
   ,)
