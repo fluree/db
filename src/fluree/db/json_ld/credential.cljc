@@ -77,35 +77,38 @@
                                                    private)))})))
 
 (defn verify
-  "Takes a credential and returns true if it verifies."
+  "I a credential and returns the credential subject and issuer id if it verifies. If
+  credential does not have a jws returns the credential without verifying it. If the
+  credential is invalid an exception will be thrown."
   [credential]
   (go-try
-    (try*
-      (let [jws           (get-in credential ["proof" "jws"])
-            {:keys [header signature]} (deserialize-jws jws)
+    (if-let [jws (get-in credential ["proof" "jws"])]
+      (try*
+        (let [subject (get credential "credentialSubject")
+              issuer  (get credential "issuer")
+              {:keys [header signature]} (deserialize-jws jws)
 
-            signing-input #?(:clj (-> (get credential "credentialSubject")
-                                      (jld-processor/canonize)
-                                      (crypto/sha2-256))
-                             :cljs (<p! (-> (get credential "credentialSubject")
-                                            (jld-processor/canonize)
-                                            (.then (fn [res] (crypto/sha2-256 res))))))
+              signing-input #?(:clj (-> (jld-processor/canonize subject)
+                                        (crypto/sha2-256))
+                               :cljs (<p! (-> (jld-processor/canonize subject)
+                                              (.then (fn [res] (crypto/sha2-256 res))))))
 
-            proof-did     (get-in credential ["proof" "verificationMethod"])
-            pubkey        (did/decode-did-key proof-did)]
-        (when (not= jws-header-json header)
-          (throw (ex-info "Unsupported jws header in credential."
-                          {:error :credential/unknown-signing-algorithm
-                           :supported-header jws-header-json
-                           :header header
-                           :credential credential})))
+              proof-did     (get-in credential ["proof" "verificationMethod"])
+              pubkey        (did/decode-did-key proof-did)]
+          (when (not= jws-header-json header)
+            (throw (ex-info "Unsupported jws header in credential."
+                            {:error :credential/unknown-signing-algorithm
+                             :supported-header jws-header-json
+                             :header header
+                             :credential credential})))
 
-        (when (not (crypto/verify-signature pubkey signing-input signature))
-          (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
-        ;; everything is good
-        true)
-      (catch* e
-              (throw (ex-info "Unverifiable credential"
-                              {:credential credential
-                               :error :credential/unverifiable
-                               :message e}))))))
+          (when (not (crypto/verify-signature pubkey signing-input signature))
+            (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
+          ;; everything is good
+          {:subject subject :issuer issuer})
+        (catch* e
+                (throw (ex-info "Unverifiable credential"
+                                {:credential credential
+                                 :error :credential/unverifiable
+                                 :message e}))))
+      {:subject credential})))

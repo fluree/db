@@ -18,7 +18,8 @@
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec.where :as where]
             [clojure.core.async :as async :refer [>!]]
-            [fluree.db.dbproto :as dbproto])
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.credential :as cred])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -230,15 +231,16 @@
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap?] :as _opts}]
+  [db {:keys [bootstrap? issuer] :as _opts}]
   (let [{:keys [block ecount schema branch ledger], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t        (-> commit-t inc -)]                       ;; commit-t is always positive, need to make negative for internal indexing
-    {:db-before     db
+    {:issuer        issuer
+     :db-before     db
      :bootstrap?    bootstrap?
-     :stage-update? (= t db-t)                              ;; if a previously staged db is getting updated again before committed
+     :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
      :new?          (zero? db-t)
@@ -247,7 +249,7 @@
      :last-sid      last-sid
      :next-pid      (fn [] (vswap! last-pid inc))
      :next-sid      (fn [] (vswap! last-sid inc))
-     :subj-mods     (atom {})                               ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
+     :subj-mods     (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
      :iris          (volatile! {})}))
 
 (defn final-ecount
@@ -407,7 +409,7 @@
 
 (defn insert
   "Performs insert transaction"
-  [{:keys [schema] :as db} json-ld opts]
+  [{:keys [schema issuer] :as db} json-ld opts]
   (go-try
     (let [default-ctx (if (:js? opts) (:context-str schema) (:context schema))
           tx-state    (->tx-state db opts)
@@ -426,8 +428,8 @@
   "Executes a delete statement"
   [{:keys [t] :as db} max-fuel json-ld opts]
   (go-try
-   (let [{:keys [db-before t] :as tx-state}
-         (->tx-state db nil)
+    (let [{:keys [db-before t] :as tx-state}
+         (->tx-state db opts)
 
          {:keys [delete] :as parsed-query}
          (-> json-ld
@@ -476,7 +478,9 @@
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
   [db json-ld opts]
-  (if (and (contains? json-ld :delete)
-           (contains? json-ld :where))
-    (delete db util/max-integer json-ld opts)
-    (insert db json-ld opts)))
+  (go-try
+    (let [{tx :subject issuer :issuer} (<? (cred/verify json-ld))]
+      (if (and (contains? tx :delete)
+               (contains? tx :where))
+        (<? (delete db util/max-integer tx (assoc opts {:issuer issuer})))
+        (<? (insert db tx (assoc opts :issuer issuer)))))))
