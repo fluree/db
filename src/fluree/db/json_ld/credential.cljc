@@ -77,7 +77,7 @@
                                                    private)))})))
 
 (defn verify
-  "I a credential and returns the credential subject and issuer id if it verifies. If
+  "Takes a credential and returns the credential subject and issuer id if it verifies. If
   credential does not have a jws returns the credential without verifying it. If the
   credential is invalid an exception will be thrown."
   [credential]
