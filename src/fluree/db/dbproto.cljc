@@ -13,6 +13,7 @@
   (-tag [db tag-id] [db tag-id pred] "Returns resolved tag, shortens namespace if pred provided.")
   (-tag-id [db tag-name] [db tag-name pred] "Returns the tag sid. If pred provided will namespace tag if not already.")
   (-subid [db ident] [db ident strict?] "Returns subject ID if exists, else nil")
+  (-class-ids [db subject-id] "For the provided subject-id (long int), returns a list of class subject ids it is a member of (long ints)")
   (-iri [db subject-id] [db ident compact-fn] "Returns the IRI for the requested subject ID (json-ld only)")
   (-search [db fparts] "Performs a slice, but determines best index to use.")
   (-query [db query] [db query opts] "Performs a query.")

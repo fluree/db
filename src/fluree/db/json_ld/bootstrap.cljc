@@ -135,24 +135,25 @@
 
 
 (defn bootstrap-tx
-  [default-ctx dids]
+  [default-ctx]
   (let [ctx    (when default-ctx
                  (let [default-ctx* (normalize-default-ctx default-ctx)]
                    {"@id"     "fluree-default-context"
                     "@type"   ["Context"]
                     "context" default-ctx*}))
-        did-tx (when dids
-                 (dids-tx dids))]
-    {"@context" "https://ns.flur.ee/ledger/v1"
-     "@graph"   (cond-> default-tx
-                        ctx (conj ctx)
-                        did-tx (into did-tx))}))
+        graph (cond-> []
+                      ctx (conj ctx))]
+    (when (seq graph)
+      {"@context" "https://ns.flur.ee/ledger/v1"
+       "@graph"   graph})))
 
 (defn bootstrap
   "Bootstraps a permissioned JSON-LD db. Returns async channel."
-  [blank-db default-ctx dids]
-  (let [tx (bootstrap-tx default-ctx dids)]
-    (db-proto/-stage blank-db tx {:bootstrap? true})))
+  [blank-db default-ctx]
+  (let [tx (bootstrap-tx default-ctx)]
+    (if tx
+      (db-proto/-stage blank-db tx {:bootstrap? true})
+      blank-db)))
 
 (defn blank-db
   "When not bootstrapping with a transaction, bootstraps initial base set of flakes required for a db."
