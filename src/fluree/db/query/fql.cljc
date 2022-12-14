@@ -15,7 +15,7 @@
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.constants :as const]
-            [fluree.db.query.parse :as parse])
+            [fluree.db.query.exec :as exec])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -61,7 +61,7 @@
 
 (s/def ::wildcard wildcard?)
 
-(s/def ::var parse/variable?)
+(s/def ::var exec/variable?)
 
 (s/def ::ref (s/or :keyword keyword?
                    :string string?))
