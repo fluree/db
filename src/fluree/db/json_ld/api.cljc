@@ -1,9 +1,11 @@
 (ns fluree.db.json-ld.api
-  (:require [fluree.db.conn.ipfs :as ipfs-conn]
+  (:require [clojure.string :as str]
+            [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.platform :as platform]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.query :as query-api]
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
@@ -12,7 +14,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as perm])
-  (:refer-clojure :exclude [merge load range]))
+  (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -21,8 +23,8 @@
   [port]
   #?(:clj
      (let [p (promise)]
-       (async/go
-         (let [res (async/<! port)]
+       (go
+         (let [res (<! port)]
            (when (util/exception? res)
              (log/error res))
            (deliver p res)))
@@ -30,8 +32,8 @@
      :cljs
      (js/Promise.
        (fn [resolve reject]
-         (async/go
-           (let [res (async/<! port)]
+         (go
+           (let [res (<! port)]
              (if (util/exception? res)
                (reject res)
                (resolve res))))))))
@@ -81,6 +83,11 @@
   [opts]
   (connect (assoc opts :method :memory)))
 
+(defn address?
+  "Returns true if the argument is a full ledger address, false if it is just an
+  alias."
+  [ledger-alias-or-address]
+  (str/starts-with? ledger-alias-or-address "fluree:"))
 
 (defn create
   "Creates a new json-ld ledger. A connection (conn)
@@ -108,7 +115,7 @@
    (let [res-ch (jld-ledger/create conn ledger-alias opts)]
      (promise-wrap res-ch))))
 
-(defn load
+(defn load-from-address
   "Loads a ledger defined with a Fluree address, e.g.:
   fluree:ipfs://Qmaq4ip1bJq6255S5PhU8veo6gxaq2yyucKZmJkV1WW8YG
   fluree:ipns://k51qzi5uqu5dljuijgifuqz9lt1r45lmlnvmu3xzjew9v8oafoqb122jov0mr2
@@ -122,6 +129,35 @@
   ([conn address]
    (promise-wrap
      (jld-ledger/load conn address))))
+
+(defn alias->address
+  "Returns a core.async channel with the connection-specific address of the
+  given ledger-alias."
+  [conn ledger-alias]
+  (log/debug "Looking up address for ledger alias" ledger-alias)
+  (conn-proto/-address conn ledger-alias nil))
+
+(defn load
+  "Loads an existing ledger by its alias (which will be converted to a
+  connection-specific address first)."
+  [conn ledger-alias]
+  (promise-wrap
+    (go
+      (let [address (<! (alias->address conn ledger-alias))]
+        (log/debug "Loading ledger from" address)
+        (<! (jld-ledger/load conn address))))))
+
+(defn exists?
+  "Returns a promise with true if the ledger alias or address exists, false
+  otherwise."
+  [conn ledger-alias-or-address]
+  (promise-wrap
+    (go
+      (let [address (if (address? ledger-alias-or-address)
+                      ledger-alias-or-address
+                      (<! (alias->address conn ledger-alias-or-address)))]
+        (log/debug "exists? - ledger address:" address)
+        (<! (conn-proto/-exists? conn address))))))
 
 (defn index
   "Performs indexing operation on the specified ledger"

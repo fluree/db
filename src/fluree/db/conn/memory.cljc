@@ -1,11 +1,8 @@
 (ns fluree.db.conn.memory
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.core :as util
-             #?@(:clj [:refer [try* catch*]])
-             #?@(:cljs [:refer-macros [try* catch*]])]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try channel?]]
@@ -82,39 +79,41 @@
                              parallelism msg-in-ch msg-out-ch data-atom]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (async/go (read-commit data-atom commit-key)))
+  (-c-read [_ commit-key] (go (read-commit data-atom commit-key)))
   (-c-write [_ commit-data] (c-write! data-atom commit-data))
   (-c-write [_ db commit-data] (c-write! data-atom commit-data))
 
   conn-proto/iNameService
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
-  (-push [this address ledger-data] (async/go (push! data-atom address ledger-data)))
+  (-push [this address ledger-data] (go (push! data-atom address ledger-data)))
   (-alias [this address]
     (-> (address-path address)
         (str/split #"/")
         (->> (drop 2)
              (str/join "/"))))
   (-lookup [this head-commit-address]
-    (async/go #?(:clj
-                 (if-let [head-commit (read-address data-atom head-commit-address)]
-                   (-> head-commit (get "credentialSubject") (get "data") (get "address"))
-                   (throw (ex-info (str "Unable to lookup ledger address from conn: "
-                                        head-commit-address)
-                                   {:status 500 :error :db/missing-head})))
+    (go #?(:clj
+           (if-let [head-commit (read-address data-atom head-commit-address)]
+             (-> head-commit (get "credentialSubject") (get "data") (get "address"))
+             (throw (ex-info (str "Unable to lookup ledger address from conn: "
+                                  head-commit-address)
+                             {:status 500 :error :db/missing-head})))
 
-                 :cljs
-                 (if platform/BROWSER
-                   (if-let [head-commit (read-address data-atom head-commit-address)]
-                     (memory-address head-commit)
-                     (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
-                                          head-commit-address)
-                                     {:status 500 :error :db/missing-head})))
-                   (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
-                                        head-commit-address)
-                                   {:status 500 :error :db/invalid-ledger}))))))
-  (-address [_ ledger-alias {:keys [branch] :as _opts}]
-    (async/go (memory-address (str ledger-alias "/" (name branch) "/" "HEAD"))))
+           :cljs
+           (if platform/BROWSER
+             (if-let [head-commit (read-address data-atom head-commit-address)]
+               (memory-address head-commit)
+               (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
+                                    head-commit-address)
+                               {:status 500 :error :db/missing-head})))
+             (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
+                                  head-commit-address)
+                             {:status 500 :error :db/invalid-ledger}))))))
+  (-address [_ ledger-alias {:keys [branch] :or {branch :main} :as _opts}]
+    (go (memory-address (str ledger-alias "/" (name branch) "/head"))))
+  (-exists? [_ ledger-address]
+    (go (boolean (read-address data-atom ledger-address))))
 
   conn-proto/iConnection
   (-close [_]
@@ -171,7 +170,7 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context did] :as defaults}]
+  [{:keys [context did] :as _defaults}]
   (async/go
     {:context context
      :did     did}))
