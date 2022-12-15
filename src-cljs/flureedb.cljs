@@ -57,8 +57,11 @@
   ([conn ledger-alias] (fluree/load conn ledger-alias)))
 
 (defn ^:export jldStage
-  ([db-or-ledger json-ld] (fluree/stage db-or-ledger (js->clj json-ld)))
-  ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger (js->clj json-ld) (js->clj opts :keywordize-keys true))))
+  ([db-or-ledger json-ld]
+   (fluree/stage db-or-ledger (js->clj json-ld) {:js? true}))
+  ([db-or-ledger json-ld opts]
+   (fluree/stage db-or-ledger (js->clj json-ld) (-> (js->clj opts :keywordize-keys true)
+                                                    (assoc :js? true)))))
 
 (defn ^:export jldCommit
   ([db] (.then (fluree/commit! db)
@@ -80,10 +83,10 @@
   [db query]
   (let [query* (->> (js->clj query :keywordize-keys false)
                     (reduce-kv (fn [acc k v]
-                                   (assoc acc (keyword k) v))
+                                 (assoc acc (keyword k) v))
                                {}))]
-       (.then (fluree/query db (assoc-in query* [:opts :js?] true))
-              (fn [result] (clj->js result)))))
+    (.then (fluree/query db (assoc-in query* [:opts :js?] true))
+           (fn [result] (clj->js result)))))
 
 
 ;; ======================================
@@ -568,34 +571,34 @@
   (http-signatures/sign-request req-method url request private-key auth))
 
 (def ^:export flureedb
-  #js {:authenticate authenticate
-       :close close
-       :close_listener close-listener
-       :connect connect
-       :connect_p connect-p
-       :db db
-       :db_schema db-schema
-       :delete_ledger delete-ledger
-       :history_query history-query
-       :http_signature http-signature
-       :jldCommit jldCommit
-       :jldConnect jldConnect
-       :jldCreate jldCreate
-       :jldDb jldDb
-       :jldLoad jldLoad
-       :jldQuery jldQuery
-       :jldStage jldStage
-       :jldStatus jldStatus
-       :ledger_stats ledger-stats
-       :listen listen
-       :listeners listeners
-       :monitor_tx monitor-tx
-       :multi_query multi-query
-       :new_ledger new-ledger
+  #js {:authenticate      authenticate
+       :close             close
+       :close_listener    close-listener
+       :connect           connect
+       :connect_p         connect-p
+       :db                db
+       :db_schema         db-schema
+       :delete_ledger     delete-ledger
+       :history_query     history-query
+       :http_signature    http-signature
+       :jldCommit         jldCommit
+       :jldConnect        jldConnect
+       :jldCreate         jldCreate
+       :jldDb             jldDb
+       :jldLoad           jldLoad
+       :jldQuery          jldQuery
+       :jldStage          jldStage
+       :jldStatus         jldStatus
+       :ledger_stats      ledger-stats
+       :listen            listen
+       :listeners         listeners
+       :monitor_tx        monitor-tx
+       :multi_query       multi-query
+       :new_ledger        new-ledger
        :password_generate password-generate
-       :password_login password-login
-       :query query
-       :renew_token renew-token
-       :set_logging set-logging
-       :signed_query signed-query
-       :transact transact})
+       :password_login    password-login
+       :query             query
+       :renew_token       renew-token
+       :set_logging       set-logging
+       :signed_query      signed-query
+       :transact          transact})

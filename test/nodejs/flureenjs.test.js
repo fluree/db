@@ -70,6 +70,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
         wiki: "https://www.wikidata.org/wiki/",
         skos: "http://www.w3.org/2008/05/skos#",
         f: "https://ns.flur.ee/ledger#",
+        ex: "http://example.org/ns/"
       },
       did: {
         id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
@@ -83,45 +84,53 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
 
   const ledger = await flureenjs.jldCreate(conn, "testledger");
 
+  const db = await flureenjs.jldStage(ledger, {
+    id: "ex:john",
+    "@type": "ex:User",
+    "schema:name": "John"
+  });
+
+
    const results = await flureenjs.jldQuery(
-     flureenjs.jldDb(ledger),
+     db,
      {
        select: { "?s": ["*"] },
-       where: [["?s", "rdf:type", "https://ns.flur.ee/ledger#DID"]]
+       where: [["?s", "rdf:type", "ex:User"]]
      }
-   )
+   );
+
 
    expect(results).toStrictEqual(
        [
          {
-           id: 'did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6',
-           'rdf:type': [ 'f:DID' ],
-           'f:role': { id: 'fluree-root-role' }
+           id: 'ex:john',
+           'rdf:type': [ 'ex:User' ],
+           'schema:name': "John"
          }
        ]
    );
 
    // test providing context works and remaps keys
    const contextResults = await flureenjs.jldQuery(
-     flureenjs.jldDb(ledger),
-     { "@context": {"flhubee": "https://ns.flur.ee/ledger#role"},
+     db,
+     { "@context": {"flhubee": "http://schema.org/name"},
        select: { "?s": ["*"] },
-       where: [["?s", "rdf:type", "https://ns.flur.ee/ledger#DID"]]
+       where: [["?s", "rdf:type", "ex:User"]]
      }
    );
 
    expect(contextResults).toStrictEqual(
     [
       {
-        id: 'did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6',
-        flhubee: { id: 'fluree-root-role' },
-        'rdf:type': [ 'f:DID' ]
+        id: 'ex:john',
+        'rdf:type': [ 'ex:User' ],
+        flhubee: 'John'
       }
     ]
    );
 
 
-  const db = await flureenjs.jldStage(ledger, {
+  const db2 = await flureenjs.jldStage(db, {
     "@id": "uniqueId",
     foo: "foo",
     bar: "bar",
@@ -129,7 +138,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
 
 //  await flureenjs.jldCommit(db);
 
-  const results2 = await flureenjs.jldQuery(db, {
+  const results2 = await flureenjs.jldQuery(db2, {
     select: { "?s": ["*"] },
     where: [["?s", "@id", "uniqueId"]],
   });
