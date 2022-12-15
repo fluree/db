@@ -239,13 +239,16 @@
                                        (select-values result selectors))))]
     (async/pipe result-ch select-ch)))
 
+(defn parse-context
+  [db q]
+  (let [db-ctx (get-in db [:schema :context])
+        q-ctx  (or (:context q) (get q "@context"))]
+    (json-ld/parse-context db-ctx q-ctx)))
+
 (defn query
   [db q]
-  (let [error-ch    (async/chan)
-        context     (json-ld/parse-context (get-in db [:schema :context])
-                                           (or (:context q) (get q "@context")))
-        constraints (:where q)
-        selectors   (:select q)]
-    (->> (where db context error-ch constraints)
-         (select selectors)
-         (async/reduce conj []))))
+  (let [error-ch (async/chan)
+        context  (parse-context db q)]
+    (->> (where db context error-ch (:where q))
+         (select (:select q))
+         (async/into []))))
