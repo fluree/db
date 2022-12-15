@@ -68,8 +68,11 @@
   (fluree/load conn ledger-alias))
 
 (defn ^:export jldStage
-  ([db-or-ledger json-ld] (fluree/stage db-or-ledger (js->clj json-ld)))
-  ([db-or-ledger json-ld opts] (fluree/stage db-or-ledger (js->clj json-ld) (js->clj opts :keywordize-keys true))))
+  ([db-or-ledger json-ld]
+   (fluree/stage db-or-ledger (js->clj json-ld) {:js? true}))
+  ([db-or-ledger json-ld opts]
+   (fluree/stage db-or-ledger (js->clj json-ld) (-> (js->clj opts :keywordize-keys true)
+                                                    (assoc :js? true)))))
 
 (defn ^:export jldCommit
   ([db] (fluree/commit! db))
@@ -88,12 +91,12 @@
   [db query]
   (let [query* (->> (js->clj query :keywordize-keys false)
                     (reduce-kv (fn [acc k v]
-                                   (assoc acc (if (str/starts-with? k "@")
-                                                k
-                                                (keyword k)) v))
+                                 (assoc acc (if (str/starts-with? k "@")
+                                              k
+                                              (keyword k)) v))
                                {}))]
-       (.then (fluree/query db (assoc-in query* [:opts :js?] true))
-              (fn [result] (clj->js result)))))
+    (.then (fluree/query db (assoc-in query* [:opts :js?] true))
+           (fn [result] (clj->js result)))))
 
 
 

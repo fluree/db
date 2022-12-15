@@ -384,21 +384,22 @@
   "Performs insert transaction"
   [{:keys [schema] :as db} json-ld opts]
   (go-try
-    (let [tx-state (->tx-state db opts)
-          db*      (-> json-ld
-                       (json-ld/expand (:context schema))
-                       (stage-flakes tx-state)
-                       <?
-                       (final-db tx-state)
-                       <?
-                       (validate-rules tx-state)
-                       <?)]
+    (let [default-ctx (if (:js? opts) (:context-str schema) (:context schema))
+          tx-state    (->tx-state db opts)
+          db*         (-> json-ld
+                          (json-ld/expand default-ctx)
+                          (stage-flakes tx-state)
+                          <?
+                          (final-db tx-state)
+                          <?
+                          (validate-rules tx-state)
+                          <?)]
       db*)))
 
 ;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
 (defn delete
   "Executes a delete statement"
-  [db max-fuel json-ld]
+  [db max-fuel json-ld opts]
   (go-try
     (let [{:keys [delete] :as parsed-query} (q-parse/parse db json-ld)
           fuel          (volatile! 0)
@@ -443,5 +444,5 @@
   [db json-ld opts]
   (if (and (contains? json-ld :delete)
            (contains? json-ld :where))
-    (delete db util/max-integer json-ld)
+    (delete db util/max-integer json-ld opts)
     (insert db json-ld opts)))
