@@ -1,4 +1,4 @@
-(ns fluree.db.query.fql-resp
+(ns fluree.db.query.fql.resp
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util
