@@ -20,7 +20,7 @@
                                 {:select {"?s" [:*]} :where [["?s" "@id" "http://dan.com/dan"]]})
         db2-results (idxr/query idxr (:db/address db2-info)
                                 {:select {"?s" [:*]} :where [["?s" "@id" "http://dan.com/dan"]]})]
-    (is (= "fluree:db:memory:test1/init"
+    (is (= "fluree:db:memory:test1/db/init"
            db0-address))
     (is (= [] db0-results))
     ;; address has a random-uuid, not deterministic

@@ -9,13 +9,13 @@
 
 (defn create-commit-address
   [store ledger-name id]
-  (store/address store :commit (str ledger-name "/commits/" id)))
+  (store/address store :commit (str ledger-name "/commit/" id)))
 
 (defn create
-  [tx meta]
+  [tx db-info]
   (let [{:keys [db/address db/context db/t db/flakes db/size db/assert db/retract
                 commit/prev txr/store ledger/name]}
-        meta
+        db-info
         ;; TODO: properly figure out asserts, retracts
         commit-tx (cond-> {:commit/assert assert
                            :commit/retract retract

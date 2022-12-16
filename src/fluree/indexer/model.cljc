@@ -1,6 +1,5 @@
 (ns fluree.indexer.model
-  (:require [fluree.transactor.api :as txr]
-            [fluree.store.api :as store]))
+  (:require [fluree.store.api :as store]))
 
 (def IndexerConfig
   [:and
@@ -35,7 +34,6 @@
 
 (def DbInfo
   [:map
-   [:ledger/name :string]
    [:db/address :string]
    [:db/t :int]
    [:db/flakes :int]

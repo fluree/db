@@ -26,6 +26,7 @@
   [:and
    idxr/DbInfo
    [:map
+    [:ledger/name :string]
     [:commit/prev {:optional true} :string]]])
 
 (def Commit

@@ -6,7 +6,7 @@
 (defn create-db-address
   [db]
   ;; TODO: uses tt-id now, would be nice to get a content-addressed id
-  (store/address (:conn db) "db" (str (:alias db) "/" (or (:tt-id db) "init"))))
+  (store/address (:conn db) "db" (str (:alias db) "/db/" (or (:tt-id db) "init"))))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"

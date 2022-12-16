@@ -16,7 +16,7 @@
    EntryInfo
    [:entry/previous {:optional true} EntryInfo]
    [:entry/commit {:optional true} txr/CommitInfo]
-   [:entry/index {:optional true}
+   [:entry/db {:optional true}
     [:map
      [:db/address :string]
      [:db/t :int]

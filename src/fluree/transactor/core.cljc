@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [read])
   (:require [fluree.common.identity :as ident]
             [fluree.common.protocols :as service-proto]
+            [fluree.common.model :as model]
             [fluree.db.util.log :as log]
             [fluree.store.api :as store]
             [fluree.transactor.commit :as commit]

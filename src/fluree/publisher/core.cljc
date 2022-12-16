@@ -27,22 +27,22 @@
 (defn init-ledger
   [pub ledger-name {:keys [context head-address db-address] :as opts}]
   (let [store          (:store pub)
-        init-ledger         (ledger/create store ledger-name opts)
-        ledger-entry   (ledger-entry/create store init-ledger nil {:index/address db-address})
+        init-ledger    (ledger/create store ledger-name opts)
+        ledger-entry   (ledger-entry/create store init-ledger nil {:db/address db-address})
         ledger         (assoc init-ledger :ledger/head ledger-entry)
         ledger-address (:ledger/address ledger)
         existing?      (pull-publisher pub ledger-address)
 
         _ (when existing? (throw (ex-info (str "Cannot initialize file ledger: " (pr-str ledger-name)
                                                "already exists.")
-                                          {:ledger-name ledger-name
+                                          {:ledger-name    ledger-name
                                            :ledger-address ledger-address
-                                           :opts opts})))
+                                           :opts           opts})))
 
-        final-ledger   (if (:did pub)
-                         (credential/generate ledger (:did pub))
-                         ledger)
-        entry-address  (ledger-entry/create-entry-address store ledger-name "init")
+        final-ledger  (if (:did pub)
+                        (credential/generate ledger (:did pub))
+                        ledger)
+        entry-address (ledger-entry/create-entry-address store ledger-name "init")
 
         {entry-path :address/path}  (ident/address-parts entry-address)
         {ledger-path :address/path} (ident/address-parts (:ledger/address ledger))]
@@ -53,12 +53,12 @@
     (:ledger/address ledger)))
 
 (defn push-publisher
-  [pub ledger-address {:keys [commit-info index-info]}]
+  [pub ledger-address {:keys [commit-info db-info]}]
   (let [store        (:store pub)
         prev-ledger  (pull-publisher pub ledger-address)
         ;; unwrap ledger from credential if it's wrapped
         prev-ledger  (get prev-ledger :cred/credential-subject prev-ledger)
-        entry        (ledger-entry/create store prev-ledger commit-info index-info)
+        entry        (ledger-entry/create store prev-ledger commit-info db-info)
         ledger       (assoc prev-ledger :ledger/head entry)
         final-ledger (if (:did pub)
                        (credential/generate ledger (:did pub))
