@@ -1,7 +1,6 @@
 (ns fluree.db.query.subject-crawl.core
   (:require [clojure.core.async :refer [go <!] :as async]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
-            [fluree.db.query.fql-parser :refer [parse-db]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.subject :refer [subj-crawl]]
