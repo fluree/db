@@ -12,7 +12,8 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.dbproto :as db-proto]
             [fluree.db.util.log :as log]
-            [fluree.db.query.range :as query-range])
+            [fluree.db.query.range :as query-range]
+            [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -263,6 +264,18 @@
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
      (ledger-proto/-db ledger opts))))
+
+
+(defn wrap-policy
+  "Wraps a db object with specified permission attributes.
+  When requesting a db from a ledger, permission attributes can
+  be requested at that point, however if one has a db already, this
+  allows the permission attributes to be modified.
+
+  Returns promise"
+  [db {:keys [f/$identity f/role f/credential]}]
+  (promise-wrap
+    (perm/wrap-policy db $identity role credential)))
 
 
 (defn query
