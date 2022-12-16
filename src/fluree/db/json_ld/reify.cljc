@@ -86,7 +86,7 @@
     (let [{:keys [id type]} node
           existing-sid    (<? (get-iri-sid id db iris))
           sid             (or existing-sid
-                              (jld-ledger/generate-new-sid node iris next-pid next-sid))
+                              (jld-ledger/generate-new-sid node nil iris next-pid next-sid))
           type-assertions (if type
                             (loop [[type-item & r] type
                                    acc []]
@@ -118,7 +118,7 @@
                   acc*         (cond-> (if id ;; is a ref to another IRI
                                          (let [existing-sid (<? (get-iri-sid id db iris))
                                                ref-sid      (or existing-sid
-                                                                (jld-ledger/generate-new-sid v-map iris next-pid next-sid))]
+                                                                (jld-ledger/generate-new-sid v-map pid iris next-pid next-sid))]
                                            (cond-> (conj acc (flake/create sid pid ref-sid const/$xsd:anyURI t true nil))
                                              (nil? existing-sid) (conj (flake/create ref-sid const/$iri id const/$xsd:string t true nil))))
                                          (let [[value dt] (datatype/from-expanded v-map nil)]

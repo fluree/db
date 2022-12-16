@@ -29,15 +29,22 @@
   Only need to test maps that have :id - and if they have other properties they
   are defining then we know it is a node and have additional data to include."
   [mapx]
-  (if (contains? mapx :value)
+  (cond
+    (contains? mapx :value)
     false
-    (let [n (count mapx)]
-      (case n
-        2 (not (and (contains? mapx :id)
-                    (contains? mapx :idx)))
-        1 (not (contains? mapx :id))                        ;; I think all nodes now contain :idx, so this is likely unnecessary check
-        ;;else
-        true))))
+
+    (and
+      (contains? mapx :list)
+      (= #{:list :idx} (set (keys mapx))))
+    false
+
+    (and
+      (contains? mapx :set)
+      (= #{:set :idx} (set (keys mapx))))
+    false
+
+    :else
+    true))
 
 
 (defn json-ld-type-data
@@ -66,17 +73,15 @@
 
 (defn- new-pid
   "Generates a new property id (pid)"
-  [property ref? {:keys [iris next-pid refs] :as tx-state}]
+  [property ref? {:keys [iris next-pid refs] :as _tx-state}]
   (let [new-id (jld-ledger/generate-new-pid property iris next-pid ref? refs)]
     new-id))
 
-(defn add-ref-flakes
-  [])
 
 (defn add-property
   "Adds property. Parameters"
-  [sid pid {shacl-dt :dt, validate-fn :validate-fn} check-retracts? list? {:keys [id value] :as v-map}
-   {:keys [iris next-sid next-pid t db-before] :as tx-state}]
+  [sid pid {shacl-dt :dt, validate-fn :validate-fn} check-retracts? list? {:keys [value] :as v-map}
+   {:keys [t db-before] :as tx-state}]
   (go-try
     (let [retractions (when check-retracts?                 ;; don't need to check if generated pid during this transaction
                         (->> (<? (query-range/index-range db-before :spot = [sid pid]))
@@ -86,8 +91,7 @@
           flakes      (cond
                         ;; a new node's data is contained, process as another node then link to this one
                         (node? v-map)
-                        (let [node-flakes (<? (json-ld-node->flakes v-map tx-state))
-                              node-sid    (get @iris id)]
+                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
                           (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
                         ;; a literal value
@@ -101,21 +105,8 @@
 
                         ;; otherwise should be an IRI 'ref' either as an :id, or mis-cast as a value that needs coercion
                         :else
-                        (let [iri (or id value)]
-                          (let [blank? (str/starts-with? iri "_:")
-                                [id-sid id-flake] (if-let [existing (<? (jld-reify/get-iri-sid iri db-before iris))]
-                                                    [existing nil]
-                                                    (let [id-sid (or (get jld-ledger/predefined-properties iri)
-                                                                     (if (#{const/$sh:path const/$sh:ignoredProperties
-                                                                            const/$sh:targetClass
-                                                                            const/$sh:targetSubjectsOf const/$sh:targetObjectsOf}
-                                                                          pid)
-                                                                       (next-pid) ;; shacl path is a property, so assign pid
-                                                                       (next-sid)))]
-                                                      (vswap! iris assoc iri id-sid)
-                                                      [id-sid (flake/create id-sid const/$iri iri const/$xsd:string t true nil)]))]
-                            (cond-> [(flake/create sid pid id-sid const/$xsd:anyURI t true m)]
-                                    id-flake (conj id-flake)))))]
+                        (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
+                                        {:status 400 :error :db/invalid-transaction})))]
       (into flakes retractions))))
 
 (defn list-value?
@@ -135,9 +126,46 @@
         (into added-classes type-sids)
         added-classes))))
 
+(defn iri-only?
+  "Returns true if a JSON-LD node contains only an IRI and no actual property data.
+
+  Note, this is only used if we already know the node is a subject (not a scalar value)
+  so no need to check for presence of :id."
+  [node]
+  (= 2 (count node)))
+
+(defn register-node
+  "Registers nodes being created/updated in an atom to verify the same node isn't being
+  manipulated multiple spots and also registering shacl rules that need further processing
+  once completed."
+  [subj-mods node sid node-meta-map]
+  (swap! subj-mods update sid
+         (fn [existing]
+           (if-not existing
+             node-meta-map
+             (cond
+               ;; if previously created, but this is just using the IRI it is OK
+               (:iri-only? node-meta-map)
+               existing
+
+               ;; if previously updated, but prior updates were only the IRI then it is OK
+               (:iri-only? existing)
+               node-meta-map
+
+               :else
+               (throw (ex-info (str "Subject " (:id node) " is being updated in more than one JSON-LD map. "
+                                    "All items for a single subject should be consolidated.")
+                               {:status 400 :error :db/invalid-transaction})))))))
+
 (defn json-ld-node->flakes
+  "Returns two-tupel of [sid node-flakes] that will contain the top-level sid
+  and all flakes from the target node and all children nodes that ultimately get processed.
+
+  If property-id is non-nil, it can be checked when assigning new subject id for the node
+  if it meets certain criteria. It will only be non-nil for nested subjects in the json-ld."
   [{:keys [id type] :as node}
-   {:keys [t next-pid next-sid iris db-before subj-mods] :as tx-state}]
+   {:keys [t next-pid next-sid iris db-before subj-mods] :as tx-state}
+   referring-pid]
   (go-try
     (let [existing-sid (when id
                          (<? (jld-reify/get-iri-sid id db-before iris)))
@@ -146,7 +174,7 @@
                                         (<? (json-ld-type-data type tx-state)))
           sid          (if new-subj?
                          ;; TODO - this will check if subject is rdfs:Class, but we already have the new-type-sids above and know that - this can be a little faster, but reify.cljc also uses this logic and they need to align
-                         (jld-ledger/generate-new-sid node iris next-pid next-sid)
+                         (jld-ledger/generate-new-sid node referring-pid iris next-pid next-sid)
                          existing-sid)
           classes      (if new-subj?
                          new-type-sids
@@ -158,16 +186,11 @@
           base-flakes  (cond-> []
                                new-subj? (conj (flake/create sid const/$iri id* const/$xsd:string t true nil))
                                new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
-      ;; save SHACL, class data into atom for later validation
-      (swap! subj-mods update sid
-             (fn [existing]
-               (if existing
-                 (throw (ex-info (str "Subject " id " is being updated in more than one JSON-LD map. "
-                                      "All items for a single subject should be consolidated.")
-                                 {:status 400 :error :db/invalid-transaction}))
-                 {:shacl   shacl-map
-                  :new?    new-subj?
-                  :classes classes})))
+      ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
+      (register-node subj-mods node sid {:iri-only? (iri-only? node)
+                                         :shacl     shacl-map
+                                         :new?      new-subj?
+                                         :classes   classes})
       (loop [[[k v] & r] (dissoc node :id :idx :type)
              property-flakes type-flakes                    ;; only used if generating new Class and Property flakes
              subj-flakes     base-flakes]
@@ -203,7 +226,8 @@
                                        (cond-> flakes*
                                                property-flakes (into property-flakes)))))]
             (recur r property-flakes* flakes*))
-          (into subj-flakes property-flakes))))))
+          ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
+          [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
   [db {:keys [bootstrap?] :as _opts}]
@@ -355,7 +379,8 @@
       (loop [[node & r] (util/sequential json-ld)
              flakes* ss]
         (if node
-          (recur r (into flakes* (<? (json-ld-node->flakes node tx-state))))
+          (let [[node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
+            (recur r (into flakes* node-flakes)))
           flakes*)))))
 
 (defn validate-rules
