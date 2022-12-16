@@ -1,6 +1,7 @@
 (ns fluree.publisher.model
   (:require [fluree.store.api :as store]
-            [fluree.transactor.api :as txr]))
+            [fluree.transactor.api :as txr]
+            [fluree.indexer.api :as idxr]))
 
 (def EntryInfo
   [:map
@@ -15,7 +16,13 @@
    EntryInfo
    [:entry/previous {:optional true} EntryInfo]
    [:entry/commit {:optional true} txr/CommitInfo]
-   [:entry/index {:optional true} :map]])
+   [:entry/index {:optional true}
+    [:map
+     [:db/address :string]
+     [:db/t :int]
+     [:db/v :int]
+     [:db/size :int]
+     [:db/flakes :int]]]])
 
 (def Ledger
   [:map

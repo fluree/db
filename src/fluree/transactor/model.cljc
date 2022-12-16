@@ -1,5 +1,6 @@
 (ns fluree.transactor.model
-  (:require [fluree.store.api :as store]))
+  (:require [fluree.store.api :as store]
+            [fluree.indexer.api :as idxr]))
 
 (def CommitTx
   [:map
@@ -22,15 +23,10 @@
    [:commit/flakes :int]])
 
 (def TxInfo
-  [:map
-   [:ledger/name :string]
-   [:commit/prev {:optional true} :string]
-   [:db/address :string]
-   [:db/t :int]
-   [:db/flakes :int]
-   [:db/size :int]
-   [:db/assert [:sequential :any]]
-   [:db/retract [:sequential :any]]])
+  [:and
+   idxr/DbInfo
+   [:map
+    [:commit/prev {:optional true} :string]]])
 
 (def Commit
   [:and
