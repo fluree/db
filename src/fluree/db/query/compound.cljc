@@ -20,8 +20,11 @@
 
 (defn query-range-opts
   [idx t s p {:keys [filter] :as o}]
-  (let [start-flake (flake/create s p o nil nil nil util/min-integer)
-        end-flake   (flake/create s p o nil nil nil util/max-integer)]
+  (let [o*          (if (map? o)
+                      (:value o)
+                      o)
+        start-flake (flake/create s p o* nil nil nil util/min-integer)
+        end-flake   (flake/create s p o* nil nil nil util/max-integer)]
     {:idx         idx
      :from-t      t
      :to-t        t
@@ -58,8 +61,10 @@
                   (if-let [next-chunk (async/<! in-ch)]
                     (if (seq next-chunk)
                       ;; calc interim results
-                      (let [result (cond->> (sequence flake-x-form next-chunk)
-                                            pass-vals (map #(concat % pass-vals)))]
+                      (let [result (if (= :filter-nils flake-x-form)
+                                     [pass-vals]
+                                     (cond->> (sequence flake-x-form next-chunk)
+                                              pass-vals (map #(concat % pass-vals))))]
                         (recur (if interim-results
                                  (into interim-results result)
                                  result)))

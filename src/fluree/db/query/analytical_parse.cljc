@@ -745,7 +745,12 @@
       (map (fn [f] [[(flake/o f) (flake/dt f)]]))
 
       p-var?
-      (map (fn [f] [(flake/p f)])))))
+      (map (fn [f] [(flake/p f)]))
+
+      ;; if no variables exist from the flake, it must be a filtering statement. Instead of x-form
+      ;; we should filter out any nil results, or allow passthrough vars for non-nil results
+      :else
+      :filter-nils)))
 
 (defn build-vec-extraction-fn
   [extraction-positions]
