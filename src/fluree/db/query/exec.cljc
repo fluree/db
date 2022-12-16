@@ -221,10 +221,11 @@
 (defn where
   [db context error-ch tuples]
   (let [initial-ch (async/to-chan! [empty-result])]
-    (reduce (fn [result-ch tuple]
-              (let [constraint (parse-tuple tuple db context)]
-                (with-constraint db constraint error-ch result-ch)))
-            initial-ch tuples)))
+    (transduce (map (fn [c]
+                      (parse-tuple c db context)))
+               (completing (fn [result-ch constraint]
+                             (with-constraint db constraint error-ch result-ch)))
+               initial-ch tuples)))
 
 (defn select-values
   [result selectors]
