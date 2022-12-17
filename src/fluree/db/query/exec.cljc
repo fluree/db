@@ -41,10 +41,10 @@
                       #_#_obj-filter (assoc :object-fn obj-filter))]
     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
 
-(defmulti constrain
-  (fn [db result constraint error-ch]
-    (if (map? constraint)
-      (-> constraint keys first)
+(defmulti match-flakes
+  (fn [db result pattern error-ch]
+    (if (map-entry? pattern)
+      (key pattern)
       :tuple)))
 
 (defn with-values
@@ -63,30 +63,30 @@
        (not (::val component))))
 
 (defn bind-flake
-  [result constraint flake]
-  (let [[s p o] constraint]
+  [result pattern flake]
+  (let [[s p o] pattern]
     (cond-> result
       (unbound? s) (assoc (::var s) (flake/s flake))
       (unbound? p) (assoc (::var p) (flake/p flake))
       (unbound? o) (assoc (::var o) (flake/o flake)))))
 
-(defmethod constrain :tuple
-  [db result constraint error-ch]
-  (let [flake-ch      (->> (with-values constraint result)
+(defmethod match-flakes :tuple
+  [db result pattern error-ch]
+  (let [flake-ch      (->> (with-values pattern result)
                            (mapv ::val)
                            (resolve-flake-range db error-ch))
-        constraint-ch (async/chan 4 (comp cat
+        pattern-ch (async/chan 4 (comp cat
                                           (map (fn [flake]
-                                                 (bind-flake result constraint flake)))))]
-    (async/pipe flake-ch constraint-ch)))
+                                                 (bind-flake result pattern flake)))))]
+    (async/pipe flake-ch pattern-ch)))
 
-(defn with-constraint
-  [db constraint error-ch result-ch]
+(defn with-pattern
+  [db pattern error-ch result-ch]
   (let [out-ch (async/chan 4)]
     (async/pipeline-async 4
                           out-ch
                           (fn [result ch]
-                            (async/pipe (constrain db result constraint error-ch)
+                            (async/pipe (match-flakes db result pattern error-ch)
                                         ch))
                           result-ch)
     out-ch))
@@ -94,11 +94,11 @@
 (def empty-result {})
 
 (defn where
-  [db context error-ch constraints]
+  [db context error-ch patterns]
   (let [initial-ch (async/to-chan! [empty-result])]
-    (reduce (fn [result-ch constraint]
-              (with-constraint db constraint error-ch result-ch))
-            initial-ch constraints)))
+    (reduce (fn [result-ch pattern]
+              (with-pattern db pattern error-ch result-ch))
+            initial-ch patterns)))
 
 (defn select-values
   [result selectors]

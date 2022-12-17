@@ -140,8 +140,8 @@
 
 (defn parse-where
   [where-clause db context]
-  (mapv (fn [constraint]
-          (parse-tuple constraint db context))
+  (mapv (fn [pattern]
+          (parse-tuple pattern db context))
         where-clause))
 
 (defn parse-context
