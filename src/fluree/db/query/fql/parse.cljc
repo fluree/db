@@ -11,7 +11,16 @@
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const])
+  (:import (clojure.lang MapEntry)))
+
+(defn ->pattern
+  [typ data]
+  (MapEntry/create typ data))
+
+(defn sid?
+  [x]
+  (int? x))
 
 (def rdf-type-preds #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                       "a"
@@ -54,94 +63,113 @@
          (util/str->int recur-n)
          default-recursion-depth)])))
 
-(defn pred-id-strict
-  "Returns predicate ID for a given predicate, else will throw with an invalid
-  predicate error."
-  [db predicate]
-  (or (dbproto/-p-prop db :id predicate)
-      (throw (ex-info (str "Invalid predicate: " predicate)
+(defn parse-variable
+  [x]
+  (when (variable? x)
+    {::exec/var (symbol x)}))
+
+(defn parse-pred-ident
+  [x]
+  (when (util/pred-ident? x)
+    {::exec/ident x}))
+
+(defn parse-subject-id
+  ([x]
+   (when (sid? x)
+     {::exec/val x}))
+
+  ([x context]
+   (if-let [parsed (parse-subject-id x)]
+     parsed
+     (when context
+       {::exec/val (json-ld/expand-iri x context)}))))
+
+(defn parse-subject-pattern
+  [s-pat context]
+  (when s-pat
+    (or (parse-variable s-pat)
+        (parse-pred-ident s-pat)
+        (parse-subject-id s-pat context)
+        (throw (ex-info (str "Subject values in where statement must be integer subject IDs or two-tuple identies. "
+                             "Provided: " s-pat ".")
+                        {:status 400 :error :db/invalid-query})))))
+
+(defn parse-class-predicate
+  [x]
+  (when (rdf-type? x)
+    {::exec/val const/$rdf:type}))
+
+(defn parse-iri-predicate
+  [x]
+  (when (= "@id" x)
+    {::exec/val const/$iri}))
+
+(defn iri->id
+  [iri db context]
+  (let [full-iri (json-ld/expand-iri iri context)]
+    (dbproto/-p-prop db :id full-iri)))
+
+(defn iri->pred-id
+  [iri db context]
+  (or (iri->id iri db context)
+      (throw (ex-info (str "Invalid predicate: " iri)
                       {:status 400 :error :db/invalid-query}))))
 
-(defn parse-subject
-  [s context]
-  (cond
-    (util/pred-ident? s)
-    {::exec/ident s}
+(defn parse-recursion-predicate
+  [x db context]
+  (when-let [[p-iri recur-n] (recursion-predicate x context)]
+    {::exec/val   (iri->pred-id p-iri db context)
+     ::exec/recur (or recur-n util/max-integer)}))
 
-    (variable? s)
-    {::exec/var (symbol s)}
+(defn parse-full-text-predicate
+  [x db context]
+  (when (and (string? x)
+             (str/starts-with? x "fullText:"))
+    {::exec/full-text (iri->pred-id (subs x 9) db context)}))
 
-    (nil? s)
-    nil
+(defn parse-predicate-id
+  [x db context]
+  {::exec/val (iri->pred-id x db context)})
 
-    context
-    {::exec/val (if (int? s)
-                  s
-                  (json-ld/expand-iri s context))}
+(defn parse-predicate-pattern
+  [p-pat db context]
+  (or (parse-iri-predicate p-pat)
+      (parse-class-predicate p-pat)
+      (parse-variable p-pat)
+      (parse-recursion-predicate p-pat db context)
+      (parse-full-text-predicate p-pat db context)
+      (parse-predicate-id p-pat db context)))
 
-    :else
-    (if (not (int? s))
-      (throw (ex-info (str "Subject values in where statement must be integer subject IDs or two-tuple identies. "
-                           "Provided: " s ".")
-                      {:status 400 :error :db/invalid-query}))
-      {::exec/val s})))
+(defn parse-class
+  [o-iri db context]
+  (if-let [id (iri->id o-iri db context)]
+    (parse-subject-id id)
+    (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o-iri context))
+                    {:status 400 :error :db/invalid-query}))))
 
-(defn parse-predicate
-  [p db context]
-  (cond
-    (rdf-type? p)
-    {::exec/val const/$rdf:type}
+(defn parse-object-pattern
+  [o-pat]
+  (or (parse-variable o-pat)
+      (parse-pred-ident o-pat)
+      {::exec/val o-pat}))
 
-    (= "@id" p)
-    {::exec/val const/$iri}
-
-    (variable? p)
-    {::exec/var (symbol p)}
-
-    (recursion-predicate p context)
-    (let [[p-iri recur-n] (recursion-predicate p context)]
-      {::exec/val (pred-id-strict db p-iri)
-       ::exec/recur (or recur-n util/max-integer)}) ;; default recursion depth
-
-    (and (string? p)
-         (str/starts-with? p "fullText:"))
-    {::exec/full-text (->> (json-ld/expand-iri (subs p 9) context)
-                           (pred-id-strict db))}
-
-    :else
-    {::exec/val (->> (json-ld/expand-iri p context)
-                     (pred-id-strict db))}))
-
-(defn parse-object
-  [o context]
-  (cond
-    (util/pred-ident? o)
-    {::exec/ident o}
-
-    (variable? o)
-    {::exec/var (symbol o)}
-
-    (nil? o)
-    nil
-
-    context
-    {::exec/val (if (int? o)
-                  o
-                  (json-ld/expand-iri o context))}
-
-    :else
-    {::exec/val o}))
-
-(defn parse-tuple
-  [[s p o] db context]
-  [(parse-subject s context)
-   (parse-predicate p db context)
-   (parse-object o context)])
+(defn parse-tuple-pattern
+  [[s-pat p-pat o-pat] db context]
+  (let [s (parse-subject-pattern s-pat context)
+        p (parse-predicate-pattern p-pat db context)]
+    (if (= const/$rdf:type (::exec/val p))
+      (let [cls (parse-class o-pat db context)]
+        (->pattern :class [s p cls]))
+      (let [o     (parse-object-pattern o-pat)
+            tuple [s p o]]
+        (if (= const/$iri (::exec/val p))
+          (->pattern :iri tuple)
+          tuple)))))
 
 (defn parse-where
   [where-clause db context]
   (mapv (fn [pattern]
-          (parse-tuple pattern db context))
+          (parse-tuple-pattern pattern db context))
         where-clause))
 
 (defn parse-context
