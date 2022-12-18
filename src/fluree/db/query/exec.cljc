@@ -148,14 +148,15 @@
 
 (defn select
   [selectors result-ch]
-  (let [select-ch (async/chan 2 (map (fn [result]
-                                       (select-values result selectors))))]
-    (async/pipe result-ch select-ch)))
+  (async/transduce (map (fn [result]
+                          (select-values result selectors)))
+                   conj
+                   []
+                   result-ch))
 
 (defn execute
   [db q]
   (let [error-ch (async/chan)
         context (:context q)]
     (->> (where db context error-ch (:where q))
-         (select (:select q))
-         (async/into []))))
+         (select (:select q)))))
