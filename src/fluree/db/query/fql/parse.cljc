@@ -153,7 +153,13 @@
       (parse-pred-ident o-pat)
       {::exec/val o-pat}))
 
-(defn parse-tuple-pattern
+(defmulti parse-pattern
+  (fn [pattern db context]
+    (if (map? pattern)
+      (->> pattern keys first)
+      :tuple)))
+
+(defmethod parse-pattern :tuple
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
@@ -169,7 +175,7 @@
 (defn parse-where
   [where-clause db context]
   (mapv (fn [pattern]
-          (parse-tuple-pattern pattern db context))
+          (parse-pattern pattern db context))
         where-clause))
 
 (defn parse-context
