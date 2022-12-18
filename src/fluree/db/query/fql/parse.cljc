@@ -159,6 +159,12 @@
       (->> pattern keys first)
       :tuple)))
 
+(defn parse-where-clause
+  [clause db context]
+  (mapv (fn [pattern]
+          (parse-pattern pattern db context))
+        clause))
+
 (defmethod parse-pattern :tuple
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
@@ -172,11 +178,12 @@
           (->pattern :iri tuple)
           tuple)))))
 
-(defn parse-where
-  [where-clause db context]
-  (mapv (fn [pattern]
-          (parse-pattern pattern db context))
-        where-clause))
+(defmethod parse-pattern :union
+  [{:keys [union]} db context]
+  (let [parsed (mapv (fn [clause]
+                       (parse-where-clause clause db context))
+                     union)]
+    (->pattern :union parsed)))
 
 (defn parse-context
   [q db]
@@ -189,4 +196,4 @@
   (let [context (parse-context q db)]
     (-> q
         (assoc :context context)
-        (update :where parse-where db context))))
+        (update :where parse-where-clause db context))))
