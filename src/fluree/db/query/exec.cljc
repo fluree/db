@@ -72,22 +72,62 @@
 
 (defmethod match-flakes :tuple
   [db result pattern error-ch]
-  (let [flake-ch      (->> (with-values pattern result)
-                           (mapv ::val)
-                           (resolve-flake-range db error-ch))
-        pattern-ch (async/chan 4 (comp cat
-                                          (map (fn [flake]
-                                                 (bind-flake result pattern flake)))))]
-    (async/pipe flake-ch pattern-ch)))
+  (let [flake-ch (->> (with-values pattern result)
+                      (mapv ::val)
+                      (resolve-flake-range db error-ch))
+        match-ch (async/chan 4 (comp cat
+                                     (map (fn [flake]
+                                            (bind-flake result pattern flake)))))]
+    (async/pipe flake-ch match-ch)))
 
-(defn with-pattern
+(defn with-distinct-subjects
+  []
+  (fn [rf]
+    (let [seen (volatile! #{})]
+      (fn
+        ;; Initialization: do nothing but initialize the supplied reducing fn
+        ([]
+         (rf))
+
+        ;; Iteration: keep track of subject ids seen and only pass through
+        ;; flakes with new subject ids to the supplied reducing fn.
+        ([result f]
+         (let [sid (flake/s f)]
+           (if (contains? @seen sid)
+             result
+             (do (vswap! seen conj sid)
+                 (rf result f)))))
+
+        ;; Termination: do nothing but terminate the supplied reducing fn
+        ([result]
+         (rf result))))))
+
+(defmethod match-flakes :class
+  [db result pattern error-ch]
+  (let [tuple    (val pattern)
+        [s p o]  (map ::val (with-values tuple result))
+        classes  (into [o] (dbproto/-class-prop db :subclasses o))
+        match-ch (async/chan 2 (comp cat
+                                     (with-distinct-subjects)
+                                     (map (fn [flake]
+                                            (bind-flake result tuple flake)))))]
+    (async/pipeline-async 2
+                          match-ch
+                          (fn [cls ch]
+                            (async/pipe (resolve-flake-range db error-ch [s p cls])
+                                        ch))
+                          (async/to-chan! classes))
+    match-ch))
+
+(defn with-constraint
   [db pattern error-ch result-ch]
   (let [out-ch (async/chan 4)]
     (async/pipeline-async 4
                           out-ch
                           (fn [result ch]
-                            (async/pipe (match-flakes db result pattern error-ch)
-                                        ch))
+                            (-> db
+                                (match-flakes result pattern error-ch)
+                                (async/pipe ch)))
                           result-ch)
     out-ch))
 
@@ -97,7 +137,7 @@
   [db context error-ch patterns]
   (let [initial-ch (async/to-chan! [empty-result])]
     (reduce (fn [result-ch pattern]
-              (with-pattern db pattern error-ch result-ch))
+              (with-constraint db pattern error-ch result-ch))
             initial-ch patterns)))
 
 (defn select-values
