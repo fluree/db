@@ -81,6 +81,8 @@
     (async/pipe flake-ch match-ch)))
 
 (defn with-distinct-subjects
+  "Return a transducer that filters a stream of flakes by removing any flakes with
+  subject ids repeated from previously processed flakes."
   []
   (fn [rf]
     (let [seen-sids (volatile! #{})]
