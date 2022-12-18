@@ -122,6 +122,30 @@
                           class-ch)
     match-ch))
 
+(defn match-clause
+  "Puts all match results in `db` extending from `result` that match all the
+  patterns in the collection `clause` onto the channel `out-ch`."
+  [db result clause error-ch out-ch]
+  (let [clause-ch (async/to-chan! clause)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [pattern ch]
+                            (-> (match-flakes db result pattern error-ch)
+                                (async/pipe ch)))
+                          clause-ch)))
+
+(defmethod match-flakes :union
+  [db result pattern error-ch]
+  (let [clauses   (val pattern)
+        clause-ch (async/to-chan! clauses)
+        out-ch    (async/chan 2)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [clause ch]
+                            (match-clause db result clause error-ch ch))
+                          clause-ch)
+    out-ch))
+
 (defn with-constraint
   [db pattern error-ch result-ch]
   (let [out-ch (async/chan 2)]
