@@ -42,7 +42,7 @@
     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
 
 (defmulti match-flakes
-  (fn [db result pattern error-ch]
+  (fn [db solution pattern error-ch]
     (if (map-entry? pattern)
       (key pattern)
       :tuple)))
@@ -63,21 +63,21 @@
        (not (::val component))))
 
 (defn bind-flake
-  [result pattern flake]
+  [solution pattern flake]
   (let [[s p o] pattern]
-    (cond-> result
+    (cond-> solution
       (unbound? s) (assoc (::var s) (flake/s flake))
       (unbound? p) (assoc (::var p) (flake/p flake))
       (unbound? o) (assoc (::var o) (flake/o flake)))))
 
 (defmethod match-flakes :tuple
-  [db result pattern error-ch]
-  (let [flake-ch (->> (with-values pattern result)
+  [db solution pattern error-ch]
+  (let [flake-ch (->> (with-values pattern solution)
                       (map ::val)
                       (resolve-flake-range db error-ch))
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
-                                            (bind-flake result pattern flake)))))]
+                                            (bind-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
 
 (defn with-distinct-subjects
@@ -105,15 +105,15 @@
          (rf result))))))
 
 (defmethod match-flakes :class
-  [db result pattern error-ch]
+  [db solution pattern error-ch]
   (let [tuple    (val pattern)
-        [s p o]  (map ::val (with-values tuple result))
+        [s p o]  (map ::val (with-values tuple solution))
         classes  (into [o] (dbproto/-class-prop db :subclasses o))
         class-ch (async/to-chan! classes)
         match-ch (async/chan 2 (comp cat
                                      (with-distinct-subjects)
                                      (map (fn [flake]
-                                            (bind-flake result tuple flake)))))]
+                                            (bind-flake solution tuple flake)))))]
     (async/pipeline-async 2
                           match-ch
                           (fn [cls ch]
@@ -123,54 +123,54 @@
     match-ch))
 
 (defn match-clause
-  "Puts all match results in `db` extending from `result` that match all the
+  "Puts all match solutions in `db` extending from `solution` that match all the
   patterns in the collection `clause` onto the channel `out-ch`."
-  [db result clause error-ch out-ch]
+  [db solution clause error-ch out-ch]
   (let [clause-ch (async/to-chan! clause)]
     (async/pipeline-async 2
                           out-ch
                           (fn [pattern ch]
-                            (-> (match-flakes db result pattern error-ch)
+                            (-> (match-flakes db solution pattern error-ch)
                                 (async/pipe ch)))
                           clause-ch)))
 
 (defmethod match-flakes :union
-  [db result pattern error-ch]
+  [db solution pattern error-ch]
   (let [clauses   (val pattern)
         clause-ch (async/to-chan! clauses)
         out-ch    (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [clause ch]
-                            (match-clause db result clause error-ch ch))
+                            (match-clause db solution clause error-ch ch))
                           clause-ch)
     out-ch))
 
 (defn with-constraint
-  [db pattern error-ch result-ch]
+  [db pattern error-ch solution-ch]
   (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
-                          (fn [result ch]
-                            (-> (match-flakes db result pattern error-ch)
+                          (fn [solution ch]
+                            (-> (match-flakes db solution pattern error-ch)
                                 (async/pipe ch)))
-                          result-ch)
+                          solution-ch)
     out-ch))
 
-(def blank-result {})
+(def blank-solution {})
 
 (defn where
   [db context error-ch patterns]
-  (let [initial-ch (async/to-chan! [blank-result])]
-    (reduce (fn [result-ch pattern]
-              (with-constraint db pattern error-ch result-ch))
+  (let [initial-ch (async/to-chan! [blank-solution])]
+    (reduce (fn [solution-ch pattern]
+              (with-constraint db pattern error-ch solution-ch))
             initial-ch patterns)))
 
-(defn split-result-by
-  [variables result]
-  (let [values    (mapv (partial get result)
+(defn split-solution-by
+  [variables solution]
+  (let [values    (mapv (partial get solution)
                         variables)
-        remaining (apply dissoc result variables)]
+        remaining (apply dissoc solution variables)]
     [values remaining]))
 
 (defn assoc-coll
@@ -180,7 +180,7 @@
                     (or [])
                     (conj v)))))
 
-(defn group-result
+(defn group-solution
   [groups [group-key grouped-val]]
   (assoc-coll groups group-key grouped-val))
 
@@ -193,37 +193,37 @@
 
 (defn unwind-groups
   [grouping groups]
-  (reduce-kv (fn [results group-key grouped-vals]
+  (reduce-kv (fn [solutions group-key grouped-vals]
                (let [merged-vals (reduce merge-with-colls {} grouped-vals)
-                     result      (into merged-vals
+                     solution      (into merged-vals
                                        (map vector grouping group-key))]
-                 (conj results result)))
+                 (conj solutions solution)))
              [] groups))
 
 (defn group
-  [grouping result-ch]
+  [grouping solution-ch]
   (if grouping
-    (-> (async/transduce (map (partial split-result-by grouping))
-                         (completing group-result
+    (-> (async/transduce (map (partial split-solution-by grouping))
+                         (completing group-solution
                                      (partial unwind-groups grouping))
                          {}
-                         result-ch)
+                         solution-ch)
         (async/pipe (async/chan 2 cat)))
-    result-ch))
+    solution-ch))
 
 (defn select-values
-  [result selectors]
+  [solution selectors]
   (reduce (fn [values selector]
-            (conj values (get result selector)))
+            (conj values (get solution selector)))
           [] selectors))
 
 (defn select
-  [selectors result-ch]
-  (async/transduce (map (fn [result]
-                          (select-values result selectors)))
+  [selectors solution-ch]
+  (async/transduce (map (fn [solution]
+                          (select-values solution selectors)))
                    conj
                    []
-                   result-ch))
+                   solution-ch))
 
 (defn execute
   [db q]
