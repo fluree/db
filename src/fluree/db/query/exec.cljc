@@ -122,30 +122,6 @@
                           class-ch)
     match-ch))
 
-(defn match-clause
-  "Puts all match solutions in `db` extending from `solution` that match all the
-  patterns in the collection `clause` onto the channel `out-ch`."
-  [db solution clause error-ch out-ch]
-  (let [clause-ch (async/to-chan! clause)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [pattern ch]
-                            (-> (match-flakes db solution pattern error-ch)
-                                (async/pipe ch)))
-                          clause-ch)))
-
-(defmethod match-flakes :union
-  [db solution pattern error-ch]
-  (let [clauses   (val pattern)
-        clause-ch (async/to-chan! clauses)
-        out-ch    (async/chan 2)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [clause ch]
-                            (match-clause db solution clause error-ch ch))
-                          clause-ch)
-    out-ch))
-
 (defn with-constraint
   [db pattern error-ch solution-ch]
   (let [out-ch (async/chan 2)]
@@ -157,14 +133,34 @@
                           solution-ch)
     out-ch))
 
+(defn match-clause
+  "Returns a channel that will eventually contain all match solutions in `db`
+  extending from `solution` that also match all the patterns in the collection
+  `clause`."
+  [db solution clause error-ch]
+  (let [initial-ch (async/to-chan! [solution])]
+    (reduce (fn [solution-ch pattern]
+              (with-constraint db pattern error-ch solution-ch))
+            initial-ch clause)))
+
+(defmethod match-flakes :union
+  [db solution pattern error-ch]
+  (let [clauses   (val pattern)
+        clause-ch (async/to-chan! clauses)
+        out-ch    (async/chan 2)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [clause ch]
+                            (-> (match-clause db solution clause error-ch)
+                                (async/pipe ch)))
+                          clause-ch)
+    out-ch))
+
 (def blank-solution {})
 
 (defn where
-  [db context error-ch patterns]
-  (let [initial-ch (async/to-chan! [blank-solution])]
-    (reduce (fn [solution-ch pattern]
-              (with-constraint db pattern error-ch solution-ch))
-            initial-ch patterns)))
+  [db context where-clause error-ch]
+  (match-clause db blank-solution where-clause error-ch))
 
 (defn split-solution-by
   [variables solution]
@@ -229,6 +225,6 @@
   [db q]
   (let [error-ch (async/chan)
         context (:context q)]
-    (->> (where db context error-ch (:where q))
+    (->> (where db context (:where q) error-ch)
          (group (:group-by q))
          (select (:select q)))))
