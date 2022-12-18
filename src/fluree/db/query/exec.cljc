@@ -140,6 +140,51 @@
               (with-constraint db pattern error-ch result-ch))
             initial-ch patterns)))
 
+(defn split-result-by
+  [variables result]
+  (let [values    (mapv (partial get result)
+                        variables)
+        remaining (apply dissoc result variables)]
+    [values remaining]))
+
+(defn assoc-coll
+  [m k v]
+  (update m k (fn [coll]
+                (-> coll
+                    (or [])
+                    (conj v)))))
+
+(defn group-result
+  [groups [group-key grouped-val]]
+  (assoc-coll groups group-key grouped-val))
+
+(defn merge-with-colls
+  [m1 m2]
+  (reduce (fn [merged k]
+            (let [v (get m2 k)]
+              (assoc-coll merged k v)))
+          m1 (keys m2)))
+
+(defn unwind-groups
+  [grouping groups]
+  (reduce-kv (fn [results group-key grouped-vals]
+               (let [merged-vals (reduce merge-with-colls {} grouped-vals)
+                     result      (into merged-vals
+                                       (map vector grouping group-key))]
+                 (conj results result)))
+             [] groups))
+
+(defn group
+  [grouping result-ch]
+  (if grouping
+    (-> (async/transduce (map (partial split-result-by grouping))
+                         (completing group-result
+                                     (partial unwind-groups grouping))
+                         {}
+                         result-ch)
+        (async/pipe (async/chan 2 cat)))
+    result-ch))
+
 (defn select-values
   [result selectors]
   (reduce (fn [values selector]
@@ -159,4 +204,5 @@
   (let [error-ch (async/chan)
         context (:context q)]
     (->> (where db context error-ch (:where q))
+         (group (:group-by q))
          (select (:select q)))))
