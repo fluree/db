@@ -17,7 +17,7 @@ jobs:
       - name: Run tests
         run: script/run-in-docker.sh make cljtest
   test-cljs:
-    name: run clj tests
+    name: run cljs tests
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -27,7 +27,7 @@ jobs:
       - name: Run tests
         run: script/run-in-docker.sh make cljstest
   test-nodejs:
-    name: run clj tests
+    name: run nodejs tests
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -37,7 +37,7 @@ jobs:
       - name: Run tests
         run: script/run-in-docker.sh make nodejs-test
   test-browser:
-    name: run clj tests
+    name: run browser tests
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -47,7 +47,7 @@ jobs:
       - name: Run tests
         run: script/run-in-docker.sh make browser-test
   test-eastwood:
-    name: run clj tests
+    name: run eastwood
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -57,7 +57,7 @@ jobs:
       - name: Run tests
         run: script/run-in-docker.sh make eastwood
   build-docker:
-    name: Run tests & build Docker image
+    name: build Docker image
     needs: [test-clj, test-cljs, test-nodejs, test-browser, test-eastwood]
     runs-on: [linux, large, docker]
     steps:
