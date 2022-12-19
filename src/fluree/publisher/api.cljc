@@ -23,6 +23,10 @@
   [publisher ledger-name {:keys [context head-address db-address] :as opts}]
   (pub-impl/init publisher ledger-name opts))
 
+(defn list
+  [publisher]
+  (pub-impl/list publisher))
+
 (defn push
   "Creates a ledger entry and stores it in store under its id. Returns a ledger document
   with links to the head db and the head commit."

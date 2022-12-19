@@ -1,5 +1,5 @@
 (ns fluree.store.api
-  (:refer-clojure :exclude [read])
+  (:refer-clojure :exclude [read list])
   (:require [fluree.store.core :as store-impl]
             [fluree.store.model :as store-model]))
 
@@ -27,6 +27,11 @@
   "Read data from key k in store."
   [store k]
   (store-impl/read store k))
+
+(defn list
+  "Return keys from store with given prefix."
+  [store prefix]
+  (store-impl/list store prefix))
 
 (defn delete
   "Remove data for key k in store."

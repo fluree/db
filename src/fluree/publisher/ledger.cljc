@@ -9,7 +9,7 @@
 
 (defn create-ledger-address
   [store ledger-name]
-  (store/address store "ledger" (str ledger-name "/head")))
+  (store/address store "ledger" (str "head/" ledger-name)))
 
 (defn create
   "Creates a ledger."

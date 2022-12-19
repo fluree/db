@@ -8,7 +8,8 @@
             [fluree.common.identity :as ident]
             [fluree.common.protocols :as service-proto]
             [fluree.common.util :as util]
-            [fluree.store.protocols :as store-proto]))
+            [fluree.store.protocols :as store-proto]
+            [clojure.string :as str]))
 
 (defn stop-memory-store [store]
   (log/info (str "Stopping MemoryStore " (service-proto/id store) "."))
@@ -27,8 +28,10 @@
   store-proto/Store
   (address [_ type k] (address-memory type k))
   (read [_ k] (get @storage-atom k))
-  (write [_ k data] (swap! storage-atom assoc k data) :written)
-  (delete [_ k] (swap! storage-atom dissoc k) :deleted)
+  (list [_ prefix]  (let [ks (filter #(str/starts-with? % prefix) (keys @storage-atom))]
+                      (map #(get @storage-atom %) ks)))
+  (write [_ k data] (swap! storage-atom assoc k data) :store/written)
+  (delete [_ k] (swap! storage-atom dissoc k) :store/deleted)
 
   fluree.db.index/Resolver
   (resolve

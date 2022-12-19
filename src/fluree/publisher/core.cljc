@@ -1,4 +1,5 @@
 (ns fluree.publisher.core
+  (:refer-clojure :exclude [list])
   (:require [fluree.common.identity :as ident]
             [fluree.common.model :as model]
             [fluree.common.protocols :as service-proto]
@@ -52,6 +53,11 @@
     (store/write store ledger-path entry-path)
     (:ledger/address ledger)))
 
+(defn list-ledgers
+  [{:keys [store]}]
+  (let [ledger-heads (store/list store "head/")]
+    (map (partial store/read store) ledger-heads)))
+
 (defn push-publisher
   [pub ledger-address {:keys [commit-info db-info]}]
   (let [store        (:store pub)
@@ -79,6 +85,7 @@
 
   pub-proto/Publisher
   (init [pub ledger-name opts] (init-ledger pub ledger-name opts))
+  (list [pub] (list-ledgers pub))
   (push [pub ledger-address info] (push-publisher pub ledger-address info))
   (pull [pub ledger-address] (pull-publisher pub ledger-address)))
 
@@ -103,6 +110,10 @@
 (defn init
   [publisher ledger-name opts]
   (pub-proto/init publisher ledger-name opts))
+
+(defn list
+  [publisher]
+  (pub-proto/list publisher))
 
 (defn push
   [publisher ledger-address info]
