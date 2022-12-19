@@ -25,10 +25,9 @@
               ledger-cred     (conn/transact conn ledger-address tx)
               after-ledger-tx @(-> conn :store :storage-atom)
 
-              query-results (conn/query conn (conn/head-db-address conn ledger-address)
-                                        {:context context
-                                         :select  {"?s" [:*]}
-                                         :where   [["?s" "@id" "ex:dan"]]})]
+              query-results (conn/query conn ledger-address {:context context
+                                                             :select {"?s" [:*]}
+                                                             :where [["?s" "@id" "ex:dan"]]})]
           (testing "wrote head and init entry"
             (is (= expected-create-result
                    ledger-address))
@@ -64,10 +63,9 @@
               pub-after-ledger-tx    @(-> conn :publisher :store :storage-atom)
               idxr-after-ledger-tx   @(-> conn :indexer :store :storage-atom)
 
-              query-results (conn/query conn (conn/head-db-address conn ledger-address)
-                                        {:context context
-                                         :select  {"?s" [:*]}
-                                         :where   [["?s" "@id" "ex:dan"]]})]
+              query-results (conn/query conn ledger-address {:context context
+                                                             :select {"?s" [:*]}
+                                                             :where [["?s" "@id" "ex:dan"]]})]
           (testing "txr init writes nothing"
             (is (= {}
                    txr-after-ledger-init)))

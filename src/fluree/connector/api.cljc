@@ -14,7 +14,7 @@
   (conn-impl/close conn))
 
 (defn create
-  "Create a ledger in the connection."
+  "Create a ledger and return its address."
   ([conn ledger-name]
    (create conn ledger-name {}))
   ([conn ledger-name opts]
@@ -28,26 +28,11 @@
    (conn-impl/transact conn ledger-address tx opts)))
 
 (defn query
-  "Query a db."
-  ([conn db-address q]
-   (query conn db-address q {}))
-  ([conn db-address query opts]
-   (conn-impl/query conn db-address query opts)))
-
-(defn head-db-address
-  "Retrieve the latest db-address for the given ledger."
-  [conn ledger-address]
-  (conn-impl/head-db-address conn ledger-address))
-
-(defn head-commit-address
-  "Retrieve the latest commit-address for the given ledger."
-  [conn ledger-address]
-  (conn-impl/head-commit-address conn ledger-address))
-
-#_(defn load
-    "Add a ledger to the connection."
-    [conn query opts]
-    (throw (ex-info "TODO" {})))
+  "Query a ledger."
+  ([conn ledger-address q]
+   (query conn ledger-address q {}))
+  ([conn ledger-address query opts]
+   (conn-impl/query conn ledger-address query opts)))
 
 #_(defn subscribe
   "Subscribe to a ledger's updates."

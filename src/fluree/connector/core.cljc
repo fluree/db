@@ -59,8 +59,11 @@
         ledger-cred))))
 
 (defn query-conn
-  [conn db-address query opts]
-  (idxr/query (:indexer conn) db-address query))
+  [conn ledger-address query opts]
+  (let [ledger              (pub/pull (:publisher conn) ledger-address)
+        {head :ledger/head} (get ledger :cred/credential-subject ledger)
+        db-address          (-> head :entry/db :db/address)]
+    (idxr/query (:indexer conn) db-address query)))
 
 (defrecord FlureeConnection [id transactor indexer publisher enforcer]
   service-proto/Service
@@ -70,7 +73,7 @@
   conn-proto/Connection
   (transact [conn ledger-address tx opts] (transact-conn conn ledger-address tx opts))
   (create [conn ledger-name opts] (create-ledger conn ledger-name opts))
-  (query [conn db-address query opts] (query-conn conn db-address query opts))
+  (query [conn ledger-address query opts] (query-conn conn ledger-address query opts))
   ;; TODO
   #_(load [conn query opts])
   #_(subscribe [conn query fn])
@@ -123,5 +126,5 @@
   (conn-proto/transact conn ledger-address tx opts))
 
 (defn query
-  [conn db-address query opts]
-  (conn-proto/query conn db-address query opts))
+  [conn ledger-address query opts]
+  (conn-proto/query conn ledger-address query opts))
