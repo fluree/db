@@ -43,15 +43,20 @@
 
         db-address     (-> head :entry/db :db/address)
         commit-address (-> head :entry/commit :commit/address)
-        db-info        (idxr/stage idxr db-address tx)
-        commit-info    (txr/commit txr tx (assoc db-info
-                                                 :commit/prev commit-address
-                                                 :ledger/name (:ledger/name ledger)))
-        ledger-cred    (pub/push pub ledger-address
-                                 {:commit-info commit-info
-                                  :db-info (select-keys db-info [:db/address :db/t :db/flakes :db/size
-                                                                    :ledger/name])})]
-    ledger-cred))
+
+        {:keys [errors db/address] :as db-info} (idxr/stage idxr db-address tx)]
+    (if errors
+      (do
+        (idxr/discard address)
+        errors)
+      (let [commit-info (txr/commit txr tx (assoc db-info
+                                                  :commit/prev commit-address
+                                                  :ledger/name (:ledger/name ledger)))
+            ledger-cred (pub/push pub ledger-address
+                                  {:commit-info commit-info
+                                   :db-info (select-keys db-info [:db/address :db/t :db/flakes :db/size
+                                                                  :ledger/name])})]
+        ledger-cred))))
 
 (defn query-conn
   [conn db-address query opts]

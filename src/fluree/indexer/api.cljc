@@ -23,6 +23,11 @@
   [idxr db-address data]
   (idxr-impl/stage idxr db-address data))
 
+(defn discard
+  "Discard the index associated with the db-address."
+  [idxr db-address]
+  (idxr-impl/discard idxr db-address))
+
 (defn query
   "Run a query against the specified db to get the query results."
   [idxr db-address query]
