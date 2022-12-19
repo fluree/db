@@ -7,7 +7,7 @@
 (deftest indexer
   (let [idxr (idxr/start {:idxr/store-config {:store/method :memory}})
 
-        db0-address (idxr/init idxr "test1" {})
+        db0-address (idxr/init idxr {})
         ;; two different stages onto the same db
         db1-info (idxr/stage idxr db0-address {"@context" {"me" "http://dan.com/"}
                                                "@id"      "me:dan"
@@ -20,7 +20,7 @@
                                 {:select {"?s" [:*]} :where [["?s" "@id" "http://dan.com/dan"]]})
         db2-results (idxr/query idxr (:db/address db2-info)
                                 {:select {"?s" [:*]} :where [["?s" "@id" "http://dan.com/dan"]]})]
-    (is (= "fluree:db:memory:test1/db/init"
+    (is (= "fluree:db:memory:init"
            db0-address))
     (is (= [] db0-results))
     ;; address has a random-uuid, not deterministic

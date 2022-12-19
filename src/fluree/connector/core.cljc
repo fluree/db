@@ -30,7 +30,7 @@
 
 (defn create-ledger
   [{:keys [indexer publisher]} ledger-name opts]
-  (let [db-address     (idxr/init indexer ledger-name opts)
+  (let [db-address     (idxr/init indexer opts)
         ledger-address (pub/init publisher ledger-name (assoc opts :db-address db-address))]
     ledger-address))
 

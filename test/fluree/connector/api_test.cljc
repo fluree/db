@@ -32,7 +32,7 @@
           (testing "wrote head and init entry"
             (is (= expected-create-result
                    ledger-address))
-            (is (= ["fluree:db:memory:testconn/db/init"
+            (is (= ["fluree:db:memory:init"
                     "testconn/entry/init"
                     "testconn/head"]
                    (sort (keys after-ledger-init)))))

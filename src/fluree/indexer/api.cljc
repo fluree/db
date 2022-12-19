@@ -13,9 +13,10 @@
   (idxr-impl/stop idxr))
 
 (defn init
-  "Initialize a db index for the given ledger name."
-  [idxr ledger-name opts]
-  (idxr-impl/init idxr ledger-name opts))
+  "Initialize a db index and returns the db-address"
+  [idxr opts]
+  (idxr-impl/init idxr opts))
+
 
 (defn stage
   "Index some data and return a db-address."

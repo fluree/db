@@ -6,7 +6,7 @@
 (defn create-db-address
   [db]
   ;; TODO: uses tt-id now, would be nice to get a content-addressed id
-  (store/address (:conn db) "db" (str (:alias db) "/db/" (or (:tt-id db) "init"))))
+  (store/address (:conn db) "db" (str (or (:tt-id db) "init"))))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -39,9 +39,9 @@
                                        :t 0}}}}))
 
 (defn create
-  [store {:keys [ledger/name]}]
+  [store opts]
   (jld-db/create (map->DummyLedger {:method nil
-                                    :alias name
+                                    :alias ""
                                     :branch :main
                                     :state (state-at-t 0 nil)
                                     ;; resolve-flake-slices looks for a Resolver under :conn

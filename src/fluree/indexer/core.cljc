@@ -16,17 +16,17 @@
   (log/info "Stopping Indexer " (service-proto/id idxr) ".")
   (store/stop (:store idxr)))
 
-(defn init-indexer
-  [{:keys [store] :as idxr} ledger-name opts]
-  (let [db (db/create store {:ledger/name ledger-name})
+(defn init-db
+  [{:keys [store] :as idxr} opts]
+  (let [db (db/create store opts)
         db-address (db/create-db-address db)]
     (if (store/read store db-address)
-      (throw (ex-info "Ledger index already exists." {:ledger/name ledger-name}))
+      db-address
       (do
         (store/write store db-address db)
         db-address))))
 
-(defn stage-indexer
+(defn stage-db
   [{:keys [store] :as idxr} db-address data]
   (if-let [db (store/read store db-address)]
     (let [db0 (db/prepare db)
@@ -44,12 +44,16 @@
     (throw (ex-info "No such db-address." {:error :stage/no-such-db
                                            :db-address db-address}))))
 
-(defn query-indexer
+(defn query-db
   [{:keys [store] :as idxr} db-address query]
   (if-let [db (store/read store db-address)]
     (async/<!! (jld-query/query-async db query))
     (throw (ex-info "No such db-address." {:error :query/no-such-db
                                            :db-address db-address}))))
+
+(defn explain-query
+  [idxr db-address query]
+  (throw (ex-info "TODO" {:todo :explain-not-implemented})))
 
 (defrecord Indexer [id]
   service-proto/Service
@@ -57,10 +61,10 @@
   (stop [idxr] (stop-indexer idxr))
 
   idxr-proto/Indexer
-  (init [idxr ledger-name opts] (init-indexer idxr ledger-name opts))
-  (stage [idxr db-address data] (stage-indexer idxr db-address data))
-  (query [idxr db-address query] (query-indexer idxr db-address query))
-  (explain [idxr db-address query] (throw (ex-info "TODO"))))
+  (init [idxr opts] (init-db idxr opts))
+  (stage [idxr db-address data] (stage-db idxr db-address data))
+  (query [idxr db-address query] (query-db idxr db-address query))
+  (explain [idxr db-address query] (explain-query idxr db-address query)))
 
 (defn create-indexer
   [{:keys [:idxr/id :idxr/store-config :idxr/store] :as config}]
@@ -80,8 +84,8 @@
   (service-proto/stop idxr))
 
 (defn init
-  [idxr ledger-name opts]
-  (idxr-proto/init idxr ledger-name opts))
+  [idxr opts]
+  (idxr-proto/init idxr opts))
 
 (defn stage
   [idxr db-address data]
