@@ -1,5 +1,5 @@
 (ns fluree.transactor.core
-  (:refer-clojure :exclude [read])
+  (:refer-clojure :exclude [resolve])
   (:require [fluree.common.identity :as ident]
             [fluree.common.protocols :as service-proto]
             [fluree.common.model :as model]
@@ -9,14 +9,14 @@
             [fluree.transactor.model :as txr-model]
             [fluree.transactor.protocols :as txr-proto]))
 
-(defn -commit
+(defn write-commit
   [txr tx tx-info]
   (let [store       (:store txr)
         commit      (commit/create tx (assoc tx-info :txr/store store))
-        commit-info (merge (select-keys commit [:id :commit/address :commit/size :commit/flakes])
-                           (select-keys (:commit/tx commit) [:commit/t :commit/v]))
+        commit-info (merge (select-keys commit [:address :hash])
+                           (dissoc (:value commit) :commit/assert :commit/retract))
 
-        {commit-path :address/path} (ident/address-parts (:commit/address commit))]
+        {commit-path :address/path} (ident/address-parts (:address commit))]
     (store/write store commit-path commit)
     commit-info))
 
@@ -26,14 +26,19 @@
   (store/stop (:store txr))
   :stopped)
 
+(defn resolve-commit
+  [txr commit-address]
+  (let [{commit-path :address/path} (ident/address-parts commit-address)]
+    (store/read (:store txr) commit-path)))
+
 (defrecord Transactor [id store]
   service-proto/Service
   (id [_] id)
   (stop [txr] (stop-transactor txr))
 
   txr-proto/Transactor
-  (commit [txr tx tx-info] (-commit txr tx tx-info))
-  (read [txr commit-address] (throw (ex-info "TODO"))))
+  (commit [txr tx tx-info] (write-commit txr tx tx-info))
+  (resolve [txr commit-address] (resolve-commit txr commit-address)))
 
 (defn create-transactor
   [{:keys [:txr/id :txr/store-config :txr/store] :as config}]
@@ -55,3 +60,7 @@
 (defn commit
   [txr tx tx-info]
   (txr-proto/commit txr tx tx-info))
+
+(defn resolve
+  [txr commit-address]
+  (txr-proto/resolve txr commit-address))

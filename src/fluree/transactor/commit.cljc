@@ -1,15 +1,13 @@
 (ns fluree.transactor.commit
   (:require [fluree.common.identity :as ident]
             [fluree.json-ld :as json-ld]
-            [fluree.store.api :as store]))
-
-(defn create-commit-id
-  [data]
-  (ident/create-id :commit data))
+            [fluree.store.api :as store]
+            [fluree.crypto :as crypto]
+            [clojure.string :as str]))
 
 (defn create-commit-address
-  [store ledger-name id]
-  (store/address store :commit (str ledger-name "/commit/" id)))
+  [store path]
+  (store/address store :commit path))
 
 (defn create
   [tx db-info]
@@ -17,21 +15,19 @@
                 commit/prev txr/store ledger/name]}
         db-info
         ;; TODO: properly figure out asserts, retracts
-        commit-tx (cond-> {:commit/assert assert
-                           :commit/retract retract
-                           :commit/context context
-                           :commit/t t
-                           ;; hardcode v to 0 until we need additional versions
-                           :commit/v 0}
-                    prev (assoc :commit/prev prev))
-        data (json-ld/normalize-data commit-tx)
-        id (create-commit-id data)
-        {hash :id/hash} (ident/id-parts id )]
-    {:id id
-     :type :commit
-     :commit/address (create-commit-address store name hash)
-     :db/address address
-     :commit/hash hash
-     :commit/size size
-     :commit/flakes flakes
-     :commit/tx commit-tx}))
+        commit-tx      (cond-> {:type :commit
+                                :commit/size size
+                                :commit/flakes flakes
+                                :commit/assert assert
+                                :commit/retract retract
+                                :commit/t t
+                                ;; hardcode v to 0 until we need additional versions
+                                :commit/v 0}
+                         prev (assoc :commit/prev prev))
+        commit-data    (json-ld/normalize-data commit-tx)
+        hash           (crypto/sha2-256 commit-data)
+        path           (str name "/commit/" hash)
+        commit-address (create-commit-address store path)]
+    {:address commit-address
+     :hash    hash
+     :value   commit-tx}))

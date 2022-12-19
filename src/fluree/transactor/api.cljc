@@ -1,4 +1,5 @@
 (ns fluree.transactor.api
+  (:refer-clojure :exclude [resolve])
   (:require [fluree.transactor.core :as txr-impl]
             [fluree.transactor.model :as txr-model]))
 
@@ -17,11 +18,16 @@
   [txr tx tx-info]
   (txr-impl/commit txr tx tx-info))
 
+(defn resolve
+  "Returns the commit map corresponding to the commit-address. Returns `nil` if not found."
+  [txr commit-address]
+  (txr-impl/resolve txr commit-address))
+
 ;; models
 
-(def CommitTx txr-model/CommitTx)
-(def CommitInfo txr-model/CommitInfo)
 (def Commit txr-model/Commit)
+(def CommitWrapper txr-model/CommitWrapper)
+(def CommitSummary txr-model/CommitSummary)
 
 (def TxInfo txr-model/TxInfo)
 

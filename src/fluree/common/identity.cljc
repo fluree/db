@@ -23,11 +23,11 @@
   (str "fluree:" (name class) ":" (name method) ":" path))
 
 (defn address-parts
-  "Returns the components of an address: the :address/ns, :address/type, :address/method,
-  and :address/path."
   [address]
-  (let [[ns class method path] (str/split address #":")]
-    {:address/ns ns
-     :address/type (keyword class)
+  (let [[ns type method path] (str/split address #":")
+        id                    (last (str/split path #"/"))]
+    {:address/ns     ns
+     :address/type   (keyword type)
      :address/method (keyword method)
-     :address/path path}))
+     :address/path   path
+     :address/id     id}))

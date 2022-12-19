@@ -1,16 +1,31 @@
 (ns fluree.transactor.api-test
   (:require [clojure.test :as test :refer :all]
             [fluree.transactor.api :as txr]
-            [fluree.store.api :as store]))
+            [fluree.store.api :as store]
+            [fluree.common.identity :as ident]))
 
 (deftest transactor
-  (let [expected-commit-info
-        {:id "fluree:commit:988d5119c56068df2f1e1f09311d50e9fdaeb019c62af6ff4430779a441a665b"
-         :commit/address "fluree:commit:memory:testledger1/commit/988d5119c56068df2f1e1f09311d50e9fdaeb019c62af6ff4430779a441a665b"
-         :commit/size 0
-         :commit/flakes 0
-         :commit/t 1
-         :commit/v 0}
+  (let [expected-commit-summary
+        {:address "fluree:commit:memory:testledger1/commit/41f73e7a3279d64e6ef7a62cff2aeaf325a6ca12f1e714296681141d79557ccf",
+         :hash "41f73e7a3279d64e6ef7a62cff2aeaf325a6ca12f1e714296681141d79557ccf",
+         :type :commit,
+         :commit/size 0,
+         :commit/flakes 0,
+         :commit/t 1,
+         :commit/v 0,
+         :commit/prev "address of previous commit"}
+
+        expected-commit
+        {:address "fluree:commit:memory:testledger1/commit/41f73e7a3279d64e6ef7a62cff2aeaf325a6ca12f1e714296681141d79557ccf",
+         :hash "41f73e7a3279d64e6ef7a62cff2aeaf325a6ca12f1e714296681141d79557ccf",
+         :value {:type :commit,
+                 :commit/size 0,
+                 :commit/flakes 0,
+                 :commit/assert [],
+                 :commit/retract [],
+                 :commit/t 1,
+                 :commit/v 0,
+                 :commit/prev "address of previous commit"}}
 
         mem-store (store/start {:store/method :memory})
         txr       (txr/start {:txr/method :file
@@ -24,29 +39,22 @@
                      :db/size     0
                      :db/assert   []
                      :db/retract  []
-                     :commit/prev "fluree:commit:testledger1/abc123"
+                     :commit/prev "address of previous commit"
                      :txr/store   mem-store
                      :ledger/name "testledger1"}
-        commit-info (txr/commit txr tx tx-info)
-        committed   (-> txr :store :storage-atom deref)]
-    (is (= expected-commit-info
-           commit-info))
-    (is (= {"testledger1/commit/988d5119c56068df2f1e1f09311d50e9fdaeb019c62af6ff4430779a441a665b"
-           {:id
-            "fluree:commit:988d5119c56068df2f1e1f09311d50e9fdaeb019c62af6ff4430779a441a665b",
-            :type :commit,
-            :commit/address
-            "fluree:commit:memory:testledger1/commit/988d5119c56068df2f1e1f09311d50e9fdaeb019c62af6ff4430779a441a665b",
-            :db/address "fluree:db:memory/testledger1/id",
-            :commit/hash
-            "988d5119c56068df2f1e1f09311d50e9fdaeb019c62af6ff4430779a441a665b",
-            :commit/size 0,
-            :commit/flakes 0,
-            :commit/tx
-            #:commit{:assert [],
-                     :retract [],
-                     :context {},
-                     :t 1,
-                     :v 0,
-                     :prev "fluree:commit:testledger1/abc123"}}}
-           committed))))
+
+        {:keys [address] :as commit-info} (txr/commit txr tx tx-info)
+        {:keys [address/path]} (ident/address-parts address)
+
+        committed   (-> txr :store :storage-atom deref )
+
+        resolved    (txr/resolve txr address)]
+    (testing "commit returns expected commit-info"
+      (is (= expected-commit-summary
+             commit-info)))
+    (testing "commit writes a commit to the store"
+      (is (= {path expected-commit}
+             committed)))
+    (testing "resolve returns the commit"
+      (is (= expected-commit
+             resolved)))))
