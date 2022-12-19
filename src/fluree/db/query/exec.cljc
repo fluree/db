@@ -42,6 +42,9 @@
     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
 
 (defmulti match-flakes
+  "Return a channel that will contain all solutions from flakes in `db` that are
+  compatible with the initial solution `solution` and matches the additional
+  where-clause pattern `pattern`."
   (fn [db solution pattern error-ch]
     (if (map-entry? pattern)
       (key pattern)
@@ -123,6 +126,8 @@
     match-ch))
 
 (defn with-constraint
+  "Return a channel of all solutions from `db` that extend from the solutions in
+  `solution-ch` and also match the where-clause pattern `pattern`."
   [db pattern error-ch solution-ch]
   (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
@@ -135,8 +140,8 @@
 
 (defn match-clause
   "Returns a channel that will eventually contain all match solutions in `db`
-  extending from `solution` that also match all the patterns in the collection
-  `clause`."
+  extending from `solution` that also match all the where-clause patterns in the
+  collection `clause`."
   [db solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])]
     (reduce (fn [solution-ch pattern]
@@ -158,7 +163,7 @@
 
 (defn with-default
   "Return a transducer that transforms an input stream of solutions to include the
-  default solution if and only if the stream was empty."
+  `default-solution` if and only if the stream was empty."
   [default-solution]
   (fn [rf]
     (let [solutions? (volatile! false)]
@@ -181,7 +186,7 @@
            (rf result)
            (do (vreset! solutions? true) ; mark that a solution was processed in
                                          ; case the reducing fn is terminated
-                                         ; again
+                                         ; again as can happen with buffers.
                (-> result
                    (rf default-solution)
                    rf))))))))
