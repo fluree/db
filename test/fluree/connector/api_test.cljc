@@ -9,12 +9,12 @@
           tx                     {"@context" context
                                   "@id"      "ex:dan"
                                   "ex:foo"   "bar"}
-          expected-create-result "fluree:ledger:memory:testconn/head"
-          expected-tx-result     {:id             "fluree:ledger:2a09ed1d61b94f89b92dc49e26059b0ceaf05a4e0f47ca413f455b05b5df0d73",
-                                  :type           :ledger,
-                                  :ledger/address "fluree:ledger:memory:testconn/head",
-                                  :ledger/name    "testconn",
-                                  :ledger/v       0}
+          expected-create-result "fluree:ledger:memory:head/testconn"
+          expected-tx-result     {:id "fluree:ledger:2a09ed1d61b94f89b92dc49e26059b0ceaf05a4e0f47ca413f455b05b5df0d73",
+                                  :type :ledger,
+                                  :ledger/address "fluree:ledger:memory:head/testconn",
+                                  :ledger/name "testconn",
+                                  :ledger/v 0}
           expected-query-result  [{"@id" "ex:dan", "ex:foo" "bar"}]]
 
       (testing "shared store"
@@ -32,8 +32,8 @@
             (is (= expected-create-result
                    ledger-address))
             (is (= ["fluree:db:memory:init"
-                    "testconn/entry/init"
-                    "testconn/head"]
+                    "head/testconn"
+                    "testconn/entry/init"]
                    (sort (keys after-ledger-init)))))
 
           (testing "added commit and entry"
@@ -70,22 +70,22 @@
             (is (= {}
                    txr-after-ledger-init)))
           (testing "pub init sets head at init entry"
-            (is (= ["testconn/entry/init" "testconn/head"]
+            (is (= ["head/testconn" "testconn/entry/init"]
                    (sort (keys pub-after-ledger-init))))
             (is (= "testconn/entry/init"
-                   (-> pub-after-ledger-init (get "testconn/head")))))
+                   (-> pub-after-ledger-init (get "head/testconn")))))
 
           (testing "db is initialized after conn create"
             (is (= 1
                    (count idxr-after-ledger-init))))
 
           (testing "txr tx writes commit"
-            (is (= ["testconn/commit/bf35229bbcde17fa075d8f460ea361f84641174a996e6894ba158dad5d6252df"]
+            (is (= ["testconn/commit/69430f0caf4609a727b4369006741f0d4274a4c7a6dd1076eb08cdeb134904cf"]
                    (keys txr-after-ledger-tx))))
           (testing "pub tx sets head at new entry"
             (is (= 3
                    (count pub-after-ledger-tx)))
-            (is (not (nil? (get pub-after-ledger-tx (-> pub-after-ledger-tx (get "testconn/head")))))))
+            (is (not (nil? (get pub-after-ledger-tx (-> pub-after-ledger-tx (get "head/testconn")))))))
 
           (testing "transact"
             (is (= expected-tx-result

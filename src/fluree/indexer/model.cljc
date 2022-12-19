@@ -32,10 +32,11 @@
    [:db/permissions :any]
    [:db/ecount :any]])
 
-(def DbInfo
+(def DbSummary
   [:map
    [:db/address :string]
    [:db/t :int]
+   [:db/v :int]
    [:db/flakes :int]
    [:db/size :int]
    [:db/assert [:sequential :any]]

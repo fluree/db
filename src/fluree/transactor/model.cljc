@@ -58,7 +58,7 @@
 (def TxInfo
   "This is the input to commit/create, along with the tx."
   [:and
-   idxr/DbInfo
+   idxr/DbSummary
    [:map
     [:ledger/name :string]
     [:commit/prev {:optional true} :string]]])

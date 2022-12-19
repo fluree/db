@@ -41,4 +41,4 @@
 
 (def Db idxr-model/Db)
 
-(def DbInfo idxr-model/DbInfo)
+(def DbSummary idxr-model/DbSummary)

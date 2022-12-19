@@ -35,6 +35,7 @@
       (store/write store db-address db1)
       ;; return db-info
       {:db/address db-address
+       :db/v 0
        :db/t (- (:t db1))
        :db/flakes (-> db1 :stats :flakes)
        :db/size (-> db1 :stats :size)
