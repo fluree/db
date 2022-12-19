@@ -6,8 +6,59 @@ on:
     - cron: 13 01 * * *
 
 jobs:
-  test:
+  test-clj:
+    name: run clj tests
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: actions/checkout@v3.1.0
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - name: Run tests
+        run: script/run-in-docker.sh make cljtest
+  test-cljs:
+    name: run clj tests
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: actions/checkout@v3.1.0
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - name: Run tests
+        run: script/run-in-docker.sh make cljstest
+  test-nodejs:
+    name: run clj tests
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: actions/checkout@v3.1.0
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - name: Run tests
+        run: script/run-in-docker.sh make nodejs-test
+  test-browser:
+    name: run clj tests
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: actions/checkout@v3.1.0
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - name: Run tests
+        run: script/run-in-docker.sh make browser-test
+  test-eastwood:
+    name: run clj tests
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: actions/checkout@v3.1.0
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - name: Run tests
+        run: script/run-in-docker.sh make eastwood
+  build-docker:
     name: Run tests & build Docker image
+    needs: [test-clj, test-cljs, test-nodejs, test-browser, test-eastwood]
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
