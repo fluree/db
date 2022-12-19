@@ -185,6 +185,11 @@
                      union)]
     (->pattern :union parsed)))
 
+(defmethod parse-pattern :optional
+  [{:keys [optional]} db context]
+  (let [parsed (parse-where-clause optional db context)]
+    (->pattern :optional parsed)))
+
 (defn parse-context
   [q db]
   (let [db-ctx (get-in db [:schema :context])

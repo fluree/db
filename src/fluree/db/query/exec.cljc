@@ -156,6 +156,43 @@
                           clause-ch)
     out-ch))
 
+(defn with-default
+  "Return a transducer that transforms an input stream of solutions to include the
+  default solution if and only if the stream was empty."
+  [default-solution]
+  (fn [rf]
+    (let [solutions? (volatile! false)]
+      (fn
+        ;; Initialization: do nothing but initialize the supplied reducing fn.
+        ([]
+         (rf))
+
+        ;; Iteration: mark that a solution was processed, and pass it to the supplied
+        ;; reducing fn.
+        ([result solution]
+         (do (vreset! solutions? true)
+             (rf result solution)))
+
+        ;; Termination: if no other solutions were processed, then process the
+        ;; default-solution with the supplied reducing fn before terminating it;
+        ;; terminate as normal otherwise.
+        ([result]
+         (if @solutions?
+           (rf result)
+           (do (vreset! solutions? true) ; mark that a solution was processed in
+                                         ; case the reducing fn is terminated
+                                         ; again
+               (-> result
+                   (rf default-solution)
+                   rf))))))))
+
+(defmethod match-flakes :optional
+  [db solution pattern error-ch]
+  (let [clause (val pattern)
+        out-ch (async/chan 2 (with-default solution))]
+    (-> (match-clause db solution clause error-ch)
+        (async/pipe out-ch))))
+
 (def blank-solution {})
 
 (defn where
@@ -191,8 +228,8 @@
   [grouping groups]
   (reduce-kv (fn [solutions group-key grouped-vals]
                (let [merged-vals (reduce merge-with-colls {} grouped-vals)
-                     solution      (into merged-vals
-                                       (map vector grouping group-key))]
+                     solution    (into merged-vals
+                                         (map vector grouping group-key))]
                  (conj solutions solution)))
              [] groups))
 
