@@ -5,6 +5,17 @@ on:
     - cron: 13 01 * * *
 
 jobs:
+  docker-build-baseline:
+    name: time how long it takes to start running in docker
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: actions/checkout@v3.1.0
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - name: Run tests
+        run: script/run-in-docker.sh ls
+
   test-nodejs:
     name: test and build flureenjs.js
     runs-on: [linux, large, docker]
