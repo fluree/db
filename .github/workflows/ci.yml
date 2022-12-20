@@ -17,7 +17,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: fluree/db
-          outputs: type=docker,dest=/tmp/myiamge.tar
+          outputs: type=docker,dest=/tmp/myimage.tar
 
   test-clj:
     name: run clj & cljs tests
