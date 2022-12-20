@@ -206,7 +206,7 @@
                         :fork      fork
                         :forkBlock fork-block}
            ser         (serdeproto/-serialize-db-root (serde conn) data)]
-       (<? (write conn db-root-key ser))))))
+       (<? (store/write conn db-root-key ser))))))
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
