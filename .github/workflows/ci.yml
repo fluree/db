@@ -5,8 +5,8 @@ on:
     - cron: 13 01 * * *
 
 jobs:
-  docker-build-baseline:
-    name: time how long it takes to start running in docker
+  docker-build-cache:
+    name: docker build cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -25,6 +25,7 @@ jobs:
 
   test-nodejs:
     name: test and build flureenjs.js
+    needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -43,6 +44,7 @@ jobs:
 
   test-browser:
     name: test and build flureedb.js
+    needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -61,6 +63,7 @@ jobs:
 
   test-clj:
     name: run clj tests
+    needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -79,6 +82,7 @@ jobs:
 
   test-cljs:
     name: run cljs tests
+    needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -102,6 +106,7 @@ jobs:
 
   test-eastwood:
     name: run eastwood
+    needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
