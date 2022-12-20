@@ -78,7 +78,7 @@ jobs:
           tags: fluree/db
           load: true
       - name: Run tests
-        run: script/run-in-docker.sh make cljtest
+        run: script/run-in-docker.sh make cljtest eastwood
 
   test-cljs:
     name: run cljs tests
@@ -102,23 +102,3 @@ jobs:
           load: true
       - name: Run tests
         run: script/run-in-docker.sh make cljstest
-
-
-  test-eastwood:
-    name: run eastwood
-    needs: docker-build-cache
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - uses: docker/build-push-action@v3
-        with:
-          context: .
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          tags: fluree/db
-          load: true
-      - name: Run tests
-        run: script/run-in-docker.sh make eastwood
