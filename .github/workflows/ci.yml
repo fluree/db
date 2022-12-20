@@ -6,17 +6,17 @@ on:
 
 jobs:
   docker-layer-cache:
-  name: Build with Docker
-  runs-on: [linux, large, docker]
-  steps:
-    - uses: actions/checkout@v3
-    - uses: docker/setup-buildx-action@v2.2.1
-    - uses: docker/build-push-action@v3
-      with:
-        context: .
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-        load: true
+    name: Build with Docker
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: docker/setup-buildx-action@v2.2.1
+      - uses: docker/build-push-action@v3
+        with:
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          load: true
 
   test-clj:
     name: run clj & cljs tests
