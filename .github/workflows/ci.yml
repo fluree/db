@@ -11,13 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: docker/setup-buildx-action@v2.2.1
-      - uses: docker/build-push-action@v3
-        with:
-          context: .
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          load: true
-          tags: fluree/db
+      - uses: satackey/action-docker-layer-caching@v0.0.11
+        continue-on-error: true
+      - name: build docker image
+        run: script/run-in-docker ls
 
   test-clj:
     name: run clj & cljs tests
@@ -28,6 +25,8 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
+      - uses: satackey/action-docker-layer-caching@v0.0.11
+        continue-on-error: true
       - name: Run tests
         run: script/run-in-docker.sh make cljtest
   test-nodejs:
@@ -39,6 +38,8 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
+      - uses: satackey/action-docker-layer-caching@v0.0.11
+        continue-on-error: true
       - name: Run tests
         run: script/run-in-docker.sh make nodejs-test
   test-browser:
@@ -50,6 +51,8 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
+      - uses: satackey/action-docker-layer-caching@v0.0.11
+        continue-on-error: true
       - name: Run tests
         run: script/run-in-docker.sh make browser-test
   test-eastwood:
@@ -61,6 +64,8 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
+      - uses: satackey/action-docker-layer-caching@v0.0.11
+        continue-on-error: true
       - name: Run tests
         run: script/run-in-docker.sh make eastwood
   build-docker:
