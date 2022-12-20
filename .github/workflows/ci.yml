@@ -17,6 +17,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           load: true
+          tags: fluree/db
 
   test-clj:
     name: run clj & cljs tests
