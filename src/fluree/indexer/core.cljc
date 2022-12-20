@@ -33,23 +33,39 @@
 
 (defn stage-db
   [{:keys [store] :as idxr} db-address data]
-  (if-let [db (<?? (store/read store db-address))]
-    (let [db0        (db/prepare db)
-          db1        (<?? (jld-transact/stage db0 data {}))
-          db-address (db/create-db-address db1)
-          idx        (-> db1 :ledger :indexer)]
-      (<?? (store/write store db-address db1))
-      (when (idx-proto/-index? idx db1)
-        (idx-proto/-index idx db1))
+  (if-let [db-before (<?? (store/read store db-address))]
+    (let [db-after   (<?? (jld-transact/stage (db/prepare db-before) data {}))
+          db-address (db/create-db-address db-after)
+          idx        (-> db-after :ledger :indexer)
+
+          {:keys [context did private push?] :as _opts} data
+
+          context*      (-> (if context
+                              (json-ld/parse-context (:context (:schema db-after)) context)
+                              (:context (:schema db-after)))
+                            (json-ld/parse-context {"f" "https://ns.flur.ee/ledger#"})
+                            jld-commit/stringify-context)
+          ctx-used-atom (atom {})
+          compact-fn    (json-ld/compact-fn context* ctx-used-atom)
+          flakes        (jld-commit/commit-flakes db-after)
+
+          {:keys [assert retract refs-ctx] :as c}
+          (<?? (jld-commit/generate-commit flakes db {:compact-fn compact-fn}))
+
+          ]
+      ;; (<?? (store/write store db-address db-after))
+      ;; (when (idx-proto/-index? idx db-after)
+      ;;   (idx-proto/-index idx db-after))
       ;; return db-info
-      {:db/address db-address
+      c
+      #_{:db/address db-address
        :db/v       0
-       :db/t       (- (:t db1))
-       :db/flakes  (-> db1 :stats :flakes)
-       :db/size    (-> db1 :stats :size)
-       ;; TODO: calculate assert+retract
-       :db/assert  []
-       :db/retract []})
+       :db/t       (- (:t db-after))
+       :db/flakes  (-> db-after :stats :flakes)
+       :db/size    (-> db-after :stats :size)
+       :db/context refs-ctx
+       :db/assert assert
+       :db/retract retract})
     (throw (ex-info "No such db-address." {:error      :stage/no-such-db
                                            :db-address db-address}))))
 
