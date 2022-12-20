@@ -18,7 +18,7 @@ jobs:
           cache-to: type=gha,mode=max
           tags: fluree/db
           load: true
-        run: script/run-in-docker.sh ls
+      - run: script/run-in-docker.sh ls
 
   docker-layer-cache-2:
     name: Build with Docker
@@ -34,4 +34,4 @@ jobs:
           cache-to: type=gha,mode=max
           tags: fluree/db
           load: true
-        run: script/run-in-docker.sh ls
+      - run: script/run-in-docker.sh ls
