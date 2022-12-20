@@ -24,7 +24,7 @@ jobs:
         run: script/run-in-docker.sh ls
 
   test-nodejs:
-    name: test and build flureenjs.js
+    name: test flureenjs.js
     needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
@@ -43,7 +43,7 @@ jobs:
         run: script/run-in-docker.sh make nodejs-test
 
   test-browser:
-    name: test and build flureedb.js
+    name: test flureedb.js
     needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
@@ -132,8 +132,13 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
-      - name: Build Docker image
-        run: docker build -t fluree/db .
+      - uses: docker/build-push-action@v3
+        with:
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
       - name: Notify Slack fail
         if: github.ref == 'refs/heads/main' && failure()
         env:
