@@ -40,7 +40,7 @@ jobs:
         run: make deps jar
 
   test-nodejs:
-    name: build flureenjs.js
+    name: test and build flureenjs.js
     runs-on: [linux, large, docker]
     needs: deps
     steps:
@@ -72,11 +72,14 @@ jobs:
         with:
           path: out/flureenjs.js
           key: flureenjs.js-{{ github.sha }}
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
       - name: Run tests
         run: script/run-in-docker.sh make nodejs-test
 
   test-browser:
-    name: build flureedb.js
+    name: test and build flureedb.js
     runs-on: [linux, large, docker]
     needs: deps
     steps:
@@ -108,6 +111,9 @@ jobs:
         with:
           path: out/flureedb.js
           key: flureedb.js-{{ github.sha }}
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
       - name: Run tests
         run: script/run-in-docker.sh make browser-test
 
