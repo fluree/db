@@ -110,7 +110,7 @@ jobs:
 
   build-docker:
     name: build Docker image
-    needs: [test-clj, test-nodejs, test-browser, test-eastwood]
+    needs: [test-clj, test-js, test-eastwood]
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
