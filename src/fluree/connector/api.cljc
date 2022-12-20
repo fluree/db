@@ -1,5 +1,5 @@
 (ns fluree.connector.api
-  (:refer-clojure :exclude [load])
+  (:refer-clojure :exclude [load list])
   (:require [fluree.connector.core :as conn-impl]
             [fluree.connector.model :as conn-model]))
 
@@ -19,6 +19,11 @@
    (create conn ledger-name {}))
   ([conn ledger-name opts]
    (conn-impl/create conn ledger-name opts)))
+
+(defn list
+  "List ledgers on this connection."
+  [conn]
+  (conn-impl/list conn))
 
 (defn transact
   "Transact data into a ledger."

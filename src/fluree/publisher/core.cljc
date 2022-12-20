@@ -55,9 +55,9 @@
     (:ledger/address ledger)))
 
 (defn list-ledgers
-  [{:keys [store]}]
+  [{:keys [store] :as pub}]
   (let [ledger-heads (<?? (store/list store "head/"))]
-    (map (fn [entry-address] (<?? (store/read store entry-address))) ledger-heads)))
+    (map (fn [entry-address] (pull-publisher pub entry-address)) ledger-heads)))
 
 (defn push-publisher
   [pub ledger-address {:keys [commit-info db-info]}]

@@ -1,4 +1,5 @@
 (ns fluree.connector.core
+  (:refer-clojure :exclude [list])
   (:require
    [fluree.common.model :as model]
    [fluree.common.protocols :as service-proto]
@@ -52,6 +53,7 @@
       (let [commit-summary (txr/commit txr tx (assoc db-summary
                                                      :commit/prev commit-address
                                                      :ledger/name (:ledger/name ledger)))
+            ;; TODO: check that commit t hasn't been pushed already?
             ledger-cred (pub/push pub ledger-address
                                   {:commit-info commit-summary
                                    :db-info (select-keys db-summary [:db/address :db/t :db/flakes :db/size
@@ -128,3 +130,8 @@
 (defn query
   [conn ledger-address query opts]
   (conn-proto/query conn ledger-address query opts))
+
+;; TODO: make this part of the conn protocol?
+(defn list
+  [conn]
+  (pub/list (:publisher conn)))
