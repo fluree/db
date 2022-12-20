@@ -14,7 +14,7 @@ jobs:
         with:
           install: true
       - name: Run tests
-        run: script/run-in-docker.sh make ci -j
+        run: script/run-in-docker.sh make ci
       - name: Build Docker image
         run: docker build -t fluree/db .
       - name: Notify Slack fail
