@@ -14,7 +14,7 @@ jobs:
       - uses: satackey/action-docker-layer-caching@v0.0.11
         continue-on-error: true
       - name: build docker image
-        run: script/run-in-docker ls
+        run: script/run-in-docker.sh ls
 
   test-clj:
     name: run clj & cljs tests
