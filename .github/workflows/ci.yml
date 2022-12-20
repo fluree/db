@@ -18,6 +18,11 @@ jobs:
           cache-to: type=gha,mode=max
           tags: fluree/db
           outputs: type=docker,dest=/tmp/myimage.tar
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: myimage
+          path: /tmp/myimage.tar
 
   test-clj:
     name: run clj & cljs tests
