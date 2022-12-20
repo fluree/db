@@ -23,10 +23,14 @@
   #?(:clj
      (try
        (with-open [out (io/output-stream (io/file path))]
-         (let [serialized (case serialize-to
-                            :json (json/stringify data)
-                            :edn (pr-str data))]
-           (.write out (util/string->bytes serialized))))
+         ;; TODO: use a proper Serde here, from config
+         (let [serialized (cond (bytes? data) data
+                                (= serialize-to :json) (json/stringify data)
+                                (= serialize-to :edn) (pr-str data))
+               bytes (if (string? serialized)
+                       (util/string->bytes serialized)
+                       serialized)]
+           (.write out bytes)))
        :written
        (catch FileNotFoundException _
          (try
@@ -46,10 +50,13 @@
            (try
              (fs/mkdirSync (path/dirname path) #js{:recursive true})
              (try
-               (let [serialized (case serialize-to
-                                  :json (js/JSON.stringify data)
-                                  :edn (pr-str data))])
-               (fs/writeFileSync path serialized)
+               (let [serialized (cond (bytes? data) data
+                                      (= serialize-to :json) (json/stringify data)
+                                      (= serialize-to :edn) (pr-str data))
+                     bytes (if (string? serialized)
+                             (util/string->bytes serialized)
+                             serialized)])
+               (fs/writeFileSync path bytes)
                :store/written
                (catch :default e
                  (log/error (str "Unable to write file to path " path
