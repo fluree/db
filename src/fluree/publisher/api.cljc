@@ -30,8 +30,8 @@
 (defn push
   "Creates a ledger entry and stores it in store under its id. Returns a ledger document
   with links to the head db and the head commit."
-  [publisher ledger-address {:keys [commit-info db-info] :as info}]
-  (pub-impl/push publisher ledger-address info))
+  [publisher ledger-address {:keys [commit-summary db-summary] :as summary}]
+  (pub-impl/push publisher ledger-address summary))
 
 (defn pull
   "If address is an entry-address, returns the corresponding entry. If address is a

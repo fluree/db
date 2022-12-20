@@ -15,14 +15,8 @@
   [:and
    EntryInfo
    [:entry/previous {:optional true} EntryInfo]
-   [:entry/commit {:optional true} txr/CommitSummary]
-   [:entry/db {:optional true}
-    [:map
-     [:db/address :string]
-     [:db/t :int]
-     [:db/v :int]
-     [:db/size :int]
-     [:db/flakes :int]]]])
+   [:entry/commit-summary {:optional true} txr/CommitSummary]
+   [:entry/db-summary {:optional true} idxr/DbSummary]])
 
 (def Ledger
   [:map

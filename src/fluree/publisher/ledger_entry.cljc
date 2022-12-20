@@ -16,14 +16,14 @@
   (store/address store :ledger-entry (str ledger-name "/entry/" entry-id)))
 
 (defn create
-  [store {:keys [ledger/head ledger/name]} commit-info index-info]
-  (let [prev-commit              (:entry/commit head)
-        prev-index               (:entry/db head)
-        entry                    (cond-> {:type :ledger-entry
-                                          :entry/time (util/current-time-iso)}
-                                   head        (assoc :entry/previous (:entry/address head))
-                                   commit-info (assoc :entry/commit (or commit-info prev-commit))
-                                   index-info  (assoc :entry/db (or index-info prev-index)))
+  [store {:keys [ledger/head ledger/name]} commit-summary db-summary]
+  (let [prev-commit           (:entry/commit head)
+        prev-index            (:entry/db head)
+        entry                 (cond-> {:type :ledger-entry
+                                       :entry/time (util/current-time-iso)}
+                                head           (assoc :entry/previous (:entry/address head))
+                                commit-summary (assoc :entry/commit-summary (or commit-summary prev-commit))
+                                db-summary     (assoc :entry/db-summary (or db-summary prev-index)))
         entry-id              (create-entry-id entry)
         {entry-hash :id/hash} (ident/id-parts entry-id)
         entry-address         (create-entry-address store name entry-hash)]

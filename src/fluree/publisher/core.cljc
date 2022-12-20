@@ -57,15 +57,15 @@
 (defn list-ledgers
   [{:keys [store] :as pub}]
   (let [ledger-heads (<?? (store/list store "head/"))]
-    (map (fn [entry-address] (pull-publisher pub entry-address)) ledger-heads)))
+    (map (fn [entry-address] (<?? (store/read store entry-address))) ledger-heads)))
 
 (defn push-publisher
-  [pub ledger-address {:keys [commit-info db-info]}]
+  [pub ledger-address {:keys [commit-summary db-summary]}]
   (let [store        (:store pub)
         prev-ledger  (pull-publisher pub ledger-address)
         ;; unwrap ledger from credential if it's wrapped
         prev-ledger  (get prev-ledger :cred/credential-subject prev-ledger)
-        entry        (ledger-entry/create store prev-ledger commit-info db-info)
+        entry        (ledger-entry/create store prev-ledger commit-summary db-summary)
         ledger       (assoc prev-ledger :ledger/head entry)
         final-ledger (if (:did pub)
                        (credential/generate ledger (:did pub))
@@ -117,8 +117,8 @@
   (pub-proto/list publisher))
 
 (defn push
-  [publisher ledger-address info]
-  (pub-proto/push publisher ledger-address info))
+  [publisher ledger-address summary]
+  (pub-proto/push publisher ledger-address summary))
 
 (defn pull
   [publisher address]

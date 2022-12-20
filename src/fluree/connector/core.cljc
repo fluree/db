@@ -42,8 +42,8 @@
         ledger              (pub/pull pub ledger-address)
         {head :ledger/head} (get ledger :cred/credential-subject ledger)
 
-        db-address     (-> head :entry/db :db/address)
-        commit-address (-> head :entry/commit :commit/address)
+        db-address     (-> head :entry/db-summary :db/address)
+        commit-address (-> head :entry/commit-summary :commit/address)
 
         {:keys [errors db/address] :as db-summary} (idxr/stage idxr db-address tx)]
     (if errors
@@ -55,8 +55,8 @@
                                                      :ledger/name (:ledger/name ledger)))
             ;; TODO: check that commit t hasn't been pushed already?
             ledger-cred (pub/push pub ledger-address
-                                  {:commit-info commit-summary
-                                   :db-info (select-keys db-summary [:db/address :db/t :db/flakes :db/size
+                                  {:commit-summary commit-summary
+                                   :db-summary (select-keys db-summary [:db/address :db/t :db/flakes :db/size
                                                                      :ledger/name])})]
         ledger-cred))))
 

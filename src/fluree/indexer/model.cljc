@@ -38,6 +38,11 @@
    [:db/t :int]
    [:db/v :int]
    [:db/flakes :int]
-   [:db/size :int]
-   [:db/assert [:sequential :any]]
-   [:db/retract [:sequential :any]]])
+   [:db/size :int]])
+
+(def TxSummary
+  [:and
+   DbSummary
+   [:map
+    [:db/assert [:sequential :any]]
+    [:db/retract [:sequential :any]]]])

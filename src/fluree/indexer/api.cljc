@@ -42,3 +42,4 @@
 (def Db idxr-model/Db)
 
 (def DbSummary idxr-model/DbSummary)
+(def TxSummary idxr-model/TxSummary)
