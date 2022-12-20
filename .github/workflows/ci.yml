@@ -5,94 +5,33 @@ on:
     - cron: 13 01 * * *
 
 jobs:
-  docker-build-baseline:
-    name: time how long it takes to start running in docker
+  docker-layer-cache:
+    name: Build with Docker
     runs-on: [linux, large, docker]
     steps:
-      - uses: actions/checkout@v3.1.0
+      - uses: actions/checkout@v3
       - uses: docker/setup-buildx-action@v2.2.1
+      - uses: docker/build-push-action@v3
         with:
-          install: true
-      - name: Run tests
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
         run: script/run-in-docker.sh ls
 
-  test-nodejs:
-    name: test and build flureenjs.js
+  docker-layer-cache-2:
+    name: Build with Docker
+    needs: docker-layer-cache
     runs-on: [linux, large, docker]
     steps:
-      - uses: actions/checkout@v3.1.0
+      - uses: actions/checkout@v3
       - uses: docker/setup-buildx-action@v2.2.1
+      - uses: docker/build-push-action@v3
         with:
-          install: true
-      - name: Run tests
-        run: script/run-in-docker.sh make nodejs-test
-
-  test-browser:
-    name: test and build flureedb.js
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - name: Run tests
-        run: script/run-in-docker.sh make browser-test
-
-  test-clj:
-    name: run clj tests
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - name: Run tests
-        run: script/run-in-docker.sh make cljtest
-
-  test-cljs:
-    name: run cljs tests
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - name: Run tests
-        run: script/run-in-docker.sh make cljstest
-
-
-  test-eastwood:
-    name: run eastwood
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - name: Run tests
-        run: script/run-in-docker.sh make eastwood
-
-  build-docker:
-    name: build Docker image
-    needs: [test-clj, test-cljs, test-nodejs, test-browser, test-eastwood]
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - name: Build Docker image
-        run: docker build -t fluree/db .
-      - name: Notify Slack fail
-        if: github.ref == 'refs/heads/main' && failure()
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        uses: voxmedia/github-action-slack-notify-build@v2
-        with:
-          channel_id: CNCH08G14 # development channel
-          status: FAILED
-          color: danger
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
+        run: script/run-in-docker.sh ls
