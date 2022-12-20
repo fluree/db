@@ -1,5 +1,5 @@
 (ns fluree.connector.core
-  (:refer-clojure :exclude [list])
+  (:refer-clojure :exclude [list load])
   (:require
    [fluree.common.model :as model]
    [fluree.common.protocols :as service-proto]
@@ -60,6 +60,42 @@
                                                                      :ledger/name])})]
         ledger-cred))))
 
+(defn load-ledger
+  [conn ledger-address opts]
+  (let [{txr :transactor pub :publisher idxr :indexer} conn
+
+        ledger (pub/pull pub ledger-address)
+
+        {head :ledger/head} (get ledger :cred/credential-subject ledger)
+
+        db-address (-> head :entry/db-summary :db/address)]
+    (if false
+      ;; TODO: attempt to load index first
+      :TODO #_(idxr/load idxr db-address)
+      ;; fall back to re-staging commits
+      (let [commit-addresses (loop [ledger-entry     head
+                                    commit-addresses '()]
+                               (let [{:keys [entry/previous entry/commit-summary]} ledger-entry
+                                     {:keys [address commit/t]} commit-summary]
+                                 (if previous
+                                   (let [prev-ledger               (pub/pull pub previous)
+                                         {prev-entry :ledger/head} (get prev-ledger :cred/credential-subject prev-ledger)]
+                                     (recur prev-entry (conj commit-addresses address)))
+                                   commit-addresses)))
+
+            ;; db-summary (reduce (fn [db-summary commit-address]
+            ;;                      (let [commit (txr/resolve txr commit-address)
+            ;;                            db-summary (idxr/stage idxr (:db/address db-summary) commit)]
+            ;;                        db-summary))
+            ;;                    {:db/address (idxr/init idxr {})}
+            ;;                    commit-addresses)
+
+            ;; ledger-cred (pub/push pub ledger-address
+            ;;                       {:db-summary (select-keys db-summary [:db/address :db/t :db/flakes :db/size
+            ;;                                                             :ledger/name])})
+            ]
+        commit-addresses))))
+
 (defn query-conn
   [conn ledger-address query opts]
   (let [ledger              (pub/pull (:publisher conn) ledger-address)
@@ -76,8 +112,8 @@
   (transact [conn ledger-address tx opts] (transact-conn conn ledger-address tx opts))
   (create [conn ledger-name opts] (create-ledger conn ledger-name opts))
   (query [conn ledger-address query opts] (query-conn conn ledger-address query opts))
+  (load [conn ledger-address opts] (load-ledger conn ledger-address opts))
   ;; TODO
-  #_(load [conn query opts])
   #_(subscribe [conn query fn])
   )
 
@@ -122,6 +158,10 @@
 (defn create
   [conn ledger-name opts]
   (conn-proto/create conn ledger-name opts))
+
+(defn load
+  [conn ledger-address opts]
+  (conn-proto/load conn ledger-address opts))
 
 (defn transact
   [conn ledger-address tx opts]

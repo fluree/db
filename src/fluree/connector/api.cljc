@@ -20,6 +20,13 @@
   ([conn ledger-name opts]
    (conn-impl/create conn ledger-name opts)))
 
+(defn load
+  "Prepare a ledger for transacting and querying."
+  ([conn ledger-name]
+   (load conn ledger-name {}))
+  ([conn ledger-name opts]
+   (conn-impl/load conn ledger-name opts)))
+
 (defn list
   "List ledgers on this connection."
   [conn]
