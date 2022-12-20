@@ -33,7 +33,7 @@ jobs:
           distribution: 'zulu'
           java-version: '11'
       - name: Install clojure tools
-        uses: DeLaGuardo/setup-clojure@1.11.1
+        uses: DeLaGuardo/setup-clojure@10.1
         with:
           cli: 1.11.1.1189
       - name: fetch deps and build jar
