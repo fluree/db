@@ -5,51 +5,11 @@ on:
     - cron: 13 01 * * *
 
 jobs:
-  deps:
-    name: download deps
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - run: npm install
-      - name: clj cache
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2
-          key: clj-deps-${{ hashFiles('deps.edn') }}
-          restore-keys: |
-            clj-deps-
-      - name: jar cache
-        uses: actions/cache@v3
-        with:
-          path: target/fluree-db.jar
-          key: jar-{{ github.sha }}
-      - name: Prepare java
-        uses: actions/setup-java@v3
-        with:
-          distribution: 'zulu'
-          java-version: '11'
-      - name: Install clojure tools
-        uses: DeLaGuardo/setup-clojure@10.1
-        with:
-          cli: 1.11.1.1189
-      - name: fetch deps and build jar
-        run: make deps jar
-
   test-nodejs:
     name: test and build flureenjs.js
     runs-on: [linux, large, docker]
-    needs: deps
     steps:
       - uses: actions/checkout@v3.1.0
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - run: npm install
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
@@ -59,14 +19,8 @@ jobs:
   test-browser:
     name: test and build flureedb.js
     runs-on: [linux, large, docker]
-    needs: deps
     steps:
       - uses: actions/checkout@v3.1.0
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - run: npm install
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
@@ -113,28 +67,13 @@ jobs:
 
   build-docker:
     name: build Docker image
-    needs: [test-clj, test-nodejs, test-browser, test-eastwood]
+    needs: [test-clj, test-cljs, test-nodejs, test-browser, test-eastwood]
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
-      - name: jar cache
-        uses: actions/cache@v3
-        with:
-          path: target/fluree-db.jar
-          key: jar-{{ github.sha }}
-      - name: flureedb.js cache
-        uses: actions/cache@v3
-        with:
-          path: out/flureedb.js
-          key: flureedb.js-{{ github.sha }}
-      - name: flureenjs cache
-        uses: actions/cache@v3
-        with:
-          path: out/flureenjs.js
-          key: flureenjs.js-{{ github.sha }}
       - name: Build Docker image
         run: docker build -t fluree/db .
       - name: Notify Slack fail
