@@ -39,7 +39,7 @@ jobs:
       - name: fetch deps and build jar
         run: make deps jar
 
-  build-flureenjs-js:
+  test-nodejs:
     name: build flureenjs.js
     runs-on: [linux, large, docker]
     needs: deps
@@ -72,8 +72,10 @@ jobs:
         with:
           path: out/flureenjs.js
           key: flureenjs.js-{{ github.sha }}
+      - name: Run tests
+        run: script/run-in-docker.sh make nodejs-test
 
-  build-flureedb-js:
+  test-browser:
     name: build flureedb.js
     runs-on: [linux, large, docker]
     needs: deps
@@ -106,6 +108,8 @@ jobs:
         with:
           path: out/flureedb.js
           key: flureedb.js-{{ github.sha }}
+      - name: Run tests
+        run: script/run-in-docker.sh make browser-test
 
   test-clj:
     name: run clj & cljs tests
@@ -117,52 +121,6 @@ jobs:
           install: true
       - name: Run tests
         run: script/run-in-docker.sh make cljtest
-
-  test-nodejs:
-    name: run nodejs tests
-    needs: build-flureenjs-js
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - name: flureenjs cache
-        uses: actions/cache@v3
-        with:
-          path: out/flureenjs.js
-          key: flureenjs.js-{{ github.sha }}
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - name: Run tests
-        run: script/run-in-docker.sh make nodejs-test
-
-  test-browser:
-    name: run browser tests
-    needs: build-flureedb-js
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - name: flureedb.js cache
-        uses: actions/cache@v3
-        with:
-          path: out/flureedb.js
-          key: flureedb.js-{{ github.sha }}
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - name: Run tests
-        run: script/run-in-docker.sh make browser-test
 
   test-eastwood:
     name: run eastwood
