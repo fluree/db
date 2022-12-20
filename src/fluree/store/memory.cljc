@@ -27,11 +27,12 @@
 
   store-proto/Store
   (address [_ type k] (address-memory type k))
-  (read [_ k] (get @storage-atom k))
-  (list [_ prefix]  (let [ks (filter #(str/starts-with? % prefix) (keys @storage-atom))]
-                      (map #(get @storage-atom %) ks)))
-  (write [_ k data] (swap! storage-atom assoc k data) :store/written)
-  (delete [_ k] (swap! storage-atom dissoc k) :store/deleted)
+  (read [_ k] (async/go (get @storage-atom k)))
+  (list [_ prefix]  (async/go
+                      (let [ks (filter #(str/starts-with? % prefix) (keys @storage-atom))]
+                        (map #(get @storage-atom %) ks))))
+  (write [_ k data] (async/go (swap! storage-atom assoc k data) :written))
+  (delete [_ k] (async/go (swap! storage-atom dissoc k) :deleted))
 
   fluree.db.index/Resolver
   (resolve

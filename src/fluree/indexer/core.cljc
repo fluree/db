@@ -5,6 +5,7 @@
    [fluree.common.protocols :as service-proto]
    [fluree.db.api.query :as jld-query]
    [fluree.db.json-ld.transact :as jld-transact]
+   [fluree.db.util.async :refer [<?? go-try]]
    [fluree.db.util.log :as log]
    [fluree.indexer.db :as db]
    [fluree.indexer.model :as idxr-model]
@@ -17,22 +18,22 @@
   (store/stop (:store idxr)))
 
 (defn init-db
-  [{:keys [store] :as idxr} opts]
-  (let [db (db/create store opts)
+  [{:keys [store config] :as idxr} opts]
+  (let [db (db/create store (merge config opts))
         db-address (db/create-db-address db)]
-    (if (store/read store db-address)
+    (if (<?? (store/read store db-address))
       db-address
       (do
-        (store/write store db-address db)
+        (<?? (store/write store db-address db))
         db-address))))
 
 (defn stage-db
   [{:keys [store] :as idxr} db-address data]
-  (if-let [db (store/read store db-address)]
+  (if-let [db (<?? (store/read store db-address))]
     (let [db0 (db/prepare db)
-          db1 (async/<!! (jld-transact/stage db0 data {}))
-          db-address (db/create-db-address db1)]
-      (store/write store db-address db1)
+          db1 (<?? (jld-transact/stage db0 data {}))
+          db-address (db/create-db-address db1)
+      (<?? (store/write store db-address db1))
       ;; return db-info
       {:db/address db-address
        :db/v 0
@@ -52,8 +53,8 @@
 
 (defn query-db
   [{:keys [store] :as idxr} db-address query]
-  (if-let [db (store/read store db-address)]
-    (async/<!! (jld-query/query-async db query))
+  (if-let [db (<?? (store/read store db-address))]
+    (<?? (jld-query/query-async db query))
     (throw (ex-info "No such db-address." {:error :query/no-such-db
                                            :db-address db-address}))))
 
@@ -77,7 +78,7 @@
   (let [store (or store (store/start store-config))
         id (or id (random-uuid))]
     (log/info "Starting Indexer " id "." config)
-    (map->Indexer {:id id :store store})))
+    (map->Indexer {:id id :store store :config config})))
 
 (defn start
   [config]
@@ -108,3 +109,59 @@
 (defn explain
   [idxr db-address query]
   (idxr-proto/explain idxr db-address query))
+
+
+(comment
+  (def idxr (start {:idxr/store-config {:store/method :memory}}))
+
+  (def xxx (-> idxr :store :storage-atom deref))
+
+  (init idxr {})
+  "fluree:db:memory:init"
+
+
+  (stage idxr "fluree:db:memory:init" {:context {:ex "http://ex.co/"}
+                                       "@id" "ex/dan"
+                                       "ex/foo" "bar"})
+  #:db{:address "fluree:db:memory:91e45a25-e184-4ed1-8227-5ec16d1c1a01", :t 1, :flakes 6, :size 466, :assert [], :retract []}
+
+  (def xxx (-> idxr :store :storage-atom deref))
+
+  xxx
+
+  (def db (get xxx "fluree:db:memory:91e45a25-e184-4ed1-8227-5ec16d1c1a01"))
+
+  (keys db)
+  (:ledger :conn :method :alias :branch :commit :block :t :tt-id :stats :spot :psot :post :opst :tspo :schema :comparators :novelty :permissions :ecount :state)
+
+  (:spot db)
+  {:children
+   {"[9223372036854775807 0 9223372036854775807 5 0 true nil]"
+    {:block 0,
+     :ledger-id "",
+     :leaf true,
+     :size 0,
+     :leftmost? true,
+     :id :empty,
+     :tempid #uuid "14b7520c-ef09-464e-bf45-98621903450a",
+     :comparator "[fluree.db.flake/cmp-flakes-spot]",
+     :t 0,
+     :network nil,
+     :first "[9223372036854775807 0 9223372036854775807 5 0 true nil]",
+     :tt-id #uuid "91e45a25-e184-4ed1-8227-5ec16d1c1a01",
+     :rhs nil}},
+   :block 0,
+   :ledger-id "",
+   :leaf false,
+   :size 0,
+   :leftmost? true,
+   :id :empty,
+   :tempid #uuid "540e620b-5657-4302-8182-8f43eb335616",
+   :comparator "[fluree.db.flake/cmp-flakes-spot]",
+   :t 0,
+   :network nil,
+   :first "[9223372036854775807 0 9223372036854775807 5 0 true nil]",
+   :tt-id #uuid "91e45a25-e184-4ed1-8227-5ec16d1c1a01",
+   :rhs nil}
+
+  ,)

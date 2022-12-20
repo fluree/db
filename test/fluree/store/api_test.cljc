@@ -1,5 +1,6 @@
 (ns fluree.store.api-test
   (:require [clojure.test :as test :refer :all]
+            [fluree.db.util.async :refer [<? <?? go-try]]
             [fluree.store.api :as store]))
 
 #?(:clj
@@ -11,11 +12,11 @@
 
              out-file   "store.json"
              out        "hello"]
-         (is (= :written (store/write file-store out-file out)))
-         (is (= out (store/read file-store out-file)))
+         (is (= :written (<?? (store/write file-store out-file out))))
+         (is (= out (<?? (store/read file-store out-file))))
 
-         (is (= :deleted (store/delete file-store out-file)))
-         (is (nil? (store/read file-store out-file)))
+         (is (= :deleted (<?? (store/delete file-store out-file))))
+         (is (nil? (<?? (store/read file-store out-file))))
 
          (is (= :stopped (store/stop file-store)))))
      (testing "edn"
@@ -25,11 +26,11 @@
 
              out-file   "store.edn"
              out        "hello"]
-         (is (= :written (store/write file-store out-file out)))
-         (is (= out (store/read file-store out-file)))
+         (is (= :written (<?? (store/write file-store out-file out))))
+         (is (= out (<?? (store/read file-store out-file))))
 
-         (is (= :deleted (store/delete file-store out-file)))
-         (is (nil? (store/read file-store out-file)))
+         (is (= :deleted (<?? (store/delete file-store out-file))))
+         (is (nil? (<?? (store/read file-store out-file))))
 
          (is (= :stopped (store/stop file-store)))))))
 
@@ -38,10 +39,10 @@
 
         out-file "out.text"
         out "hello"]
-    (is (= :written (store/write mem-store out-file out)))
-    (is (= out (store/read mem-store out-file)))
+    (is (= :written (<?? (store/write mem-store out-file out))))
+    (is (= out (<?? (store/read mem-store out-file))))
 
-    (is (= :deleted (store/delete mem-store out-file)))
-    (is (nil? (store/read mem-store out-file)))
+    (is (= :deleted (<?? (store/delete mem-store out-file))))
+    (is (nil? (<?? (store/read mem-store out-file))))
 
     (is (= :stopped (store/stop mem-store)))))

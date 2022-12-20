@@ -1,7 +1,8 @@
 (ns fluree.indexer.db
   (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.store.api :as store]))
+            [fluree.store.api :as store]
+            [fluree.db.indexer.default :as idx-default]))
 
 (defn create-db-address
   [db]
@@ -44,6 +45,7 @@
                                     :alias ""
                                     :branch :main
                                     :state (state-at-t 0 nil)
+                                    :indexer (idx-default/create (:indexer-config opts))
                                     ;; resolve-flake-slices looks for a Resolver under :conn
                                     :conn store})))
 ;; create at t0, update before every tx to hardcode commit t,

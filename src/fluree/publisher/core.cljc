@@ -4,6 +4,7 @@
             [fluree.common.model :as model]
             [fluree.common.protocols :as service-proto]
             [fluree.db.json-ld.credential :as credential]
+            [fluree.db.util.async :refer [<?? go-try]]
             [fluree.db.util.log :as log]
             [fluree.publisher.ledger :as ledger]
             [fluree.publisher.ledger-entry :as ledger-entry]
@@ -21,9 +22,9 @@
   [pub address]
   (let [{:keys [address/type address/path]} (ident/address-parts address)]
     (case type
-      :ledger (let [entry-path (store/read (:store pub) path)]
-                (store/read (:store pub) entry-path))
-      :ledger-entry (store/read (:store pub) path))))
+      :ledger (let [entry-path (<?? (store/read (:store pub) path))]
+                (<?? (store/read (:store pub) entry-path)))
+      :ledger-entry (<?? (store/read (:store pub) path)))))
 
 (defn init-ledger
   [pub ledger-name {:keys [context head-address db-address] :as opts}]
@@ -48,15 +49,15 @@
         {entry-path :address/path}  (ident/address-parts entry-address)
         {ledger-path :address/path} (ident/address-parts (:ledger/address ledger))]
     ;; create the ledger in the store
-    (store/write store entry-path final-ledger)
+    (<?? (store/write store entry-path final-ledger))
     ;; set the head to the initial entry (no commit)
-    (store/write store ledger-path entry-path)
+    (<?? (store/write store ledger-path entry-path))
     (:ledger/address ledger)))
 
 (defn list-ledgers
   [{:keys [store]}]
-  (let [ledger-heads (store/list store "head/")]
-    (map (partial store/read store) ledger-heads)))
+  (let [ledger-heads (<?? (store/list store "head/"))]
+    (map (fn [entry-address] (<?? (store/read store entry-address))) ledger-heads)))
 
 (defn push-publisher
   [pub ledger-address {:keys [commit-info db-info]}]
@@ -73,9 +74,9 @@
         {entry-path :address/path}  (ident/address-parts (:entry/address entry))
         {ledger-path :address/path} (ident/address-parts (:ledger/address ledger))]
     ;; add the entry to the store
-    (store/write store entry-path final-ledger)
+    (<?? (store/write store entry-path final-ledger))
     ;; mutate the head in store
-    (store/write store ledger-path entry-path)
+    (<?? (store/write store ledger-path entry-path))
     final-ledger))
 
 (defrecord Publisher [id store]

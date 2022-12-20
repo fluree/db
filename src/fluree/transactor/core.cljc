@@ -3,6 +3,7 @@
   (:require [fluree.common.identity :as ident]
             [fluree.common.protocols :as service-proto]
             [fluree.common.model :as model]
+            [fluree.db.util.async :refer [<?? go-try]]
             [fluree.db.util.log :as log]
             [fluree.store.api :as store]
             [fluree.transactor.commit :as commit]
@@ -17,7 +18,7 @@
                            (dissoc (:value commit) :commit/assert :commit/retract))
 
         {commit-path :address/path} (ident/address-parts (:address commit))]
-    (store/write store commit-path commit)
+    (<?? (store/write store commit-path commit))
     commit-info))
 
 (defn stop-transactor
@@ -29,7 +30,7 @@
 (defn resolve-commit
   [txr commit-address]
   (let [{commit-path :address/path} (ident/address-parts commit-address)]
-    (store/read (:store txr) commit-path)))
+    (<?? (store/read (:store txr) commit-path))))
 
 (defrecord Transactor [id store]
   service-proto/Service
