@@ -36,8 +36,12 @@
   [t stats]
   (atom {:branch :main
          :branches {:main {:name :main
+                           :commit {:alias ""
+                                    :v 0
+                                    :branch :main
+                                    :data {:t (or t 0)}}
                            :latest-db {:stats (or stats {:size 0 :flakes 0})
-                                       :t 0}}}}))
+                                       :t (or t 0)}}}}))
 
 (defn create
   [store opts]
@@ -54,4 +58,4 @@
   "Hardcode the branch data so ->tx-state can figure out the next t and stats. This is a
   temporary hack until we can move the branch mechanics to the ledger."
   [{:keys [t stats] :as db}]
-  (assoc db :state (state-at-t t stats)))
+  (assoc-in db [:ledger :state] (state-at-t (- t) stats)))

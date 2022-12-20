@@ -4,6 +4,7 @@
    [fluree.common.model :as model]
    [fluree.common.protocols :as service-proto]
    [fluree.db.api.query :as jld-query]
+   [fluree.db.json-ld.commit :as jld-commit]
    [fluree.db.json-ld.transact :as jld-transact]
    [fluree.db.util.async :refer [<?? go-try]]
    [fluree.db.util.log :as log]
@@ -11,7 +12,8 @@
    [fluree.indexer.model :as idxr-model]
    [fluree.indexer.protocols :as idxr-proto]
    [fluree.store.api :as store]
-   [fluree.db.indexer.proto :as idx-proto]))
+   [fluree.db.indexer.proto :as idx-proto]
+   [fluree.json-ld :as json-ld]))
 
 (defn stop-indexer
   [idxr]
