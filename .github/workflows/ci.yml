@@ -7,7 +7,6 @@ on:
 jobs:
   test-clj:
     name: run clj & cljs tests
-    needs: docker-layer-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -18,7 +17,6 @@ jobs:
         run: script/run-in-docker.sh make cljtest
   test-nodejs:
     name: run nodejs tests
-    needs: docker-layer-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -29,7 +27,6 @@ jobs:
         run: script/run-in-docker.sh make nodejs-test
   test-browser:
     name: run browser tests
-    needs: docker-layer-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
@@ -40,7 +37,6 @@ jobs:
         run: script/run-in-docker.sh make browser-test
   test-eastwood:
     name: run eastwood
-    needs: docker-layer-cache
     runs-on: [linux, large, docker]
     steps:
       - uses: actions/checkout@v3.1.0
