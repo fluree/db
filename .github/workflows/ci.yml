@@ -57,7 +57,7 @@ jobs:
         run: |
           docker load --input /tmp/myimage.tar
           docker image ls -a
-       - name: Run tests
+      - name: Run tests
         run: script/run-in-docker.sh make nodejs-test
   test-browser:
     name: run browser tests
@@ -77,7 +77,7 @@ jobs:
         run: |
           docker load --input /tmp/myimage.tar
           docker image ls -a
-       - name: Run tests
+      - name: Run tests
         run: script/run-in-docker.sh make browser-test
   test-eastwood:
     name: run eastwood
@@ -97,7 +97,7 @@ jobs:
         run: |
           docker load --input /tmp/myimage.tar
           docker image ls -a
-       - name: Run tests
+      - name: Run tests
         run: script/run-in-docker.sh make eastwood
   build-docker:
     name: build Docker image
