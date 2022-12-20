@@ -28,9 +28,9 @@
      :commit commit}))
 
 (defrecord DummyLedger []
-    ledger-proto/iLedger
-    (-status [ledger] (status ledger nil))
-    (-status [ledger branch] (status ledger branch)))
+  ledger-proto/iLedger
+  (-status [ledger] (status ledger nil))
+  (-status [ledger branch] (status ledger branch)))
 
 (defn state-at-t
   [t stats]
@@ -45,7 +45,7 @@
                                     :alias ""
                                     :branch :main
                                     :state (state-at-t 0 nil)
-                                    :indexer (idx-default/create (:indexer-config opts))
+                                    :indexer (idx-default/create opts)
                                     ;; resolve-flake-slices looks for a Resolver under :conn
                                     :conn store})))
 ;; create at t0, update before every tx to hardcode commit t,

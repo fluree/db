@@ -11,7 +11,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.json-ld.vocab :as vocab]
-            #?(:clj [clojure.java.io :as io])))
+            #?(:clj [clojure.java.io :as io])
+            [fluree.store.api :as store]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -135,7 +136,7 @@
    (go-try
      (let [data {:flakes flakes}
            ser  (serdeproto/-serialize-leaf (serde conn) data)
-           res  (<? (write conn leaf-id ser))]
+           res  (<? (store/write conn leaf-id ser))]
        (assoc leaf :id (or (:address res) leaf-id))))))
 
 (defn write-branch-data
@@ -143,7 +144,7 @@
   [conn key data]
   (go-try
     (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-      (<? (write conn key ser)))))
+      (<? (store/write conn key ser)))))
 
 (defn random-branch-id
   [network ledger-id idx]

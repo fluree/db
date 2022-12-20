@@ -9,7 +9,8 @@
             [fluree.common.protocols :as service-proto]
             [fluree.common.util :as util]
             [fluree.store.protocols :as store-proto]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.serde.none :as none-serde]))
 
 (defn stop-memory-store [store]
   (log/info (str "Stopping MemoryStore " (service-proto/id store) "."))
@@ -83,4 +84,7 @@
         default-cache-atom (atom (default-object-cache-factory memory-object-size))
         async-cache-fn (default-async-cache-fn default-cache-atom)]
     (log/info "Starting MemoryStore " id "." config)
-    (map->MemoryStore {:id id :storage-atom storage-atom :async-cache async-cache-fn})))
+    (map->MemoryStore {:id id
+                       :storage-atom storage-atom
+                       :async-cache async-cache-fn
+                       :serializer (none-serde/->Serializer)})))

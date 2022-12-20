@@ -10,10 +10,12 @@
    [fluree.indexer.db :as db]
    [fluree.indexer.model :as idxr-model]
    [fluree.indexer.protocols :as idxr-proto]
-   [fluree.store.api :as store]))
+   [fluree.store.api :as store]
+   [fluree.db.indexer.proto :as idx-proto]))
 
 (defn stop-indexer
   [idxr]
+  ;; TODO: call idx-proto/-index when stopping to flush novelty to Store
   (log/info "Stopping Indexer " (service-proto/id idxr) ".")
   (store/stop (:store idxr)))
 
@@ -30,20 +32,23 @@
 (defn stage-db
   [{:keys [store] :as idxr} db-address data]
   (if-let [db (<?? (store/read store db-address))]
-    (let [db0 (db/prepare db)
-          db1 (<?? (jld-transact/stage db0 data {}))
+    (let [db0        (db/prepare db)
+          db1        (<?? (jld-transact/stage db0 data {}))
           db-address (db/create-db-address db1)
+          idx        (-> db1 :ledger :indexer)]
       (<?? (store/write store db-address db1))
+      (when (idx-proto/-index? idx db1)
+        (idx-proto/-index idx db1))
       ;; return db-info
       {:db/address db-address
-       :db/v 0
-       :db/t (- (:t db1))
-       :db/flakes (-> db1 :stats :flakes)
-       :db/size (-> db1 :stats :size)
+       :db/v       0
+       :db/t       (- (:t db1))
+       :db/flakes  (-> db1 :stats :flakes)
+       :db/size    (-> db1 :stats :size)
        ;; TODO: calculate assert+retract
-       :db/assert []
+       :db/assert  []
        :db/retract []})
-    (throw (ex-info "No such db-address." {:error :stage/no-such-db
+    (throw (ex-info "No such db-address." {:error      :stage/no-such-db
                                            :db-address db-address}))))
 
 (defn discard-db
