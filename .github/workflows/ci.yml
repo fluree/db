@@ -39,8 +39,8 @@ jobs:
       - name: fetch deps and build jar
         run: make deps jar
 
-  test-nodejs:
-    name: test and build flureenjs.js
+  test-js:
+    name: test and build js builds
     runs-on: [linux, large, docker]
     needs: deps
     steps:
@@ -66,58 +66,25 @@ jobs:
         uses: DeLaGuardo/setup-clojure@10.1
         with:
           cli: 1.11.1.1189
-      - name: build fluree njs
+      - name: build flureenjs.js
         run: npx shadow-cljs release flureenjs && cp out/nodejs/flureenjs.js out/flureenjs.js
       - name: flureenjs cache
         uses: actions/cache@v3
         with:
           path: out/flureenjs.js
           key: flureenjs.js-{{ github.sha }}
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - name: Run tests
-        run: script/run-in-docker.sh make nodejs-test
-
-  test-browser:
-    name: test and build flureedb.js
-    runs-on: [linux, large, docker]
-    needs: deps
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - run: npm install
-      - name: clj cache
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2
-          key: clj-deps-${{ hashFiles('deps.edn') }}
-          restore-keys: |
-            clj-deps-
-      - name: Prepare java
-        uses: actions/setup-java@v3
-        with:
-          distribution: 'zulu'
-          java-version: '11'
-      - name: Install clojure tools
-        uses: DeLaGuardo/setup-clojure@10.1
-        with:
-          cli: 1.11.1.1189
-      - name: build fluree njs
+      - name: build flureedb.js
         run: npx shadow-cljs release flureedb && cp out/browser/flureedb.js out/flureedb.js
       - name: flureedb.js cache
         uses: actions/cache@v3
         with:
           path: out/flureedb.js
           key: flureedb.js-{{ github.sha }}
-      - uses: docker/setup-buildx-action@v2.2.1
+       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
       - name: Run tests
-        run: script/run-in-docker.sh make browser-test
+        run: script/run-in-docker.sh make cljtest cljstest nodejs-test browser-test
 
   test-clj:
     name: run clj tests
@@ -129,22 +96,6 @@ jobs:
           install: true
       - name: Run tests
         run: script/run-in-docker.sh make cljtest
-
-  test-cljs:
-    name: run cljs tests
-    runs-on: [linux, large, docker]
-    steps:
-      - uses: actions/checkout@v3.1.0
-      - uses: docker/setup-buildx-action@v2.2.1
-        with:
-          install: true
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
-      - name: Run tests
-        run: script/run-in-docker.sh make cljstest
-
 
   test-eastwood:
     name: run eastwood
