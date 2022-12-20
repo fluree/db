@@ -11,12 +11,13 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - uses: docker/setup-buildx-action@v2.2.1
+      - uses: docker/build-push-action@v3
         with:
-          install: true
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
-      - name: build docker image
-        run: script/run-in-docker.sh ls
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          outputs: type=docker,dest=/tmp/myiamge.tar
 
   test-clj:
     name: run clj & cljs tests
@@ -27,8 +28,15 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: myimage
+          path: /tmp
+      - name: Load image
+        run: |
+          docker load --input /tmp/myimage.tar
+          docker image ls -a
       - name: Run tests
         run: script/run-in-docker.sh make cljtest
   test-nodejs:
@@ -40,9 +48,16 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
-      - name: Run tests
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: myimage
+          path: /tmp
+      - name: Load image
+        run: |
+          docker load --input /tmp/myimage.tar
+          docker image ls -a
+       - name: Run tests
         run: script/run-in-docker.sh make nodejs-test
   test-browser:
     name: run browser tests
@@ -53,9 +68,16 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
-      - name: Run tests
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: myimage
+          path: /tmp
+      - name: Load image
+        run: |
+          docker load --input /tmp/myimage.tar
+          docker image ls -a
+       - name: Run tests
         run: script/run-in-docker.sh make browser-test
   test-eastwood:
     name: run eastwood
@@ -66,9 +88,16 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
-      - uses: satackey/action-docker-layer-caching@v0.0.11
-        continue-on-error: true
-      - name: Run tests
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: myimage
+          path: /tmp
+      - name: Load image
+        run: |
+          docker load --input /tmp/myimage.tar
+          docker image ls -a
+       - name: Run tests
         run: script/run-in-docker.sh make eastwood
   build-docker:
     name: build Docker image
