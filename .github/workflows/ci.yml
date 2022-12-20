@@ -80,7 +80,7 @@ jobs:
         with:
           path: out/flureedb.js
           key: flureedb.js-{{ github.sha }}
-       - uses: docker/setup-buildx-action@v2.2.1
+      - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
       - name: Run tests
