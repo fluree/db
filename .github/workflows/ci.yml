@@ -89,10 +89,6 @@ jobs:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 16
-          cache: 'npm'
       - uses: docker/build-push-action@v3
         with:
           context: .
