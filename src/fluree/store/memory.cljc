@@ -1,16 +1,17 @@
 (ns fluree.store.memory
   (:refer-clojure :exclude [exists? list])
-  (:require [clojure.core.async :as async]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
-            [fluree.db.index :sa index]
-            [fluree.db.storage.core :as storage]
-            [fluree.db.util.log :as log]
-            [fluree.common.identity :as ident]
-            [fluree.common.protocols :as service-proto]
-            [fluree.common.util :as util]
-            [fluree.store.protocols :as store-proto]
-            [clojure.string :as str]
-            [fluree.db.serde.none :as none-serde]))
+  (:require
+   [clojure.core.async :as async]
+   [clojure.string :as str]
+   [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
+   [fluree.common.identity :as ident]
+   [fluree.common.protocols :as service-proto]
+   [fluree.common.util :as util]
+   [fluree.db.index]
+   [fluree.db.serde.none :as none-serde]
+   [fluree.db.util.log :as log]
+   [fluree.store.protocols :as store-proto]
+   [fluree.store.resolver :as resolver]))
 
 (defn stop-memory-store [store]
   (log/info (str "Stopping MemoryStore " (service-proto/id store) "."))
@@ -39,11 +40,11 @@
   (resolve
     [store {:keys [id tempid] :as node}]
     (if (= :empty id)
-      (storage/resolve-empty-leaf node)
+      (resolver/resolve-empty-leaf node)
       (async-cache
         [::resolve id tempid]
         (fn [_]
-          (storage/resolve-index-node store node
+          (resolver/resolve-index-node store node
                                       (fn []
                                         (async-cache [::resolve id tempid] nil))))))))
 

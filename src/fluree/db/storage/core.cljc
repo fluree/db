@@ -1,5 +1,4 @@
 (ns fluree.db.storage.core
-  (:refer-clojure :exclude [read exists? list])
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
             [clojure.string :as str]
@@ -15,14 +14,6 @@
             [fluree.store.api :as store]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defprotocol Store
-  (exists? [s k] "Returns true when `k` exists in `s`")
-  (list [s d] "Returns a collection containing the keys stored under the subdirectory/prefix `d` of `s`")
-  (read [s k] "Reads raw bytes from `s` associated with `k`")
-  (write [s k data] "Writes `data` as raw bytes to `s` and associates it with `k`")
-  (rename [s old-key new-key] "Remove `old-key` and associate its data to `new-key`")
-  (delete [s k] "Delete data associated with key `k`"))
 
 #?(:clj
    (defn block-storage-path
@@ -65,7 +56,7 @@
   [conn network ledger-id block]
   (go-try
     (let [key  (ledger-block-key network ledger-id block)
-          data (<? (read conn key))]
+          data (<? (store/read conn key))]
       (when data
         (serdeproto/-deserialize-block (serde conn) data)))))
 
@@ -74,7 +65,7 @@
   [conn network ledger-id block version]
   (go-try
     (let [key  (str (ledger-block-key network ledger-id block) "--v" version)
-          data (<? (read conn key))]
+          data (<? (store/read conn key))]
       (when data
         (serdeproto/-deserialize-block (serde conn) data)))))
 
@@ -95,7 +86,7 @@
                                                 (:block persisted-data))
                               "--v" version)
           ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
-      (<? (write conn key ser)))))
+      (<? (store/write conn key ser)))))
 
 (defn write-block
   "Block data should look like:
@@ -112,7 +103,7 @@
     (let [persisted-data (select-keys block-data [:block :t :flakes])
           key            (ledger-block-key network ledger-id (:block persisted-data))
           ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
-      (<? (write conn key ser)))))
+      (<? (store/write conn key ser)))))
 
 (defn child-data
   "Given a child, unresolved node, extracts just the data that will go into
@@ -179,7 +170,7 @@
                        :block     block
                        :garbage   garbage}
           ser         (serdeproto/-serialize-garbage (serde conn) data)]
-      (<? (write conn garbage-key ser)))))
+      (<? (store/write conn garbage-key ser)))))
 
 (defn write-db-root
   ([db]
@@ -211,13 +202,13 @@
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (read conn key))]
+    (when-let [data (<? (store/read conn key))]
       (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (read conn key))]
+    (when-let [data (<? (store/read conn key))]
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
@@ -259,7 +250,7 @@
   [conn network ledger-id block]
   (go-try
     (let [key  (ledger-garbage-key network ledger-id block)
-          data (read conn key)]
+          data (store/read conn key)]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) (<? data))))))
 
@@ -268,13 +259,13 @@
   "Returns all data for a db index root of a given block."
   ([conn idx-address]
    (go-try
-     (let [data (<? (read conn idx-address))]
+     (let [data (<? (store/read conn idx-address))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data)))))
   ([conn network ledger-id block]
    (go-try
      (let [key  (ledger-root-key network ledger-id block)
-           data (<? (read conn key))]
+           data (<? (store/read conn key))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data))))))
 

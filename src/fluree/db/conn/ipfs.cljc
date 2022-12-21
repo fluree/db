@@ -14,7 +14,8 @@
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.indexer.default :as idx-default]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.store.protocols :as store-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -124,13 +125,13 @@
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
-  storage/Store
+  store-proto/Store
   (read [_ k]
     (ipfs/read ipfs-endpoint k true))
   (write [_ k data]
     (ipfs/commit ipfs-endpoint data))
   (exists? [conn k]
-    (storage/read conn k))
+    (store-proto/read conn k))
   (rename [_ old-key new-key]
     (throw (ex-info (str "IPFS does not support renaming of files: " old-key new-key)
                     {:status 500 :error :db/unexpected-error})))

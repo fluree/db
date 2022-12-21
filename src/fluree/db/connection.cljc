@@ -24,7 +24,8 @@
             [fluree.db.storage.core :as storage]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.did :as did]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [fluree.store.protocols :as store-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -148,7 +149,7 @@
       (when-not k
         (throw (ex-info (str "Invalid commit address: " commit-key)
                         {:status 400 :error :db/invalid-commit})))
-      (-> (<? (storage/read conn k))
+      (-> (<? (store-proto/read conn k))
           (json/parse false)))))
 
 
@@ -170,7 +171,7 @@
                        ns-lookup
                        did context]
 
-  storage/Store
+  store-proto/Store
   (read [_ k]
     (storage-read k))
   (write [_ k data]

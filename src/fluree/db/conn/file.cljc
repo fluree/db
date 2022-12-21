@@ -20,7 +20,8 @@
             #?(:clj [fluree.db.full-text :as full-text])
             #?(:clj [clojure.java.io :as io])
             [fluree.db.util.json :as json]
-            [fluree.db.ledger.proto :as ledger-proto])
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.store.protocols :as store-proto])
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
@@ -230,11 +231,12 @@
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
-  storage/Store
+  store-proto/Store
   (exists? [s k]
-    (let [path (store-key->local-path s k)]
-      #?(:clj  (-> path io/file .exists)
-         :cljs (fs/existsSync path))))
+    (go-try
+      (let [path (store-key->local-path s k)]
+        #?(:clj  (-> path io/file .exists)
+           :cljs (fs/existsSync path)))))
   (list [s d]
     (log/error "TODO: file Store/list" d))
   (read [s k]

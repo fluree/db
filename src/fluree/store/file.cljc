@@ -7,13 +7,13 @@
    [fluree.common.protocols :as service-proto]
    [fluree.common.util :as util]
    [fluree.db.index]
-   [fluree.db.storage.core :as storage]
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.json :as json]
    [fluree.db.util.log :as log]
    #?@(:cljs [["fs" :as fs]
               ["path" :as path]])
-   [fluree.store.protocols :as store-proto])
+   [fluree.store.protocols :as store-proto]
+   [fluree.store.resolver :as resolver])
   (:import
    (java.io ByteArrayOutputStream FileNotFoundException)))
 
@@ -135,7 +135,7 @@
   fluree.db.index/Resolver
   (resolve
     [_ node]
-    (storage/resolve-empty-leaf node)))
+    (resolver/resolve-empty-leaf node)))
 
 (defn create-file-store
   [{:keys [:store/id :file-store/storage-path :file-store/serialize-to] :as config}]

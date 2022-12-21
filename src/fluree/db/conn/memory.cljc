@@ -12,7 +12,8 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
             [clojure.string :as str]
-            [fluree.crypto :as crypto]))
+            [fluree.crypto :as crypto]
+            [fluree.store.protocols :as store-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -137,7 +138,7 @@
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
-  storage/Store
+  store-proto/Store
   (read [_ k]
     #?(:clj (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
                             {:status 500 :error :db/unexpected-error}))
