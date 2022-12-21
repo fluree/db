@@ -83,6 +83,16 @@
                                             (bind-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
 
+(defmethod match-flakes :iri
+  [db solution pattern error-ch]
+  (let [flake-ch (->> (with-values pattern solution)
+                      (map ::val)
+                      (resolve-flake-range db error-ch))
+        match-ch (async/chan 2 (comp cat
+                                     (map (fn [flake]
+                                            (bind-flake solution pattern flake)))))]
+    (async/pipe flake-ch match-ch)))
+
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
   subject ids repeated from previously processed flakes."
