@@ -110,10 +110,13 @@
                            :binding (s/coll-of any?, :count 2)
                            :remote  (s/coll-of any?, :count 4)))
 
-(s/def ::where (s/coll-of (s/or :map   ::where-map
-                                :tuple ::where-tuple)))
+(s/def ::where-pattern (s/or :map   ::where-map
+                             :tuple ::where-tuple))
 
-(s/def ::optional ::where)
+(s/def ::where (s/coll-of ::where-pattern))
+
+(s/def ::optional (s/or :single ::where-pattern
+                        :coll   ::where))
 
 (s/def ::union (s/coll-of ::where))
 
