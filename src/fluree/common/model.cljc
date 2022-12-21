@@ -12,4 +12,4 @@
 
 (defn report
   [explanation]
-  {:errors (me/humanize explanation)})
+  (me/humanize explanation))

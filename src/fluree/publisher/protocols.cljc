@@ -1,4 +1,5 @@
-(ns fluree.publisher.protocols)
+(ns fluree.publisher.protocols
+  (:refer-clojure :exclude [list]))
 
 (defprotocol Publisher
   (init [_ ledger-name opts] "Initialize a ledger, returning a ledger address.")

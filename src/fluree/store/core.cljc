@@ -11,7 +11,8 @@
   "Takes a config and returns a possibly stateful Store."
   [{:keys [:store/method] :as config}]
   (if-let [validation-error (model/explain store-model/StoreConfig config)]
-    (throw (ex-info "Invalid store config." (model/report validation-error)))
+    (throw (ex-info "Invalid store config." {:errors (model/report validation-error)
+                                             :config config}))
     (case method
       :file (file-store/create-file-store config)
       :memory (memory-store/create-memory-store config)

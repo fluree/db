@@ -101,7 +101,8 @@
 (defn start
   [config]
   (if-let [validation-error (model/explain pub-model/PublisherConfig config)]
-    (throw (ex-info "Invalid publisher config." {:errors (model/report validation-error)}))
+    (throw (ex-info "Invalid publisher config." {:errors (model/report validation-error)
+                                                 :config config}))
     (create-publisher config)))
 
 (defn stop

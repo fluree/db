@@ -153,7 +153,8 @@
 (defn connect
   [config]
   (if-let [validation-error (model/explain conn-model/ConnectionConfig config)]
-    (throw (ex-info "Invalid connection config." {:errors (model/report validation-error)}))
+    (throw (ex-info "Invalid connection config." {:errors (model/report validation-error)
+                                                  :config config}))
     (create-conn config)))
 
 (defn close

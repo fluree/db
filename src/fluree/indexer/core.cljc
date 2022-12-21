@@ -102,7 +102,8 @@
 (defn start
   [config]
   (if-let [validation-error (model/explain idxr-model/IndexerConfig config)]
-    (throw (ex-info "Invalid indexer config." {:errors (model/report validation-error)}))
+    (throw (ex-info "Invalid indexer config." {:errors (model/report validation-error)
+                                               :config config}))
     (create-indexer config)))
 
 (defn stop

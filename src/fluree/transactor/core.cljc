@@ -51,7 +51,8 @@
 (defn start
   [config]
   (if-let [validation-error (model/explain txr-model/TransactorConfig config)]
-    (throw (ex-info "Invalid transactor config." {:errors (model/report validation-error)}))
+    (throw (ex-info "Invalid transactor config." {:errors (model/report validation-error)
+                                                  :config config}))
     (create-transactor config)))
 
 (defn stop

@@ -4,6 +4,7 @@
   a given ledger. It also has a Store where it stores the LedgerCreds, verifiable
   credentials wrapping the Ledger, a durable, verifiable record of the commit and index
   updates."
+  (:refer-clojure :exclude [list])
   (:require [fluree.publisher.core :as pub-impl]
             [fluree.publisher.model :as pub-model]))
 
