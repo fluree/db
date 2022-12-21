@@ -103,7 +103,6 @@
                                                 {:status 400 :error :db/shacl-validation}))))
                           [(flake/create sid pid value* dt t true m)])
 
-                        ;; otherwise should be an IRI 'ref' either as an :id, or mis-cast as a value that needs coercion
                         :else
                         (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
                                         {:status 400 :error :db/invalid-transaction})))]
@@ -158,7 +157,7 @@
                                {:status 400 :error :db/invalid-transaction})))))))
 
 (defn json-ld-node->flakes
-  "Returns two-tupel of [sid node-flakes] that will contain the top-level sid
+  "Returns two-tuple of [sid node-flakes] that will contain the top-level sid
   and all flakes from the target node and all children nodes that ultimately get processed.
 
   If property-id is non-nil, it can be checked when assigning new subject id for the node
