@@ -21,12 +21,15 @@
   (conn/transact conn "fluree:ledger:memory:head/dan1" {:context {:ex "http://example.com/"}
                                                         "@id" :ex/kp
                                                         :ex/foo "bar"})
+
   (conn/transact conn "fluree:ledger:memory:head/dan1" {:context {:ex "http://example.com/"}
                                                         "@id" :ex/ap
                                                         :ex/foo "bar"})
+
   (conn/transact conn "fluree:ledger:memory:head/dan1" {:context {:ex "http://example.com/"}
                                                         "@id" :ex/pp
                                                         :ex/foo "bar"})
+
   (conn/transact conn "fluree:ledger:memory:head/dan1" {:context {:ex "http://example.com/"}
                                                         "@id" :ex/mp
                                                         :ex/foo "bar"})
@@ -41,23 +44,19 @@
                                                         :ex/foo "wherefore"})
 
   (def dbs (-> conn :store :storage-atom deref))
-  (def db (-> dbs (get "fluree:db:memory:f7b93a3a-aa0d-461f-b03b-19fc673cd204")) )
-
-  (fluree.connector.core/head-db-address conn "fluree:ledger:memory:head/dan1")
+  (def db (-> dbs (get (fluree.connector.core/head-db-address conn "fluree:ledger:memory:head/dan1"))) )
 
   (conn/list conn)
 
   (conn/load conn "fluree:ledger:memory:head/dan1")
 
-  (let [{txr :transactor pub :publisher idxr :indexer} conn
-        commit   (txr/resolve txr "fluree:commit:memory:dan1/commit/9c1c9d36140f26c67cf83bd66b67e6f8741526f0836ef4bd919b47249d0de648")
-        {:keys [commit/assert commit/retract]} (:value commit)]
-    commit)
+  (conn/load conn "fluree:ledger:memory:head/foo")
 
-
-  (conn/query conn "fluree:ledger:memory:head/dan2" {:context {:ex "http://example.com/"}
+  (conn/query conn "fluree:ledger:memory:head/dan1" {:context {:ex "http://example.com/"}
                                                      :select {'?s [:*]}
                                                      :where [['?s :ex/foo '?f]]})
+
+
   [{"@id" :ex/sp, :ex/foo "bar"}
    {"@id" :ex/mp, :ex/foo "bar"}
    {"@id" :ex/pp, :ex/foo "bar"}

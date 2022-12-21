@@ -15,7 +15,7 @@
   (let [store       (:store txr)
         commit      (commit/create tx (assoc tx-info :txr/store store))
         commit-info (merge (select-keys commit [:address :hash])
-                           (dissoc (:value commit) :commit/assert :commit/retract))
+                           (dissoc (:value commit) :commit/assert :commit/retract :commit/tx :commit/context))
 
         {commit-path :address/path} (ident/address-parts (:address commit))]
     (<?? (store/write store commit-path commit))

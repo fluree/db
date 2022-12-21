@@ -3,7 +3,8 @@
             [fluree.json-ld :as json-ld]
             [fluree.store.api :as store]
             [fluree.crypto :as crypto]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.util.json :as json]))
 
 (defn create-commit-address
   [store path]
@@ -20,11 +21,13 @@
                                 :commit/flakes flakes
                                 :commit/assert assert
                                 :commit/retract retract
+                                :commit/tx tx
                                 :commit/t t
                                 ;; hardcode v to 0 until we need additional versions
                                 :commit/v 0}
                          prev (assoc :commit/prev prev))
-        commit-data    (json-ld/normalize-data commit-tx)
+
+        commit-data    (json/stringify commit-tx)
         hash           (crypto/sha2-256 commit-data)
         path           (str name "/commit/" hash)
         commit-address (create-commit-address store path)]

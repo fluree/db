@@ -80,7 +80,7 @@
                    (count idxr-after-ledger-init))))
 
           (testing "txr tx writes commit"
-            (is (= ["testconn/commit/69430f0caf4609a727b4369006741f0d4274a4c7a6dd1076eb08cdeb134904cf"]
+            (is (= ["testconn/commit/eac4fe4e7ed0b5c37e7b760a06d575d60f3ddc0efcd068a476c563af33496c73"]
                    (keys txr-after-ledger-tx))))
           (testing "pub tx sets head at new entry"
             (is (= 3
