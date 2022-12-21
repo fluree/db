@@ -103,21 +103,40 @@
 
 (defmulti where-map-spec first-key)
 
+(s/def ::where-map (s/and (s/map-of ::where-op any?, :count 1)
+                          (s/multi-spec where-map-spec first-key)))
+
+(s/def ::where-tuple (s/or :local   (s/coll-of any?, :count 3)
+                           :binding (s/coll-of any?, :count 2)
+                           :remote  (s/coll-of any?, :count 4)))
+
+(s/def ::where (s/coll-of (s/or :map   ::where-map
+                                :tuple ::where-tuple)))
+
+(s/def ::optional ::where)
+
+(s/def ::union (s/coll-of ::where))
+
+(s/def ::bind (s/map-of ::var any?))
+
+(s/def ::where (s/coll-of (s/or :map   ::where-map
+                                :tuple ::where-tuple)))
+
 (defmethod where-map-spec :filter
   [_]
-  (s/map-of ::where-op ::filter))
+  (s/keys :req-un [::filter]))
 
 (defmethod where-map-spec :optional
   [_]
-  (s/map-of ::where-op ::where))
+  (s/keys :req-un [::optional]))
 
 (defmethod where-map-spec :union
   [_]
-  (s/map-of ::where-op (s/coll-of ::where)))
+  (s/keys :req-un [::union]))
 
 (defmethod where-map-spec :bind
   [_]
-  (s/map-of ::where-op map?))
+  (s/keys :req-un [::bind]))
 
 (def never? (constantly false))
 
@@ -129,16 +148,6 @@
 (defmethod where-map-spec :default
   [_]
   never?)
-
-(s/def ::where-map (s/and (s/map-of ::where-op map?, :count 1)
-                          (s/multi-spec where-map-spec first-key)))
-
-(s/def ::where-tuple (s/or :binding (s/coll-of any?, :count 2)
-                           :local   (s/coll-of any?, :count 3)
-                           :remote  (s/coll-of any?, :count 4)))
-
-(s/def ::where (s/coll-of (s/or :map   ::where-map
-                                :tuple ::where-tuple)))
 
 (s/def ::vars (s/map-of ::var any?))
 
