@@ -113,7 +113,7 @@
 
 (defmethod where-map-spec :union
   [_]
-  (s/map-of ::where-op (s/coll-of ::where, :count 2)))
+  (s/map-of ::where-op (s/coll-of ::where)))
 
 (defmethod where-map-spec :bind
   [_]
@@ -140,11 +140,13 @@
 (s/def ::where (s/coll-of (s/or :map   ::where-map
                                 :tuple ::where-tuple)))
 
+(s/def ::vars (s/map-of ::var any?))
+
 (s/def ::query-map
   (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct
                    ::selectReduced ::select-reduced ::where ::orderBy ::order-by
-                   ::groupBy ::group-by ::filter ::limit ::offset ::maxFuel ::max-fuel
-                   ::depth ::opts ::prettyPrint ::pretty-print]))
+                   ::groupBy ::group-by ::filter ::vars ::limit ::offset ::maxFuel
+                   ::max-fuel ::depth ::opts ::prettyPrint ::pretty-print]))
 
 (defn validate
   [qry]
