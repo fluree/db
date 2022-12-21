@@ -45,26 +45,22 @@
                               (:context (:schema db-after)))
                             (json-ld/parse-context {"f" "https://ns.flur.ee/ledger#"})
                             jld-commit/stringify-context)
+
           ctx-used-atom (atom {})
-          compact-fn    (json-ld/compact-fn context* ctx-used-atom)
-          flakes        (jld-commit/commit-flakes db-after)
+          compact-fn (json-ld/compact-fn context* ctx-used-atom)
 
-          {:keys [assert retract refs-ctx] :as c}
-          (<?? (jld-commit/generate-commit flakes db {:compact-fn compact-fn}))
-
-          ]
-      ;; (<?? (store/write store db-address db-after))
-      ;; (when (idx-proto/-index? idx db-after)
-      ;;   (idx-proto/-index idx db-after))
-      ;; return db-info
-      c
-      #_{:db/address db-address
+          {:keys [assert retract] :as c}
+          (<?? (jld-commit/commit-opts->data db-after {:compact-fn compact-fn :id-key "@id" :type-key "@type"}))]
+      (<?? (store/write store db-address db-after))
+      (when (idx-proto/-index? idx db-after)
+        (idx-proto/-index idx db-after))
+      {:db/address db-address
        :db/v       0
        :db/t       (- (:t db-after))
        :db/flakes  (-> db-after :stats :flakes)
        :db/size    (-> db-after :stats :size)
-       :db/context refs-ctx
-       :db/assert assert
+       :db/context @ctx-used-atom
+       :db/assert  assert
        :db/retract retract})
     (throw (ex-info "No such db-address." {:error      :stage/no-such-db
                                            :db-address db-address}))))
@@ -132,59 +128,3 @@
 (defn explain
   [idxr db-address query]
   (idxr-proto/explain idxr db-address query))
-
-
-(comment
-  (def idxr (start {:idxr/store-config {:store/method :memory}}))
-
-  (def xxx (-> idxr :store :storage-atom deref))
-
-  (init idxr {})
-  "fluree:db:memory:init"
-
-
-  (stage idxr "fluree:db:memory:init" {:context {:ex "http://ex.co/"}
-                                       "@id" "ex/dan"
-                                       "ex/foo" "bar"})
-  #:db{:address "fluree:db:memory:91e45a25-e184-4ed1-8227-5ec16d1c1a01", :t 1, :flakes 6, :size 466, :assert [], :retract []}
-
-  (def xxx (-> idxr :store :storage-atom deref))
-
-  xxx
-
-  (def db (get xxx "fluree:db:memory:91e45a25-e184-4ed1-8227-5ec16d1c1a01"))
-
-  (keys db)
-  (:ledger :conn :method :alias :branch :commit :block :t :tt-id :stats :spot :psot :post :opst :tspo :schema :comparators :novelty :permissions :ecount :state)
-
-  (:spot db)
-  {:children
-   {"[9223372036854775807 0 9223372036854775807 5 0 true nil]"
-    {:block 0,
-     :ledger-id "",
-     :leaf true,
-     :size 0,
-     :leftmost? true,
-     :id :empty,
-     :tempid #uuid "14b7520c-ef09-464e-bf45-98621903450a",
-     :comparator "[fluree.db.flake/cmp-flakes-spot]",
-     :t 0,
-     :network nil,
-     :first "[9223372036854775807 0 9223372036854775807 5 0 true nil]",
-     :tt-id #uuid "91e45a25-e184-4ed1-8227-5ec16d1c1a01",
-     :rhs nil}},
-   :block 0,
-   :ledger-id "",
-   :leaf false,
-   :size 0,
-   :leftmost? true,
-   :id :empty,
-   :tempid #uuid "540e620b-5657-4302-8182-8f43eb335616",
-   :comparator "[fluree.db.flake/cmp-flakes-spot]",
-   :t 0,
-   :network nil,
-   :first "[9223372036854775807 0 9223372036854775807 5 0 true nil]",
-   :tt-id #uuid "91e45a25-e184-4ed1-8227-5ec16d1c1a01",
-   :rhs nil}
-
-  ,)
