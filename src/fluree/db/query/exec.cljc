@@ -41,7 +41,7 @@
                       #_#_obj-filter (assoc :object-fn obj-filter))]
     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
 
-(defmulti match-flakes
+(defmulti match-pattern
   "Return a channel that will contain all solutions from flakes in `db` that are
   compatible with the initial solution `solution` and matches the additional
   where-clause pattern `pattern`."
@@ -73,7 +73,7 @@
       (unbound? p) (assoc (::var p) (flake/p flake))
       (unbound? o) (assoc (::var o) (flake/o flake)))))
 
-(defmethod match-flakes :tuple
+(defmethod match-pattern :tuple
   [db solution pattern error-ch]
   (let [flake-ch (->> (with-values pattern solution)
                       (map ::val)
@@ -83,7 +83,7 @@
                                             (bind-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
 
-(defmethod match-flakes :iri
+(defmethod match-pattern :iri
   [db solution pattern error-ch]
   (let [flake-ch (->> (with-values pattern solution)
                       (map ::val)
@@ -117,7 +117,7 @@
         ([result]
          (rf result))))))
 
-(defmethod match-flakes :class
+(defmethod match-pattern :class
   [db solution pattern error-ch]
   (let [tuple    (val pattern)
         [s p o]  (map ::val (with-values tuple solution))
@@ -143,7 +143,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-flakes db solution pattern error-ch)
+                            (-> (match-pattern db solution pattern error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
@@ -158,7 +158,7 @@
               (with-constraint db pattern error-ch solution-ch))
             initial-ch clause)))
 
-(defmethod match-flakes :union
+(defmethod match-pattern :union
   [db solution pattern error-ch]
   (let [clauses   (val pattern)
         clause-ch (async/to-chan! clauses)
@@ -201,12 +201,12 @@
                    (rf default-solution)
                    rf))))))))
 
-(defmethod match-flakes :optional
+(defmethod match-pattern :optional
   [db solution pattern error-ch]
   (let [clause (val pattern)
-        out-ch (async/chan 2 (with-default solution))]
+        opt-ch (async/chan 2 (with-default solution))]
     (-> (match-clause db solution clause error-ch)
-        (async/pipe out-ch))))
+        (async/pipe opt-ch))))
 
 (def blank-solution {})
 

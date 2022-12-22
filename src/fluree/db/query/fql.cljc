@@ -23,6 +23,12 @@
 
 (declare query)
 
+(defn parse-query
+  [q db]
+  (-> q
+      syntax/validate
+      (parse/parse db)))
+
 (defn cache-query
   "Returns already cached query from cache if available, else
   executes and stores query into cache."
@@ -41,36 +47,18 @@
                 (async/put! pc res)))
             pc)))))
 
-
 (defn cache?
   "Returns true if query was requested to run from the cache."
   [{:keys [opts] :as _query-map}]
   #?(:clj (:cache opts) :cljs false))
 
-
-(defn first-async
-  "Returns first result of a sequence returned from an async channel."
-  [ch]
-  (go-try
-    (let [res (<? ch)]
-      (first res))))
-
-
-(defn query
-  [db query-map]
-  (if (cache? query-map)
-    (cache-query db query-map)))
-
 (defn query
   "Returns core async channel with results or exception"
   [db query-map]
-  (log/debug "Running query:" query-map)
   (if (cache? query-map)
     (cache-query db query-map)
-    (let [parsed-query (-> query-map
-                           syntax/validate
-                           (parse/parse db))
-          db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
-      (if (= :simple-subject-crawl (:strategy parsed-query))
-        (simple-subject-crawl db* parsed-query)
-        (exec/execute db* parsed-query)))))
+    (let [q   (parse-query query-map db)
+          db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
+      (if (= :simple-subject-crawl (:strategy q))
+        (simple-subject-crawl db* q)
+        (exec/execute db* q)))))
