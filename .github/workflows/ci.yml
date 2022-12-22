@@ -18,8 +18,6 @@ jobs:
           cache-to: type=gha,mode=max
           tags: fluree/db
           load: true
-      - name: Run tests
-        run: script/run-in-docker.sh ls
 
   # test-nodejs:
   #   name: test flureenjs.js
