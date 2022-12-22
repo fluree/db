@@ -74,3 +74,18 @@ jobs:
           load: true
       - name: Run tests
         run: docker run fluree/db make cljtest eastwood nodejs-test
+
+  notifications:
+    name: Send any relevant run notifications
+    if: always()
+    needs: [test-browser, test-cljs, test-other]
+    steps:
+      - name:
+        if: github.ref == 'refs/heads/main' && failure()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        uses: voxmedia/github-action-slack-notify-build@v1.5.0
+        with:
+          channel: development
+          status: FAILED
+          color: danger
