@@ -73,4 +73,4 @@
           db*          (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy parsed-query))
         (simple-subject-crawl db* parsed-query)
-        (async/into [] (exec/execute db* parsed-query))))))
+        (exec/execute db* parsed-query)))))
