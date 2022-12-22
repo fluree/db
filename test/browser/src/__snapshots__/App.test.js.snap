@@ -6,106 +6,37 @@ exports[`lists flureedb fns 1`] = `
     class="App"
   >
     <li>
-      authenticate
-    </li>
-    <li>
-      block_query
-    </li>
-    <li>
-      block_range
-    </li>
-    <li>
-      block_range_with_txn
-    </li>
-    <li>
-      close
-    </li>
-    <li>
-      close_listener
+      commit
     </li>
     <li>
       connect
     </li>
     <li>
-      connect_p
+      create
     </li>
     <li>
       db
     </li>
     <li>
-      db_schema
+      exists
     </li>
     <li>
-      delete_ledger
+      load
     </li>
     <li>
-      history_query
-    </li>
-    <li>
-      http_signature
-    </li>
-    <li>
-      jldCommit
-    </li>
-    <li>
-      jldConnect
-    </li>
-    <li>
-      jldCreate
-    </li>
-    <li>
-      jldDb
-    </li>
-    <li>
-      jldLoad
-    </li>
-    <li>
-      jldQuery
-    </li>
-    <li>
-      jldStage
-    </li>
-    <li>
-      jldStatus
-    </li>
-    <li>
-      ledger_stats
-    </li>
-    <li>
-      listen
-    </li>
-    <li>
-      listeners
-    </li>
-    <li>
-      monitor_tx
-    </li>
-    <li>
-      multi_query
-    </li>
-    <li>
-      new_ledger
-    </li>
-    <li>
-      password_generate
-    </li>
-    <li>
-      password_login
+      loadFromAddress
     </li>
     <li>
       query
     </li>
     <li>
-      renew_token
+      setLogging
     </li>
     <li>
-      set_logging
+      stage
     </li>
     <li>
-      signed_query
-    </li>
-    <li>
-      transact
+      status
     </li>
   </ul>
 </DocumentFragment>
