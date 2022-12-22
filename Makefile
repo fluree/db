@@ -8,9 +8,9 @@ DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
 
 SOURCES := $(shell find src)
 RESOURCES := $(shell find resources)
-BROWSER_SOURCES := src-cljs/flureedb.cljs
+BROWSER_SOURCES := src-cljs/fluree_browser_sdk.cljs
 WEBWORKER_SOURCES := src-cljs/flureeworker.cljs
-NODEJS_SOURCES := $(shell find src-nodejs)
+NODEJS_SOURCES := src-cljs/fluree_node_sdk.cljs
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
 
 all: jar browser nodejs webworker js-packages docs
@@ -23,15 +23,15 @@ jar: target/fluree-db.jar
 package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
-out/flureenjs.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
-	npx shadow-cljs release flureenjs && cp out/nodejs/flureenjs.js out/flureenjs.js
+out/fluree-node-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
+	npx shadow-cljs release fluree-node-sdk && cp out/nodejs/fluree-node-sdk.js out/fluree-node-sdk.js
 
-nodejs: out/flureenjs.js
+nodejs: out/fluree-node-sdk.js
 
-out/flureedb.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
-	npx shadow-cljs release flureedb && cp out/browser/flureedb.js out/flureedb.js
+out/fluree-browser-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
+	npx shadow-cljs release fluree-browser-sdk && cp out/browser/fluree-browser-sdk.js out/fluree-browser-sdk.js
 
-browser: out/flureedb.js
+browser: out/fluree-browser-sdk.js
 
 out/flureeworker.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
 	npx shadow-cljs release flureeworker && cp out/webworker/flureeworker.js out/flureeworker.js
@@ -59,25 +59,25 @@ js-packages/browser/package.json: package.json
 js-packages/webworker/package.json: package.json
 	clojure -T:build sync-package-json :target $(@D)/package.json
 
-js-packages/nodejs/flureenjs.js: out/flureenjs.js
+js-packages/nodejs/fluree-node-sdk.js: out/fluree-node-sdk.js
 	cp $< $@
 
-js-packages/browser/flureedb.js: out/flureedb.js
+js-packages/browser/fluree-browser-sdk.js: out/fluree-browser-sdk.js
 	cp $< $@
 
 js-packages/webworker/flureeworker.js: out/flureeworker.js
 	cp $< $@
 
-js-packages: js-packages/nodejs/flureenjs.js js-packages/browser/flureedb.js js-packages/webworker/flureeworker.js
+js-packages: js-packages/nodejs/fluree-node-sdk.js js-packages/browser/fluree-browser-sdk.js js-packages/webworker/flureeworker.js
 
 sync-package-json: js-packages/nodejs/package.json js-packages/browser/package.json js-packages/webworker/package.json
 
 NPM_TAG ?= latest
 
-publish-nodejs: js-packages/nodejs/flureenjs.js js-packages/nodejs/package.json
+publish-nodejs: js-packages/nodejs/fluree-node-sdk.js js-packages/nodejs/package.json
 	cd $(<D) && npm publish --tag $(NPM_TAG)
 
-publish-browser: js-packages/browser/flureedb.js js-packages/browser/package.json
+publish-browser: js-packages/browser/fluree-browser-sdk.js js-packages/browser/package.json
 	cd $(<D) && npm publish --tag $(NPM_TAG)
 
 publish-webworker: js-packages/webworker/flureeworker.js js-packages/webworker/package.json
@@ -100,10 +100,10 @@ cljs-browser-test: node_modules package-lock.json
 cljs-node-test: node_modules package-lock.json
 	npx shadow-cljs release node-test
 
-nodejs-test: out/flureenjs.js
+nodejs-test: out/fluree-node-sdk.js
 	cd test/nodejs && npm install && node --experimental-vm-modules node_modules/jest/bin/jest.js
 
-browser-test: out/flureedb.js
+browser-test: out/fluree-browser-sdk.js
 	cd test/browser && npm install && npm ci
 
 cljstest: cljs-browser-test cljs-node-test
