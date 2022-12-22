@@ -24,27 +24,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: fluree/db
-          outputs: type=docker,dest=/tmp/docker-image.tar
-      - uses: actions/upload-artifact@v3
-        with:
-          name: docker-image
-          path: /tmp/docker-image.tar
+          load: true
 
   test-nodejs:
     name: test flureenjs.js
     needs: docker-build-cache
     runs-on: [linux, large, docker]
     steps:
-      - uses: actions/download-artifact@v3
+      - uses: docker/build-push-action@v3
         with:
-          name: docker-image
-          path: /tmp
-      - name: Load Docker image
-        run: |
-          docker load --input /tmp/docker-image.tar
-          docker image ls -a
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
       - name: Run tests
-        run: docker run ${{ needs.docker-build-cache.outputs.docker-image }} make nodejs-test
+        run: docker run fluree/db make nodejs-test
 
 #  test-browser:
 #    name: test flureedb.js
