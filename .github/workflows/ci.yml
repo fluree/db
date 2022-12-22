@@ -58,7 +58,9 @@ jobs:
           tags: fluree/db
           load: true
       - name: Run tests
-        run: docker run fluree/db make cljstest
+        run: |
+          docker cp fluree/db:/usr/src/flureedb/docker-chrome-seccomp.json .
+          docker run --security-opt seccomp=docker-chrome-seccomp.json fluree/db make cljstest
 
   test-other:
     name: run other tests
