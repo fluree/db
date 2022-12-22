@@ -79,6 +79,7 @@ jobs:
     name: Send any relevant run notifications
     if: always()
     needs: [test-browser, test-cljs, test-other]
+    runs-on: [linux, large, docker]
     steps:
       - name:
         if: github.ref == 'refs/heads/main' && failure()
