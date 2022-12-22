@@ -76,7 +76,7 @@ jobs:
         run: docker run fluree/db make cljtest eastwood nodejs-test
 
   notifications:
-    name: Send any relevant run notifications
+    name: send notifications
     if: always()
     needs: [test-browser, test-cljs, test-other]
     runs-on: [linux, large, docker]
