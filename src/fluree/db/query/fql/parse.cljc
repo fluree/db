@@ -187,7 +187,10 @@
 
 (defmethod parse-pattern :optional
   [{:keys [optional]} db context]
-  (let [parsed (parse-where-clause optional db context)]
+  (let [clause (if (coll? (first optional))
+                 optional
+                 [optional])
+        parsed (parse-where-clause clause db context)]
     (->pattern :optional parsed)))
 
 (defn parse-context
