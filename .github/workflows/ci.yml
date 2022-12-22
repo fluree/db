@@ -4,16 +4,10 @@ on:
   schedule:
     - cron: 13 01 * * *
 
-# Docker image artifact uploading & downloading approach is the one suggested
-# here for sharing Docker images between jobs:
-# https://docs.docker.com/build/ci/github-actions/examples/#share-built-image-between-jobs
-
 jobs:
   docker-build-cache:
     name: docker build cache
     runs-on: [linux, large, docker]
-    outputs:
-      docker-image: ${{ steps.build.outputs.imageid }}
     steps:
       - uses: docker/setup-buildx-action@v2.2.1
         with:
