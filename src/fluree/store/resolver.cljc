@@ -1,5 +1,6 @@
 (ns fluree.store.resolver
   (:require [clojure.core.async :refer [go <!] :as async]
+            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.flake :as flake]
@@ -75,3 +76,48 @@
         empty-node (assoc node :flakes empty-set)]
     (async/put! ch empty-node)
     ch))
+
+(defn lookup-cache
+  [cache-atom k value-fn]
+  (if (nil? value-fn)
+    (swap! cache-atom cache/evict k)
+    (when-let [v (get @cache-atom k)]
+      (swap! cache-atom cache/hit k)
+      v)))
+
+(defn default-object-cache-factory
+  "Generates a default object cache."
+  [cache-size]
+  (cache/lru-cache-factory {} :threshold cache-size))
+
+(defn default-async-cache-fn
+  "Default asynchronous object cache to use for ledger."
+  [cache-atom]
+  (fn [k value-fn]
+    (let [out (async/chan)]
+      (if-let [v (lookup-cache cache-atom k value-fn)]
+        (async/put! out v)
+        (async/go
+          (let [v (async/<! (value-fn k))]
+            (when-not (util/exception? v)
+              (swap! cache-atom cache/miss k v))
+            (async/put! out v))))
+      out)))
+
+(defn create-async-cache
+  [{:keys [cache-size-bytes] :as _config}]
+  (let [memory  (or cache-size-bytes 1000000) ;; default 1MB memory
+        memory-object-size (quot memory 100000)
+        default-cache-atom (atom (default-object-cache-factory memory-object-size))]
+    (default-async-cache-fn default-cache-atom)))
+
+(defn resolve-node
+  [store async-cache {:keys [id tempid] :as node}]
+  (if (= :empty id)
+    (resolve-empty-leaf node)
+    (async-cache
+      [::resolve id tempid]
+      (fn [_]
+        (resolve-index-node store node
+                            (fn []
+                              (async-cache [::resolve id tempid] nil)))))))

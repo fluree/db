@@ -131,11 +131,8 @@
   (write [_ k data] (go-try (write-file (str storage-path k) data serialize-to)))
   (delete [_ k] (go-try (delete-file (str storage-path k))))
 
-  ;; TODO: make a proper resolver
   fluree.db.index/Resolver
-  (resolve
-    [_ node]
-    (resolver/resolve-empty-leaf node)))
+  (resolve [store node] (resolver/resolve-node store async-cache node)))
 
 (defn create-file-store
   [{:keys [:store/id :file-store/storage-path :file-store/serialize-to] :as config}]
