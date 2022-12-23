@@ -243,8 +243,8 @@
 
 (defn split-solution-by
   [variables solution]
-  (let [values    (mapv (partial get-value solution)
-                        variables)]
+  (let [values (mapv (partial get-value solution)
+                     variables)]
     [values solution]))
 
 (defn assoc-coll
@@ -270,7 +270,7 @@
   (reduce-kv (fn [solutions group-key grouped-vals]
                (let [merged-vals (reduce merge-with-colls {} grouped-vals)
                      solution    (into merged-vals
-                                         (map vector grouping group-key))]
+                                       (map vector grouping group-key))]
                  (conj solutions solution)))
              [] groups))
 

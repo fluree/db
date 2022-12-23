@@ -83,5 +83,5 @@
                                  :where  [[?s :rdf/type :ex/User]
                                           [?s :schema/name ?name]
                                           {:optional [[?s :ex/favColor ?favColor]
-                                                      [?s :schema/email ?email]]}]})
-             "Multi-statement optional clauses not yet supported!")))))
+                                                      [?s :schema/email ?email]]}]}))
+          "Multiple optional clauses should work as a left outer join between them"))))

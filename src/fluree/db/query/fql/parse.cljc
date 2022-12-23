@@ -63,10 +63,15 @@
          (util/str->int recur-n)
          default-recursion-depth)])))
 
-(defn parse-variable
+(defn parse-var-name
   [x]
   (when (variable? x)
-    {::exec/var (symbol x)}))
+    (symbol x)))
+
+(defn parse-variable
+  [x]
+  (when-let [var-name (parse-var-name x)]
+    {::exec/var var-name}))
 
 (defn parse-pred-ident
   [x]
@@ -201,11 +206,20 @@
 
 (defn parse-vars
   [var-map]
-  (reduce-kv (fn [m var val]
-               (let [variable (-> (parse-variable var)
-                                  (assoc ::val val))]
-                 (assoc m var variable)))
-             {} var-map))
+  (when var-map
+    (reduce-kv (fn [m var val]
+                 (let [variable (-> (parse-variable var)
+                                    (assoc ::val val))]
+                   (assoc m var variable)))
+               {} var-map)))
+
+(defn parse-group-by
+  [grouping]
+  (when grouping
+    (let [grouping* (if (sequential? grouping)
+                      grouping
+                      [grouping])]
+      (mapv parse-var-name grouping*))))
 
 (defn parse
   [q db]
@@ -213,4 +227,5 @@
     (-> q
         (assoc :context context)
         (update :where parse-where-clause db context)
+        (update :group-by parse-group-by)
         (update :vars parse-vars))))
