@@ -10,7 +10,8 @@
    [fluree.db.serde.none :as none-serde]
    [fluree.db.util.log :as log]
    [fluree.store.protocols :as store-proto]
-   [fluree.store.resolver :as resolver]))
+   [fluree.store.resolver :as resolver]
+   [fluree.crypto :as crypto]))
 
 (defn stop-memory-store [store]
   (log/info (str "Stopping MemoryStore " (service-proto/id store) "."))
@@ -30,10 +31,10 @@
   (address [_ type k] (address-memory type k))
   (read [_ k] (async/go (get @storage-atom k)))
   (list [_ prefix]  (async/go
-                      (let [ks (filter #(str/starts-with? % prefix) (keys @storage-atom))]
-                        (map #(get @storage-atom %) ks))))
-  (write [_ k data] (async/go (swap! storage-atom assoc k data) {:address k
-                                                                 :hash (crypto/sha2-256 (pr-str data))}))
+                      (filter #(str/starts-with? % prefix) (keys @storage-atom))))
+  (write [_ k data] (async/go (swap! storage-atom assoc k data)
+                              {:path k :address (address-memory "" k)
+                               :hash (crypto/sha2-256 (pr-str data))}))
   (delete [_ k] (async/go (swap! storage-atom dissoc k) :deleted))
 
   fluree.db.index/Resolver
