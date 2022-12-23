@@ -50,11 +50,17 @@
       (key pattern)
       :tuple)))
 
+(defn get-value
+  [solution variable]
+  (-> solution
+      (get variable)
+      ::val))
+
 (defn with-values
-  [tuple values]
+  [tuple solution]
   (mapv (fn [component]
           (if-let [variable (::var component)]
-            (let [value (get values variable)]
+            (let [value (get-value solution variable)]
               (cond-> component
                 value (assoc ::val value)))
             component))
@@ -65,13 +71,31 @@
   (and (::var component)
        (not (::val component))))
 
+(defn bind-subject
+  [s-pattern flake]
+  (assoc s-pattern
+         ::val      (flake/s flake)
+         ::datatype const/$xsd:anyURI))
+
+(defn bind-predicate
+  [p-pattern flake]
+  (assoc p-pattern
+         ::val      (flake/p flake)
+         ::datatype const/$xsd:anyURI))
+
+(defn bind-object
+  [o-pattern flake]
+  (assoc o-pattern
+         ::val      (flake/o flake)
+         ::datatype (flake/dt flake)))
+
 (defn bind-flake
   [solution pattern flake]
   (let [[s p o] pattern]
     (cond-> solution
-      (unbound? s) (assoc (::var s) (flake/s flake))
-      (unbound? p) (assoc (::var p) (flake/p flake))
-      (unbound? o) (assoc (::var o) (flake/o flake)))))
+      (unbound? s) (assoc (::var s) (bind-subject s flake))
+      (unbound? p) (assoc (::var p) (bind-predicate p flake))
+      (unbound? o) (assoc (::var o) (bind-object o flake)))))
 
 (defmethod match-pattern :tuple
   [db solution pattern error-ch]
@@ -216,10 +240,9 @@
 
 (defn split-solution-by
   [variables solution]
-  (let [values    (mapv (partial get solution)
-                        variables)
-        remaining (apply dissoc solution variables)]
-    [values remaining]))
+  (let [values    (mapv (partial get-value solution)
+                        variables)]
+    [values solution]))
 
 (defn assoc-coll
   [m k v]
@@ -259,24 +282,47 @@
         (async/pipe (async/chan 2 cat)))
     solution-ch))
 
+(defmulti display
+  (fn [v db compact]
+    (::datatype v)))
+
+(defmethod display :default
+  [v _ _]
+  (go (::val v)))
+
+(defmethod display const/$xsd:anyURI
+  [v db compact]
+  (dbproto/-iri db (::val v) compact))
+
 (defn select-values
-  [solution selectors]
-  (reduce (fn [values selector]
-            (conj values (get solution selector)))
-          [] selectors))
+  [db compact solution selectors]
+  (go-loop [selectors selectors
+            values     []]
+    (if-let [selector (first selectors)]
+      (let [value (<? (-> solution
+                          (get selector)
+                          (display db compact)))]
+        (recur (rest selectors)
+               (conj values value)))
+      values)))
 
 (defn select
-  [selectors solution-ch]
-  (async/transduce (map (fn [solution]
-                          (select-values solution selectors)))
-                   conj
-                   []
-                   solution-ch))
+  [db compact selectors solution-ch]
+  (let [select-ch (async/chan)]
+    (async/pipeline-async 2
+                          select-ch
+                          (fn [solution ch]
+                            (-> (select-values db compact solution selectors)
+                                (async/pipe ch)))
+                          solution-ch)
+    select-ch))
 
 (defn execute
   [db q]
   (let [error-ch (async/chan)
-        context (:context q)]
+        context  (:context q)
+        compact  (json-ld/compact-fn context)]
     (->> (where db context (:where q) error-ch)
          (group (:group-by q))
-         (select (:select q)))))
+         (select db compact (:select q))
+         (async/into []))))
