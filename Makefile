@@ -104,7 +104,7 @@ nodejs-test: out/fluree-node-sdk.js
 	cd test/nodejs && npm install && node --experimental-vm-modules node_modules/jest/bin/jest.js
 
 browser-test: out/fluree-browser-sdk.js
-	cd test/browser && npm install && npm ci
+	cd test/browser && npm install && CI=true npm test
 
 cljstest: cljs-browser-test cljs-node-test
 
