@@ -35,6 +35,10 @@
   [{:keys [store] :as idxr} db-address data]
   (if-let [db-before (<?? (store/read store db-address))]
     (let [db-after   (<?? (jld-transact/stage (db/prepare db-before) data {}))
+          ;; This is a hack to sync t into various places since dbs shouldn't care about branches
+          ;; used in do-index > refresh > index-update > empty-novelty
+          db-after   (assoc-in db-after [:commit :data :t] (- (:t db-after)))
+
           db-address (db/create-db-address db-after)
           idx        (-> db-after :ledger :indexer)
 
