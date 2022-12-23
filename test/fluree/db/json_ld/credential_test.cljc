@@ -48,7 +48,7 @@
 
        (testing "verify incorrect signature"
          (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
-           (is (= "Unverifiable credential"
+           (is (= "Verification failed."
                   (-> (async/<!! (cred/verify wrong-cred))
                       (Throwable->map)
                       (:cause))))))
@@ -85,7 +85,7 @@
               (async/go
                 (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
-                    (is (= "Unverifiable credential"
+                    (is (= "Verification failed."
                            (-> (async/<! (cred/verify wrong-cred))
                                (.-message e))))
                     (done)))))))
