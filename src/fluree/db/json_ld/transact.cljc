@@ -482,5 +482,5 @@
     (let [{tx :subject issuer :issuer} (<? (cred/verify json-ld))]
       (if (and (contains? tx :delete)
                (contains? tx :where))
-        (<? (delete db util/max-integer tx (assoc opts {:issuer issuer})))
+        (<? (delete db util/max-integer tx (assoc opts :issuer issuer)))
         (<? (insert db tx (assoc opts :issuer issuer)))))))
