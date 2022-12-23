@@ -36,7 +36,7 @@
         existing?      (pull-publisher pub ledger-address)
 
         _ (when existing? (throw (ex-info (str "Cannot initialize file ledger: " (pr-str ledger-name)
-                                               "already exists.")
+                                               " already exists.")
                                           {:ledger-name    ledger-name
                                            :ledger-address ledger-address
                                            :opts           opts})))
@@ -56,7 +56,8 @@
 
 (defn list-ledgers
   [{:keys [store] :as pub}]
-  (let [ledger-heads (<?? (store/list store "head/"))]
+  (let [ledger-head-paths (<?? (store/list store "head/"))
+        ledger-heads (map (fn [head-path] (<?? (store/read store head-path))) ledger-head-paths)]
     (map (fn [entry-address] (<?? (store/read store entry-address))) ledger-heads)))
 
 (defn push-publisher
