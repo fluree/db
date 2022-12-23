@@ -235,8 +235,11 @@
 (def blank-solution {})
 
 (defn where
-  [db context where-clause error-ch]
-  (match-clause db blank-solution where-clause error-ch))
+  [db q error-ch]
+  (let [where-clause     (:where q)
+        initial-solution (or (:vars q)
+                             blank-solution)]
+    (match-clause db initial-solution where-clause error-ch)))
 
 (defn split-solution-by
   [variables solution]
@@ -322,7 +325,7 @@
   (let [error-ch (async/chan)
         context  (:context q)
         compact  (json-ld/compact-fn context)]
-    (->> (where db context (:where q) error-ch)
+    (->> (where db q error-ch)
          (group (:group-by q))
          (select db compact (:select q))
          (async/into []))))

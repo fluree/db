@@ -199,9 +199,18 @@
         q-ctx  (or (:context q) (get q "@context"))]
     (json-ld/parse-context db-ctx q-ctx)))
 
+(defn parse-vars
+  [var-map]
+  (reduce-kv (fn [m var val]
+               (let [variable (-> (parse-variable var)
+                                  (assoc ::val val))]
+                 (assoc m var variable)))
+             {} var-map))
+
 (defn parse
   [q db]
   (let [context (parse-context q db)]
     (-> q
         (assoc :context context)
-        (update :where parse-where-clause db context))))
+        (update :where parse-where-clause db context)
+        (update :vars parse-vars))))
