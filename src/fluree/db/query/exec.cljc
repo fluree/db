@@ -24,28 +24,31 @@
     :else     :spot))
 
 (defn resolve-flake-range
-  [{:keys [conn t] :as db} error-ch [s p o]]
-  (let [idx         (idx-for s p o)
-        idx-root    (get db idx)
-        novelty     (get-in db [:novelty idx])
-        start-flake (flake/create s p o nil nil nil util/min-integer)
-        end-flake   (flake/create s p o nil nil nil util/max-integer)
-        #_#_obj-filter  (some-> o :filter filter/extract-combined-filter)
-        opts        (cond-> {:idx         idx
-                             :from-t      t
-                             :to-t        t
-                             :start-test  >=
-                             :start-flake start-flake
-                             :end-test    <=
-                             :end-flake   end-flake}
-                      #_#_obj-filter (assoc :object-fn obj-filter))]
+  [{:keys [conn t] :as db} error-ch components]
+  (let [[s p o]          (map ::val components)
+        [s-fn p-fn o-fn] (map ::fn components)
+        idx              (idx-for s p o)
+        idx-root         (get db idx)
+        novelty          (get-in db [:novelty idx])
+        start-flake      (flake/create s p o nil nil nil util/min-integer)
+        end-flake        (flake/create s p o nil nil nil util/max-integer)
+        opts             (cond-> {:idx         idx
+                                  :from-t      t
+                                  :to-t        t
+                                  :start-test  >=
+                                  :start-flake start-flake
+                                  :end-test    <=
+                                  :end-flake   end-flake}
+                           s-fn (assoc :subject-fn s-fn)
+                           p-fn (assoc :predicate-fn p-fn)
+                           o-fn (assoc :object-fn o-fn))]
     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
 
 (defmulti match-pattern
   "Return a channel that will contain all solutions from flakes in `db` that are
   compatible with the initial solution `solution` and matches the additional
   where-clause pattern `pattern`."
-  (fn [db solution pattern error-ch]
+  (fn [db solution pattern filters error-ch]
     (if (map-entry? pattern)
       (key pattern)
       :tuple)))
@@ -56,13 +59,18 @@
       (get variable)
       ::val))
 
-(defn with-values
-  [tuple solution]
+(defn assign-tuple
+  [tuple solution filters]
   (mapv (fn [component]
           (if-let [variable (::var component)]
-            (let [value (get-value solution variable)]
+            (let [value     (get-value solution variable)
+                  filter-fn (some->> (get filters variable)
+                                     (and (nil? value))
+                                     (map ::fn)
+                                     (apply every-pred))]
               (cond-> component
-                value (assoc ::val value)))
+                value     (assoc ::val value)
+                filter-fn (assoc ::fn filter-fn)))
             component))
         tuple))
 
@@ -98,20 +106,18 @@
       (unbound? o) (assoc (::var o) (bind-object o flake)))))
 
 (defmethod match-pattern :tuple
-  [db solution pattern error-ch]
-  (let [flake-ch (->> (with-values pattern solution)
-                      (map ::val)
-                      (resolve-flake-range db error-ch))
+  [db solution pattern filters error-ch]
+  (let [cur-vals (assign-tuple pattern solution filters)
+        flake-ch (resolve-flake-range db error-ch cur-vals)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
                                             (bind-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
 
 (defmethod match-pattern :iri
-  [db solution pattern error-ch]
-  (let [flake-ch (->> (with-values pattern solution)
-                      (map ::val)
-                      (resolve-flake-range db error-ch))
+  [db solution pattern filters error-ch]
+  (let [cur-vals (assign-tuple pattern solution filters)
+        flake-ch (resolve-flake-range db error-ch cur-vals)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
                                             (bind-flake solution pattern flake)))))]
@@ -142,10 +148,11 @@
          (rf result))))))
 
 (defmethod match-pattern :class
-  [db solution pattern error-ch]
+  [db solution pattern filters error-ch]
   (let [tuple    (val pattern)
-        [s p o]  (map ::val (with-values tuple solution))
-        classes  (into [o] (dbproto/-class-prop db :subclasses o))
+        [s p o]  (assign-tuple tuple solution filters)
+        cls      (::val o)
+        classes  (into [cls] (dbproto/-class-prop db :subclasses cls))
         class-ch (async/to-chan! classes)
         match-ch (async/chan 2 (comp cat
                                      (with-distinct-subjects)
@@ -154,7 +161,7 @@
     (async/pipeline-async 2
                           match-ch
                           (fn [cls ch]
-                            (-> (resolve-flake-range db error-ch [s p cls])
+                            (-> (resolve-flake-range db error-ch [s p (assoc o ::val cls)])
                                 (async/pipe ch)))
                           class-ch)
     match-ch))
@@ -162,12 +169,12 @@
 (defn with-constraint
   "Return a channel of all solutions from `db` that extend from the solutions in
   `solution-ch` and also match the where-clause pattern `pattern`."
-  [db pattern error-ch solution-ch]
+  [db pattern filters error-ch solution-ch]
   (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-pattern db solution pattern error-ch)
+                            (-> (match-pattern db solution pattern filters error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
@@ -177,13 +184,14 @@
   extending from `solution` that also match the parsed where clause `clause`."
   [db solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
+        filters    (::filters clause)
         patterns   (::patterns clause)]
     (reduce (fn [solution-ch pattern]
-              (with-constraint db pattern error-ch solution-ch))
+              (with-constraint db pattern filters error-ch solution-ch))
             initial-ch patterns)))
 
 (defmethod match-pattern :union
-  [db solution pattern error-ch]
+  [db solution pattern _ error-ch]
   (let [clauses   (val pattern)
         clause-ch (async/to-chan! clauses)
         out-ch    (async/chan 2)]
@@ -226,7 +234,7 @@
                    rf))))))))
 
 (defmethod match-pattern :optional
-  [db solution pattern error-ch]
+  [db solution pattern _ error-ch]
   (let [clause (val pattern)
         opt-ch (async/chan 2 (with-default solution))]
     (-> (match-clause db solution clause error-ch)

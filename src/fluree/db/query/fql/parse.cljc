@@ -2,6 +2,8 @@
   (:require [fluree.db.query.exec :as exec]
             [clojure.spec.alpha :as spec]
             [clojure.string :as str]
+            [clojure.set :as set]
+            [clojure.walk :refer [postwalk]]
             [fluree.json-ld :as json-ld]
             [fluree.db.query.range :as query-range]
             [clojure.core.async :as async :refer [<! >! go go-loop]]
@@ -44,6 +46,77 @@
   (and (string? x)
        (re-matches #"^#\(.+\)$" x)))
 
+(def read-str #?(:clj read-string :cljs cljs.reader/read-string))
+
+(defn safe-read
+  [code-str]
+  (try*
+    (let [code (read-str code-str)]
+      (when-not (list? code)
+        (throw (ex-info (code-str "Invalid function: " code-str)
+                        {:status 400 :error :db/invalid-query})))
+      code)
+    (catch* e
+            (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
+            (throw (ex-info (code-str "Invalid query function: " code-str)
+                            {:status 400 :error :db/invalid-query})))))
+
+(defn parse-var-name
+  "Returns a `x` as a symbol if `x` is a valid '?variable'."
+  [x]
+  (when (variable? x)
+    (symbol x)))
+
+(defn variables
+  "Returns the set of items within the arbitrary data structure `data` that
+  are variables ."
+  [data]
+  (postwalk (fn [x]
+              (if (coll? x)
+                (apply set/union x)
+                (if-let [var (parse-var-name x)]
+                  #{var}
+                  #{})))
+            data))
+
+(defn find-filtered-var
+  "Returns the var that will represent flake/o when passed in a flake to execute
+  filter fn.
+
+  There can be multiple vars in the filter function which can utilize the
+  original query's 'vars' map, however there should be exactly one var in the
+  filter fn that isn't in that map - which should be the var that will receive
+  flake/o."
+  [params vars]
+  (let [non-assigned-vars (set/difference params vars)]
+    (case (count non-assigned-vars)
+      1 (first non-assigned-vars)
+      0 (throw (ex-info (str "Query filter function has no variable assigned to it, all parameters "
+                             "exist in the 'vars' map. Filter function params: " params ". "
+                             "Vars assigned in query: " vars ".")
+                        {:status 400
+                         :error  :db/invalid-query}))
+      ;; else
+      (throw (ex-info (str "Vars used in a filter function are not included in the 'vars' map "
+                           "or as a binding. Should only be missing one var, but missing: " (vec non-assigned-vars) ".")
+                      {:status 400
+                       :error  :db/invalid-query})))))
+
+(defn parse-filter-function
+  "Evals, and returns query function."
+  [code-str vars]
+  (let [code      (safe-read code-str)
+        code-vars (or (not-empty (variables code))
+                      (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code-str)
+                                      {:status 400 :error :db/invalid-query})))
+        var-name  (find-filtered-var code-vars vars)
+        params    (vec code-vars)
+        [fun _]   (filter/extract-filter-fn code code-vars)]
+    {::exec/var    var-name
+     ::exec/params params
+     ::exec/fn-str (str "(fn " params " " fun ")")
+     ::exec/fn     (filter/make-executable params fun)}))
+
 (def ^:const default-recursion-depth 100)
 
 (defn recursion-predicate
@@ -62,11 +135,6 @@
        (if recur-n
          (util/str->int recur-n)
          default-recursion-depth)])))
-
-(defn parse-var-name
-  [x]
-  (when (variable? x)
-    (symbol x)))
 
 (defn parse-variable
   [x]
@@ -159,19 +227,47 @@
       {::exec/val o-pat}))
 
 (defmulti parse-pattern
-  (fn [pattern db context]
+  (fn [pattern vars db context]
     (if (map? pattern)
       (->> pattern keys first)
       :tuple)))
 
+(def divide
+  "Function to divide a sequence into two subsequences, one containing all
+  elements for which the supplied predicate returns `true`, and the other `false`"
+  (juxt filter remove))
+
+(defn filter-pattern?
+  [x]
+  (and (map? x)
+       (-> x keys first (= :filter))))
+
+(defn parse-filter-maps
+  [filters supplied-vars]
+  (let [supplied-vars (set supplied-vars)]
+    (->> filters
+         (mapcat vals)
+         flatten
+         (map (fn [f-str]
+                (parse-filter-function f-str supplied-vars)))
+         (reduce (fn [m fltr]
+                   (let [var-name (::exec/var fltr)]
+                     (update m var-name (fn [var-fltrs]
+                                          (-> var-fltrs
+                                              (or [])
+                                              (conj fltr))))))
+                 {}))))
+
 (defn parse-where-clause
-  [clause db context]
-  {::exec/patterns (mapv (fn [pattern]
-                           (parse-pattern pattern db context))
-                         clause)})
+  [clause vars db context]
+  (let [[filters patterns] (divide filter-pattern? clause)]
+    {::exec/patterns (mapv (fn [pattern]
+                             (parse-pattern pattern vars db context))
+                           patterns)
+     ::exec/filters  (parse-filter-maps filters vars)}))
 
 (defmethod parse-pattern :tuple
-  [[s-pat p-pat o-pat] db context]
+  [[s-pat p-pat o-pat] _ db context]
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
     (if (= const/$rdf:type (::exec/val p))
@@ -184,18 +280,18 @@
           tuple)))))
 
 (defmethod parse-pattern :union
-  [{:keys [union]} db context]
+  [{:keys [union]} vars db context]
   (let [parsed (mapv (fn [clause]
-                       (parse-where-clause clause db context))
+                       (parse-where-clause clause vars db context))
                      union)]
     (->pattern :union parsed)))
 
 (defmethod parse-pattern :optional
-  [{:keys [optional]} db context]
+  [{:keys [optional]} vars db context]
   (let [clause (if (coll? (first optional))
                  optional
                  [optional])
-        parsed (parse-where-clause clause db context)]
+        parsed (parse-where-clause clause vars db context)]
     (->pattern :optional parsed)))
 
 (defn parse-context
@@ -223,9 +319,11 @@
 
 (defn parse
   [q db]
-  (let [context (parse-context q db)]
+  (let [context       (parse-context q db)
+        supplied-vars (parse-vars (:vars q))
+        where         (parse-where-clause (:where q) supplied-vars db context)]
     (-> q
-        (assoc :context context)
-        (update :where parse-where-clause db context)
-        (update :group-by parse-group-by)
-        (update :vars parse-vars))))
+        (assoc :context context
+               :vars    supplied-vars
+               :where   where)
+        (update :group-by parse-group-by))))
