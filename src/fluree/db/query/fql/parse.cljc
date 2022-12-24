@@ -166,9 +166,9 @@
 
 (defn parse-where-clause
   [clause db context]
-  (mapv (fn [pattern]
-          (parse-pattern pattern db context))
-        clause))
+  {::exec/patterns (mapv (fn [pattern]
+                           (parse-pattern pattern db context))
+                         clause)})
 
 (defmethod parse-pattern :tuple
   [[s-pat p-pat o-pat] db context]

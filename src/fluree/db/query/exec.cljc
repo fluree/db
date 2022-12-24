@@ -174,13 +174,13 @@
 
 (defn match-clause
   "Returns a channel that will eventually contain all match solutions in `db`
-  extending from `solution` that also match all the where-clause patterns in the
-  collection `clause`."
+  extending from `solution` that also match the parsed where clause `clause`."
   [db solution clause error-ch]
-  (let [initial-ch (async/to-chan! [solution])]
+  (let [initial-ch (async/to-chan! [solution])
+        patterns   (::patterns clause)]
     (reduce (fn [solution-ch pattern]
               (with-constraint db pattern error-ch solution-ch))
-            initial-ch clause)))
+            initial-ch patterns)))
 
 (defmethod match-pattern :union
   [db solution pattern error-ch]
