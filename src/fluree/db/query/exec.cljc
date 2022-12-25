@@ -251,9 +251,12 @@
 
 (defn split-solution-by
   [variables solution]
-  (let [values (mapv (partial get-value solution)
-                     variables)]
-    [values solution]))
+  (let [group-key   (mapv (fn [v]
+                            (-> (get solution v)
+                                (select-keys [::val ::datatype])))
+                          variables)
+        grouped-val (apply dissoc solution variables)]
+    [group-key grouped-val]))
 
 (defn assoc-coll
   [m k v]
@@ -276,9 +279,16 @@
 (defn unwind-groups
   [grouping groups]
   (reduce-kv (fn [solutions group-key grouped-vals]
-               (let [merged-vals (reduce merge-with-colls {} grouped-vals)
+               (let [merged-vals (->> grouped-vals
+                                      (reduce merge-with-colls {})
+                                      (reduce-kv (fn [m k v]
+                                                   (assoc m k {::var       k
+                                                               ::val       v
+                                                               ::datatype ::grouping}))
+                                                 {}))
                      solution    (into merged-vals
                                        (map vector grouping group-key))]
+                 (log/info "found solution:" solution)
                  (conj solutions solution)))
              [] groups))
 
@@ -343,6 +353,15 @@
 (defmethod display const/$xsd:anyURI
   [v db compact]
   (dbproto/-iri db (::val v) compact))
+
+(defmethod display ::grouping
+  [v db compact]
+  (let [group (::val v)]
+    (->> v
+         ::val
+         (map (fn [grouped-val]
+                (display grouped-val db compact)))
+         (async/map vector))))
 
 (defn select-values
   [db compact solution selectors]
