@@ -86,7 +86,7 @@
 
 (s/def ::ordering (s/or :scalar ::var
                         :vector (s/cat :direction ::direction
-                                       :field     ::var)))
+                                       :dimension ::var)))
 
 (s/def ::orderBy (s/or :clause     ::ordering
                        :collection (s/coll-of ::ordering)))

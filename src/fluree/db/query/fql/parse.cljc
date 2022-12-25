@@ -1,5 +1,6 @@
 (ns fluree.db.query.fql.parse
   (:require [fluree.db.query.exec :as exec]
+            [fluree.db.query.fql.syntax :as syntax]
             [clojure.spec.alpha :as spec]
             [clojure.string :as str]
             [clojure.set :as set]
@@ -301,29 +302,51 @@
     (json-ld/parse-context db-ctx q-ctx)))
 
 (defn parse-vars
-  [var-map]
-  (when var-map
+  [{:keys [vars] :as _q}]
+  (when vars
     (reduce-kv (fn [m var val]
                  (let [variable (-> (parse-variable var)
                                     (assoc ::val val))]
                    (assoc m var variable)))
-               {} var-map)))
+               {} vars)))
 
-(defn parse-group-by
-  [grouping]
-  (when grouping
-    (let [grouping* (if (sequential? grouping)
-                      grouping
-                      [grouping])]
-      (mapv parse-var-name grouping*))))
+(defn ensure-vector
+  [x]
+  (if (vector? x)
+    x
+    [x]))
+
+(defn parse-grouping
+  [q]
+  (some->> (or (:groupBy q)
+               (:group-by q))
+           ensure-vector
+           (mapv parse-var-name)))
+
+(defn parse-ordering
+  [q]
+  (some->> (or (:order-by q)
+               (:orderBy q))
+           ensure-vector
+           (mapv (fn [ord]
+                   (if-let [v (parse-var-name ord)]
+                     [v :asc]
+                     (let [[dir dim] ord
+                           v         (parse-var-name dim)]
+                       (if (syntax/asc? dir)
+                         [v :asc]
+                         [v :desc])))))))
 
 (defn parse
   [q db]
   (let [context       (parse-context q db)
-        supplied-vars (parse-vars (:vars q))
-        where         (parse-where-clause (:where q) supplied-vars db context)]
-    (-> q
-        (assoc :context context
-               :vars    supplied-vars
-               :where   where)
-        (update :group-by parse-group-by))))
+        supplied-vars (parse-vars q)
+        where         (parse-where-clause (:where q) supplied-vars db context)
+        grouping      (parse-grouping q)
+        ordering      (parse-ordering q)]
+    (cond-> (assoc q
+                   :context context
+                   :vars    supplied-vars
+                   :where   where)
+      grouping (assoc :group-by grouping)
+      ordering (assoc :order-by ordering))))

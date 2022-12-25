@@ -293,6 +293,45 @@
         (async/pipe (async/chan 2 cat)))
     solution-ch))
 
+(defn compare-vals
+  [x-val x-dt y-val y-dt]
+  (let [dt-cmp (compare x-dt y-dt)]
+    (if (zero? dt-cmp)
+      (compare x-val y-val)
+      dt-cmp)))
+
+(defn compare-solutions-by
+  [variable direction x y]
+  (let [x-var (get x variable)
+        x-val (::val x-var)
+        x-dt  (::datatype x-var)
+
+        y-var (get y variable)
+        y-val (::val y-var)
+        y-dt  (::datatype y-var)]
+    (if (= direction :asc)
+      (compare-vals x-val x-dt y-val y-dt)
+      (compare-vals y-val y-dt x-val x-dt))))
+
+(defn compare-solutions
+  [ordering x y]
+  (reduce (fn [comparison [variable direction]]
+            (let [cmp (compare-solutions-by variable direction x y)]
+              (if (zero? cmp)
+                comparison
+                (reduced cmp))))
+          0 ordering))
+
+(defn order
+  [ordering solution-ch]
+  (if ordering
+    (let [sorter     (partial compare-solutions ordering)
+          coll-ch    (async/into [] solution-ch)
+          ordered-ch (async/chan 2 (comp (map (partial sort sorter))
+                                         cat))]
+      (async/pipe coll-ch ordered-ch))
+    solution-ch))
+
 (defmulti display
   (fn [v db compact]
     (::datatype v)))
@@ -335,5 +374,6 @@
         compact  (json-ld/compact-fn context)]
     (->> (where db q error-ch)
          (group (:group-by q))
+         (order (:order-by q))
          (select db compact (:select q))
          (async/into []))))
