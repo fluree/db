@@ -342,6 +342,19 @@
       (async/pipe coll-ch ordered-ch))
     solution-ch))
 
+(defn offset
+  [n solution-ch]
+  (if n
+    (async/pipe solution-ch
+                (async/chan 2 (drop n)))
+    solution-ch))
+
+(defn limit
+  [n solution-ch]
+  (if n
+    (async/take n solution-ch)
+    solution-ch))
+
 (defmulti display
   (fn [v db compact]
     (::datatype v)))
@@ -394,5 +407,7 @@
     (->> (where db q error-ch)
          (group (:group-by q))
          (order (:order-by q))
+         (offset (:offset q))
+         (limit (:limit q))
          (select db compact (:select q))
          (async/into []))))
