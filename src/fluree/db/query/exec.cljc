@@ -288,7 +288,6 @@
                                                  {}))
                      solution    (into merged-vals
                                        (map vector grouping group-key))]
-                 (log/info "found solution:" solution)
                  (conj solutions solution)))
              [] groups))
 
@@ -335,9 +334,9 @@
 (defn order
   [ordering solution-ch]
   (if ordering
-    (let [sorter     (partial compare-solutions ordering)
+    (let [comparator (partial compare-solutions ordering)
           coll-ch    (async/into [] solution-ch)
-          ordered-ch (async/chan 2 (comp (map (partial sort sorter))
+          ordered-ch (async/chan 2 (comp (map (partial sort comparator))
                                          cat))]
       (async/pipe coll-ch ordered-ch))
     solution-ch))
@@ -389,8 +388,11 @@
       values)))
 
 (defn select
-  [db compact selectors solution-ch]
-  (let [select-ch (async/chan)]
+  [db q solution-ch]
+  (let [compact   (->> q :context json-ld/compact-fn )
+        selectors (or (:select q)
+                      (:selectOne q))
+        select-ch (async/chan)]
     (async/pipeline-async 2
                           select-ch
                           (fn [solution ch]
@@ -399,15 +401,19 @@
                           solution-ch)
     select-ch))
 
+(defn collect-results
+  [q result-ch]
+  (if (:selectOne q)
+    (async/take 1 result-ch)
+    (async/into [] result-ch)))
+
 (defn execute
   [db q]
-  (let [error-ch (async/chan)
-        context  (:context q)
-        compact  (json-ld/compact-fn context)]
+  (let [error-ch (async/chan)]
     (->> (where db q error-ch)
          (group (:group-by q))
          (order (:order-by q))
          (offset (:offset q))
          (limit (:limit q))
-         (select db compact (:select q))
-         (async/into []))))
+         (select db q)
+         (collect-results q))))

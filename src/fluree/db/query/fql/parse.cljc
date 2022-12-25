@@ -337,6 +337,12 @@
                          [v :asc]
                          [v :desc])))))))
 
+(defn parse-limit
+  [q]
+  (if (:selectOne q)
+    (assoc q :limit 1)
+    q))
+
 (defn parse
   [q db]
   (let [context       (parse-context q db)
@@ -349,4 +355,5 @@
                    :vars    supplied-vars
                    :where   where)
       grouping (assoc :group-by grouping)
-      ordering (assoc :order-by ordering))))
+      ordering (assoc :order-by ordering)
+      true     parse-limit)))
