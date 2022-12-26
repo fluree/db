@@ -14,12 +14,7 @@
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const])
-  (:import (clojure.lang MapEntry)))
-
-(defn ->pattern
-  [typ data]
-  (MapEntry/create typ data))
+            [fluree.db.constants :as const]))
 
 (defn sid?
   [x]
@@ -273,11 +268,11 @@
         p (parse-predicate-pattern p-pat db context)]
     (if (= const/$rdf:type (::exec/val p))
       (let [cls (parse-class o-pat db context)]
-        (->pattern :class [s p cls]))
+        (exec/->pattern :class [s p cls]))
       (let [o     (parse-object-pattern o-pat)
             tuple [s p o]]
         (if (= const/$iri (::exec/val p))
-          (->pattern :iri tuple)
+          (exec/->pattern :iri tuple)
           tuple)))))
 
 (defmethod parse-pattern :union
@@ -285,7 +280,7 @@
   (let [parsed (mapv (fn [clause]
                        (parse-where-clause clause vars db context))
                      union)]
-    (->pattern :union parsed)))
+    (exec/->pattern :union parsed)))
 
 (defmethod parse-pattern :optional
   [{:keys [optional]} vars db context]
@@ -293,7 +288,7 @@
                  optional
                  [optional])
         parsed (parse-where-clause clause vars db context)]
-    (->pattern :optional parsed)))
+    (exec/->pattern :optional parsed)))
 
 (defn parse-context
   [q db]

@@ -10,7 +10,8 @@
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const])
+  (:import (clojure.lang MapEntry)))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -43,6 +44,10 @@
                            p-fn (assoc :predicate-fn p-fn)
                            o-fn (assoc :object-fn o-fn))]
     (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
+
+(defn ->pattern
+  [typ data]
+  (MapEntry/create typ data))
 
 (defmulti match-pattern
   "Return a channel that will contain all solutions from flakes in `db` that are
