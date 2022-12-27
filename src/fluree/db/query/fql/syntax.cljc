@@ -52,13 +52,13 @@
                    :string string?))
 
 (s/def ::selector
-  (s/or :aggregate ::function
-        :var       ::var
+  (s/or :var       ::var
         :wildcard  ::wildcard
         :pred      ::ref
+        :aggregate ::function
         :map       (s/map-of (s/or :var      ::var
                                    :wildcard ::wildcard
-                                   :ref     ::ref)
+                                   :ref      ::ref)
                              ::select
                              :count 1)))
 

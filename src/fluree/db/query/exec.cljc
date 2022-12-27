@@ -360,48 +360,76 @@
     solution-ch))
 
 (defmulti display
-  (fn [v db compact]
-    (::datatype v)))
+  (fn [match db select-cache compact]
+    (::datatype match)))
 
 (defmethod display :default
-  [v _ _]
-  (go (::val v)))
+  [match _ _ _]
+  (go (::val match)))
 
 (defmethod display const/$xsd:anyURI
-  [v db compact]
-  (dbproto/-iri db (::val v) compact))
+  [match db select-cache compact]
+  (go-try
+   (let [v (::val match)]
+     (if-let [cached (get @select-cache v)]
+       cached
+       (let [iri (<? (dbproto/-iri db (::val match) compact))]
+         (vswap! select-cache assoc v iri)
+         iri)))))
 
 (defmethod display ::grouping
-  [v db compact]
-  (let [group (::val v)]
-    (->> v
-         ::val
+  [match db select-cache compact]
+  (let [group (::val match)]
+    (->> group
          (map (fn [grouped-val]
-                (display grouped-val db compact)))
+                (display grouped-val db select-cache compact)))
          (async/map vector))))
 
+(defmulti format
+  (fn [selector db select-cache compact solution]
+    (if (map? selector)
+      (::selector selector)
+      :var)))
+
+(defmethod format :var
+  [variable db select-cache compact solution]
+  (-> solution
+      (get variable)
+      (display db select-cache compact)))
+
+(defn ->aggregate-selector
+  [variable function]
+  {::selector :aggregate
+   ::variable variable
+   ::function function})
+
+(defmethod format :aggregate
+  [{::keys [variable function]} db select-cache compact solution]
+  (go-try
+   (let [group (<? (format variable db select-cache compact solution))]
+     (function group))))
+
 (defn select-values
-  [db compact solution selectors]
+  [db select-cache compact solution selectors]
   (go-loop [selectors selectors
             values     []]
     (if-let [selector (first selectors)]
-      (let [value (<? (-> solution
-                          (get selector)
-                          (display db compact)))]
+      (let [value (<? (format selector db select-cache compact solution))]
         (recur (rest selectors)
                (conj values value)))
       values)))
 
 (defn select
   [db q solution-ch]
-  (let [compact   (->> q :context json-ld/compact-fn )
-        selectors (or (:select q)
-                      (:selectOne q))
-        select-ch (async/chan)]
-    (async/pipeline-async 2
+  (let [compact      (->> q :context json-ld/compact-fn)
+        selectors    (or (:select q)
+                         (:selectOne q))
+        select-cache (volatile! {})
+        select-ch    (async/chan)]
+    (async/pipeline-async 1
                           select-ch
                           (fn [solution ch]
-                            (-> (select-values db compact solution selectors)
+                            (-> (select-values db select-cache compact solution selectors)
                                 (async/pipe ch)))
                           solution-ch)
     select-ch))

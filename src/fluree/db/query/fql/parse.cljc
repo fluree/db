@@ -1,5 +1,6 @@
 (ns fluree.db.query.fql.parse
   (:require [fluree.db.query.exec :as exec]
+            [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.spec.alpha :as spec]
             [clojure.string :as str]
@@ -37,10 +38,9 @@
        (-> x name first (= \?))))
 
 (defn query-fn?
-  "Query function as positioned in a :where statement"
   [x]
-  (and (string? x)
-       (re-matches #"^#\(.+\)$" x)))
+  (or (syntax/fn-string? x)
+      (syntax/fn-list? x)))
 
 (def read-str #?(:clj read-string :cljs cljs.reader/read-string))
 
@@ -296,6 +296,18 @@
         q-ctx  (or (:context q) (get q "@context"))]
     (json-ld/parse-context db-ctx q-ctx)))
 
+(defn parse-select
+  [{:keys [select]}]
+  (let [clause (if (coll? select)
+                 select
+                 [select])]
+    (mapv (fn [s]
+            (cond
+              (variable? s) (parse-var-name s)
+              (query-fn? s) (let [{:keys [variable function]} (parse-aggregate s)]
+                              (exec/->aggregate-selector variable function))))
+          clause)))
+
 (defn parse-vars
   [{:keys [vars] :as _q}]
   (when vars
@@ -332,23 +344,18 @@
                          [v :asc]
                          [v :desc])))))))
 
-(defn parse-limit
-  [q]
-  (if (:selectOne q)
-    (assoc q :limit 1)
-    q))
-
 (defn parse
   [q db]
   (let [context       (parse-context q db)
         supplied-vars (parse-vars q)
         where         (parse-where-clause (:where q) supplied-vars db context)
         grouping      (parse-grouping q)
-        ordering      (parse-ordering q)]
+        ordering      (parse-ordering q)
+        select        (parse-select q)]
     (cond-> (assoc q
                    :context context
+                   :select  select
                    :vars    supplied-vars
                    :where   where)
       grouping (assoc :group-by grouping)
-      ordering (assoc :order-by ordering)
-      true     parse-limit)))
+      ordering (assoc :order-by ordering))))
