@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.parse
   (:require [fluree.db.query.exec :as exec]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
+            [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.spec.alpha :as spec]
             [clojure.string :as str]
@@ -41,6 +42,10 @@
   [x]
   (or (syntax/fn-string? x)
       (syntax/fn-list? x)))
+
+(defn select-map?
+  [x]
+  (map? x))
 
 (def read-str #?(:clj read-string :cljs cljs.reader/read-string))
 
@@ -297,15 +302,19 @@
     (json-ld/parse-context db-ctx q-ctx)))
 
 (defn parse-select
-  [{:keys [select]}]
+  [{:keys [select] :as q} db context]
   (let [clause (if (coll? select)
                  select
-                 [select])]
+                 [select])
+        depth  (or (:depth q) 0)]
     (mapv (fn [s]
             (cond
-              (variable? s) (parse-var-name s)
-              (query-fn? s) (let [{:keys [variable function]} (parse-aggregate s)]
-                              (exec/->aggregate-selector variable function))))
+              (variable? s)   (parse-var-name s)
+              (query-fn? s)   (let [{:keys [variable function]} (parse-aggregate s)]
+                                (exec/->aggregate-selector variable function))
+              (select-map? s) (let [{:keys [variable selection depth spec]}
+                                    (parse-subselection db context s depth)]
+                                (exec/->subgraph-selector variable selection spec depth))))
           clause)))
 
 (defn parse-vars
@@ -351,7 +360,7 @@
         where         (parse-where-clause (:where q) supplied-vars db context)
         grouping      (parse-grouping q)
         ordering      (parse-ordering q)
-        select        (parse-select q)]
+        select        (parse-select q db context)]
     (cond-> (assoc q
                    :context context
                    :select  select

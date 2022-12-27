@@ -2,6 +2,7 @@
   (:require [clojure.spec.alpha :as spec]
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
+            [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.query.range :as query-range]
             [clojure.core.async :as async :refer [<! >! go go-loop]]
             [fluree.db.flake :as flake]
@@ -408,6 +409,24 @@
   (go-try
    (let [group (<? (format variable db select-cache compact solution))]
      (function group))))
+
+(defn ->subgraph-selector
+  [variable selection spec depth]
+  {::selector  :subgraph
+   ::variable  variable
+   ::selection selection
+   ::depth     depth
+   ::spec      spec})
+
+(defmethod format :subgraph
+  [{::keys [variable selection depth spec]} db select-cache compact solution]
+  (go-try
+   (let [sid    (-> solution
+                    (get variable)
+                    ::val)
+         flakes (<? (query-range/index-range db :spot = [sid]))]
+     ;; TODO: Replace these nils with fuel values when we turn fuel back on
+     (<? (json-ld-resp/flakes->res db select-cache compact nil nil spec 0 flakes)))))
 
 (defn select-values
   [db select-cache compact solution selectors]

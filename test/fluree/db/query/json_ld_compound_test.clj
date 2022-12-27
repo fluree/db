@@ -11,44 +11,44 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/compounda")
           db     @(fluree/stage
-                    ledger
-                    [{:context      {:ex "http://example.org/ns/"}
-                      :id           :ex/brian,
-                      :type         :ex/User,
-                      :schema/name  "Brian"
-                      :schema/email "brian@example.org"
-                      :schema/age   50
-                      :ex/favNums   7}
-                     {:context      {:ex "http://example.org/ns/"}
-                      :id           :ex/alice,
-                      :type         :ex/User,
-                      :schema/name  "Alice"
-                      :schema/email "alice@example.org"
-                      :schema/age   50
-                      :ex/favNums   [42, 76, 9]}
-                     {:context      {:ex "http://example.org/ns/"}
-                      :id           :ex/cam,
-                      :type         :ex/User,
-                      :schema/name  "Cam"
-                      :schema/email "cam@example.org"
-                      :schema/age   34
-                      :ex/favNums   [5, 10]
-                      :ex/friend    [:ex/brian :ex/alice]}])
+                   ledger
+                   [{:context      {:ex "http://example.org/ns/"}
+                     :id           :ex/brian,
+                     :type         :ex/User,
+                     :schema/name  "Brian"
+                     :schema/email "brian@example.org"
+                     :schema/age   50
+                     :ex/favNums   7}
+                    {:context      {:ex "http://example.org/ns/"}
+                     :id           :ex/alice,
+                     :type         :ex/User,
+                     :schema/name  "Alice"
+                     :schema/email "alice@example.org"
+                     :schema/age   50
+                     :ex/favNums   [42, 76, 9]}
+                    {:context      {:ex "http://example.org/ns/"}
+                     :id           :ex/cam,
+                     :type         :ex/User,
+                     :schema/name  "Cam"
+                     :schema/email "cam@example.org"
+                     :schema/age   34
+                     :ex/favNums   [5, 10]
+                     :ex/friend    [:ex/brian :ex/alice]}])
 
           two-tuple-select-with-crawl
-                 @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                                    :select  ['?age {'?f [:*]}]
-                                    :where   [['?s :schema/name "Cam"]
-                                              ['?s :ex/friend '?f]
-                                              ['?f :schema/age '?age]]})
+          @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                             :select  ['?age {'?f [:*]}]
+                             :where   [['?s :schema/name "Cam"]
+                                       ['?s :ex/friend '?f]
+                                       ['?f :schema/age '?age]]})
 
           two-tuple-select-with-crawl+var
-                 @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                                    :select  ['?age {'?f [:*]}]
-                                    :where   [['?s :schema/name '?name]
-                                              ['?s :ex/friend '?f]
-                                              ['?f :schema/age '?age]]
-                                    :vars    {'?name "Cam"}})]
+          @(fluree/query db {:context {:ex "http://example.org/ns/"}
+                             :select  ['?age {'?f [:*]}]
+                             :where   [['?s :schema/name '?name]
+                                       ['?s :ex/friend '?f]
+                                       ['?f :schema/age '?age]]
+                             :vars    {'?name "Cam"}})]
 
       (is (= two-tuple-select-with-crawl
              two-tuple-select-with-crawl+var
