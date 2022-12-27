@@ -48,13 +48,13 @@
             (is (= (->> @(fluree/slice db :spot [alice-sid])
                         (mapv flake/Flake->parts))
                    [[alice-sid 0 "http://example.org/ns/alice" 1 -1 true nil]
-                    [alice-sid 200 1014 0 -1 true nil]
-                    [alice-sid 1015 "Alice" 1 -1 true nil]
-                    [alice-sid 1016 "alice@example.org" 1 -1 true nil]
-                    [alice-sid 1017 50 7 -1 true nil]
-                    [alice-sid 1018 9 7 -1 true nil]
-                    [alice-sid 1018 42 7 -1 true nil]
-                    [alice-sid 1018 76 7 -1 true nil]])
+                    [alice-sid 200 1002 0 -1 true nil]
+                    [alice-sid 1003 "Alice" 1 -1 true nil]
+                    [alice-sid 1004 "alice@example.org" 1 -1 true nil]
+                    [alice-sid 1005 50 7 -1 true nil]
+                    [alice-sid 1006 9 7 -1 true nil]
+                    [alice-sid 1006 42 7 -1 true nil]
+                    [alice-sid 1006 76 7 -1 true nil]])
                 "Slice should return a vector of flakes for only Alice")))
 
         (testing "Slice for subject + predicate"

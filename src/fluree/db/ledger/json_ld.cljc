@@ -197,10 +197,9 @@
                            :indexer indexer
                            :conn    conn})
           blank-db      (jld-db/create ledger)
-          bootstrap?    (and (not blank?)
-                             (or context* did*))
+          bootstrap?    (and (not blank?) context*)
           db            (if bootstrap?
-                          (<? (bootstrap/bootstrap blank-db context* (:id did*)))
+                          (<? (bootstrap/bootstrap blank-db context*))
                           (bootstrap/blank-db blank-db))]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)

@@ -66,10 +66,9 @@
           "http://www.w3.org/ns/shacl#maxExclusive"             const/$sh:maxExclusive
           "http://www.w3.org/ns/shacl#maxInclusive"             const/$sh:maxInclusive
           ;; fluree
-          "https://ns.flur.ee/ledger#context"                   const/$fluree:context}))
+          "https://ns.flur.ee/ledger#context"                   const/$fluree:context
+          const/iri-default-context                             const/$fluree:default-context}))
 
-(def ^:const predefined-subjects
-  {const/iri-default-context const/$fluree:default-context})
 
 (defn flip-key-vals
   [map]
@@ -111,11 +110,17 @@
       (dec (flake/->sid const/$_shard 0))))
 
 (defn generate-new-sid
-  [{:keys [id] :as node} iris next-pid next-sid]
-  (let [new-sid (if (class-or-property? node)
-                  (next-pid)
-                  (or
-                    (get predefined-subjects id)
+  "Generates a new subject ID. If it is know this is a property or class will
+  assign the lower range of subject ids."
+  [{:keys [id] :as node} referring-pid iris next-pid next-sid]
+  (let [new-sid (or
+                  (get predefined-properties id)
+                  (if (or (class-or-property? node)
+                          (#{const/$sh:path const/$sh:ignoredProperties
+                             const/$sh:targetClass
+                             const/$sh:targetSubjectsOf const/$sh:targetObjectsOf}
+                           referring-pid))
+                    (next-pid)
                     (next-sid)))]
     (vswap! iris assoc id new-sid)
     new-sid))

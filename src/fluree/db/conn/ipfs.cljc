@@ -6,7 +6,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.method.ipfs.xhttp :as ipfs-xhttp]
             [fluree.db.util.async :refer [<? go-try channel?]]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.conn.state-machine :as state-machine]
@@ -25,6 +24,7 @@
   "Returns IPNS address for a given key."
   [{:keys [ipfs-endpoint ledger-defaults] :as _conn} ledger-alias opts]
   (go-try
+    (log/debug "Getting address for ledger alias:" ledger-alias)
     (let [base-address (if-let [key (-> opts :ipns :key)]
                          (<? (ipfs-keys/address ipfs-endpoint key))
                          (-> ledger-defaults :ipns :address))]
@@ -50,19 +50,30 @@
     [proto address (trim-slashes db)]))
 
 (defn lookup-address
-  "Given IPNS address, performs lookup and returns latest db address."
+  "Given IPNS address, performs lookup and returns latest ledger address."
   [{:keys [ipfs-endpoint] :as _conn} ledger-name]
   (go-try
-    (if-let [[proto address db] (address-parts ledger-name)]
+    (if-let [[proto address ledger] (address-parts ledger-name)]
       (let [ipfs-addr (if (= "ipns" proto)
                         (str "/ipns/" address)
                         address)]
         ;; address might be a directory, or could directly be a commit file - try to look up as directory first
-        (let [dbs (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
-          (or (get dbs db)
+        (let [ledgers (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
+          (or (get ledgers ledger)
               ledger-name)))
       ledger-name)))
 
+(defn address-exists?
+  [{:keys [ipfs-endpoint] :as _conn} ledger-address]
+  (go-try
+    (log/debug "Checking for existence of ledger" ledger-address)
+    (boolean
+      (when-let [[proto address ledger] (address-parts ledger-address)]
+        (let [ipfs-addr (if (= "ipns" proto)
+                          (str "/ipns/" address)
+                          address)
+              ledgers   (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
+          (contains? ledgers ledger))))))
 
 (defrecord IPFSConnection [id memory state ledger-defaults async-cache
                            serializer parallelism msg-in-ch msg-out-ch
@@ -87,6 +98,7 @@
   (-alias [_ ledger-address] (let [[_ _ alias] (address-parts ledger-address)]
                                alias))
   (-address [this ledger-alias opts] (get-address this ledger-alias opts))
+  (-exists? [this ledger-address] (address-exists? this ledger-address))
 
   conn-proto/iConnection
   (-close [_]

@@ -308,6 +308,14 @@
                                      e)))))
     return-chan))
 
+(defn class-ids
+  "Returns list of class-ids for given subject-id"
+  [db subject-id]
+  (go-try
+    (->>
+      (<? (query-range/index-range db :spot = [subject-id const/$rdf:type]))
+      (map flake/o))))
+
 (defn iri
   "Returns the iri for a given subject ID"
   [db subject-id compact-fn]
@@ -323,9 +331,7 @@
       (assoc current-db :permissions permissions))))
 
 (defn- graphdb-root-db [this]
-  (assoc this :permissions {:root?      true
-                            :collection {:all? true}
-                            :predicate  {:all? true}}))
+  (assoc this :permissions {:root?      true}))
 
 (defn- graphdb-c-prop [{:keys [schema]} property collection]
   ;; collection properties TODO-deprecate :id property below in favor of :partition
@@ -443,6 +449,7 @@
   (-tag-id [this tag-name pred] (graphdb-tag-id this tag-name pred))
   (-subid [this ident] (subid this ident false))
   (-subid [this ident strict?] (subid this ident strict?))
+  (-class-ids [this subject] (class-ids this subject))
   (-iri [this subject-id] (iri this subject-id identity))
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-search [this fparts] (query-range/search this fparts))

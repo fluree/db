@@ -44,8 +44,6 @@
                        {:status 500 :error :db/invalid-commit})))
      (ipfs/cat ipfs-endpoint ipfs-cid keywordize-keys?))))
 
-
-
 (defn address-parts
   "Parses full ipns ledger address and returns parts"
   [address]

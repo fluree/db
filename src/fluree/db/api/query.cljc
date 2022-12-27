@@ -340,9 +340,10 @@
           db            (if (async-util/channel? sources)   ;; only support 1 source currently
                           (<? sources)
                           sources)
-          db*           (if t
-                          (<? (time-travel/as-of db t))
-                          db)
+          db*           (-> (if t
+                              (<? (time-travel/as-of db t))
+                              db)
+                            (assoc-in [:permissions :cache] (atom {})))
           source-opts   (if prefixes
                           (get-sources (:conn db*) (:network db*) (:auth-id db*) prefixes)
                           {})

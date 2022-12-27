@@ -194,18 +194,14 @@
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (let [s1 (flake/s start)
-           p1 (flake/p start)
-           s2 (flake/s end)
-           p2 (flake/p end)]
-       (if (perm-validate/no-filter? permissions s1 s2 p1 p2)
-         flake-slices
-         (let [auth-fn (fn [flakes ch]
-                         (-> (authorize-flakes db error-ch flakes)
-                             (async/pipe ch)))
-               out-ch  (chan)]
-           (async/pipeline-async 2 out-ch auth-fn flake-slices)
-           out-ch)))))
+     (if (true? (:root? permissions))
+       flake-slices
+       (let [auth-fn (fn [flakes ch]
+                       (-> (authorize-flakes db error-ch flakes)
+                           (async/pipe ch)))
+             out-ch  (chan)]
+         (async/pipeline-async 2 out-ch auth-fn flake-slices)
+         out-ch))))
 
 (defn filter-subject-page
   "Returns a transducer to filter a stream of flakes to only contain flakes from
