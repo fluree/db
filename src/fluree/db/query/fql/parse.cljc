@@ -301,12 +301,11 @@
         q-ctx  (or (:context q) (get q "@context"))]
     (json-ld/parse-context db-ctx q-ctx)))
 
-(defn parse-select
-  [{:keys [select] :as q} db context]
-  (let [clause (if (coll? select)
-                 select
-                 [select])
-        depth  (or (:depth q) 0)]
+(defn parse-select-clause
+  [clause db context depth]
+  (let [clause (if (coll? clause)
+                 clause
+                 [clause])]
     (mapv (fn [s]
             (cond
               (variable? s)   (parse-var-name s)
@@ -316,6 +315,13 @@
                                     (parse-subselection db context s depth)]
                                 (exec/->subgraph-selector variable selection spec depth))))
           clause)))
+
+(defn parse-select
+  [q db context]
+  (let [depth  (or (:depth q) 0)]
+    (if (:selectOne q)
+      (update q :selectOne parse-select-clause db context depth)
+      (update q :select parse-select-clause db context depth))))
 
 (defn parse-vars
   [{:keys [vars] :as _q}]
@@ -359,12 +365,11 @@
         supplied-vars (parse-vars q)
         where         (parse-where-clause (:where q) supplied-vars db context)
         grouping      (parse-grouping q)
-        ordering      (parse-ordering q)
-        select        (parse-select q db context)]
+        ordering      (parse-ordering q)]
     (cond-> (assoc q
                    :context context
-                   :select  select
                    :vars    supplied-vars
                    :where   where)
       grouping (assoc :group-by grouping)
-      ordering (assoc :order-by ordering))))
+      ordering (assoc :order-by ordering)
+      true     (parse-select db context))))
