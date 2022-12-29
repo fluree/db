@@ -155,12 +155,18 @@
 
 (s/def ::vars (s/map-of ::var any?))
 
-(s/def ::from (s/or :spec (s/or :sid        number?
+(defn sid?
+  [x]
+  (int? x))
+
+(s/def ::from (s/or :spec (s/or :sid        sid?
                                 :iri-str    string?
                                 :iri-kw     keyword?
                                 :pred-ident pred-ident?)
-                    :coll (s/coll-of number?))) ; only sids are supported for
-                                                ; specifying multiple subjects
+                    :coll (s/coll-of sid?))) ; only sids are supported for
+                                             ; specifying multiple subjects
+
+(s/def ::basic-query (s/keys :req-un [::from]))
 
 (s/def ::query-map
   (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct

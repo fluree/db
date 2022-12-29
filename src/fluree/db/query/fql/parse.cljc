@@ -2,6 +2,7 @@
   (:require [fluree.db.query.exec :as exec]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
+            [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.spec.alpha :as spec]
             [clojure.string :as str]
@@ -18,9 +19,9 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]))
 
-(defn sid?
-  [x]
-  (int? x))
+(defn basic-query?
+  [q]
+  (contains? q :from))
 
 (def rdf-type-preds #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                       "a"
@@ -149,7 +150,7 @@
 
 (defn parse-subject-id
   ([x]
-   (when (sid? x)
+   (when (syntax/sid? x)
      {::exec/val x}))
 
   ([x context]
@@ -222,7 +223,7 @@
                     {:status 400 :error :db/invalid-query}))))
 
 (defn parse-object-pattern
-  [o-pat]
+  [o-pat context]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
       {::exec/val o-pat}))
@@ -265,19 +266,26 @@
                       (parse-filter-maps vars))]
     (exec/->where-clause patterns filters)))
 
-
-(defmethod parse-pattern :tuple
-  [[s-pat p-pat o-pat] _ db context]
+(defn parse-tuple
+  [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
     (if (= const/$rdf:type (::exec/val p))
       (let [cls (parse-class o-pat db context)]
         (exec/->pattern :class [s p cls]))
-      (let [o     (parse-object-pattern o-pat)
+      (let [o     (parse-object-pattern o-pat context)
             tuple [s p o]]
         (if (= const/$iri (::exec/val p))
-          (exec/->pattern :iri tuple)
+          (let [o*     (-> o
+                           (update ::exec/val json-ld/expand-iri context)
+                           (assoc ::exec/datatype const/$xsd:anyURI))
+                tuple* [s p o*]]
+            (exec/->pattern :iri tuple*))
           tuple)))))
+
+(defmethod parse-pattern :tuple
+  [tuple _ db context]
+  (parse-tuple tuple db context))
 
 (defmethod parse-pattern :union
   [{:keys [union]} vars db context]
@@ -294,6 +302,27 @@
         parsed (parse-where-clause clause vars db context)]
     (exec/->pattern :optional parsed)))
 
+(defn from->tuple
+  [from-clause context]
+  (let [s-var (symbol "?s")]
+    (cond
+      (syntax/sid? from-clause)      [s-var :_id from-clause]
+      (or (string? from-clause)
+          (keyword? from-clause))    [s-var "@id" (json-ld/expand-iri from-clause context)]
+      (util/pred-ident? from-clause) [s-var (first from-clause) (second from-clause)])))
+
+(defn parse-where
+  [q vars db context]
+  (if-let [where (:where q)]
+    [(parse-where-clause where vars db context) vars]
+    (let [from-clause (:from q)]
+      (if (coll? from-clause)
+        (let [vars* (assoc vars '?__subj from-clause)
+              where `[[?s :_id ?__subj]]]
+          [(parse-where-clause where vars* db context) vars*])
+        (let [where [(from->tuple from-clause context)]]
+          [(parse-where-clause where vars db context) vars])))))
+
 (defn parse-context
   [q db]
   (let [db-ctx (get-in db [:schema :context])
@@ -302,7 +331,7 @@
 
 (defn parse-select-clause
   [clause db context depth]
-  (let [clause (if (coll? clause)
+  (let [clause (if (sequential? clause)
                  clause
                  [clause])]
     (mapv (fn [s]
@@ -361,8 +390,10 @@
 (defn parse
   [q db]
   (let [context       (parse-context q db)
+        q             (cond->> q
+                        (basic-query? q) (basic-to-analytical-transpiler db))
         supplied-vars (parse-vars q)
-        where         (parse-where-clause (:where q) supplied-vars db context)
+        [where vars]  (parse-where q supplied-vars db context)
         grouping      (parse-grouping q)
         ordering      (parse-ordering q)]
     (cond-> (assoc q

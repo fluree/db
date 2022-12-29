@@ -51,18 +51,25 @@
   (MapEntry/create typ data))
 
 (defn ->where-clause
-  [patterns filters]
-  {::patterns patterns
-   ::filters  filters})
+  ([patterns]
+   {::patterns patterns})
+  ([patterns filters]
+   (-> patterns
+       ->where-clause
+       (assoc ::filters filters))))
+
+(defn pattern-type
+  [pattern]
+  (if (map-entry? pattern)
+    (key pattern)
+    :tuple))
 
 (defmulti match-pattern
   "Return a channel that will contain all solutions from flakes in `db` that are
   compatible with the initial solution `solution` and matches the additional
   where-clause pattern `pattern`."
   (fn [db solution pattern filters error-ch]
-    (if (map-entry? pattern)
-      (key pattern)
-      :tuple)))
+    (pattern-type pattern)))
 
 (defn get-value
   [solution variable]
@@ -127,11 +134,12 @@
 
 (defmethod match-pattern :iri
   [db solution pattern filters error-ch]
-  (let [cur-vals (assign-tuple pattern solution filters)
+  (let [tuple    (val pattern)
+        cur-vals (assign-tuple tuple solution filters)
         flake-ch (resolve-flake-range db error-ch cur-vals)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
-                                            (bind-flake solution pattern flake)))))]
+                                            (bind-flake solution tuple flake)))))]
     (async/pipe flake-ch match-ch)))
 
 (defn with-distinct-subjects
