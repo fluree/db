@@ -233,24 +233,19 @@
       (->> pattern keys first)
       :tuple)))
 
-(def divide
-  "Function to divide a sequence into two subsequences, one containing all
-  elements for which the supplied predicate returns `true`, and the other `false`"
-  (juxt filter remove))
-
 (defn filter-pattern?
   [x]
   (and (map? x)
        (-> x keys first (= :filter))))
 
 (defn parse-filter-maps
-  [filters supplied-vars]
-  (let [supplied-vars (set supplied-vars)]
+  [vars filters]
+  (let [vars (set vars)]
     (->> filters
          (mapcat vals)
          flatten
          (map (fn [f-str]
-                (parse-filter-function f-str supplied-vars)))
+                (parse-filter-function f-str vars)))
          (reduce (fn [m fltr]
                    (let [var-name (::exec/var fltr)]
                      (update m var-name (fn [var-fltrs]
@@ -261,11 +256,15 @@
 
 (defn parse-where-clause
   [clause vars db context]
-  (let [[filters patterns] (divide filter-pattern? clause)]
-    {::exec/patterns (mapv (fn [pattern]
-                             (parse-pattern pattern vars db context))
-                           patterns)
-     ::exec/filters  (parse-filter-maps filters vars)}))
+  (let [patterns (->> clause
+                      (remove filter-pattern?)
+                      (mapv (fn [pattern]
+                              (parse-pattern pattern vars db context))))
+        filters  (->> clause
+                      (filter filter-pattern?)
+                      (parse-filter-maps vars))]
+    (exec/->where-clause patterns filters)))
+
 
 (defmethod parse-pattern :tuple
   [[s-pat p-pat o-pat] _ db context]

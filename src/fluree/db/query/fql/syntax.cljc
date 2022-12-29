@@ -1,5 +1,6 @@
 (ns fluree.db.query.fql.syntax
-  (:require [clojure.spec.alpha :as s]))
+  (:require [clojure.spec.alpha :as s]
+            [fluree.db.util.core :refer [pred-ident?]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -154,9 +155,16 @@
 
 (s/def ::vars (s/map-of ::var any?))
 
+(s/def ::from (s/or :spec (s/or :sid        number?
+                                :iri-str    string?
+                                :iri-kw     keyword?
+                                :pred-ident pred-ident?)
+                    :coll (s/coll-of number?))) ; only sids are supported for
+                                                ; specifying multiple subjects
+
 (s/def ::query-map
   (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct
-                   ::selectReduced ::select-reduced ::where ::orderBy ::order-by
+                   ::selectReduced ::select-reduced ::from ::where ::orderBy ::order-by
                    ::groupBy ::group-by ::filter ::vars ::limit ::offset ::maxFuel
                    ::max-fuel ::depth ::opts ::prettyPrint ::pretty-print]))
 

@@ -50,6 +50,11 @@
   [typ data]
   (MapEntry/create typ data))
 
+(defn ->where-clause
+  [patterns filters]
+  {::patterns patterns
+   ::filters  filters})
+
 (defmulti match-pattern
   "Return a channel that will contain all solutions from flakes in `db` that are
   compatible with the initial solution `solution` and matches the additional
