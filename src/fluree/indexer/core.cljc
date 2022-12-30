@@ -22,18 +22,18 @@
   (store/stop (:store idxr)))
 
 (defn init-db
-  [{:keys [store config] :as idxr} opts]
+  [{:keys [store config db-map] :as idxr} opts]
   (let [db (db/create store (merge config opts))
         db-address (db/create-db-address db)]
-    (if (<?? (store/read store db-address))
+    (if (get @db-map db-address)
       db-address
       (do
-        (<?? (store/write store db-address db))
+        (swap! db-map assoc db-address db)
         db-address))))
 
 (defn stage-db
-  [{:keys [store] :as idxr} db-address data]
-  (if-let [db-before (<?? (store/read store db-address))]
+  [{:keys [store db-map] :as idxr} db-address data]
+  (if-let [db-before (get @db-map db-address)]
     (let [db-after   (<?? (jld-transact/stage (db/prepare db-before) data {}))
           ;; This is a hack to sync t into various places since dbs shouldn't care about branches
           ;; used in do-index > refresh > index-update > empty-novelty
@@ -55,7 +55,8 @@
 
           {:keys [assert retract] :as c}
           (<?? (jld-commit/commit-opts->data db-after {:compact-fn compact-fn :id-key "@id" :type-key "@type"}))]
-      (<?? (store/write store db-address db-after))
+
+      (swap! db-map assoc db-address db-after)
       (when (idx-proto/-index? idx db-after)
         (idx-proto/-index idx db-after))
       {:db/address db-address
@@ -70,13 +71,13 @@
                                            :db-address db-address}))))
 
 (defn discard-db
-  [{:keys [store] :as idxr} db-address]
-  (store/delete store db-address)
+  [{:keys [store db-map] :as idxr} db-address]
+  (swap! db-map dissoc db-address)
   :idxr/discarded)
 
 (defn query-db
-  [{:keys [store] :as idxr} db-address query]
-  (if-let [db (<?? (store/read store db-address))]
+  [{:keys [store db-map] :as idxr} db-address query]
+  (if-let [db (get @db-map db-address)]
     (<?? (jld-query/query-async db query))
     (throw (ex-info "No such db-address." {:error :query/no-such-db
                                            :db-address db-address}))))
@@ -101,7 +102,7 @@
   (let [store (or store (store/start store-config))
         id (or id (random-uuid))]
     (log/info "Starting Indexer " id "." config)
-    (map->Indexer {:id id :store store :config config})))
+    (map->Indexer {:id id :store store :config config :db-map (atom {})})))
 
 (defn start
   [config]

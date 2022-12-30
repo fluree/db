@@ -141,7 +141,7 @@
         pub   (pub/start (if store
                            (assoc publisher-config :pub/store store)
                            publisher-config))]
-    (log/info "Starting FileConnection " id "." config)
+    (log/info "Starting Connection " id "." config)
     (map->FlureeConnection
       (cond-> {:id id
                :indexer idxr

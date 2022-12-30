@@ -31,8 +31,7 @@
           (testing "wrote head and init entry"
             (is (= expected-create-result
                    ledger-address))
-            (is (= ["fluree:db:memory:init"
-                    "head/testconn"
+            (is (= ["head/testconn"
                     "testconn/entry/init"]
                    (sort (keys after-ledger-init)))))
 
@@ -76,7 +75,7 @@
                    (-> pub-after-ledger-init (get "head/testconn")))))
 
           (testing "db is initialized after conn create"
-            (is (= 1
+            (is (= 0
                    (count idxr-after-ledger-init))))
 
           (testing "txr tx writes commit"

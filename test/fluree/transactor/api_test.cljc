@@ -8,8 +8,8 @@
   (let [tx {:foo "bar"}
 
         expected-commit-summary
-        {:address "fluree:commit:memory:testledger1/commit/b1f56f334b6b89a6a54833479b3e3408bc77a8c8fac45bb67e17fdf86c913daa"
-         :hash    "b1f56f334b6b89a6a54833479b3e3408bc77a8c8fac45bb67e17fdf86c913daa"
+        {:address "fluree:commit:memory:testledger1/commit/dd09d8e981a23acd834ffe9fbe340b0e17288bed4bd48004f89a1d87ceb6bdf9"
+         :hash    "dd09d8e981a23acd834ffe9fbe340b0e17288bed4bd48004f89a1d87ceb6bdf9"
          :type          :commit
          :commit/size   0
          :commit/flakes 0
@@ -18,8 +18,8 @@
          :commit/prev   "address of previous commit"}
 
         expected-commit
-        {:address "fluree:commit:memory:testledger1/commit/b1f56f334b6b89a6a54833479b3e3408bc77a8c8fac45bb67e17fdf86c913daa"
-         :hash    "b1f56f334b6b89a6a54833479b3e3408bc77a8c8fac45bb67e17fdf86c913daa"
+        {:address "fluree:commit:memory:testledger1/commit/dd09d8e981a23acd834ffe9fbe340b0e17288bed4bd48004f89a1d87ceb6bdf9"
+         :hash    "dd09d8e981a23acd834ffe9fbe340b0e17288bed4bd48004f89a1d87ceb6bdf9"
          :value   {:type           :commit
                    :commit/size    0
                    :commit/tx      tx
