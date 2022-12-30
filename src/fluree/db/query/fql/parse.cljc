@@ -1,5 +1,6 @@
 (ns fluree.db.query.fql.parse
   (:require [fluree.db.query.exec :as exec]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
@@ -113,11 +114,9 @@
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)
         params    (vec code-vars)
-        [fun _]   (filter/extract-filter-fn code code-vars)]
-    {::exec/var    var-name
-     ::exec/params params
-     ::exec/fn-str (str "(fn " params " " fun ")")
-     ::exec/fn     (filter/make-executable params fun)}))
+        [fun _]   (filter/extract-filter-fn code code-vars)
+        f         (filter/make-executable params fun)]
+    (where/->function var-name params f)))
 
 (def ^:const default-recursion-depth 100)
 
@@ -141,23 +140,25 @@
 (defn parse-variable
   [x]
   (when-let [var-name (parse-var-name x)]
-    {::exec/var var-name}))
+    (where/->variable var-name)))
 
 (defn parse-pred-ident
   [x]
   (when (util/pred-ident? x)
-    {::exec/ident x}))
+    (where/->ident x)))
 
 (defn parse-subject-id
   ([x]
    (when (syntax/sid? x)
-     {::exec/val x}))
+     (where/->value x)))
 
   ([x context]
    (if-let [parsed (parse-subject-id x)]
      parsed
      (when context
-       {::exec/val (json-ld/expand-iri x context)}))))
+       (-> x
+           (json-ld/expand-iri context)
+           where/->value)))))
 
 (defn parse-subject-pattern
   [s-pat context]
@@ -172,12 +173,12 @@
 (defn parse-class-predicate
   [x]
   (when (rdf-type? x)
-    {::exec/val const/$rdf:type}))
+    (where/->value const/$rdf:type)))
 
 (defn parse-iri-predicate
   [x]
   (when (= "@id" x)
-    {::exec/val const/$iri}))
+    (where/->predicate const/$iri)))
 
 (defn iri->id
   [iri db context]
@@ -193,18 +194,24 @@
 (defn parse-recursion-predicate
   [x db context]
   (when-let [[p-iri recur-n] (recursion-predicate x context)]
-    {::exec/val   (iri->pred-id p-iri db context)
-     ::exec/recur (or recur-n util/max-integer)}))
+    (let [iri     (iri->pred-id p-iri db context)
+          recur-n (or recur-n util/max-integer)]
+      (where/->predicate iri recur-n))))
 
 (defn parse-full-text-predicate
   [x db context]
   (when (and (string? x)
              (str/starts-with? x "fullText:"))
-    {::exec/full-text (iri->pred-id (subs x 9) db context)}))
+    (-> x
+        (subs 9)
+        (iri->pred-id db context)
+        where/->full-text)))
 
 (defn parse-predicate-id
   [x db context]
-  {::exec/val (iri->pred-id x db context)})
+  (-> x
+      (iri->pred-id db context)
+      where/->value))
 
 (defn parse-predicate-pattern
   [p-pat db context]
@@ -226,7 +233,7 @@
   [o-pat context]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
-      {::exec/val o-pat}))
+      (where/->value o-pat)))
 
 (defmulti parse-pattern
   (fn [pattern vars db context]
@@ -248,7 +255,7 @@
          (map (fn [f-str]
                 (parse-filter-function f-str vars)))
          (reduce (fn [m fltr]
-                   (let [var-name (::exec/var fltr)]
+                   (let [var-name (::where/var fltr)]
                      (update m var-name (fn [var-fltrs]
                                           (-> var-fltrs
                                               (or [])
@@ -264,23 +271,23 @@
         filters  (->> clause
                       (filter filter-pattern?)
                       (parse-filter-maps vars))]
-    (exec/->where-clause patterns filters)))
+    (where/->where-clause patterns filters)))
 
 (defn parse-tuple
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
-    (if (= const/$rdf:type (::exec/val p))
+    (if (= const/$rdf:type (::where/val p))
       (let [cls (parse-class o-pat db context)]
-        (exec/->pattern :class [s p cls]))
+        (where/->pattern :class [s p cls]))
       (let [o     (parse-object-pattern o-pat context)
             tuple [s p o]]
-        (if (= const/$iri (::exec/val p))
+        (if (= const/$iri (::where/val p))
           (let [o*     (-> o
-                           (update ::exec/val json-ld/expand-iri context)
-                           (assoc ::exec/datatype const/$xsd:anyURI))
+                           (update ::where/val json-ld/expand-iri context)
+                           (assoc ::where/datatype const/$xsd:anyURI))
                 tuple* [s p o*]]
-            (exec/->pattern :iri tuple*))
+            (where/->pattern :iri tuple*))
           tuple)))))
 
 (defmethod parse-pattern :tuple
@@ -292,7 +299,7 @@
   (let [parsed (mapv (fn [clause]
                        (parse-where-clause clause vars db context))
                      union)]
-    (exec/->pattern :union parsed)))
+    (where/->pattern :union parsed)))
 
 (defmethod parse-pattern :optional
   [{:keys [optional]} vars db context]
@@ -300,7 +307,7 @@
                  optional
                  [optional])
         parsed (parse-where-clause clause vars db context)]
-    (exec/->pattern :optional parsed)))
+    (where/->pattern :optional parsed)))
 
 (defn from->tuple
   [from-clause context]
@@ -358,7 +365,7 @@
   (when vars
     (reduce-kv (fn [m var val]
                  (let [variable (-> (parse-variable var)
-                                    (assoc ::val val))]
+                                    (assoc ::where/val val))]
                    (assoc m var variable)))
                {} vars)))
 
