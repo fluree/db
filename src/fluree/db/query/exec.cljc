@@ -443,13 +443,17 @@
 
 (defn select-values
   [db select-cache compact solution selectors]
-  (go-loop [selectors selectors
+  (go-try
+   (if (sequential? selectors)
+     (loop [selectors selectors
             values     []]
-    (if-let [selector (first selectors)]
-      (let [value (<? (format selector db select-cache compact solution))]
-        (recur (rest selectors)
-               (conj values value)))
-      values)))
+       (if-let [selector (first selectors)]
+         (let [value (<? (format selector db select-cache compact solution))]
+           (recur (rest selectors)
+                  (conj values value)))
+         values))
+     (let [selector selectors]
+       (<? (format selector db select-cache compact solution))))))
 
 (defn select
   [db q solution-ch]

@@ -329,20 +329,22 @@
         q-ctx  (or (:context q) (get q "@context"))]
     (json-ld/parse-context db-ctx q-ctx)))
 
+(defn parse-selector
+  [db context depth s]
+  (cond
+    (variable? s)   (parse-var-name s)
+    (query-fn? s)   (let [{:keys [variable function]} (parse-aggregate s)]
+                      (exec/->aggregate-selector variable function))
+    (select-map? s) (let [{:keys [variable selection depth spec]}
+                          (parse-subselection db context s depth)]
+                      (exec/->subgraph-selector variable selection spec depth))))
+
 (defn parse-select-clause
   [clause db context depth]
-  (let [clause (if (sequential? clause)
-                 clause
-                 [clause])]
-    (mapv (fn [s]
-            (cond
-              (variable? s)   (parse-var-name s)
-              (query-fn? s)   (let [{:keys [variable function]} (parse-aggregate s)]
-                                (exec/->aggregate-selector variable function))
-              (select-map? s) (let [{:keys [variable selection depth spec]}
-                                    (parse-subselection db context s depth)]
-                                (exec/->subgraph-selector variable selection spec depth))))
-          clause)))
+  (if (sequential? clause)
+    (mapv (partial parse-selector db context depth)
+          clause)
+    (parse-selector db context depth clause)))
 
 (defn parse-select
   [q db context]
