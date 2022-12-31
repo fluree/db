@@ -1,21 +1,10 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! >! go]]
-            [clojure.spec.alpha :as s]
-            [clojure.walk :refer [keywordize-keys]]
-            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]
-             :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :refer [vswap! try* catch*]]
-            [fluree.db.dbproto :as db-proto]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.query.exec :as exec]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.query.json-ld.response :as json-ld-resp]
-            [fluree.db.dbproto :as db-proto]
-            [fluree.db.constants :as const])
+            [fluree.db.query.exec :as exec])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -41,9 +30,9 @@
     (oc cache-key
         (fn [_]
           (let [pc (async/promise-chan)]
-            (async/go
-              (let [res (async/<! (query db (assoc-in query-map [:opts :cache]
-                                                      false)))]
+            (go
+              (let [res (<! (query db (assoc-in query-map [:opts :cache]
+                                                false)))]
                 (async/put! pc res)))
             pc)))))
 
