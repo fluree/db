@@ -321,15 +321,8 @@
 
 (defn parse-where
   [q vars db context]
-  (if-let [where (:where q)]
-    [(parse-where-clause where vars db context) vars]
-    (let [from-clause (:from q)]
-      (if (coll? from-clause)
-        (let [vars* (assoc vars '?__subj from-clause)
-              where `[[?s :_id ?__subj]]]
-          [(parse-where-clause where vars* db context) vars*])
-        (let [where [(from->tuple from-clause context)]]
-          [(parse-where-clause where vars db context) vars])))))
+  (when-let [where (:where q)]
+    (parse-where-clause where vars db context)))
 
 (defn parse-context
   [q db]
@@ -403,13 +396,13 @@
         q             (cond->> q
                         (basic-query? q) (basic-to-analytical-transpiler db))
         supplied-vars (parse-vars q)
-        [where vars]  (parse-where q supplied-vars db context)
+        where         (parse-where q supplied-vars db context)
         grouping      (parse-grouping q)
         ordering      (parse-ordering q)]
-    (cond-> (assoc q
-                   :context context
-                   :vars    supplied-vars
-                   :where   where)
-      grouping (assoc :group-by grouping)
-      ordering (assoc :order-by ordering)
-      true     (parse-select db context))))
+    (-> q
+        (assoc :context context
+               :vars    supplied-vars
+               :where   where)
+        (cond-> grouping (assoc :group-by grouping)
+                ordering (assoc :order-by ordering))
+        (parse-select db context))))
