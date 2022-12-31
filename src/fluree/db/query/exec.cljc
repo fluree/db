@@ -140,5 +140,5 @@
          (order (:order-by q))
          (offset (:offset q))
          (limit (:limit q))
-         (select/select db q error-ch)
+         (select/format db q error-ch)
          (collect-results q))))

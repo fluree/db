@@ -1,10 +1,11 @@
 (ns fluree.db.query.exec.select
+  (:refer-clojure :exclude [format])
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.query.range :as query-range]
             [clojure.core.async :as async :refer [<! >! chan go go-loop]]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
@@ -33,76 +34,78 @@
                       (log/error e "Error displaying iri:" v)
                       (>! error-ch e)))))))
 
-(defmulti format
-  (fn [selector db iri-cache compact error-ch solution]
-    (if (map? selector)
-      (::selector selector)
-      :var)))
+(defprotocol ValueFormatter
+  (format-value [fmt db iri-cache compact error-ch solution]))
 
-(defmethod format :var
-  [variable db iri-cache compact error-ch solution]
-  (-> solution
-      (get variable)
-      (display db iri-cache compact error-ch)))
+(defrecord VariableFormatter [var]
+  ValueFormatter
+  (format-value
+    [_ db iri-cache compact error-ch solution]
+    (-> solution
+        (get var)
+        (display db iri-cache compact error-ch))))
 
-(defn ->aggregate-selector
-  [variable function]
-  {::selector :aggregate
-   ::variable variable
-   ::function function})
+(defn variable-selector
+  [variable]
+  (->VariableFormatter variable))
 
-(defmethod format :aggregate
-  [{::keys [variable function]} db iri-cache compact error-ch solution]
-  (let [agg-ch (chan 1 (map function))]
-    (-> (format variable db iri-cache compact error-ch solution)
-        (async/pipe agg-ch))))
+(defrecord AggregateFormatter [fmt agg-fn]
+  ValueFormatter
+  (format-value
+    [_ db iri-cache compact error-ch solution]
+    (let [agg-ch (chan 1 (map agg-fn))]
+      (-> (format-value fmt db iri-cache compact error-ch solution)
+          (async/pipe agg-ch)))))
 
-(defn ->subgraph-selector
-  [variable selection spec depth]
-  {::selector  :subgraph
-   ::variable  variable
-   ::selection selection
-   ::depth     depth
-   ::spec      spec})
+(defn aggregate-selector
+  [variable agg-function]
+  (let [var-fmt (variable-selector variable)]
+    (->AggregateFormatter var-fmt agg-function)))
 
-(defmethod format :subgraph
-  [{::keys [variable selection depth spec]} db iri-cache compact error-ch solution]
-  (go
-    (let [sid (-> solution
-                  (get variable)
-                  ::where/val)]
-      (try*
-       (let [flakes (<? (query-range/index-range db :spot = [sid]))]
-         ;; TODO: Replace these nils with fuel values when we turn fuel back on
-         (<? (json-ld-resp/flakes->res db iri-cache compact nil nil spec 0 flakes)))
-       (catch* e
-               (log/error e "Error formatting subgraph for subject:" sid)
-               (>! error-ch e))))))
+(defrecord SubgraphFormatter [var selection depth spec]
+  ValueFormatter
+  (format-value
+    [_ db iri-cache compact error-ch solution]
+    (go
+      (let [sid (-> solution
+                    (get var)
+                    ::where/val)]
+        (try*
+         (let [flakes (<? (query-range/index-range db :spot = [sid]))]
+           ;; TODO: Replace these nils with fuel values when we turn fuel back on
+           (<? (json-ld-resp/flakes->res db iri-cache compact nil nil spec 0 flakes)))
+         (catch* e
+                 (log/error e "Error formatting subgraph for subject:" sid)
+                 (>! error-ch e)))))))
 
-(defn select-values
+(defn subgraph-selector
+  [variable selection depth spec]
+  (->SubgraphFormatter variable selection depth spec))
+
+(defn format-values
   [solution db iri-cache compact error-ch select-clause]
   (if (sequential? select-clause)
     (go-loop [selectors  select-clause
               values     []]
       (if-let [selector (first selectors)]
-        (let [value (<! (format selector db iri-cache compact error-ch solution))]
+        (let [value (<! (format-value selector db iri-cache compact error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
         values))
-    (format select-clause db iri-cache compact error-ch solution)))
+    (format-value select-clause db iri-cache compact error-ch solution)))
 
-(defn select
+(defn format
   [db q error-ch solution-ch]
   (let [compact   (->> q :context json-ld/compact-fn)
         clause    (or (:select q)
                       (:selectOne q))
         iri-cache (volatile! {})
-        select-ch (chan)]
+        format-ch (chan)]
     (async/pipeline-async 1
-                          select-ch
+                          format-ch
                           (fn [solution ch]
                             (-> solution
-                                (select-values db iri-cache compact error-ch clause)
+                                (format-values db iri-cache compact error-ch clause)
                                 (async/pipe ch)))
                           solution-ch)
-    select-ch))
+    format-ch))

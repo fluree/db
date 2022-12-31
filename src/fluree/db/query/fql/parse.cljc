@@ -333,12 +333,12 @@
 (defn parse-selector
   [db context depth s]
   (cond
-    (variable? s)   (parse-var-name s)
+    (variable? s)   (-> s parse-var-name select/variable-selector)
     (query-fn? s)   (let [{:keys [variable function]} (parse-aggregate s)]
-                      (select/->aggregate-selector variable function))
+                      (select/aggregate-selector variable function))
     (select-map? s) (let [{:keys [variable selection depth spec]}
                           (parse-subselection db context s depth)]
-                      (select/->subgraph-selector variable selection spec depth))))
+                      (select/subgraph-selector variable selection depth spec))))
 
 (defn parse-select-clause
   [clause db context depth]
