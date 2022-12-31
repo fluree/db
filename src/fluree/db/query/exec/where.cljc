@@ -9,6 +9,8 @@
             [fluree.db.constants :as const])
   (:import (clojure.lang MapEntry)))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn idx-for
   [s p o]
   (cond

@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.parse
   (:require [fluree.db.query.exec :as exec]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.exec.select :as select]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
@@ -341,10 +342,10 @@
   (cond
     (variable? s)   (parse-var-name s)
     (query-fn? s)   (let [{:keys [variable function]} (parse-aggregate s)]
-                      (exec/->aggregate-selector variable function))
+                      (select/->aggregate-selector variable function))
     (select-map? s) (let [{:keys [variable selection depth spec]}
                           (parse-subselection db context s depth)]
-                      (exec/->subgraph-selector variable selection spec depth))))
+                      (select/->subgraph-selector variable selection spec depth))))
 
 (defn parse-select-clause
   [clause db context depth]
