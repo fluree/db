@@ -67,11 +67,11 @@
     solution-ch))
 
 (defmethod select/display ::grouping
-  [match db select-cache compact]
+  [match db select-cache compact error-ch]
   (let [group (::where/val match)]
     (->> group
          (map (fn [grouped-val]
-                (select/display grouped-val db select-cache compact)))
+                (select/display grouped-val db select-cache compact error-ch)))
          (async/map vector))))
 
 (defn compare-vals
@@ -140,5 +140,5 @@
          (order (:order-by q))
          (offset (:offset q))
          (limit (:limit q))
-         (select/select db q)
+         (select/select db q error-ch)
          (collect-results q))))

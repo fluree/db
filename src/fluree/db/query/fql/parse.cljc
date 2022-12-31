@@ -392,9 +392,9 @@
 
 (defn parse
   [q db]
-  (let [context       (parse-context q db)
-        q             (cond->> q
+  (let [q             (cond->> q
                         (basic-query? q) (basic-to-analytical-transpiler db))
+        context       (parse-context q db)
         supplied-vars (parse-vars q)
         where         (parse-where q supplied-vars db context)
         grouping      (parse-grouping q)
