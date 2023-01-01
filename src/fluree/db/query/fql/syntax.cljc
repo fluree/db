@@ -49,17 +49,25 @@
 
 (s/def ::var variable?)
 
-(s/def ::ref (s/or :keyword keyword?
+(s/def ::iri (s/or :keyword keyword?
                    :string string?))
+
+(defn sid?
+  [x]
+  (int? x))
+
+(s/def ::subject (s/or :sid   sid?
+                       :iri   ::iri
+                       :ident pred-ident?))
 
 (s/def ::selector
   (s/or :var       ::var
         :wildcard  ::wildcard
-        :pred      ::ref
+        :pred      ::iri
         :aggregate ::function
         :map       (s/map-of (s/or :var      ::var
                                    :wildcard ::wildcard
-                                   :ref      ::ref)
+                                   :ref      ::iri)
                              ::select
                              :count 1)))
 
@@ -107,7 +115,11 @@
 (s/def ::where-map (s/and (s/map-of ::where-op any?, :count 1)
                           (s/multi-spec where-map-spec first-key)))
 
-(s/def ::where-tuple (s/or :local   (s/coll-of any?, :count 3)
+(s/def ::triple (s/cat :subject   (s/or :var variable?, :val ::subject)
+                       :predicate (s/or :var variable?, :iri ::iri)
+                       :object    (s/or :var variable?, :val any?)))
+
+(s/def ::where-tuple (s/or :local   ::triple
                            :binding (s/coll-of any?, :count 2)
                            :remote  (s/coll-of any?, :count 4)))
 
@@ -155,14 +167,7 @@
 
 (s/def ::vars (s/map-of ::var any?))
 
-(defn sid?
-  [x]
-  (int? x))
-
-(s/def ::from (s/or :spec (s/or :sid        sid?
-                                :iri-str    string?
-                                :iri-kw     keyword?
-                                :pred-ident pred-ident?)
+(s/def ::from (s/or :subj ::subject
                     :coll (s/coll-of sid?))) ; only sids are supported for
                                              ; specifying multiple subjects
 
