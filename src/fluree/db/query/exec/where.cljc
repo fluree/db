@@ -22,24 +22,34 @@
 
 (defn resolve-flake-range
   [{:keys [conn t] :as db} error-ch components]
-  (let [[s p o]          (map ::val components)
-        [s-fn p-fn o-fn] (map ::fn components)
-        idx              (idx-for s p o)
-        idx-root         (get db idx)
-        novelty          (get-in db [:novelty idx])
-        start-flake      (flake/create s p o nil nil nil util/min-integer)
-        end-flake        (flake/create s p o nil nil nil util/max-integer)
-        opts             (cond-> {:idx         idx
-                                  :from-t      t
-                                  :to-t        t
-                                  :start-test  >=
-                                  :start-flake start-flake
-                                  :end-test    <=
-                                  :end-flake   end-flake}
-                           s-fn (assoc :subject-fn s-fn)
-                           p-fn (assoc :predicate-fn p-fn)
-                           o-fn (assoc :object-fn o-fn))]
-    (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)))
+  (let [out-ch           (async/chan)
+        [s p o]          (map ::val components)
+        [s-fn p-fn o-fn] (map ::fn components)]
+    (go
+      (try* (let [s*          (if (and s (not (number? s)))
+                                (<? (dbproto/-subid db s true))
+                                s)
+                  idx         (idx-for s* p o)
+                  idx-root    (get db idx)
+                  novelty     (get-in db [:novelty idx])
+                  start-flake (flake/create s* p o nil nil nil util/min-integer)
+                  end-flake   (flake/create s* p o nil nil nil util/max-integer)
+                  opts        (cond-> {:idx         idx
+                                       :from-t      t
+                                       :to-t        t
+                                       :start-test  >=
+                                       :start-flake start-flake
+                                       :end-test    <=
+                                       :end-flake   end-flake}
+                                s-fn (assoc :subject-fn s-fn)
+                                p-fn (assoc :predicate-fn p-fn)
+                                o-fn (assoc :object-fn o-fn))]
+              (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
+                  (async/pipe out-ch)))
+            (catch* e
+                    (log/error e "Error resolving flake range")
+                    (>! error-ch e))))
+    out-ch))
 
 (defn ->pattern
   [typ data]

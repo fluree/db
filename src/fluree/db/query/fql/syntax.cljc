@@ -173,6 +173,11 @@
 
 (s/def ::basic-query (s/keys :req-un [::from]))
 
+(s/def ::delete ::triple)
+
+(s/def ::delete-op (s/keys :req-un [::delete ::where]
+                           :opt-un [::vars]))
+
 (s/def ::query-map
   (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct
                    ::selectReduced ::select-reduced ::from ::where ::orderBy ::order-by

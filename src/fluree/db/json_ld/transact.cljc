@@ -8,16 +8,17 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util :refer [vswap!]]
+            [fluree.db.util.core :as util :refer [try* catch* vswap!]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.datatype :as datatype]
             [fluree.db.json-ld.shacl :as shacl]
-            [fluree.db.query.analytical-parse :as q-parse]
-            [fluree.db.query.compound :as compound]
-            [clojure.core.async :as async]
-            [fluree.db.dbproto :as db-proto])
+            [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.exec.where :as where]
+            [clojure.core.async :as async :refer [>!]]
+            [fluree.db.dbproto :as dbproto])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -423,44 +424,48 @@
 ;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
 (defn delete
   "Executes a delete statement"
-  [db max-fuel json-ld opts]
+  [{:keys [t] :as db} max-fuel json-ld opts]
   (go-try
-    (let [{:keys [delete] :as parsed-query} (q-parse/parse db json-ld)
-          fuel          (volatile! 0)
-          error-ch      (async/chan)
-          where-ch      (compound/where db parsed-query fuel max-fuel error-ch)
-          where-results (loop [results []]
-                          (if-let [next-res (async/<! where-ch)]
-                            (recur (into results next-res))
-                            results))
-          {:keys [db-before t] :as tx-state} (->tx-state db nil)
-          {:keys [s p o]} delete
-          {s-value :value, s-in-n :in-n} s
-          {p-value :value, p-in-n :in-n} p
-          {o-value :value, o-in-n :in-n} o
-          s-value*      (when s-value
-                          (if (number? s-value)
-                            s-value
-                            (<? (db-proto/-subid db s-value true))))
-          ;; turn the query results into final triples that need to get retracted
-          triples       (mapv (fn [result-item]
-                                [(or s-value* (nth result-item s-in-n))
-                                 (or p-value (nth result-item p-in-n))
-                                 (or o-value (nth result-item o-in-n))])
-                              where-results)
-          flakes        (loop [[triple & r] triples
-                               flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
-                          (if triple
-                            (let [flake (->> (<? (query-range/index-range db-before :spot = triple))
-                                             (map #(flake/flip-flake % t)))]
-                              (recur r (into flakes flake)))
-                            flakes))]
-      (-> flakes
-          (final-db tx-state)
-          <?
-          (validate-rules tx-state)
-          <?))))
+   (let [{:keys [db-before t] :as tx-state}
+         (->tx-state db nil)
 
+         {:keys [delete] :as parsed-query}
+         (-> json-ld
+             syntax/validate
+             (q-parse/parse-delete db))
+
+         [s p o]  delete
+         parsed-query (assoc parsed-query :delete [s p o])
+
+         error-ch (async/chan)
+         flake-ch (async/chan)
+         where-ch (where/search db parsed-query error-ch)]
+     (async/pipeline-async 1
+                        flake-ch
+                        (fn [solution ch]
+                          (let [s* (if (::where/val s)
+                                     s
+                                     (get solution (::where/var s)))
+                                p* (if (::where/val p)
+                                     p
+                                     (get solution (::where/var p)))
+                                o* (if (::where/val o)
+                                     o
+                                     (get solution (::where/var o)))]
+                            (-> (where/resolve-flake-range db error-ch [s* p* o*])
+                                (async/pipe ch))))
+                        where-ch)
+     (let [flakes (async/<! (async/transduce (comp cat
+                                             (map (fn [f]
+                                                    (flake/flip-flake f t))))
+                                       (completing conj)
+                                       (flake/sorted-set-by flake/cmp-flakes-spot)
+                                       flake-ch))]
+         (-> flakes
+             (final-db tx-state)
+             <?
+             (validate-rules tx-state)
+             <?)))))
 
 (defn stage
   "Stages changes, but does not commit.
