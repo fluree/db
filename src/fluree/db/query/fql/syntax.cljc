@@ -119,7 +119,7 @@
                        :predicate (s/or :var variable?, :iri ::iri)
                        :object    (s/or :var variable?, :val any?)))
 
-(s/def ::where-tuple (s/or :local   ::triple
+(s/def ::where-tuple (s/or :triple  ::triple
                            :binding (s/coll-of any?, :count 2)
                            :remote  (s/coll-of any?, :count 4)))
 

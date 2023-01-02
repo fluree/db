@@ -441,26 +441,31 @@
          flake-ch (async/chan)
          where-ch (where/search db parsed-query error-ch)]
      (async/pipeline-async 1
-                        flake-ch
-                        (fn [solution ch]
-                          (let [s* (if (::where/val s)
-                                     s
-                                     (get solution (::where/var s)))
-                                p* (if (::where/val p)
-                                     p
-                                     (get solution (::where/var p)))
-                                o* (if (::where/val o)
-                                     o
-                                     (get solution (::where/var o)))]
-                            (-> (where/resolve-flake-range db error-ch [s* p* o*])
-                                (async/pipe ch))))
-                        where-ch)
-     (let [flakes (async/<! (async/transduce (comp cat
-                                             (map (fn [f]
-                                                    (flake/flip-flake f t))))
-                                       (completing conj)
-                                       (flake/sorted-set-by flake/cmp-flakes-spot)
-                                       flake-ch))]
+                           flake-ch
+                           (fn [solution ch]
+                             (let [s* (if (::where/val s)
+                                        s
+                                        (get solution (::where/var s)))
+                                   p* (if (::where/val p)
+                                        p
+                                        (get solution (::where/var p)))
+                                   o* (if (::where/val o)
+                                        o
+                                        (get solution (::where/var o)))]
+                               (-> (where/resolve-flake-range db error-ch [s* p* o*])
+                                   (async/pipe ch))))
+                           where-ch)
+     (let [delete-ch (async/transduce (comp cat
+                                            (map (fn [f]
+                                                   (flake/flip-flake f t))))
+                                      (completing conj)
+                                      (flake/sorted-set-by flake/cmp-flakes-spot)
+                                      flake-ch)
+           flakes    (async/alt!
+                       error-ch  ([e]
+                                  (throw e))
+                       delete-ch ([flakes]
+                                  flakes))]
          (-> flakes
              (final-db tx-state)
              <?
