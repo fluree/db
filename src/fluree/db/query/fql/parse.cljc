@@ -381,11 +381,9 @@
                          [v :asc]
                          [v :desc])))))))
 
-(defn parse
+(defn parse-analytical-query
   [q db]
-  (let [q             (cond->> q
-                        (basic-query? q) (basic-to-analytical-transpiler db))
-        context       (parse-context q db)
+  (let [context       (parse-context q db)
         supplied-vars (parse-vars q)
         where         (parse-where q supplied-vars db context)
         grouping      (parse-grouping q)
@@ -397,6 +395,17 @@
         (cond-> grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
         (parse-select db context))))
+
+(defn parse-basic-query
+  [q db]
+  (let [q (basic-to-analytical-transpiler db q)]
+    (parse-analytical-query q db)))
+
+(defn parse
+  [q db]
+  (if (basic-query? q)
+    (parse-basic-query q db)
+    (parse-analytical-query q db)))
 
 (defn parse-delete
   [q db]
