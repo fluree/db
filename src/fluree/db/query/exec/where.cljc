@@ -1,13 +1,13 @@
 (ns fluree.db.query.exec.where
   (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [<! >! go go-loop]]
+            [clojure.core.async :as async :refer [>! go]]
             [fluree.db.flake :as flake]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const])
-  (:import (clojure.lang MapEntry)))
+  #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -53,7 +53,8 @@
 
 (defn ->pattern
   [typ data]
-  (MapEntry/create typ data))
+  #?(:clj (MapEntry/create typ data)
+     :cljs (MapEntry. typ data nil)))
 
 (defn ->variable
   [nme]
