@@ -32,6 +32,10 @@
   (and (list? x)
        (-> x first symbol?)))
 
+(defn query-fn?
+  [x]
+  (or (fn-string? x) (fn-list? x)))
+
 (s/def ::function (s/or :string fn-string?, :list fn-list?))
 
 (s/def ::filter (s/coll-of ::function))
@@ -60,16 +64,18 @@
                        :iri   ::iri
                        :ident pred-ident?))
 
+(s/def ::select-map (s/map-of (s/or :var      ::var
+                                    :wildcard ::wildcard
+                                    :iri      ::iri)
+                              ::select
+                              :count 1))
+
 (s/def ::selector
   (s/or :var       ::var
         :wildcard  ::wildcard
         :pred      ::iri
         :aggregate ::function
-        :map       (s/map-of (s/or :var      ::var
-                                   :wildcard ::wildcard
-                                   :ref      ::iri)
-                             ::select
-                             :count 1)))
+        :map       ::select-map))
 
 (s/def ::select (s/or :selector   ::selector
                       :collection (s/coll-of ::selector)))
@@ -117,7 +123,9 @@
 
 (s/def ::triple (s/cat :subject   (s/or :var variable?, :val ::subject)
                        :predicate (s/or :var variable?, :iri ::iri)
-                       :object    (s/or :var variable?, :val any?)))
+                       :object    (s/or :var   variable?
+                                        :ident pred-ident?
+                                        :val   any?)))
 
 (s/def ::where-tuple (s/or :triple  ::triple
                            :binding (s/coll-of any?, :count 2)
@@ -128,8 +136,8 @@
 
 (s/def ::where (s/coll-of ::where-pattern))
 
-(s/def ::optional (s/or :single ::where-pattern
-                        :coll   ::where))
+(s/def ::optional (s/or :single     ::where-pattern
+                        :collection ::where))
 
 (s/def ::union (s/coll-of ::where))
 
