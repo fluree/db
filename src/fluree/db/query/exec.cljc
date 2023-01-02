@@ -3,121 +3,11 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.exec.group :as group]
+            [fluree.db.query.exec.order :as order]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn split-solution-by
-  [variables solution]
-  (let [group-key   (mapv (fn [v]
-                            (-> (get solution v)
-                                (select-keys [::where/val ::where/datatype])))
-                          variables)
-        grouped-val (apply dissoc solution variables)]
-    [group-key grouped-val]))
-
-(defn assoc-coll
-  [m k v]
-  (update m k (fn [coll]
-                (-> coll
-                    (or [])
-                    (conj v)))))
-
-(defn group-solution
-  [groups [group-key grouped-val]]
-  (assoc-coll groups group-key grouped-val))
-
-(defn merge-with-colls
-  [m1 m2]
-  (reduce (fn [merged k]
-            (let [v (get m2 k)]
-              (assoc-coll merged k v)))
-          m1 (keys m2)))
-
-(defn unwind-groups
-  [grouping groups]
-  (reduce-kv (fn [solutions group-key grouped-vals]
-               (let [merged-vals (->> grouped-vals
-                                      (reduce merge-with-colls {})
-                                      (reduce-kv (fn [m k v]
-                                                   (assoc m k {::where/var       k
-                                                               ::where/val       v
-                                                               ::where/datatype ::grouping}))
-                                                 {}))
-                     solution    (into merged-vals
-                                       (map vector grouping group-key))]
-                 (conj solutions solution)))
-             [] groups))
-
-(defn implicit-grouping
-  [select]
-  (when (some select/implicit-grouping? select)
-    [nil]))
-
-(defmethod select/display ::grouping
-  [match db select-cache compact error-ch]
-  (let [group (::where/val match)]
-    (->> group
-         (map (fn [grouped-val]
-                (select/display grouped-val db select-cache compact error-ch)))
-         (async/map vector))))
-
-(defn group
-  "Returns a channel of solutions from `solution-ch` collected into groups defined
-  by the `:group-by` clause specified in the supplied query."
-  [{:keys [group-by select]} solution-ch]
-  (if-let [grouping (or group-by
-                        (implicit-grouping select))]
-    (-> (async/transduce (map (partial split-solution-by grouping))
-                         (completing group-solution
-                                     (partial unwind-groups grouping))
-                         {}
-                         solution-ch)
-        (async/pipe (async/chan 2 cat)))
-    solution-ch))
-
-(defn compare-vals
-  [x-val x-dt y-val y-dt]
-  (let [dt-cmp (compare x-dt y-dt)]
-    (if (zero? dt-cmp)
-      (compare x-val y-val)
-      dt-cmp)))
-
-(defn compare-solutions-by
-  [variable direction x y]
-  (let [x-var (get x variable)
-        x-val (::where/val x-var)
-        x-dt  (::where/datatype x-var)
-
-        y-var (get y variable)
-        y-val (::where/val y-var)
-        y-dt  (::where/datatype y-var)]
-    (if (= direction :asc)
-      (compare-vals x-val x-dt y-val y-dt)
-      (compare-vals y-val y-dt x-val x-dt))))
-
-(defn compare-solutions
-  [ordering x y]
-  (reduce (fn [comparison [variable direction]]
-            (let [cmp (compare-solutions-by variable direction x y)]
-              (if (zero? cmp)
-                comparison
-                (reduced cmp))))
-          0 ordering))
-
-(defn order
-  "Returns a channel containing all solutions from `solution-ch` sorted by the
-  ordering specified by the `:order-by` clause of the supplied parsed query.
-  Note that all solutions from `solution-ch` are first loaded into memory before
-  they are sorted in place and placed individually on the output channel."
-  [{:keys [order-by]} solution-ch]
-  (if order-by
-    (let [comparator (partial compare-solutions order-by)
-          coll-ch    (async/into [] solution-ch)
-          ordered-ch (async/chan 2 (comp (map (partial sort comparator))
-                                         cat))]
-      (async/pipe coll-ch ordered-ch))
-    solution-ch))
 
 (defn drop-offset
   "Returns a channel containing the stream of solutions from `solution-ch` after
@@ -159,8 +49,8 @@
   (go
    (let [error-ch  (async/chan)
          result-ch (->> (where/search db q error-ch)
-                        (group q)
-                        (order q)
+                        (group/combine q)
+                        (order/arrange q)
                         (drop-offset q)
                         (take-limit q)
                         (select/format db q error-ch)
