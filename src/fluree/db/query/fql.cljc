@@ -50,4 +50,4 @@
           db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy q))
         (simple-subject-crawl db* q)
-        (exec/execute db* q)))))
+        (exec/query db* q)))))
