@@ -55,9 +55,15 @@
                  (conj solutions solution)))
              [] groups))
 
+(defn implicit-grouping
+  [select]
+  (when (some select/implicit-grouping? select)
+    [nil]))
+
 (defn group
-  [grouping solution-ch]
-  (if grouping
+  [{:keys [group-by select]} solution-ch]
+  (if-let [grouping (or group-by
+                        (implicit-grouping select))]
     (-> (async/transduce (map (partial split-solution-by grouping))
                          (completing group-solution
                                      (partial unwind-groups grouping))
@@ -136,7 +142,7 @@
   [db q]
   (let [error-ch (async/chan)]
     (->> (where/search db q error-ch)
-         (group (:group-by q))
+         (group q)
          (order (:order-by q))
          (offset (:offset q))
          (limit (:limit q))

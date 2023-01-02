@@ -109,3 +109,7 @@
                                 (async/pipe ch)))
                           solution-ch)
     format-ch))
+
+(defn implicit-grouping?
+  [selector]
+  (instance? AggregateFormatter selector))
