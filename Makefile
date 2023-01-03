@@ -8,9 +8,9 @@ DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
 
 SOURCES := $(shell find src)
 RESOURCES := $(shell find resources)
-BROWSER_SOURCES := src-cljs/fluree_browser_sdk.cljs
+BROWSER_SOURCES := src/fluree/sdk/browser.cljs
+NODEJS_SOURCES := src/fluree/sdk/node.cljs
 WEBWORKER_SOURCES := src-cljs/flureeworker.cljs
-NODEJS_SOURCES := src-cljs/fluree_node_sdk.cljs
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
 
 all: jar browser nodejs webworker js-packages docs

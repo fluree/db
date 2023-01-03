@@ -1,26 +1,10 @@
-(ns fluree-browser-sdk
-  (:require [fluree.db.json-ld.api :as fluree]
+(ns fluree.sdk.node
+  (:require [cljs.nodejs :as node-js]
+            [clojure.string :as str]
+            [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
 
-(enable-console-print!)
-
-;; define your app data so that it doesn't get over-written on reload
-(defonce app-state (atom {:product "FlureeDB APIs"
-                          :version "v0.17.0"}))
-
-(println (:product @app-state) (:version @app-state))
-
-
-
-
-;; optionally touch your app-state to force rerendering depending on
-;; your application
-;; (swap! app-state update-in [:__figwheel_counter] inc)
-(defn on-js-reload [])
-
-;; ----------------------------------------
-;; JSON-LD
-;; ----------------------------------------
+(node-js/enable-util-print!)
 
 (defn ^:export connect
   [opts]
@@ -40,7 +24,8 @@
   ([conn address] (fluree/load-from-address conn address)))
 
 (defn ^:export load
-  ([conn ledger-alias] (fluree/load conn ledger-alias)))
+  [conn ledger-alias]
+  (fluree/load conn ledger-alias))
 
 (defn ^:export stage
   ([db-or-ledger json-ld]
@@ -50,12 +35,9 @@
                                                     (assoc :js? true)))))
 
 (defn ^:export commit
-  ([db] (.then (fluree/commit! db)
-               (fn [result] (clj->js result))))
-  ([ledger db] (.then (fluree/commit! ledger db)
-                      (fn [result] (clj->js result))))
-  ([ledger db opts] (.then (fluree/commit! ledger db (js->clj opts :keywordize-keys true))
-                           (fn [result] (clj->js result)))))
+  ([db] (fluree/commit! db))
+  ([ledger db] (fluree/commit! ledger db))
+  ([ledger db opts] (fluree/commit! ledger db (js->clj opts :keywordize-keys true))))
 
 (defn ^:export status
   ([ledger] (clj->js (fluree/status ledger)))
@@ -69,19 +51,14 @@
   [db query]
   (let [query* (->> (js->clj query :keywordize-keys false)
                     (reduce-kv (fn [acc k v]
-                                 (assoc acc (keyword k) v))
+                                 (assoc acc (if (str/starts-with? k "@")
+                                              k
+                                              (keyword k)) v))
                                {}))]
     (.then (fluree/query db (assoc-in query* [:opts :js?] true))
            (fn [result] (clj->js result)))))
 
-
-;; ======================================
-;;
-;; Support logging at different levels
-;;
-;; ======================================
-(log/set-level! :warning) ;; default to log only warnings or errors
-;(def ^:export logging-levels log/levels)
+(log/set-level! :warning)
 
 (defn ^:export setLogging
   "Configure logging for Fluree processes.  Supported options:
@@ -91,16 +68,3 @@
   (let [opts' (js->clj opts :keywordize-keys true)
         {:keys [level]} opts']
     (log/set-level! (keyword level))))
-
-(def ^:export fluree-browser-sdk
-  #js {:commit          commit
-       :connect         connect
-       :create          create
-       :db              db
-       :exists          exists
-       :load            load
-       :loadFromAddress loadFromAddress
-       :query           query
-       :setLogging      setLogging
-       :stage           stage
-       :status          status})

@@ -4,65 +4,65 @@
 
  :builds
  {:fluree-browser-sdk
-  {:target     :esm
-   :output-dir "out/browser/"
+  {:target          :esm
+   :output-dir      "out/browser/"
    :closure-defines {fluree.db.platform/BROWSER true
-                     cljs.core/*global* "window"}
-   :js-options {:resolve {"fs" false
-                          "path" false
-                          "process" false
-                          "buffer" false
-                          "crypto" false}}
-   :modules {:fluree-browser-sdk {:exports {default fluree-browser-sdk/fluree-browser-sdk}}}
-   :build-hooks [(shadow.cljs.build-report/hook)]
-   :devtools {:watch-dir "dev/browser"}}
+                     cljs.core/*global*         "window"}
+   :js-options      {:resolve {"fs"      false
+                               "path"    false
+                               "process" false
+                               "buffer"  false
+                               "crypto"  false}}
+   :modules         {:fluree-browser-sdk {:exports {default fluree.sdk.browser/fluree-browser-sdk}}}
+   :build-hooks     [(shadow.cljs.build-report/hook)]
+   :devtools        {:watch-dir "dev/browser"}}
 
   :fluree-node-sdk
-  {:target    :node-library
-   :output-to "out/nodejs/fluree-node-sdk.js"
-   :closure-defines {fluree.db.platform/BROWSER false}
+  {:target           :node-library
+   :output-to        "out/nodejs/fluree-node-sdk.js"
+   :closure-defines  {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}
-   :exports   {:commit fluree-node-sdk/commit
-               :connect fluree-node-sdk/connect
-               :create fluree-node-sdk/create
-               :db fluree-node-sdk/db
-               :exists fluree-node-sdk/exists
-               :load fluree-node-sdk/load
-               :loadFromAddress fluree-node-sdk/loadFromAddress
-               :query fluree-node-sdk/query
-               :setLogging fluree-node-sdk/setLogging
-               :stage fluree-node-sdk/stage
-               :status fluree-node-sdk/status}}
+   :exports          {:commit          fluree.sdk.node/commit
+                      :connect         fluree.sdk.node/connect
+                      :create          fluree.sdk.node/create
+                      :db              fluree.sdk.node/db
+                      :exists          fluree.sdk.node/exists
+                      :load            fluree.sdk.node/load
+                      :loadFromAddress fluree.sdk.node/loadFromAddress
+                      :query           fluree.sdk.node/query
+                      :setLogging      fluree.sdk.node/setLogging
+                      :stage           fluree.sdk.node/stage
+                      :status          fluree.sdk.node/status}}
 
   :fluree-webworker
-  {:target      :esm
-   :output-dir  "out/webworker/"
+  {:target          :esm
+   :output-dir      "out/webworker/"
    :closure-defines {fluree.db.platform/BROWSER true
-                     cljs.core/*global* "self"}
-   :js-options {:resolve {"fs" false
-                          "path" false
-                          "process" false
-                          "buffer" false
-                          "crypto" false}}
+                     cljs.core/*global*         "self"}
+   :js-options      {:resolve {"fs"      false
+                               "path"    false
+                               "process" false
+                               "buffer"  false
+                               "crypto"  false}}
    :modules
    {:flureeworker {:entries [flureeworker]
                    :init-fn flureeworker/init}}
-   :build-hooks [(shadow.cljs.build-report/hook)]}
+   :build-hooks     [(shadow.cljs.build-report/hook)]}
 
   :node-test                            ; runs the cljs tests on node
-  {:target    :node-test
-   :output-to "out/nodejs-test/node-tests.js"
-   :autorun true
-   :closure-defines {fluree.db.platform/BROWSER false}
+  {:target           :node-test
+   :output-to        "out/nodejs-test/node-tests.js"
+   :autorun          true
+   :closure-defines  {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}}
 
   :browser-test                         ; runs the cljs tests in the browser via karma
-  {:target :karma
-   :output-to  "out/browser-test/browser-tests.js"
+  {:target          :karma
+   :output-to       "out/browser-test/browser-tests.js"
    :closure-defines {fluree.db.platform/BROWSER true
-                     cljs.core/*global* "window"}
-   :js-options {:resolve {"fs" false
-                          "path" false
-                          "process" false
-                          "buffer" false
-                          "crypto" false}}}}}
+                     cljs.core/*global*         "window"}
+   :js-options      {:resolve {"fs"      false
+                               "path"    false
+                               "process" false
+                               "buffer"  false
+                               "crypto"  false}}}}}
