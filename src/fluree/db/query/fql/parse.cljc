@@ -22,7 +22,10 @@
 
 (defn parse-context
   [q db]
-  (let [db-ctx (get-in db [:schema :context])
+  (let [ctx-key (if (-> q :opts :js?)
+                  :context-str
+                  :context)
+        db-ctx (get-in db [:schema ctx-key])
         q-ctx  (or (:context q) (get q "@context"))]
     (json-ld/parse-context db-ctx q-ctx)))
 
