@@ -1,4 +1,6 @@
 (ns fluree.db.query.exec.select
+  "Format and display solutions consisting of pattern matches found in where
+  searches."
   (:refer-clojure :exclude [format])
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.query.exec.where :as where]
@@ -14,6 +16,8 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defmulti display
+  "Format a where-pattern match for presentation based on the match's datatype.
+  Return an async channel that will eventually contain the formatted match."
   (fn [match db iri-cache compact error-ch]
     (::where/datatype match)))
 
@@ -34,11 +38,13 @@
                       (log/error e "Error displaying iri:" v)
                       (>! error-ch e)))))))
 
-(defprotocol ValueFormatter
+(defprotocol ValueSelector
+  "Format a where search solution (collection of pattern matches) by extracting
+  and displaying relevant pattern matches."
   (format-value [fmt db iri-cache compact error-ch solution]))
 
-(defrecord VariableFormatter [var]
-  ValueFormatter
+(defrecord VariableSelector [var]
+  ValueSelector
   (format-value
     [_ db iri-cache compact error-ch solution]
     (-> solution
@@ -46,11 +52,13 @@
         (display db iri-cache compact error-ch))))
 
 (defn variable-selector
+  "Returns a selector that extracts and formats a value bound to the specified
+  `variable` in where search solutions for presentation."
   [variable]
-  (->VariableFormatter variable))
+  (->VariableSelector variable))
 
-(defrecord AggregateFormatter [fmt agg-fn]
-  ValueFormatter
+(defrecord AggregateSelector [fmt agg-fn]
+  ValueSelector
   (format-value
     [_ db iri-cache compact error-ch solution]
     (let [agg-ch (chan 1 (map agg-fn))]
@@ -58,12 +66,16 @@
           (async/pipe agg-ch)))))
 
 (defn aggregate-selector
+  "Returns a selector that extracts the grouped value bound to the specified
+  `variable` from a where solution, formats each item in the group, and
+  processes the formatted group with the supplied `agg-function` to generate the
+  final aggregated result for display."
   [variable agg-function]
   (let [var-fmt (variable-selector variable)]
-    (->AggregateFormatter var-fmt agg-function)))
+    (->AggregateSelector var-fmt agg-function)))
 
-(defrecord SubgraphFormatter [var selection depth spec]
-  ValueFormatter
+(defrecord SubgraphSelector [var selection depth spec]
+  ValueSelector
   (format-value
     [_ db iri-cache compact error-ch solution]
     (go
@@ -79,25 +91,33 @@
                  (>! error-ch e)))))))
 
 (defn subgraph-selector
+  "Returns a selector that extracts the subject id bound to the supplied
+  `variable` within a where solution and extracts the subgraph containing
+  attributes and values associated with that subject specified by `selection`
+  from a database value."
   [variable selection depth spec]
-  (->SubgraphFormatter variable selection depth spec))
+  (->SubgraphSelector variable selection depth spec))
 
 (defn format-values
-  [solution db iri-cache compact error-ch select-clause]
-  (if (sequential? select-clause)
-    (go-loop [selectors  select-clause
+  "Formats the values from the specified where search solution `solution`
+  according to the selector or collection of selectors specified by `selectors`"
+  [solution db iri-cache compact error-ch selectors]
+  (if (sequential? selectors)
+    (go-loop [selectors  selectors
               values     []]
       (if-let [selector (first selectors)]
         (let [value (<! (format-value selector db iri-cache compact error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
         values))
-    (format-value select-clause db iri-cache compact error-ch solution)))
+    (format-value selectors db iri-cache compact error-ch solution)))
 
 (defn format
+  "Formats each solution within the stream of solutions in `solution-ch` according
+  to the selectors within the select clause of the supplied parsed query `q`."
   [db q error-ch solution-ch]
   (let [compact   (->> q :context json-ld/compact-fn)
-        clause    (or (:select q)
+        selectors (or (:select q)
                       (:selectOne q))
         iri-cache (volatile! {})
         format-ch (chan)]
@@ -105,11 +125,12 @@
                           format-ch
                           (fn [solution ch]
                             (-> solution
-                                (format-values db iri-cache compact error-ch clause)
+                                (format-values db iri-cache compact error-ch selectors)
                                 (async/pipe ch)))
                           solution-ch)
     format-ch))
 
 (defn implicit-grouping?
+  "Returns true if the provide `selector` can only operate on grouped elements."
   [selector]
-  (instance? AggregateFormatter selector))
+  (instance? AggregateSelector selector))
