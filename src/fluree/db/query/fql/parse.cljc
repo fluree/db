@@ -16,6 +16,8 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn basic-query?
   [q]
   (contains? q :from))
