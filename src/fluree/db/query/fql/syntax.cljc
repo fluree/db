@@ -183,9 +183,10 @@
                            :opt-un [::vars]))
 
 (s/def ::analytical-query
-  (s/keys :opt-un [::select ::selectOne ::select-one ::where ::orderBy ::order-by
-                   ::groupBy ::group-by ::filter ::vars ::limit ::offset ::maxFuel
-                   ::max-fuel ::depth ::opts ::prettyPrint ::pretty-print]))
+  (s/keys :req-un [::where]
+          :opt-un [::select ::selectOne ::select-one ::orderBy ::order-by ::groupBy
+                   ::group-by ::filter ::vars ::limit ::offset ::maxFuel ::max-fuel
+                   ::depth ::opts ::prettyPrint ::pretty-print]))
 
 (defn validate
   [qry]
