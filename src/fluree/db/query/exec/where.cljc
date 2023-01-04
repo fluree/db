@@ -52,23 +52,29 @@
     out-ch))
 
 (defn ->pattern
+  "Build a new non-tuple match pattern of type `typ`."
   [typ data]
   #?(:clj (MapEntry/create typ data)
      :cljs (MapEntry. typ data nil)))
 
 (defn ->variable
+  "Build an unmatched variable pattern."
   [nme]
   {::var nme})
 
 (defn ->value
+  "Build a pattern that already matches an explicit value."
   [v]
   {::val v})
 
 (defn ->ident
+  "Build a pattern that already matches the two-tuple database identifier `x`"
   [x]
   {::ident x})
 
 (defn ->function
+  "Build a filter function specification for the variable `var` out of the
+  boolean function `f` with parameters `params`."
   [var params f]
   (-> var
       ->variable
@@ -76,6 +82,7 @@
              ::fn     f)))
 
 (defn ->predicate
+  "Build a pattern that already matches the explicit predicate value `value`."
   ([value]
    (->value value))
   ([value recur-n]
@@ -84,10 +91,15 @@
        (assoc ::recur recur-n))))
 
 (defn ->full-text
+  "Build a full text predicate pattern match."
   [pred]
   {::full-text pred})
 
 (defn ->where-clause
+  "Build a pattern that matches all the patterns in the supplied `patterns`
+  collection and filters any matches for variables appearing as a key in the
+  supplied `filters` map with the filter specification found in the value of the
+  filters map for that variable, if the `filters` map is provided."
   ([patterns]
    {::patterns patterns})
   ([patterns filters]
@@ -102,81 +114,100 @@
     :tuple))
 
 (defmulti match-pattern
-  "Return a channel that will contain all solutions from flakes in `db` that are
-  compatible with the initial solution `solution` and matches the additional
-  where-clause pattern `pattern`."
+  "Return a channel that will contain all pattern match solutions from flakes in
+  `db` that are compatible with the initial solution `solution` and matches the
+  additional where-clause pattern `pattern`."
   (fn [db solution pattern filters error-ch]
     (pattern-type pattern)))
 
 (defn get-value
+  "Get the value matched to the supplied `variable` within the supplied pattern
+  match `solution`."
   [solution variable]
   (-> solution
       (get variable)
       ::val))
 
-(defn assign-tuple
-  [tuple solution filters]
+(defn assign-matched-values
+  "Assigns the value of any variables within the supplied `triple-pattern` that
+  were previously matched in the supplied solution map `solution` to their
+  values from `solution`. If a variable in `triple-pattern` does not have a
+  match in `solution`, but does appear as a key in the filter specification map
+  `filters`, the variable's match filter function within `triple-pattern` is set
+  to the value associated with that variable from the `filter` specification
+  map."
+  [triple-pattern solution filters]
   (mapv (fn [component]
           (if-let [variable (::var component)]
-            (let [value     (get-value solution variable)
-                  filter-fn (some->> (get filters variable)
-                                     (and (nil? value))
-                                     (map ::fn)
-                                     (apply every-pred))]
-              (cond-> component
-                value     (assoc ::val value)
-                filter-fn (assoc ::fn filter-fn)))
+            (if-let [value (get-value solution variable)]
+              (assoc component ::val value)
+              (let [filter-fn (some->> (get filters variable)
+                                       (map ::fn)
+                                       (apply every-pred))]
+                (assoc component ::fn filter-fn)))
             component))
-        tuple))
+        triple-pattern))
 
-(defn unbound?
+(defn unmatched?
+  "Returns true if the triple pattern component `component` represents a variable
+  without an associated value."
   [component]
   (and (::var component)
        (not (::val component))))
 
-(defn bind-subject
+(defn match-subject
+  "Matches the subject of the supplied `flake` to the triple subject pattern
+  component `s-pattern`, and marks the matched pattern component as a URI data
+  type."
   [s-pattern flake]
   (assoc s-pattern
          ::val      (flake/s flake)
          ::datatype const/$xsd:anyURI))
 
-(defn bind-predicate
+(defn match-predicate
+  "Matches the predicate of the supplied `flake` to the triple predicate pattern
+  component `p-pattern`, and marks the matched pattern component as a URI data
+  type."
   [p-pattern flake]
   (assoc p-pattern
          ::val      (flake/p flake)
          ::datatype const/$xsd:anyURI))
 
-(defn bind-object
+(defn match-object
+  "Matches the object and data type of the supplied `flake` to the triple object
+  pattern component `o-pattern`."
   [o-pattern flake]
   (assoc o-pattern
          ::val      (flake/o flake)
          ::datatype (flake/dt flake)))
 
-(defn bind-flake
-  [solution pattern flake]
-  (let [[s p o] pattern]
+(defn match-flake
+  "Assigns the unmatched variables within the supplied `triple-pattern` to their
+  corresponding values from `flake` in the supplied match `solution`."
+  [solution triple-pattern flake]
+  (let [[s p o] triple-pattern]
     (cond-> solution
-      (unbound? s) (assoc (::var s) (bind-subject s flake))
-      (unbound? p) (assoc (::var p) (bind-predicate p flake))
-      (unbound? o) (assoc (::var o) (bind-object o flake)))))
+      (unmatched? s) (assoc (::var s) (match-subject s flake))
+      (unmatched? p) (assoc (::var p) (match-predicate p flake))
+      (unmatched? o) (assoc (::var o) (match-object o flake)))))
 
 (defmethod match-pattern :tuple
   [db solution pattern filters error-ch]
-  (let [cur-vals (assign-tuple pattern solution filters)
+  (let [cur-vals (assign-matched-values pattern solution filters)
         flake-ch (resolve-flake-range db error-ch cur-vals)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
-                                            (bind-flake solution pattern flake)))))]
+                                            (match-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
 
 (defmethod match-pattern :iri
   [db solution pattern filters error-ch]
-  (let [tuple    (val pattern)
-        cur-vals (assign-tuple tuple solution filters)
+  (let [triple   (val pattern)
+        cur-vals (assign-matched-values triple solution filters)
         flake-ch (resolve-flake-range db error-ch cur-vals)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
-                                            (bind-flake solution tuple flake)))))]
+                                            (match-flake solution triple flake)))))]
     (async/pipe flake-ch match-ch)))
 
 (defn with-distinct-subjects
@@ -205,15 +236,15 @@
 
 (defmethod match-pattern :class
   [db solution pattern filters error-ch]
-  (let [tuple    (val pattern)
-        [s p o]  (assign-tuple tuple solution filters)
+  (let [triple   (val pattern)
+        [s p o]  (assign-matched-values triple solution filters)
         cls      (::val o)
         classes  (into [cls] (dbproto/-class-prop db :subclasses cls))
         class-ch (async/to-chan! classes)
         match-ch (async/chan 2 (comp cat
                                      (with-distinct-subjects)
                                      (map (fn [flake]
-                                            (bind-flake solution tuple flake)))))]
+                                            (match-flake solution triple flake)))))]
     (async/pipeline-async 2
                           match-ch
                           (fn [cls ch]
@@ -237,7 +268,8 @@
 
 (defn match-clause
   "Returns a channel that will eventually contain all match solutions in `db`
-  extending from `solution` that also match the parsed where clause `clause`."
+  extending from `solution` that also match all the patterns in the parsed where
+  clause collection `clause`."
   [db solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
         filters    (::filters clause)

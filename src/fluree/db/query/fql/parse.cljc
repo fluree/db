@@ -355,11 +355,11 @@
                        (get select-key)
                        (parse-select-clause db context depth))]
     (case select-key
-      :select (assoc q :select select)
+      :select     (assoc q :select select)
       :select-one (assoc q :select-one select)
-      :selectOne (-> q
-                     (dissoc :selectOne)
-                     (assoc :select-one select)))))
+      :selectOne  (-> q
+                      (dissoc :selectOne)
+                      (assoc :select-one select)))))
 
 (defn ensure-vector
   [x]
