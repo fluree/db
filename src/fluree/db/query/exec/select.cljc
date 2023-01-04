@@ -39,8 +39,8 @@
                       (>! error-ch e)))))))
 
 (defprotocol ValueSelector
-  "Format a where search solution (collection of pattern matches) by extracting
-  and displaying relevant pattern matches."
+  "Format a where search solution (map of pattern matches) by extracting and
+  displaying relevant pattern matches."
   (format-value [fmt db iri-cache compact error-ch solution]))
 
 (defrecord VariableSelector [var]
