@@ -118,7 +118,7 @@
   [db q error-ch solution-ch]
   (let [compact   (->> q :context json-ld/compact-fn)
         selectors (or (:select q)
-                      (:selectOne q))
+                      (:select-one q))
         iri-cache (volatile! {})
         format-ch (chan)]
     (async/pipeline-async 1

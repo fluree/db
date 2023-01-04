@@ -37,7 +37,7 @@
   containing a single result to the output channel instead of the single result
   alone."
   [q result-ch]
-  (if (:selectOne q)
+  (if (:select-one q)
     (async/take 1 result-ch)
     (async/into [] result-ch)))
 

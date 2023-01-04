@@ -347,10 +347,19 @@
 
 (defn parse-select
   [q db context]
-  (let [depth (or (:depth q) 0)]
-    (cond-> q
-      (:select q)    (update :select parse-select-clause db context depth)
-      (:selectOne q) (update :selectOne parse-select-clause db context depth))))
+  (let [depth      (or (:depth q) 0)
+        select-key (some (fn [k]
+                           (and (contains? q k) k))
+                         [:select :selectOne :select-one])
+        select     (-> q
+                       (get select-key)
+                       (parse-select-clause db context depth))]
+    (case select-key
+      :select (assoc q :select select)
+      :select-one (assoc q :select-one select)
+      :selectOne (-> q
+                     (dissoc :selectOne)
+                     (assoc :select-one select)))))
 
 (defn ensure-vector
   [x]

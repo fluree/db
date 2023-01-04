@@ -85,12 +85,6 @@
 (s/def ::selectOne ::select)
 (s/def ::select-one ::selectOne)
 
-(s/def ::selectDistinct ::select)
-(s/def ::select-distinct ::selectDistinct)
-
-(s/def ::selectReduced ::select)
-(s/def ::select-reduced ::selectReduced)
-
 (defn asc?
   [x]
   (boolean (#{'asc "asc" :asc} x)))
@@ -189,8 +183,7 @@
                            :opt-un [::vars]))
 
 (s/def ::analytical-query
-  (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct
-                   ::selectReduced ::select-reduced ::where ::orderBy ::order-by
+  (s/keys :opt-un [::select ::selectOne ::select-one ::where ::orderBy ::order-by
                    ::groupBy ::group-by ::filter ::vars ::limit ::offset ::maxFuel
                    ::max-fuel ::depth ::opts ::prettyPrint ::pretty-print]))
 

@@ -3,7 +3,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.exec :as exec])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
