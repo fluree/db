@@ -12,12 +12,6 @@
 
 (declare query)
 
-(defn parse-query
-  [q db]
-  (-> q
-      syntax/validate
-      (parse/parse db)))
-
 (defn cache-query
   "Returns already cached query from cache if available, else
   executes and stores query into cache."
@@ -46,7 +40,7 @@
   [db query-map]
   (if (cache? query-map)
     (cache-query db query-map)
-    (let [q   (parse-query query-map db)
+    (let [q   (parse/parse query-map db)
           db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (= :simple-subject-crawl (:strategy q))
         (simple-subject-crawl db* q)

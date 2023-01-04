@@ -64,15 +64,17 @@
                        :iri   ::iri
                        :ident pred-ident?))
 
-(s/def ::select-map (s/map-of (s/or :var      ::var
-                                    :wildcard ::wildcard
-                                    :iri      ::iri)
-                              ::select
+(s/def ::subselect-map (s/map-of ::iri ::subselection))
+
+(s/def ::subselection (s/coll-of (s/or :wildcard  ::wildcard
+                                       :predicate ::iri
+                                       :map       ::subselect-map)))
+
+(s/def ::select-map (s/map-of ::var ::subselection
                               :count 1))
 
 (s/def ::selector
   (s/or :var       ::var
-        :wildcard  ::wildcard
         :pred      ::iri
         :aggregate ::function
         :map       ::select-map))
@@ -186,17 +188,17 @@
 (s/def ::delete-op (s/keys :req-un [::delete ::where]
                            :opt-un [::vars]))
 
-(s/def ::query-map
+(s/def ::analytical-query
   (s/keys :opt-un [::select ::selectOne ::select-one ::selectDistinct ::select-distinct
-                   ::selectReduced ::select-reduced ::from ::where ::orderBy ::order-by
+                   ::selectReduced ::select-reduced ::where ::orderBy ::order-by
                    ::groupBy ::group-by ::filter ::vars ::limit ::offset ::maxFuel
                    ::max-fuel ::depth ::opts ::prettyPrint ::pretty-print]))
 
 (defn validate
   [qry]
-  (if (s/valid? ::query-map qry)
+  (if (s/valid? ::analytical-query qry)
     qry
     (throw (ex-info "Invalid Query"
                     {:status  400
                      :error   :db/invalid-query
-                     :reasons (s/explain-data ::query-map qry)}))))
+                     :reasons (s/explain-data ::analytical-query qry)}))))

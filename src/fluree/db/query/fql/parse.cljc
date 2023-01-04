@@ -381,6 +381,7 @@
 
 (defn parse-analytical-query
   [q db]
+  (syntax/validate q)
   (let [context  (parse-context q db)
         vars     (parse-vars q)
         where    (parse-where q vars db context)
