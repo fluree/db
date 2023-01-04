@@ -165,4 +165,31 @@
               [:ex/cam :ex/favNums 10]
               [:ex/cam :ex/friend :ex/brian]
               [:ex/cam :ex/friend :ex/alice]])
-          "IRIs are resolved from subj ids, whether s, p, or o vals."))))
+          "IRIs are resolved from subj ids, whether s, p, or o vals.")
+
+      ;; checking object-subject joins
+      (is (= @(fluree/query db
+                            '{:context {:ex "http://example.org/ns/"}
+                              :select  {?s ["*" {:ex/friend ["*"]}]}
+                              :where   [[?s :ex/friend ?o]
+                                        [?o :schema/name "Alice"]]})
+             [{:id :ex/cam,
+               :rdf/type [:ex/User],
+               :schema/name "Cam",
+               :schema/email "cam@example.org",
+               :schema/age 34,
+               :ex/favNums [5 10],
+               :ex/friend
+               [{:id :ex/brian,
+                 :rdf/type [:ex/User],
+                 :schema/name "Brian",
+                 :schema/email "brian@example.org",
+                 :schema/age 50,
+                 :ex/favNums 7}
+                {:id :ex/alice,
+                 :rdf/type [:ex/User],
+                 :schema/name "Alice",
+                 :schema/email "alice@example.org",
+                 :schema/age 50,
+                 :ex/favNums [9 42 76]}]}])
+          "Subjects appearing as objects should be referenceable."))))
