@@ -1,5 +1,5 @@
 import './App.css';
-import flureedb from '@fluree/flureedb';
+import flureedb from '@fluree/fluree-browser-sdk';
 
 function App() {
   return (
