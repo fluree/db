@@ -19,8 +19,10 @@
 (s/def ::parseJSON boolean?)
 (s/def ::parse-json ::parseJSON)
 
+(s/def ::js? boolean?)
+
 (s/def ::opts (s/keys :opt-un [::maxFuel ::max-fuel ::parseJSON ::parse-json
-                               ::prettyPrint ::pretty-print]))
+                               ::prettyPrint ::pretty-print ::js?]))
 
 (defn fn-string?
   [x]
