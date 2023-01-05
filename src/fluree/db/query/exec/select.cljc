@@ -101,7 +101,7 @@
 (defn format-values
   "Formats the values from the specified where search solution `solution`
   according to the selector or collection of selectors specified by `selectors`"
-  [solution db iri-cache compact error-ch selectors]
+  [selectors db iri-cache compact error-ch solution]
   (if (sequential? selectors)
     (go-loop [selectors  selectors
               values     []]
@@ -124,8 +124,7 @@
     (async/pipeline-async 1
                           format-ch
                           (fn [solution ch]
-                            (-> solution
-                                (format-values db iri-cache compact error-ch selectors)
+                            (-> (format-values selectors db iri-cache compact error-ch solution)
                                 (async/pipe ch)))
                           solution-ch)
     format-ch))
