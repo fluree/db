@@ -10,7 +10,7 @@ SOURCES := $(shell find src)
 RESOURCES := $(shell find resources)
 BROWSER_SOURCES := src/fluree/sdk/browser.cljs
 NODEJS_SOURCES := src/fluree/sdk/node.cljs
-WEBWORKER_SOURCES := src-cljs/flureeworker.cljs
+WEBWORKER_SOURCES := src/fluree/sdk/webworker.cljs
 ALL_SOURCES := $(SOURCES) $(BROWSER_SOURCES) $(WEBWORKER_SOURCES) $(NODEJS_SOURCES)
 
 all: jar browser nodejs webworker js-packages docs
@@ -33,10 +33,10 @@ out/fluree-browser-sdk.js: package.json package-lock.json node_modules deps.edn 
 
 browser: out/fluree-browser-sdk.js
 
-out/flureeworker.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
-	npx shadow-cljs release flureeworker && cp out/webworker/flureeworker.js out/flureeworker.js
+out/fluree-webworker.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
+	npx shadow-cljs release fluree-webworker && cp out/webworker/fluree-webworker.js out/fluree-webworker.js
 
-webworker: out/flureeworker.js
+webworker: out/fluree-webworker.js
 
 deps:
 	clojure -A:cljtest:cljstest:eastwood:docs -P
@@ -65,10 +65,10 @@ js-packages/nodejs/fluree-node-sdk.js: out/fluree-node-sdk.js
 js-packages/browser/fluree-browser-sdk.js: out/fluree-browser-sdk.js
 	cp $< $@
 
-js-packages/webworker/flureeworker.js: out/flureeworker.js
+js-packages/webworker/fluree-webworker.js: out/fluree-webworker.js
 	cp $< $@
 
-js-packages: js-packages/nodejs/fluree-node-sdk.js js-packages/browser/fluree-browser-sdk.js js-packages/webworker/flureeworker.js
+js-packages: js-packages/nodejs/fluree-node-sdk.js js-packages/browser/fluree-browser-sdk.js js-packages/webworker/fluree-webworker.js
 
 sync-package-json: js-packages/nodejs/package.json js-packages/browser/package.json js-packages/webworker/package.json
 
@@ -80,7 +80,7 @@ publish-nodejs: js-packages/nodejs/fluree-node-sdk.js js-packages/nodejs/package
 publish-browser: js-packages/browser/fluree-browser-sdk.js js-packages/browser/package.json
 	cd $(<D) && npm publish --tag $(NPM_TAG)
 
-publish-webworker: js-packages/webworker/flureeworker.js js-packages/webworker/package.json
+publish-webworker: js-packages/webworker/fluree-webworker.js js-packages/webworker/package.json
 	cd $(<D) && npm publish --tag $(NPM_TAG)
 
 publish-js: publish-nodejs publish-browser publish-webworker

@@ -1,4 +1,4 @@
-(ns flureeworker
+(ns fluree.sdk.webworker
   (:require [cljs.core.async :as async]
             [fluree.db.session :as session]
             [fluree.db.connection :as connection]

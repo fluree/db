@@ -45,8 +45,8 @@
                                "buffer"  false
                                "crypto"  false}}
    :modules
-   {:flureeworker {:entries [flureeworker]
-                   :init-fn flureeworker/init}}
+   {:fluree-webworker {:entries [fluree.sdk.webworker]
+                       :init-fn fluree.sdk.webworker/init}}
    :build-hooks     [(shadow.cljs.build-report/hook)]}
 
   :node-test                            ; runs the cljs tests on node
