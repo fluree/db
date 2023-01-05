@@ -313,7 +313,3 @@
 (def ^:const _setting$language:hi 68)                       ; Hindi
 (def ^:const _setting$language:id 69)                       ; Indonesian
 (def ^:const _setting$language:ru 70)                       ; Russian
-
-
-;;
-

@@ -13,7 +13,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util]
             [fluree.db.connection-js :as conn-handler]
-            [fluree.db.query.fql-resp :refer [flakes->res]]))
+            [fluree.db.query.fql.resp :refer [flakes->res]]))
 
 ;; supporting code for JS APIS (webworker, flureedb (both browser and nodejs)
 

@@ -1,6 +1,5 @@
-(ns fluree.db.query.fql-resp
-  (:require [fluree.db.query.fql-parser :refer [ns-lookup-pred-spec p->pred-config]]
-            [fluree.db.dbproto :as dbproto]
+(ns fluree.db.query.fql.resp
+  (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.async :refer [go-try <?]]
             [fluree.db.util.core :as util
              #?@(:clj  [:refer [try* catch* vswap!]]
@@ -17,6 +16,46 @@
 
 (declare flakes->res)
 
+(defn p->pred-config
+  [db p compact?]
+  (let [name (dbproto/-p-prop db :name p)]
+    {:p          p
+     :limit      nil
+     :name       name
+     :as         (if (and compact? name)
+                   (second (re-find #"/(.+)" name))
+                   (or name (str p)))
+     :multi?     (dbproto/-p-prop db :multi p)
+     :component? (dbproto/-p-prop db :component p)
+     :tag?       (= :tag (dbproto/-p-prop db :type p))
+     :ref?       (dbproto/-p-prop db :ref? p)}))
+
+
+(defn- build-predicate-map
+  "For a flake selection, build out parts of the
+  base set of predicates so we don't need to look them up
+  each time... like multi, component, etc."
+  [db pred-name]
+  (when-let [p (dbproto/-p-prop db :id pred-name)]
+    (p->pred-config db p false)))
+
+
+(defn ns-lookup-pred-spec
+  "Given an predicate spec produced by the parsed select statement,
+  when an predicate does not have a namespace we will default it to
+  utilize the namespace of the subject.
+
+  This fills out the predicate spec that couldn't be done earlier because
+  we did not know the collection."
+  [db collection-id ns-lookup-spec-map]
+  (let [collection-name (dbproto/-c-prop db :name collection-id)]
+    (reduce-kv
+      (fn [acc k v]
+        (let [pred (str collection-name "/" k)]
+          (if-let [p-map (build-predicate-map db pred)]
+            (assoc acc (:p p-map) (merge p-map v))
+            acc)))
+      nil ns-lookup-spec-map)))
 
 (defn- has-ns-lookups?
   "Returns true if the predicate spec has a sub-selection that requires a namespace lookup."

@@ -150,7 +150,7 @@
                               {:status 400 :error :db/invalid-query}))]
 
     (-> query-map
+        (dissoc :from)
         (assoc selectKey {"?s" select-smt}
-               :where where*
-               :vars vars*)
-        (dissoc :from))))
+               :where    where*)
+        (cond-> vars* (assoc :vars vars*)))))

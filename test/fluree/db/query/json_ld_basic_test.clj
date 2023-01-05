@@ -12,8 +12,6 @@
       (testing "basic wildcard single subject query"
         (let [query-res @(fluree/query db {:select [:*]
                                            :from   :wiki/Q836821})]
-          (is (= (count query-res) 1)
-              "There should only be one subject in the result set")
           (is (= query-res [{:id                               :wiki/Q836821,
                              :rdf/type                         [:schema/Movie],
                              :schema/name                      "The Hitchhiker's Guide to the Galaxy",

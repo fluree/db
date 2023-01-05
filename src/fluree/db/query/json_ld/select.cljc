@@ -97,6 +97,14 @@
             (assoc acc pid (assoc spec :as select-item))))))
     {:depth depth} selection))
 
+(defn parse-subselection
+  [db context select-map depth]
+  (let [{:keys [variable selection depth]} (parse-map select-map depth)
+        spec                               (expand-selection db context depth selection)]
+    {:variable  variable
+     :selection selection
+     :depth     depth
+     :spec      spec}))
 
 (defn expand-spec
   "If a :select item (select statement always coerced to vector if not already)

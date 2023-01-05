@@ -13,7 +13,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.fql-resp :refer [flakes->res]]
+            [fluree.db.query.fql.resp :refer [flakes->res]]
             [fluree.db.util.async :as async-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
