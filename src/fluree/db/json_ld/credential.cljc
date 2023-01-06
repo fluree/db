@@ -82,7 +82,7 @@
   credential is invalid an exception will be thrown."
   [credential]
   (go-try
-    (if-let [jws (get-in credential ["proof" "jws"])]
+    (when-let [jws (get-in credential ["proof" "jws"])]
       (let [subject (get credential "credentialSubject")
             issuer  (get credential "issuer")
             {:keys [header signature]} (deserialize-jws jws)
@@ -104,6 +104,4 @@
         (when (not (crypto/verify-signature pubkey signing-input signature))
           (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
         ;; everything is good
-        {:subject subject :issuer issuer})
-      ;; nothing to be verified, is implicitly good
-      {:subject credential})))
+        {:subject subject :issuer issuer}))))

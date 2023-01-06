@@ -336,7 +336,8 @@
   Returns core async channel containing result."
   [sources query]
   (go-try
-    (let [{query :subject issuer :issuer} (<? (cred/verify query))
+    (let [{query :subject issuer :issuer} (or (<? (cred/verify query))
+                                              {:subject query})
           {:keys [select selectOne selectDistinct selectReduced construct
                   from where prefixes opts t]} query
           db            (if (async-util/channel? sources) ;; only support 1 source currently

@@ -479,7 +479,8 @@
   Returns async channel that will contain updated db or exception."
   [db json-ld opts]
   (go-try
-    (let [{tx :subject issuer :issuer} (<? (cred/verify json-ld))]
+    (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
+                                           {:subject json-ld})]
       (if (and (contains? tx :delete)
                (contains? tx :where))
         (<? (delete db util/max-integer tx (assoc opts :issuer issuer)))

@@ -55,8 +55,7 @@
 
        (testing "verify not a credential"
          (let [non-cred example-cred-subject]
-           (is (= {:subject example-cred-subject}
-                  (async/<!! (cred/verify non-cred)))))))))
+           (is (nil? (async/<!! (cred/verify non-cred)))))))))
 
 #?(:cljs
    (deftest generate
@@ -95,8 +94,7 @@
               (async/go
                 (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [non-cred example-cred-subject]
-                    (is (= {:subject non-cred}
-                           (async/<! (cred/verify non-cred))))
+                    (is (nil? (async/<! (cred/verify non-cred))))
                     (done)))))))
 
 (comment
