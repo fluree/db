@@ -18,7 +18,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn- promise-wrap
+(defn promise-wrap
   "Wraps an async channel that will contain a response in a promise."
   [port]
   #?(:clj

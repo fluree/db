@@ -54,6 +54,51 @@
             (swap! cache assoc equals-rule last-result)
             last-result))))))
 
+(defn cache-store-value
+  "Caches path lookup result into the permissions map cache. Returns original value."
+  [db cache-key value]
+  (swap! (get-in db [:permissions :cache])
+         assoc cache-key value)
+  value)
+
+(defn cache-get-value
+  "Attempts to return cached result in permission key. Cache implemented to work correctly
+  only with non-boolean result values - and thus can avoid having to do additional logic (e.g. contains? or some)"
+  [db cache-key]
+  (get @(get-in db [:permission :cache]) cache-key))
+
+(defn generate-equals-fn
+  "Returns validating function for :f/equals rule.
+
+  Validating functions take two arguments, the db and the flake to be validated.
+
+  Returns two-tuple of [async? policy-fn] where async? is boolean if policy-fn returns an async channel
+  which must be resolved to get the final value.
+
+  All policy functions are evaluated for a truthy or falsey result which determins if the provided flake
+  can be operated on/viewed."
+  [rule property-path]
+  (if (= :f/$identity (first property-path))
+    ;; make certain first element of path is :f/$identity which following fn only considers. Will support other path constructs in the future
+    (let [path-no-identity (rest property-path)             ;; remove :f/$identity - following logic will "substitute" the user's actual identity in its place
+          f                (fn [db flake]
+                             (go-try
+                               ;; because same 'path' is likely used in many flake evaluations, keep a local cache of results so expensive lookup only happens once per query/transaction.
+                               (let [path-val (or (cache-get-value db property-path)
+                                                  (->> (async/<! (resolve-equals-rule db path-no-identity rule))
+                                                       (cache-store-value db property-path)))]
+                                 (if (util/exception? path-val)
+                                   (do
+                                     (log/warn "Exception while processing path in policy rule, not allowing flake for subject " (flake/s flake)
+                                               " through policy enforcement for rule: " rule)
+                                     false)
+                                   (= (flake/s flake) path-val)))))]
+      [true f])
+    (do
+      (log/warn (str "Policy f:equals only supports equals paths that start with f:$identity currently. "
+                     "Ignoring provided rule: " rule))
+      [false (constantly false)])))
+
 
 (defn resolve-contains-rule
   "When using a contains rule, calculates a given path's value and stores in local cache.
