@@ -58,42 +58,6 @@
         ))
     all-rules))
 
-(defn restrict-view?
-  "Given a restriction (the map value of an :f/allow property),
-  does it apply to view permissions?"
-  [restriction]
-  (= :f/view (get-in restriction [:f/action :id])))
-
-(defn restrict-modify?
-  "Given a restriction (the map value of an :f/allow property),
-  does it apply to modify permissions?"
-  [restriction]
-  (= :f/modify (get-in restriction [:f/action :id])))
-
-(defn restrict-rule?
-  "If a restriction rule is in place that must be evaluated,
-  meaning there are ':f/equals', ':f/contains', etc. restrictions."
-  [restriction]
-  (some restriction-properties (-> restriction keys)))
-
-(defn compile-restriction
-  "A restriction is the map value of an :f/allow property.
-
-  Returns a function with two args - first the permissions map which contains
-  the :ident and (soon) other metadata that might be used in evaluations, and
-  secondly the flake being evaluated."
-  [restriction]
-  (let [view?          (restrict-view? restriction)
-        restrict-rule? (restrict-rule? restriction)]
-    ;; TODO - for now this only looks for view rules, not modify rules. Need to address modify when working on txns
-    (when view?
-      (if restrict-rule?
-        (do
-          (log/warn "Not yet enforcing conditional restriction rules as found for: " restriction)
-          ;; return two-tuple of [async? fn]
-          [false (constantly false)])
-        [false (constantly true)]))))
-
 (defn subids
   "Returns a vector of subids from the input collection as a single result async chan.
   If any exception occurs during resolution, returns the error immediately."
@@ -213,12 +177,7 @@
           allow-spec            (get rule :f/allow)
           default-restrictions  (if (sequential? allow-spec)
                                   (<? (parse-rule db (first allow-spec)))
-                                  #_(let [all-restrictions (map compile-restriction allow-spec)]
-                                      [false (fn [db flake]
-                                               (some (fn [restriction-fn]
-                                                       (restriction-fn db flake)) all-restrictions))])
-                                  (<? (parse-rule db allow-spec))
-                                  #_(compile-restriction allow-spec))
+                                  (<? (parse-rule db allow-spec)))
           property-restrictions (when-let [prop-rules (:f/property rule)]
                                   (<? (compile-property-rules db prop-rules)))
           all-restrictions      (assoc property-restrictions :default default-restrictions)]
@@ -233,23 +192,20 @@
   "Compiles a node rule (where :f/targetNode is used)"
   [db action rule nodes]
   (go-try
-    (let [node-sids             (<? (subids db nodes))
-          restrictions          (get rule :f/allow)
-          compiled-restrictions (if (sequential? restrictions)
-                                  (let [all-restrictions (map compile-restriction restrictions)]
-                                    (fn [x]
-                                      (some (fn [restriction-fn]
-                                              (restriction-fn x)) all-restrictions)))
-                                  (compile-restriction restrictions))]
+    (let [node-sids            (<? (subids db nodes))
+          allow-spec           (get rule :f/allow)
+          default-restrictions (if (sequential? allow-spec)
+                                 (<? (parse-rule db (first allow-spec)))
+                                 (<? (parse-rule db allow-spec)))]
       (when (:f/property rule)
         (log/warn "Currently, property based restrictions are not yet enforced. Found for nodes: " nodes))
       ;; for each class targeted by the rule, map to each compiled fn
       (if (and (= [:f/allNodes] nodes)
-               (nil? (->> node-sids first (get compiled-restrictions))))
+               (nil? (->> node-sids first (get default-restrictions))))
         {:root? true}
         (reduce
           (fn [acc node-sid]
-            (assoc acc node-sid compiled-restrictions))
+            (assoc acc node-sid default-restrictions))
           {} node-sids)))))
 
 
