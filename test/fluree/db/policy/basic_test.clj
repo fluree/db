@@ -46,17 +46,17 @@
                        db
                        ;; add policy targeting :ex/rootRole that can view and modify everything
                        [{:id           :ex/rootPolicy,
-                         :type         [:f/Policy],
-                         :f/targetNode :f/allNodes
+                         :type         [:f/Policy],         ;; must be of type :f/Policy, else it won't be treated as a policy
+                         :f/targetNode :f/allNodes          ;; :f/allNodes special keyword meaning every node (everything)
                          :f/allow      [{:id           :ex/rootAccessAllow
-                                         :f/targetRole :ex/rootRole ;; keyword for a global role
+                                         :f/targetRole :ex/rootRole ;; our name for global / root role
                                          :f/action     [:f/view :f/modify]}]}
                         ;; add a policy targeting :ex/userRole that can see all users, but only SSN if belonging to themselves
                         {:id            :ex/UserPolicy,
                          :type          [:f/Policy],
                          :f/targetClass :ex/User
                          :f/allow       [{:id           :ex/globalViewAllow
-                                          :f/targetRole :ex/userRole ;; keyword for a global role
+                                          :f/targetRole :ex/userRole ;; our assigned name for standard user's role (given to Alice above)
                                           :f/action     [:f/view]}]
                          :f/property    [{:f/path  :schema/ssn
                                           :f/allow [{:id           :ex/ssnViewRule
