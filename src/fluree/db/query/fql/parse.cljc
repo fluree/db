@@ -156,8 +156,7 @@
   [x context]
   (-> x
       (json-ld/expand-iri context)
-      where/->value
-      (assoc ::where/datatype const/$xsd:anyURI)))
+      (where/->value const/$xsd:anyURI)))
 
 (defn parse-sid
   [x]
@@ -239,7 +238,7 @@
 (defn parse-class
   [o-iri db context]
   (if-let [id (iri->pred-id o-iri db context)]
-    (parse-sid id)
+    (where/->value id const/$xsd:anyURI)
     (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o-iri context))
                     {:status 400 :error :db/invalid-query}))))
 
@@ -294,15 +293,13 @@
     (if (= const/$rdf:type (::where/val p))
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
-      (let [o     (parse-object-pattern o-pat context)
-            triple [s p o]]
-        (if (= const/$iri (::where/val p))
-          (let [o*     (-> o
-                           (update ::where/val json-ld/expand-iri context)
-                           (assoc ::where/datatype const/$xsd:anyURI))
-                triple* [s p o*]]
-            (where/->pattern :iri triple*))
-          triple)))))
+      (if (= const/$iri (::where/val p))
+        (let [o (-> o-pat
+                    (json-ld/expand-iri context)
+                    where/->value)]
+          (where/->pattern :iri [s p o]))
+        (let [o (parse-object-pattern o-pat context)]
+          [s p o])))))
 
 (defmethod parse-pattern :triple
   [triple _ db context]
