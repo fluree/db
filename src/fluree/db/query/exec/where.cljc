@@ -5,6 +5,7 @@
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -22,9 +23,12 @@
 
 (defn resolve-flake-range
   [{:keys [conn t] :as db} error-ch components]
-  (let [out-ch           (async/chan)
-        [s p o]          (map ::val components)
-        [s-fn p-fn o-fn] (map ::fn components)]
+  (let [out-ch               (async/chan)
+        [s-cmp p-cmp o-cmp]  components
+        {s ::val, s-fn ::fn} s-cmp
+        {p ::val, p-fn ::fn} p-cmp
+        {o ::val, o-fn ::fn
+         o-dt ::datatype}    o-cmp]
     (go
       (try* (let [s*          (if (and s (not (number? s)))
                                 (<? (dbproto/-subid db s true))
@@ -32,8 +36,8 @@
                   idx         (idx-for s* p o)
                   idx-root    (get db idx)
                   novelty     (get-in db [:novelty idx])
-                  start-flake (flake/create s* p o nil nil nil util/min-integer)
-                  end-flake   (flake/create s* p o nil nil nil util/max-integer)
+                  start-flake (flake/create s* p o o-dt nil nil util/min-integer)
+                  end-flake   (flake/create s* p o o-dt nil nil util/max-integer)
                   opts        (cond-> {:idx         idx
                                        :from-t      t
                                        :to-t        t
@@ -64,8 +68,12 @@
 
 (defn ->value
   "Build a pattern that already matches an explicit value."
-  [v]
-  {::val v})
+  ([v]
+   (let [dt (datatype/infer v)]
+     (->value v dt)))
+  ([v dt]
+   {::val      v
+    ::datatype dt}))
 
 (defn ->ident
   "Build a pattern that already matches the two-tuple database identifier `x`"
