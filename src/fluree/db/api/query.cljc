@@ -14,7 +14,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.fql.resp :refer [flakes->res]]
-            [fluree.db.util.async :as async-util]))
+            [fluree.db.util.async :as async-util]
+            [fluree.db.json-ld.credential :as cred]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -333,11 +334,13 @@
   "Execute a query against a database source, or optionally
   additional sources if the query spans multiple data sets.
   Returns core async channel containing result."
-  [sources flureeQL]
+  [sources query]
   (go-try
-    (let [{:keys [select selectOne selectDistinct selectReduced construct
-                  from where prefixes opts t]} flureeQL
-          db            (if (async-util/channel? sources)   ;; only support 1 source currently
+    (let [{query :subject issuer :issuer} (or (<? (cred/verify query))
+                                              {:subject query})
+          {:keys [select selectOne selectDistinct selectReduced construct
+                  from where prefixes opts t]} query
+          db            (if (async-util/channel? sources) ;; only support 1 source currently
                           (<? sources)
                           sources)
           db*           (-> (if t
@@ -350,15 +353,16 @@
           meta?         (:meta opts)
           fuel          (when (or (:fuel opts) meta?) (volatile! 0)) ;; only measure fuel if fuel budget provided, or :meta true
           opts*         (assoc opts :sources source-opts
-                                    :max-fuel (or (:fuel opts) 1000000)
-                                    :fuel fuel)
+                               :max-fuel (or (:fuel opts) 1000000)
+                               :fuel fuel
+                               :issuer issuer)
           _             (when-not (and (or select selectOne selectDistinct selectReduced construct)
                                        (or from where))
                           (throw (ex-info (str "Invalid query.")
                                           {:status 400
                                            :error  :db/invalid-query})))
           start #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
-          result        (<? (fql/query db* (assoc flureeQL :opts opts*)))]
+          result        (<? (fql/query db* (assoc query :opts opts*)))]
       (if meta?
         {:status 200
          :result result
