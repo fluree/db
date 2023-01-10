@@ -1,18 +1,24 @@
 (ns fluree.db.json-ld.policy
-  (:require [fluree.db.dbproto :as dbproto]
+  (:require [clojure.core.async :as async]
             [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]
-            [fluree.db.flake :as flake]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.policy-validate :as validate]
-            [fluree.db.query.fql :refer [query]]))
+            [fluree.db.query.fql :refer [query]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
+;; if these keys exist in the policy's :f/allow definition, there exist specific logic rules
+;; that need to get enforced (e.g. as opposed to generically allowing an entire Class, members
+;; will need to get evaluated for specific criteria)
 (def restriction-properties
   #{:f/equals :f/contains})
 
+;; These special IRIs (today only one) get replaced with an actual value in the context of the
+;; request.
+;;  - :f/$identity - gets replaced with the subject ID of the identity (DID) that signed
+;;                   the particular request
 (def special-meaning-properties
   #{:f/$identity})
 
@@ -120,7 +126,7 @@
         property-ids))))
 
 
-(defmulti compile-allow-rule
+(defmulti compile-allow-rule-fn
           "Defined allow rules compile into different functions that accept both a db
           and flake argument, and return truthy if flake is allowed. Different parse rules
           currently supported are listed with their respective defmethod keyword dispatch
@@ -134,19 +140,19 @@
               (contains? rule :f/contains) :f/contains
               :else ::unrestricted-rule)))
 
-(defmethod compile-allow-rule :f/equals
+(defmethod compile-allow-rule-fn :f/equals
   [db rule]
   (go-try
     (let [resolved-path (<? (property-path db :f/equals rule))]
       (validate/generate-equals-fn rule resolved-path))))
 
-(defmethod compile-allow-rule :f/contains
+(defmethod compile-allow-rule-fn :f/contains
   [db rule]
   ;; TODO
   (go-try
     (throw (ex-info ":f/contains not yet implemented!" {}))))
 
-(defmethod compile-allow-rule ::unrestricted-rule
+(defmethod compile-allow-rule-fn ::unrestricted-rule
   [db rule]
   ;; there are no conditions on the rule, which means explicitly allow
   (go-try
@@ -166,13 +172,13 @@
           (let [allow-spec (:f/allow prop-policy)
                 fn-tuple   (if (sequential? allow-spec)
                              (do
-                               ;; TODO - Multiple conditions existing for a single role/property is probably a valid use case but uncommon.
-                               ;; TODO --- they should be treated as an -OR- condition and could be wrapped into a single fn.
-                               ;; TODO --- the wrapping fn would have to look for async fns and use <? takes (and itself be async)
                                (log/warn (str "Multiple role policies for same property is not currently allowed. Using only first "
                                               "allow specification in policy: " prop-policy "."))
-                               (<? (compile-allow-rule db (first allow-spec))))
-                             (<? (compile-allow-rule db allow-spec))) ;; returns two-tuple of [async? validation-fn]
+                               ;; TODO - Multiple conditions existing for a single role/property is probably a valid use case but uncommon.
+                               ;; TODO --- they should be treated as an -OR- condition and could be wrapped into a single fn.
+                               ;; TODO --- the wrapping fn would have to look for async fns and use <?/<! takes (and itself be async as applicable)
+                               (<? (compile-allow-rule-fn db (first allow-spec))))
+                             (<? (compile-allow-rule-fn db allow-spec))) ;; returns two-tuple of [async? validation-fn]
                 prop-sid   (<? (dbproto/-subid db (get-in prop-policy [:f/path :id])))]
             ;; TODO - if multiple rules target the same path we need to concatenate them and should use an 'or' condition
             (when (get acc prop-sid)
@@ -182,34 +188,113 @@
           acc)))))
 
 
+(defn compile-allow-rule
+  "Compiles an allow rule, which will be associated with one or more actions.
+
+  Adds a compiled rule function (takes two args - db + flake being evaluated) along with async? flag
+
+  Returns a map of modified rule in a map where each key is the actions where the rule must be evaluated.
+
+  e.g. input allow-rule:
+  {:id ...
+   :f/targetRole ...
+   :f/action [{:id :f/view}, {:id :f/modify}]
+   :f/equals ... }
+
+   Returns (note, two actions defined - so same map returned keyed by each respective action)
+   {:f/view   {:id ...
+               :f/fn [true <compiled function here!>]
+               :f/targetRole ...
+               :f/equals ... }
+    :f/modify {:id ...
+               :f/fn [true <compiled function here!>]
+               :f/targetRole ...
+               :f/equals ... }"
+  [db policy-key-seqs allow-rule]
+  (go-try
+    (let [fn-tuple    (<? (compile-allow-rule-fn db allow-rule))
+          actions     (->> allow-rule :f/action util/sequential (map :id))
+          allow-rule* (-> allow-rule
+                          ;; remove :f/action as we end up keying the rule *per-action* in the final policy map, don't want confusion if this hangs around that it is used
+                          (dissoc :f/action)
+                          ;; associate our compiled function to the existing allow-rule map
+                          (assoc :function fn-tuple))]
+      (for [policy-key-seq policy-key-seqs
+            action         actions]
+        ;; for every policy-key-seqs (key sequence that can be used with (assoc-in m <ks-here> ...))
+        ;; prepend key-sequence with the policy rule's action(s)
+        (let [ks* (into [action] policy-key-seq)]
+          ;; return two-tuple of [full-key-seq updated-allow-rule-map]
+          [ks* allow-rule*])))))
+
+(defn compile-prop-policy
+  [db default-key-seqs prop-policy]
+  (go-try
+    (let [allow-rule  (:f/allow prop-policy)
+          fn-tuple    (if (sequential? allow-rule)
+                        (do
+                          (log/warn (str "Multiple role policies for same property is not currently allowed. Using only first "
+                                         "allow specification in policy: " prop-policy "."))
+                          ;; TODO - Multiple conditions existing for a single role/property is probably a valid use case but uncommon.
+                          ;; TODO --- they should be treated as an -OR- condition and could be wrapped into a single fn.
+                          ;; TODO --- the wrapping fn would have to look for async fns and use <?/<! takes (and itself be async as applicable)
+                          (<? (compile-allow-rule-fn db (first allow-rule))))
+                        (<? (compile-allow-rule-fn db allow-rule))) ;; returns two-tuple of [async? validation-fn]
+          prop-sid    (<? (dbproto/-subid db (get-in prop-policy [:f/path :id])))
+          actions     (->> allow-rule :f/action util/sequential (map :id))
+          allow-rule* (-> allow-rule
+                          ;; remove :f/action as we end up keying the rule *per-action* in the final policy map, don't want confusion if this hangs around that it is used
+                          (dissoc :f/action)
+                          ;; associate our compiled function to the existing allow-rule map
+                          (assoc :function fn-tuple))
+          prop-ks     (map #(conj % prop-sid) default-key-seqs)]
+      (for [policy-key-seq prop-ks
+            action         actions]
+        ;; for every policy-key-seqs (key sequence that can be used with (assoc-in m <ks-here> ...))
+        ;; prepend key-sequence with the policy rule's action(s)
+        (let [ks* (into [action] policy-key-seq)]
+          ;; return two-tuple of [full-key-seq updated-allow-rule-map]
+          [ks* allow-rule*])))))
+
+
 (defn compile-class-policy
   "Compiles a class rule (where :f/targetClass is used)"
-  [db action policy classes]
+  [db policy classes]
   (go-try
     (let [class-sids            (<? (subids db classes))
-          allow-spec            (get policy :f/allow)
-          default-restrictions  (if (sequential? allow-spec)
-                                  (<? (compile-allow-rule db (first allow-spec)))
-                                  (<? (compile-allow-rule db allow-spec)))
-          property-restrictions (when-let [prop-policies (:f/property policy)]
-                                  (<? (compile-property-policies db prop-policies)))
-          all-restrictions      (assoc property-restrictions :default default-restrictions)]
-      ;; for each class targeted by the rule, map to each compiled fn
-      (reduce
-        (fn [acc class-sid]
-          (assoc acc class-sid all-restrictions))
-        {} class-sids))))
+          default-allow         (not-empty (get policy :f/allow))
+          default-key-seqs      (map #(vector :class %) class-sids)
+          default-allow-keys    (when default-allow
+                                  (map #(conj % :default) default-key-seqs))
+          default-restrictions  (->> default-allow
+                                     util/sequential
+                                     (map #(compile-allow-rule db default-allow-keys %))
+                                     async/merge
+                                     (async/reduce
+                                       (fn [acc result]
+                                         (into acc result)) [])
+                                     <?)
+          property-restrictions (when-let [prop-policies (-> policy :f/property util/sequential not-empty)]
+                                  (->> prop-policies
+                                       (map #(compile-prop-policy db default-key-seqs %))
+                                       async/merge
+                                       (async/reduce
+                                         (fn [acc result]
+                                           (into acc result)) [])
+                                       <?))]
+      (concat default-restrictions property-restrictions))))
 
 
 (defn compile-node-policy
   "Compiles a node rule (where :f/targetNode is used)"
-  [db action policy nodes]
+  [db policy nodes]
   (go-try
     (let [node-sids            (<? (subids db nodes))
-          allow-spec           (get policy :f/allow)
-          default-restrictions (if (sequential? allow-spec)
-                                 (<? (compile-allow-rule db (first allow-spec)))
-                                 (<? (compile-allow-rule db allow-spec)))]
+          default-allow        (not-empty (get policy :f/allow))
+          default-restrictions (when default-allow
+                                 #_(if (sequential? default-allow)
+                                     (<? (compile-allow-rule db (first default-allow)))
+                                     (<? (compile-allow-rule db default-allow))))]
       (when (:f/property policy)
         (log/warn "Currently, property based restrictions are not yet enforced. Found for nodes: " nodes))
       ;; for each class targeted by the rule, map to each compiled fn
@@ -223,28 +308,29 @@
 
 
 (defn compile-policy
-  [db action policy]
+  [db policy]
   (go-try
     (let [classes (some->> policy :f/targetClass util/sequential (mapv :id))
           nodes   (some->> policy :f/targetNode util/sequential (mapv :id))]
       (cond
-        classes {:class (<? (compile-class-policy db action policy classes))}
-        nodes {:node (<? (compile-node-policy db action policy nodes))}))))
+        classes (<? (compile-class-policy db policy classes))
+        nodes (<? (compile-node-policy db policy nodes))))))
 
 
 (defn compile-policies
   "Compiles rules into a fn that returns truthy if, when given a flake, is allowed."
-  [db action policies]
+  [db policies]
   ;; TODO - if multiple rules target the same class, we need to 'or' the rules together.
   (->> policies
-       (map #(compile-policy db action %))
+       (map #(compile-policy db %))
        async/merge
-       (async/into [])))
+       (async/reduce (fn [acc compiled-policy]
+                       (into acc compiled-policy)) [])))
 
 
 (defn permission-map
   "perm-action is a set of the action(s) being filtered for."
-  [db action identity role credential]
+  [db identity role credential]
   (async/go
     (try*
       (let [ident-sid         (<? (dbproto/-subid db identity))
@@ -254,18 +340,19 @@
                                 #{(<? (dbproto/-subid db role))})
             permissions       {:ident ident-sid
                                :roles role-sids
-                               :cache (atom {})
-                               :root? nil}
+                               :cache (atom {})}
             ;; TODO - query for all rules is very cacheable - but cache must be cleared when any new tx updates a rule
             ;; TODO - (easier said than done, as they are nested nodes whose top node is the only one required to have a specific class type)
             role-policies     (<? (policies-for-roles db permissions))
 
-            compiled-policies (->> (<? (compile-policies db action role-policies))
-                                   (apply merge))
+            compiled-policies (->> (<? (compile-policies db role-policies))
+                                   (reduce (fn [acc [ks m]]
+                                             (assoc-in acc ks m))
+                                           permissions))
             root-access?      (= compiled-policies
-                                 {:node {:root? true}})]
-        (cond-> (assoc permissions :view compiled-policies)
-                root-access? (assoc :root? true)))
+                                 {:f/view {:node {:root? true}}})]
+        (cond-> compiled-policies
+                root-access? (assoc-in [:f/view :root?] true)))
       (catch* e
               (if (= :db/invalid-query (:error (ex-data e)))
                 (throw (ex-info (str "There are no Fluree rules in the db, a policy-driven database cannot be retrieved. "
