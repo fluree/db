@@ -3,6 +3,11 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defprotocol iLedger
+  (-create [conn params] "Creates a new, empty ledger")
+  (-load [conn params] "Loads an existing ledger by alias")
+  (-load-from-address [conn params] "Loads an existing ledger by alias"))
+
 (defprotocol iConnection
   (-close [conn] "Closes all resources for this connection")
   (-closed? [conn] "Indicates if connection is open or closed")
@@ -15,7 +20,6 @@
   (-msg-in [conn msg] "Handler for incoming message from connection service")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
   (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))
-
 
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")

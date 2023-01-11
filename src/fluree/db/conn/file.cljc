@@ -1,6 +1,6 @@
 (ns fluree.db.conn.file
   (:refer-clojure :exclude [exists?])
-  (:require [clojure.core.async :as async :refer [go]]
+  (:require [clojure.core.async :as async :refer [go <!]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.json-ld :as json-ld]
@@ -13,6 +13,7 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.storage.core :as storage]
             [fluree.db.indexer.default :as idx-default]
+            [fluree.db.ledger.json-ld :as jld-ledger]
             #?(:clj [fluree.db.serde.avro :as avro-serde])
             #?(:cljs [fluree.db.serde.json :as json-serde])
             #?@(:cljs [["fs" :as fs]
@@ -181,6 +182,16 @@
 
 (defrecord FileConnection [id memory state ledger-defaults push commit
                            parallelism msg-in-ch msg-out-ch async-cache]
+  conn-proto/iLedger
+  (-create [conn {:keys [ledger-alias opts]}] (jld-ledger/create
+                                                conn ledger-alias opts))
+  (-load [conn {:keys [ledger-alias]}]
+    (go
+      (let [address (<! (conn-proto/-address conn {:ledger-alias ledger-alias}))]
+        (log/debug "Loading ledger from" address)
+        (<! (jld-ledger/load conn address)))))
+  (-load-from-address [conn {:keys [ledger-address]}]
+    (jld-ledger/load conn ledger-address))
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (go (read-commit conn commit-key)))

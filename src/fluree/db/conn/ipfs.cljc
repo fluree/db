@@ -14,6 +14,7 @@
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.indexer.default :as idx-default]
+            [fluree.db.ledger.json-ld :as jld-ledger]
             [clojure.string :as str]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -78,6 +79,16 @@
 (defrecord IPFSConnection [id memory state ledger-defaults async-cache
                            serializer parallelism msg-in-ch msg-out-ch
                            ipfs-endpoint]
+  conn-proto/iLedger
+  (-create [conn {:keys [ledger-alias opts]}] (jld-ledger/create
+                                                conn ledger-alias opts))
+  (-load [conn {:keys [ledger-alias]}]
+    (go
+      (let [address (<! conn-proto/-address conn {:ledger-alias ledger-alias})]
+        (log/debug "Loading ledger from" address)
+        (<! (jld-ledger/load conn address)))))
+  (-load-from-address [conn {:keys [ledger-address]}]
+    (jld-ledger/load conn ledger-address))
 
   conn-proto/iStorage
   (-c-read [_ commit-key]
