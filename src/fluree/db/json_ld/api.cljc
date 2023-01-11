@@ -4,6 +4,7 @@
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.conn.fn :as fn-conn]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.query :as query-api]
@@ -64,7 +65,8 @@
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
                 (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)))))
+        :memory (memory-conn/connect opts*)
+        :fn (fn-conn/connect opts*)))))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
