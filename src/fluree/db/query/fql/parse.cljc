@@ -4,7 +4,6 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
-            [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.string :as str]
             [clojure.set :as set]
@@ -17,10 +16,6 @@
             [fluree.db.constants :as const]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn basic-query?
-  [q]
-  (contains? q :from))
 
 (defn parse-context
   [q db]
@@ -385,7 +380,7 @@
                          [v :asc]
                          [v :desc])))))))
 
-(defn parse-analytical-query
+(defn parse
   [q db]
   (syntax/validate q)
   (let [context  (parse-context q db)
@@ -400,17 +395,6 @@
         (cond-> grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
         (parse-select db context))))
-
-(defn parse-basic-query
-  [q db]
-  (let [q (basic-to-analytical-transpiler db q)]
-    (parse-analytical-query q db)))
-
-(defn parse
-  [q db]
-  (if (basic-query? q)
-    (parse-basic-query q db)
-    (parse-analytical-query q db)))
 
 (defn parse-delete
   [q db]

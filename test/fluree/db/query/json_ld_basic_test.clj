@@ -10,8 +10,8 @@
           movies (test-utils/load-movies conn)
           db     (fluree/db movies)]
       (testing "basic wildcard single subject query"
-        (let [query-res @(fluree/query db {:select [:*]
-                                           :from   :wiki/Q836821})]
+        (let [query-res @(fluree/query db '{:select {?s [:*]}
+                                            :where [[?s :id :wiki/Q836821]]})]
           (is (= query-res [{:id                               :wiki/Q836821,
                              :rdf/type                         [:schema/Movie],
                              :schema/name                      "The Hitchhiker's Guide to the Galaxy",
@@ -20,16 +20,16 @@
                              :schema/isBasedOn                 {:id :wiki/Q3107329}}])
               "Basic select * is working will context normalization")))
       (testing "basic single subject query with explicit field selection"
-        (let [query-res @(fluree/query db {:select [:id :schema/name]
-                                           :from   :wiki/Q836821})]
+        (let [query-res @(fluree/query db '{:select {?s [:id :schema/name]}
+                                            :where [[?s :id :wiki/Q836821]]})]
           (is (= query-res [{:id :wiki/Q836821, :schema/name "The Hitchhiker's Guide to the Galaxy"}]))))
       (testing "basic single subject query with selectOne"
-        (let [query-res @(fluree/query db {:selectOne [:id :schema/name]
-                                           :from      :wiki/Q836821})]
+        (let [query-res @(fluree/query db '{:selectOne {?s [:id :schema/name]}
+                                            :where [[?s :id :wiki/Q836821]]})]
           (is (= query-res {:id :wiki/Q836821, :schema/name "The Hitchhiker's Guide to the Galaxy"}))))
       (testing "basic single subject query with graph crawl"
-        (let [query-res @(fluree/query db {:selectOne [:* {:schema/isBasedOn [:*]}]
-                                           :from      :wiki/Q836821})]
+        (let [query-res @(fluree/query db '{:selectOne {?s [:* {:schema/isBasedOn [:*]}]}
+                                            :where [[?s :id :wiki/Q836821]]})]
           (is (= query-res {:id                               :wiki/Q836821,
                             :rdf/type                         [:schema/Movie],
                             :schema/name                      "The Hitchhiker's Guide to the Galaxy",
@@ -42,9 +42,9 @@
                                                                :schema/author {:id :wiki/Q42}}}))))
       (testing "basic single subject query using depth graph crawl"
         (testing "using only wildcard"
-          (let [query-res @(fluree/query db {:selectOne [:*]
-                                             :from      :wiki/Q836821
-                                             :depth     3})]
+          (let [query-res @(fluree/query db '{:selectOne {?s [:*]}
+                                              :where [[?s :id :wiki/Q836821]]
+                                              :depth 3})]
             (is (= query-res {:id                               :wiki/Q836821,
                               :rdf/type                         [:schema/Movie],
                               :schema/name                      "The Hitchhiker's Guide to the Galaxy",
@@ -58,9 +58,9 @@
                                                                                  :rdf/type    [:schema/Person],
                                                                                  :schema/name "Douglas Adams"}}}))))
         (testing "using graph sub-selection"
-          (let [query-res @(fluree/query db {:selectOne [:* {:schema/isBasedOn [:*]}]
-                                             :from      :wiki/Q836821
-                                             :depth     3})]
+          (let [query-res @(fluree/query db '{:selectOne {?s [:* {:schema/isBasedOn [:*]}]}
+                                              :where [[?s :id :wiki/Q836821]]
+                                              :depth 3})]
             (is (= query-res {:id                               :wiki/Q836821,
                               :rdf/type                         [:schema/Movie],
                               :schema/name                      "The Hitchhiker's Guide to the Galaxy",
@@ -80,8 +80,8 @@
           movies (test-utils/load-movies conn)
           db     (fluree/db movies)]
       (testing "basic analytical RFD type query"
-        (let [query-res @(fluree/query db {:select {'?s [:* {:schema/isBasedOn [:*]}]}
-                                           :where  [['?s :rdf/type :schema/Movie]]})]
+        (let [query-res @(fluree/query db '{:select {?s [:* {:schema/isBasedOn [:*]}]}
+                                            :where  [[?s :rdf/type :schema/Movie]]})]
           (is (= query-res                                  ;; :id is a DID and will be unique per DB so exclude from comparison
                  [{:id                               :wiki/Q230552,
                    :rdf/type                         [:schema/Movie],
@@ -119,9 +119,9 @@
                                                          :ex/list {"@container" "@list"}}
                                                :id      "list-test"
                                                :ex/list [42 2 88 1]})
-              query-res @(fluree/query db {:context   {:ex "http://example.org/ns#"}
-                                           :selectOne [:*]
-                                           :from      "list-test"})]
+              query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
+                                            :selectOne {?s [:*]},
+                                            :where [[?s :id "list-test"]]})]
           (is (= query-res
                  {:id      "list-test"
                   :ex/list [42 2 88 1]})
@@ -130,9 +130,9 @@
         (let [db        @(fluree/stage movies {:context {:ex "http://example.org/ns#"}
                                                :id      "list-test2"
                                                :ex/list {"@list" [42 2 88 1]}})
-              query-res @(fluree/query db {:context   {:ex "http://example.org/ns#"}
-                                           :selectOne [:*]
-                                           :from      "list-test2"})]
+              query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
+                                            :selectOne {?s [:*]},
+                                            :where [[?s :id "list-test2"]]})]
           (is (= query-res
                  {:id      "list-test2"
                   :ex/list [42 2 88 1]})
@@ -175,16 +175,7 @@
                     :schema/age   46
                     :ex/favNums   [15 70]
                     :ex/friend    [:ex/cam]}])]
-    (testing "using `from`"
-      (is (= [{:id           :ex/brian,
-               :rdf/type     [:ex/User]
-               :schema/name  "Brian"
-               :ex/last      "Smith"
-               :schema/email "brian@example.org"
-               :schema/age   50
-               :ex/favNums   7}]
-             @(fluree/query db {:select [:*]
-                                :from   :ex/brian}))))
+
     (testing "using `where`"
       (testing "id"
         (is (= [{:id           :ex/brian,

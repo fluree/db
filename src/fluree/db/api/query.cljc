@@ -29,7 +29,7 @@
   "Returns keyword of query type by inspecting flureeQL query.
 
   Query types are:
-    :standard - basic or analytical query
+    :standard - analytical query
     :multi - multi-query
     :block - block query
     :history - history query"

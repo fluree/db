@@ -173,12 +173,6 @@
 
 (s/def ::vars (s/map-of ::var any?))
 
-(s/def ::from (s/or :subj ::subject
-                    :coll (s/coll-of sid?))) ; only sids are supported for
-                                             ; specifying multiple subjects
-
-(s/def ::basic-query (s/keys :req-un [::from]))
-
 (s/def ::delete ::triple)
 
 (s/def ::delete-op (s/keys :req-un [::delete ::where]
