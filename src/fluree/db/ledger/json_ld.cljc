@@ -101,7 +101,7 @@
 (defrecord JsonLDLedger [id address alias context did indexer
                          state cache conn method]
   ledger-proto/iCommit
-  (-commit! [params] (commit! params))
+  (-commit! [{:keys [ledger db opts]}] (commit! ledger db opts))
   (-commit! [ledger db-or-opts] (if (jld-db/json-ld-db? db-or-opts)
                                   (commit! ledger db-or-opts nil)
                                   (commit! ledger nil db-or-opts)))
