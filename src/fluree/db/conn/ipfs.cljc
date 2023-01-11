@@ -84,7 +84,7 @@
                                                 conn ledger-alias opts))
   (-load [conn {:keys [ledger-alias]}]
     (go
-      (let [address (<! conn-proto/-address conn {:ledger-alias ledger-alias})]
+      (let [address (<! (conn-proto/-address conn {:ledger-alias ledger-alias}))]
         (log/debug "Loading ledger from" address)
         (<! (jld-ledger/load conn address)))))
   (-load-from-address [conn {:keys [ledger-address]}]

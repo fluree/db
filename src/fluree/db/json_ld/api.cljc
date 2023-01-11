@@ -259,8 +259,8 @@
 
 
 (defn query
-  [db query
-   (promise-wrap (query-api/query-async db query))])
+  [db query]
+  (promise-wrap (query-api/query-async db query)))
 
 (defn range
   "Performs a range scan against the specified index using test functions
