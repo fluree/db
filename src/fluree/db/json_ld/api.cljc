@@ -113,8 +113,8 @@
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
-   (let [res-ch (jld-ledger/create conn ledger-alias opts)]
-     (promise-wrap res-ch))))
+   (promise-wrap (conn-proto/-create conn {:ledger-alias ledger-alias
+                                           :opts         opts}))))
 
 (defn load-from-address
   "Loads a ledger defined with a Fluree address, e.g.:
@@ -129,7 +129,7 @@
    (throw (ex-info "Not yet implemented" {:status 500 :error :db/unexpected-error})))
   ([conn address]
    (promise-wrap
-     (jld-ledger/load conn address))))
+     (conn-proto/-load-from-address conn {:ledger-address address}))))
 
 (defn alias->address
   "Returns a core.async channel with the connection-specific address of the
@@ -142,11 +142,7 @@
   "Loads an existing ledger by its alias (which will be converted to a
   connection-specific address first)."
   [conn ledger-alias]
-  (promise-wrap
-    (go
-      (let [address (<! (alias->address conn ledger-alias))]
-        (log/debug "Loading ledger from" address)
-        (<! (jld-ledger/load conn address))))))
+  (promise-wrap (conn-proto/-load conn {:ledger-alias ledger-alias})))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
@@ -158,7 +154,7 @@
                       ledger-alias-or-address
                       (<! (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
-        (<! (conn-proto/-exists? conn address))))))
+        (<! (conn-proto/-exists? conn {:ledger-address address}))))))
 
 (defn index
   "Performs indexing operation on the specified ledger"
@@ -170,18 +166,13 @@
   "Validates a ledger, checks block integrity along with signatures."
   [])
 
-
-
 (defn pull
   "Checks name service for ledger and pulls latest version locally."
   [])
 
-
-
 (defn combine
   "Combines multiple ledgers into a new, read-only ledger."
   [])
-
 
 
 ;; mutations
@@ -268,9 +259,8 @@
 
 
 (defn query
-  [db query]
-  (let [res-chan (query-api/query-async db query)]
-    (promise-wrap res-chan)))
+  [db query
+   (promise-wrap (query-api/query-async db query))])
 
 (defn range
   "Performs a range scan against the specified index using test functions
