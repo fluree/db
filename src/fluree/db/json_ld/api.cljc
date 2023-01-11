@@ -134,7 +134,7 @@
   given ledger-alias."
   [conn ledger-alias]
   (log/debug "Looking up address for ledger alias" ledger-alias)
-  (conn-proto/-address conn ledger-alias nil))
+  (conn-proto/-address conn {:ledger-alias ledger-alias}))
 
 (defn load
   "Loads an existing ledger by its alias (which will be converted to a
