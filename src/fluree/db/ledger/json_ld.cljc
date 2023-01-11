@@ -101,7 +101,7 @@
 (defrecord JsonLDLedger [id address alias context did indexer
                          state cache conn method]
   ledger-proto/iCommit
-  (-commit! [ledger] (commit! ledger nil nil))
+  (-commit! [params] (commit! params))
   (-commit! [ledger db-or-opts] (if (jld-db/json-ld-db? db-or-opts)
                                   (commit! ledger db-or-opts nil)
                                   (commit! ledger nil db-or-opts)))
@@ -173,7 +173,9 @@
                                                           {:reindex-min-bytes reindex-min-bytes
                                                            :reindex-max-bytes reindex-max-bytes})))
           ledger-alias* (normalize-alias ledger-alias)
-          address       (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
+          address       (<? (conn-proto/-address conn
+                                                 {:ledger-alias ledger-alias*
+                                                  :opts         {:branch branch}}))
           context*      (merge (conn-proto/-context conn) context)
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from

@@ -94,11 +94,14 @@
     (ipfs/push! ipfs-endpoint address ledger-data))
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
-  (-lookup [this ledger-address] (lookup-address this ledger-address))
-  (-alias [_ ledger-address] (let [[_ _ alias] (address-parts ledger-address)]
-                               alias))
-  (-address [this ledger-alias opts] (get-address this ledger-alias opts))
-  (-exists? [this ledger-address] (address-exists? this ledger-address))
+  (-lookup [this {:keys [head-commit-address]}]
+    (lookup-address this head-commit-address))
+  (-alias [_ {:keys [ledger-address]}]
+    (let [[_ _ alias] (address-parts ledger-address)] alias))
+  (-address [this {:keys [ledger-alias opts]}]
+    (get-address this ledger-alias opts))
+  (-exists? [this {:keys [ledger-address]}]
+    (address-exists? this ledger-address))
 
   conn-proto/iConnection
   (-close [_]

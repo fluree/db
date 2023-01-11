@@ -4,7 +4,7 @@
 
 (defprotocol iCommit
   ;; retrieving/updating DBs
-  (-commit! [db] [ledger-or-db db-or-opts] [ledger db opts] "Commits a db to a ledger."))
+  (-commit! [params] [ledger-or-db db-or-opts] [ledger db opts] "Commits a db to a ledger."))
 
 (defprotocol iLedger
   ;; retrieving/updating DBs

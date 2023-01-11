@@ -190,18 +190,22 @@
   conn-proto/iNameService
   (-pull [conn ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
   (-subscribe [conn ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
-  (-alias [conn ledger-address]
+  (-alias [conn {:keys [ledger-address]}]
     ;; TODO: need to validate that the branch doesn't have a slash?
     (-> (address-path ledger-address)
         (str/split #"/")
         (->> (drop-last 2) ; branch-name, head
              (str/join #"/"))))
   (-push [conn head-path commit-data] (go (push conn head-path commit-data)))
-  (-lookup [conn head-address] (go (file-address (read-address conn head-address))))
-  (-address [conn ledger-alias {:keys [branch] :as _opts}]
+  (-lookup [conn {:keys [head-commit-address]}]
+    (go
+      (let [read-addr (read-address conn head-commit-address)]
+        (log/debug "-lookup - read address:" read-addr)
+        (file-address read-addr))))
+  (-address [_conn {:keys [ledger-alias] {:keys [branch]} :opts}]
     (let [branch (if branch (name branch) "main")]
       (go (file-address (str ledger-alias "/" branch "/head")))))
-  (-exists? [conn ledger-address]
+  (-exists? [conn {:keys [ledger-address]}]
     (go (address-path-exists? conn ledger-address)))
 
   conn-proto/iConnection

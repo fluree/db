@@ -87,12 +87,12 @@
   (-pull [this ledger] :TODO)
   (-subscribe [this ledger] :TODO)
   (-push [this address ledger-data] (go (push! data-atom address ledger-data)))
-  (-alias [this address]
-    (-> (address-path address)
+  (-alias [this {:keys [ledger-address]}]
+    (-> (address-path ledger-address)
         (str/split #"/")
         (->> (drop 2)
              (str/join "/"))))
-  (-lookup [this head-commit-address]
+  (-lookup [this {:keys [head-commit-address]}]
     (go #?(:clj
            (if-let [head-commit (read-address data-atom head-commit-address)]
              (-> head-commit (get "credentialSubject") (get "data") (get "address"))
@@ -110,9 +110,9 @@
              (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
                                   head-commit-address)
                              {:status 500 :error :db/invalid-ledger}))))))
-  (-address [_ ledger-alias {:keys [branch] :or {branch :main} :as _opts}]
+  (-address [_ {:keys [ledger-alias branch] :or {branch :main}}]
     (go (memory-address (str ledger-alias "/" (name branch) "/head"))))
-  (-exists? [_ ledger-address]
+  (-exists? [_ {:keys [ledger-address]}]
     (go (boolean (read-address data-atom ledger-address))))
 
   conn-proto/iConnection

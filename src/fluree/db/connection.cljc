@@ -208,8 +208,10 @@
 
   conn-proto/iNameService
   (-push [conn address commit-data] (jld-push! conn address commit-data))
-  (-lookup [conn address] (ns-lookup conn address))
-  (-address [_ ledger-alias opts] (async/go (str "fluree:raft://" ledger-alias)))
+  (-lookup [conn {:keys [head-commit-address]}]
+    (ns-lookup conn head-commit-address))
+  (-address [_ {:keys [ledger-alias]}]
+    (async/go (str "fluree:raft://" ledger-alias)))
 
 
   #?@(:clj
