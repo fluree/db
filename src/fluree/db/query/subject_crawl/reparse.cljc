@@ -135,8 +135,12 @@
 (defn simple-subject-crawl?
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
-  [{:keys [where select] :as _parsed-query}]
+  [{:keys [where select vars] :as _parsed-query}]
   (and (instance? SubgraphSelector select)
+       ;;TODO, filtering not supported yet
+       (empty? (:fluree.db.query.exec.where/filters where))
+       ;;TODO: vars support not complete
+       (empty? vars)
        (if-let [{select-var :var} select]
          (let [{:fluree.db.query.exec.where/keys [patterns]} where]
            (every? #(and (= select-var (clause-subject-var %))
