@@ -90,26 +90,24 @@
         (assoc filter-map :required-p required-p)))))
 
 
-(defn reparse-tuple
-  [tuple]
-  (let [[s p o] tuple
+(defn re-parse-pattern
+  "Re-parses a pattern into the format recognized
+  by downstream simple-subject-crawl code"
+  [pattern]
+  (let [type (where/pattern-type pattern)
+        [s p o] (if (= :tuple type)
+                  pattern
+                  (let [[_type-kw tuple] pattern]
+                    tuple)) 
         reparse-component (fn [component]
                             (let [{::where/keys [var val]} component]
                               (cond
                                 var {:variable var}
                                 val {:value val})))]
-    {:s (reparse-component s)
+    {:type type
+     :s (reparse-component s)
      :p (reparse-component p)
      :o (assoc (reparse-component o) :datatype (::where/datatype o))}))
-
-(defn reparse-pattern
-  [pattern]
-  (let [type (where/pattern-type pattern)
-        reparsed (if (= :tuple type)
-                   (reparse-tuple pattern)
-                   (let [[type-kw tuple] pattern]
-                     (reparse-tuple tuple)))]
-    (assoc reparsed :type type)))  
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.
@@ -118,7 +116,7 @@
   [{:keys [where vars] :as parsed-query}]
   (let [{::where/keys [patterns]} where
         [first-pattern & rest-patterns] patterns
-        reparsed-first-clause (reparse-pattern first-pattern)]
+        reparsed-first-clause (re-parse-pattern first-pattern)]
     (when-let [first-s (and (mergeable-where-clause? first-pattern)
                             (clause-subject-var first-pattern))]
       (if (empty? rest-patterns)
