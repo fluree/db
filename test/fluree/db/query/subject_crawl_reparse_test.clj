@@ -53,12 +53,17 @@
                                                                      ['?s :ex/favNums '?favNums]]
                                                           :group-by '?name
                                                           :order-by '?name}
-                                                         db)]
+                                                         db)
+        vars-query-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
+                                                         :where  [["?s" :schema/name '?name]]
+                                                         :vars {'?name "Alice"}}
+                                                        db)]
     (testing "simple-subject-crawl?"
       (is (= true
              (reparse/simple-subject-crawl? ssc-q1-parsed)))
       (is (= true
              (reparse/simple-subject-crawl? ssc-q2-parsed)))
+      (is (not (reparse/simple-subject-crawl? vars-query-parsed)))
       (is (not (reparse/simple-subject-crawl? not-ssc-parsed)))
       (is (not (reparse/simple-subject-crawl? order-group-parsed))))
     (testing "reparse"
