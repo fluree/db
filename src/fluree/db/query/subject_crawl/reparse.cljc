@@ -157,6 +157,6 @@
   [{:keys [order-by group-by] :as parsed-query}]
   (when (and (simple-subject-crawl? parsed-query)
              (not group-by)
-             (not= :variable (:type order-by)))
+             (not order-by))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))

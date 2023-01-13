@@ -178,6 +178,17 @@
                      (select-keys f1 [:fluree.db.query.exec.where/var
                                       :fluree.db.query.exec.where/params])))
               (is (:fluree.db.query.exec.where/fn f1))
-              (is (:fluree.db.query.exec.where/fn f2)))))))))
+              (is (:fluree.db.query.exec.where/fn f2))))))
+      (testing "group-by, order-by"
+        (let [query {:select   ['?name '?favNums]
+                     :where    [['?s :schema/name '?name]
+                                ['?s :ex/favNums '?favNums]]
+                     :group-by '?name
+                     :order-by '?name}
+              {:keys [select where group-by order-by] :as parsed} (parse/parse-analytical-query query db)]
+          (is (= ['?name] 
+                 group-by))
+          (is (=  [['?name :asc]]
+                 order-by)))))))
 
 ;;TODO fulltext, recursion
