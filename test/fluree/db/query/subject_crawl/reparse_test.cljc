@@ -12,24 +12,21 @@
         ledger @(fluree/create conn "query/parse" {:context {:ex "http://example.org/ns/"}})
         db     @(fluree/stage
                  ledger
-                 [{;;:context      {:ex "http://example.org/ns/"}
-                   :id           :ex/brian,
+                 [{:id           :ex/brian,
                    :type         :ex/User,
                    :schema/name  "Brian"
                    :schema/email "brian@example.org"
                    :schema/age   50
                    :ex/favColor  "Green"
                    :ex/favNums   7}
-                  {;;:context      {:ex "http://example.org/ns/"}
-                   :id           :ex/alice,
+                  {:id           :ex/alice,
                    :type         :ex/User,
                    :schema/name  "Alice"
                    :schema/email "alice@example.org"
                    :schema/age   50
                    :ex/favColor  "Blue"
                    :ex/favNums   [42, 76, 9]}
-                  {;;:context      {:ex "http://example.org/ns/"}
-                   :id           :ex/cam,
+                  {:id           :ex/cam,
                    :type         :ex/User,
                    :schema/name  "Cam"
                    :schema/email "cam@example.org"
