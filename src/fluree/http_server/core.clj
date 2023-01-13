@@ -40,7 +40,11 @@
   [routes]
   (ring/ring-handler
     (ring/router
-      routes
+      [routes
+       ["/swagger.json"
+        {:get {:no-doc true
+               :swagger {:info {:title "API Docs"}}
+               :handler (swagger/create-swagger-handler)}}]]
       {:data {:coercion reitit.coercion.malli/coercion
               :muuntaja (muun/create)
               :middleware [swagger/swagger-feature
@@ -56,13 +60,13 @@
     (ring/routes
       (ring/ring-handler
         (ring/router
-          ["/ws" {:get (fn [req]
-                         (if (jetty9/ws-upgrade-request? req)
-                           (jetty9/ws-upgrade-response websocket-handler)
-                           {:status 400
-                            :body "Invalid websocket upgrade request"}))}]))
+          [["/ws" {:get (fn [req]
+                          (if (jetty9/ws-upgrade-request? req)
+                            (jetty9/ws-upgrade-response websocket-handler)
+                            {:status 400
+                             :body "Invalid websocket upgrade request"}))}]]))
       (swagger-ui/create-swagger-ui-handler
-        {:path "/"
+        {:path "/api-docs"
          :config {:validatorUrl nil
                   :operationsSorter "alpha"}})
       (ring/create-default-handler))))
