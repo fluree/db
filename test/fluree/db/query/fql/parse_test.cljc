@@ -6,6 +6,14 @@
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.query.fql.parse :as parse]))
 
+(defn de-recordify-select
+  "Select statements are parsed into records.
+  This fn turns them into raw maps/vectors for ease of testing "
+  [select]
+  (if (sequential? select)
+    (mapv #(into {} %) select)
+    (into {} select)))
+
 (deftest test-parse-query
   (let  [conn   (test-utils/create-conn)
          ledger @(fluree/create conn "query/parse" {:context {:ex "http://example.org/ns/"}})
@@ -39,8 +47,7 @@
                 :selection ["*"]
                 :depth 0
                 :spec {:depth 0 :wildcard? true}}
-               ;;select is a record, turn into map for testing
-               (into {} select)))
+               (de-recordify-select select)))
         (is (= {:fluree.db.query.exec.where/patterns	    
 	        [[{:fluree.db.query.exec.where/var '?s}
 	          {:fluree.db.query.exec.where/val 1003}
@@ -59,8 +66,7 @@
                 :selection ["*"]
                 :depth 0
                 :spec {:depth 0 :wildcard? true}}
-               ;;select is a record, turn into map for testing
-               (into {} select)))
+               (de-recordify-select select)))
         (is (= {:fluree.db.query.exec.where/patterns	    
                 [[{:fluree.db.query.exec.where/var '?s}
                   {:fluree.db.query.exec.where/val 1003}
@@ -78,7 +84,7 @@
         (is (= [{:var '?name}
                 {:var '?age}
                 {:var '?email}] 
-               (mapv #(into {} %) select)))
+               (de-recordify-select select)))
         (is (= {:fluree.db.query.exec.where/patterns	  
                 [[{:fluree.db.query.exec.where/var '?s}
                   {:fluree.db.query.exec.where/val 1003}
@@ -128,7 +134,7 @@
                                          [['?s :schema/email '?email2]]]}]}
               {:keys [select where] :as parsed} (parse/parse-analytical-query union-q db)]
           (is (= [{:var '?s} {:var '?email1} {:var '?email2}]
-                 (mapv #(into {} %) select)))
+                 (de-recordify-select select)))
           (is (= {:fluree.db.query.exec.where/patterns	  
                   [[:class
                     [{:fluree.db.query.exec.where/var '?s}
@@ -155,7 +161,7 @@
                                  {:filter ["(> ?age 45)", "(< ?age 50)"]}]}
               {:keys [select where] :as parsed} (parse/parse-analytical-query filter-q db)]
           (is (= [{:var '?name} {:var '?age}]
-                 (mapv #(into {} %) select)))
+                 (de-recordify-select select)))
           (let [{:fluree.db.query.exec.where/keys [patterns filters]} where]
             (is (= [[:class
                      [{:fluree.db.query.exec.where/var '?s}
