@@ -147,11 +147,11 @@
        (empty? vars)
        (if-let [{select-var :var} select]
          (let [{:fluree.db.query.exec.where/keys [patterns]} where]
-           (every? #(and (= select-var (clause-subject-var %))
-                         ;; exclude if any recursion specified in where statement (e.g. person/follows+3)
-                         ;;TODO check new parsed result for correct detection of recursion 
-                         (not (:recur %)))
-                   patterns)))))
+           (every? (fn [pattern]
+                     (let [pred (second pattern)]
+                       (and (= select-var (clause-subject-var pattern))
+                            (not (::where/recur pred))
+                            (not (::where/fullText pattern))))) patterns)))))
 
 (defn re-parse-as-simple-subj-crawl
   "Returns true if query contains a single subject crawl.
@@ -159,8 +159,8 @@
   {:select {?subjects ['*']}
    :where [...]}"
   [{:keys [order-by group-by] :as parsed-query}]
-  (when (and (simple-subject-crawl? parsed-query)
-             (not group-by)
-             (not order-by))
+  (when (and (not group-by)
+             (not order-by)
+             (simple-subject-crawl? parsed-query))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))
