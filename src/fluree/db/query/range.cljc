@@ -286,8 +286,8 @@
          start-parts (match->flake-parts db idx start-match)
          end-parts   (match->flake-parts db idx end-match)]
      (go-try
-      (let [start-flake (apply resolve-match-flake db start-test start-parts)
-            end-flake   (apply resolve-match-flake db end-test end-parts)
+      (let [start-flake (apply resolve-match-flake start-test start-parts)
+            end-flake   (apply resolve-match-flake end-test end-parts)
             error-ch    (chan)
             range-ch    (index-range* db
                                       error-ch
