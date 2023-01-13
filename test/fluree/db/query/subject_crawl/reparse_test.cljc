@@ -69,7 +69,6 @@
       (is (not (reparse/simple-subject-crawl? not-ssc-parsed)))
       (is (not (reparse/simple-subject-crawl? order-group-parsed))))
     (testing "reparse"
-      ;;THIS query returns nothing
       (let [ssc-q1-reparsed (reparse/re-parse-as-simple-subj-crawl ssc-q1-parsed)
             {:keys [where context]} ssc-q1-reparsed
             [pattern] where
