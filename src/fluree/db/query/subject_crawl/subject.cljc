@@ -25,9 +25,10 @@
                         (get vars variable)))
         p*          (:value p)
         idx*        (where/idx-for nil p* o*) 
+        o-dt        (:datatype o)
         [fflake lflake] (case idx*
-                          :post [(flake/create nil p* o* nil nil nil util/min-integer)
-                                 (flake/create nil p* o* nil nil nil util/max-integer)]
+                          :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
+                                 (flake/create nil p* o* o-dt nil nil util/max-integer)]
                           :psot [(flake/create nil p* nil nil nil nil util/min-integer)
                                  (flake/create nil p* nil nil nil nil util/max-integer)])
         filter-fn   (cond

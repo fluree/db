@@ -81,8 +81,10 @@
         (is (= {:variable '?s} 
                s))
         (is (number? (:value p)))
-        (is (= {:value "Alice"} 
-               o)))
+        (let [{:keys [value datatype]} o]
+          (is (= "Alice" 
+                 value))
+          (is datatype)))
       (let [ssc-q2-reparsed (reparse/re-parse-as-simple-subj-crawl ssc-q2-parsed)
             {:keys [where context]} ssc-q2-reparsed
             [pattern _s-filter] where
@@ -91,8 +93,10 @@
         (is (= {:variable '?s}
                s))
         (is (number? (:value p)))
-        (is (= {:value 50}
-               o)))
+        (let [{:keys [value datatype]} o]
+          (is (= 50
+                 value))
+          (is datatype)))
       #_(let [ssc-vars-reparsed (reparse/re-parse-as-simple-subj-crawl ssc-vars-parsed)
             {:keys [vars where context]} ssc-vars-reparsed
             [pattern] where

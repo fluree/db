@@ -93,11 +93,15 @@
 
 (defn reparse-tuple
   [tuple]
-  (zipmap [:s :p :o] (map (fn [component]
+  (let [[s p o] tuple
+        reparse-component (fn [component]
                             (let [{::where/keys [var val]} component]
                               (cond
                                 var {:variable var}
-                                val {:value val}))) tuple)))
+                                val {:value val})))]
+    {:s (reparse-component s)
+     :p (reparse-component p)
+     :o (assoc (reparse-component o) :datatype (::where/datatype o))}))
 
 (defn reparse-pattern
   [pattern]
