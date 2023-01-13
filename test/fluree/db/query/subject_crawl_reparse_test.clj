@@ -1,7 +1,6 @@
-(ns fluree.db.query.subject-crawl.reparse-test
+(ns fluree.db.query.subject-crawl-reparse-test
   (:require
-   #?@(:clj  [[clojure.test :refer :all]]
-       :cljs [[cljs.test :refer-macros [deftest is testing]]])
+   [clojure.test :refer :all]
    [fluree.db.test-utils :as test-utils]
    [fluree.db.json-ld.api :as fluree]
    [fluree.db.query.fql.parse :as parse]

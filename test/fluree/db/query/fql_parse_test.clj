@@ -1,11 +1,10 @@
-(ns fluree.db.query.fql.parse-test
+(ns fluree.db.query.fql-parse-test
   (:require
-   #?@(:clj  [[clojure.test :refer :all]]
-       :cljs [[cljs.test :refer-macros [deftest is testing]]])
-   #?@(:clj [[fluree.db.query.exec.where :as-alias where]])
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.query.fql.parse :as parse]))
+   [clojure.test :refer :all]
+   [fluree.db.query.exec.where :as where]
+   [fluree.db.test-utils :as test-utils]
+   [fluree.db.json-ld.api :as fluree]
+   [fluree.db.query.fql.parse :as parse]))
 
 (defn de-recordify-select
   "Select statements are parsed into records.
