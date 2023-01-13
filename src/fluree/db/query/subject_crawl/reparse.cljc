@@ -34,7 +34,7 @@
   [where-clause]
   (-> where-clause
       first
-      :fluree.db.query.exec.where/var))
+      ::where/var))
 
 
 ;;TODO update for new parsing result
@@ -61,17 +61,17 @@
          required-p #{} ;; set of 'p' values that are going to be required for a subject to have
          filter-map {}] ;; key 'p' value, val is list of filtering fns
     (let [[s p o] where-smt
-          {p* :fluree.db.query.exec.where/val} p
+          {p* ::where/val} p
           type (where/pattern-type where-smt)]
       (if where-smt
         (when (and (= :tuple type)
                    (= first-s (clause-subject-var where-smt)))
-          (let [;;TODO filters
-                {:fluree.db.query.exec.where/keys [val var]} o 
+          (let [{::where/keys [val var]} o 
                 f (cond
                     val
                     (fn [flake _] (= val (flake/o flake)))
 
+                    ;;TODO: filters are not yet supported 
                     #_#_filter
                     (let [{:keys [params variable function]} filter]
                       (if (= 1 (count params))
@@ -81,7 +81,8 @@
                             (log/debug (str "Calling query-filter fn: " ("fn-str" filter)
                                             "with params: " params "."))
                             (apply function params)))))
-                    (and var (get supplied-vars var))
+                    ;;TODO: vars are not yet supported
+                    #_#_(and var (get supplied-vars var))
                     (fn [flake vars]
                       (= (flake/o flake) (get vars var))))]
             (recur r
@@ -90,6 +91,7 @@
                      (update filter-map p* util/conjv f)
                      filter-map))))
         (assoc filter-map :required-p required-p)))))
+
 
 (defn reparse-tuple
   [tuple]
@@ -121,7 +123,7 @@
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
   [{:keys [where vars] :as parsed-query}]
-  (let [{:keys [fluree.db.query.exec.where/patterns]} where
+  (let [{::where/keys [patterns]} where
         [first-pattern & rest-patterns] patterns
         reparsed-first-clause (reparse-pattern first-pattern)]
     (when-let [first-s (and (mergeable-where-clause? first-pattern)
@@ -142,11 +144,11 @@
   [{:keys [where select vars] :as _parsed-query}]
   (and (instance? SubgraphSelector select)
        ;;TODO, filtering not supported yet
-       (empty? (:fluree.db.query.exec.where/filters where))
+       (empty? (::where/filters where))
        ;;TODO: vars support not complete
        (empty? vars)
        (if-let [{select-var :var} select]
-         (let [{:fluree.db.query.exec.where/keys [patterns]} where]
+         (let [{::where/keys [patterns]} where]
            (every? (fn [pattern]
                      (let [pred (second pattern)]
                        (and (= select-var (clause-subject-var pattern))

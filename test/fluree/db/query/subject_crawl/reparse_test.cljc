@@ -49,10 +49,6 @@
                                                                 ['?f :schema/age '?age]
                                                                 ['?f :schema/email '?email]]}
                                                      db)
-        ssc-vars-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
-                                                       :where  [["?s" :schema/name '?name]]
-                                                       :vars {'?name "Alice"}}
-                                                      db)
         order-group-parsed (parse/parse-analytical-query {:select   ['?name '?favNums]
                                                           :where    [['?s :schema/name '?name]
                                                                      ['?s :ex/favNums '?favNums]]
@@ -64,8 +60,6 @@
              (reparse/simple-subject-crawl? ssc-q1-parsed)))
       (is (= true
              (reparse/simple-subject-crawl? ssc-q2-parsed)))
-      #_(is (= true
-             (reparse/simple-subject-crawl? ssc-vars-parsed)))
       (is (not (reparse/simple-subject-crawl? not-ssc-parsed)))
       (is (not (reparse/simple-subject-crawl? order-group-parsed))))
     (testing "reparse"
@@ -93,17 +87,5 @@
           (is (= 50
                  value))
           (is datatype)))
-      #_(let [ssc-vars-reparsed (reparse/re-parse-as-simple-subj-crawl ssc-vars-parsed)
-            {:keys [vars where context]} ssc-vars-reparsed
-            [pattern] where
-            {:keys [s p o]} pattern]
-        (is (not (nil? context)))
-        #_(is (= :TODO
-               vars))
-        (is (= {:variable '?s}
-               s))
-        (is (number? (:value p)))
-        (is (= {:variable '?name}
-               o)))
       (is (nil?
            (reparse/re-parse-as-simple-subj-crawl not-ssc-parsed))))))
