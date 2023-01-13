@@ -27,7 +27,6 @@
   with other clauses to create a filter for the simple-subject-crawl
   strategy"
   [where-clause]
-  ;;TODO do :fullText predicates need special exclusion?
   (#{:class :tuple} (where/pattern-type where-clause)))
 
 (defn clause-subject-var
@@ -36,8 +35,6 @@
       first
       ::where/var))
 
-
-;;TODO update for new parsing result
 (defn merge-wheres-to-filter
   "Merges all subsequent where clauses (rest where) for simple-subject-crawl
   into a map containing predicate filters.
@@ -114,10 +111,6 @@
                      (reparse-tuple tuple)))]
     (assoc reparsed :type type)))  
 
-;;TODO reformat vars for downstream use
-(defn reformat-vars
-  [vars])
-
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.
   If where does not end up meeting simple-subject-crawl criteria, returns nil
@@ -130,10 +123,8 @@
                             (clause-subject-var first-pattern))]
       (if (empty? rest-patterns)
         (assoc parsed-query
-               ;;TODO unsure of format here, needs to be wrapped in vector?
                :where [reparsed-first-clause]
                :strategy :simple-subject-crawl)
-        ;;TODO update for multi-clause, rm supplied-vars
         (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
           (assoc parsed-query :where [reparsed-first-clause
                                       {:s-filter subj-filter-map}]
