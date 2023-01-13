@@ -2,7 +2,8 @@
   (:require [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            #?(:cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
+            #?(:clj [fluree.db.query.exec.select]
+               :cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
             [fluree.db.query.exec.where :as where])
   #?(:clj (:import [fluree.db.query.exec.select SubgraphSelector])))
 
