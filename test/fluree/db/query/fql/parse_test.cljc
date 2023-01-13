@@ -2,6 +2,7 @@
   (:require
    #?@(:clj  [[clojure.test :refer :all]]
        :cljs [[cljs.test :refer-macros [deftest is testing]]])
+   #?@(:clj [[fluree.db.query.exec.where :as-alias where]])
     [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.query.fql.parse :as parse]))
@@ -42,40 +43,38 @@
     (testing "parse-analytical-query"
       (let [ssc {:select {"?s" ["*"]}
                  :where  [["?s" :schema/name "Alice"]]}
-            {:keys [select where] :as parsed} (parse/parse-analytical-query ssc db)]
+            {:keys [select where] :as parsed} (parse/parse-analytical-query ssc db)
+            {::where/keys [patterns]} where]
         (is (= {:var '?s
                 :selection ["*"]
                 :depth 0
                 :spec {:depth 0 :wildcard? true}}
                (de-recordify-select select)))
-        (is (= {:fluree.db.query.exec.where/patterns	    
-	        [[{:fluree.db.query.exec.where/var '?s}
-	          {:fluree.db.query.exec.where/val 1003
-                   :fluree.db.query.exec.where/datatype 7}
-	          {:fluree.db.query.exec.where/val "Alice"
-                   :fluree.db.query.exec.where/datatype 1}]]
-	        :fluree.db.query.exec.where/filters {}}
-               where)))
-      (let [ssc-vars {:select {"?s" ["*"]}
+        (is (= [[{::where/var '?s}
+	         {::where/val 1003
+                  ::where/datatype 7}
+	         {::where/val "Alice"
+                  ::where/datatype 1}]]
+               patterns)))
+      (let [vars-query {:select {"?s" ["*"]}
                       :where  [["?s" :schema/name '?name]]
                       :vars {'?name "Alice"} }
-            {:keys [select where vars] :as parsed} (parse/parse-analytical-query ssc-vars db)]
+            {:keys [select where vars] :as parsed} (parse/parse-analytical-query vars-query db)
+            {::where/keys [patterns]} where]
         (is (= {'?name	  
-                {:fluree.db.query.exec.where/var '?name
-                 :fluree.db.query.exec.where/val "Alice"}}
+                {::where/var '?name
+                 ::where/val "Alice"}}
                vars))
         (is (= {:var '?s
                 :selection ["*"]
                 :depth 0
                 :spec {:depth 0 :wildcard? true}}
                (de-recordify-select select)))
-        (is (= {:fluree.db.query.exec.where/patterns	    
-                [[{:fluree.db.query.exec.where/var '?s}
-                  {:fluree.db.query.exec.where/val 1003
-                   :fluree.db.query.exec.where/datatype 7}
-                  {:fluree.db.query.exec.where/var '?name}]]
-                :fluree.db.query.exec.where/filters {}}
-               where)))
+        (is (= [[{::where/var '?s}
+                 {::where/val 1003
+                  ::where/datatype 7}
+                 {::where/var '?name}]]
+               patterns)))
       (let [query  {:context {:ex "http://example.org/ns/"}
                     :select  ['?name '?age '?email]
                     :where   [['?s :schema/name "Cam"]
@@ -83,129 +82,115 @@
                               ['?f :schema/name '?name]
                               ['?f :schema/age '?age]
                               ['?f :ex/email '?email]]}
-            {:keys [select where] :as parsed} (parse/parse-analytical-query query db)]
+            {:keys [select where] :as parsed} (parse/parse-analytical-query query db)
+            {::where/keys [patterns]} where]
         (is (= [{:var '?name}
                 {:var '?age}
                 {:var '?email}] 
                (de-recordify-select select)))
-        (is (= {:fluree.db.query.exec.where/patterns	  
-                [[{:fluree.db.query.exec.where/var '?s}
-                  {:fluree.db.query.exec.where/val 1003
-                   :fluree.db.query.exec.where/datatype 7}
-                  {:fluree.db.query.exec.where/val "Cam"
-                   :fluree.db.query.exec.where/datatype 1}]
-                 [{:fluree.db.query.exec.where/var '?s}
-                  {:fluree.db.query.exec.where/val 1009
-                   :fluree.db.query.exec.where/datatype 7}
-                  {:fluree.db.query.exec.where/var '?f}]
-                 [{:fluree.db.query.exec.where/var '?f}
-                  {:fluree.db.query.exec.where/val 1003
-                   :fluree.db.query.exec.where/datatype 7}
-                  {:fluree.db.query.exec.where/var '?name}]
-                 [{:fluree.db.query.exec.where/var '?f}
-                  {:fluree.db.query.exec.where/val 1005
-                   :fluree.db.query.exec.where/datatype 7}
-                  {:fluree.db.query.exec.where/var '?age}]
-                 [{:fluree.db.query.exec.where/var '?f}
-                  {:fluree.db.query.exec.where/val 1008
-                   :fluree.db.query.exec.where/datatype 7}
-                  {:fluree.db.query.exec.where/var '?email}]]
-                :fluree.db.query.exec.where/filters {}}
-               where)))
+        (is (= [[{::where/var '?s}
+                 {::where/val 1003
+                  ::where/datatype 7}
+                 {::where/val "Cam"
+                  ::where/datatype 1}]
+                [{::where/var '?s}
+                 {::where/val 1009
+                  ::where/datatype 7}
+                 {::where/var '?f}]
+                [{::where/var '?f}
+                 {::where/val 1003
+                  ::where/datatype 7}
+                 {::where/var '?name}]
+                [{::where/var '?f}
+                 {::where/val 1005
+                  ::where/datatype 7}
+                 {::where/var '?age}]
+                [{::where/var '?f}
+                 {::where/val 1008
+                  ::where/datatype 7}
+                 {::where/var '?email}]]
+              patterns)))
       (testing "class, optional"
         (let [optional-q {:select ['?name '?favColor]
                           :where  [['?s :rdf/type :ex/User]
                                    ['?s :schema/name '?name]
                                    {:optional ['?s :ex/favColor '?favColor]}]}
-              {:keys [select where] :as parsed} (parse/parse-analytical-query optional-q db)]
+              {:keys [select where] :as parsed} (parse/parse-analytical-query optional-q db)
+              {::where/keys [patterns]} where]
           (is (= [{:var '?name} {:var '?favColor}]
                  (mapv #(into {} %) select)))
-          (is (= {:fluree.db.query.exec.where/patterns	  
-                  [[:class
-                    [{:fluree.db.query.exec.where/var '?s}
-                     {:fluree.db.query.exec.where/val 200
-                      :fluree.db.query.exec.where/datatype 7}
-                     {:fluree.db.query.exec.where/val 1002
-                      :fluree.db.query.exec.where/datatype 0}]]
-                   [{:fluree.db.query.exec.where/var '?s}
-                    {:fluree.db.query.exec.where/val 1003
-                     :fluree.db.query.exec.where/datatype 7}
-                    {:fluree.db.query.exec.where/var '?name}]
-                   [:optional
-                    {:fluree.db.query.exec.where/patterns
-                     [[{:fluree.db.query.exec.where/var '?s}
-                       {:fluree.db.query.exec.where/val 1007
-                        :fluree.db.query.exec.where/datatype 7}
-                       {:fluree.db.query.exec.where/var '?favColor}]]
-                     :fluree.db.query.exec.where/filters {}}]]
-                  :fluree.db.query.exec.where/filters {}}
-                 where))))
+          (is (= [[:class
+                   [{::where/var '?s}
+                    {::where/val 200
+                     ::where/datatype 7}
+                    {::where/val 1002
+                     ::where/datatype 0}]]
+                  [{::where/var '?s}
+                   {::where/val 1003
+                    ::where/datatype 7}
+                   {::where/var '?name}]
+                  [:optional
+                   {::where/patterns
+                    [[{::where/var '?s}
+                      {::where/val 1007
+                       ::where/datatype 7}
+                      {::where/var '?favColor}]]
+                    ::where/filters {}}]]
+                 patterns))))
       (testing "class, union"
         (let [union-q {:select ['?s '?email1 '?email2]
                        :where  [['?s :rdf/type :ex/User]
                                 {:union [[['?s :ex/email '?email1]]
                                          [['?s :schema/email '?email2]]]}]}
-              {:keys [select where] :as parsed} (parse/parse-analytical-query union-q db)]
+              {:keys [select where] :as parsed} (parse/parse-analytical-query union-q db)
+              {::where/keys [patterns]} where]
           (is (= [{:var '?s} {:var '?email1} {:var '?email2}]
                  (de-recordify-select select)))
-          (is (= {:fluree.db.query.exec.where/patterns	  
-                  [[:class
-                    [{:fluree.db.query.exec.where/var '?s}
-                     {:fluree.db.query.exec.where/val 200
-                      :fluree.db.query.exec.where/datatype 7}
-                     {:fluree.db.query.exec.where/val 1002
-                      :fluree.db.query.exec.where/datatype 0}]]
-                   [:union
-                    [{:fluree.db.query.exec.where/patterns
-                      [[{:fluree.db.query.exec.where/var '?s}
-                        {:fluree.db.query.exec.where/val 1008
-                         :fluree.db.query.exec.where/datatype 7}
-                        {:fluree.db.query.exec.where/var '?email1}]]
-                      :fluree.db.query.exec.where/filters {}}
-                     {:fluree.db.query.exec.where/patterns
-                      [[{:fluree.db.query.exec.where/var '?s}
-                        {:fluree.db.query.exec.where/val 1004
-                         :fluree.db.query.exec.where/datatype 7}
-                        {:fluree.db.query.exec.where/var '?email2}]]
-                      :fluree.db.query.exec.where/filters {}}]]]
-                  :fluree.db.query.exec.where/filters {}}
-                 where))))
+          (is (= [[:class
+                   [{::where/var '?s}
+                    {::where/val 200
+                     ::where/datatype 7}
+                    {::where/val 1002
+                     ::where/datatype 0}]]
+                  [:union
+                   [{::where/patterns
+                     [[{::where/var '?s}
+                       {::where/val 1008
+                        ::where/datatype 7}
+                       {::where/var '?email1}]]
+                     ::where/filters {}}
+                    {::where/patterns
+                     [[{::where/var '?s}
+                       {::where/val 1004
+                        ::where/datatype 7}
+                       {::where/var '?email2}]]
+                     ::where/filters {}}]]]
+              patterns))))
       (testing "class, filters"
         (let [filter-q {:select ['?name '?age]
                         :where  [['?s :rdf/type :ex/User]
                                  ['?s :schema/age '?age]
                                  ['?s :schema/name '?name]
                                  {:filter ["(> ?age 45)", "(< ?age 50)"]}]}
-              {:keys [select where] :as parsed} (parse/parse-analytical-query filter-q db)]
+              {:keys [select where] :as parsed} (parse/parse-analytical-query filter-q db)
+              {::where/keys [patterns filters]} where]
           (is (= [{:var '?name} {:var '?age}]
                  (de-recordify-select select)))
-          (let [{:fluree.db.query.exec.where/keys [patterns filters]} where]
-            (is (= [[:class	  
-                     [{:fluree.db.query.exec.where/var '?s}
-                      {:fluree.db.query.exec.where/val 200
-                       :fluree.db.query.exec.where/datatype 7}
-                      {:fluree.db.query.exec.where/val 1002
-                       :fluree.db.query.exec.where/datatype 0}]]
-                    [{:fluree.db.query.exec.where/var '?s}
-                     {:fluree.db.query.exec.where/val 1005
-                      :fluree.db.query.exec.where/datatype 7}
-                     {:fluree.db.query.exec.where/var '?age}]
-                    [{:fluree.db.query.exec.where/var '?s}
-                     {:fluree.db.query.exec.where/val 1003
-                      :fluree.db.query.exec.where/datatype 7}
-                     {:fluree.db.query.exec.where/var '?name}]]
-                   patterns))
-            (is (= '?age
-                   (-> filters keys first)))
-            (let [filter-details (get filters '?age)
-                  [f1 f2] filter-details]
-              (def f filter-details)
-              (is (= {:fluree.db.query.exec.where/var '?age
-                      :fluree.db.query.exec.where/params ['?age]}
-                     (select-keys f1 [:fluree.db.query.exec.where/var
-                                      :fluree.db.query.exec.where/params])))
-              (is (:fluree.db.query.exec.where/fn f1))
-              (is (:fluree.db.query.exec.where/fn f2))))))
+          (is (= [[:class	  
+                   [{::where/var '?s}
+                    {::where/val 200
+                     ::where/datatype 7}
+                    {::where/val 1002
+                     ::where/datatype 0}]]
+                  [{::where/var '?s}
+                   {::where/val 1005
+                    ::where/datatype 7}
+                   {::where/var '?age}]
+                  [{::where/var '?s}
+                   {::where/val 1003
+                    ::where/datatype 7}
+                   {::where/var '?name}]]
+                 patterns))))
       (testing "group-by, order-by"
         (let [query {:select   ['?name '?favNums]
                      :where    [['?s :schema/name '?name]
