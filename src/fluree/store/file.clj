@@ -31,31 +31,31 @@
 
 (defn write-file
   "Write string to disk at the given file path."
-  [base-path path data serialize-to]
-  ;; TODO: use a proper serde here, from config
-  (let [serialized (cond (bytes? data) data
+  [base-path path data serialize-to {:keys [serializer content-address?] :as _opts}]
+  ;; TODO: use a proper serde here, from config. Avro needs schemas for everything it writes...
+  (let [serialized (cond (bytes? data)          data
                          (= serialize-to :json) (json/stringify data)
-                         (= serialize-to :edn) (pr-str data))
-
-        bytes (if (string? serialized)
-                (util/string->bytes serialized)
-                serialized)
-
-        file-path (str base-path path)]
+                         (= serialize-to :edn)  (pr-str data))
+        bytes      (if (string? serialized)
+                     (util/string->bytes serialized)
+                     serialized)
+        hash       (crypto/sha2-256 bytes)
+        path       (str path (when content-address? hash))
+        file-path  (str base-path path )]
     (try
       (with-open [out (io/output-stream (io/file file-path))]
         (.write out ^bytes bytes))
-      {:path path
+      {:path    path
        :address (address-file "" path)
-       :hash (crypto/sha2-256 bytes)}
+       :hash    hash}
       (catch FileNotFoundException _
         (try
           (io/make-parents (io/file file-path))
           (with-open [out (io/output-stream (io/file file-path))]
             (.write out ^bytes bytes))
-          {:path path
+          {:path    path
            :address (address-file "" path)
-           :hash (crypto/sha2-256 bytes)}
+           :hash    hash}
           (catch Exception e
             (log/error (str "Unable to create storage directory: " path
                             " with error: " (.getMessage e) "."))
@@ -64,7 +64,8 @@
 
 (defn read-file
   "Read string from disk at given file path."
-  [base-path path serialize-to]
+  [base-path path serialize-to {:keys [deserializer] :as _opts}]
+  ;; TODO: proper serde support here
   (try
     (with-open [xin (io/input-stream (str base-path path))
                 xout (ByteArrayOutputStream.)]
@@ -100,20 +101,22 @@
 
   store-proto/Store
   (address [_ type k] (address-file type k))
-  (read [_ k] (go-try (read-file storage-path k serialize-to)))
+  (read [_ k] (go-try (read-file storage-path k serialize-to {})))
+  (read [_ k opts] (go-try (read-file storage-path k serialize-to opts)))
   (list [_ prefix] (go-try (list-files storage-path prefix serialize-to)))
-  (write [_ k data] (go-try (write-file storage-path k data serialize-to)))
+  (write [_ k data] (go-try (write-file storage-path k data serialize-to {})))
+  (write [_ k data opts] (go-try (write-file storage-path k data serialize-to opts)))
   (delete [_ k] (go-try (delete-file storage-path k)))
 
   fluree.db.index/Resolver
   (resolve [store node] (resolver/resolve-node store async-cache node)))
 
 (defn create-file-store
-  [{:keys [:store/id :file-store/storage-path :file-store/serialize-to] :as config}]
+  [{:keys [:store/id :store/serde :file-store/storage-path :file-store/serialize-to] :as config}]
   (let [id (or id (random-uuid))]
     (log/info "Starting FileStore " id "." config)
     (map->FileStore {:id id
                      :serialize-to serialize-to
                      :async-cache (resolver/create-async-cache config)
-                     :serializer (avro-serde/->Serializer)
+                     :serializer (or serde (avro-serde/->Serializer))
                      :storage-path (util/ensure-trailing-slash storage-path)})))

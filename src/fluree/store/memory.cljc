@@ -1,5 +1,5 @@
 (ns fluree.store.memory
-  (:refer-clojure :exclude [exists? list])
+  (:refer-clojure :exclude [exists? list hash])
   (:require
    [clojure.core.async :as async]
    [clojure.string :as str]
@@ -22,6 +22,27 @@
   [type k]
   (ident/create-address type :memory k))
 
+(defn memory-write
+  [storage-atom k data {:keys [serializer content-address?] :as _opts}]
+  (let [serializer (or serializer pr-str)
+        serialized (serializer data)
+        hash       (crypto/sha2-256 serialized)
+        path       (if content-address?
+                     (str k hash)
+                     k)]
+    ;; for convenience, store the clj data instead of the serialized data
+    (swap! storage-atom assoc path data)
+    {:path    path
+     :address (address-memory "" path)
+     :hash    hash}))
+
+(defn memory-read
+  [storage-atom k {:keys [deserializer] :as _opts}]
+  (let [data (get @storage-atom k)]
+    (if deserializer
+      (deserializer data)
+      data)))
+
 (defrecord MemoryStore [id storage-atom async-cache]
   service-proto/Service
   (id [_] id)
@@ -29,16 +50,16 @@
 
   store-proto/Store
   (address [_ type k] (address-memory type k))
-  (read [_ k] (async/go (get @storage-atom k)))
-  (list [_ prefix]  (async/go
-                      (filter #(str/starts-with? % prefix) (keys @storage-atom))))
-  (write [_ k data] (async/go (swap! storage-atom assoc k data)
-                              {:path k :address (address-memory "" k)
-                               :hash (crypto/sha2-256 (pr-str data))}))
+  (read [_ k] (async/go (memory-read storage-atom k {})))
+  (read [_ k opts] (async/go (memory-read storage-atom k opts)))
+  (list [_ prefix]  (async/go (filter #(str/starts-with? % prefix) (keys @storage-atom))))
+  (write [_ k data] (async/go (memory-write storage-atom k data {})))
+  (write [_ k data opts] (async/go (memory-write storage-atom k data opts)))
   (delete [_ k] (async/go (swap! storage-atom dissoc k) :deleted))
 
   fluree.db.index/Resolver
-  (resolve [store node] (resolver/resolve-node store async-cache node)))
+  (resolve [store node]
+    (resolver/resolve-node store async-cache node)))
 
 (defn create-memory-store
   [{:keys [store/id memory-store/storage-atom] :as config}]

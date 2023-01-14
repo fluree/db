@@ -19,14 +19,25 @@
   (store-impl/address store type k))
 
 (defn write
-  "Associate data with key k in store."
-  [store k data]
-  (store-impl/write store k data))
+  "Associate data with key k in store. Returns map of :path and :hash.
+
+  opts:
+  :serializer - override Store default serializer.
+  :content-address? - caculates the sha256 hash of `data` after serializing and appends it to the `k` before storing."
+  ([store k data]
+   (store-impl/write store k data {}))
+  ([store k data {:keys [serializer content-address?] :as opts}]
+   (store-impl/write store k data opts)))
 
 (defn read
-  "Read data from key k in store."
-  [store k]
-  (store-impl/read store k))
+  "Read data from key k in store.
+
+  opts:
+  :deserializer - override Store default deserializer."
+  ([store k]
+   (store-impl/read store k {}))
+  ([store k {:keys [deserializer] :as opts}]
+   (store-impl/read store k opts)))
 
 (defn list
   "Return keys from store with given prefix."

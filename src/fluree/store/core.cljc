@@ -25,12 +25,12 @@
   (service-proto/stop store))
 
 (defn write
-  [store k data]
-  (store-proto/write store k data))
+  [store k data opts]
+  (store-proto/write store k data opts))
 
 (defn read
-  [store k]
-  (store-proto/read store k))
+  [store k opts]
+  (store-proto/read store k opts))
 
 (defn list
   [store prefix]
