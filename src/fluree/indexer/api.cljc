@@ -14,9 +14,8 @@
 
 (defn init
   "Initialize a db index and returns the db-address"
-  [idxr opts]
-  (idxr-impl/init idxr opts))
-
+  [idxr ledger-name opts]
+  (idxr-impl/init idxr ledger-name opts))
 
 (defn stage
   "Index some data and return a db-address."

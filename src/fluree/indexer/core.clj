@@ -22,9 +22,9 @@
   (store/stop (:store idxr)))
 
 (defn init-db
-  [{:keys [store config db-map] :as idxr} opts]
+  [{:keys [store config db-map] :as idxr} ledger-name opts]
   (let [db (db/create store (merge config opts))
-        db-address (db/create-db-address db)]
+        db-address (db/create-db-address db ledger-name)]
     (if (get @db-map db-address)
       db-address
       (do
@@ -82,20 +82,16 @@
     (throw (ex-info "No such db-address." {:error :query/no-such-db
                                            :db-address db-address}))))
 
-(defn explain-query
-  [idxr db-address query]
-  (throw (ex-info "TODO" {:todo :explain-not-implemented})))
-
 (defrecord Indexer [id]
   service-proto/Service
   (id [_] id)
   (stop [idxr] (stop-indexer idxr))
 
   idxr-proto/Indexer
-  (init [idxr opts] (init-db idxr opts))
+  (init [idxr ledger-name opts] (init-db idxr ledger-name opts))
   (stage [idxr db-address data] (stage-db idxr db-address data))
   (query [idxr db-address query] (query-db idxr db-address query))
-  (explain [idxr db-address query] (explain-query idxr db-address query)))
+  (explain [idxr db-address query] (throw (ex-info "TODO" {:todo :explain-not-implemented}))))
 
 (defn create-indexer
   [{:keys [:idxr/id :idxr/store-config :idxr/store] :as config}]
@@ -116,8 +112,8 @@
   (service-proto/stop idxr))
 
 (defn init
-  [idxr opts]
-  (idxr-proto/init idxr opts))
+  [idxr ledger-name opts]
+  (idxr-proto/init idxr ledger-name opts))
 
 (defn stage
   [idxr db-address data]

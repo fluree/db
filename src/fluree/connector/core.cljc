@@ -31,11 +31,11 @@
 
 (defn create-ledger
   [{:keys [indexer publisher]} ledger-name opts]
-  (let [db-address     (idxr/init indexer opts)
+  (let [db-address     (idxr/init indexer ledger-name opts)
         ledger-address (pub/init publisher ledger-name (assoc opts :db-address db-address))]
     ledger-address))
 
-(defn transact-conn
+(defn transact-ledger
   [conn ledger-address tx opts]
   (let [{txr :transactor pub :publisher idxr :indexer} conn
 
@@ -115,7 +115,7 @@
   (stop [conn] (stop-conn conn))
 
   conn-proto/Connection
-  (transact [conn ledger-address tx opts] (transact-conn conn ledger-address tx opts))
+  (transact [conn ledger-address tx opts] (transact-ledger conn ledger-address tx opts))
   (create [conn ledger-name opts] (create-ledger conn ledger-name opts))
   (query [conn ledger-address query opts] (query-ledger conn ledger-address query opts))
   (load [conn ledger-address opts] (load-ledger conn ledger-address opts))
