@@ -54,16 +54,17 @@
           compact-fn (json-ld/compact-fn context* ctx-used-atom)
 
           {:keys [assert retract] :as c}
-          (<?? (jld-commit/commit-opts->data db-after {:compact-fn compact-fn :id-key "@id" :type-key "@type"}))]
+          (<?? (jld-commit/commit-opts->data db-after {:compact-fn compact-fn :id-key "@id" :type-key "@type"}))
 
-      (swap! db-map assoc db-address db-after)
-      (when (idx-proto/-index? idx db-after)
-        (idx-proto/-index idx db-after))
+          db-final (if (idx-proto/-index? idx db-after)
+                     (<?? (idx-proto/-index idx db-after))
+                     db-after)]
+      (swap! db-map assoc db-address db-final)
       {:db/address db-address
        :db/v       0
-       :db/t       (- (:t db-after))
-       :db/flakes  (-> db-after :stats :flakes)
-       :db/size    (-> db-after :stats :size)
+       :db/t       (- (:t db-final))
+       :db/flakes  (-> db-final :stats :flakes)
+       :db/size    (-> db-final :stats :size)
        :db/context @ctx-used-atom
        :db/assert  assert
        :db/retract retract})
