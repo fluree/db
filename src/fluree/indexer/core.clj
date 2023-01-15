@@ -9,6 +9,7 @@
    [fluree.db.util.async :refer [<?? go-try]]
    [fluree.db.util.log :as log]
    [fluree.indexer.db :as db]
+   [fluree.indexer.tx :as tx]
    [fluree.indexer.model :as idxr-model]
    [fluree.indexer.protocols :as idxr-proto]
    [fluree.store.api :as store]
@@ -23,7 +24,7 @@
 
 (defn init-db
   [{:keys [store config db-map] :as idxr} ledger-name opts]
-  (let [db (db/create store (merge config opts))
+  (let [db (db/create store ledger-name (merge config opts))
         db-address (db/create-db-address db ledger-name)]
     (if (get @db-map db-address)
       db-address
@@ -34,13 +35,13 @@
 (defn stage-db
   [{:keys [store db-map] :as idxr} db-address data]
   (if-let [db-before (get @db-map db-address)]
-    (let [db-after   (<?? (jld-transact/stage (db/prepare db-before) data {}))
+    (let [{ledger-name :ledger/name} (db/db-path-parts db-address)
+          db-after                   (<?? (jld-transact/stage (db/prepare db-before) data {}))
           ;; This is a hack to sync t into various places since dbs shouldn't care about branches
           ;; used in do-index > refresh > index-update > empty-novelty
-          db-after   (assoc-in db-after [:commit :data :t] (- (:t db-after)))
+          db-after                   (assoc-in db-after [:commit :data :t] (- (:t db-after)))
 
-          db-address (db/create-db-address db-after)
-          idx        (-> db-after :ledger :indexer)
+          idx-writer (-> db-after :ledger :indexer)
 
           {:keys [context did private push?] :as _opts} data
 
@@ -48,26 +49,27 @@
                               (json-ld/parse-context (:context (:schema db-after)) context)
                               (:context (:schema db-after)))
                             (json-ld/parse-context {"f" "https://ns.flur.ee/ledger#"})
-                            jld-commit/stringify-context)
-
+                            (jld-commit/stringify-context))
           ctx-used-atom (atom {})
-          compact-fn (json-ld/compact-fn context* ctx-used-atom)
+          compact-fn    (json-ld/compact-fn context* ctx-used-atom)
 
           {:keys [assert retract] :as c}
           (<?? (jld-commit/commit-opts->data db-after {:compact-fn compact-fn :id-key "@id" :type-key "@type"}))
 
-          db-final (if (idx-proto/-index? idx db-after)
-                     (<?? (idx-proto/-index idx db-after))
-                     db-after)]
+          db-final (if (idx-proto/-index? idx-writer db-after)
+                     (<?? (idx-proto/-index idx-writer db-after))
+                     db-after)
+
+          tx-summary    (tx/create-tx-summary db-final @ctx-used-atom assert retract)
+          tx-summary-id (tx/create-tx-summary-id tx-summary)
+
+          db-address    (db/create-db-address db-after ledger-name tx-summary-id)]
+      ;; add an entry of db-address -> db
       (swap! db-map assoc db-address db-final)
-      {:db/address db-address
-       :db/v       0
-       :db/t       (- (:t db-final))
-       :db/flakes  (-> db-final :stats :flakes)
-       :db/size    (-> db-final :stats :size)
-       :db/context @ctx-used-atom
-       :db/assert  assert
-       :db/retract retract})
+      ;; write tx-summary to store
+      (store/write store (tx/tx-path ledger-name tx-summary-id) tx-summary)
+      ;; return db-summary, a truncated tx-summary
+      (tx/create-db-summary tx-summary db-address))
     (throw (ex-info "No such db-address." {:error      :stage/no-such-db
                                            :db-address db-address}))))
 

@@ -7,8 +7,8 @@
     [:reindex-min-bytes {:optional true} :int]
     [:reindex-max-bytes {:optional true} :int]]
    [:or
-    [:map [:pub/store-config {:optional true} store/StoreConfig]]
-    [:map [:pub/store {:optional true} store/Store]]]])
+    [:map [:idxr/store-config {:optional true} store/StoreConfig]]
+    [:map [:idxr/store {:optional true} store/Store]]]])
 
 (def Indexer
   [:map
@@ -16,21 +16,37 @@
 
 (def Db
   [:map
+   [:ledger [:map
+             [:method :keyword]
+             [:alias :string]
+             [:branch :keyword]
+             [:state :any]
+             [:indexer :map]
+             [:conn store/Store]]]
+   [:conn store/Store]
+   [:branch :keyword]
+   [:commit [:map
+             [:alias :string]
+             [:v :int]
+             [:branch :keyword]
+             [:data [:map [:t :int]]]]]
+   [:t :int]
+
+   [:tt-id :uuid]
+   [:alias :string]
+   [:method :any]
+   [:block :any]
+   [:stats :map]
+   [:spot :any]
+   [:psot :any]
+   [:post :any]
+   [:opst :any]
+   [:tspo :any]
+   [:schema :map]
+   [:comparators :any]
    [:novelty :map]
-   [:ledger/name :string]
-   [:db/t :int]
-   [:db/stats [:map
-               [:db/flakes :int]
-               [:db/size :int]
-               [:db/indexed :int]]]
-   [:db/spot :any]
-   [:db/psot :any]
-   [:db/post :any]
-   [:db/opst :any]
-   [:db/tspo :any]
-   [:db/schema :any]
-   [:db/permissions :any]
-   [:db/ecount :any]])
+   [:permissions :map]
+   [:ecount :map]])
 
 (def DbSummary
   [:map
@@ -38,7 +54,8 @@
    [:db/t :int]
    [:db/v :int]
    [:db/flakes :int]
-   [:db/size :int]])
+   [:db/size :int]
+   [:db/prev :string]])
 
 (def TxSummary
   [:and

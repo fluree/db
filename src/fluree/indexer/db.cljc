@@ -2,20 +2,33 @@
   (:require [fluree.db.db.json-ld :as jld-db]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.store.api :as store]
-            [fluree.db.indexer.default :as idx-default]))
+            [fluree.db.indexer.default :as idx-default]
+            [clojure.string :as str]
+            [fluree.common.identity :as ident]
+            [fluree.crypto :as crypto]
+            [fluree.json-ld :as json-ld]))
 
-(defn root-index-address
+(defn root-index-path
   "Returns the address of the index root, if it exists."
   [db]
-  (-> db :commit :index :address))
+  (let [addr (-> db :commit :index :address)
+        [_ _ _ path] (str/split addr #": ")]
+    path))
 
 (defn create-db-address
-  "Creates an address of the form `fluree:db:<store-type>:<ledger-name>/<root-address>/<tx-summary-address>`."
+  "Creates an address of the form `fluree:db:<store-type>:<ledger-name>/<tx-summary-address>`."
   ([db ledger-name]
    (create-db-address db ledger-name "init"))
-  ([db ledger-name tx-summary-address]
-   (let [root-address (root-index-address db)]
-     (store/address (:conn db) "db" (str ledger-name "/" (or root-address "init") "/" tx-summary-address)))))
+  ([db ledger-name tx-summary-id]
+   (store/address (:conn db) "db" (str ledger-name "/t/" tx-summary-id))))
+
+(defn db-path-parts
+  "Returns the ledger name from the db-address"
+  [db-address]
+  (let [path (:address/path (ident/address-parts db-address))
+        [ledger-name tx-summary-id] (str/split path #"/")]
+    {:ledger/name ledger-name
+     :tx/summary-id tx-summary-id}))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
@@ -52,9 +65,11 @@
                                        :t (or t 0)}}}}))
 
 (defn create
-  [store opts]
+  [store ledger-name opts]
   (jld-db/create (map->DummyLedger {:method nil
-                                    :alias ""
+                                    :network ledger-name
+                                    :alias ledger-name
+                                    :ledger-id "index"
                                     :branch :main
                                     :state (state-at-t 0 nil)
                                     :indexer (idx-default/create opts)
@@ -67,3 +82,22 @@
   temporary hack until we can move the branch mechanics to the ledger."
   [{:keys [t stats] :as db}]
   (assoc-in db [:ledger :state] (state-at-t (- t) stats)))
+
+(comment
+  (def db (create (store/start {:store/method :memory}) {}))
+  (-> db
+      :commit)
+  {:alias "", :v 0, :branch :main, :data {:t 0}}
+  :main
+  :main
+  (:method :alias :branch :state :indexer :conn)
+
+  (:ledger :conn :method :alias :branch :commit :block :t :tt-id :stats :spot :psot :post :opst :tspo :schema :comparators :novelty :permissions :ecount)
+
+  (create-db-address db "dan")
+  (ident/address-parts "fluree:db:memory:dan/init/init")
+  #:address{:ns "fluree", :type :db, :method :memory, :path "dan/init/init", :id "init"}
+  "fluree:db:memory:dan/init/init"
+
+
+  ,)
