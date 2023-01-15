@@ -9,7 +9,7 @@
    [fluree.db.util.async :refer [<?? go-try]]
    [fluree.db.util.log :as log]
    [fluree.indexer.db :as db]
-   [fluree.indexer.tx :as tx]
+   [fluree.indexer.tx-summary :as tx-summary]
    [fluree.indexer.model :as idxr-model]
    [fluree.indexer.protocols :as idxr-proto]
    [fluree.store.api :as store]
@@ -25,9 +25,9 @@
 (defn init-db
   [{:keys [store config db-map] :as idxr} ledger-name opts]
   (let [db (db/create store ledger-name (merge config opts))
-        db-address (db/create-db-address db ledger-name)]
+        db-address (db/create-db-address db (str ledger-name "/tx/init"))]
     (if (get @db-map db-address)
-      db-address
+      (throw (ex-info "Ledger db already exists." {:ledger ledger-name}))
       (do
         (swap! db-map assoc db-address db)
         db-address))))
@@ -60,16 +60,16 @@
                      (<?? (idx-proto/-index idx-writer db-after))
                      db-after)
 
-          tx-summary    (tx/create-tx-summary db-final @ctx-used-atom assert retract)
-          tx-summary-id (tx/create-tx-summary-id tx-summary)
+          ;; create tx-summary and write it to store
+          tx-summary      (tx-summary/create-tx-summary db-final @ctx-used-atom assert retract)
+          tx-summary-path (:path (<?? (store/write store (tx-summary/tx-path ledger-name) tx-summary {:content-address? true})))
 
-          db-address    (db/create-db-address db-after ledger-name tx-summary-id)]
+          db-address (db/create-db-address db-after tx-summary-path)]
       ;; add an entry of db-address -> db
       (swap! db-map assoc db-address db-final)
-      ;; write tx-summary to store
-      (store/write store (tx/tx-path ledger-name tx-summary-id) tx-summary)
+
       ;; return db-summary, a truncated tx-summary
-      (tx/create-db-summary tx-summary db-address))
+      (tx-summary/create-db-summary tx-summary db-address))
     (throw (ex-info "No such db-address." {:error      :stage/no-such-db
                                            :db-address db-address}))))
 

@@ -1,4 +1,4 @@
-(ns fluree.indexer.tx
+(ns fluree.indexer.tx-summary
   (:require [fluree.crypto :as crypto]
             [fluree.json-ld :as json-ld]))
 
@@ -18,10 +18,6 @@
       (dissoc :db/assert :db/retract :db/context)
       (assoc :db/address db-address)))
 
-(defn create-tx-summary-id
-  [tx-summary]
-  (crypto/sha2-256 (json-ld/normalize-data tx-summary)))
-
 (defn tx-path
-  [ledger-name tx-summary-id]
-  (str ledger-name "/index/" tx-summary-id))
+  [ledger-name]
+  (str ledger-name "/tx/"))

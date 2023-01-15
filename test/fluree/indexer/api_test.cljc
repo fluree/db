@@ -2,7 +2,8 @@
   (:require
    [clojure.test :as test :refer :all]
    [fluree.indexer.api :as idxr]
-   [fluree.store.api :as store]))
+   [fluree.store.api :as store]
+   [clojure.core.async :as async]))
 
 (deftest indexer
   (let [idxr (idxr/start {:reindex-min-bytes 1
@@ -32,30 +33,26 @@
                                           {:select {"?s" [:*]} :where [["?s" "@id" "http://dan.com/dan"]]})]
 
     (testing "initial db"
-      (is (= "fluree:db:memory:indexertest/t/init"
+      (is (= "fluree:db:memory:indexertest/tx/init"
              db0-address))
       (is (= [] db0-results)))
     (testing "consecutive stages"
       (is (= {:db/v 0
               :db/t 1
-              :db/address "fluree:db:memory:indexertest/t/97932cb8c1fe5eed05782ecaea44051b3a150822709d122e54ac4a50e5ec733b"
+              :db/address "fluree:db:memory:indexertest/tx/646b0fd9f7d067fbdc3afb8c0e60723f01a32eedae0e02be7093f6ec0c1a47c1"
               :db/flakes 6
               :db/size 518}
              db1-summary))
       (is (= {:db/v 0
               :db/t 2
-              :db/address "fluree:db:memory:indexertest/t/6e1fb1b747c48d9b76ba903eb6033b8d258f4e2926f5b7e23aed3d48196eeb8b"
+              :db/address "fluree:db:memory:indexertest/tx/ef0665f3b9413ba91fca80c110086301c044a4a5e47adc5d31c02f548e8b3454"
               :db/flakes 8
               :db/size 648}
              db2-summary))
       (is (= [{"@id" "http://dan.com/dan"
                "http://dan.com/prop1" "bar"
                "http://dan.com/prop2" "foo"}]
-             db2-results))
-
-
-
-      )
+             db2-results)))
     (testing "two sibling stages"
       (is (not= (:db/address db1-summary)
                 (:db/address sibling-stage-summary)))
@@ -65,4 +62,13 @@
       (is (= [{"@id" "http://dan.com/dan" "http://dan.com/prop1" "DIFFERENT BRANCH"}]
              sibling-stage-results)))
 
-    ))
+    (testing "indexer persistence"
+      (let [store (:store idxr)]
+        ;; TODO, test that they link to eachother
+        (is (= ["indexertest/tx/646b0fd9f7d067fbdc3afb8c0e60723f01a32eedae0e02be7093f6ec0c1a47c1"
+                "indexertest/tx/c214cee0034979b821546250d54a4719fe9f599fd2c3624bf664012bc5db161e"
+                "indexertest/tx/ef0665f3b9413ba91fca80c110086301c044a4a5e47adc5d31c02f548e8b3454"]
+               (sort (async/<!! (store/list store "indexertest/tx")))))
+        ;; index keys are nondeterministic, so can only assert count
+        (is (= 26
+               (count (async/<!! (store/list store "indexertest/index")))))))))

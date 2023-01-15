@@ -16,17 +16,15 @@
     path))
 
 (defn create-db-address
-  "Creates an address of the form `fluree:db:<store-type>:<ledger-name>/<tx-summary-address>`."
-  ([db ledger-name]
-   (create-db-address db ledger-name "init"))
-  ([db ledger-name tx-summary-id]
-   (store/address (:conn db) "db" (str ledger-name "/t/" tx-summary-id))))
+  "Creates an address of the form `fluree:db:<store-type>:<ledger-name>/tx/<tx-summary-address>`."
+  [db tx-summary-id]
+  (store/address (:conn db) "db" tx-summary-id))
 
 (defn db-path-parts
   "Returns the ledger name from the db-address"
   [db-address]
   (let [path (:address/path (ident/address-parts db-address))
-        [ledger-name tx-summary-id] (str/split path #"/")]
+        [ledger-name _ tx-summary-id] (str/split path #"/")]
     {:ledger/name ledger-name
      :tx/summary-id tx-summary-id}))
 
@@ -57,7 +55,7 @@
   [t stats]
   (atom {:branch :main
          :branches {:main {:name :main
-                           :commit {:alias ""
+                           :commit {:alias "COMMIT_ALIAS"
                                     :v 0
                                     :branch :main
                                     :data {:t (or t 0)}}
@@ -66,38 +64,22 @@
 
 (defn create
   [store ledger-name opts]
-  (jld-db/create (map->DummyLedger {:method nil
-                                    :network ledger-name
-                                    :alias ledger-name
-                                    :ledger-id "index"
-                                    :branch :main
-                                    :state (state-at-t 0 nil)
-                                    :indexer (idx-default/create opts)
-                                    ;; resolve-flake-slices looks for a Resolver under :conn
-                                    :conn store})))
-;; create at t0, update before every tx to hardcode commit t,
+  (-> (jld-db/create (map->DummyLedger {:branch :main
+                                        ;; method is actually :network used in prefix index branch and leaf keys
+                                        :method (str ledger-name "/index/")
+                                        ;; used as the :ledger-id in index branch and leaf keys
+                                        ;; leave it blank because we get the ledger name from network (:method)
+                                        ;; (network is a prefix to index node keys, ledger-id is inside the key)
+                                        :alias ""
+                                        :state (state-at-t 0 nil)
+                                        :indexer (idx-default/create opts)
+                                        ;; resolve-flake-slices looks for a Resolver under :conn
+                                        :conn store}))
+      ;; :network is used for the prefix of garbage and root node keys
+      (assoc :network (str ledger-name "/index/"))))
 
 (defn prepare
   "Hardcode the branch data so ->tx-state can figure out the next t and stats. This is a
   temporary hack until we can move the branch mechanics to the ledger."
   [{:keys [t stats] :as db}]
   (assoc-in db [:ledger :state] (state-at-t (- t) stats)))
-
-(comment
-  (def db (create (store/start {:store/method :memory}) {}))
-  (-> db
-      :commit)
-  {:alias "", :v 0, :branch :main, :data {:t 0}}
-  :main
-  :main
-  (:method :alias :branch :state :indexer :conn)
-
-  (:ledger :conn :method :alias :branch :commit :block :t :tt-id :stats :spot :psot :post :opst :tspo :schema :comparators :novelty :permissions :ecount)
-
-  (create-db-address db "dan")
-  (ident/address-parts "fluree:db:memory:dan/init/init")
-  #:address{:ns "fluree", :type :db, :method :memory, :path "dan/init/init", :id "init"}
-  "fluree:db:memory:dan/init/init"
-
-
-  ,)
