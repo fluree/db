@@ -33,7 +33,7 @@
     ;; for convenience, store the clj data instead of the serialized data
     (swap! storage-atom assoc path data)
     {:path    path
-     :address (address-memory "" path)
+     :address path
      :hash    hash}))
 
 (defn memory-read

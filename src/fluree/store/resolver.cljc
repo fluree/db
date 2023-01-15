@@ -22,15 +22,13 @@
                                                  :block :t :tt-id :tempid])
             child-attrs     (map-indexed (fn [i child]
                                            (-> branch-metadata
-                                               (assoc :leftmost? (and leftmost?
-                                                                      (zero? i)))
+                                               (assoc :leftmost? (and leftmost? (zero? i)))
                                                (merge child)))
                                          children)
             child-entries   (mapcat (juxt :first identity)
                                     child-attrs)]
         (apply flake/sorted-map-by comparator child-entries))
-      (throw (ex-info (str "Unable to retrieve index branch with id "
-                           id " from storage.")
+      (throw (ex-info (str "Unable to retrieve index branch " id " from storage.")
                       {:status 500, :error :db/storage-error})))))
 
 (defn read-leaf
