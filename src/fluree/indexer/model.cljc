@@ -51,11 +51,15 @@
 (def DbSummary
   [:map
    [:db/address :string]
+   [:db/root {:optional true} :string]
+   [:db/previous {:optional true} :string]
    [:db/t :int]
    [:db/v :int]
    [:db/flakes :int]
    [:db/size :int]
-   [:db/prev :string]])
+   [:db/opts [:map
+              [:reindex-min-bytes :int]
+              [:reindex-max-bytes :int]]]])
 
 (def TxSummary
   [:and

@@ -1,4 +1,5 @@
 (ns fluree.indexer.core
+  (:refer-clojure :exclude [load])
   (:require
    [clojure.core.async :as async]
    [fluree.common.model :as model]
@@ -14,7 +15,11 @@
    [fluree.indexer.protocols :as idxr-proto]
    [fluree.store.api :as store]
    [fluree.db.indexer.proto :as idx-proto]
-   [fluree.json-ld :as json-ld]))
+   [fluree.json-ld :as json-ld]
+   [fluree.common.identity :as ident]
+   [fluree.db.storage.core :as storage]
+   [fluree.db.json-ld.reify :as jld-reify]
+   [fluree.db.constants :as const]))
 
 (defn stop-indexer
   [idxr]
@@ -33,6 +38,7 @@
         db-address))))
 
 (defn stage-db
+  "Index the given data, then store a tx-summary."
   [{:keys [store db-map] :as idxr} db-address data]
   (if-let [db-before (get @db-map db-address)]
     (let [{ledger-name :ledger/name} (db/db-path-parts db-address)
@@ -62,13 +68,13 @@
                      db-after)
 
           ;; create tx-summary and write it to store
-          tx-summary      (tx-summary/create-tx-summary db-after @ctx-used-atom assert retract)
-          tx-summary-path (:path (<?? (store/write store (tx-summary/tx-path ledger-name) tx-summary
-                                                   {:content-address? true})))
+          tx-summary    (tx-summary/create-tx-summary db-after @ctx-used-atom assert retract)
+          tx-summary-id (:path (<?? (store/write store (tx-summary/tx-path ledger-name) tx-summary
+                                                 {:content-address? true})))
 
           ;; save newest tx-summary so the next stage knows the previous tx
-          db-final   (assoc db-after :tx-summary tx-summary-path)
-          db-address (db/create-db-address db-final tx-summary-path)]
+          db-final   (assoc db-after :tx-summary-id tx-summary-id)
+          db-address (db/create-db-address db-final tx-summary-id)]
       ;; add an entry of db-address -> db
       (swap! db-map assoc db-address db-final)
 
@@ -77,10 +83,75 @@
     (throw (ex-info "No such db-address." {:error      :stage/no-such-db
                                            :db-address db-address}))))
 
-(defn discard-db
-  [{:keys [store db-map] :as idxr} db-address]
-  (swap! db-map dissoc db-address)
-  :idxr/discarded)
+(defn load-tx-summaries
+  "Read each tx-summary's previous until we reach the stop t or run out of previous to follow."
+  [store head-tx-summary stop-t]
+  (loop [{:db/keys [previous]} head-tx-summary
+         summaries             (list head-tx-summary)]
+    (if-let [prev-summary (<?? (store/read store previous))]
+      (if (> (:db/t prev-summary) stop-t)
+        summaries
+        (recur prev-summary (conj summaries prev-summary)))
+      summaries)))
+
+(defn merge-tx-summary
+  "Merge the tx summary into novelty."
+  [db tx-summary]
+  (let [{:db/keys [assert retract context t]} tx-summary
+
+        iris                     (volatile! {})
+        refs                     (volatile! (-> db :schema :refs))
+
+        expanded-retract         (json-ld/expand retract)
+        expanded-assert          (json-ld/expand assert)
+        ;; these expect keyword :id :type, not strings, so we expand them
+        retract-flakes           (<?? (jld-reify/retract-flakes db expanded-retract t iris))
+        {:keys [flakes pid sid]} (<?? (jld-reify/assert-flakes db expanded-assert t iris refs))
+        all-flakes               (-> (empty (get-in db [:novelty :spot]))
+                                     (into retract-flakes)
+                                     (into flakes))
+        ecount                   (assoc (:ecount db)
+                                        const/$_predicate pid
+                                        const/$_default sid)
+        db*                      (assoc db :ecount ecount)]
+    (jld-reify/merge-flakes db* t @refs all-flakes)))
+
+(defn load-db
+  "If given db-address doesn't exist, try to recreate it from index files in store, and
+  then rebuild novelty with tx-summaries."
+  [{:keys [store db-map] :as idxr} db-address opts]
+  (if-let [db (get @db-map db-address)]
+    ;; already loaded
+    (let [tx-summary (<?? (store/read store (:tx-summary-id db)))]
+      ;; update opts
+      (swap! db-map update db-address db/update-index-writer-opts opts)
+      (tx-summary/create-db-summary tx-summary db-address))
+
+    ;; rebuild db from persisted data
+    (let [tx-summary-id (:address/path (ident/address-parts db-address))
+          tx-summary    (<?? (store/read store tx-summary-id))
+
+          {ledger-name :ledger/name}        (db/db-path-parts db-address)
+          {:db/keys [root previous t opts]} tx-summary
+
+          ;; create a blank db
+          blank-db   (db/create store ledger-name opts)
+          ;; load it up with the indexes persisted to disk
+          indexed-db (<?? (storage/reify-db store blank-db root))
+          ;; find all the outstanding tx summaries
+          tx-summaries (load-tx-summaries store tx-summary (:t indexed-db))
+          ;; merge each tx-summary into novelty
+          loaded-db (reduce merge-tx-summary
+                            indexed-db
+                            tx-summaries)
+
+          rebuilt-tx-summary (tx-summary/create-tx-summary loaded-db
+                                                           (:db/context tx-summary)
+                                                           (:db/assert tx-summary)
+                                                           (:db/retract tx-summary))]
+      ;; fully loaded
+      (swap! db-map assoc db-address loaded-db)
+      (tx-summary/create-db-summary rebuilt-tx-summary db-address))))
 
 (defn query-db
   [{:keys [store db-map] :as idxr} db-address query]
@@ -96,6 +167,7 @@
 
   idxr-proto/Indexer
   (init [idxr ledger-name opts] (init-db idxr ledger-name opts))
+  (load [idxr db-address opts] (load-db idxr db-address opts))
   (stage [idxr db-address data] (stage-db idxr db-address data))
   (query [idxr db-address query] (query-db idxr db-address query))
   (explain [idxr db-address query] (throw (ex-info "TODO" {:todo :explain-not-implemented}))))
@@ -126,9 +198,9 @@
   [idxr db-address data]
   (idxr-proto/stage idxr db-address data))
 
-(defn discard
-  [idxr db-address]
-  (idxr-proto/discard idxr db-address))
+(defn load
+  [idxr db-address opts]
+  (idxr-proto/load idxr db-address opts))
 
 (defn query
   [idxr db-address query]

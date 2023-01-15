@@ -62,6 +62,18 @@
                            :latest-db {:stats (or stats {:size 0 :flakes 0})
                                        :t (or t 0)}}}}))
 
+(defn prepare
+  "Hardcode the branch data so ->tx-state can figure out the next t and stats. This is a
+  temporary hack until we can move the branch mechanics to the ledger."
+  [{:keys [t stats] :as db}]
+  (assoc-in db [:ledger :state] (state-at-t (- t) stats)))
+
+(defn update-index-writer-opts
+  "Change `reindex-min-bytes` or `reindex-max-bytes` of an existing Db."
+  [db opts]
+  (let [index-writer-state-atom (-> db :indexer :state-atom)]
+    (assoc db :indexer (idx-default/create (merge {:state-atom index-writer-state-atom} opts)))))
+
 (defn create
   [store ledger-name opts]
   (-> (jld-db/create (map->DummyLedger {:branch :main
@@ -77,9 +89,3 @@
                                         :conn store}))
       ;; :network is used for the prefix of garbage and root node keys
       (assoc :network (str ledger-name "/index/"))))
-
-(defn prepare
-  "Hardcode the branch data so ->tx-state can figure out the next t and stats. This is a
-  temporary hack until we can move the branch mechanics to the ledger."
-  [{:keys [t stats] :as db}]
-  (assoc-in db [:ledger :state] (state-at-t (- t) stats)))

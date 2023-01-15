@@ -48,9 +48,7 @@
         {:keys [errors db/address] :as db-summary} (idxr/stage idxr db-address tx)]
     ;; TODO: figure out what auth/schema errors look like
     (if errors
-      (do
-        (idxr/discard address)
-        errors)
+      errors
       (let [commit-summary (txr/commit txr tx (assoc db-summary
                                                      :commit/prev commit-address
                                                      :ledger/name (:ledger/name ledger)))
