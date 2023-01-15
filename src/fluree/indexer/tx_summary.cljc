@@ -3,19 +3,22 @@
             [fluree.json-ld :as json-ld]))
 
 (defn create-tx-summary
-  [db-final context asserts retracts]
-  {:db/v 0
-   :db/t (- (:t db-final))
-   :db/flakes (-> db-final :stats :flakes)
-   :db/size (-> db-final :stats :size)
-   :db/context context
-   :db/assert asserts
-   :db/retract retracts})
+  [{:keys [tx-summary] :as db} context asserts retracts]
+  (cond-> {:db/v 0
+           :db/t (- (:t db))
+           :db/flakes (-> db :stats :flakes)
+           :db/size (-> db :stats :size)
+           :db/context context
+           :db/assert asserts
+           :db/retract retracts}
+    tx-summary (assoc :db/previous tx-summary)))
 
 (defn create-db-summary
   [tx-summary db-address]
   (-> tx-summary
-      (dissoc :db/assert :db/retract :db/context)
+      ;; assert, retract, and context depend on user-supplied information, can be large
+      ;; previous is indexer-local state, by not sharing it we can collect as garbage if we need to
+      (dissoc :db/assert :db/retract :db/context :db/previous)
       (assoc :db/address db-address)))
 
 (defn tx-path

@@ -45,6 +45,7 @@
 
           {:keys [context did private push?] :as _opts} data
 
+          ;; create the information necessary for tx-summary
           context*      (-> (if context
                               (json-ld/parse-context (:context (:schema db-after)) context)
                               (:context (:schema db-after)))
@@ -52,19 +53,22 @@
                             (jld-commit/stringify-context))
           ctx-used-atom (atom {})
           compact-fn    (json-ld/compact-fn context* ctx-used-atom)
-
           {:keys [assert retract] :as c}
           (<?? (jld-commit/commit-opts->data db-after {:compact-fn compact-fn :id-key "@id" :type-key "@type"}))
 
-          db-final (if (idx-proto/-index? idx-writer db-after)
+          ;; kick off indexing if necessary
+          db-after (if (idx-proto/-index? idx-writer db-after)
                      (<?? (idx-proto/-index idx-writer db-after))
                      db-after)
 
           ;; create tx-summary and write it to store
-          tx-summary      (tx-summary/create-tx-summary db-final @ctx-used-atom assert retract)
-          tx-summary-path (:path (<?? (store/write store (tx-summary/tx-path ledger-name) tx-summary {:content-address? true})))
+          tx-summary      (tx-summary/create-tx-summary db-after @ctx-used-atom assert retract)
+          tx-summary-path (:path (<?? (store/write store (tx-summary/tx-path ledger-name) tx-summary
+                                                   {:content-address? true})))
 
-          db-address (db/create-db-address db-after tx-summary-path)]
+          ;; save newest tx-summary so the next stage knows the previous tx
+          db-final   (assoc db-after :tx-summary tx-summary-path)
+          db-address (db/create-db-address db-final tx-summary-path)]
       ;; add an entry of db-address -> db
       (swap! db-map assoc db-address db-final)
 

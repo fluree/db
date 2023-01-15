@@ -39,15 +39,15 @@
     (testing "consecutive stages"
       (is (= {:db/v 0
               :db/t 1
-              :db/address "fluree:db:memory:indexertest/tx/646b0fd9f7d067fbdc3afb8c0e60723f01a32eedae0e02be7093f6ec0c1a47c1"
               :db/flakes 6
-              :db/size 518}
+              :db/size 518
+              :db/address "fluree:db:memory:indexertest/tx/646b0fd9f7d067fbdc3afb8c0e60723f01a32eedae0e02be7093f6ec0c1a47c1"}
              db1-summary))
       (is (= {:db/v 0
               :db/t 2
-              :db/address "fluree:db:memory:indexertest/tx/ef0665f3b9413ba91fca80c110086301c044a4a5e47adc5d31c02f548e8b3454"
               :db/flakes 8
-              :db/size 648}
+              :db/size 648
+              :db/address "fluree:db:memory:indexertest/tx/0eaaacd3eb8d6d938f2ea2430582b26149aecc01992ac036f35a929da75719d9"}
              db2-summary))
       (is (= [{"@id" "http://dan.com/dan"
                "http://dan.com/prop1" "bar"
@@ -64,10 +64,9 @@
 
     (testing "indexer persistence"
       (let [store (:store idxr)]
-        ;; TODO, test that they link to eachother
-        (is (= ["indexertest/tx/646b0fd9f7d067fbdc3afb8c0e60723f01a32eedae0e02be7093f6ec0c1a47c1"
-                "indexertest/tx/c214cee0034979b821546250d54a4719fe9f599fd2c3624bf664012bc5db161e"
-                "indexertest/tx/ef0665f3b9413ba91fca80c110086301c044a4a5e47adc5d31c02f548e8b3454"]
+        (is (= ["indexertest/tx/0eaaacd3eb8d6d938f2ea2430582b26149aecc01992ac036f35a929da75719d9"
+                "indexertest/tx/646b0fd9f7d067fbdc3afb8c0e60723f01a32eedae0e02be7093f6ec0c1a47c1"
+                "indexertest/tx/c214cee0034979b821546250d54a4719fe9f599fd2c3624bf664012bc5db161e"]
                (sort (async/<!! (store/list store "indexertest/tx")))))
         ;; index keys are nondeterministic, so can only assert count
         (is (= 26
