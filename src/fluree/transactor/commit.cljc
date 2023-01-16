@@ -11,21 +11,20 @@
   (store/address store :commit path))
 
 (defn create
-  [tx db-info]
-  (let [{:keys [db/t db/size commit/prev txr/store ledger/name]}
-        db-info
-        ;; TODO: properly figure out asserts, retracts
-        commit-tx      (cond-> {:commit/size size
-                                :commit/tx tx
-                                :commit/t t
-                                ;; hardcode v to 0 until we need additional versions
-                                :commit/v 0}
-                         prev (assoc :commit/prev prev))
+  [store tx tx-info]
+  (let [{:keys [commit/t commit/prev ledger/name]} tx-info
 
-        commit-data    (json/stringify commit-tx)
+        commit-data    (json/stringify tx)
+        size           (count commit-data)
         hash           (crypto/sha2-256 commit-data)
         path           (str name "/commit/" hash)
-        commit-address (create-commit-address store path)]
+        commit-address (create-commit-address store path)
+        commit (cond-> {:commit/size size
+                        :commit/tx tx
+                        :commit/t t
+                        ;; hardcode v to 0 until we need additional versions
+                        :commit/v 0}
+                 prev (assoc :commit/prev prev))]
     {:address commit-address
      :hash    hash
-     :value   commit-tx}))
+     :value   commit}))

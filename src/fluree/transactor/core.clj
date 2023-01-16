@@ -10,10 +10,16 @@
             [fluree.transactor.model :as txr-model]
             [fluree.transactor.protocols :as txr-proto]))
 
+(defn stop-transactor
+  [txr]
+  (log/info (str "Stopping transactor " (service-proto/id txr) "."))
+  (store/stop (:store txr))
+  :stopped)
+
 (defn write-commit
   [txr tx tx-info]
   (let [store       (:store txr)
-        commit      (commit/create tx (assoc tx-info :txr/store store))
+        commit      (commit/create store tx tx-info)
         commit-info (merge (select-keys commit [:address :hash])
                            (dissoc (:value commit) :commit/assert :commit/retract :commit/tx :commit/context))
 
@@ -21,12 +27,6 @@
     ;; TODO: use :content-address? write opt to get commit-path
     (<?? (store/write store commit-path commit))
     commit-info))
-
-(defn stop-transactor
-  [txr]
-  (log/info (str "Stopping transactor " (service-proto/id txr) "."))
-  (store/stop (:store txr))
-  :stopped)
 
 (defn resolve-commit
   [txr commit-address]

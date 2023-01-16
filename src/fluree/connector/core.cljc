@@ -42,21 +42,22 @@
         ledger              (pub/pull pub ledger-address)
         {head :ledger/head} (get ledger :cred/credential-subject ledger)
 
+        ;; lookup latest db
         db-address     (-> head :entry/db-summary :db/address)
-        commit-address (-> head :entry/commit-summary :commit/address)
+        ;; lookup latest commit
+        {commit-address :commit/address prev-t :commit/t}
+        (-> head :entry/commit-summary)
 
-        {:keys [errors] :as db-summary} (idxr/stage idxr db-address tx)]
-    ;; TODO: figure out what auth/schema errors look like
-    (if errors
-      errors
-      (let [commit-summary (txr/commit txr tx (assoc db-summary
-                                                     :commit/prev commit-address
-                                                     :ledger/name (:ledger/name ledger)))
-            ledger-cred (pub/push pub ledger-address
-                                  {:commit-summary commit-summary
-                                   :db-summary (select-keys db-summary [:db/address :db/t :db/flakes :db/size
-                                                                        :ledger/name])})]
-        ledger-cred))))
+        ;; write tx in next commit
+        commit-summary (txr/commit txr tx {:commit/t (inc (or prev-t 0))
+                                           :commit/prev commit-address
+                                           :ledger/name (:ledger/name ledger)})
+        ;; update commit head
+        _ (pub/push pub ledger-address {:commit-summary commit-summary})
+        ;; submit tx for indexing
+        db-summary (idxr/stage idxr db-address tx)]
+    ;; update db head
+    (pub/push pub ledger-address {:db-summary db-summary})))
 
 (defn load-commits
   "While commit-t is greater than indexed-t, walk back through ledger heads to find commit

@@ -44,11 +44,10 @@
 
 (def TxInfo
   "This is the input to commit/create, along with the tx."
-  [:and
-   idxr/DbSummary
-   [:map
-    [:ledger/name :string]
-    [:commit/prev {:optional true} :string]]])
+  [:map
+   [:ledger/name :string]
+   [:commit/t :int]
+   [:commit/prev {:optional true} :string]])
 
 (def TransactorConfig
   [:or
