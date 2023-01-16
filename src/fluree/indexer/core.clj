@@ -19,7 +19,8 @@
    [fluree.common.identity :as ident]
    [fluree.db.storage.core :as storage]
    [fluree.db.json-ld.reify :as jld-reify]
-   [fluree.db.constants :as const]))
+   [fluree.db.constants :as const]
+   [fluree.db.json-ld.bootstrap :as bootstrap]))
 
 (defn stop-indexer
   [idxr]
@@ -29,7 +30,7 @@
 
 (defn init-db
   [{:keys [store config db-map] :as idxr} ledger-name opts]
-  (let [db (db/create store ledger-name (merge config opts))
+  (let [db         (bootstrap/blank-db (db/create store ledger-name opts))
         db-address (db/create-db-address db (str ledger-name "/tx/init"))]
     (if (get @db-map db-address)
       (throw (ex-info "Ledger db already exists." {:ledger ledger-name}))
@@ -135,9 +136,11 @@
           {:db/keys [root previous t opts]} tx-summary
 
           ;; create a blank db
-          blank-db   (db/create store ledger-name opts)
+          blank-db   (bootstrap/blank-db (db/create store ledger-name opts))
           ;; load it up with the indexes persisted to disk
-          indexed-db (<?? (storage/reify-db store blank-db root))
+          indexed-db (if root
+                       (<?? (storage/reify-db store blank-db root))
+                         blank-db)
           ;; find all the outstanding tx summaries
           tx-summaries (load-tx-summaries store tx-summary (:t indexed-db))
           ;; merge each tx-summary into novelty

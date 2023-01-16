@@ -2,13 +2,9 @@
   (:require [fluree.store.api :as store]))
 
 (def IndexerConfig
-  [:and
-   [:map
-    [:reindex-min-bytes {:optional true} :int]
-    [:reindex-max-bytes {:optional true} :int]]
-   [:or
-    [:map [:idxr/store-config {:optional true} store/StoreConfig]]
-    [:map [:idxr/store {:optional true} store/Store]]]])
+  [:or
+   [:map [:idxr/store-config {:optional true} store/StoreConfig]]
+   [:map [:idxr/store {:optional true} store/Store]]])
 
 (def Indexer
   [:map
