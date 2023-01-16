@@ -17,12 +17,12 @@
              out-file2 (str out-path "file2")
              out2      "memory2"]
          (is (= {:path    "store-test/file1"
-                 :address "fluree::file:store-test/file1"
+                 :address "store-test/file1"
                  :hash    "e27228f856bc2c87ab496cfa21d658b199b4f0ff3b46fd1d364227c22ac3f6bc"}
                 (<?? (store/write file-store out-file1 out1))))
          (is (= out1 (<?? (store/read file-store out-file1))))
          (is (= {:path    "store-test/file2",
-                 :address "fluree::file:store-test/file2",
+                 :address "store-test/file2",
                  :hash    "d8d10740f7b7b16830f652ed9faa81e81f126c14fc3d924f87b2b7d776bc1667"}
                 (<?? (store/write file-store out-file2 out2))))
          (is (= out2 (<?? (store/read file-store out-file2))))
@@ -53,12 +53,12 @@
              out-file2 (str out-path "file2")
              out2      "memory2"]
          (is (= {:path    "store-test/file1"
-                 :address "fluree::file:store-test/file1"
+                 :address "store-test/file1"
                  :hash    "e27228f856bc2c87ab496cfa21d658b199b4f0ff3b46fd1d364227c22ac3f6bc"}
                 (<?? (store/write file-store out-file1 out1))))
          (is (= out1 (<?? (store/read file-store out-file1))))
          (is (= {:path    "store-test/file2",
-                 :address "fluree::file:store-test/file2",
+                 :address "store-test/file2",
                  :hash    "d8d10740f7b7b16830f652ed9faa81e81f126c14fc3d924f87b2b7d776bc1667"}
                 (<?? (store/write file-store out-file2 out2))))
          (is (= out2 (<?? (store/read file-store out-file2))))
@@ -86,12 +86,12 @@
         out-file2 (str out-path "file2")
         out2      "memory2"]
     (is (= {:path "store-test/file1"
-            :address "fluree::memory:store-test/file1"
+            :address "store-test/file1"
             :hash "e27228f856bc2c87ab496cfa21d658b199b4f0ff3b46fd1d364227c22ac3f6bc"}
            (<?? (store/write mem-store out-file1 out1))))
     (is (= out1 (<?? (store/read mem-store out-file1))))
     (is (= {:path "store-test/file2",
-            :address "fluree::memory:store-test/file2",
+            :address "store-test/file2",
             :hash "d8d10740f7b7b16830f652ed9faa81e81f126c14fc3d924f87b2b7d776bc1667"}
            (<?? (store/write mem-store out-file2 out2))))
     (is (= out2 (<?? (store/read mem-store out-file2))))
