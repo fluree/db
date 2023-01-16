@@ -5,17 +5,6 @@
 (def Commit
   "This data structure gets written in the Store."
   [:map
-   [:commit/assert
-    {:doc "The subjects and properties asserted in a transaction."}
-    [:sequential :map]]
-   [:commit/retract
-    {:doc "The subjects and properties retracted in a transaction."}
-    [:sequential :map]]
-   ;; do we need this? could be expanded...
-   [:commit/context
-    {:doc "The JSON-LD context used in the transaction."}
-    :map]
-
    [:commit/t
     {:doc "The transaction `t`."}
     :int]
@@ -23,16 +12,16 @@
     {:doc "The version of this Commit structure."}
     :int]
    ;; this puts the method in the hashing zone... bad idea?
+   [:commit/size
+    {:doc "The size in bytes of the tx."}
+    :number]
+
    [:commit/prev
     {:doc "The address of the previous commit."
      :optional true}
     :string]
-
-   [:commit/size
-    {:doc "The size in bytes of the commit."}
-    :number]
-   [:commit/flakes
-    {:doc "The number of flakes in the db associated with the commit."}
+   [:commit/tx
+    {:doc "The "}
     :int]])
 
 ;; TODO: I think this is more generic and should live somewhere else.
@@ -46,14 +35,12 @@
 (def CommitSummary
   "This is returned by transactor/commit."
   [:map
-   [:address :string]
-   [:hash :string]
-   [:type [:enum :commit]]
+   [:commit/address :string]
+   [:commit/hash :string]
    [:commit/t :int]
    [:commit/v :int]
    [:commit/prev {:optional true} :string]
-   [:commit/size :int]
-   [:commit/flakes :int]])
+   [:commit/size :int]])
 
 (def TxInfo
   "This is the input to commit/create, along with the tx."

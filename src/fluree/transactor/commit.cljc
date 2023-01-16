@@ -12,15 +12,10 @@
 
 (defn create
   [tx db-info]
-  (let [{:keys [db/address db/context db/t db/flakes db/size db/assert db/retract
-                commit/prev txr/store ledger/name]}
+  (let [{:keys [db/t db/size commit/prev txr/store ledger/name]}
         db-info
         ;; TODO: properly figure out asserts, retracts
-        commit-tx      (cond-> {:type :commit
-                                :commit/size size
-                                :commit/flakes flakes
-                                :commit/assert assert
-                                :commit/retract retract
+        commit-tx      (cond-> {:commit/size size
                                 :commit/tx tx
                                 :commit/t t
                                 ;; hardcode v to 0 until we need additional versions
