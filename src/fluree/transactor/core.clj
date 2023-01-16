@@ -18,6 +18,7 @@
                            (dissoc (:value commit) :commit/assert :commit/retract :commit/tx :commit/context))
 
         {commit-path :address/path} (ident/address-parts (:address commit))]
+    ;; TODO: use :content-address? write opt to get commit-path
     (<?? (store/write store commit-path commit))
     commit-info))
 

@@ -58,7 +58,28 @@
                                                                         :ledger/name])})]
         ledger-cred))))
 
+(defn load-commits
+  "While commit-t is greater than indexed-t, walk back through ledger heads to find commit
+  addresses until we find the last indexed-t or the first commit. Then resolve all the
+  commits."
+  [{:keys [txr pub] :as _conn} head indexed-t]
+  (loop [ledger-entry head
+         commit-addresses '()]
+    (let [{:keys [entry/previous entry/commit-summary]} ledger-entry
+          {:keys [commit/address commit/t]} commit-summary]
+      (if (> t indexed-t)
+        (if previous
+          (let [prev-ledger (pub/pull pub previous)
+                {prev-entry :ledger/head} (get prev-ledger :cred/credential-subject prev-ledger)]
+            (recur prev-entry (conj commit-addresses address)))
+          ;; reached first commit
+          (map (partial txr/resolve txr) commit-addresses))
+        ;; reached indexed commit
+        (map (partial txr/resolve txr) commit-addresses)))))
+
 (defn load-ledger
+  "Load the index and make sure it's up-to-date to ensure it is ready to handle new
+  transactions and queries."
   [conn ledger-address opts]
   (let [{txr :transactor pub :publisher idxr :indexer} conn
 
@@ -69,34 +90,18 @@
 
         {head :ledger/head} (get ledger :cred/credential-subject ledger)
 
-        db-summary     (-> head :entry/db-summary)
-        commit-summary (-> head :entry/commit-summary)]
-    ;; load db at t
-    ;; if it's less than commit-t, stage commits in order starting at (inc db-t)
-    (if false
-        ;; TODO: attempt to load index first
-        :TODO #_(idxr/load idxr db-address)
-        ;; fall back to re-staging commits
-        (let [commits (loop [ledger-entry head
-                             commit-addresses '()]
-                        (let [{:keys [entry/previous entry/commit-summary]} ledger-entry
-                              {:keys [address]} commit-summary]
-                          (if previous
-                            (let [prev-ledger (pub/pull pub previous)
-                                  {prev-entry :ledger/head} (get prev-ledger :cred/credential-subject prev-ledger)]
-                              (recur prev-entry (conj commit-addresses address)))
-                            (map (partial txr/resolve txr) commit-addresses))))
+        db-summary (-> head :entry/db-summary)
+        commit-summary (-> head :entry/commit-summary)
 
-              db-summary (reduce (fn [db-summary {:keys [commit/tx]}]
-                                   (idxr/stage idxr (:db/address db-summary) tx))
-                                 {:db/address (idxr/init idxr {})}
-                                 commits)
-
-              ledger-cred (pub/push pub ledger-address
-                                    {:commit-summary commit-summary
-                                     :db-summary (select-keys db-summary [:db/address :db/t :db/flakes :db/size
-                                                                          :ledger/name])})]
-          ledger-cred))))
+        ;; load the un-indexed commits
+        commits (load-commits conn head (- (:db/t db-summary)))
+        ;; re-stage the commits in order
+        db-summary (reduce (fn [db-summary {:keys [commit/tx]}]
+                             (idxr/stage idxr (:db/address db-summary) tx))
+                           ;; load the db so it's ready to stage against
+                           (:db/address (idxr/load idxr (:db/address db-summary) opts))
+                           commits)]
+    ledger))
 
 (defn query-ledger
   [conn ledger-address query opts]
