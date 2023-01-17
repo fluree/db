@@ -22,10 +22,10 @@
 
 (defn load
   "Prepare a ledger for transacting and querying."
-  ([conn ledger-name]
-   (load conn ledger-name {}))
-  ([conn ledger-name opts]
-   (conn-impl/load conn ledger-name opts)))
+  ([conn ledger-address]
+   (conn-impl/load conn ledger-address {}))
+  ([conn ledger-address opts]
+   (conn-impl/load conn ledger-address opts)))
 
 (defn list
   "List ledgers on this connection."

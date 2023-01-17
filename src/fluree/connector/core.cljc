@@ -68,7 +68,7 @@
          commit-addresses '()]
     (let [{:keys [entry/previous entry/commit-summary]} ledger-entry
           {:keys [commit/address commit/t]} commit-summary]
-      (if (> t indexed-t)
+      (if (and t indexed-t (> t indexed-t))
         (if previous
           (let [prev-ledger (pub/pull pub previous)
                 {prev-entry :ledger/head} (get prev-ledger :cred/credential-subject prev-ledger)]

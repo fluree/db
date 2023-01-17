@@ -3,8 +3,16 @@
             [donut.system :as ds]
             [fluree.http-server.api :as http-server]
             [clojure.java.io :as io]
-            [clojure.walk :as walk])
+            [clojure.walk :as walk]
+            [fluree.db.util.log :as log])
   (:gen-class))
+
+(defn initialize
+  "Load all ledgers."
+  [conn config]
+  (log/info "Initializing fluree-server." {:config config})
+  (doseq [ledger (conn/list conn)]
+    (conn/load conn (:ledger/address ledger))))
 
 (defn app
   [conn]
@@ -44,11 +52,14 @@
   {::ds/defs
    {:config {:fluree/http-server {:port 58090}
              :fluree/connection
-             {:conn/store-config {:store/method :memory}
+             {:conn/store-config {:store/method :file
+                                  :file-store/storage-path "dev/data"
+                                  :file-store/serialize-to :edn}
               :conn/indexer-config {:reindex-min-bytes 10}}}
     :services
     {:http-server #::ds{:start (fn [{{:keys [port conn]} ::ds/config}]
-                                 (println "staring fluree-server http-server" (pr-str {:port port :conn conn}))
+                                 (initialize conn {})
+                                 (log/info "Starting fluree-server http-server." {:port port})
                                  (http-server/start {:http/port port :http/routes (app conn)}))
                         :stop (fn [{http-server ::ds/instance}]
                                 (http-server/stop http-server))
@@ -56,7 +67,7 @@
                                  :conn (ds/ref [:services :conn])}}
 
      :conn #::ds{:start (fn [{config ::ds/config}]
-                          (println "staring fluree-server connection" (pr-str config))
+                          (log/info "Creating fluree-server connection." config)
                           (conn/connect config))
                  :stop (fn [{conn ::ds/instance}]
                          (conn/close conn))
