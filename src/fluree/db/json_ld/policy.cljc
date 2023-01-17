@@ -23,6 +23,12 @@
   #{:f/$identity})
 
 
+(defn restricted-allow-rule?
+  "Returns true if an allow rule contains restrictions (e.g. :f/equals or other restriction properties)."
+  [allow-rule]
+  (->> (keys allow-rule)
+       (some restriction-properties)))
+
 (defn all-policies
   [db]
   (go-try
@@ -266,14 +272,15 @@
           default-key-seqs      (map #(vector :class %) class-sids)
           default-allow-keys    (when default-allow
                                   (map #(conj % :default) default-key-seqs))
-          default-restrictions  (->> default-allow
-                                     util/sequential
-                                     (map #(compile-allow-rule db default-allow-keys %))
-                                     async/merge
-                                     (async/reduce
-                                       (fn [acc result]
-                                         (into acc result)) [])
-                                     <?)
+          default-restrictions  (when default-allow
+                                  (->> default-allow
+                                       util/sequential
+                                       (map #(compile-allow-rule db default-allow-keys %))
+                                       async/merge
+                                       (async/reduce
+                                         (fn [acc result]
+                                           (into acc result)) [])
+                                       <?))
           property-restrictions (when-let [prop-policies (-> policy :f/property util/sequential not-empty)]
                                   (->> prop-policies
                                        (map #(compile-prop-policy db default-key-seqs %))
@@ -285,26 +292,73 @@
       (concat default-restrictions property-restrictions))))
 
 
+
+(defn root-policy?
+  "A policy and be a 'root' (all access) policy if these 3 conditions apply:
+   1) :f/targetNode value of :f/allNodes
+   2) top-level (default) :f/allow rule that has no restrictions
+   3) no additional property restrictions for the respective :f/action granted - so a policy could give
+      root view access, but not have root modify access - for example"
+  [node-policy nodes]
+  (let [uses-allNodes?  (some #(= :f/allNodes %) nodes)
+        root-candidates (reduce
+                          (fn [actions next-policy]
+                            (if (restricted-allow-rule? next-policy)
+                              ;; allow policy is restricted, therefore not 'root'
+                              actions
+                              (into actions (map :id (:f/action node-policy)))))
+                          #{} (:f/allow node-policy))]
+    (when
+      (and uses-allNodes?
+           (not-empty root-candidates))
+      ;; we have actions that appear to have root access, need to verify there
+      ;; are no property restrictions for any of the "root" permission actions
+      ;; if so, they need to be excluded as they don't have root
+      (if (:f/property node-policy)
+        (reduce
+          (fn [root-candidates next-property]
+            (let [prop-allow   (:f/allow next-property)
+                  prop-actions (map :id (:f/action prop-allow))]
+              ;; remove any property actions that might be in root candidates
+              (apply disj root-candidates prop-actions)))
+          root-candidates
+          (:f/property node-policy))
+        root-candidates))))
+
+
 (defn compile-node-policy
-  "Compiles a node rule (where :f/targetNode is used)"
+  "Compiles a node rule (where :f/targetNode is used).
+
+  :f/targetNode that uses the special keyword :f/allNodes means that the target is for
+  everything in the database. This is typically how a global 'root' policy role is
+  established.  "
   [db policy nodes]
   (go-try
-    (let [node-sids            (<? (subids db nodes))
+    (let [all-nodes?           (some #(= :f/allNodes %) nodes)
+          ;; root policy is where we have a default top-level :f/allow policy that has no restrictions
+          root-policy?         (and all-nodes?
+                                    (->> policy :f/allow (some (complement restricted-allow-rule?))))
+          node-sids            (<? (subids db nodes))
           default-allow        (not-empty (get policy :f/allow))
+          default-key-seqs     (map #(vector :node %) node-sids)
+          default-allow-keys   (when default-allow
+                                 (map #(conj % :default) default-key-seqs))
           default-restrictions (when default-allow
-                                 #_(if (sequential? default-allow)
-                                     (<? (compile-allow-rule db (first default-allow)))
-                                     (<? (compile-allow-rule db default-allow))))]
+                                 (->> default-allow
+                                      util/sequential
+                                      (map #(compile-allow-rule db default-allow-keys %))
+                                      async/merge
+                                      (async/reduce
+                                        (fn [acc result]
+                                          (into acc result)) [])
+                                      <?))]
       (when (:f/property policy)
-        (log/warn "Currently, property based restrictions are not yet enforced. Found for nodes: " nodes))
+        (log/warn "Currently, property based restrictions on nodes are not yet enforced. Found for: " nodes))
       ;; for each class targeted by the rule, map to each compiled fn
-      (if (and (= [:f/allNodes] nodes)
+      (if (and all-nodes?
                (nil? (->> node-sids first (get default-restrictions))))
-        {:root? true}
-        (reduce
-          (fn [acc node-sid]
-            (assoc acc node-sid default-restrictions))
-          {} node-sids)))))
+        [[[:root?] true]]
+        default-restrictions))))
 
 
 (defn compile-policy
@@ -368,4 +422,4 @@
   ;; TODO - not yet paying attention to verifiable credentials that are present
   (go-try
     (assoc db :permissions
-              (<? (permission-map db #{:f/view} identity role credential)))))
+              (<? (permission-map db identity role credential)))))

@@ -27,8 +27,8 @@
                           ;; note, classes will return empty list if none found ()
                           (swap! (:cache permissions) assoc s classes)
                           classes))
-          fns       (keep #(or (get-in permissions [:view :class % p])
-                               (get-in permissions [:view :class % :default])) class-ids)]
+          fns       (keep #(or (get-in permissions [:f/view :class % p :function])
+                               (get-in permissions [:f/view :class % :default :function])) class-ids)]
       (loop [[[async? f] & r] fns]
         ;; TODO - all fns are currently sync - but that will change. Can check for presence of ch? in response, or ideally pass as meta which fns are sync or async
         ;; return first truthy response, else false

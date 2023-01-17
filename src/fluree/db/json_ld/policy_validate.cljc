@@ -65,7 +65,7 @@
   "Attempts to return cached result in permission key. Cache implemented to work correctly
   only with non-boolean result values - and thus can avoid having to do additional logic (e.g. contains? or some)"
   [db cache-key]
-  (get @(get-in db [:permission :cache]) cache-key))
+  (get @(get-in db [:permissions :cache]) cache-key))
 
 (defn generate-equals-fn
   "Returns validating function for :f/equals rule.
