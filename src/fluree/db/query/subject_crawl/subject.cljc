@@ -157,9 +157,9 @@
                       (subjects-id-chan db error-ch vars* f-where*)
                       (subjects-chan db error-ch vars* f-where*))
           flakes-af (flakes-xf opts*)
-          flakes-ch (->>(async/chan 32)
-                        (drop-offset f-where)
-                        (take-limit f-where))
+          flakes-ch (->> (async/chan 32)
+                         (drop-offset f-where)
+                         (take-limit f-where))
           result-ch (async/chan)]
 
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)
