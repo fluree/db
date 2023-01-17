@@ -67,6 +67,8 @@
                                          ['?s :schema/name '?name]
                                          ['?s :ex/last '?last]
                                          {:filter ["(> ?age 45)", "(strEnds ?last \"ith\")"]}]}))))
+    ;;TODO: simple-subject-crawl does not yet support filters.
+    ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
       (is (= [{:id :ex/david,
 	      :rdf/type [:ex/User],

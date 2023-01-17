@@ -1,7 +1,11 @@
 (ns fluree.db.query.subject-crawl.reparse
   (:require [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]))
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            #?(:clj [fluree.db.query.exec.select]
+               :cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
+            [fluree.db.query.exec.where :as where])
+  #?(:clj (:import [fluree.db.query.exec.select SubgraphSelector])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -18,6 +22,19 @@
                 (throw (ex-info (str "Variable used in filter function not included in 'vars' map: " param)
                                 {:status 400 :error :db/invalid-query})))))
           [] params))
+
+(defn mergeable-where-clause?
+  "Returns true if a `where` clause is eligible for merging
+  with other clauses to create a filter for the simple-subject-crawl
+  strategy"
+  [where-clause]
+  (#{:class :tuple} (where/pattern-type where-clause)))
+
+(defn clause-subject-var
+  [where-clause]
+  (-> where-clause
+      first
+      ::where/var))
 
 (defn merge-wheres-to-filter
   "Merges all subsequent where clauses (rest where) for simple-subject-crawl
@@ -38,87 +55,104 @@
    Note that for multi-cardinality predicates, the prediate filters must pass for just one flake
   "
   [first-s rest-where supplied-vars]
-  (loop [[{:keys [type s p o] :as where-smt} & r] rest-where
+  (loop [[{:keys [s p o] :as where-smt} & r] rest-where
          required-p #{} ;; set of 'p' values that are going to be required for a subject to have
          filter-map {}] ;; key 'p' value, val is list of filtering fns
-    (if where-smt
-      (when (and (= :tuple type)
-                 (= first-s (:variable s)))
-        (let [{:keys [value filter variable]} o
-              f (cond
-                  value
-                  (fn [flake _] (= value (flake/o flake)))
+    (let [[s p o] where-smt
+          {p* ::where/val} p
+          type (where/pattern-type where-smt)]
+      (if where-smt
+        (when (and (= :tuple type)
+                   (= first-s (clause-subject-var where-smt)))
+          (let [{::where/keys [val var]} o 
+                f (cond
+                    val
+                    (fn [flake _] (= val (flake/o flake)))
 
-                  filter
-                  (let [{:keys [params variable function]} filter]
-                    (if (= 1 (count params))
-                      (fn [flake _] (function (flake/o flake)))
-                      (fn [flake vars]
-                        (let [params (fill-fn-params params (flake/o flake) variable vars)]
-                          (log/debug (str "Calling query-filter fn: " (:fn-str filter)
-                                          "with params: " params "."))
-                          (apply function params)))))
+                    ;;TODO: filters are not yet supported 
+                    #_#_filter
+                    (let [{:keys [params variable function]} filter]
+                      (if (= 1 (count params))
+                        (fn [flake _] (function (flake/o flake)))
+                        (fn [flake vars]
+                          (let [params (fill-fn-params params (flake/o flake) variable vars)]
+                            (log/debug (str "Calling query-filter fn: " ("fn-str" filter)
+                                            "with params: " params "."))
+                            (apply function params)))))
+                    ;;TODO: vars are not yet supported
+                    #_#_(and var (get supplied-vars var))
+                    (fn [flake vars]
+                      (= (flake/o flake) (get vars var))))]
+            (recur r
+                   (conj required-p p*)
+                   (if f
+                     (update filter-map p* util/conjv f)
+                     filter-map))))
+        (assoc filter-map :required-p required-p)))))
 
-                  (and variable (supplied-vars variable))
-                  (fn [flake vars]
-                    (= (flake/o flake) (get vars variable))))]
-          (recur r
-                 (conj required-p p)
-                 (if f
-                   (update filter-map p util/conjv f)
-                   filter-map))))
-      (assoc filter-map :required-p required-p))))
 
+(defn re-parse-pattern
+  "Re-parses a pattern into the format recognized
+  by downstream simple-subject-crawl code"
+  [pattern]
+  (let [type (where/pattern-type pattern)
+        [s p o] (if (= :tuple type)
+                  pattern
+                  (let [[_type-kw tuple] pattern]
+                    tuple)) 
+        reparse-component (fn [component]
+                            (let [{::where/keys [var val]} component]
+                              (cond
+                                var {:variable var}
+                                val {:value val})))]
+    {:type type
+     :s (reparse-component s)
+     :p (reparse-component p)
+     :o (assoc (reparse-component o) :datatype (::where/datatype o))}))
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
-  [{:keys [where supplied-vars] :as parsed-query}]
-  (let [first-where (first where)
-        rest-where  (rest where)
-        first-type  (:type first-where)
-        first-s     (when (and (#{:rdf/type :collection :_id :iri :tuple} first-type)
-                               (-> first-where :s :variable))
-                      (-> first-where :s :variable))]
-    (when first-s
-      (if (empty? rest-where)
-        (assoc parsed-query :strategy :simple-subject-crawl)
-        (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-where supplied-vars)]
-          (assoc parsed-query :where [first-where
+  [{:keys [where vars] :as parsed-query}]
+  (let [{::where/keys [patterns]} where
+        [first-pattern & rest-patterns] patterns
+        reparsed-first-clause (re-parse-pattern first-pattern)]
+    (when-let [first-s (and (mergeable-where-clause? first-pattern)
+                            (clause-subject-var first-pattern))]
+      (if (empty? rest-patterns)
+        (assoc parsed-query
+               :where [reparsed-first-clause]
+               :strategy :simple-subject-crawl)
+        (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
+          (assoc parsed-query :where [reparsed-first-clause
                                       {:s-filter subj-filter-map}]
                               :strategy :simple-subject-crawl))))))
-
-(defn subject-crawl?
-  "Returns true if, when given parsed query, the select statement is a
-  subject crawl - meaning there is nothing else in the :select except a
-  graph crawl on a list of subjects"
-  [{:keys [select] :as _parsed-query}]
-  (and (:expandMaps? select)
-       (not (:inVector? select))))
-
 (defn simple-subject-crawl?
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
-  [{:keys [where select] :as _parsed-query}]
-  (let [select-var (or (-> select :select first :variable)  ;; legacy select spec
-                       (-> select :spec first :variable))]
-    (when select-var                                        ;; for now exclude any filters on the first where, not implemented
-      (every? #(and (= select-var (-> % :s :variable))
-                    ;; exclude if any recursion specified in where statement (e.g. person/follows+3)
-                    (not (:recur %)))
-              where))))
+  [{:keys [where select vars] :as _parsed-query}]
+  (and (instance? SubgraphSelector select)
+       ;;TODO, filtering not supported yet
+       (empty? (::where/filters where))
+       ;;TODO: vars support not complete
+       (empty? vars)
+       (if-let [{select-var :var} select]
+         (let [{::where/keys [patterns]} where]
+           (every? (fn [pattern]
+                     (let [pred (second pattern)]
+                       (and (= select-var (clause-subject-var pattern))
+                            (not (::where/recur pred))
+                            (not (::where/fullText pred))))) patterns)))))
 
 (defn re-parse-as-simple-subj-crawl
   "Returns true if query contains a single subject crawl.
   e.g.
   {:select {?subjects ['*']}
    :where [...]}"
-  [{:keys [op-type order-by group-by] :as parsed-query}]
-  (when (and (= :select op-type)
-             (subject-crawl? parsed-query)
-             (simple-subject-crawl? parsed-query)
-             (not group-by)
-             (not= :variable (:type order-by)))
+  [{:keys [order-by group-by] :as parsed-query}]
+  (when (and (not group-by)
+             (not order-by)
+             (simple-subject-crawl? parsed-query))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))

@@ -7,7 +7,8 @@
             [fluree.db.query.subject-crawl.rdf-type :refer [collection-crawl]]
             [fluree.db.query.subject-crawl.common :refer [order-results]]
             [fluree.db.query.fql.resp :as legacy-resp]
-            [fluree.db.query.json-ld.response :as json-ld-resp]))
+            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -17,7 +18,7 @@
   This strategy is only deployed if there is a single selection graph crawl,
   so this assumes this case is true in code."
   [db {:keys [select opts] :as _parsed-query}]
-  (-> select :spec first :spec))
+  (:spec select))
 
 (defn relationship-binding
   [{:keys [collection? vars] :as opts}]
@@ -63,8 +64,8 @@
   (c) filter subjects based on subsequent where clause(s)
   (d) apply offset/limit for (c)
   (e) send result into :select graph crawl"
-  [db {:keys [vars ident-vars where limit offset fuel rel-binding? order-by
-              compact-fn opts] :as parsed-query}]
+  [db {:keys [vars ident-vars where limit offset fuel rel-binding?
+              order-by opts] :as parsed-query}]
   (log/trace "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
         f-where     (first where)
@@ -74,6 +75,7 @@
         cache       (volatile! {})
         fuel-vol    (volatile! 0)
         select-spec (retrieve-select-spec db parsed-query)
+        compact-fn  (->> parsed-query :context json-ld/compact-fn)
         result-fn   (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
