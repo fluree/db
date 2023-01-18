@@ -215,8 +215,10 @@
 (defn load
   [conn commit-address]
   (go-try
+    (log/debug "load commit-address:" commit-address)
     (let [base-context {:base commit-address}
-          last-commit  (<? (conn-proto/-lookup conn commit-address))
+          last-commit  (<? (conn-proto/-lookup
+                             conn {:head-commit-address commit-address}))
           _            (when-not last-commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-address)
                                          {:status 400 :error :db/invalid-commit-address})))

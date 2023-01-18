@@ -45,11 +45,13 @@
 
 (defn address-path
   [address]
+  (log/debug "address-path address:" address)
   (let [[_ _ path] (str/split address #":")]
     path))
 
 (defn address-full-path
   [conn address]
+  (log/debug "address-full-path address:" address)
   (str (local-path conn) "/" (address-path address)))
 
 (defn address-path-exists?
