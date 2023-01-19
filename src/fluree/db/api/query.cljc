@@ -268,7 +268,7 @@
                               {:s parsed-query}
                               parsed-query)
 
-            query [(when s (<? (dbproto/-subid db s true)))
+            query [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
                    (when p (jld-db/expand-iri db p context))
                    (when o (jld-db/expand-iri db o context))]
 
