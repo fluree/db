@@ -1,9 +1,7 @@
 (ns fluree.db.query.history-test
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.dbproto :as dbproto]
-            [clojure.core.async :as async]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration history-query
   (let [conn (test-utils/create-conn)
