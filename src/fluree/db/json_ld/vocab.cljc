@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -233,7 +234,7 @@
   [{:keys [t] :as db}]
   (go-try
     (let [vocab-flakes (<? (query-range/index-range db :spot
-                                                    >= [(flake/max-subject-id const/$_collection)]
+                                                    >= [schema-util/schema-sid-end]
                                                     <= [0]))
           base-schema  (base-schema)
           schema       (update-with* base-schema t vocab-flakes)
