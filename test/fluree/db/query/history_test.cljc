@@ -65,16 +65,26 @@
       (is (= [{:t 5 :assert {:ex/x "foo-cat"}}]
              @(fluree/history ledger {:history [:ex/dan :ex/x "foo-cat"]}))))
 
-    ;; what sort order should these be in? asc or desc?
     (testing "at-t"
       (is (= [{:t 3 :assert {:ex/x "foo-3"}}]
-             @(fluree/history ledger {:history [:ex/dan :ex/x] :t 3}))))
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 3 :to 3}}))))
     (testing "from-t"
       (is (= [{:t 3 :assert {:ex/x "foo-3"}}
               {:t 5 :assert {:ex/x "foo-cat"} :retract {:ex/x "foo-3"}}]
-             @(fluree/history ledger {:history [:ex/dan :ex/x] :t [3]}))))
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 3}}))))
+    (testing "to-t"
+      (is (= [{:t 1 :assert {:ex/x "foo-1"}}
+              {:t 2 :assert {:ex/x "foo-2"} :retract {:ex/x "foo-1"}}
+              {:t 3 :assert {:ex/x "foo-3"} :retract {:ex/x "foo-2"}}]
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:to 3}}))))
     (testing "t-range"
       (is (= [{:t 1 :assert {:ex/x "foo-1"}}
               {:t 2 :assert {:ex/x "foo-2"} :retract {:ex/x "foo-1"}}
               {:t 3 :assert {:ex/x "foo-3"} :retract {:ex/x "foo-2"}}]
-             @(fluree/history ledger {:history [:ex/dan :ex/x] :t [1 3]}))))))
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 1 :to 3}}))))
+
+    (testing "invalid query"
+      (is (= "History query not properly formatted. Provided {:history []}"
+             (-> @(fluree/history ledger {:history []})
+                 (Throwable->map)
+                 :cause))))))

@@ -218,12 +218,11 @@
         [:o [:not :nil]]]]]]]
    [:context {:optional true} ::context]
    [:t {:optional true}
-    [:orn
-     [:at-t pos-int?]
-     [:from-t [:cat pos-int?]]
-     [:t-range [:and
-                [:tuple pos-int? pos-int?]
-                [:fn (fn [[from to]] (<= from to))]]]]]])
+    [:and
+     [:map
+      [:from {:optional true} pos-int?]
+      [:to {:optional true} pos-int?]]
+     [:fn (fn [{:keys [from to] :as x}] (or from to))]]]])
 
 (defn history-query?
   "A history query requires a :history key and a either a subject iri or a vector in the
@@ -240,7 +239,7 @@
                       {:status 400
                        :error  :db/invalid-query}))
 
-      (let [{:keys [ history t context]} (m/parse History query-map)
+      (let [{:keys [history t context]} (m/parse History query-map)
 
             ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
             [query-type parsed-query] history
@@ -255,14 +254,9 @@
 
             [pattern idx] (get-history-pattern query)
 
-            ;; [:at-t <t>] or [:from-t [<t>]] :or [:t-range [from-t to-t]], with positive t values
-            [range-type range-t] t
-            [from-t to-t]        (case range-type
-                                   :at-t    [(- range-t) (- range-t)]
-                                   :from-t  [(- (first range-t)) (:t db)]
-                                   :t-range [(- (first range-t)) (- (second range-t))]
-                                   ;; default; no range specified: all history
-                                   [-1 (:t db)])
+            ;; from and to are positive ints, need to convert to negative or fill in default values
+            {:keys [from to]}  t
+            [from-t to-t]      [(if from (- from) -1) (if to (- to) (:t db))]
 
             flakes  (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
             results (<? (history-flakes->json-ld db query-map flakes))]
