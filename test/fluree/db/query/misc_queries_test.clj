@@ -1,17 +1,15 @@
 (ns fluree.db.query.misc-queries-test
   (:require
-    [clojure.string :as str]
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]))
+    [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration select-sid
   (testing "Select index's subject id in query using special keyword"
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subid" {:context {:ex "http://example.org/ns/"}})
           db     @(fluree/stage
-                    ledger
+                    (fluree/db ledger)
                     {:graph [{:id          :ex/alice,
                               :type        :ex/User,
                               :schema/name "Alice"}
@@ -38,7 +36,7 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
           db     @(fluree/stage
-                    ledger
+                    (fluree/db ledger)
                     {:graph [{:id           :ex/alice,
                               :type         :ex/User,
                               :schema/name  "Alice"

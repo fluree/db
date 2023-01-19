@@ -13,7 +13,7 @@
           ledger  @(fluree/create conn "query/index-range"
                                   {:context {:ex "http://example.org/ns/"}})
           db      @(fluree/stage
-                     ledger
+                     (fluree/db ledger)
                      [{:id           :ex/brian,
                        :type         :ex/User,
                        :schema/name  "Brian"

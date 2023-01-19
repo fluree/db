@@ -46,7 +46,9 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
 
   const ledger = await flureenjs.create(conn, "testledger");
 
-  const db = await flureenjs.stage(ledger, {
+  const db = await flureenjs.db(ledger);
+
+  const db1 = await flureenjs.stage(db, {
     id: "ex:john",
     "@type": "ex:User",
     "schema:name": "John"
@@ -54,7 +56,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
 
 
    const results = await flureenjs.query(
-     db,
+     db1,
      {
        select: { "?s": ["*"] },
        where: [["?s", "rdf:type", "ex:User"]]
@@ -74,7 +76,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
 
    // test providing context works and remaps keys
    const contextResults = await flureenjs.query(
-     db,
+     db1,
      { "@context": {"flhubee": "http://schema.org/name"},
        select: { "?s": ["*"] },
        where: [["?s", "rdf:type", "ex:User"]]

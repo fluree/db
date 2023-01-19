@@ -1,15 +1,14 @@
 (ns fluree.db.query.subclass-test
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration subclass-test
   (testing "Subclass queries work."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/subclass")
           db1    @(fluree/stage
-                    ledger
+                    (fluree/db ledger)
                     {"@context"                  "https://schema.org",
                      "id"                        "https://www.wikidata.org/wiki/Q836821",
                      "type"                      ["Movie"],
