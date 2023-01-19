@@ -97,6 +97,7 @@
    "SELECT ?person ?fullName ?favNums\nWHERE {\n  ?person fd:person/fullName ?fullName;\n          fd:person/favNums  ?favNums;\n          fd:person/handle \"jdoe\", \"zsmith\".\n}"
    "SELECT DISTINCT ?horse ?horseLabel ?mother \n{\n    ?horse wdt:P31/wdt:P279* wd:Q726 .    \n    OPTIONAL{?horse wdt:P25 ?mother .}\n}"])
 
+;; TODO: these perf metrics are written for legacy fluree, the form is useful but the method is obsolete.
 #_(defn add-and-delete-data
   [conn ledger-id]
   (let [txn       [{:_id "person" :favNums [1]}]
