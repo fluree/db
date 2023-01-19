@@ -10,28 +10,28 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/parse" {:context {:ex "http://example.org/ns/"}})
         db     @(fluree/stage
-                 ledger
-                 [{:id           :ex/brian,
-                   :type         :ex/User,
-                   :schema/name  "Brian"
-                   :schema/email "brian@example.org"
-                   :schema/age   50
-                   :ex/favColor  "Green"
-                   :ex/favNums   7}
-                  {:id           :ex/alice,
-                   :type         :ex/User,
-                   :schema/name  "Alice"
-                   :schema/email "alice@example.org"
-                   :schema/age   50
-                   :ex/favColor  "Blue"
-                   :ex/favNums   [42, 76, 9]}
-                  {:id           :ex/cam,
-                   :type         :ex/User,
-                   :schema/name  "Cam"
-                   :schema/email "cam@example.org"
-                   :schema/age   34
-                   :ex/favNums   [5, 10]
-                   :ex/friend    [:ex/brian :ex/alice]}])
+                  (fluree/db ledger)
+                  [{:id           :ex/brian,
+                    :type         :ex/User,
+                    :schema/name  "Brian"
+                    :schema/email "brian@example.org"
+                    :schema/age   50
+                    :ex/favColor  "Green"
+                    :ex/favNums   7}
+                   {:id           :ex/alice,
+                    :type         :ex/User,
+                    :schema/name  "Alice"
+                    :schema/email "alice@example.org"
+                    :schema/age   50
+                    :ex/favColor  "Blue"
+                    :ex/favNums   [42, 76, 9]}
+                   {:id           :ex/cam,
+                    :type         :ex/User,
+                    :schema/name  "Cam"
+                    :schema/email "cam@example.org"
+                    :schema/age   34
+                    :ex/favNums   [5, 10]
+                    :ex/friend    [:ex/brian :ex/alice]}])
         ssc-q1-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
                                                      :where  [["?s" :schema/name "Alice"]]}
                                                     db)

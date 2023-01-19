@@ -1,15 +1,14 @@
 (ns fluree.db.transact.retraction-test
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration retracting-data
   (testing "Retractions of individual properties and entire subjects."
     (let [conn           (test-utils/create-conn)
           ledger         @(fluree/create conn "tx/retract")
           db             @(fluree/stage
-                            ledger
+                            (fluree/db ledger)
                             {:context {:ex "http://example.org/ns/"}
                              :graph   [{:id          :ex/alice,
                                         :type        :ex/User,

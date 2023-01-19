@@ -12,11 +12,11 @@
        (let [conn         (test-utils/create-conn)
              ledger-alias "testledger"
              ledger       @(fluree/create conn ledger-alias)
-             db           @(fluree/stage ledger
+             db           @(fluree/stage (fluree/db ledger)
                                          [{:id           :f/me
                                            :type         :schema/Person
                                            :schema/fname "Me"}])]
-         @(fluree/commit! db)
+         @(fluree/commit! ledger db)
          (is @(fluree/exists? conn ledger-alias))
          (is (not @(fluree/exists? conn "notaledger"))))
 
@@ -26,11 +26,11 @@
            (let [conn         (<! (test-utils/create-conn))
                  ledger-alias "testledger"
                  ledger       (<p! (fluree/create conn ledger-alias))
-                 db           (<p! (fluree/stage ledger
+                 db           (<p! (fluree/stage (fluree/db ledger)
                                                  [{:id           :f/me
                                                    :type         :schema/Person
                                                    :schema/fname "Me"}]))]
-             (<p! (fluree/commit! db))
+             (<p! (fluree/commit! ledger db))
              (is (<p! (fluree/exists? conn ledger-alias)))
              (is (not (<p! (fluree/exists? conn "notaledger"))))
              (done)))))))

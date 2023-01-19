@@ -11,7 +11,7 @@
     (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "class/testing")
           db1       @(fluree/stage
-                       ledger
+                       (fluree/db ledger)
                        {:context            {:ex "http://example.org/ns/"}
                         :id                 :ex/MyClass,
                         :schema/description "Just a basic object not used as a class"})
@@ -38,7 +38,7 @@
                         :select  {'?s [:*]}
                         :where   [['?s :rdf/type :ex/User]]}
           db           @(fluree/stage
-                          ledger
+                          (fluree/db ledger)
                           {:context        {:ex "http://example.org/ns/"}
                            :id             :ex/UserShape,
                            :type           [:sh/NodeShape],
@@ -96,7 +96,7 @@
                         :select  {'?s [:*]}
                         :where   [['?s :rdf/type :ex/User]]}
           db           @(fluree/stage
-                          ledger
+                          (fluree/db ledger)
                           {:context        {:ex "http://example.org/ns/"}
                            :id             :ex/UserShape,
                            :type           [:sh/NodeShape],
@@ -149,7 +149,7 @@
                          :select  {'?s [:*]}
                          :where   [['?s :rdf/type :ex/User]]}
           db            @(fluree/stage
-                           ledger
+                           (fluree/db ledger)
                            {:context              {:ex "http://example.org/ns/"}
                             :id                   :ex/UserShape,
                             :type                 [:sh/NodeShape],
