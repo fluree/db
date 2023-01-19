@@ -20,7 +20,8 @@
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.json-ld :as json-ld]
             [fluree.db.db.json-ld :as jld-db]
-            [malli.core :as m]))
+            [malli.core :as m]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -160,30 +161,36 @@
 (defn history-flakes->json-ld
   [db q flakes]
   (go-try
-    (let [fuel    (volatile! 0)
-          cache   (volatile! {})
-          compact (json-ld/compact-fn (fql-parse/parse-context q db))]
-      (->> (sort-by flake/t flakes)
-           (partition-by flake/t)
-           (map (fn [t-flakes]
-                  (go-try
-                    (let [assert-flakes (not-empty (filter flake/op t-flakes))
-                          retract-flakes (not-empty (filter (complement flake/op) t-flakes))
+    (let [fuel     (volatile! 0)
+          cache    (volatile! {})
+          compact  (json-ld/compact-fn (fql-parse/parse-context q db))
+          error-ch (async/chan)
+          result-ch (->> (sort-by flake/t flakes)
+                         (partition-by flake/t)
+                         (map (fn [t-flakes]
+                                (async/go
+                                  (try*
+                                    (let [assert-flakes (not-empty (filter flake/op t-flakes))
+                                          retract-flakes (not-empty (filter (complement flake/op) t-flakes))
 
-                          asserts (<? (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                                {:wildcard? true, :depth 0} 0 assert-flakes))
-                          retracts (<? (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                                 {:wildcard? true, :depth 0}
-                                                                 0 retract-flakes))]
+                                          asserts (<? (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                                                {:wildcard? true, :depth 0} 0 assert-flakes))
+                                          retracts (<? (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                                                 {:wildcard? true, :depth 0}
+                                                                                 0 retract-flakes))]
 
-                      ;; t is always positive for users
-                      (cond-> {:t (- (flake/t (first t-flakes)))}
-                        asserts (assoc :assert asserts)
-                        retracts (assoc :retract retracts))))))
-           (async/merge)
-           (async/into [])
-           (<?)
-           (sort-by :t)))))
+                                      ;; t is always positive for users
+                                      (cond-> {:t (- (flake/t (first t-flakes)))}
+                                        asserts (assoc :assert asserts)
+                                        retracts (assoc :retract retracts)))
+                                    (catch* e
+                                            (log/error e "Error converting history flakes.")
+                                            (async/>! error-ch e))))))
+                         (async/merge)
+                         (async/into []))]
+      (async/alt!
+        error-ch ([e] e)
+        result-ch ([result] result)))))
 
 (defn get-history-pattern
   [history]
