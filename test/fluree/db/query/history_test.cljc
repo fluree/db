@@ -1,0 +1,80 @@
+(ns fluree.db.query.history-test
+  (:require [clojure.test :refer :all]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.dbproto :as dbproto]
+            [clojure.core.async :as async]))
+
+(deftest ^:integration history-query
+  (let [conn (test-utils/create-conn)
+        ledger @(fluree/create conn "historytest" {:context {:ex "http://example.org/ns/"}})
+
+        db1 @(test-utils/transact ledger {:id :ex/dan
+                                          :ex/x "foo-1"
+                                          :ex/y "bar-1"})
+        db2 @(test-utils/transact db1 {:id :ex/dan
+                                       :ex/x "foo-2"
+                                       :ex/y "bar-2"})
+        db3 @(test-utils/transact db2 {:id :ex/dan
+                                       :ex/x "foo-3"
+                                       :ex/y "bar-3"})
+        db4 @(test-utils/transact db3 {:id :ex/cat
+                                       :ex/x "foo-cat"
+                                       :ex/y "bar-cat"})
+        db5 @(test-utils/transact db4 {:id :ex/dan
+                                       :ex/x "foo-cat"
+                                       :ex/y "bar-cat"})]
+    (testing "subject history"
+      (is (= [{:t 1 :assert {:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}}
+              {:t 2 :assert {:ex/x "foo-2" :ex/y "bar-2"} :retract {:ex/x "foo-1" :ex/y "bar-1"}}
+              {:t 3 :assert {:ex/x "foo-3" :ex/y "bar-3"} :retract {:ex/x "foo-2" :ex/y "bar-2"}}
+              {:t 5 :assert {:ex/x "foo-cat" :ex/y "bar-cat"} :retract {:ex/x "foo-3" :ex/y "bar-3"}}]
+             @(fluree/history ledger {:history :ex/dan}))))
+    (testing "one-tuple flake history"
+      (is (= [{:t 1, :assert {:id :ex/dan, :ex/x "foo-1", :ex/y "bar-1"}}
+              {:t 2,
+               :assert #:ex{:x "foo-2", :y "bar-2"},
+               :retract #:ex{:x "foo-1", :y "bar-1"}}
+              {:t 3,
+               :assert #:ex{:x "foo-3", :y "bar-3"},
+               :retract #:ex{:x "foo-2", :y "bar-2"}}
+              {:t 5,
+               :retract #:ex{:x "foo-3", :y "bar-3"},
+               :assert #:ex{:x "foo-cat", :y "bar-cat"}}]
+             @(fluree/history ledger {:history [:ex/dan]}))))
+    (testing "two-tuple flake history"
+      (is (= [{:t 1 :assert {:ex/x "foo-1"}}
+              {:t 2 :assert {:ex/x "foo-2"} :retract {:ex/x "foo-1"}}
+              {:t 3 :assert {:ex/x "foo-3"} :retract {:ex/x "foo-2"}}
+              {:t 5 :assert {:ex/x "foo-cat"} :retract {:ex/x "foo-3"}}]
+             @(fluree/history ledger {:history [:ex/dan :ex/x]})))
+
+      (is (= [{:t 1 :assert {:ex/x "foo-1"}}
+              {:t 2 :assert {:ex/x "foo-2"} :retract {:ex/x "foo-1"}}
+              {:t 3 :assert {:ex/x "foo-3"} :retract {:ex/x "foo-2"}}
+              {:t 4 :assert {:ex/x "foo-cat"}}
+              {:t 5 :assert {:ex/x "foo-cat"} :retract {:ex/x "foo-3"}}]
+             @(fluree/history ledger {:history [nil :ex/x]}))))
+    (testing "three-tuple flake history"
+      (is (= [{:t 4 :assert {:ex/x "foo-cat"}}
+              {:t 5 :assert {:ex/x "foo-cat"}}]
+             @(fluree/history ledger {:history [nil :ex/x "foo-cat"]})))
+      (is (= [{:t 2 :assert {:ex/x "foo-2"}}
+              {:t 3 :retract {:ex/x "foo-2"}}]
+             @(fluree/history ledger {:history [nil :ex/x "foo-2"]})))
+      (is (= [{:t 5 :assert {:ex/x "foo-cat"}}]
+             @(fluree/history ledger {:history [:ex/dan :ex/x "foo-cat"]}))))
+
+    ;; what sort order should these be in? asc or desc?
+    (testing "at-t"
+      (is (= [{:t 3 :assert {:ex/x "foo-3"}}]
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t 3}))))
+    (testing "from-t"
+      (is (= [{:t 3 :assert {:ex/x "foo-3"}}
+              {:t 5 :assert {:ex/x "foo-cat"} :retract {:ex/x "foo-3"}}]
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t [3]}))))
+    (testing "t-range"
+      (is (= [{:t 1 :assert {:ex/x "foo-1"}}
+              {:t 2 :assert {:ex/x "foo-2"} :retract {:ex/x "foo-1"}}
+              {:t 3 :assert {:ex/x "foo-3"} :retract {:ex/x "foo-2"}}]
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t [1 3]}))))))

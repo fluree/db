@@ -100,3 +100,8 @@
         staged @(fluree/stage ledger people)
         commit @(fluree/commit! staged {:message "Adding people", :push? true})]
     ledger))
+
+(defn transact
+  [ledger data]
+  (-> @(fluree/stage ledger data)
+      (fluree/commit!)))
