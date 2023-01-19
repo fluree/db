@@ -392,5 +392,5 @@
   (let [query-type (query-type flureeQL)]
     (case query-type
       :standard (query-async source flureeQL)
-      :history (history-query-async source flureeQL)
+      :history (history source flureeQL)
       :multi (multi-query-async source flureeQL))))
