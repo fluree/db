@@ -186,12 +186,9 @@
 ;; mutations
 (defn stage
   "Performs a transaction and queues change if valid (does not commit)"
-  ([db-or-ledger json-ld] (stage db-or-ledger json-ld nil))
-  ([db-or-ledger json-ld {:keys [branch] :as opts}]
-   (let [db        (if (jld-ledger/is-ledger? db-or-ledger)
-                     (ledger-proto/-db db-or-ledger {:branch branch})
-                     db-or-ledger)
-         result-ch (db-proto/-stage db json-ld opts)]
+  ([db json-ld] (stage db json-ld nil))
+  ([db json-ld opts]
+   (let [result-ch (db-proto/-stage db json-ld opts)]
      (promise-wrap result-ch))))
 
 
@@ -202,22 +199,9 @@
   Commits are tracked in the local environment, but if the ledger is distributed
   it will still need a 'push' to ensure it is published and verified as per the
   distributed rules."
-  ([db]
+  ([ledger db]
    (promise-wrap
-     (ledger-proto/-commit! db)))
-  ([ledger-or-db db-or-opts]
-   (let [[ledger db opts]
-         [(when (jld-ledger/is-ledger? ledger-or-db)
-            ledger-or-db)
-          (cond (db-proto/db? ledger-or-db) ledger-or-db
-                (db-proto/db? db-or-opts) db-or-opts)
-          (when (not (db-proto/db? db-or-opts))
-            db-or-opts)]
-
-         res-ch (if ledger
-                  (ledger-proto/-commit! ledger db opts)
-                  (ledger-proto/-commit! db opts))]
-     (promise-wrap res-ch)))
+     (ledger-proto/-commit! ledger db)))
   ([ledger db opts]
    (promise-wrap
      (ledger-proto/-commit! ledger db opts))))
@@ -259,7 +243,7 @@
   "Retrieves latest db, or optionally a db at a moment in time
   and/or permissioned to a specific identity."
   ([ledger] (db ledger nil))
-  ([ledger {:keys [t branch] :as opts}]
+  ([ledger opts]
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
