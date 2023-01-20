@@ -104,5 +104,5 @@
 
 (defn transact
   [ledger data]
-  (-> @(fluree/stage ledger data)
-      (fluree/commit!)))
+  (->> @(fluree/stage (fluree/db ledger) data)
+       (fluree/commit! ledger)))

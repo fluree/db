@@ -10,18 +10,18 @@
         db1 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-1"
                                           :ex/y "bar-1"})
-        db2 @(test-utils/transact db1 {:id :ex/dan
-                                       :ex/x "foo-2"
-                                       :ex/y "bar-2"})
-        db3 @(test-utils/transact db2 {:id :ex/dan
-                                       :ex/x "foo-3"
-                                       :ex/y "bar-3"})
-        db4 @(test-utils/transact db3 {:id :ex/cat
-                                       :ex/x "foo-cat"
-                                       :ex/y "bar-cat"})
-        db5 @(test-utils/transact db4 {:id :ex/dan
-                                       :ex/x "foo-cat"
-                                       :ex/y "bar-cat"})]
+        db2 @(test-utils/transact ledger {:id :ex/dan
+                                          :ex/x "foo-2"
+                                          :ex/y "bar-2"})
+        db3 @(test-utils/transact ledger {:id :ex/dan
+                                          :ex/x "foo-3"
+                                          :ex/y "bar-3"})
+        db4 @(test-utils/transact ledger {:id :ex/cat
+                                          :ex/x "foo-cat"
+                                          :ex/y "bar-cat"})
+        db5 @(test-utils/transact ledger {:id :ex/dan
+                                          :ex/x "foo-cat"
+                                          :ex/y "bar-cat"})]
     (testing "subject history"
       (is (= [{:t 5 :assert {:ex/x "foo-cat" :ex/y "bar-cat"} :retract {:ex/x "foo-3" :ex/y "bar-3"}}
               {:t 3 :assert {:ex/x "foo-3" :ex/y "bar-3"} :retract {:ex/x "foo-2" :ex/y "bar-2"}}
