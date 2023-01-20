@@ -183,10 +183,12 @@
       [:prettyPrint {:optional true} ::prettyPrint]
       [:pretty-print {:optional true} ::pretty-print]]}))
 
+(def query-validator
+  (m/validator ::analytical-query {:registry registry}))
 
 (defn validate
   [qry]
-  (if (m/validate ::analytical-query qry {:registry registry})
+  (if (query-validator qry)
     qry
     (throw (ex-info "Invalid Query"
                     {:status  400
