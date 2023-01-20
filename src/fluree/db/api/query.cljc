@@ -198,7 +198,6 @@
                             out-ch
                             (fn [t-flakes ch]
                               (-> (t-flakes->json-ld db compact cache fuel error-ch t-flakes)
-
                                   (async/pipe ch)))
                             t-flakes-ch)
       (async/alt!
@@ -242,13 +241,28 @@
      [:map
       [:from {:optional true} pos-int?]
       [:to {:optional true} pos-int?]]
-     [:fn (fn [{:keys [from to] :as x}] (or from to))]]]])
+     [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+      (fn [{:keys [from to]}] (or from to))]
+     [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+      (fn [{:keys [from to]}] (if (and from to)
+                                (<= from to)
+                                true))]]]])
+
+(def history-query-validator
+  (m/validator History))
+
+(def history-query-parser
+  (m/parser History))
 
 (defn history-query?
-  "A history query requires a :history key and a either a subject iri or a vector in the
-  pattern [s p o] with either the s or the p is required. If the o is supplied it must not be nil."
+  "Requires:
+  :history - either a subject iri or a vector in the pattern [s p o] with either the
+  s or the p is required. If the o is supplied it must not be nil.
+  Optional:
+  :context - json-ld context to use in expanding the :history iris.
+  :t - a map with keys :from and :to, at least one is required if :t is provided."
   [query]
-  (m/validate History query))
+  (history-query-validator query))
 
 (defn history
   [db query-map]
@@ -259,7 +273,7 @@
                       {:status 400
                        :error  :db/invalid-query}))
 
-      (let [{:keys [history t context]} (m/parse History query-map)
+      (let [{:keys [history t context]} (history-query-parser query-map)
 
             ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
             [query-type parsed-query] history
