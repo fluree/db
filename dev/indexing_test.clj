@@ -1,6 +1,5 @@
 (ns indexing-test
   (:require [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.api :as fdb]
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.json-ld.transact :as jld-tx]
             [clojure.core.async :as async]
@@ -115,5 +114,3 @@
 
 
   )
-
-
