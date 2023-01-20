@@ -1,7 +1,7 @@
 (ns fluree.db.performance
   (:require [clojure.java.io :as io]
             [criterium.core :as criterium]
-            [fluree.db.api :as fdb]
+            [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log :include-macros true]
             [clojure.string :as str]))
 
@@ -97,7 +97,8 @@
    "SELECT ?person ?fullName ?favNums\nWHERE {\n  ?person fd:person/fullName ?fullName;\n          fd:person/favNums  ?favNums;\n          fd:person/handle \"jdoe\", \"zsmith\".\n}"
    "SELECT DISTINCT ?horse ?horseLabel ?mother \n{\n    ?horse wdt:P31/wdt:P279* wd:Q726 .    \n    OPTIONAL{?horse wdt:P25 ?mother .}\n}"])
 
-(defn add-and-delete-data
+;; TODO: these perf metrics are written for legacy fluree, the form is useful but the method is obsolete.
+#_(defn add-and-delete-data
   [conn ledger-id]
   (let [txn       [{:_id "person" :favNums [1]}]
         res       (fdb/transact conn ledger-id txn)
@@ -106,7 +107,7 @@
         deleteRes (fdb/transact conn ledger-id deleteTxn)]
     deleteRes))
 
-(defn add-and-update-data
+#_(defn add-and-update-data
   [conn ledger-id]
   (let [txn       [{:_id "person" :favNums [1]}]
         res       (fdb/transact conn ledger-id txn)
@@ -115,14 +116,14 @@
         updateRes (fdb/transact conn ledger-id updateTxn)]
     updateRes))
 
-(defn time-return-data
+#_(defn time-return-data
   [f & args]
   (let [start-time (System/nanoTime)
         _          (apply f args)
         end-time   (System/nanoTime)]
     (float (/ (- end-time start-time) 1000000))))
 
-(defn format-res
+#_(defn format-res
   [q res]
   (let [mean (-> res :mean first)
         [scale unit] (criterium/scale-time mean)]
@@ -131,7 +132,7 @@
      :mean      mean
      :mean-time (criterium/format-value mean scale unit)}))
 
-(defn test-queries
+#_(defn test-queries
   [db f coll]
   (map (fn [q]
          (try (let [res (criterium/benchmark (f db q) nil)]
@@ -139,7 +140,7 @@
               (catch Exception e {:issued q :error true})))
        coll))
 
-(defn add-schema-performance-check
+#_(defn add-schema-performance-check
   [conn ledger-id]
   (let [collections (-> "basicschema/collections.edn" io/resource slurp read-string)
         coll-txn    (time-return-data fdb/transact conn ledger-id collections)
@@ -149,7 +150,7 @@
         data-txn    (time-return-data fdb/transact conn ledger-id data)]
     (concat [coll-txn] pred-txn data-txn)))
 
-(defn performance-check
+#_(defn performance-check
   "NOTE: This performance check will take more than an hour."
   [conn ledger-id]
   (let [myDb                   (fdb/db conn ledger-id)
@@ -210,19 +211,19 @@
 
 
   (def conn (:conn user/system))
-  (def mydb (fdb/db conn "test/me"))
+  #_(def mydb (fdb/db conn "test/me"))
 
 
   (def collections (-> "basicschema/collections.edn" io/resource slurp read-string))
   (def predicates (-> "basicschema/predicates.edn" io/resource slurp read-string))
   (def data (-> "basicschema/data.edn" io/resource slurp read-string))
 
-  (time-return-data fdb/transact conn "test/me" data)
+  #_(time-return-data fdb/transact conn "test/me" data)
 
-  (fdb/history-query mydb)
+  #_(fdb/history-query mydb)
 
 
-  (test-queries mydb fdb/history-query history-query-coll)
+  #_(test-queries mydb fdb/history-query history-query-coll)
 
 
   (def res1 (-> "performanceMetrics/performance.edn" io/resource slurp read-string))

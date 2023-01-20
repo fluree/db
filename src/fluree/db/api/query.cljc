@@ -5,6 +5,7 @@
             [clojure.core.async :as async]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
+            [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.range :as query-range]
             [fluree.db.session :as session]
             [fluree.db.dbproto :as dbproto]
@@ -15,7 +16,12 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.fql.resp :refer [flakes->res]]
             [fluree.db.util.async :as async-util]
-            [fluree.db.json-ld.credential :as cred]))
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.db.json-ld :as jld-db]
+            [malli.core :as m]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -152,183 +158,148 @@
                       db-block block-end)]
       [block-start block-end])))
 
+(defn t-flakes->json-ld
+  [db compact cache fuel error-ch t-flakes]
+  (async/go
+    (try*
+      (let [assert-flakes  (not-empty (filter flake/op t-flakes))
+            retract-flakes (not-empty (filter (complement flake/op) t-flakes))
 
-(defn- format-block-resp-pretty
-  [db curr-block cache fuel]
-  (go-try (let [[asserted-subjects
-                 retracted-subjects] (loop [[flake & r] (:flakes curr-block)
-                                            asserted-subjects  {}
-                                            retracted-subjects {}]
-                                       (if-not flake
-                                         [asserted-subjects retracted-subjects]
-                                         (let [subject   (flake/s flake)
-                                               asserted? (true? (flake/op flake))
-                                               flake'    (if asserted? flake
-                                                                       (flake/flip-flake flake))]
-                                           (if asserted?
-                                             (recur r (update asserted-subjects subject #(vec (conj % flake')))
-                                                    retracted-subjects)
-                                             (recur r asserted-subjects
-                                                    (update retracted-subjects subject #(vec (conj % flake'))))))))
-                retracted (loop [[subject & r] (vals retracted-subjects)
-                                 acc []]
-                            (if-not subject
-                              acc
-                              (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}}
-                                                                  {} subject))))))
-                asserted  (loop [[subject & r] (vals asserted-subjects)
-                                 acc []]
-                            (if-not subject
-                              acc
-                              (recur r (conj acc (<? (flakes->res db cache fuel 1000000 {:wildcard? true, :select {}}
-                                                                  {} subject))))))]
-            {:block     (:block curr-block)
-             :t         (:t curr-block)
-             :retracted retracted
-             :asserted  asserted})))
+            asserts-chan   (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                     {:wildcard? true, :depth 0}
+                                                     0 assert-flakes)
+            retracts-chan  (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                     {:wildcard? true, :depth 0}
+                                                     0 retract-flakes)
 
+            asserts (<? asserts-chan)
+            retracts (<? retracts-chan)
 
-(defn- format-blocks-resp-pretty
-  [db resp]
-  (async/go-loop [fuel (volatile! 0)
-                  cache (volatile! {})
-                  curr-block (first resp)
-                  rest-blocks (rest resp)
-                  acc []]
-    (let [curr-block' (<? (format-block-resp-pretty db curr-block cache fuel))
-          acc'        (concat acc [curr-block'])]
-      (if (first rest-blocks)
-        (recur fuel cache (first rest-blocks) (rest rest-blocks) acc')
-        acc'))))
+            ;; t is always positive for users
+            result         (cond-> {:t (- (flake/t (first t-flakes)))}
+                             asserts (assoc :assert asserts)
+                             retracts (assoc :retract retracts))]
+        result)
+      (catch* e
+              (log/error e "Error converting history flakes.")
+              (async/>! error-ch e)))))
 
+(defn history-flakes->json-ld
+  [db q flakes]
+  (go-try
+    (let [fuel    (volatile! 0)
+          cache   (volatile! {})
+          compact (json-ld/compact-fn (fql-parse/parse-context q db))
+
+          error-ch   (async/chan)
+          out-ch     (async/chan)
+          results-ch (async/into [] out-ch)
+
+          t-flakes-ch (->> (sort-by flake/t flakes)
+                           (partition-by flake/t)
+                           (async/to-chan!))]
+
+      (async/pipeline-async 2
+                            out-ch
+                            (fn [t-flakes ch]
+                              (-> (t-flakes->json-ld db compact cache fuel error-ch t-flakes)
+                                  (async/pipe ch)))
+                            t-flakes-ch)
+      (async/alt!
+        error-ch ([e] e)
+        results-ch ([result] result)))))
 
 (defn get-history-pattern
   [history]
-  (let [subject (cond (util/subj-ident? history)
-                      [history]
-
-                      (sequential? history)
-                      (if (empty? history)
-                        (throw (ex-info (str "Please specify an subject for which to search history. Provided: " history)
-                                        {:status 400
-                                         :error  :db/invalid-query}))
-                        history)
-
-                      :else
-                      (throw (ex-info (str "History query not properly formatted. Provided: " history)
-                                      {:status 400
-                                       :error  :db/invalid-query})))
-        [s p o t] [(get subject 0) (get subject 1) (get subject 2) (get subject 3)]
-
+  (let [[s p o t]     [(get history 0) (get history 1) (get history 2) (get history 3)]
         [pattern idx] (cond
                         (not (nil? s))
-                        [subject :spot]
+                        [history :spot]
 
                         (and (nil? s) (not (nil? p)) (nil? o))
                         [[p s o t] :psot]
 
                         (and (nil? s) (not (nil? p)) (not (nil? o)))
-                        [[p o s t] :post]
-
-                        :else
-                        (throw (ex-info (str "History query not properly formatted. Must include at least an subject or predicate to query. Provided: " history)
-                                        {:status 400
-                                         :error  :db/invalid-query})))]
+                        [[p o s t] :post])]
     [pattern idx]))
 
+(def History
+  [:map {:registry {::iri [:or :keyword :string]
+                    ::context [:map-of :any :any]}}
+   [:history
+    [:orn
+     [:subject ::iri]
+     [:flake
+      [:or
+       [:catn
+        [:s ::iri]]
+       [:catn
+        [:s [:maybe ::iri]]
+        [:p ::iri]]
+       [:catn
+        [:s [:maybe ::iri]]
+        [:p ::iri]
+        [:o [:not :nil]]]]]]]
+   [:context {:optional true} ::context]
+   [:t {:optional true}
+    [:and
+     [:map
+      [:from {:optional true} pos-int?]
+      [:to {:optional true} pos-int?]]
+     [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+      (fn [{:keys [from to]}] (or from to))]
+     [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+      (fn [{:keys [from to]}] (if (and from to)
+                                (<= from to)
+                                true))]]]])
 
-(defn- auth-match
-  [auth-set t-map flake]
-  (let [[auth id] (get-in t-map [(flake/t flake) :auth])]
-    (or (auth-set auth)
-        (auth-set id))))
+(def history-query-validator
+  (m/validator History))
 
+(def history-query-parser
+  (m/parser History))
 
-(defn- min-safe
-  [& args]
-  (->> (remove nil? args) (apply min)))
+(defn history-query?
+  "Requires:
+  :history - either a subject iri or a vector in the pattern [s p o] with either the
+  s or the p is required. If the o is supplied it must not be nil.
+  Optional:
+  :context - json-ld context to use in expanding the :history iris.
+  :t - a map with keys :from and :to, at least one is required if :t is provided."
+  [query]
+  (history-query-validator query))
 
-
-(defn- format-history-resp
-  [db resp auth show-auth]
+(defn history
+  [db query-map]
   (go-try
-    (let [ts    (set (map #(flake/t %) resp))
-          t-map (<? (async/go-loop [[t & r] ts
-                                    acc {}]
-                      (if t
-                        (let [block (<? (time-travel/non-border-t-to-block db t))
-                              acc*  (cond-> (assoc-in acc [t :block] block)
-                                            (or auth show-auth) (assoc-in [t :auth]
-                                                                          (<? (query-async
-                                                                                (go-try db)
-                                                                                {:selectOne ["?auth" "?id"],
-                                                                                 :where     [[t, "_tx/auth", "?auth"],
-                                                                                             ["?auth", "_auth/id", "?id"]]}))))]
-                          (recur r acc*)) acc)))
-          res   (loop [[flake & r] resp
-                       acc {}]
-                  (cond (and flake auth
-                             (not (auth-match auth t-map flake)))
-                        (recur r acc)
+    (if-not (history-query? query-map)
+      (throw (ex-info (str "History query not properly formatted. Provided "
+                           (pr-str query-map))
+                      {:status 400
+                       :error  :db/invalid-query}))
 
-                        flake
-                        (let [t   (flake/t flake)
-                              {:keys [block auth]} (get t-map t)
-                              acc (cond-> acc
-                                          true (assoc-in [block :block] block)
-                                          true (update-in [block :flakes] conj flake)
-                                          true (update-in [block :t] min-safe t)
-                                          show-auth (assoc-in [block :auth] auth))]
-                          (recur r acc))
+      (let [{:keys [history t context]} (history-query-parser query-map)
 
-                        :else
-                        acc))]
-      (vals res))))
+            ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
+            [query-type parsed-query] history
 
-#?(:cljs
-   (defn block-Flakes->vector
-     "Convert flakes into vectors.
-     Notes:
-     Cannot use IPrintWithWriter override since calls to storage-handler
-     download blocks using the #Flake format to support internal query
-     handling."
-    [blocks]
-    (mapv (fn [block] (assoc block :flakes (mapv vec (:flakes block)))) blocks)))
+            {:keys [s p o]} (if (= :subject query-type)
+                              {:s parsed-query}
+                              parsed-query)
 
-(defn history-query-async
-  [sources query-map]
-  (go-try
-    (let [{:keys [block history pretty-print prettyPrint show-auth showAuth auth opts]} query-map
-          db     (<? sources)                               ;; only support 1 source currently
+            query [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
+                   (when p (jld-db/expand-iri db p context))
+                   (when o (jld-db/expand-iri db o context))]
 
-          [block-start block-end] (if block (<? (resolve-block-range db query-map)))
-          result (if (contains? query-map :history)
-                   (let [meta?    (:meta opts)
-                         ;; From-t is the higher number, meaning it is the older time
-                         ;; To-t is the lower number, meaning it is the newer time
-                         ;; time-range is inclusive
-                         from-t   (if (and block-start (not= 1 block-start))
-                                    (dec (:t (<? (time-travel/as-of-block db (dec block-start))))) -1)
-                         to-t     (if block-end
-                                    (:t (<? (time-travel/as-of-block db block-end))) (:t db))
-                         [pattern idx] (get-history-pattern history)
-                         flakes   (<? (query-range/time-range db idx = pattern {:from-t from-t
-                                                                                :to-t   to-t}))
-                         auth-set (if auth (set auth) nil)
-                         resp     (<? (format-history-resp db flakes auth-set (or showAuth show-auth)))
-                         resp'    (if (or prettyPrint pretty-print)
-                                    (<? (format-blocks-resp-pretty db resp))
-                                    #?(:clj  resp
-                                       :cljs (block-Flakes->vector resp)))]
-                     (if meta? {:result resp'
-                                :fuel   (count flakes)
-                                :status 200}
-                               resp'))
-                   (throw (ex-info (str "History query not properly formatted. Provided "
-                                        (pr-str query-map))
-                                   {:status 400
-                                    :error  :db/invalid-query})))] result)))
+            [pattern idx] (get-history-pattern query)
 
+            ;; from and to are positive ints, need to convert to negative or fill in default values
+            {:keys [from to]}  t
+            [from-t to-t]      [(if from (- from) -1) (if to (- to) (:t db))]
+
+            flakes  (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
+            results (<? (history-flakes->json-ld db query-map flakes))]
+        results))))
 
 (defn query-async
   "Execute a query against a database source, or optionally
@@ -460,5 +431,5 @@
   (let [query-type (query-type flureeQL)]
     (case query-type
       :standard (query-async source flureeQL)
-      :history (history-query-async source flureeQL)
+      :history (history source flureeQL)
       :multi (multi-query-async source flureeQL))))

@@ -267,6 +267,14 @@
   (let [res-chan (query-api/query-async db query)]
     (promise-wrap res-chan)))
 
+(defn history
+  "Return the history of the specified subject in the given time range. Optionally return
+  history of multiple subjects according to flake pattern matching."
+  [ledger query]
+  (let [latest-db (ledger-proto/-db ledger)
+        res-chan (query-api/history latest-db query)]
+    (promise-wrap res-chan)))
+
 (defn range
   "Performs a range scan against the specified index using test functions
   of >=, <=, >, <"
@@ -301,4 +309,3 @@
   (promise-wrap
     (->> (expand-iri db iri)
          (db-proto/-subid db))))
-
