@@ -51,27 +51,27 @@
                                                   (fn [] start-iso)}
                                    (fn []
                                      (let [db1 @(fluree/stage
-                                                  ledger
+                                                  (fluree/db ledger)
                                                   (first test-utils/movies))]
-                                       @(fluree/commit! db1))))
+                                       @(fluree/commit! ledger db1))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] three-loaded-millis)
                                                   #'util/current-time-iso
                                                   (fn [] three-loaded-iso)}
                                    (fn []
                                      (let [db2 @(fluree/stage
-                                                  ledger
+                                                  (fluree/db ledger)
                                                   (second test-utils/movies))]
-                                       @(fluree/commit! db2))))
+                                       @(fluree/commit! ledger db2))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] all-loaded-millis)
                                                   #'util/current-time-iso
                                                   (fn [] all-loaded-iso)}
                                    (fn []
                                      (let [db3 @(fluree/stage
-                                                  ledger
+                                                  (fluree/db ledger)
                                                   (nth test-utils/movies 2))]
-                                       @(fluree/commit! db3))))
+                                       @(fluree/commit! ledger db3))))
           db                     (fluree/db ledger)
           base-query             {:select '{?s [:*]}
                                   :where  '[[?s :rdf/type :schema/Movie]]}

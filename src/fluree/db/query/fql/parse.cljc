@@ -5,6 +5,7 @@
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
+            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.string :as str]
             [clojure.set :as set]
@@ -410,7 +411,9 @@
   [q db]
   (if (basic-query? q)
     (parse-basic-query q db)
-    (parse-analytical-query q db)))
+    (let [parsed (parse-analytical-query q db)]
+      (or (re-parse-as-simple-subj-crawl parsed)
+          parsed))))
 
 (defn parse-delete
   [q db]

@@ -392,12 +392,6 @@
          (when pred-name
            (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
 
-(defn commit!
-  "Commits a db to ledger. Extracts ledger from db object"
-  [db opts]
-  (let [ledger (:ledger db)]
-    (ledger-proto/-commit! ledger db opts)))
-
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
@@ -426,10 +420,6 @@
                      spot psot post opst tspo
                      schema comparators novelty
                      permissions ecount]
-  ledger-proto/iCommit
-  (-commit! [db] (commit! db nil))
-  (-commit! [db opts] (commit! db opts))
-
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))

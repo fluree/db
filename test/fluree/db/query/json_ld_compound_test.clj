@@ -1,17 +1,15 @@
 (ns fluree.db.query.json-ld-compound-test
   (:require
-    [clojure.string :as str]
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]))
+    [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/compounda")
           db     @(fluree/stage
-                   ledger
+                   (fluree/db ledger)
                    [{:context      {:ex "http://example.org/ns/"}
                      :id           :ex/brian,
                      :type         :ex/User,

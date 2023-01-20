@@ -7,6 +7,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.query.exec :refer [drop-offset take-limit]]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
                                                           subj-perm-filter-fn filter-subject]]
             [fluree.db.dbproto :as dbproto]))
@@ -16,18 +18,17 @@
 (defn- subjects-chan
   "Returns chan of subjects in chunks per index-leaf
   that can be pulled as needed based on the selection criteria of a where clause."
-  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o idx p-ref?] :as _where-clause}]
+  [{:keys [conn novelty t] :as db} error-ch vars {:keys [p o p-ref?] :as _where-clause}]
   (let [o*          (if-some [v (:value o)]
                       v
                       (when-let [variable (:variable o)]
                         (get vars variable)))
         p*          (:value p)
-        idx*        (if (nil? o*)
-                      :psot
-                      idx)
+        idx*        (where/idx-for nil p* o*) 
+        o-dt        (:datatype o)
         [fflake lflake] (case idx*
-                          :post [(flake/create nil p* o* nil nil nil util/min-integer)
-                                 (flake/create nil p* o* nil nil nil util/max-integer)]
+                          :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
+                                 (flake/create nil p* o* o-dt nil nil util/max-integer)]
                           :psot [(flake/create nil p* nil nil nil nil util/min-integer)
                                  (flake/create nil p* nil nil nil nil util/max-integer)])
         filter-fn   (cond
@@ -156,7 +157,9 @@
                       (subjects-id-chan db error-ch vars* f-where*)
                       (subjects-chan db error-ch vars* f-where*))
           flakes-af (flakes-xf opts*)
-          flakes-ch (async/chan 32 (comp (drop offset) (take limit)))
+          flakes-ch (->> (async/chan 32)
+                         (drop-offset f-where)
+                         (take-limit f-where))
           result-ch (async/chan)]
 
       (async/pipeline-async parallelism flakes-ch flakes-af sid-ch)

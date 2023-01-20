@@ -9,7 +9,7 @@
     (let [conn             (test-utils/create-conn)
           ledger           @(fluree/create conn "tx/delete" {:context {:ex "http://example.org/ns/"}})
           db               @(fluree/stage
-                             ledger
+                             (fluree/db ledger)
                              {:graph [{:id           :ex/alice,
                                        :type         :ex/User,
                                        :schema/name  "Alice"
