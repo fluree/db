@@ -196,22 +196,26 @@
               "_default"   {:name "_default" :id 11 :sid nil}}
         pred (map-pred-id+iri [{:iri  "@id"
                                 :idx? true
-                                :id   0}
+                                :id   const/$iri}
                                {:iri  "@type"
                                 :ref? true
                                 :idx? true
-                                :id   200}
+                                :id   const/$rdf:type}
                                {:iri  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                                 :ref? true
                                 :idx? true
-                                :id   200}])]
+                                :id   const/$rdf:type}
+                               {:iri "http://www.w3.org/2000/01/rdf-schema#Class"
+                                :ref? true
+                                :idx? true
+                                :id   const/$rdfs:Class}])]
     {:t           0
      :refs        #{}
      :coll        coll
      :pred        pred
      :context     nil
      :context-str nil
-     :shapes (atom {:class {}
+     :shapes (atom {:class {} ; TODO: Does this need to be an atom?
                     :pred {}})
      :prefix      {}
      :fullText    #{}
