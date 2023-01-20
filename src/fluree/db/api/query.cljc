@@ -165,16 +165,20 @@
       (let [assert-flakes  (not-empty (filter flake/op t-flakes))
             retract-flakes (not-empty (filter (complement flake/op) t-flakes))
 
-            asserts  (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                               {:wildcard? true, :depth 0}
-                                               0 assert-flakes)
-            retracts (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                               {:wildcard? true, :depth 0}
-                                               0 retract-flakes)
+            asserts-chan   (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                     {:wildcard? true, :depth 0}
+                                                     0 assert-flakes)
+            retracts-chan  (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                     {:wildcard? true, :depth 0}
+                                                     0 retract-flakes)
+
+            asserts (<? asserts-chan)
+            retracts (<? retracts-chan)
+
             ;; t is always positive for users
-            result (cond-> {:t (- (flake/t (first t-flakes)))}
-                     asserts  (assoc :assert (<? asserts))
-                     retracts (assoc :retract (<? retracts)))]
+            result         (cond-> {:t (- (flake/t (first t-flakes)))}
+                             asserts (assoc :assert asserts)
+                             retracts (assoc :retract retracts))]
         result)
       (catch* e
               (log/error e "Error converting history flakes.")
