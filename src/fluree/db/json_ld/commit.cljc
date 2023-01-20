@@ -287,17 +287,17 @@
 
 (defn add-commit-schema-flakes
   [{:keys [schema] :as db} t]
-  (let [schema-flakes [(flake/create const/$_block:hash const/$iri const/iri-time const/$xsd:anyURI t true nil)
-                       (flake/create const/$_block:hash const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-                       (flake/create const/$_block:transactions const/$iri const/iri-commit const/$xsd:anyURI t true nil)
-                       (flake/create const/$_block:transactions const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
+  (let [schema-flakes [(flake/create const/$_commit:dbId const/$iri const/iri-time const/$xsd:anyURI t true nil)
+                       (flake/create const/$_commit:dbId const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
+                       (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:anyURI t true nil)
+                       (flake/create const/$_commit:idRef const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
                        ;(flake/create const/$_block:prevHash const/$iri const/iri-previous const/$xsd:anyURI t true nil)
                        ;(flake/create const/$_block:prevHash const/$rdf:type const/$iri  const/$xsd:anyURIt true nil)
                        (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:anyURI t true nil)
-                       (flake/create const/$_block:ledgers const/$iri const/iri-message const/$xsd:anyURI t true nil) ;; reused $_block:ledgers as commit message
-                       (flake/create const/$_block:number const/$iri const/iri-tag const/$xsd:anyURI t true nil) ;; reused $_block:number as commit tags
-                       (flake/create const/$_block:sigs const/$iri const/iri-issuer const/$xsd:anyURI t true nil)
-                       (flake/create const/$_block:sigs const/$rdf:type const/$iri const/$xsd:anyURI t true nil)]
+                       (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:anyURI t true nil)
+                       (flake/create const/$_commit:tag const/$iri const/iri-tag const/$xsd:anyURI t true nil) 
+                       (flake/create const/$_commit:signer const/$iri const/iri-issuer const/$xsd:anyURI t true nil)
+                       (flake/create const/$_commit:signer const/$rdf:type const/$iri const/$xsd:anyURI t true nil)]
         db*           (add-commit-flakes-to-db db schema-flakes)]
     (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
 
@@ -321,31 +321,31 @@
                                     flakes []]
                                (if tag
                                  (if-let [existing-sid (<? (dbproto/-subid db* tag))]
-                                   (recur r (conj flakes (flake/create commit-sid const/$_block:number existing-sid const/$xsd:anyURI t true nil)))
+                                   (recur r (conj flakes (flake/create commit-sid const/$_commit:tag existing-sid const/$xsd:anyURI t true nil)))
                                    (let [new-sid (next-sid)]
                                      (recur r (conj flakes
                                                     (flake/create new-sid const/$iri tag const/$xsd:string t true nil)
-                                                    (flake/create t const/$_block:number new-sid const/$xsd:anyURI t true nil)))))
+                                                    (flake/create t const/$_commit:tag new-sid const/$xsd:anyURI t true nil)))))
                                  flakes))))
           issuer-flakes  (when-let [issuer-iri (:id issuer)]
                            (let [issuer-sid   (<? (dbproto/-subid db* issuer-iri))
                                  issuer-flake (when-not issuer-sid
                                                 (flake/create (next-sid) const/$iri issuer-iri const/$xsd:string t true nil))]
 
-                             (cond-> [(flake/create commit-sid const/$_block:sigs issuer-sid const/$xsd:anyURI t true nil)]
+                             (cond-> [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true nil)]
                                      issuer-flake (conj issuer-flake))))
           flakes         (cond-> [(flake/create t const/$iri db-id const/$xsd:string t true nil)
                                   ;; TODO - add @type: DB into default data flakes?
                                   ;; link db to associated commit meta
-                                  (flake/create t const/$_block:transactions commit-sid const/$xsd:anyURI t true nil)
+                                  (flake/create t const/$_commit:idRef commit-sid const/$xsd:anyURI t true nil)
                                   ;; commit flakes below
                                   (flake/create commit-sid const/$_commit:time epoch-time const/$xsd:dateTime t true nil)]
                                  ;; if address for db exists
-                                 db-address (into [(flake/create t const/$_block:hash db-address-sid const/$xsd:anyURI t true nil)
+                                 db-address (into [(flake/create t const/$_commit:dbId db-address-sid const/$xsd:anyURI t true nil)
                                                    (flake/create db-address-sid const/$iri db-address const/$xsd:string t true nil)])
                                  ;; additional commit meta if applicable
                                  issuer-flakes (into issuer-flakes)
-                                 message (conj (flake/create commit-sid const/$_block:ledgers message const/$xsd:string t true nil)) ;; reused $_block:ledgers as commit message
+                                 message (conj (flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil))
                                  tag-flakes (into tag-flakes))
           db**           (assoc-in db* [:ecount const/$_shard] @last-sid)]
       (add-commit-flakes-to-db db** flakes))))
