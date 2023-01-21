@@ -2,8 +2,6 @@
   (:require [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [clojure.core.async :as async]
-               :cljs [cljs.core.async :as async])
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.db.json-ld :as jld-db]
@@ -13,7 +11,6 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util])
   (:refer-clojure :exclude [load]))
 
