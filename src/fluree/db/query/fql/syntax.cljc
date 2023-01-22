@@ -179,10 +179,14 @@
       [:depth {:optional true} ::depth]
       [:opts {:optional true} ::opts]
       [:prettyPrint {:optional true} ::prettyPrint]
-      [:pretty-print {:optional true} ::pretty-print]]}))
+      [:pretty-print {:optional true} ::pretty-print]]
+     ::query
+     [:orn
+      [:single ::analytical-query]
+      [:multi [:map-of :string ::analytical-query]]]}))
 
 (def query-validator
-  (m/validator ::analytical-query {:registry registry}))
+  (m/validator ::query {:registry registry}))
 
 (defn validate
   [qry]
