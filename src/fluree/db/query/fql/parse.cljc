@@ -1,6 +1,5 @@
 (ns fluree.db.query.fql.parse
-  (:require [fluree.db.query.exec :as exec]
-            [fluree.db.query.exec.where :as where]
+  (:require [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
@@ -14,7 +13,8 @@
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            #?(:cljs [cljs.reader :refer [read-string]])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -61,12 +61,10 @@
   [x]
   (map? x))
 
-(def read-str #?(:clj read-string :cljs cljs.reader/read-string))
-
 (defn safe-read
   [code-str]
   (try*
-    (let [code (read-str code-str)]
+    (let [code (read-string code-str)]
       (when-not (list? code)
         (throw (ex-info (code-str "Invalid function: " code-str)
                         {:status 400 :error :db/invalid-query})))
