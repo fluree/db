@@ -151,18 +151,21 @@
                            [:where-map ::where-map]
                            [:tuple ::where-tuple]]]
      ::vars [:map-of ::var :any]
+     ::t [:or :int :string]
      ::delete ::triple     ::delete-op [:map
                                         [:delete ::delete]
                                         [:where ::where]
                                         [:vars {:optional true} ::vars]]
      ::context [:map-of :any :any]
      ::analytical-query
-     [:map
+     [:map {:closed true}
       [:where ::where]
+      [:t {:optional true} ::t]
       [:context {:optional true} ::context]
       [:select {:optional true} ::select]
       [:selectOne {:optional true} ::selectOne]
       [:select-one {:optional true} ::select-one]
+      [:delete {:optional true} ::delete]
       [:orderBy {:optional true} ::orderBy]
       [:order-by {:optional true} ::order-by]
       [:groupBy {:optional true} ::groupBy]

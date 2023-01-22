@@ -237,13 +237,13 @@
                     {:status 400 :error :db/invalid-query}))))
 
 (defn parse-object-pattern
-  [o-pat context]
+  [o-pat]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
       (where/->value o-pat)))
 
 (defmulti parse-pattern
-  (fn [pattern vars db context]
+  (fn [pattern _vars _db _context]
     (if (map? pattern)
       (->> pattern keys first)
       :triple)))
@@ -292,7 +292,7 @@
                     (json-ld/expand-iri context)
                     where/->value)]
           (where/->pattern :iri [s p o]))
-        (let [o (parse-object-pattern o-pat context)]
+        (let [o (parse-object-pattern o-pat)]
           [s p o])))))
 
 (defmethod parse-pattern :triple
