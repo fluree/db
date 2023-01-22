@@ -379,9 +379,8 @@
                          [v :asc]
                          [v :desc])))))))
 
-(defn parse-analytical-query
+(defn parse-analytical-query*
   [q db]
-  (syntax/validate q)
   (let [context  (parse-context q db)
         vars     (parse-vars q)
         where    (parse-where q vars db context)
@@ -395,11 +394,16 @@
                 ordering (assoc :order-by ordering))
         (parse-select db context))))
 
-(defn parse
+(defn parse-analytical-query
   [q db]
-  (let [parsed (parse-analytical-query q db)]
+  (let [parsed (parse-analytical-query* q db)]
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
+
+(defn parse
+  [q db]
+  (syntax/validate q)
+  (parse-analytical-query q db))
 
 (defn parse-delete
   [q db]

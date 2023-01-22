@@ -42,7 +42,7 @@
     (testing "parse-analytical-query"
       (let [ssc {:select {"?s" ["*"]}
                  :where  [["?s" :schema/name "Alice"]]}
-            {:keys [select where] :as parsed} (parse/parse-analytical-query ssc db)
+            {:keys [select where] :as parsed} (parse/parse-analytical-query* ssc db)
             {::where/keys [patterns]} where]
         (is (= {:var       '?s
                 :selection ["*"]
