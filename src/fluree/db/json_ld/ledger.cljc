@@ -116,7 +116,8 @@
   (let [new-sid (or
                   (get predefined-properties id)
                   (if (or (class-or-property? node)
-                          (#{const/$sh:path const/$sh:ignoredProperties
+                          (#{const/$rdfs:subClassOf
+                             const/$sh:path const/$sh:ignoredProperties
                              const/$sh:targetClass
                              const/$sh:targetSubjectsOf const/$sh:targetObjectsOf}
                            referring-pid))

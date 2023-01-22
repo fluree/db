@@ -9,6 +9,7 @@
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
+         metosin/malli                   {:mvn/version "0.9.2"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
                                           :sha     "0613d03a5657294a5575556f8eac68ab9f12705a"}
 
@@ -70,7 +71,7 @@
   :docs
   {:extra-deps {codox/codox {:mvn/version "0.10.8"}}
    :exec-fn    codox.main/generate-docs
-   :exec-args  {:namespaces  [fluree.db.api]
+   :exec-args  {:namespaces  [fluree.db.json-ld.api]
                 :description "Fluree DB Clojure API Documentation"
                 :name        com.fluree/db
                 :output-path "docs"}}

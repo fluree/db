@@ -47,11 +47,10 @@
                                                     (assoc :js? true)))))
 
 (defn ^:export commit
-  ([db] (.then (fluree/commit! db)
-               (fn [result] (clj->js result))))
   ([ledger db] (.then (fluree/commit! ledger db)
                       (fn [result] (clj->js result))))
-  ([ledger db opts] (.then (fluree/commit! ledger db (js->clj opts :keywordize-keys true))
+  ([ledger db opts] (.then (fluree/commit! ledger db
+                                           (js->clj opts :keywordize-keys true))
                            (fn [result] (clj->js result)))))
 
 (defn ^:export status

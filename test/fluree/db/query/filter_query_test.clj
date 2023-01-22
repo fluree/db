@@ -2,15 +2,13 @@
   (:require
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    #_[fluree.db.util.log :as log]))
-
+    [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration filter-test
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/filter" {:context {:ex "http://example.org/ns/"}})
         db     @(fluree/stage
-                 ledger
+                  (fluree/db ledger)
                  [{:id           :ex/brian,
                    :type         :ex/User,
                    :schema/name  "Brian"
@@ -67,11 +65,13 @@
                                          ['?s :schema/name '?name]
                                          ['?s :ex/last '?last]
                                          {:filter ["(> ?age 45)", "(strEnds ?last \"ith\")"]}]}))))
+    ;;TODO: simple-subject-crawl does not yet support filters.
+    ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
       (is (= [{:id :ex/david,
-	      :rdf/type [:ex/User],
-	      :schema/name "David",
-	      :ex/last "Jones",
+               :rdf/type [:ex/User],
+               :schema/name "David",
+               :ex/last "Jones",
                :schema/email "david@example.org",
                :schema/age 46,
                :ex/favNums [15 70],
@@ -83,9 +83,9 @@
                :schema/email "brian@example.org",
                :schema/age 50,
                :ex/favNums 7}]
-               @(fluree/query db {:select {"?s" ["*"]}
-                                  :where  [["?s" :schema/age "?age"]
-                                           {:filter ["(> ?age 45)"]}]})))
+             @(fluree/query db {:select {"?s" ["*"]}
+                                :where  [["?s" :schema/age "?age"]
+                                         {:filter ["(> ?age 45)"]}]})))
       (is (= [{:id :ex/david,
                :rdf/type [:ex/User],
                :schema/name "David",
@@ -108,5 +108,5 @@
                :ex/favColor "Blue"}]
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  [["?s" :ex/favColor "?color"]
-                                           {:filter ["(strStarts ?color \"B\")"]}]}))))))
+                                         {:filter ["(strStarts ?color \"B\")"]}]}))))))
 

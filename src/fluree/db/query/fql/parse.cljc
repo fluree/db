@@ -4,6 +4,7 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
+            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.string :as str]
             [clojure.set :as set]
@@ -380,7 +381,7 @@
                          [v :asc]
                          [v :desc])))))))
 
-(defn parse
+(defn parse-analytical-query
   [q db]
   (syntax/validate q)
   (let [context  (parse-context q db)
@@ -395,6 +396,12 @@
         (cond-> grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
         (parse-select db context))))
+
+(defn parse
+  [q db]
+  (let [parsed (parse-analytical-query q db)]
+    (or (re-parse-as-simple-subj-crawl parsed)
+        parsed)))
 
 (defn parse-delete
   [q db]

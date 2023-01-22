@@ -1,8 +1,7 @@
 (ns fluree.db.query.json-ld-basic-test
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration json-ld-basic-query
   (testing "json-ld"
@@ -115,10 +114,11 @@
     (let [conn   (test-utils/create-conn)
           movies (test-utils/load-movies conn)]
       (testing "define @list container in context"
-        (let [db        @(fluree/stage movies {:context {:ex      "http://example.org/ns#"
-                                                         :ex/list {"@container" "@list"}}
-                                               :id      "list-test"
-                                               :ex/list [42 2 88 1]})
+        (let [db        @(fluree/stage (fluree/db movies)
+                                       {:context {:ex      "http://example.org/ns#"
+                                                  :ex/list {"@container" "@list"}}
+                                        :id      "list-test"
+                                        :ex/list [42 2 88 1]})
               query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
                                             :selectOne {?s [:*]},
                                             :where [[?s :id "list-test"]]})]
@@ -127,9 +127,10 @@
                   :ex/list [42 2 88 1]})
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
-        (let [db        @(fluree/stage movies {:context {:ex "http://example.org/ns#"}
-                                               :id      "list-test2"
-                                               :ex/list {"@list" [42 2 88 1]}})
+        (let [db        @(fluree/stage (fluree/db movies)
+                                       {:context {:ex "http://example.org/ns#"}
+                                        :id      "list-test2"
+                                        :ex/list {"@list" [42 2 88 1]}})
               query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
                                             :selectOne {?s [:*]},
                                             :where [[?s :id "list-test2"]]})]
@@ -142,13 +143,14 @@
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/simple-subject-crawl" {:context {:ex "http://example.org/ns/"}})
         db     @(fluree/stage
-                  ledger
+                  (fluree/db ledger)
                   [{:id           :ex/brian,
                     :type         :ex/User,
                     :schema/name  "Brian"
                     :ex/last      "Smith"
                     :schema/email "brian@example.org"
                     :schema/age   50
+                    :ex/favColor  "Green"
                     :ex/favNums   7}
                    {:id           :ex/alice,
                     :type         :ex/User,
@@ -175,18 +177,20 @@
                     :schema/age   46
                     :ex/favNums   [15 70]
                     :ex/friend    [:ex/cam]}])]
-
     (testing "using `where`"
       (testing "id"
+        ;;TODO not getting reparsed as ssc
         (is (= [{:id           :ex/brian,
                  :rdf/type     [:ex/User]
                  :schema/name  "Brian"
                  :ex/last      "Smith"
                  :schema/email "brian@example.org"
                  :schema/age   50
+                 :ex/favColor  "Green"
                  :ex/favNums   7}]
                @(fluree/query db {:select {"?s" ["*"]}
                                   :where  [["?s" :id :ex/brian]]}))))
+      ;;TODO not getting reparsed as ssc
       (testing "iri"
         (is (= [{:id           :ex/david
                  :rdf/type     [:ex/User]
@@ -219,6 +223,7 @@
                  :ex/last      "Smith"
                  :schema/email "brian@example.org"
                  :schema/age   50
+                 :ex/favColor  "Green"
                  :ex/favNums   7}]
                @(fluree/query db {:select {"?s" ["*"]}
                                   :where  [["?s" :type :ex/User]]}))))
@@ -249,7 +254,15 @@
                  :schema/email "alice@example.org"
                  :schema/age   42
                  :ex/favNums   [9 42 76]
-                 :ex/favColor  "Green"}]
+                 :ex/favColor  "Green"}
+                {:id           :ex/brian,
+                 :rdf/type     [:ex/User],
+                 :ex/favNums   7,
+                 :ex/favColor  "Green",
+                 :schema/age   50,
+                 :ex/last      "Smith",
+                 :schema/email "brian@example.org",
+                 :schema/name  "Brian"}]
                @(fluree/query db {:select {"?s" ["*"]}
                                   :where  [["?s" :ex/favColor "?color"]]})))
         (is (= [{:id           :ex/alice
@@ -261,4 +274,15 @@
                  :ex/favNums   [9 42 76]
                  :ex/favColor  "Green"}]
                @(fluree/query db {:select {"?s" ["*"]}
-                                  :where  [["?s" :schema/age 42]]})))))))
+                                  :where  [["?s" :schema/age 42]]})))
+        (is (= [{:id           :ex/alice,
+                 :rdf/type     [:ex/User],
+                 :ex/favNums   [9 42 76],
+                 :ex/favColor  "Green",
+                 :schema/age   42,
+                 :ex/last      "Smith",
+                 :schema/email "alice@example.org",
+                 :schema/name  "Alice"}]
+               @(fluree/query db {:select {"?s" ["*"]}
+                                  :where  [["?s" :schema/age 42]
+                                           ["?s" :ex/favColor "Green"]]})))))))

@@ -45,6 +45,8 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 
 ### Building
 
+NOTE: use `make -j` to run tasks in parallel.
+
 * `make deps` - install all local dependencies
 * `make` - make everything below
 * `make jar` - make Java JAR file

@@ -11,21 +11,21 @@
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/optional" {:context {:ex "http://example.org/ns/"}})
           db     @(fluree/stage
-                   ledger
-                   [{:id          :ex/brian,
-                     :type        :ex/User,
-                     :schema/name "Brian"
-                     :ex/friend   [:ex/alice]}
-                    {:id          :ex/alice,
-                     :type        :ex/User,
-                     :ex/favColor "Green"
-                     :schema/email "alice@flur.ee"
-                     :schema/name "Alice"}
-                    {:id          :ex/cam,
-                     :type        :ex/User,
-                     :schema/name "Cam"
-                     :schema/email "cam@flur.ee"
-                     :ex/friend   [:ex/brian :ex/alice]}])]
+                    (fluree/db ledger)
+                    [{:id          :ex/brian,
+                      :type        :ex/User,
+                      :schema/name "Brian"
+                      :ex/friend   [:ex/alice]}
+                     {:id          :ex/alice,
+                      :type        :ex/User,
+                      :ex/favColor "Green"
+                      :schema/email "alice@flur.ee"
+                      :schema/name "Alice"}
+                     {:id          :ex/cam,
+                      :type        :ex/User,
+                      :schema/name "Cam"
+                      :schema/email "cam@flur.ee"
+                      :ex/friend   [:ex/brian :ex/alice]}])]
 
       ;; basic single optional statement
       (is (= @(fluree/query db '{:select [?name ?favColor]
