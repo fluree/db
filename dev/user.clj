@@ -1,7 +1,7 @@
 (ns user
   (:require [clojure.tools.namespace.repl :as tn :refer [refresh refresh-all]]
             [clojure.core.async :as async]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [fluree.db.util.async :refer [<? <?? go-try merge-into?]]
             [fluree.db.flake :as flake]
             [fluree.db.permissions :as permissions]
             [fluree.db.dbfunctions.fns :as dbfunctions]
