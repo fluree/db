@@ -13,9 +13,7 @@
             [fluree.db.auth :as auth]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.fql.resp :refer [flakes->res]]
-            [fluree.db.util.async :as async-util]
+            [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.json-ld :as json-ld]
@@ -309,8 +307,7 @@
   (go-try
     (let [{query :subject issuer :issuer} (or (<? (cred/verify query))
                                               {:subject query})
-          {:keys [select selectOne selectDistinct selectReduced construct
-                  from where prefixes opts t]} query
+          {:keys [prefixes opts t]} query
           db            (if (async-util/channel? sources) ;; only support 1 source currently
                           (<? sources)
                           sources)
@@ -327,12 +324,8 @@
                                :max-fuel (or (:fuel opts) 1000000)
                                :fuel fuel
                                :issuer issuer)
-          _             (when-not (and (or select selectOne selectDistinct selectReduced construct)
-                                       (or from where))
-                          (throw (ex-info (str "Invalid query.")
-                                          {:status 400
-                                           :error  :db/invalid-query})))
-          start #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
+          start         #?(:clj (System/nanoTime)
+                           :cljs (util/current-time-millis))
           result        (<? (fql/query db* (assoc query :opts opts*)))]
       (if meta?
         {:status 200
