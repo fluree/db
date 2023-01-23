@@ -42,7 +42,6 @@
 
 ;; models
 
-(def EntryInfo pub-model/EntryInfo)
 (def LedgerEntry pub-model/LedgerEntry)
 (def Ledger pub-model/Ledger)
 (def LedgerCred pub-model/LedgerCred)
