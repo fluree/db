@@ -37,6 +37,54 @@
                   >= (flake/parts->Flake [(flake/max-subject-id const/$_collection) -1])
                   <= (flake/parts->Flake [0 -1])))
 
+(defn- get-type-retractions
+  [{:keys [db iris sid t]} type]
+  (go-try
+    (if type
+      (loop [[type-item & r] type
+             acc []]
+        (if type-item
+          (let [type-id (or (<? (get-iri-sid type-item db iris))
+                            (throw (ex-info
+                                     (str "Retractions specifies an @type that does not exist: "
+                                          type-item)
+                                     {:status 400 :error :db/invalid-commit})))]
+            (recur r (conj acc (flake/create sid const/$rdf:type type-id
+                                             const/$xsd:anyURI t false nil))))
+          acc))
+      [])))
+
+(defn- retract-v-maps
+  [{:keys [sid pid t acc]} v-maps]
+  (go-try
+    (loop [[v-map & r-v-maps] v-maps
+           acc* acc]
+      (log/debug "retract v-map:" v-map)
+      (let [[value dt] (datatype/from-expanded v-map nil)
+            acc** (conj acc* (flake/create sid pid value dt t false nil))]
+        (if (seq r-v-maps)
+          (recur r-v-maps acc**)
+          acc**)))))
+
+(defn- retract-node*
+  [{:keys [db type-retractions iris] :as context} node]
+  (go-try
+    (loop [[[k v-maps] & r] node
+           acc type-retractions]
+      (if k
+        (if (keyword? k)
+          (recur r acc)
+          (let [pid (or (<? (get-iri-sid k db iris))
+                        (throw (ex-info (str "Retraction on a property that does not exist: "
+                                             k)
+                                        {:status 400
+                                         :error :db/invalid-commit})))
+                _       (log/debug "retract-node* v-maps:" v-maps)
+                v-maps* (if (sequential? v-maps) v-maps [v-maps])
+                acc*    (<? (retract-v-maps (assoc context :pid pid :acc acc)
+                                            v-maps*))]
+            (recur r acc*)))
+        acc))))
 
 (defn retract-node
   [db node t iris]
@@ -45,29 +93,12 @@
           sid              (or (<? (get-iri-sid id db iris))
                                (throw (ex-info (str "Retractions specifies an IRI that does not exist: " id
                                                     " at db t value: " t ".")
-                                               {:status 400 :error :db/invalid-commit})))
-          type-retractions (if type
-                             (loop [[type-item & r] type
-                                    acc []]
-                               (if type-item
-                                 (let [type-id (or (<? (get-iri-sid type-item db iris))
-                                                   (throw (ex-info (str "Retractions specifies an @type that does not exist: " type-item)
-                                                                   {:status 400 :error :db/invalid-commit})))]
-                                   (recur r (conj acc (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t false nil))))
-                                 acc))
-                             [])]
-      (loop [[[k v-map] & r] node
-             acc type-retractions]
-        (if k
-          (if (keyword? k)
-            (recur r acc)
-            (let [pid (or (<? (get-iri-sid k db iris))
-                          (throw (ex-info (str "Retraction on a property that does not exist: " k)
-                                          {:status 400 :error :db/invalid-commit})))
-                  [value dt] (datatype/from-expanded v-map nil)]
-              (recur r (conj acc (flake/create sid pid value dt t false nil)))))
-          acc)))))
-
+                                               {:status 400 :error
+                                                :db/invalid-commit})))
+          context          {:db db, :iris iris, :sid sid, :t t}
+          type-retractions (<? (get-type-retractions context type))
+          context*         (assoc context :type-retractions type-retractions)]
+      (<? (retract-node* context* node)))))
 
 (defn retract-flakes
   [db retractions t iris]
@@ -79,12 +110,12 @@
           (recur r (into acc flakes)))
         acc))))
 
-(defn- process-v-maps
+(defn- assert-v-maps
   [{:keys [db iris pid existing-pid next-pid sid next-sid id k t acc]} v-maps]
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
-      (log/debug "processing v-map:" v-map)
+      (log/debug "assert v-map:" v-map)
       (let [acc**
             (cond->
               (if id ;; is a ref to another IRI
@@ -100,8 +131,7 @@
                                                               id
                                                               const/$xsd:string
                                                               t true nil))))
-                (let [_ (log/debug "calling datatype/from-expanded on:" v-map)
-                      [value dt] (datatype/from-expanded v-map nil)]
+                (let [[value dt] (datatype/from-expanded v-map nil)]
                   (conj acc* (flake/create sid pid value dt t true nil))))
               (nil? existing-pid) (conj (flake/create pid const/$iri k
                                                       const/$xsd:string t true
@@ -124,12 +154,37 @@
                                  (get jld-ledger/predefined-properties k)
                                  (jld-ledger/generate-new-pid
                                    k iris next-pid (-> v-maps* first :id) refs))
-                acc*         (<? (process-v-maps
+                acc*         (<? (assert-v-maps
                                    (assoc context :existing-pid existing-pid
                                                   :pid pid, :k k, :acc acc)
                                    v-maps*))]
             (recur r acc*)))
         acc))))
+
+(defn- get-type-assertions
+  [{:keys [db iris next-pid sid t]} type]
+  (go-try
+    (if type
+      (loop [[type-item & r] type
+             acc []]
+        (if type-item
+          (let [existing-id (or (<? (get-iri-sid type-item db iris))
+                                (get jld-ledger/predefined-properties type-item))
+                type-id     (or existing-id
+                                (jld-ledger/generate-new-pid type-item iris
+                                                             next-pid nil nil))
+                type-flakes (when-not existing-id
+                              [(flake/create type-id const/$iri type-item
+                                             const/$xsd:string t true nil)
+                               (flake/create type-id const/$rdf:type
+                                             const/$rdfs:Class const/$xsd:anyURI
+                                             t true nil)])]
+            (recur r (cond-> (conj acc
+                                   (flake/create sid const/$rdf:type type-id
+                                                 const/$xsd:anyURI t true nil))
+                             type-flakes (into type-flakes))))
+          acc))
+      [])))
 
 (defn assert-node
   [db node t iris refs next-pid next-sid]
@@ -137,32 +192,19 @@
     (let [{:keys [id type]} node
           existing-sid    (<? (get-iri-sid id db iris))
           sid             (or existing-sid
-                              (jld-ledger/generate-new-sid node nil iris next-pid next-sid))
-          type-assertions (if type
-                            (loop [[type-item & r] type
-                                   acc []]
-                              (if type-item
-                                (let [existing-id (or (<? (get-iri-sid type-item db iris))
-                                                      (get jld-ledger/predefined-properties type-item))
-                                      type-id     (or existing-id
-                                                      (jld-ledger/generate-new-pid type-item iris next-pid nil nil))
-                                      type-flakes (when-not existing-id
-                                                    [(flake/create type-id const/$iri type-item const/$xsd:string t true nil)
-                                                     (flake/create type-id const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)])]
-                                  (recur r (cond-> (conj acc
-                                                         (flake/create sid const/$rdf:type type-id const/$xsd:anyURI t true nil))
-                                                   type-flakes (into type-flakes))))
-                                acc))
-                            [])
+                              (jld-ledger/generate-new-sid node nil iris
+                                                           next-pid next-sid))
+          context         {:db       db, :iris iris, :id id
+                           :next-pid next-pid, :refs refs, :sid sid
+                           :next-sid next-sid, :t t}
+          type-assertions (<? (get-type-assertions context type))
           base-flakes     (if existing-sid
                             type-assertions
                             (conj type-assertions
                                   (flake/create sid const/$iri id
                                                 const/$xsd:string t true nil)))
-          context         {:base-flakes base-flakes, :db db, :iris iris, :id id
-                           :next-pid    next-pid, :refs refs, :sid sid
-                           :next-sid    next-sid, :t t}]
-      (<? (assert-node* context node)))))
+          context*        (assoc context :base-flakes base-flakes)]
+      (<? (assert-node* context* node)))))
 
 
 (defn assert-flakes
