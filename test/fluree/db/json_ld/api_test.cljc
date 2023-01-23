@@ -64,6 +64,13 @@
                                  :schema/age   34
                                  :ex/favNums   5
                                  :ex/friend    :ex/brian}])
+               db           @(fluree/commit! ledger db)
+               db           @(fluree/stage
+                               db
+                               ;; test a retraction
+                               {:context   {:ex "http://example.org/ns/"}
+                                :f/retract {:id         :ex/brian
+                                            :ex/favNums 7}})
                _            @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                _            (Thread/sleep 1000)
@@ -106,6 +113,13 @@
                                  :schema/age   34
                                  :ex/favNums   [5, 10]
                                  :ex/friend    [:ex/brian :ex/alice]}])
+               db           @(fluree/commit! ledger db)
+               db           @(fluree/stage
+                               db
+                               ;; test a multi-cardinality retraction
+                               [{:context   {:ex "http://example.org/ns/"}
+                                 :f/retract {:id         :ex/alice
+                                             :ex/favNums [42, 76, 9]}}])
                _            @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                _            (Thread/sleep 1000)
