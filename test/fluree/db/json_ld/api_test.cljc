@@ -65,6 +65,7 @@
                                  :ex/favNums   5
                                  :ex/friend    :ex/brian}])
                _            @(fluree/commit! ledger db)
+               ;; TODO: Replace this w/ :syncTo equivalent once we have it
                _            (Thread/sleep 1000)
                loaded       @(fluree/load conn ledger-alias)]
            (if (instance? Throwable loaded)
@@ -106,6 +107,7 @@
                                  :ex/favNums   [5, 10]
                                  :ex/friend    [:ex/brian :ex/alice]}])
                _            @(fluree/commit! ledger db)
+               ;; TODO: Replace this w/ :syncTo equivalent once we have it
                _            (Thread/sleep 1000)
                loaded       @(fluree/load conn ledger-alias)]
            (if (instance? Throwable loaded)
