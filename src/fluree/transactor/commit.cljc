@@ -1,30 +1,30 @@
 (ns fluree.transactor.commit
-  (:require [fluree.common.identity :as ident]
-            [fluree.json-ld :as json-ld]
-            [fluree.store.api :as store]
-            [fluree.crypto :as crypto]
-            [clojure.string :as str]
-            [fluree.db.util.json :as json]))
+  (:require
+   [fluree.common.iri :as iri]
+   [fluree.store.api :as store]))
+
+(defn create-commit
+  [previous-commit-summary tx]
+  (let [{previous   iri/CommitAddress
+         previous-t iri/CommitT} previous-commit-summary]
+    (cond-> {iri/type iri/Commit
+             iri/CommitTx tx
+             iri/CommitSize (count tx)
+             iri/CommitT ((fnil inc -1) previous-t)
+             iri/CommitV 0}
+      previous (assoc iri/CommitPrevious previous))))
+
+(defn create-commit-summary
+  [commit commit-address]
+  (-> commit
+      (dissoc iri/CommitTx)
+      (assoc iri/CommitAddress commit-address
+             iri/type iri/CommitSummary)))
+
+(defn commit-path
+  [ledger-name]
+  (str ledger-name "/commit/"))
 
 (defn create-commit-address
   [store path]
   (store/address store :commit path))
-
-(defn create
-  [store tx tx-info]
-  (let [{:keys [commit/t commit/prev ledger/name]} tx-info
-
-        commit-data    (json/stringify tx)
-        size           (count commit-data)
-        hash           (crypto/sha2-256 commit-data)
-        path           (str name "/commit/" hash)
-        commit-address (create-commit-address store path)
-        commit (cond-> {:commit/size size
-                        :commit/tx tx
-                        :commit/t t
-                        ;; hardcode v to 0 until we need additional versions
-                        :commit/v 0}
-                 prev (assoc :commit/prev prev))]
-    {:address commit-address
-     :hash    hash
-     :value   commit}))
