@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec
   "Find and format results of queries against database values."
-  (:require [clojure.core.async :as async :refer [go]]
+  (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.group :as group]
@@ -41,6 +41,32 @@
     (async/take 1 result-ch)
     (async/into [] result-ch)))
 
+(defn single-query
+  [db error-ch q]
+  (->> (where/search db q error-ch)
+       (group/combine q)
+       (order/arrange q)
+       (drop-offset q)
+       (take-limit q)
+       (select/format db q error-ch)
+       (collect-results q)))
+
+(defn multi-query?
+  [q]
+  (and (map? q)
+       (->> q vals (every? :select))))
+
+(defn multi-query
+  [db error-ch multi-q]
+  (go
+    (let [queries (seq multi-q)
+          ks      (map key queries)
+          results (<! (->> queries
+                           (map val)
+                           (map (partial single-query db error-ch))
+                           (async/map vector)))]
+      (zipmap ks results))))
+
 (defn query
   "Execute the parsed query `q` against the database value `db`. Returns an async
   channel which will eventually contain a single vector of results, or an
@@ -48,13 +74,9 @@
   [db q]
   (go
    (let [error-ch  (async/chan)
-         result-ch (->> (where/search db q error-ch)
-                        (group/combine q)
-                        (order/arrange q)
-                        (drop-offset q)
-                        (take-limit q)
-                        (select/format db q error-ch)
-                        (collect-results q))]
+         result-ch (if (multi-query? q)
+                     (multi-query db error-ch q)
+                     (single-query db error-ch q))]
      (async/alt!
        error-ch  ([e] e)
        result-ch ([result] result)))))
