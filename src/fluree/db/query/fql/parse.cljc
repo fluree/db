@@ -70,8 +70,8 @@
                         {:status 400 :error :db/invalid-query})))
       code)
     (catch* e
-            (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
-            (throw (ex-info (code-str "Invalid query function: " code-str)
+            (log/warn e "Invalid query function attempted: " code-str)
+            (throw (ex-info (str "Invalid query function: " code-str)
                             {:status 400 :error :db/invalid-query})))))
 
 (defn variables
