@@ -18,7 +18,8 @@
           expected-query-result  [{"@id" "ex:dan", "ex:foo" "bar"}]]
 
       (testing "shared store"
-        (let [conn              (conn/connect {:conn/store-config {:store/method :memory}})
+        (let [conn              (conn/connect {:conn/mode :fluree
+                                               :conn/store-config {:store/method :memory}})
               ledger-address    (conn/create conn "testconn")
               after-ledger-init @(-> conn :store :storage-atom)
 
@@ -47,7 +48,8 @@
           (conn/close conn)))
 
       (testing "a-la-carte config"
-        (let [conn                   (conn/connect {:conn/publisher-config
+        (let [conn                   (conn/connect {:conn/mode :fluree
+                                                    :conn/publisher-config
                                                     {:pub/store-config {:store/method :memory}}
                                                     :conn/transactor-config
                                                     {:txr/store-config {:store/method :memory}}
