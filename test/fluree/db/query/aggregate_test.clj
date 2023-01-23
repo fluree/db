@@ -8,11 +8,7 @@
   (testing "aggregate queries"
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
-          db     (fluree/db people)
-          qry    '{:context {:ex "http://example.org/ns/"}
-                   :select  [?name (count ?favNums)]
-                   :where   [[?s :schema/name ?name]
-                             [?s :ex/favNums ?favNums]]}]
+          db     (fluree/db people)]
       (testing "with explicit grouping"
         (let [qry    '{:context {:ex "http://example.org/ns/"}
                        :select  [?name (count ?favNums)]

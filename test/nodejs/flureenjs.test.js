@@ -1,64 +1,26 @@
-const flureenjs = require("@fluree/flureenjs");
+const flureenjs = require("@fluree/fluree-node-sdk");
 const fs = require("fs");
 const path = require("path");
 
 test("expect all flureenjs functions to be defined", () => {
   expect(Object.keys(flureenjs).sort()).toStrictEqual([
-    "accountId",
-    "close",
-    "closeListener",
-    "collectionFlakes",
-    "collectionId",
+    "commit",
     "connect",
+    "create",
     "db",
-    "deleteLedger",
-    "forwardTimeTravel",
-    "graphql",
-    "historyQuery",
-    "httpSignature",
-    "isForwardTimeTravelDb",
-    "jldCommit",
-    "jldConnect",
-    "jldCreate",
-    "jldDb",
-    "jldLoad",
-    "jldQuery",
-    "jldStage",
-    "jldStatus",
-    "ledgerInfo",
-    "ledgerList",
-    "listen",
-    "listeners",
-    "monitorTx",
-    "multiQuery",
-    "newLedger",
-    "newPrivateKey",
-    "passwordGenerate",
-    "passwordLogin",
-    "predicateId",
-    "predicateName",
-    "publicKey",
-    "publicKeyFromPrivate",
+    "exists",
+    "load",
+    "loadFromAddress",
     "query",
-    "queryWith",
-    "renewToken",
-    "resolveLedger",
-    "search",
-    "session",
-    "setDefaultKey",
     "setLogging",
-    "sign",
-    "sparql",
-    "sql",
-    "subid",
-    "transact",
-    "txToCommand",
+    "stage",
+    "status"
   ]);
 });
 
 test("expect conn, ledger, stage, commit, and query to work", async () => {
 
-  const conn = await flureenjs.jldConnect({
+  const conn = await flureenjs.connect({
     method: "memory",
     defaults: {
       context: {
@@ -82,17 +44,19 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
     },
   });
 
-  const ledger = await flureenjs.jldCreate(conn, "testledger");
+  const ledger = await flureenjs.create(conn, "testledger");
 
-  const db = await flureenjs.jldStage(ledger, {
+  const db = await flureenjs.db(ledger);
+
+  const db1 = await flureenjs.stage(db, {
     id: "ex:john",
     "@type": "ex:User",
     "schema:name": "John"
   });
 
 
-   const results = await flureenjs.jldQuery(
-     db,
+   const results = await flureenjs.query(
+     db1,
      {
        select: { "?s": ["*"] },
        where: [["?s", "rdf:type", "ex:User"]]
@@ -111,8 +75,8 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
    );
 
    // test providing context works and remaps keys
-   const contextResults = await flureenjs.jldQuery(
-     db,
+   const contextResults = await flureenjs.query(
+     db1,
      { "@context": {"flhubee": "http://schema.org/name"},
        select: { "?s": ["*"] },
        where: [["?s", "rdf:type", "ex:User"]]
@@ -130,7 +94,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
    );
 
 
-  const db2 = await flureenjs.jldStage(db, {
+  const db2 = await flureenjs.stage(db, {
     "@id": "uniqueId",
     foo: "foo",
     bar: "bar",
@@ -138,7 +102,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
 
 //  await flureenjs.jldCommit(db);
 
-  const results2 = await flureenjs.jldQuery(db2, {
+  const results2 = await flureenjs.query(db2, {
     select: { "?s": ["*"] },
     where: [["?s", "@id", "uniqueId"]],
   });

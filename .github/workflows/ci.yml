@@ -1,29 +1,92 @@
 name: CI
 on:
   push:
-  pull_request:
   schedule:
     - cron: 13 01 * * *
 
 jobs:
-  test:
-    name: Run tests & build Docker image
+  docker-build-cache:
+    name: docker build cache
     runs-on: [linux, large, docker]
     steps:
-      - uses: actions/checkout@v3.1.0
       - uses: docker/setup-buildx-action@v2.2.1
         with:
           install: true
+      - uses: docker/build-push-action@v3
+        id: build
+        with:
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
+
+  test-browser:
+    name: test flureedb.js
+    needs: docker-build-cache
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - uses: docker/build-push-action@v3
+        with:
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
       - name: Run tests
-        run: script/run-in-docker.sh make ci
-      - name: Build Docker image
-        run: docker build -t fluree/db .
-      - name: Notify Slack fail
+        run: docker run fluree/db make browser-test
+
+  test-cljs:
+    name: run cljs tests
+    needs: docker-build-cache
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - uses: docker/build-push-action@v3
+        with:
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
+      - name: Run tests
+        run: |
+          docker create --name fluree-db fluree/db true
+          docker cp fluree-db:/usr/src/flureedb/docker-chrome-seccomp.json .
+          docker rm fluree-db
+          docker run --security-opt seccomp=docker-chrome-seccomp.json fluree/db make cljstest
+
+  test-other:
+    name: run other tests
+    needs: docker-build-cache
+    runs-on: [linux, large, docker]
+    steps:
+      - uses: docker/setup-buildx-action@v2.2.1
+        with:
+          install: true
+      - uses: docker/build-push-action@v3
+        with:
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: fluree/db
+          load: true
+      - name: Run tests
+        run: docker run fluree/db make cljtest eastwood nodejs-test
+
+  notifications:
+    name: send notifications
+    if: always()
+    needs: [test-browser, test-cljs, test-other]
+    runs-on: [linux, large, docker]
+    steps:
+      - name:
         if: github.ref == 'refs/heads/main' && failure()
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-        uses: voxmedia/github-action-slack-notify-build@v2
+        uses: voxmedia/github-action-slack-notify-build@v1.5.0
         with:
-          channel_id: CNCH08G14 # development channel
+          channel: development
           status: FAILED
           color: danger

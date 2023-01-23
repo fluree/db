@@ -1,17 +1,15 @@
 (ns fluree.db.query.reverse-query-test
   (:require
-    [clojure.string :as str]
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]))
+    [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration context-reverse-test
   (testing "Test that the @reverse context values pulls select values back correctly."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/reverse" {:context {:ex "http://example.org/ns/"}})
           db     @(fluree/stage
-                    ledger
+                    (fluree/db ledger)
                     [{:id           :ex/brian,
                       :type         :ex/User,
                       :schema/name  "Brian"

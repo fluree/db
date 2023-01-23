@@ -89,14 +89,20 @@
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
     (doseq [movie movies]
-      (let [staged @(fluree/stage ledger movie)]
-        @(fluree/commit! staged {:message (str "Commit " (get movie "name"))
-                                 :push? true})))
+      (let [staged @(fluree/stage (fluree/db ledger) movie)]
+        @(fluree/commit! ledger staged
+                         {:message (str "Commit " (get movie "name"))
+                          :push? true})))
     ledger))
 
 (defn load-people
   [conn]
   (let [ledger @(fluree/create conn "test/people")
-        staged @(fluree/stage ledger people)
-        commit @(fluree/commit! staged {:message "Adding people", :push? true})]
+        staged @(fluree/stage (fluree/db ledger) people)]
+    @(fluree/commit! ledger staged {:message "Adding people", :push? true})
     ledger))
+
+(defn transact
+  [ledger data]
+  (->> @(fluree/stage (fluree/db ledger) data)
+       (fluree/commit! ledger)))

@@ -7,7 +7,7 @@
     "test": "jest"
   },
   "dependencies": {
-    "@fluree/flureenjs": "file:../../out/nodejs/flureenjs.js"
+    "@fluree/fluree-node-sdk": "file:../../out/nodejs/fluree-node-sdk.js"
   },
   "devDependencies": {
     "jest": "^28.1.1",

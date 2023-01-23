@@ -1,17 +1,15 @@
 (ns fluree.db.query.union-query-test
   (:require
-    [clojure.string :as str]
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]))
+    [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration union-queries
   (testing "Testing various 'union' query clauses."
     (let [conn   (test-utils/create-conn)
           ledger @(fluree/create conn "query/union" {:context {:ex "http://example.org/ns/"}})
           db     @(fluree/stage
-                    ledger
+                    (fluree/db ledger)
                     [{:id           :ex/brian,
                       :type         :ex/User,
                       :schema/name  "Brian"
@@ -69,5 +67,5 @@
              [["Cam" "cam@example.org" nil]
               ["Alice" nil "alice@example.org"]
               ["Brian" nil "brian@example.org"]])
-          "Emails for all 3 users should return using different vars, but also passing through a variable")
-      )))
+          "Emails for all 3 users should return using different vars, but also passing through a variable"))))
+

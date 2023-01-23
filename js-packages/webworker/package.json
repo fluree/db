@@ -5,12 +5,12 @@
     "url" : "git+https://github.com/fluree/flureejs.git"
   },
   "license" : "SEE LICENSE IN LICENSE",
-  "name" : "@fluree/flureeworker",
+  "name" : "@fluree/fluree-webworker",
   "scripts" : {
     "test" : "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords" : [ "fluree", "flureeworker", "react", "javascript", "service worker" ],
+  "keywords" : [ "fluree", "fluree-webworker", "react", "javascript", "service worker" ],
   "author" : "Fluree PBC (https://flur.ee)",
   "version" : null,
-  "main" : "flureeworker.js"
+  "main" : "fluree-webworker.js"
 }

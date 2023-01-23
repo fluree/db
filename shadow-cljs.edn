@@ -3,105 +3,66 @@
  :dev-http {8000 "dev/browser/"}
 
  :builds
- {:flureedb
-  {:target     :esm
-   :output-dir "out/browser/"
+ {:fluree-browser-sdk
+  {:target          :esm
+   :output-dir      "out/browser/"
    :closure-defines {fluree.db.platform/BROWSER true
-                     cljs.core/*global* "window"}
-   :js-options {:resolve {"fs" false
-                          "path" false
-                          "process" false
-                          "buffer" false
-                          "crypto" false}}
-   :modules {:flureedb {:exports {default flureedb/flureedb}}}
-   :build-hooks [(shadow.cljs.build-report/hook)]
-   :devtools {:watch-dir "dev/browser"}}
+                     cljs.core/*global*         "window"}
+   :js-options      {:resolve {"fs"      false
+                               "path"    false
+                               "process" false
+                               "buffer"  false
+                               "crypto"  false}}
+   :modules         {:fluree-browser-sdk {:exports {default fluree.sdk.browser/fluree-browser-sdk}}}
+   :build-hooks     [(shadow.cljs.build-report/hook)]
+   :devtools        {:watch-dir "dev/browser"}}
 
-  :flureeworker
-  {:target      :esm
-   :output-dir  "out/webworker/"
-   :closure-defines {fluree.db.platform/BROWSER true
-                     cljs.core/*global* "self"}
-   :js-options {:resolve {"fs" false
-                          "path" false
-                          "process" false
-                          "buffer" false
-                          "crypto" false}}
-   :modules
-   {:flureeworker {:entries [flureeworker]
-                   :init-fn flureeworker/init}}
-   :build-hooks [(shadow.cljs.build-report/hook)]}
-
-  :flureenjs
-  {:target    :node-library
-   :output-to "out/nodejs/flureenjs.js"
-   :closure-defines {fluree.db.platform/BROWSER false}
+  :fluree-node-sdk
+  {:target           :node-library
+   :output-to        "out/nodejs/fluree-node-sdk.js"
+   :closure-defines  {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}
-   :exports   {:accountId             flureenjs/accountId
-               :close                 flureenjs/close
-               :closeListener         flureenjs/closeListener
-               :collectionFlakes      flureenjs/collectionFlakes
-               :connect               flureenjs/connect
-               :db                    flureenjs/db
-               :deleteLedger          flureenjs/deleteLedger
-               :forwardTimeTravel     flureenjs/forwardTimeTravel
-               :graphql               flureenjs/graphql
-               :historyQuery          flureenjs/historyQuery
-               :httpSignature         flureenjs/httpSignature
-               :isForwardTimeTravelDb flureenjs/isForwardTimeTravelDb
-               :jldCommit             flureenjs/jldCommit
-               :jldConnect            flureenjs/jldConnect
-               :jldCreate             flureenjs/jldCreate
-               :jldDb                 flureenjs/jldDb
-               :jldLoad               flureenjs/jldLoad
-               :jldQuery              flureenjs/jldQuery
-               :jldStage              flureenjs/jldStage
-               :jldStatus             flureenjs/jldStatus
-               :ledgerInfo            flureenjs/ledgerInfo
-               :ledgerList            flureenjs/ledgerList
-               :listen                flureenjs/listen
-               :listeners             flureenjs/listeners
-               :monitorTx             flureenjs/monitorTx
-               :multiQuery            flureenjs/multiQuery
-               :newLedger             flureenjs/newLedger
-               :newPrivateKey         flureenjs/newPrivateKey
-               :passwordGenerate      flureenjs/passwordGenerate
-               :passwordLogin         flureenjs/passwordLogin
-               :predicateId           flureenjs/predicateId
-               :predicateName         flureenjs/predicateName
-               :publicKey             flureenjs/publicKey
-               :publicKeyFromPrivate  flureenjs/publicKeyFromPrivate
-               :query                 flureenjs/query
-               :queryWith             flureenjs/queryWith
-               :renewToken            flureenjs/renewToken
-               :resolveLedger         flureenjs/resolveLedger
-               :search                flureenjs/search
-               :session               flureenjs/session
-               :setDefaultKey         flureenjs/setDefaultKey
-               :setLogging            flureenjs/setLogging
-               :sign                  flureenjs/sign
-               :sparql                flureenjs/sparql
-               :sql                   flureenjs/sql
-               :subid                 flureenjs/subid
-               :transact              flureenjs/transact
-               :txToCommand           flureenjs/txToCommand
-               :collectionId          flureenjs/collectionId}}
+   :exports          {:commit          fluree.sdk.node/commit
+                      :connect         fluree.sdk.node/connect
+                      :create          fluree.sdk.node/create
+                      :db              fluree.sdk.node/db
+                      :exists          fluree.sdk.node/exists
+                      :load            fluree.sdk.node/load
+                      :loadFromAddress fluree.sdk.node/loadFromAddress
+                      :query           fluree.sdk.node/query
+                      :setLogging      fluree.sdk.node/setLogging
+                      :stage           fluree.sdk.node/stage
+                      :status          fluree.sdk.node/status}}
+
+  :fluree-webworker
+  {:target          :esm
+   :output-dir      "out/webworker/"
+   :closure-defines {fluree.db.platform/BROWSER true
+                     cljs.core/*global*         "self"}
+   :js-options      {:resolve {"fs"      false
+                               "path"    false
+                               "process" false
+                               "buffer"  false
+                               "crypto"  false}}
+   :modules
+   {:fluree-webworker {:entries [fluree.sdk.webworker]
+                       :init-fn fluree.sdk.webworker/init}}
+   :build-hooks     [(shadow.cljs.build-report/hook)]}
 
   :node-test                            ; runs the cljs tests on node
-  {:target    :node-test
-   :output-to "out/nodejs-test/node-tests.js"
-   :autorun true
-   :closure-defines {fluree.db.platform/BROWSER false}
+  {:target           :node-test
+   :output-to        "out/nodejs-test/node-tests.js"
+   :autorun          true
+   :closure-defines  {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}}
 
   :browser-test                         ; runs the cljs tests in the browser via karma
-  {:target :karma
-   :output-to  "out/browser-test/browser-tests.js"
+  {:target          :karma
+   :output-to       "out/browser-test/browser-tests.js"
    :closure-defines {fluree.db.platform/BROWSER true
-                     cljs.core/*global* "window"}
-   :js-options {:resolve {"fs" false
-                          "path" false
-                          "process" false
-                          "buffer" false
-                          "crypto" false}}}}}
-
+                     cljs.core/*global*         "window"}
+   :js-options      {:resolve {"fs"      false
+                               "path"    false
+                               "process" false
+                               "buffer"  false
+                               "crypto"  false}}}}}
