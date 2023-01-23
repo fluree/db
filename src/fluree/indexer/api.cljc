@@ -45,5 +45,5 @@
 
 (def Db idxr-model/Db)
 
-(def DbSummary idxr-model/DbSummary)
-(def TxSummary idxr-model/TxSummary)
+(def DbBlockSummary idxr-model/DbBlockSummary)
+(def DbBlock idxr-model/DbBlock)

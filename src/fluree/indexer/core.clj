@@ -1,26 +1,26 @@
 (ns fluree.indexer.core
   (:refer-clojure :exclude [load])
   (:require
-   [clojure.core.async :as async]
+   [fluree.common.identity :as ident]
+   [fluree.common.iri :as iri]
    [fluree.common.model :as model]
    [fluree.common.protocols :as service-proto]
    [fluree.db.api.query :as jld-query]
+   [fluree.db.constants :as const]
+   [fluree.db.indexer.proto :as idx-proto]
+   [fluree.db.json-ld.bootstrap :as bootstrap]
    [fluree.db.json-ld.commit :as jld-commit]
+   [fluree.db.json-ld.reify :as jld-reify]
    [fluree.db.json-ld.transact :as jld-transact]
-   [fluree.db.util.async :refer [<?? go-try]]
+   [fluree.db.storage.core :as storage]
+   [fluree.db.util.async :refer [<??]]
    [fluree.db.util.log :as log]
    [fluree.indexer.db :as db]
-   [fluree.indexer.tx-summary :as tx-summary]
+   [fluree.indexer.db-block :as block]
    [fluree.indexer.model :as idxr-model]
    [fluree.indexer.protocols :as idxr-proto]
-   [fluree.store.api :as store]
-   [fluree.db.indexer.proto :as idx-proto]
    [fluree.json-ld :as json-ld]
-   [fluree.common.identity :as ident]
-   [fluree.db.storage.core :as storage]
-   [fluree.db.json-ld.reify :as jld-reify]
-   [fluree.db.constants :as const]
-   [fluree.db.json-ld.bootstrap :as bootstrap]))
+   [fluree.store.api :as store]))
 
 (defn stop-indexer
   [idxr]
@@ -29,19 +29,19 @@
   (store/stop (:store idxr)))
 
 (defn init-db
-  [{:keys [store config db-map] :as idxr} ledger-name opts]
+  [{:keys [store config state] :as idxr} ledger-name opts]
   (let [db         (bootstrap/blank-db (db/create store ledger-name opts))
-        db-address (db/create-db-address db (str ledger-name "/tx/init"))]
-    (if (get @db-map db-address)
+        db-address (db/create-db-address db (str (block/db-block-path ledger-name) "init"))]
+    (if (get @state db-address)
       (throw (ex-info "Ledger db already exists." {:ledger ledger-name}))
       (do
-        (swap! db-map assoc db-address db)
+        (swap! state assoc db-address db)
         db-address))))
 
 (defn stage-db
-  "Index the given data, then store a tx-summary."
-  [{:keys [store db-map] :as idxr} db-address data]
-  (if-let [db-before (get @db-map db-address)]
+  "Index the given data, then store a db-block"
+  [{:keys [store state] :as idxr} db-address data]
+  (if-let [db-before (get @state db-address)]
     (let [{ledger-name :ledger/name} (db/db-path-parts db-address)
           db-after                   (<?? (jld-transact/stage (db/prepare db-before) data {}))
           ;; This is a hack to sync t into various places since dbs shouldn't care about branches
@@ -52,7 +52,8 @@
 
           {:keys [context did private push?] :as _opts} data
 
-          ;; create the information necessary for tx-summary
+          ;; create the information necessary for db-block -
+          ;; can this context stuff can be removed if data is expanded?
           context*      (-> (if context
                               (json-ld/parse-context (:context (:schema db-after)) context)
                               (:context (:schema db-after)))
@@ -68,40 +69,42 @@
                      (<?? (idx-proto/-index idx-writer db-after))
                      db-after)
 
-          ;; create tx-summary and write it to store
-          tx-summary    (tx-summary/create-tx-summary db-after @ctx-used-atom assert retract)
-          tx-summary-id (:path (<?? (store/write store (tx-summary/tx-path ledger-name) tx-summary
-                                                 {:content-address? true})))
+          ;; create db-block and write it to store
+          db-block      (block/create-db-block db-after assert retract)
+          db-block-path (:path (<?? (store/write store (block/db-block-path ledger-name) db-block
+                                               {:content-address? true})))
 
-          ;; save newest tx-summary so the next stage knows the previous tx
-          db-final   (assoc db-after :tx-summary-id tx-summary-id)
-          db-address (db/create-db-address db-final tx-summary-id)]
+          ;; save newest db-block so the next stage knows the previous tx
+          db-final   (assoc db-after :db-block-id db-block-path)
+          db-address (db/create-db-address db-final db-block-path)]
       ;; add an entry of db-address -> db
-      (swap! db-map assoc db-address db-final)
+      (swap! state assoc db-address db-final)
 
-      ;; return db-summary, a truncated tx-summary
-      (tx-summary/create-db-summary tx-summary db-address))
+      ;; return db-summary, a truncated db-block
+      (block/create-db-summary db-block db-address))
     (throw (ex-info "No such db-address." {:error      :stage/no-such-db
                                            :db-address db-address}))))
 
-(defn load-tx-summaries
-  "Read each tx-summary's previous until we reach the stop t or run out of previous to follow."
-  [store head-tx-summary stop-t]
-  (loop [{:db/keys [previous]} head-tx-summary
-         summaries             (list head-tx-summary)]
-    (if-let [prev-summary (<?? (store/read store previous))]
-      (if (> (:db/t prev-summary) stop-t)
-        summaries
-        (recur prev-summary (conj summaries prev-summary)))
-      summaries)))
+(defn load-db-blocks
+  "Read each db-block's previous until we reach the stop t or run out of previous to follow."
+  [store head-db-block stop-t]
+  (loop [{previous iri/DbBlockPrevious} head-db-block
+         db-blocks                      (list head-db-block)]
+    (if-let [prev-db-block (<?? (store/read store previous))]
+      (if (> (get prev-db-block iri/DbBlockT) stop-t)
+        db-blocks
+        (recur prev-db-block (conj db-blocks prev-db-block)))
+      db-blocks)))
 
-(defn merge-tx-summary
-  "Merge the tx summary into novelty."
-  [db tx-summary]
-  (let [{:db/keys [assert retract context t]} tx-summary
+(defn merge-db-block
+  "Merge the db-block into novelty and return a new Db."
+  [db db-block]
+  (let [{assert  iri/DbBlockAssert
+         retract iri/DbBlockRetract
+         t       iri/DbBlockT} db-block
 
-        iris                     (volatile! {})
-        refs                     (volatile! (-> db :schema :refs))
+        iris (volatile! {})
+        refs (volatile! (-> db :schema :refs))
 
         expanded-retract         (json-ld/expand retract)
         expanded-assert          (json-ld/expand assert)
@@ -120,45 +123,50 @@
 (defn load-db
   "If given db-address doesn't exist, try to recreate it from index files in store, and
   then rebuild novelty with tx-summaries."
-  [{:keys [store db-map] :as idxr} db-address opts]
-  (if-let [db (get @db-map db-address)]
+  [{:keys [store state] :as idxr} db-address opts]
+  (if-let [db (get @state db-address)]
     ;; already loaded
-    (let [tx-summary (<?? (store/read store (:tx-summary-id db)))]
+    (let [db-block (<?? (store/read store (:db-block-id db)))]
       ;; update opts
-      (swap! db-map update db-address db/update-index-writer-opts opts)
-      (tx-summary/create-db-summary tx-summary db-address))
+      (swap! state update db-address db/update-index-writer-opts opts)
+      (block/create-db-summary db-block db-address))
 
     ;; rebuild db from persisted data
-    (let [tx-summary-id (:address/path (ident/address-parts db-address))
-          tx-summary    (<?? (store/read store tx-summary-id))
+    (let [db-block-id (:address/path (ident/address-parts db-address))
+          db-block    (<?? (store/read store db-block-id))
 
-          {ledger-name :ledger/name}        (db/db-path-parts db-address)
-          {:db/keys [root previous t opts]} tx-summary
+          {ledger-name :ledger/name}          (db/db-path-parts db-address)
+          {root        iri/DbBlockIndexRoot
+           previous    iri/DbBlockPrevious
+           t           iri/DbBlockT
+           reindex-min iri/DbBlockReindexMin
+           reindex-max iri/DbBlockReindexMax} db-block
 
-          ;; create a blank db
-          blank-db   (bootstrap/blank-db (db/create store ledger-name opts))
+          ;; create a blank db, updating opts with supplied opts
+          blank-db   (bootstrap/blank-db (db/create store ledger-name (merge {:reindex-min-bytes reindex-min
+                                                                              :reindex-max-bytes reindex-max}
+                                                                             opts)))
           ;; load it up with the indexes persisted to disk
           indexed-db (if root
                        (<?? (storage/reify-db store blank-db root))
-                         blank-db)
+                       blank-db)
           ;; find all the outstanding tx summaries
-          tx-summaries (load-tx-summaries store tx-summary (:t indexed-db))
-          ;; merge each tx-summary into novelty
-          loaded-db (reduce merge-tx-summary
-                            indexed-db
-                            tx-summaries)
+          db-blocks  (load-db-blocks store db-block (:t indexed-db))
+          ;; merge each db-block into novelty
+          loaded-db  (reduce merge-db-block
+                             indexed-db
+                             db-blocks)
 
-          rebuilt-tx-summary (tx-summary/create-tx-summary loaded-db
-                                                           (:db/context tx-summary)
-                                                           (:db/assert tx-summary)
-                                                           (:db/retract tx-summary))]
+          rebuilt-db-block (block/create-db-block loaded-db
+                                                  (get db-block iri/DbBlockAssert)
+                                                  (get db-block iri/DbBlockRetract))]
       ;; fully loaded
-      (swap! db-map assoc db-address loaded-db)
-      (tx-summary/create-db-summary rebuilt-tx-summary db-address))))
+      (swap! state assoc db-address loaded-db)
+      (block/create-db-summary rebuilt-db-block db-address))))
 
 (defn query-db
-  [{:keys [store db-map] :as idxr} db-address query]
-  (if-let [db (get @db-map db-address)]
+  [{:keys [store state] :as idxr} db-address query]
+  (if-let [db (get @state db-address)]
     (<?? (jld-query/query-async db query))
     (throw (ex-info "No such db-address." {:error :query/no-such-db
                                            :db-address db-address}))))
@@ -178,9 +186,11 @@
 (defn create-indexer
   [{:keys [:idxr/id :idxr/store-config :idxr/store] :as config}]
   (let [store (or store (store/start store-config))
-        id (or id (random-uuid))]
+        id (or id (random-uuid))
+        ;; state is a map of db-address to JsonLdDb
+        state (atom {})]
     (log/info "Starting Indexer " id "." config)
-    (map->Indexer {:id id :store store :config config :db-map (atom {})})))
+    (map->Indexer {:id id :store store :config config :state state})))
 
 (defn start
   [config]

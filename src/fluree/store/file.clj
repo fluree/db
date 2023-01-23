@@ -46,6 +46,7 @@
       (with-open [out (io/output-stream (io/file file-path))]
         (.write out ^bytes bytes))
       {:path    path
+       :id      hash
        :address path
        :hash    hash}
       (catch FileNotFoundException _
@@ -54,6 +55,7 @@
           (with-open [out (io/output-stream (io/file file-path))]
             (.write out ^bytes bytes))
           {:path    path
+           :id      hash
            :address path
            :hash    hash}
           (catch Exception e

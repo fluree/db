@@ -16,9 +16,9 @@
     path))
 
 (defn create-db-address
-  "Creates an address of the form `fluree:db:<store-type>:<ledger-name>/tx/<tx-summary-address>`."
-  [db tx-summary-id]
-  (store/address (:conn db) "db" tx-summary-id))
+  "Creates an address of the form `fluree:db:<store-type>:<ledger-name>/db/<db-block-id>`."
+  [db db-block-id]
+  (store/address (:conn db) "db" db-block-id))
 
 (defn db-path-parts
   "Returns the ledger name from the db-address"

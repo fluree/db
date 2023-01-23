@@ -1,5 +1,6 @@
 (ns fluree.indexer.model
-  (:require [fluree.store.api :as store]))
+  (:require [fluree.store.api :as store]
+            [fluree.common.iri :as iri]))
 
 (def IndexerConfig
   [:or
@@ -44,22 +45,29 @@
    [:permissions :map]
    [:ecount :map]])
 
-(def DbSummary
+(def DbBlock
+  "Persisted to disk to track updates to novelty."
   [:map
-   [:db/address :string]
-   [:db/root {:optional true} :string]
-   [:db/previous {:optional true} :string]
-   [:db/t :int]
-   [:db/v :int]
-   [:db/flakes :int]
-   [:db/size :int]
-   [:db/opts [:map
-              [:reindex-min-bytes :int]
-              [:reindex-max-bytes :int]]]])
+   [iri/type [:enum iri/DbBlock]]
 
-(def TxSummary
-  [:and
-   DbSummary
-   [:map
-    [:db/assert [:sequential :any]]
-    [:db/retract [:sequential :any]]]])
+   [iri/DbBlockV nat-int?]
+   [iri/DbBlockT nat-int?]
+   [iri/DbBlockSize nat-int?]
+   [iri/DbBlockPrevious {:optional true} :string]
+
+   [iri/DbBlockReindexMin nat-int?]
+   [iri/DbBlockReindexMax nat-int?]
+   [iri/DbBlockAssert [:sequential :any]]
+   [iri/DbBlockRetract [:sequential :any]]])
+
+(def DbBlockSummary
+  "Returned to caller."
+  [:map
+   [iri/type [:enum iri/DbBlockSummary]]
+
+   [iri/DbBlockAddress :string]
+
+   [iri/DbBlockV nat-int?]
+   [iri/DbBlockT nat-int?]
+   [iri/DbBlockSize nat-int?]
+   [iri/DbBlockPrevious {:optional true} :string]])

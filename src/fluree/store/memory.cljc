@@ -33,6 +33,7 @@
     ;; for convenience, store the clj data instead of the serialized data
     (swap! storage-atom assoc path data)
     {:path    path
+     :id      hash
      :address path
      :hash    hash}))
 
