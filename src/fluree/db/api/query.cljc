@@ -6,6 +6,7 @@
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as fql-parse]
+            [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
             [fluree.db.session :as session]
             [fluree.db.dbproto :as dbproto]
