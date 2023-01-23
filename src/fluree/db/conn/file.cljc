@@ -32,12 +32,12 @@
     (str "fluree:file://" path)))
 
 (defn local-path
-  [conn]
+  [{:keys [storage-path] :as _conn}]
   (let [abs-root #?(:clj (.getAbsolutePath (io/file ""))
                     :cljs (path/resolve "."))
         path (str abs-root
                   "/"
-                  (:storage-path conn)
+                  storage-path
                   "/")]
     #?(:clj  (-> path io/file .getCanonicalPath)
        :cljs (path/resolve path))))
