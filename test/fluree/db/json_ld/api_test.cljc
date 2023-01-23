@@ -44,7 +44,7 @@
                                {:method :file :storage-path storage-path
                                 :defaults
                                 {:context test-utils/default-context}})
-               ledger-alias "transact-basic-test-single-card"
+               ledger-alias "load-from-file-test-single-card"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
                                (fluree/db ledger)
@@ -73,11 +73,8 @@
                                             :ex/favNums 7}})
                _            @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               _            (Thread/sleep 1000)
-               loaded       @(fluree/load conn ledger-alias)]
-           (if (instance? Throwable loaded)
-             (throw loaded)
-             (is (= (:t db) (:t (fluree/db loaded))))))))
+               loaded       (test-utils/retry-load conn ledger-alias 100)]
+           (is (= (:t db) (:t (fluree/db loaded)))))))
 
      (testing "can load a file ledger with multi-cardinality predicates"
        (with-tmp-dir storage-path
@@ -85,7 +82,7 @@
                                {:method :file :storage-path storage-path
                                 :defaults
                                 {:context test-utils/default-context}})
-               ledger-alias "transact-basic-test-multi-card"
+               ledger-alias "load-from-file-test-multi-card"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
                                (fluree/db ledger)
@@ -122,8 +119,5 @@
                                              :ex/favNums [42, 76, 9]}}])
                _            @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               _            (Thread/sleep 1000)
-               loaded       @(fluree/load conn ledger-alias)]
-           (if (instance? Throwable loaded)
-             (throw loaded)
-             (is (= (:t db) (:t (fluree/db loaded))))))))))
+               loaded       (test-utils/retry-load conn ledger-alias 100)]
+           (is (= (:t db) (:t (fluree/db loaded)))))))))
