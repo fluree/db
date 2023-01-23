@@ -24,6 +24,12 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def root-policy-map
+  "Base policy (permissions) map that will give access to all flakes."
+  {:f/view   {:root? true}
+   :f/modify {:root? true}})
+
+
 (defn validate-ledger-name
   "Returns when ledger name is valid.
   Otherwise throws."
@@ -331,7 +337,7 @@
       (assoc current-db :permissions permissions))))
 
 (defn- graphdb-root-db [this]
-  (assoc this :permissions {:root?      true}))
+  (assoc this :permissions root-policy-map))
 
 (defn- graphdb-c-prop [{:keys [schema]} property collection]
   ;; collection properties TODO-deprecate :id property below in favor of :partition
@@ -505,10 +511,6 @@
 (defn create
   [{:keys [method alias conn] :as ledger}]
   (let [novelty     (new-novelty-map index/default-comparators)
-        permissions {:collection {:all? false}
-                     :predicate  {:all? true}
-                     :root?      true}
-
         {spot-cmp :spot
          psot-cmp :psot
          post-cmp :post
@@ -541,7 +543,7 @@
                     :schema      schema
                     :comparators index/default-comparators
                     :novelty     novelty
-                    :permissions permissions
+                    :permissions root-policy-map
                     :ecount      genesis-ecount})))
 
 

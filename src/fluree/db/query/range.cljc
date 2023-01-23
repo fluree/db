@@ -189,7 +189,7 @@
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (true? (:root? permissions))
+     (if (true? (get-in permissions [:f/view :root?]))
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)

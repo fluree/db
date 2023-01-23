@@ -246,6 +246,7 @@
                           ;; TODO --- the wrapping fn would have to look for async fns and use <?/<! takes (and itself be async as applicable)
                           (<? (compile-allow-rule-fn db (first allow-rule))))
                         (<? (compile-allow-rule-fn db allow-rule))) ;; returns two-tuple of [async? validation-fn]
+          _           (when-not (get-in prop-policy [:f/path :id]) (log/warn "NO :f/path PATH! FOR:  " prop-policy))
           prop-sid    (<? (dbproto/-subid db (get-in prop-policy [:f/path :id])))
           actions     (->> allow-rule :f/action util/sequential (map :id))
           allow-rule* (-> allow-rule
@@ -263,67 +264,91 @@
           [ks* allow-rule*])))))
 
 
-(defn compile-class-policy
-  "Compiles a class rule (where :f/targetClass is used)"
-  [db policy classes]
-  (go-try
-    (let [class-sids            (<? (subids db classes))
-          default-allow         (not-empty (get policy :f/allow))
-          default-key-seqs      (map #(vector :class %) class-sids)
-          default-allow-keys    (when default-allow
-                                  (map #(conj % :default) default-key-seqs))
-          default-restrictions  (when default-allow
-                                  (->> default-allow
-                                       util/sequential
-                                       (map #(compile-allow-rule db default-allow-keys %))
-                                       async/merge
-                                       (async/reduce
-                                         (fn [acc result]
-                                           (into acc result)) [])
-                                       <?))
-          property-restrictions (when-let [prop-policies (-> policy :f/property util/sequential not-empty)]
-                                  (->> prop-policies
-                                       (map #(compile-prop-policy db default-key-seqs %))
-                                       async/merge
-                                       (async/reduce
-                                         (fn [acc result]
-                                           (into acc result)) [])
-                                       <?))]
-      (concat default-restrictions property-restrictions))))
-
-
-
-(defn root-policy?
-  "A policy and be a 'root' (all access) policy if these 3 conditions apply:
+(defn unrestricted-actions
+  "A policy will be a 'root' (all access) policy if these 3 conditions apply:
    1) :f/targetNode value of :f/allNodes
    2) top-level (default) :f/allow rule that has no restrictions
-   3) no additional property restrictions for the respective :f/action granted - so a policy could give
-      root view access, but not have root modify access - for example"
-  [node-policy nodes]
-  (let [uses-allNodes?  (some #(= :f/allNodes %) nodes)
-        root-candidates (reduce
-                          (fn [actions next-policy]
-                            (if (restricted-allow-rule? next-policy)
-                              ;; allow policy is restricted, therefore not 'root'
-                              actions
-                              (into actions (map :id (:f/action node-policy)))))
-                          #{} (:f/allow node-policy))]
-    (when
-      (and uses-allNodes?
-           (not-empty root-candidates))
-      ;; we have actions that appear to have root access, need to verify there
-      ;; are no property restrictions for any of the "root" permission actions
-      ;; if so, they need to be excluded as they don't have root
-      (if (:f/property node-policy)
-        (reduce
-          (fn [root-candidates next-property]
-            (let [prop-allow   (:f/allow next-property)
-                  prop-actions (map :id (:f/action prop-allow))]
-              ;; remove any property actions that might be in root candidates
-              (apply disj root-candidates prop-actions)))
-          root-candidates
-          (:f/property node-policy))
-        root-candidates))))
+   3) no additional :f/property restrictions for the respective :f/action granted
+
+   Where a root policy exists for a specific action, returns the key sequences for each of the
+   actions., e.g. [ [[:f/view :root?], true], [[:f/modify :root?], true] ] which will end up in
+   the policy map like:
+   {:f/view   {:root? true}
+    :f/modify {:root? true}}
+
+   At this stage, these root policies exist at the top-level :f/allow rule, but if we
+   discover there is a more restrictive policy for a :f/property, they will be removed (due to
+   condition #3 above not being met)."
+  [node-policy]
+  (let [root-actions (reduce
+                       (fn [actions next-policy]
+                         (if (restricted-allow-rule? next-policy)
+                           ;; allow policy is restricted, therefore not 'root'
+                           actions
+                           (into actions (map :id (:f/action next-policy)))))
+                       #{} (:f/allow node-policy))]
+    (not-empty root-actions)))
+
+
+(defn non-allNodes
+  "Removes :f/allNodes from list of nodes.
+  Returns nil if no other nodes exist."
+  [nodes]
+  (not-empty
+    (remove #(= :f/allNodes %) nodes)))
+
+
+(defn remove-root-default-allow
+  "Removes :f/allow top-level policies that have already been granted
+  root access as they no longer need to be considered in evaulation."
+  [node-policy root-actions]
+  (let [default-allow          (get node-policy :f/allow)
+        non-root-default-allow (reduce
+                                 (fn [acc allow-policy]
+                                   (let [actions          (:f/action allow-policy)
+                                         ;; root-actions is a set, remove any actions that are already root, which is likely is all of them
+                                         non-root-actions (remove #(root-actions (:id %)) actions)]
+                                     ;; if any actions are left, leave the policy with the remaining actions - else remove policy entirely
+                                     (if (empty? non-root-actions)
+                                       acc
+                                       (conj acc (assoc allow-policy :f/action non-root-actions)))))
+                                 [] default-allow)]
+    ;; if there are no non-root default allow policies, remove :f/allow
+    ;; else, replace with only non-root default allow policies
+    (if (empty non-root-default-allow)
+      (dissoc node-policy :f/allow)
+      (assoc node-policy :f/allow non-root-default-allow))))
+
+;; TODO - exceptions in here won't be caught!
+(defn default-allow-restrictions
+  "Takes default allow policy (:f/allow full-policy) and returns two-tuples of [key-seq policy-fn]
+  where key-seq is the key sequence (as used by assoc-in) of where the policy function should
+  land in the final policy map."
+  [db base-key-seq default-allow]
+  (go-try
+    (let [default-allow-keys (map #(conj % :default) base-key-seq)]
+      (->> default-allow                                    ;; calling function assumed to force into sequential if wasn't already
+           (map #(compile-allow-rule db default-allow-keys %))
+           async/merge
+           (async/reduce
+             (fn [acc result]
+               (into acc result)) [])
+           <?))))
+
+;; TODO - exceptions in here won't be caught!
+(defn property-restrictions
+  "Takes property policies (:f/property full-policy) and returns two-tuples of [key-seq policy-fn]
+  where key-seq is the key sequence (as used by assoc-in) of where the policy function should
+  land in the final policy map."
+  [db base-key-seq prop-policies]
+  (go-try
+    (->> prop-policies
+         (map #(compile-prop-policy db base-key-seq %))
+         async/merge
+         (async/reduce
+           (fn [acc result]
+             (into acc result)) [])
+         <?)))
 
 
 (defn compile-node-policy
@@ -331,34 +356,55 @@
 
   :f/targetNode that uses the special keyword :f/allNodes means that the target is for
   everything in the database. This is typically how a global 'root' policy role is
-  established.  "
+  established.
+
+  One way to establish 'root, except x' policy would be to grant default allow policy for :f/allNodes
+  but then limit access to a specific property using :f/property restriction for that same :f/action.
+
+  Here we calculate all 'root' actions (if any), but then remove them if we later find a :f/property
+  restriction for that same action."
   [db policy nodes]
   (go-try
-    (let [all-nodes?           (some #(= :f/allNodes %) nodes)
-          ;; root policy is where we have a default top-level :f/allow policy that has no restrictions
-          root-policy?         (and all-nodes?
-                                    (->> policy :f/allow (some (complement restricted-allow-rule?))))
-          node-sids            (<? (subids db nodes))
-          default-allow        (not-empty (get policy :f/allow))
-          default-key-seqs     (map #(vector :node %) node-sids)
-          default-allow-keys   (when default-allow
-                                 (map #(conj % :default) default-key-seqs))
-          default-restrictions (when default-allow
-                                 (->> default-allow
-                                      util/sequential
-                                      (map #(compile-allow-rule db default-allow-keys %))
-                                      async/merge
-                                      (async/reduce
-                                        (fn [acc result]
-                                          (into acc result)) [])
-                                      <?))]
-      (when (:f/property policy)
-        (log/warn "Currently, property based restrictions on nodes are not yet enforced. Found for: " nodes))
-      ;; for each class targeted by the rule, map to each compiled fn
-      (if (and all-nodes?
-               (nil? (->> node-sids first (get default-restrictions))))
-        [[[:root?] true]]
-        default-restrictions))))
+    (let [all-nodes?               (some #(= :f/allNodes %) nodes)
+          nodes*                   (when all-nodes?
+                                     (non-allNodes nodes)
+                                     nodes)
+          root-actions             (when all-nodes?
+                                     (unrestricted-actions policy))
+          non-root-policy          (if root-actions         ;; if there was a root policy defined, remove default allows that contain it
+                                     (remove-root-default-allow policy root-actions)
+                                     policy)
+          node-sids                (when nodes*             ;; if this policy was only to define root, this will be empty - so no need to create async chans
+                                     (<? (subids db nodes*)))
+          default-key-seqs         (map (fn [node-sid] [:node node-sid]) node-sids)
+          ;; the default restrictions will exist only for non-root policies defined for :f/allow
+          default-restrictions     (when-let [default-allow (some-> (:f/allow non-root-policy) util/sequential)]
+                                     (<? (default-allow-restrictions db default-key-seqs default-allow)))
+          ;; property restrictions can "cancel" out root policy - meaning policy was allowed to perform action on everything *except* these specified properties (which is non-root)
+          property-restrictions    (when-let [prop-policies (some-> (:f/property policy) util/sequential)]
+                                     (<? (property-restrictions db default-key-seqs prop-policies)))
+
+          prop-restriction-actions (into #{} (map ffirst property-restrictions)) ;; "action" is the first item in the key sequence
+          ;; need to remove any root actions that have property restrictions
+          root-actions*            (remove prop-restriction-actions root-actions)
+          root-policies            (map (fn [root-action] [[root-action :root?] true]) root-actions*)]
+
+      (cond-> []
+              root-policies (into root-policies)
+              default-restrictions (into default-restrictions)
+              property-restrictions (into property-restrictions)))))
+
+(defn compile-class-policy
+  "Compiles a class rule (where :f/targetClass is used)"
+  [db policy classes]
+  (go-try
+    (let [class-sids            (<? (subids db classes))
+          default-key-seqs      (map #(vector :class %) class-sids)
+          default-restrictions  (when-let [default-allow (some-> (:f/allow policy) util/sequential)]
+                                  (<? (default-allow-restrictions db default-key-seqs default-allow)))
+          property-restrictions (when-let [prop-policies (some-> (:f/property policy) util/sequential)]
+                                  (<? (property-restrictions db default-key-seqs prop-policies)))]
+      (concat default-restrictions property-restrictions))))
 
 
 (defn compile-policy
@@ -366,9 +412,9 @@
   (go-try
     (let [classes (some->> policy :f/targetClass util/sequential (mapv :id))
           nodes   (some->> policy :f/targetNode util/sequential (mapv :id))]
-      (cond
-        classes (<? (compile-class-policy db policy classes))
-        nodes (<? (compile-node-policy db policy nodes))))))
+      (cond-> []
+              classes (into (<? (compile-class-policy db policy classes)))
+              nodes (into (<? (compile-node-policy db policy nodes)))))))
 
 
 (defn compile-policies
