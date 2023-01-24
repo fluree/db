@@ -264,7 +264,7 @@
 
 (defn query
   [db query]
-  (let [res-chan (query-api/query-async db query)]
+  (let [res-chan (query-api/query db query)]
     (promise-wrap res-chan)))
 
 (defn history

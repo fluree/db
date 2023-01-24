@@ -26,42 +26,7 @@
 ;; main query interface for APIs, etc.
 
 
-(declare query query-async)
-
-
-(defn query-type
-  "Returns keyword of query type by inspecting flureeQL query.
-
-  Query types are:
-    :standard - analytical query
-    :multi - multi-query
-    :block - block query
-    :history - history query"
-  [flureeQL]
-  (cond
-    (:select flureeQL)
-    :standard
-
-    (:selectOne flureeQL)
-    :standard
-
-    (:history flureeQL)
-    :history
-
-    (:selectDistinct flureeQL)
-    :standard
-
-    (:selectReduced flureeQL)                               ;; SPARQL standard, no special treatment over :selectDistinct
-    :standard
-
-    (:block flureeQL)                                       ;; block checked last, as block is allowed in above query types
-    :block
-
-    ;; (:construct flureeQL) - we don't yet have support for SPARQL-like construct queries
-    ;; :construct
-
-    :else
-    :multi))
+(declare query)
 
 
 (defn db-ident?
@@ -299,7 +264,7 @@
             results (<? (history-flakes->json-ld db query-map flakes))]
         results))))
 
-(defn query-async
+(defn query
   "Execute a query against a database source, or optionally
   additional sources if the query spans multiple data sets.
   Returns core async channel containing result."
@@ -413,16 +378,3 @@
                                                            res)))]
               (recur r status-global* fuel* response*)))))
       (catch* e e))))
-
-(defn query
-  "Generic query interface. Will determine if multi-query, standard query, block or history
-  and dispatch appropriately.
-
-  For now, sources is expected to be just a db. In the case of a block query, which requires
-  a conn + ledger, those will be extracted from the db."
-  [source flureeQL]
-  (let [query-type (query-type flureeQL)]
-    (case query-type
-      :standard (query-async source flureeQL)
-      :history (history source flureeQL)
-      :multi (multi-query-async source flureeQL))))
