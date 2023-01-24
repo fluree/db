@@ -135,7 +135,7 @@
     (let [db-block-id (:address/path (ident/address-parts db-address))
           db-block    (<?? (store/read store db-block-id))
 
-          {ledger-name :ledger/name}          (db/db-path-parts db-address)
+          {ledger-name :ledger/name} (db/db-path-parts db-address)
           {root        iri/DbBlockIndexRoot
            previous    iri/DbBlockPrevious
            t           iri/DbBlockT

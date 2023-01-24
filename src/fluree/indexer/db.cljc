@@ -24,9 +24,9 @@
   "Returns the ledger name from the db-address"
   [db-address]
   (let [path (:address/path (ident/address-parts db-address))
-        [ledger-name _ tx-summary-id] (str/split path #"/")]
+        [ledger-name _ db-block-id] (str/split path #"/")]
     {:ledger/name ledger-name
-     :tx/summary-id tx-summary-id}))
+     :db/block-id db-block-id}))
 
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
