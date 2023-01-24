@@ -16,7 +16,8 @@
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.json-ld.vocab :as vocab])
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.json-ld.transact :as jld-transact])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -275,15 +276,17 @@
   (let [{:keys [novelty]} db
         {:keys [spot psot post opst tspo]} novelty
         size (flake/size-bytes flakes)]
-    (assoc db :novelty {:spot (into spot flakes)
-                        :psot (into psot flakes)
-                        :post (into post flakes)
-                        :opst opst
-                        :tspo (into tspo flakes)
-                        :size (+ (:size novelty) size)}
-              :stats (-> (:stats db)
-                         (update :size + size)
-                         (update :flakes + (count flakes))))))
+    (-> db
+        (assoc :novelty {:spot (into spot flakes)
+                         :psot (into psot flakes)
+                         :post (into post flakes)
+                         :opst opst
+                         :tspo (into tspo flakes)
+                         :size (+ (:size novelty) size)}
+               :stats (-> (:stats db)
+                          (update :size + size)
+                          (update :flakes + (count flakes))))
+        (jld-transact/add-tt-id))))
 
 (defn add-commit-schema-flakes
   [{:keys [schema] :as db} t]
@@ -291,8 +294,8 @@
                        (flake/create const/$_commit:dbId const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
                        (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:anyURI t true nil)
                        (flake/create const/$_commit:idRef const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-                       ;(flake/create const/$_block:prevHash const/$iri const/iri-previous const/$xsd:anyURI t true nil)
-                       ;(flake/create const/$_block:prevHash const/$rdf:type const/$iri  const/$xsd:anyURIt true nil)
+                       ;; (flake/create const/$_block:prevHash const/$iri const/iri-previous const/$xsd:anyURI t true nil)
+                       ;; (flake/create const/$_block:prevHash const/$rdf:type const/$iri  const/$xsd:anyURIt true nil)
                        (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:anyURI t true nil)
                        (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:anyURI t true nil)
                        (flake/create const/$_commit:tag const/$iri const/iri-tag const/$xsd:anyURI t true nil) 
