@@ -78,27 +78,6 @@
         (async/put! pc db**)))
     pc))
 
-
-(comment
-
-  ;; sample usage
-  ;; use fake-conn
-  (def db (new-db (fake-conn) "blah/two"))
-
-  ;; a normal query will work
-  @(fluree.db.api/query db {:select [:*] :from "_collection"})
-
-  ;; must manually set new predicate subject ids for now
-  (def db2 (transact-tuples db
-                            [[(flake/->sid const/$_user 1001) const/$_user:username "brian"]
-                             [(flake/->sid const/$_user 1002) const/$_user:username "lois"]]))
-
-  ;; able to use new db (db2) like any normal db.
-  @(fluree.db.api/query db2 {:select [:*] :from "_user"}))
-
-
-
-
 ;; TODO - this is now duplicated with fluree.db.ledger.bootstrap - consolidate when this becomes an actually supported db.
 (def ^:const genesis-ecount
   {const/$_predicate  (flake/->sid const/$_predicate 1000)
