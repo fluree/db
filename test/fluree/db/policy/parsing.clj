@@ -53,7 +53,7 @@
           alice-did    (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           customer-did (:id (did/private->did-map "854358f6cb3a78ff81febe0786010d6e22839ea6bd52e03365a728d7b693b5a0"))
           db           @(fluree/stage
-                          ledger
+                          (fluree/db ledger)
                           [;; assign root-did to :ex/rootRole
                            {:id     root-did
                             :f/role :ex/rootRole}
