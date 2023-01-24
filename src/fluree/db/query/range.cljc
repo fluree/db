@@ -177,7 +177,7 @@
 (defn authorize-flakes
   "Authorize each flake in the supplied `flakes` collection asynchronously,
   returning a collection containing only allowed flakes according to the
-  permissions of the supplied `db`."
+  policy of the supplied `db`."
   [db error-ch flakes]
   (->> flakes
        (map (partial authorize-flake db error-ch))
@@ -189,12 +189,12 @@
   containing only the schema flakes and the flakes validated by
   fluree.db.permissions-validate/allow-flake? function for the database `db`
   from the `flake-slices` channel"
-  [{:keys [permissions] :as db} start end error-ch flake-slices]
+  [{:keys [policy] :as db} start end error-ch flake-slices]
   #?(:cljs
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (true? (get-in permissions [:f/view :root?]))
+     (if (true? (get-in policy [:f/view :root?]))
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)
@@ -325,7 +325,7 @@
      (index-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
-  ([{:keys [permissions t] :as db} idx start-test start-match end-test end-match
+  ([{:keys [policy t] :as db} idx start-test start-match end-test end-match
     {:keys [object-fn] :as opts}]
    (let [[s1 p1 o1 t1 op1 m1]
          (match->flake-parts db idx start-match)

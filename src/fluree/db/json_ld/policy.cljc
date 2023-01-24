@@ -428,7 +428,7 @@
                        (into acc compiled-policy)) [])))
 
 
-(defn permission-map
+(defn policy-map
   "perm-action is a set of the action(s) being filtered for."
   [db identity role credential]
   (async/go
@@ -438,17 +438,17 @@
                                 (->> (<? (subids db role))
                                      (into #{}))
                                 #{(<? (dbproto/-subid db role))})
-            permissions       {:ident ident-sid
+            policies          {:ident ident-sid
                                :roles role-sids
                                :cache (atom {})}
             ;; TODO - query for all rules is very cacheable - but cache must be cleared when any new tx updates a rule
             ;; TODO - (easier said than done, as they are nested nodes whose top node is the only one required to have a specific class type)
-            role-policies     (<? (policies-for-roles db permissions))
+            role-policies     (<? (policies-for-roles db policies))
 
             compiled-policies (->> (<? (compile-policies db role-policies))
                                    (reduce (fn [acc [ks m]]
                                              (assoc-in acc ks m))
-                                           permissions))
+                                           policies))
             root-access?      (= compiled-policies
                                  {:f/view {:node {:root? true}}})]
         (cond-> compiled-policies
@@ -467,5 +467,5 @@
   [db identity role credential]
   ;; TODO - not yet paying attention to verifiable credentials that are present
   (go-try
-    (assoc db :permissions
-              (<? (permission-map db identity role credential)))))
+    (assoc db :policy
+              (<? (policy-map db identity role credential)))))

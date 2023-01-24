@@ -331,13 +331,13 @@
 
 ;; ================ GraphDB record support fns ================================
 
-(defn- graphdb-latest-db [{:keys [current-db-fn permissions]}]
+(defn- graphdb-latest-db [{:keys [current-db-fn policy]}]
   (go-try
     (let [current-db (<? (current-db-fn))]
-      (assoc current-db :permissions permissions))))
+      (assoc current-db :policy policy))))
 
 (defn- graphdb-root-db [this]
-  (assoc this :permissions root-policy-map))
+  (assoc this :policy root-policy-map))
 
 (defn- graphdb-c-prop [{:keys [schema]} property collection]
   ;; collection properties TODO-deprecate :id property below in favor of :partition
@@ -425,7 +425,7 @@
 (defrecord JsonLdDb [ledger conn method alias branch commit block t tt-id stats
                      spot psot post opst tspo
                      schema comparators novelty
-                     permissions ecount]
+                     policy ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
@@ -467,14 +467,14 @@
        (-write w "#FlureeJsonLdDb ")
        (-write w (pr {:method      (:method db) :alias (:alias db) :block (:block db)
                       :t           (:t db) :stats (:stats db)
-                      :permissions (:permissions db)})))))
+                      :policy      (:policy db)})))))
 
 #?(:clj
    (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
      (.write w (str "#FlureeJsonLdDb "))
      (binding [*out* w]
        (pr {:method (:method db) :alias (:alias db) :block (:block db)
-            :t      (:t db) :stats (:stats db) :permissions (:permissions db)}))))
+            :t      (:t db) :stats (:stats db) :policy (:policy db)}))))
 
 (defn new-novelty-map
   [comparators]
@@ -533,7 +533,7 @@
                     :schema      schema
                     :comparators index/default-comparators
                     :novelty     novelty
-                    :permissions root-policy-map
+                    :policy      root-policy-map
                     :ecount      genesis-ecount})))
 
 

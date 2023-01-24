@@ -75,7 +75,7 @@
   [ledger-id]
   (re-find #"[a-z0-9]+/[a-z0-9]+" ledger-id))
 
-
+;; TODO - not using new policy below, needs to have updated logic to lookup user roles!
 (defn db
   "Returns a queryable database as a promise channel from the connection for the specified ledger."
   ([conn ledger]
@@ -317,7 +317,7 @@
           db*           (-> (if t
                               (<? (time-travel/as-of db t))
                               db)
-                            (assoc-in [:permissions :cache] (atom {})))
+                            (assoc-in [:policy :cache] (atom {})))
           source-opts   (if prefixes
                           (get-sources (:conn db*) (:network db*) (:auth-id db*) prefixes)
                           {})

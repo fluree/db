@@ -90,8 +90,8 @@
           sid-User     @(fluree/promise-wrap (dbproto/-subid db :ex/User))
           sid-ssn      @(fluree/promise-wrap (dbproto/-subid db :schema/ssn))
           ;; create optimized policy map for ex:userRole
-          policy-alice @(fluree/promise-wrap (policy/permission-map db alice-did :ex/userRole nil))
-          policy-root  @(fluree/promise-wrap (policy/permission-map db root-did :ex/rootRole nil))]
+          policy-alice @(fluree/promise-wrap (policy/policy-map db alice-did :ex/userRole nil))
+          policy-root  @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))]
 
       ;; look at  policy for user
       (is (= (replace-policy-fns policy-alice)              ;; replace compiled functions for data comparisons below

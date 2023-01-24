@@ -32,9 +32,9 @@
   Equals should return a single value result. If anywhere along the path multiple results
   are returned, it will choose the first one and log out a warning that equals is being
   used with data that is not compliant (prefer f:contains)."
-  [{:keys [permissions] :as db} path-pids equals-rule]
+  [{:keys [policy] :as db} path-pids equals-rule]
   (go-try
-    (let [{:keys [cache ident]} permissions
+    (let [{:keys [cache ident]} policy
           db-root (dbproto/-rootdb db)]
       (loop [[next-pid & r] path-pids
              last-result ident]
@@ -55,17 +55,17 @@
             last-result))))))
 
 (defn cache-store-value
-  "Caches path lookup result into the permissions map cache. Returns original value."
+  "Caches path lookup result into the policy map cache. Returns original value."
   [db cache-key value]
-  (swap! (get-in db [:permissions :cache])
+  (swap! (get-in db [:policy :cache])
          assoc cache-key value)
   value)
 
 (defn cache-get-value
-  "Attempts to return cached result in permission key. Cache implemented to work correctly
+  "Attempts to return cached result in policy key. Cache implemented to work correctly
   only with non-boolean result values - and thus can avoid having to do additional logic (e.g. contains? or some)"
   [db cache-key]
-  (get @(get-in db [:permissions :cache]) cache-key))
+  (get @(get-in db [:policy :cache]) cache-key))
 
 (defn generate-equals-fn
   "Returns validating function for :f/equals rule.
@@ -75,7 +75,7 @@
   Returns two-tuple of [async? policy-fn] where async? is boolean if policy-fn returns an async channel
   which must be resolved to get the final value.
 
-  All policy functions are evaluated for a truthy or falsey result which determins if the provided flake
+  All policy functions are evaluated for a truthy or falsey result which determines if the provided flake
   can be operated on/viewed."
   [rule property-path]
   (if (= :f/$identity (first property-path))
@@ -105,9 +105,9 @@
 
   Contains, unlike 'equals' will return a set of all possible results at the leaf of the
   defined path."
-  [{:keys [permissions] :as db} path-pids equals-rule]
+  [{:keys [policy] :as db} path-pids equals-rule]
   (go-try
-    (let [{:keys [cache ident]} permissions]
+    (let [{:keys [cache ident]} policy]
       (loop [[next-pid & rest-path] path-pids
              last-results #{ident}]
         (if next-pid
