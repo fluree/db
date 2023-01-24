@@ -96,7 +96,9 @@
                                                {:status 400 :error
                                                 :db/invalid-commit})))
           context          {:db db, :iris iris, :sid sid, :t t}
-          type-retractions (<? (get-type-retractions context type))
+          type-retractions (if (seq type)
+                             (<? (get-type-retractions context type))
+                             [])
           context*         (assoc context :type-retractions type-retractions)]
       (<? (retract-node* context* node)))))
 
@@ -197,7 +199,9 @@
           context         {:db       db, :iris iris, :id id
                            :next-pid next-pid, :refs refs, :sid sid
                            :next-sid next-sid, :t t}
-          type-assertions (<? (get-type-assertions context type))
+          type-assertions (if (seq type)
+                            (<? (get-type-assertions context type))
+                            [])
           base-flakes     (if existing-sid
                             type-assertions
                             (conj type-assertions
