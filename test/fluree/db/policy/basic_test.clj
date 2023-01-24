@@ -117,3 +117,11 @@
              @(fluree/query alice-db {:select {'?s [:* {:ex/location [:*]}]}
                                       :where  [['?s :rdf/type :ex/User]]}))
           "Both users should show, but only SSN for Alice")
+
+      ;; Alice can only see her allowed data in a non-graph-crawl query too
+      (is (= [["John" nil] ["Alice" "111-11-1111"]]
+             @(fluree/query alice-db {:select '[?name ?ssn]
+                                      :where  '[[?p :schema/name ?name]
+                                                {:optional [?p :schema/ssn ?ssn]}]}))
+          "Both user names should show, but only SSN for Alice"))))
+
