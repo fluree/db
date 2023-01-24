@@ -2,11 +2,15 @@
   (:require [fluree.transactor.api :as txr]
             [fluree.publisher.api :as pub]
             [fluree.store.api :as store]
-            [fluree.indexer.api :as idxr]))
+            [fluree.indexer.api :as idxr]
+            [fluree.common.model :as model]))
 
 (def BaseConnectionConfig
   [:map
-   [:conn/mode [:enum :fluree :query]]])
+   [:conn/mode [:enum :fluree :query]]
+   [:conn/did {:optional true} model/Did]
+   [:conn/trust {:optional true} model/TrustPolicy]
+   [:conn/distrust {:optional true} model/DistrustPolicy]])
 
 (def FlureeConnectionConfig
   [:and

@@ -5,10 +5,14 @@
    [fluree.store.api :as store]
    [clojure.core.async :as async]
    [fluree.common.iri :as iri]
-   [fluree.common.model :as model]))
+   [fluree.common.model :as model]
+   [fluree.db.did :as did]
+   [fluree.db.test-utils :as test-utils]))
 
 (deftest indexer
-  (let [idxr (idxr/start {:idxr/store-config {:store/method :memory}})
+  (let [idxr (idxr/start {:idxr/store-config {:store/method :memory}
+                          :idxr/did          (did/private->did-map test-utils/default-private-key)
+                          :idxr/trust        :all})
 
         db0-address (idxr/init idxr "indexertest" {:reindex-min-bytes 1})
 
@@ -42,10 +46,10 @@
               "https://ns.flur.ee/DbBlock#address"
               "fluree:db:memory:indexertest/db/31af39137b85dd4273becc7edde9bc9bd42b0670cd68a2b1c5d7ad0916640155",
               "https://ns.flur.ee/DbBlock#reindexMax" 1000000,
-              "https://ns.flur.ee/DbBlock#size" 828,
-              "https://ns.flur.ee/DbBlock#v" 0,
-              "@type" "https://ns.flur.ee/DbBlockSummary/",
-              "https://ns.flur.ee/DbBlock#t" 1}
+              "https://ns.flur.ee/DbBlock#size"       828,
+              "https://ns.flur.ee/DbBlock#v"          0,
+              "@type"                                 "https://ns.flur.ee/DbBlockSummary/",
+              "https://ns.flur.ee/DbBlock#t"          1}
              db1-summary))
       (is (model/valid? idxr/DbBlockSummary db1-summary))
 
@@ -53,10 +57,10 @@
               "https://ns.flur.ee/DbBlock#address"
               "fluree:db:memory:indexertest/db/3abc11deba4a312f64cd1ef35bd0a7fefc520bb400137a4aebe8b7ae0d27dc28",
               "https://ns.flur.ee/DbBlock#reindexMax" 1000000,
-              "https://ns.flur.ee/DbBlock#size" 958,
-              "https://ns.flur.ee/DbBlock#v" 0,
-              "@type" "https://ns.flur.ee/DbBlockSummary/",
-              "https://ns.flur.ee/DbBlock#t" 2}
+              "https://ns.flur.ee/DbBlock#size"       958,
+              "https://ns.flur.ee/DbBlock#v"          0,
+              "@type"                                 "https://ns.flur.ee/DbBlockSummary/",
+              "https://ns.flur.ee/DbBlock#t"          2}
              db2-summary))
       (is (model/valid? idxr/DbBlockSummary db2-summary))
 
@@ -76,7 +80,9 @@
     (testing "indexer persistence"
       (let [store (:store idxr)
 
-            idxr2 (idxr/start {:idxr/store store})
+            idxr2 (idxr/start {:idxr/store store
+                               :idxr/did   (did/private->did-map test-utils/default-private-key)
+                               :idxr/trust :all})
 
             loaded-summary (idxr/load idxr2 (get db2-summary iri/DbBlockAddress))
             loaded-results (idxr/query idxr (get db2-summary iri/DbBlockAddress)

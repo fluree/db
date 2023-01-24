@@ -3,12 +3,16 @@
    [clojure.test :as test :refer :all]
    [fluree.common.iri :as iri]
    [fluree.common.model :as model]
-   [fluree.publisher.api :as pub]))
+   [fluree.publisher.api :as pub]
+   [fluree.db.did :as did]
+   [fluree.db.test-utils :as test-utils]))
 
 (deftest publisher
   (with-redefs #_:clj-kondo/ignore
     [fluree.common.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-    (let [pub             (pub/start {:pub/store-config {:store/method :memory}})
+    (let [pub             (pub/start {:pub/store-config {:store/method :memory}
+                                      :pub/did (did/private->did-map test-utils/default-private-key)
+                                      :pub/trust :all})
           opts            {:commit-address "fluree:commit:memory:testpub1/commit/init"
                            :db-address     "fluree:db:memory:testpub1/db/init"
                            :context        {"foo" "foo:bar"}}

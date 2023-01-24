@@ -2,19 +2,18 @@
   (:require [fluree.store.api :as store]
             [fluree.transactor.api :as txr]
             [fluree.indexer.api :as idxr]
-            [fluree.common.iri :as iri]))
+            [fluree.common.iri :as iri]
+            [fluree.common.model :as model]))
 
 (def PublisherConfig
   [:and
-   [:map
-    [:pub/defaults {:optional true}
-     [:map
-      [:pub/did
-       [:map
-        [:public :string]
-        [:private :string]
-        [:id :string]]]
-      [:pub/context :map]]]]
+   [:and
+    [:map
+     [:pub/did model/Did]
+     [:pub/trust {:optional true} model/TrustPolicy]
+     [:pub/distrust {:optional true} model/DistrustPolicy]]
+    [:fn (fn [{:pub/keys [trust distrust]}]
+           (model/valid-trust-policy? trust distrust))]]
    [:or
     [:map [:pub/store-config {:optional true} store/StoreConfig]]
     [:map [:pub/store {:optional true} store/Store]]]])

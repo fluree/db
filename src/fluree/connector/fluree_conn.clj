@@ -111,24 +111,31 @@
   #_(subscribe [conn query fn]))
 
 (defn create-fluree-conn
-  [{:keys [:conn/id :conn/store-config :conn/transactor-config :conn/publisher-config :conn/indexer-config]
-    :as config}]
+  [{:keys [:conn/id :conn/store-config :conn/did :conn/trust :conn/distrust
+           :conn/transactor-config :conn/publisher-config :conn/indexer-config]
+    :as   config}]
   (let [id (or id (random-uuid))
 
         store (when store-config
                 (store/start store-config))
 
-        idxr  (idxr/start (if store
-                            (assoc indexer-config :idxr/store store)
-                            indexer-config))
+        idxr (idxr/start (cond-> indexer-config
+                           did      (assoc :idxr/did did)
+                           trust    (assoc :idxr/trust trust)
+                           distrust (assoc :idxr/distrust distrust)
+                           store    (assoc :idxr/store store)))
 
-        txr   (txr/start (if store
-                           (assoc transactor-config :txr/store store)
-                           transactor-config))
+        txr (txr/start (cond-> transactor-config
+                         did      (assoc :txr/did did)
+                         trust    (assoc :txr/trust trust)
+                         distrust (assoc :txr/distrust distrust)
+                         store    (assoc :txr/store store)))
 
-        pub   (pub/start (if store
-                           (assoc publisher-config :pub/store store)
-                           publisher-config))]
+        pub (pub/start (cond-> publisher-config
+                         did      (assoc :pub/did did)
+                         trust    (assoc :pub/trust trust)
+                         distrust (assoc :pub/distrust distrust)
+                         store    (assoc :pub/store store)))]
     (log/info "Starting FlureeConnection " id "." config)
     (map->FlureeConnection
       (cond-> {:id id

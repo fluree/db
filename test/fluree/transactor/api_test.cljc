@@ -5,12 +5,15 @@
             [fluree.common.identity :as ident]
             [fluree.common.iri :as iri]
             [fluree.common.model :as model]
-            [fluree.transactor.model :as txr-model]))
+            [fluree.transactor.model :as txr-model]
+            [fluree.db.did :as did]
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest transactor
   (let [mem-store   (store/start {:store/method :memory})
-        txr         (txr/start {:txr/method :file
-                                :txr/store  mem-store})
+        txr         (txr/start {:txr/did   (did/private->did-map test-utils/default-private-key)
+                                :txr/trust :all
+                                :txr/store mem-store})
         ledger-name "testtransactor"
 
         init-address    (txr/init txr ledger-name)

@@ -37,9 +37,10 @@
                                           {:ledger-name    ledger-name
                                            :ledger-address ledger-address
                                            :opts           opts})))
-
         final-ledger  (if (:did pub)
-                        (credential/generate ledger (:did pub))
+                        ledger
+                        ;; TODO: actually generate
+                        #_(credential/generate ledger (:did pub))
                         ledger)
 
         ledger-path (ledger/ledger-path ledger-name)]
@@ -61,7 +62,9 @@
         new-head     (ledger/create-ledger-entry prev-ledger commit-summary db-summary)
         ledger       (assoc prev-ledger iri/LedgerHead new-head)
         final-ledger (if (:did pub)
-                       (credential/generate ledger (:did pub))
+                       ledger
+                       ;; TODO: actually generate
+                       #_(credential/generate ledger (:did pub))
                        ledger)
 
         {ledger-path :address/path} (ident/address-parts ledger-address)]
@@ -86,7 +89,6 @@
         id (or id (random-uuid))]
     (log/info "Starting Publisher " id "." config)
     (map->Publisher {:id id :did did :store store})))
-
 
 (defn start
   [config]

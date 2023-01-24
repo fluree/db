@@ -1,7 +1,8 @@
 (ns fluree.transactor.model
   (:require
    [fluree.common.iri :as iri]
-   [fluree.store.api :as store]))
+   [fluree.store.api :as store]
+   [fluree.common.model :as model]))
 
 (def Commit
   "This data structure gets written in the Store."
@@ -24,14 +25,23 @@
    [iri/CommitPrevious {:optional true} :string]])
 
 (def TransactorConfig
-  [:or
-   [:map
-    [:txr/store-config
-     [:orn
-      [:file store/FileStoreConfig]
-      [:memory store/MemoryStoreConfig]]]]
-   [:map
-    [:txr/store store/Store]]])
+  [:and
+   [:and
+    [:map
+     [:txr/did model/Did]
+     [:txr/trust {:optional true} model/TrustPolicy]
+     [:txr/distrust {:optional true} model/DistrustPolicy]]
+    [:fn (fn [{:txr/keys [trust distrust]}]
+           (model/valid-trust-policy? trust distrust))]]
+
+   [:or
+    [:map
+     [:txr/store-config
+      [:orn
+       [:file store/FileStoreConfig]
+       [:memory store/MemoryStoreConfig]]]]
+    [:map
+     [:txr/store store/Store]]]])
 
 (def Transactor
   [:map

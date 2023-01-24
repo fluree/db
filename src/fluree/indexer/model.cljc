@@ -1,15 +1,27 @@
 (ns fluree.indexer.model
   (:require [fluree.store.api :as store]
-            [fluree.common.iri :as iri]))
+            [fluree.common.iri :as iri]
+            [fluree.common.model :as model]))
 
 (def IndexerConfig
-  [:or
-   [:map [:idxr/store-config {:optional true} store/StoreConfig]]
-   [:map [:idxr/store {:optional true} store/Store]]])
+  [:and
+   [:and
+    [:map
+     [:idxr/did model/Did]
+     [:idxr/trust {:optional true} model/TrustPolicy]
+     [:idxr/distrust {:optional true} model/DistrustPolicy]]
+    [:fn (fn [{:idxr/keys [trust distrust]}]
+           (model/valid-trust-policy? trust distrust))]]
+   [:or
+    [:map [:idxr/store-config {:optional true} store/StoreConfig]]
+    [:map [:idxr/store {:optional true} store/Store]]]])
 
 (def Indexer
   [:map
-   [:store store/Store]])
+   [:store store/Store]
+   [:id :any]
+   [:state {:doc "An atom with a map of db-address to JsonLdDb"}
+    [:map-of :string :any]]])
 
 (def Db
   [:map

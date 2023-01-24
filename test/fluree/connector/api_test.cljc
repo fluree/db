@@ -2,18 +2,23 @@
   (:require [clojure.test :as test :refer :all]
             [fluree.connector.api :as conn]
             [fluree.store.api :as store]
-            [fluree.connector.model :as conn-model]))
+            [fluree.connector.model :as conn-model]
+            [fluree.db.did :as did]
+            [fluree.db.test-utils :as test-utils]))
 
 (deftest connector
   (with-redefs [fluree.common.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-    (let [context {"ex" "https://example.com/" "f" "https://ns.flur.ee"}
+    (let [did     (did/private->did-map test-utils/default-private-key)
+          context {"ex" "https://example.com/" "f" "https://ns.flur.ee"}
           tx      {"@context" context
                    "@id"      "ex:dan"
                    "ex:foo"   "bar"}]
 
       (testing "shared store"
-        (let [conn              (conn/connect {:conn/mode         :fluree
-                                               :conn/store-config {:store/method :memory}})
+        (let [conn (conn/connect {:conn/mode  :fluree
+                                  :conn/did   did
+                                  :conn/trust :all
+                                  :conn/store-config {:store/method :memory}})
               ledger-address    (conn/create conn "testconn")
               after-ledger-init @(-> conn :store :storage-atom)
 
@@ -72,11 +77,17 @@
       (testing "a-la-carte config"
         (let [conn                   (conn/connect {:conn/mode :fluree
                                                     :conn/publisher-config
-                                                    {:pub/store-config {:store/method :memory}}
+                                                    {:pub/store-config {:store/method :memory}
+                                                     :pub/did          did
+                                                     :pub/trust        :all}
                                                     :conn/transactor-config
-                                                    {:txr/store-config {:store/method :memory}}
+                                                    {:txr/store-config {:store/method :memory}
+                                                     :txr/did          did
+                                                     :txr/trust        :all}
                                                     :conn/indexer-config
-                                                    {:idxr/store-config {:store/method :memory}}})
+                                                    {:idxr/store-config {:store/method :memory}
+                                                     :idxr/did          did
+                                                     :idxr/trust        :all}})
               ledger-address         (conn/create conn "testconn")
               txr-after-ledger-init  @(-> conn :transactor :store :storage-atom)
               pub-after-ledger-init  @(-> conn :publisher :store :storage-atom)
