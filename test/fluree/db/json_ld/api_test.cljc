@@ -71,10 +71,11 @@
                                {:context   {:ex "http://example.org/ns/"}
                                 :f/retract {:id         :ex/brian
                                             :ex/favNums 7}})
-               _            @(fluree/commit! ledger db)
+               db           @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded       (test-utils/retry-load conn ledger-alias 100)]
-           (is (= (:t db) (:t (fluree/db loaded)))))))
+           (is (= (:t db) (:t (fluree/db loaded))))
+           (is (= (:stats db) (:stats (fluree/db loaded)))))))
 
      (testing "can load a file ledger with multi-cardinality predicates"
        (with-tmp-dir storage-path
@@ -117,7 +118,8 @@
                                [{:context   {:ex "http://example.org/ns/"}
                                  :f/retract {:id         :ex/alice
                                              :ex/favNums [42, 76, 9]}}])
-               _            @(fluree/commit! ledger db)
+               db           @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded       (test-utils/retry-load conn ledger-alias 100)]
-           (is (= (:t db) (:t (fluree/db loaded)))))))))
+           (is (= (:t db) (:t (fluree/db loaded))))
+           (is (= (:stats db) (:stats (fluree/db loaded)))))))))
