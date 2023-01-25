@@ -48,7 +48,10 @@
                                 s-fn (assoc :subject-fn s-fn)
                                 p-fn (assoc :predicate-fn p-fn)
                                 o-fn (assoc :object-fn o-fn))]
-              (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
+              (-> (query-range/resolve-flake-slices conn idx-root novelty
+                                                    error-ch opts)
+                  (->> (query-range/filter-authorized db start-flake end-flake
+                                                      error-ch))
                   (async/pipe out-ch)))
             (catch* e
                     (log/error e "Error resolving flake range")

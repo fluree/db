@@ -1,6 +1,5 @@
 (ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
@@ -9,9 +8,9 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+            [fluree.db.util.async :refer [<? go-try]]
+            #?(:clj  [clojure.core.async :refer [go] :as async]
+               :cljs [cljs.core.async :refer [go] :as async])
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
@@ -535,8 +534,3 @@
                     :novelty     novelty
                     :policy      root-policy-map
                     :ecount      genesis-ecount})))
-
-
-(defn json-ld-db?
-  [db]
-  (instance? JsonLdDb db))

@@ -25,17 +25,23 @@
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
 
 (defn file-address
-  "Turn a path into a fluree file address."
+  "Turn a path or a protocol-relative URL into a fluree file address."
   [path]
-  (str "fluree:file://" path))
+  (if (str/starts-with? path "//")
+    (str "fluree:file:" path)
+    (str "fluree:file://" path)))
 
 (defn local-path
-  [conn]
-  (str #?(:clj  (.getAbsolutePath (io/file ""))
-          :cljs (path/resolve "."))
-       "/"
-       (:storage-path conn)
-       "/"))
+  [{:keys [storage-path] :as _conn}]
+  (let [abs-path? #?(:clj  (.isAbsolute (io/file storage-path))
+                     :cljs (path/isAbsolute storage-path))
+        abs-root  (if abs-path?
+                    ""
+                    (str #?(:clj  (.getAbsolutePath (io/file ""))
+                            :cljs (path/resolve ".")) "/"))
+        path      (str abs-root storage-path "/")]
+    #?(:clj  (-> path io/file .getCanonicalPath)
+       :cljs (path/resolve path))))
 
 (defn address-path
   [address]
@@ -44,12 +50,13 @@
 
 (defn address-full-path
   [conn address]
-  (str (local-path conn) (address-path address)))
+  (str (local-path conn) "/" (address-path address)))
 
 (defn address-path-exists?
   [conn address]
-  #?(:clj  (->> address (address-full-path conn) io/file .exists)
-     :cljs (->> address (address-full-path conn) fs/existsSync)))
+  (let [full-path (address-full-path conn address)]
+    #?(:clj  (->> full-path io/file .exists)
+       :cljs (fs/existsSync full-path))))
 
 (defn read-file
   "Read a string from disk at `path`. Returns nil if file does not exist."
@@ -64,9 +71,9 @@
        (catch FileNotFoundException _
          nil))
      :cljs
-     (try*
+     (try
        (fs/readFileSync path "utf8")
-       (catch* e
+       (catch :default e
          (when (not= "ENOENT" (.-code e))
            (throw (ex-info "Error reading file."
                            {"errno"   ^String (.-errno e)
@@ -149,7 +156,7 @@
                           (when branch (str "/" branch))
                           "/commits/"
                           hash ".json")
-         write-path  (str (local-path conn) commit-path)]
+         write-path  (str (local-path conn) "/" commit-path)]
      (log/debug (str "Writing commit at " write-path))
      (write-file write-path bytes)
      {:name    hash
@@ -163,7 +170,7 @@
   (let [local-path  (local-path conn)
         commit-path (address-path commit-address)
         head-path   (address-path publish-address)
-        write-path  (str local-path head-path)
+        write-path  (str local-path "/" head-path)
 
         work        (fn [complete]
                       (log/debug (str "Updating head at " write-path " to " commit-path "."))
@@ -177,7 +184,7 @@
 (defn store-key->local-path
   [store k]
   (let [[_ ledger & r] (str/split k #"_")]
-    (str (local-path store) ledger "/" "indexes" "/" (str/join "/" r))))
+    (str (local-path store) "/" ledger "/" "indexes" "/" (str/join "/" r))))
 
 (defrecord FileConnection [id memory state ledger-defaults push commit
                            parallelism msg-in-ch msg-out-ch async-cache]

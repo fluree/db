@@ -110,7 +110,7 @@
       (dec (flake/->sid const/$_shard 0))))
 
 (defn generate-new-sid
-  "Generates a new subject ID. If it is know this is a property or class will
+  "Generates a new subject ID. If it is known this is a property or class will
   assign the lower range of subject ids."
   [{:keys [id] :as node} referring-pid iris next-pid next-sid]
   (let [new-sid (or
