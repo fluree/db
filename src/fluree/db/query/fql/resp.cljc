@@ -299,7 +299,7 @@
 
                                ;; if a ref, put out an {:_id ...}
                                ref?
-                               (if (true? (-> db :permissions :root?))
+                               (if (true? (-> db :policy :f/view :root?))
                                  [(mapv #(hash-map :_id (flake/o %)) flakes) offset-map]
                                  (loop [[f & r] flakes
                                         acc []]

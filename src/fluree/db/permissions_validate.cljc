@@ -18,20 +18,19 @@
 
   Note this should only be called if the db is permissioned, don't call if the
   root user as the results will not come back correctly."
-  [{:keys [permissions] :as db} flake]
+  [{:keys [policy] :as db} flake]
   (go-try
     (let [s         (flake/s flake)
           p         (flake/p flake)
-          class-ids (or (get @(:cache permissions) s)
+          class-ids (or (get @(:cache policy) s)
                         (let [classes (<? (dbproto/-class-ids
                                             (dbproto/-rootdb db)
                                             (flake/s flake)))]
                           ;; note, classes will return empty list if none found ()
-                          (swap! (:cache permissions) assoc s classes)
+                          (swap! (:cache policy) assoc s classes)
                           classes))
-          fns       (keep #(or (get-in permissions [:view :class % p])
-                               (get-in permissions [:view :class % :default]))
-                          class-ids)]
+          fns       (keep #(or (get-in policy [:f/view :class % p :function])
+                               (get-in policy [:f/view :class % :default :function])) class-ids)]
       (loop [[[async? f] & r] fns]
         ;; return first truthy response, else false
         (if f
@@ -44,8 +43,8 @@
 
 
 (defn allow-flakes?
-  "Like allow-flake, but filters a sequence of flakes to only allow those
-  whose permissions do not return 'false'."
+  "Like allow-flake, but filters a sequence of flakes to only
+  allow those whose policy do not return 'false'."
   [db flakes]
   (async/go
     (loop [[flake & r] flakes
