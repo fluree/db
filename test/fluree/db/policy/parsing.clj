@@ -90,12 +90,12 @@
           sid-User     @(fluree/promise-wrap (dbproto/-subid db :ex/User))
           sid-ssn      @(fluree/promise-wrap (dbproto/-subid db :schema/ssn))
           ;; create optimized policy map for ex:userRole
-          policy-alice @(fluree/promise-wrap (policy/policy-map db alice-did :ex/userRole nil))
+          policy-alice (-> @(fluree/promise-wrap (policy/policy-map db alice-did :ex/userRole nil))
+                           replace-policy-fns)
           policy-root  @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))]
 
       ;; look at  policy for user
-      (is (= (replace-policy-fns policy-alice)              ;; replace compiled functions for data comparisons below
-             {:f/modify {:class {sid-User {:default {:f/equals     [{:id :f/$identity}
+      (is (= {:f/modify {:class {sid-User {:default {:f/equals     [{:id :f/$identity}
                                                                     {:id :ex/user}]
                                                      :f/targetRole {:_id sid-userRole}
                                                      :function     [true
@@ -112,5 +112,6 @@
                                                                     :fluree.db.policy.parsing/replaced-policy-function]
                                                      :id           :ex/globalViewAllow}}}}
               :ident    sid-alice
-              :roles    #{sid-userRole}})
+              :roles    #{sid-userRole}}
+             policy-alice)
           "Policies for only :ex/userRole should return"))))
