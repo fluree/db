@@ -159,6 +159,20 @@
                       db-block block-end)]
       [block-start block-end])))
 
+(defn commit-details
+  [db query-map]
+  (go-try
+   (if-not (history/commit-details-query? query-map)
+     (throw (ex-info (str "Commit query not properly formatted. Provided "
+                          (pr-str query-map))
+                     {:status 400
+                      :error  :db/invalid-query}))
+     (let [{:keys [commit-details from to]} (history/commit-details-query-parser query-map)
+           [from-t to-t] [(if from (- from) -1) (if to (- to) (:t db))]
+           flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
+           results (<? (history/history-flakes->json-ld db {} flakes))]
+       results))))
+
 (defn history
   [db query-map]
   (go-try
