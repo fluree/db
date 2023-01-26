@@ -33,7 +33,7 @@
 
 (deftest ^:integration s+p+o-full-db-queries
   (testing "Query that pulls entire database."
-    (with-redefs [fluree.db.util.core/str->epoch-ms (fn [_] 0000000000000)]
+    (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
       (let [conn   (test-utils/create-conn)
             ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
             db     @(fluree/stage
@@ -54,9 +54,7 @@
                                 :schema/age   30}]})
             db @(fluree/commit! ledger db)]
 
-        (is (= @(fluree/query db {:select ['?s '?p '?o]
-                                  :where  [['?s '?p '?o]]})
-               [[:ex/jane :id "http://example.org/ns/jane"]
+        (is (= [[:ex/jane :id "http://example.org/ns/jane"]
                 [:ex/jane :rdf/type :ex/User]
                 [:ex/jane :schema/name "Jane"]
                 [:ex/jane :schema/email "jane@flur.ee"]
@@ -70,10 +68,11 @@
                 [:ex/alice :schema/name "Alice"]
                 [:ex/alice :schema/email "alice@flur.ee"]
                 [:ex/alice :schema/age 42]
-                ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                [nil :f/time 0000000000000]
-                [nil "https://www.w3.org/2018/credentials#issuer" :ex/jane]
                 ["fluree:memory://cdfbc32cddc850f1766742d08f20e52bc1d587e7f2b6384c1703f2e8b0c8971b" :id "fluree:memory://cdfbc32cddc850f1766742d08f20e52bc1d587e7f2b6384c1703f2e8b0c8971b"]
+                ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k" :id "fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"]
+                ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k" :f/time 720000]
+                ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k" "https://www.w3.org/2018/credentials#issuer" "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
                 [:schema/age :id "http://schema.org/age"]
                 [:schema/email :id "http://schema.org/email"]
                 [:schema/name :id "http://schema.org/name"]
@@ -99,6 +98,7 @@
                 [:id :id "@id"]
                 ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6" :id "fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"]
                 ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6" :f/address "fluree:memory://cdfbc32cddc850f1766742d08f20e52bc1d587e7f2b6384c1703f2e8b0c8971b"]
-                ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6" :f/commit nil]]
-               )
+                ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6" :f/commit "fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"]]
+               @(fluree/query db {:select ['?s '?p '?o]
+                                  :where  [['?s '?p '?o]]}))
             "Entire database should be pulled.")))))
