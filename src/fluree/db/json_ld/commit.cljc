@@ -291,16 +291,22 @@
 (defn add-commit-schema-flakes
   "If there hasn't been a commit yet, we need to transact the commit vocab so commit properties are defined."
   [{:keys [schema] :as db} t]
-  (let [schema-flakes [(flake/create const/$_commit:dbId const/$iri const/iri-address const/$xsd:anyURI t true nil)
+  (let [schema-flakes [(flake/create const/$_commit:dbId const/$iri const/iri-address const/$xsd:string t true nil)
                        (flake/create const/$_commit:dbId const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-                       (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:anyURI t true nil)
+
+                       (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:string t true nil)
                        (flake/create const/$_commit:idRef const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
+
                        ;; (flake/create const/$_block:prevHash const/$iri const/iri-previous const/$xsd:anyURI t true nil)
                        ;; (flake/create const/$_block:prevHash const/$rdf:type const/$iri  const/$xsd:anyURIt true nil)
-                       (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:anyURI t true nil)
-                       (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:anyURI t true nil)
-                       (flake/create const/$_commit:tag const/$iri const/iri-tag const/$xsd:anyURI t true nil)
-                       (flake/create const/$_commit:signer const/$iri const/iri-issuer const/$xsd:anyURI t true nil)
+
+                       (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:string t true nil)
+
+                       (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:string t true nil)
+
+                       (flake/create const/$_commit:tag const/$iri const/iri-tag const/$xsd:string t true nil)
+
+                       (flake/create const/$_commit:signer const/$iri const/iri-issuer const/$xsd:string t true nil)
                        (flake/create const/$_commit:signer const/$rdf:type const/$iri const/$xsd:anyURI t true nil)]
         db*           (add-commit-flakes-to-db db schema-flakes)]
     (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
