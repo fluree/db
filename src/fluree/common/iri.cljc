@@ -53,6 +53,19 @@
 (def CommitSummary (str fluree "CommitSummary/"))
 (def CommitAddress (iri "Commit" "address"))
 
+;; TxSummary
+(def TxSummary (str fluree "TxSummary/"))
+(def TxSummaryTx (iri "TxSummary" "tx"))
+(def TxSummaryTxId (iri "TxSummary" "txId"))
+(def TxSummarySize (iri "TxSummary" "size"))
+(def TxSummaryT (iri "TxSummary" "t"))
+(def TxSummaryV (iri "TxSummary" "v"))
+(def TxSummaryPrevious (iri "TxSummary" "previous"))
+
+;; TxHead
+(def TxHead (str fluree "TxHead/"))
+(def TxHeadAddress (iri "TxHead" "address"))
+
 ;; Query
 (def Query (str fluree "Query/"))
 (def QueryQuery (iri "Query" "query"))

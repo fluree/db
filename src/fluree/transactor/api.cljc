@@ -1,5 +1,5 @@
 (ns fluree.transactor.api
-  (:refer-clojure :exclude [resolve load])
+  (:refer-clojure :exclude [resolve])
   (:require [fluree.transactor.core :as txr-impl]
             [fluree.transactor.model :as txr-model]))
 
@@ -18,25 +18,26 @@
   [txr ledger-name]
   (txr-impl/init txr ledger-name))
 
-(defn load
-  "Return the commit-summary for the transaction head for the ledger."
+(defn head
+  "Return the summary of the transaction head for the ledger."
   [txr ledger-name]
-  (txr-impl/load txr ledger-name))
+  (txr-impl/head txr ledger-name))
 
-(defn commit
-  "Creates a commit from the tx."
+(defn transact
+  "Persist the transaction and return a tx summary."
   [txr ledger-name tx]
-  (txr-impl/commit txr ledger-name tx))
+  (txr-impl/transact txr ledger-name tx))
 
 (defn resolve
-  "Returns the commit map corresponding to the commit-address. Returns `nil` if not found."
-  [txr commit-address]
-  (txr-impl/resolve txr commit-address))
+  "Returns the transaction that corresponds to the tx-address."
+  [txr tx-address]
+  (txr-impl/resolve txr tx-address))
 
 ;; models
 
-(def Commit txr-model/Commit)
-(def CommitSummary txr-model/CommitSummary)
+(def TxSummary txr-model/TxSummary)
+(def TxHead txr-model/TxHead)
+
 
 (def TransactorConfig txr-model/TransactorConfig)
 

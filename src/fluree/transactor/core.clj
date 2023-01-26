@@ -1,5 +1,5 @@
 (ns fluree.transactor.core
-  (:refer-clojure :exclude [resolve load])
+  (:refer-clojure :exclude [resolve])
   (:require
    [fluree.common.identity :as ident]
    [fluree.common.model :as model]
@@ -7,9 +7,9 @@
    [fluree.db.util.async :refer [<??]]
    [fluree.db.util.log :as log]
    [fluree.store.api :as store]
-   [fluree.transactor.commit :as commit]
    [fluree.transactor.model :as txr-model]
-   [fluree.transactor.protocols :as txr-proto]))
+   [fluree.transactor.protocols :as txr-proto]
+   [fluree.transactor.tx-summary :as tx-summary]))
 
 (defn stop-transactor
   [txr]
@@ -19,51 +19,48 @@
 
 (defn gen-head-path
   [ledger-name]
-  (str (commit/commit-path ledger-name) "head"))
+  (str (tx-summary/tx-summary-path ledger-name) "HEAD"))
 
-(defn head-commit
+(defn init-tx
   [txr ledger-name]
-  (let [store          (:store txr)
-        init-commit    (commit/create-commit nil nil)
-        commit-path      (:path (<?? (store/write store (str (commit/commit-path ledger-name) "init") init-commit)))
-        commit-address (commit/create-commit-address store commit-path)
-        head-path      (gen-head-path ledger-name)]
+  (let [store              (:store txr)
+        init-tx-summary    (tx-summary/create-tx-summary nil nil)
+        tx-summary-path    (:path (<?? (store/write store (str (tx-summary/tx-summary-path ledger-name) "init") init-tx-summary)))
+        tx-summary-address (tx-summary/create-tx-summary-address store tx-summary-path)
+        head-path          (gen-head-path ledger-name)]
     ;; update head
-    (<?? (store/write store head-path commit-address))
-    commit-address))
+    (<?? (store/write store head-path tx-summary-address))
+    tx-summary-address))
 
-(defn resolve-commit
-  [txr commit-address]
-  (let [{commit-path :address/path} (ident/address-parts commit-address)]
-    (<?? (store/read (:store txr) commit-path))))
+(defn resolve-tx
+  [txr tx-address]
+  (let [{tx-summary-path :address/path} (ident/address-parts tx-address)]
+    (<?? (store/read (:store txr) tx-summary-path))))
 
-(defn load-head
+(defn head-tx
   [txr ledger-name]
-  (let [store (:store txr)
-        head-path (gen-head-path ledger-name)
-
-        head-commit-address (<?? (store/read store head-path))
-        head-commit (resolve-commit txr head-commit-address)]
-    (commit/create-commit-summary head-commit head-commit-address)))
-
-(defn write-commit
-  [txr ledger-name tx]
   (let [store     (:store txr)
         head-path (gen-head-path ledger-name)
 
-        prev-commit-address (<?? (store/read store head-path))
-        prev-commit         (resolve-commit txr prev-commit-address)
-        prev-commit-summary (commit/create-commit-summary prev-commit prev-commit-address)
+        head-tx-address (<?? (store/read store head-path))
+        head-tx-summary (resolve-tx txr head-tx-address)]
+    (tx-summary/create-tx-head head-tx-summary head-tx-address)))
 
-        commit    (commit/create-commit prev-commit-summary tx)
-        commit-id (:path (<?? (store/write store (commit/commit-path ledger-name) commit
-                                           {:content-address? true})))
+(defn transact-tx
+  [txr ledger-name tx]
+  (let [store        (:store txr)
+        head-path    (gen-head-path ledger-name)
+        prev-tx-head (head-tx txr ledger-name)
 
-        commit-address (commit/create-commit-address store commit-id)
-        commit-summary (commit/create-commit-summary commit commit-address)]
+        tx-summary      (tx-summary/create-tx-summary prev-tx-head tx)
+        tx-summary-path (:path (<?? (store/write store (tx-summary/tx-summary-path ledger-name) tx-summary
+                                                 {:content-address? true})))
+
+        tx-summary-address (tx-summary/create-tx-summary-address store tx-summary-path)
+        tx-head            (tx-summary/create-tx-head tx-summary tx-summary-address)]
     ;; update head
-    (<?? (store/write store head-path commit-address))
-    commit-summary))
+    (<?? (store/write store head-path tx-summary-address))
+    tx-head))
 
 (defrecord Transactor [id store]
   service-proto/Service
@@ -71,10 +68,10 @@
   (stop [txr] (stop-transactor txr))
 
   txr-proto/Transactor
-  (init [txr ledger-name] (head-commit txr ledger-name))
-  (commit [txr ledger-name tx] (write-commit txr ledger-name tx))
-  (load [txr ledger-name] (load-head txr ledger-name))
-  (resolve [txr commit-address] (resolve-commit txr commit-address)))
+  (init [txr ledger-name] (init-tx txr ledger-name))
+  (head [txr ledger-name] (head-tx txr ledger-name))
+  (resolve [txr tx-address] (resolve-tx txr tx-address))
+  (transact [txr ledger-name tx] (transact-tx txr ledger-name tx)))
 
 (defn create-transactor
   [{:keys [:txr/id :txr/store-config :txr/store] :as config}]
@@ -94,18 +91,18 @@
   [txr]
   (service-proto/stop txr))
 
-(defn commit
-  [txr ledger-name tx]
-  (txr-proto/commit txr ledger-name tx))
-
-(defn resolve
-  [txr commit-address]
-  (txr-proto/resolve txr commit-address))
-
-(defn load
-  [txr ledger-name]
-  (txr-proto/load txr ledger-name))
-
 (defn init
   [txr ledger-name]
   (txr-proto/init txr ledger-name))
+
+(defn head
+  [txr ledger-name]
+  (txr-proto/head txr ledger-name))
+
+(defn transact
+  [txr ledger-name tx]
+  (txr-proto/transact txr ledger-name tx))
+
+(defn resolve
+  [txr tx-address]
+  (txr-proto/resolve txr tx-address))

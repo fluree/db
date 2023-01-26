@@ -4,25 +4,24 @@
    [fluree.store.api :as store]
    [fluree.common.model :as model]))
 
-(def Commit
-  "This data structure gets written in the Store."
+(def TxSummary
+  "Metadata about the transaction, persisted to Store."
   [:map
-   [iri/type [:enum iri/Commit]]
-   [iri/CommitT {:doc "The transaction `t`."} nat-int?]
-   [iri/CommitV {:doc "The version of this Commit structure."} nat-int?]
-   [iri/CommitSize {:doc "The size in bytes of the tx."} nat-int?]
-   [iri/CommitTx {:doc "The submitted transaction."} :any]
-   [iri/CommitPrevious {:doc "The address of the previous commit." :optional true} :string]])
+   [iri/type [:enum iri/TxSummary]]
+   [iri/TxSummaryV {:doc "The version of this TxSummary structure."} nat-int?]
+   [iri/TxSummarySize {:doc "The size in bytes of the tx."} nat-int?]
+   [iri/TxSummaryTx {:doc "The submitted transaction."} :any]
+   [iri/TxSummaryTxId {:doc "The hash of the submitted transaction."} :string]
+   [iri/TxSummaryPrevious {:doc "The address of the previous tx-summary." :optional true} :string]])
 
-(def CommitSummary
-  "This is returned by transactor/commit."
+(def TxHead
+  "Abridged TxSummary of constant size that is returned to the caller."
   [:map
-   [iri/type [:enum iri/CommitSummary]]
-   [iri/CommitAddress :string]
-   [iri/CommitV nat-int?]
-   [iri/CommitT nat-int?]
-   [iri/CommitSize nat-int?]
-   [iri/CommitPrevious {:optional true} :string]])
+   [iri/type [:enum iri/TxHead]]
+   [iri/TxHeadAddress :string]
+   [iri/TxSummaryV nat-int?]
+   [iri/TxSummarySize nat-int?]
+   [iri/TxSummaryPrevious {:optional true} :string]])
 
 (def TransactorConfig
   [:and
