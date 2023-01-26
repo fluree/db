@@ -325,12 +325,12 @@
                              (loop [[tag & r] tags
                                     flakes []]
                                (if tag
-                                 (if-let [existing-sid (<? (dbproto/-subid db* tag))]
-                                   (recur r (conj flakes (flake/create commit-sid const/$_commit:tag existing-sid const/$xsd:anyURI t true nil)))
-                                   (let [new-sid (next-sid)]
+                                 (if-let [existing-tag-sid (<? (dbproto/-subid db* tag))]
+                                   (recur r (conj flakes (flake/create commit-sid const/$_commit:tag existing-tag-sid const/$xsd:anyURI t true nil)))
+                                   (let [new-tag-sid (next-sid)]
                                      (recur r (conj flakes
-                                                    (flake/create new-sid const/$iri tag const/$xsd:string t true nil)
-                                                    (flake/create t const/$_commit:tag new-sid const/$xsd:anyURI t true nil)))))
+                                                    (flake/create new-tag-sid const/$iri tag const/$xsd:string t true nil)
+                                                    (flake/create t const/$_commit:tag new-tag-sid const/$xsd:anyURI t true nil)))))
                                  flakes))))
           issuer-flakes  (when-let [issuer-iri (:id issuer)]
                            (let [issuer-sid   (<? (dbproto/-subid db* issuer-iri))
