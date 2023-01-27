@@ -29,8 +29,10 @@
 
 (defn stage
   "Index some data and return a db-address."
-  [idxr db-address data]
-  (idxr-impl/stage idxr db-address data))
+  ([idxr db-address data]
+   (idxr-impl/stage idxr db-address data {}))
+  ([idxr db-address data opts]
+   (idxr-impl/stage idxr db-address data opts)))
 
 (defn query
   "Run a query against the specified db to get the query results."

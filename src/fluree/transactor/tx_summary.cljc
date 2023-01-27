@@ -8,6 +8,8 @@
   [tx-head tx]
   (let [{previous iri/TxHeadAddress} tx-head]
     (cond-> {iri/type iri/TxSummary
+             ;; TODO: persist tx and use the address here
+             iri/TxSummaryTxAddress ""
              iri/TxSummaryTx tx
              ;; TODO: properly serialize tx
              iri/TxSummaryTxId (crypto/sha2-256 (pr-str tx))

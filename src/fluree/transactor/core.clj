@@ -21,21 +21,26 @@
   [ledger-name]
   (str (tx-summary/tx-summary-path ledger-name) "HEAD"))
 
-(defn init-tx
-  [txr ledger-name]
-  (let [store              (:store txr)
-        init-tx-summary    (tx-summary/create-tx-summary nil nil)
-        tx-summary-path    (:path (<?? (store/write store (str (tx-summary/tx-summary-path ledger-name) "init") init-tx-summary)))
-        tx-summary-address (tx-summary/create-tx-summary-address store tx-summary-path)
-        head-path          (gen-head-path ledger-name)]
-    ;; update head
-    (<?? (store/write store head-path tx-summary-address))
-    tx-summary-address))
-
 (defn resolve-tx
   [txr tx-address]
   (let [{tx-summary-path :address/path} (ident/address-parts tx-address)]
     (<?? (store/read (:store txr) tx-summary-path))))
+
+(defn init-tx
+  [txr ledger-name]
+  (let [store              (:store txr)
+        init-tx-summary    (tx-summary/create-tx-summary nil nil)
+        tx-summary-path    (str (tx-summary/tx-summary-path ledger-name) "init")
+        tx-summary-address (tx-summary/create-tx-summary-address store tx-summary-path)
+
+        existing?          (resolve-tx txr tx-summary-address)]
+    (when existing? (throw (ex-info "Cannot initialize transactor: " (pr-str ledger-name)
+                                          " already exists.")))
+    ;; write init summary
+    (<?? (store/write store tx-summary-path init-tx-summary))
+    ;; initialize head file
+    (<?? (store/write store (gen-head-path ledger-name) tx-summary-address))
+    tx-summary-address))
 
 (defn head-tx
   [txr ledger-name]

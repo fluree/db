@@ -21,6 +21,7 @@
    [iri/TxHeadAddress :string]
    [iri/TxSummaryV nat-int?]
    [iri/TxSummarySize nat-int?]
+   [iri/TxSummaryTxId :string]
    [iri/TxSummaryPrevious {:optional true} :string]])
 
 (def TransactorConfig

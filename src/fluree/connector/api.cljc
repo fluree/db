@@ -41,8 +41,8 @@
 
 (defn query
   "Query a ledger."
-  ([conn ledger-address q]
-   (query conn ledger-address q {}))
+  ([conn ledger-address query]
+   (conn-impl/query conn ledger-address query {}))
   ([conn ledger-address query opts]
    (conn-impl/query conn ledger-address query opts)))
 

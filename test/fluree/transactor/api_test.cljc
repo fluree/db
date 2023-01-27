@@ -42,28 +42,30 @@
       (testing "commit summary has expected shape"
         (is (model/valid? txr-model/TxHead head-summary0)))
       (testing "tx-head has expected data"
-        (is (= {"@type"                             "https://ns.flur.ee/TxHead/",
+        (is (= {"@type" "https://ns.flur.ee/TxHead/",
+                "https://ns.flur.ee/TxSummary#txAddress" "",
                 "https://ns.flur.ee/TxSummary#txId"
                 "5da3a4c7f117944275b4c8629c4916403625d5a4a6573a01ecb03f0e9d2edbe6",
                 "https://ns.flur.ee/TxSummary#size" 0,
-                "https://ns.flur.ee/TxSummary#v"    0,
+                "https://ns.flur.ee/TxSummary#v" 0,
                 "https://ns.flur.ee/TxHead#address"
                 "fluree:tx-summary:memory:testtransactor/tx-summary/init"}
                head-summary0)))
       (testing "tx-summary has expected shape"
         (is (model/valid? txr-model/TxSummary init-tx-summary)))
       (testing "tx-summary has expected data"
-        (is (= {"@type"                             "https://ns.flur.ee/TxSummary/",
-                "https://ns.flur.ee/TxSummary#tx"   nil,
+        (is (= {"@type" "https://ns.flur.ee/TxSummary/",
+                "https://ns.flur.ee/TxSummary#txAddress" "",
+                "https://ns.flur.ee/TxSummary#tx" nil,
                 "https://ns.flur.ee/TxSummary#txId"
                 "5da3a4c7f117944275b4c8629c4916403625d5a4a6573a01ecb03f0e9d2edbe6",
                 "https://ns.flur.ee/TxSummary#size" 0,
-                "https://ns.flur.ee/TxSummary#v"    0}
+                "https://ns.flur.ee/TxSummary#v" 0}
                init-tx-summary))))
 
     (testing "tx-summary1"
       (testing "address is deterministic"
-        (is (= "fluree:tx-summary:memory:testtransactor/tx-summary/742660714b7bc87dbea35da0e6b8326495108c41881ea72ff98dd8d4fbce456c"
+        (is (= "fluree:tx-summary:memory:testtransactor/tx-summary/5a565475717f95abff284b0b14a237816df6ebb1c834104e1974725d0a42e7f7"
                tx-address1)))
       (testing "address can be loaded"
         (is (= tx-head1 head1)))
@@ -76,7 +78,7 @@
 
     (testing "tx-summary2"
       (testing "address is deterministic"
-        (is (= "fluree:tx-summary:memory:testtransactor/tx-summary/54058e229452347938189b02f47cec4f76e4bffe65dc5992fbee3d1c12c72db4"
+        (is (= "fluree:tx-summary:memory:testtransactor/tx-summary/07e084158fba01f576533efce3734b1afbdaa87cf6f8b2f09160f2c519d17a93"
                tx-address2)))
       (testing "head address can be resolved"
         (is (= tx-head2 head2)))
@@ -87,8 +89,8 @@
       (testing "commit has expected shape"
         (is (model/valid? txr-model/TxSummary tx-summary2))))
     (testing "storage"
-      (is (= ["testtransactor/tx-summary/54058e229452347938189b02f47cec4f76e4bffe65dc5992fbee3d1c12c72db4"
-             "testtransactor/tx-summary/742660714b7bc87dbea35da0e6b8326495108c41881ea72ff98dd8d4fbce456c"
-             "testtransactor/tx-summary/HEAD"
-             "testtransactor/tx-summary/init"]
+      (is (= ["testtransactor/tx-summary/07e084158fba01f576533efce3734b1afbdaa87cf6f8b2f09160f2c519d17a93"
+              "testtransactor/tx-summary/5a565475717f95abff284b0b14a237816df6ebb1c834104e1974725d0a42e7f7"
+              "testtransactor/tx-summary/HEAD"
+              "testtransactor/tx-summary/init"]
              (sort (keys committed)))))))

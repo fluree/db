@@ -2,7 +2,7 @@
   (:require [fluree.common.iri :as iri]))
 
 (defn create-db-block
-  [{:keys [db-block-id] :as db} asserts retracts]
+  [{:keys [db-block-id] :as db} asserts retracts tx-id]
   (let [index-root                                    (-> db :commit :index :address)
         {:keys [reindex-min-bytes reindex-max-bytes]} (-> db :ledger :indexer)]
     (cond-> {iri/type iri/DbBlock
@@ -11,6 +11,7 @@
              iri/DbBlockSize (-> db :stats :size)
              iri/DbBlockReindexMin reindex-min-bytes
              iri/DbBlockReindexMax reindex-max-bytes
+             iri/DbBlockTxId tx-id
              iri/DbBlockAssert asserts
              iri/DbBlockRetract retracts}
       index-root (assoc iri/DbBlockIndexRoot index-root)

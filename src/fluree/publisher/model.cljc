@@ -30,7 +30,7 @@
   [:map
    [iri/type [:enum iri/LedgerEntry]]
    [iri/LedgerEntryCreated :string]
-   [iri/LedgerEntryCommit {:optional true} txr/CommitSummary]
+   [iri/LedgerTxHead {:optional true} txr/TxHead]
    [iri/LedgerEntryDb {:optional true} idxr/DbBlockSummary]])
 
 (def Ledger

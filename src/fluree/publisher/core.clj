@@ -25,7 +25,7 @@
     (<?? (store/read (:store pub) path))))
 
 (defn init-ledger
-  [pub ledger-name {:keys [context head-address db-address] :as opts}]
+  [pub ledger-name {:keys [context tx-address db-address] :as opts}]
   (let [store  (:store pub)
         ledger (ledger/create-ledger store ledger-name opts)
 

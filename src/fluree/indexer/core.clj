@@ -40,7 +40,7 @@
 
 (defn stage-db
   "Index the given data, then store a db-block"
-  [{:keys [store state] :as idxr} db-address data]
+  [{:keys [store state] :as idxr} db-address data {:keys [tx-id] :as _opts}]
   (if-let [db-before (get @state db-address)]
     (let [{ledger-name :ledger/name} (db/db-path-parts db-address)
           db-after                   (<?? (jld-transact/stage (db/prepare db-before) data {}))
@@ -70,9 +70,9 @@
                      db-after)
 
           ;; create db-block and write it to store
-          db-block      (block/create-db-block db-after assert retract)
+          db-block      (block/create-db-block db-after assert retract tx-id)
           db-block-path (:path (<?? (store/write store (block/db-block-path ledger-name) db-block
-                                               {:content-address? true})))
+                                                 {:content-address? true})))
 
           ;; save newest db-block so the next stage knows the previous tx
           db-final   (assoc db-after :db-block-id db-block-path)
@@ -139,6 +139,7 @@
           {root        iri/DbBlockIndexRoot
            previous    iri/DbBlockPrevious
            t           iri/DbBlockT
+           tx-id       iri/DbBlockTxId
            reindex-min iri/DbBlockReindexMin
            reindex-max iri/DbBlockReindexMax} db-block
 
@@ -159,7 +160,8 @@
 
           rebuilt-db-block (block/create-db-block loaded-db
                                                   (get db-block iri/DbBlockAssert)
-                                                  (get db-block iri/DbBlockRetract))]
+                                                  (get db-block iri/DbBlockRetract)
+                                                  tx-id)]
       ;; fully loaded
       (swap! state assoc db-address loaded-db)
       (block/create-db-summary rebuilt-db-block db-address))))
@@ -179,7 +181,7 @@
   idxr-proto/Indexer
   (init [idxr ledger-name opts] (init-db idxr ledger-name opts))
   (load [idxr db-address opts] (load-db idxr db-address opts))
-  (stage [idxr db-address data] (stage-db idxr db-address data))
+  (stage [idxr db-address data opts] (stage-db idxr db-address data opts))
   (query [idxr db-address query] (query-db idxr db-address query))
   (explain [idxr db-address query] (throw (ex-info "TODO" {:todo :explain-not-implemented}))))
 
@@ -208,8 +210,8 @@
   (idxr-proto/init idxr ledger-name opts))
 
 (defn stage
-  [idxr db-address data]
-  (idxr-proto/stage idxr db-address data))
+  [idxr db-address data opts]
+  (idxr-proto/stage idxr db-address data opts))
 
 (defn load
   [idxr db-address opts]

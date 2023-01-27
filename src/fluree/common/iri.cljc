@@ -56,6 +56,7 @@
 ;; TxSummary
 (def TxSummary (str fluree "TxSummary/"))
 (def TxSummaryTx (iri "TxSummary" "tx"))
+(def TxSummaryTxAddress (iri "TxSummary" "txAddress"))
 (def TxSummaryTxId (iri "TxSummary" "txId"))
 (def TxSummarySize (iri "TxSummary" "size"))
 (def TxSummaryT (iri "TxSummary" "t"))
@@ -78,6 +79,7 @@
 (def DbBlockSize (iri "DbBlock" "size"))
 (def DbBlockT (iri "DbBlock" "t"))
 (def DbBlockV (iri "DbBlock" "v"))
+(def DbBlockTxId (iri "DbBlock" "txId"))
 (def DbBlockReindexMin (iri "DbBlock" "reindexMin"))
 (def DbBlockReindexMax (iri "DbBlock" "reindexMax"))
 (def DbBlockIndexRoot (iri "DbBlock" "indexRoot"))
@@ -99,4 +101,5 @@
 (def LedgerEntryCreated (iri "LedgerEntry" "created"))
 (def LedgerEntryPrevious (iri "LedgerEntry" "previous"))
 (def LedgerEntryCommit (iri "LedgerEntry" "commit"))
+(def LedgerTxHead (iri "LedgerEntry" "txHead"))
 (def LedgerEntryDb (iri "LedgerEntry" "db"))

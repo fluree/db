@@ -18,48 +18,51 @@
 
 (defn fluree-create
   [{:keys [indexer publisher transactor]} ledger-name opts]
-  (let [commit-address (txr/init transactor ledger-name)
+  (let [tx-address     (txr/init transactor ledger-name)
         db-address     (idxr/init indexer ledger-name opts)
-        ledger-address (pub/init publisher ledger-name (assoc opts :db-address db-address))]
+        ledger-address (pub/init publisher ledger-name (assoc opts
+                                                              :db-address db-address
+                                                              :tx-address tx-address))]
     ledger-address))
 
 (defn fluree-transact
   [conn ledger-address tx opts]
   (let [{txr :transactor pub :publisher idxr :indexer} conn
 
-        ledger                (pub/pull pub ledger-address)
+        ledger (pub/pull pub ledger-address)
 
         {ledger-name iri/LedgerName} (get ledger :cred/credential-subject ledger)
 
         ;; lookup latest db
         db-address (-> ledger (get iri/LedgerHead) (get iri/LedgerEntryDb) (get iri/DbBlockAddress))
 
-        ;; write tx in next commit
-        commit-summary (txr/commit txr ledger-name tx)
+        ;; save transaction
+        tx-head (txr/transact txr ledger-name tx)
 
         ;; submit tx for indexing
-        db-summary (idxr/stage idxr db-address tx)]
+        db-summary (idxr/stage idxr db-address tx {:tx-id (get tx-head iri/TxSummaryTxId)})]
     ;; update db head
-    (pub/push pub ledger-address {:db-summary db-summary :commit-summary commit-summary})))
+    (pub/push pub ledger-address {:db-summary db-summary :commit-summary tx-head})))
 
-(defn load-commits
+(defn load-txs
   "While commit-t is greater than indexed-t, walk back through ledger heads to find commit
   addresses until we find the last indexed-t or the first commit. Then resolve all the
   commits."
-  [{:keys [txr pub] :as _conn} ledger-name indexed-t]
-  (let [head-commit-summary (txr/load txr ledger-name)]
-    (loop [{address  iri/CommitAddress
-            t        iri/CommitT
-            previous iri/CommitPrevious
-            :as commit} (txr/resolve txr (get head-commit-summary iri/CommitAddress))
+  [{:keys [txr pub] :as _conn} ledger-name indexed-tx-id]
+  (let [tx-head (txr/head txr ledger-name)]
+    (loop [{address  iri/TxHeadAddress
+            tx-id    iri/TxSummaryTxId
+            previous iri/TxSummaryPrevious
+            :as      commit} (txr/resolve txr (get tx-head iri/TxHeadAddress))
 
-           commits '()]
-      (if (and t indexed-t (> t indexed-t))
+           txs '()]
+      (if (not= indexed-tx-id tx-id)
         (if previous
           (let [prev-commit (txr/resolve txr previous)]
-            (recur prev-commit (conj commits commit)))
+            (recur prev-commit (conj txs commit)))
           ;; reached first commit
-          commits)))))
+          txs)
+        txs))))
 
 (defn fluree-load
   "Load the index and make sure it's up-to-date to ensure it is ready to handle new
@@ -74,18 +77,18 @@
 
         {head iri/LedgerHead} (get ledger :cred/credential-subject ledger)
 
-        {indexed-t iri/DbBlockT
+        {indexed-tx-id iri/DbBlockTxId
          db-address iri/DbBlockAddress} (-> head (get iri/LedgerEntryDb))
 
 
-        ;; load the un-indexed commits
-        commits    (load-commits conn (get ledger iri/LedgerName) indexed-t)
-        ;; re-stage the unindexed commits in order
+        ;; load the un-indexed txs
+        txs    (load-txs conn (get ledger iri/LedgerName) indexed-tx-id)
+        ;; re-stage the unindexed txs in order
         db-summary (reduce (fn [{db-address iri/DbBlockAddress} {:keys [commit/tx]}]
                              (idxr/stage idxr db-address tx))
                            ;; load the db so it's ready to stage against
                            (idxr/load idxr db-address opts)
-                           commits)]
+                           txs)]
     ledger))
 
 (defn fluree-query
