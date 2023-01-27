@@ -60,7 +60,8 @@
      ::pretty-print ::prettyPrint
      ::parseJSON boolean?
      ::parse-json ::parseJSON
-     ::js? boolean?
+     ::contextType [:enum :string :keyword]
+     ::context-type ::contextType
      ::opts [:map
              [:maxFuel {:optional true} ::maxFuel]
              [:max-fuel {:optional true} ::maxFuel]
@@ -68,7 +69,8 @@
              [:parse-json {:optional true} ::parse-json]
              [:prettyPrint {:optional true} ::prettyPrint]
              [:pretty-print {:optional true} ::pretty-print]
-             [:js {:optional true} ::js?]]
+             [:contextType {:optional true} ::contextType]
+             [:context-type {:optional true} ::contextType]]
      ::function [:orn
                  [:string [:fn fn-string?]]
                  [:list [:fn fn-list?]]]
