@@ -201,11 +201,12 @@
         id (or id (random-uuid))
         ;; state is a map of db-address to JsonLdDb
         state (atom {})]
-    (log/info "Starting Indexer " id "." config)
+    (log/info "Started Indexer." id)
     (map->Indexer {:id id :store store :config config :state state})))
 
 (defn start
   [config]
+  (log/info "Starting Indexer." config)
   (if-let [validation-error (model/explain idxr-model/IndexerConfig config)]
     (throw (ex-info "Invalid indexer config." {:errors (model/report validation-error)
                                                :config config}))

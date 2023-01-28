@@ -82,11 +82,12 @@
   [{:keys [:txr/id :txr/store-config :txr/store] :as config}]
   (let [store (or store (store/start store-config))
         id (or id (random-uuid))]
-    (log/info "Starting transactor " id "." config)
+    (log/info "Started Transactor." id)
     (map->Transactor {:id id :store store})))
 
 (defn start
   [config]
+  (log/info "Starting Transactor." config)
   (if-let [validation-error (model/explain txr-model/TransactorConfig config)]
     (throw (ex-info "Invalid transactor config." {:errors (model/report validation-error)
                                                   :config config}))

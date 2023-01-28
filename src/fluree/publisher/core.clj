@@ -87,11 +87,12 @@
   [{:keys [:pub/id :pub/did :pub/store-config :pub/store] :as config}]
   (let [store (or store (store/start store-config))
         id (or id (random-uuid))]
-    (log/info "Starting Publisher " id "." config)
+    (log/info "Started Publisher." id)
     (map->Publisher {:id id :did did :store store})))
 
 (defn start
   [config]
+  (log/info "Starting Publisher." config)
   (if-let [validation-error (model/explain pub-model/PublisherConfig config)]
     (throw (ex-info "Invalid publisher config." {:errors (model/report validation-error)
                                                  :config config}))

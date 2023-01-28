@@ -66,7 +66,7 @@
   [{:keys [store/id memory-store/storage-atom] :as config}]
   (let [id (or id (random-uuid))
         storage-atom (or storage-atom (atom {}))]
-    (log/info "Starting MemoryStore " id "." config)
+    (log/info "Started MemoryStore." id )
     (map->MemoryStore {:id id
                        :storage-atom storage-atom
                        :async-cache (resolver/create-async-cache config)

@@ -5,11 +5,13 @@
             [fluree.store.file :as file-store]
             [fluree.store.memory :as memory-store]
             [fluree.store.model :as store-model]
-            [fluree.store.protocols :as store-proto]))
+            [fluree.store.protocols :as store-proto]
+            [fluree.db.util.log :as log]))
 
 (defn start
   "Takes a config and returns a possibly stateful Store."
   [{:keys [:store/method] :as config}]
+  (log/info "Starting Store." config)
   (if-let [validation-error (model/explain store-model/StoreConfig config)]
     (throw (ex-info "Invalid store config." {:errors (model/report validation-error)
                                              :config config}))

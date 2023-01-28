@@ -173,7 +173,7 @@
                          store    (assoc :pub/store store)))
 
         subscriptions (atom {})]
-    (log/info "Starting FlureeConnection " id "." config)
+    (log/info "Started FlureeConnection." id)
     (map->FlureeConnection
       (cond-> {:id id
                :indexer idxr

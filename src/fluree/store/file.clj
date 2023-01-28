@@ -116,7 +116,7 @@
 (defn create-file-store
   [{:keys [:store/id :store/serde :file-store/storage-path :file-store/serialize-to] :as config}]
   (let [id (or id (random-uuid))]
-    (log/info "Starting FileStore " id "." config)
+    (log/info "Started FileStore." id)
     (map->FileStore {:id id
                      :serialize-to serialize-to
                      :async-cache (resolver/create-async-cache config)
