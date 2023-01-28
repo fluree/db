@@ -4,16 +4,20 @@
    [fluree.common.model :as model]
    [fluree.common.protocols :as service-proto]
    [fluree.connector.fluree-conn :as fluree-conn]
+   [fluree.connector.transactor-conn :as transactor-conn]
    [fluree.connector.model :as conn-model]
-   [fluree.connector.protocols :as conn-proto]))
+   [fluree.connector.protocols :as conn-proto]
+   [fluree.db.util.log :as log]))
 
 (defn connect
   [{:keys [:conn/mode] :as config}]
+  (log/info "Starting connection." config)
   (if-let [validation-error (model/explain conn-model/ConnectionConfig config)]
     (throw (ex-info "Invalid connection config." {:errors (model/report validation-error)
                                                   :config config}))
     (case mode
-      :fluree (fluree-conn/create-fluree-conn config))))
+      :fluree (fluree-conn/create-fluree-conn config)
+      :transactor (transactor-conn/create-transactor-conn config))))
 
 (defn close
   [conn]
