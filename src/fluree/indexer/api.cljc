@@ -1,5 +1,5 @@
 (ns fluree.indexer.api
-  (:refer-clojure :exclude [load])
+  (:refer-clojure :exclude [load resolve])
   (:require [fluree.indexer.core :as idxr-impl]
             [fluree.indexer.model :as idxr-model]))
 
@@ -26,6 +26,11 @@
    (idxr-impl/load idxr db-address {}))
   ([idxr db-address {:keys [reindex-min-bytes reindex-max-bytes] :as opts}]
    (idxr-impl/load idxr db-address opts)))
+
+(defn resolve
+  "Return the db-block associated with the db-address."
+  [idxr db-address]
+  (idxr-impl/resolve idxr db-address))
 
 (defn stage
   "Index some data and return a db-address."

@@ -91,7 +91,9 @@
 
             loaded-summary (idxr/load idxr2 (get db2-summary iri/DbBlockAddress))
             loaded-results (idxr/query idxr (get db2-summary iri/DbBlockAddress)
-                                       {:select {"?s" [:*]} :where [["?s" "@id" "http://dan.com/dan"]]})]
+                                       {:select {"?s" [:*]} :where [["?s" "@id" "http://dan.com/dan"]]})
+
+            resolved-block (idxr/resolve idxr2 (get db2-summary iri/DbBlockAddress))]
         (is (= ["indexertest/db/1ed976882c0db213d475590378758a490f631d2ed1d223c8540b0540689aa3bf"
                 "indexertest/db/545b2c139d73fd08fc3b74a0a3cdf93ab796cd761c2e39c2a0cb40b01345780d"
                 "indexertest/db/6c3954582f8699a0c7e7a424b32292b7de3799ef7db1a0bf0ba3e3829ff5543f"]
@@ -110,4 +112,20 @@
                  loaded-summary))
         ;; query results are the same
         (is (= db2-results
-               loaded-results))))))
+               loaded-results))
+
+        (is (= {"https://ns.flur.ee/DbBlock#reindexMin" 1,
+                "https://ns.flur.ee/DbBlock#previous"
+                "indexertest/db/1ed976882c0db213d475590378758a490f631d2ed1d223c8540b0540689aa3bf",
+                "https://ns.flur.ee/DbBlock#reindexMax" 1000000,
+                "https://ns.flur.ee/DbBlock#size" 958,
+                "https://ns.flur.ee/DbBlock#v" 0,
+                "https://ns.flur.ee/DbBlock#indexRoot"
+                "indexertest/index/__root_000000000000000",
+                "https://ns.flur.ee/DbBlock#assert"
+                [{"http://dan.com/prop2" "foo", "@id" "http://dan.com/dan"}],
+                "https://ns.flur.ee/DbBlock#txId" "TX-ID2",
+                "https://ns.flur.ee/DbBlock#retract" [],
+                "@type" "https://ns.flur.ee/DbBlock/",
+                "https://ns.flur.ee/DbBlock#t" 2}
+               resolved-block))))))

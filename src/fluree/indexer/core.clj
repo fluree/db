@@ -1,5 +1,5 @@
 (ns fluree.indexer.core
-  (:refer-clojure :exclude [load])
+  (:refer-clojure :exclude [load resolve])
   (:require
    [fluree.common.identity :as ident]
    [fluree.common.iri :as iri]
@@ -37,6 +37,14 @@
       (do
         (swap! state assoc db-address db)
         db-address))))
+
+(defn resolve-db
+  [{:keys [store state] :as idxr} db-address]
+  (let [db-block-id (:address/path (ident/address-parts db-address))
+        db-block    (<?? (store/read store db-block-id))]
+    (if db-block
+      db-block
+      (throw (ex-info (str "Db block with address " db-address " does not exist." {:db-address db-address}))))))
 
 (defn stage-db
   "Index the given data, then store a db-block"
@@ -181,6 +189,8 @@
   idxr-proto/Indexer
   (init [idxr ledger-name opts] (init-db idxr ledger-name opts))
   (load [idxr db-address opts] (load-db idxr db-address opts))
+  (resolve [idxr db-address] (resolve-db idxr db-address))
+
   (stage [idxr db-address data opts] (stage-db idxr db-address data opts))
   (query [idxr db-address query] (query-db idxr db-address query))
   (explain [idxr db-address query] (throw (ex-info "TODO" {:todo :explain-not-implemented}))))
@@ -216,6 +226,10 @@
 (defn load
   [idxr db-address opts]
   (idxr-proto/load idxr db-address opts))
+
+(defn resolve
+  [idxr db-address]
+  (idxr-proto/resolve idxr db-address))
 
 (defn query
   [idxr db-address query]
