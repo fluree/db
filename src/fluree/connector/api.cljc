@@ -46,10 +46,15 @@
   ([conn ledger-address query opts]
    (conn-impl/query conn ledger-address query opts)))
 
-#_(defn subscribe
-  "Subscribe to a ledger's updates."
-  [conn query fn]
-  (throw (ex-info "TODO" {})))
+(defn subscribe
+  "Register a listener with a ledger to receive new db-blocks and new db-root notifications."
+  [conn ledger-address cb opts]
+  (conn-impl/subscribe conn ledger-address cb opts))
+
+(defn unsubscribe
+  "Unregister the listener to stop receiving updates."
+  [conn ledger-address subscription-key]
+  (conn-impl/unsubscribe conn ledger-address subscription-key))
 
 ;; models
 

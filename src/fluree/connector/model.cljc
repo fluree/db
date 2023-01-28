@@ -31,4 +31,13 @@
    [:id :any]
    [:transactor txr/Transactor]
    [:publisher pub/Publisher]
-   [:indexer idxr/Indexer]])
+   [:indexer idxr/Indexer]
+   ;; atom
+   [:subscriptions
+    [:map-of :string
+     [:map-of :string
+      [:map
+       [:subscription/opts :map]
+       [:subscription/cb [:fn [:catn
+                               [:db-block :map]
+                               [:opts [:map [:authClaims :map]]]]]]]]]]])

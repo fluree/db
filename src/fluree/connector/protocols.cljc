@@ -7,4 +7,6 @@
   (transact [_ ledger-address tx opts] "Transact data, indexing it, checking it, and then commiting it.")
   (query [_ ledger-address query opts] "Query a db and get results.")
   (load [_ ledger-address opts] "Prepare a ledger for querying and transacting.")
-  #_(subscribe [_ query fn]))
+
+  (subscribe [idxr ledger-address cb opts] "Register a listener with a ledger to receive new db-blocks and new db-root notifications.")
+  (unsubscribe [idxr ledger-address subscription-key] "Unregister the listener to stop receiving updates."))

@@ -8,8 +8,8 @@
             [fluree.store.api :as store]
             [fluree.common.iri :as iri]))
 
-(defn stop-conn
-  [{:keys [transactor indexer publisher enforcer] :as conn}]
+(defn stop-fluree-conn
+  [{:keys [transactor indexer publisher] :as conn}]
   (log/info "Stopping Connection " (service-proto/id conn) ".")
   (when transactor (service-proto/stop transactor))
   (when indexer (service-proto/stop indexer))
@@ -24,6 +24,31 @@
                                                               :db-address db-address
                                                               :tx-address tx-address))]
     ledger-address))
+
+(defn fluree-subscribe
+  [{:keys [subscriptions publisher] :as conn} ledger-address cb {:keys [auth-claims] :as opts}]
+  (if-let [ledger (pub/pull publisher ledger-address)]
+    (let [subscription-key (str (random-uuid))]
+      (swap! subscriptions assoc-in [ledger-address subscription-key] {:subscription/opts opts :subscription/cb cb})
+      subscription-key)
+    (throw (ex-info "No ledger for ledger-address."
+                    {:error :connection/invalid-subscription :ledger-address ledger-address}))))
+
+(defn fluree-unsubscribe
+  [{:keys [subscriptions] :as idxr} ledger-address subscription-key]
+  (swap! subscriptions update ledger-address dissoc subscription-key)
+  :unsubscribed)
+
+(defn fluree-broadcast
+  "Broadcast the latest block to all subscribers."
+  [{:keys [subscriptions indexer publisher] :as idxr} ledger-address]
+  (let [ledger     (pub/pull publisher ledger-address)
+        db-address (-> ledger (get iri/LedgerHead) (get iri/LedgerEntryDb) (get iri/DbBlockAddress))
+        db-block   (idxr/resolve indexer db-address)]
+    (doseq [[subscription-key {:keys [subscription/opts subscription/cb]}] (get @subscriptions ledger-address)]
+      (log/info "Broadcasting from db-address to" subscription-key "with opts " opts ".")
+      ;; TODO: filter db-block for cb auth (:authClaims opt)
+      (cb db-block opts))))
 
 (defn fluree-transact
   [conn ledger-address tx opts]
@@ -40,9 +65,14 @@
         tx-head (txr/transact txr ledger-name tx)
 
         ;; submit tx for indexing
-        db-summary (idxr/stage idxr db-address tx {:tx-id (get tx-head iri/TxSummaryTxId)})]
-    ;; update db head
-    (pub/push pub ledger-address {:db-summary db-summary :commit-summary tx-head})))
+        db-summary (idxr/stage idxr db-address tx {:tx-id (get tx-head iri/TxSummaryTxId)})
+
+        ;; update ledger head
+        new-ledger (pub/push pub ledger-address {:db-summary db-summary :commit-summary tx-head})]
+    ;; broadcast to subscribers
+    (fluree-broadcast conn ledger-address)
+    ;; return new ledger
+    new-ledger))
 
 (defn load-txs
   "While commit-t is greater than indexed-t, walk back through ledger heads to find commit
@@ -99,19 +129,21 @@
         db-address          (-> ledger (get iri/LedgerHead) (get iri/LedgerEntryDb) (get iri/DbBlockAddress))]
     (idxr/query (:indexer conn) db-address query)))
 
-(defrecord FlureeConnection [id transactor indexer publisher enforcer]
+(defrecord FlureeConnection [id transactor indexer publisher]
   service-proto/Service
   (id [_] id)
-  (stop [conn] (stop-conn conn))
+  (stop [conn] (stop-fluree-conn conn))
 
   conn-proto/Connection
   (create [conn ledger-name opts] (fluree-create conn ledger-name opts))
-  (transact [conn ledger-address tx opts] (fluree-transact conn ledger-address tx opts))
-  (query [conn ledger-address query opts] (fluree-query conn ledger-address query opts))
   (load [conn ledger-address opts] (fluree-load conn ledger-address opts))
   (list [conn] (pub/list (:publisher conn)))
-  ;; TODO
-  #_(subscribe [conn query fn]))
+
+  (transact [conn ledger-address tx opts] (fluree-transact conn ledger-address tx opts))
+  (query [conn ledger-address query opts] (fluree-query conn ledger-address query opts))
+
+  (subscribe [idxr ledger-address cb opts] (fluree-subscribe idxr ledger-address cb opts))
+  (unsubscribe [idxr ledger-address subscription-key] (fluree-unsubscribe idxr ledger-address subscription-key)))
 
 (defn create-fluree-conn
   [{:keys [:conn/id :conn/store-config :conn/did :conn/trust :conn/distrust
@@ -138,11 +170,14 @@
                          did      (assoc :pub/did did)
                          trust    (assoc :pub/trust trust)
                          distrust (assoc :pub/distrust distrust)
-                         store    (assoc :pub/store store)))]
+                         store    (assoc :pub/store store)))
+
+        subscriptions (atom {})]
     (log/info "Starting FlureeConnection " id "." config)
     (map->FlureeConnection
       (cond-> {:id id
                :indexer idxr
                :transactor txr
-               :publisher pub}
+               :publisher pub
+               :subscriptions subscriptions}
         store (assoc :store store)))))

@@ -38,3 +38,11 @@
 (defn list
   [conn]
   (conn-proto/list conn))
+
+(defn subscribe
+  [conn ledger-address cb opts]
+  (conn-proto/subscribe conn ledger-address cb opts))
+
+(defn unsubscribe
+  [conn ledger-address subscription-key]
+  (conn-proto/unsubscribe conn ledger-address subscription-key))
