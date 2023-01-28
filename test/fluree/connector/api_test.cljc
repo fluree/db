@@ -6,7 +6,7 @@
             [fluree.db.did :as did]
             [fluree.db.test-utils :as test-utils]))
 
-(deftest fluree-conn
+(deftest connector
   (with-redefs [fluree.common.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
     (let [did     (did/private->did-map test-utils/default-private-key)
           context {"ex" "https://example.com/" "f" "https://ns.flur.ee"}
@@ -194,71 +194,3 @@
             (is (= [{"@id" "ex:dan" "ex:foo" "bar"}]
                    query-results)))
           (conn/close conn))))))
-
-(deftest transactor-conn
-  (with-redefs [fluree.common.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
-    (let [did     (did/private->did-map test-utils/default-private-key)
-          context {"ex" "https://example.com/" "f" "https://ns.flur.ee"}
-          tx      {"@context" context
-                   "@id"      "ex:dan"
-                   "ex:foo"   "bar"}
-
-          conn              (conn/connect {:conn/mode         :transactor
-                                           :conn/did          did
-                                           :conn/trust        :all
-                                           :conn/store-config {:store/method :memory}})
-
-          ledger-address (conn/create conn "test-transactor-conn")]
-      (testing "create"
-        (is (= "fluree:tx-summary:memory:test-transactor-conn/tx-summary/init"
-               ledger-address)))
-      (testing "transact"
-        (is (= {"@type" "https://ns.flur.ee/TxHead/",
-                "https://ns.flur.ee/TxSummary#txAddress" "",
-                "https://ns.flur.ee/TxSummary#txId"
-                "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212",
-                "https://ns.flur.ee/TxSummary#size" 3,
-                "https://ns.flur.ee/TxSummary#v" 0,
-                "https://ns.flur.ee/TxSummary#previous"
-                "fluree:tx-summary:memory:test-transactor-conn/tx-summary/init",
-                "https://ns.flur.ee/TxHead#address"
-                "fluree:tx-summary:memory:test-transactor-conn/tx-summary/92b20866cab757b146b10b607169a7284456bda0eabf21b0298a9b1148184289"}
-               (conn/transact conn ledger-address tx))))
-
-      (testing "load"
-        (is (= {"@type" "https://ns.flur.ee/TxHead/",
-                "https://ns.flur.ee/TxSummary#txAddress" "",
-                "https://ns.flur.ee/TxSummary#txId"
-                "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212",
-                "https://ns.flur.ee/TxSummary#size" 3,
-                "https://ns.flur.ee/TxSummary#v" 0,
-                "https://ns.flur.ee/TxSummary#previous"
-                "fluree:tx-summary:memory:test-transactor-conn/tx-summary/init",
-                "https://ns.flur.ee/TxHead#address"
-                "fluree:tx-summary:memory:test-transactor-conn/tx-summary/92b20866cab757b146b10b607169a7284456bda0eabf21b0298a9b1148184289"}
-               (conn/load conn ledger-address))))
-
-      (testing "list"
-        (is (= "TransactorConnection does not support list."
-               (try (conn/list conn)
-                    (catch Exception e
-                      (-> (Throwable->map e)
-                          :cause))))))
-      (testing "query"
-        (is (= "TransactorConnection does not support query."
-               (try (conn/query conn ledger-address {})
-                    (catch Exception e
-                      (-> (Throwable->map e)
-                          :cause))))))
-      (testing "subscribe"
-        (is (= "TransactorConnection does not support subscribe."
-               (try (conn/subscribe conn ledger-address (constantly :nope) {})
-                    (catch Exception e
-                      (-> (Throwable->map e)
-                          :cause))))))
-      (testing "unsubscribe"
-        (is (= "TransactorConnection does not support unsubscribe."
-               (try (conn/unsubscribe conn ledger-address :sub-key)
-                    (catch Exception e
-                      (-> (Throwable->map e)
-                          :cause)))))))))
