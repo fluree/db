@@ -50,11 +50,12 @@
   "Index the given data, then store a db-block"
   [{:keys [store state] :as idxr} db-address data {:keys [tx-id] :as _opts}]
   (if-let [db-before (get @state db-address)]
-    (let [{ledger-name :ledger/name} (db/db-path-parts db-address)
-          db-after                   (<?? (jld-transact/stage (db/prepare db-before) data {}))
+    (let [{ledger-name :address/ledger-name} (ident/address-parts db-address)
+
+          db-after (<?? (jld-transact/stage (db/prepare db-before) data {}))
           ;; This is a hack to sync t into various places since dbs shouldn't care about branches
           ;; used in do-index > refresh > index-update > empty-novelty
-          db-after                   (assoc-in db-after [:commit :data :t] (- (:t db-after)))
+          db-after (assoc-in db-after [:commit :data :t] (- (:t db-after)))
 
           idx-writer (-> db-after :ledger :indexer)
 
@@ -140,10 +141,12 @@
       (block/create-db-summary db-block db-address))
 
     ;; rebuild db from persisted data
-    (let [db-block-id (:address/path (ident/address-parts db-address))
+    (let [{db-block-id :address/path
+           ledger-name :address/ledger-name}
+          (ident/address-parts db-address)
+
           db-block    (<?? (store/read store db-block-id))
 
-          {ledger-name :ledger/name} (db/db-path-parts db-address)
           {root        iri/DbBlockIndexRoot
            previous    iri/DbBlockPrevious
            t           iri/DbBlockT

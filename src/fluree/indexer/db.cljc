@@ -20,14 +20,6 @@
   [db db-block-id]
   (store/address (:conn db) "db" db-block-id))
 
-(defn db-path-parts
-  "Returns the ledger name from the db-address"
-  [db-address]
-  (let [path (:address/path (ident/address-parts db-address))
-        [ledger-name _ db-block-id] (str/split path #"/")]
-    {:ledger/name ledger-name
-     :db/block-id db-block-id}))
-
 (defn status
   "Returns current commit metadata for specified branch (or default branch if nil)"
   [{:keys [state address alias] :as _ledger} requested-branch]

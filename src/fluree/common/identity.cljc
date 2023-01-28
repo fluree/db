@@ -25,9 +25,10 @@
 (defn address-parts
   [address]
   (let [[ns type method path] (str/split address #":")
-        id                    (last (str/split path #"/"))]
+        [ledger-name _ id]    (str/split path #"/")]
     {:address/ns     ns
      :address/type   (keyword type)
      :address/method (keyword method)
+     :address/ledger-name ledger-name
      :address/path   path
      :address/id     id}))
