@@ -14,40 +14,40 @@
   (store-impl/stop store))
 
 (defn address
-  "Given a k and the k's type, return an address for k's data."
-  [store type k]
-  (store-impl/address store type k))
+  "Given a path and the path's type, return an address for path's data."
+  [store type path]
+  (store-impl/address store type path))
 
 (defn write
-  "Associate data with key k in store. Returns map of :path and :hash.
+  "Associate data with path in store. Returns map of :path and :hash.
 
   opts:
   :serializer - override Store default serializer.
-  :content-address? - caculates the sha256 hash of `data` after serializing and appends it to the `k` before storing."
-  ([store k data]
-   (store-impl/write store k data {}))
-  ([store k data {:keys [serializer content-address?] :as opts}]
-   (store-impl/write store k data opts)))
+  :content-address? - caculates the sha256 hash of `data` after serializing and appends it to the `path` before storing."
+  ([store path data]
+   (store-impl/write store path data {}))
+  ([store path data {:keys [serializer content-address?] :as opts}]
+   (store-impl/write store path data opts)))
 
 (defn read
-  "Read data from key k in store.
+  "Read data from path in store.
 
   opts:
   :deserializer - override Store default deserializer."
-  ([store k]
-   (store-impl/read store k {}))
-  ([store k {:keys [deserializer] :as opts}]
-   (store-impl/read store k opts)))
+  ([store path]
+   (store-impl/read store path {}))
+  ([store path {:keys [deserializer] :as opts}]
+   (store-impl/read store path opts)))
 
 (defn list
-  "Return keys from store with given prefix."
+  "Return paths from store with given prefix."
   [store prefix]
   (store-impl/list store prefix))
 
 (defn delete
-  "Remove data for key k in store."
-  [store k]
-  (store-impl/delete store k))
+  "Remove data for path in store."
+  [store path]
+  (store-impl/delete store path))
 
 ;; model definitions
 (def BaseStoreConfig store-model/BaseStoreConfig)

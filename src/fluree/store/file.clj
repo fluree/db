@@ -26,8 +26,8 @@
   :stopped)
 
 (defn address-file
-  [type k]
-  (ident/create-address type :file k))
+  [type path]
+  (ident/create-address type :file path))
 
 (defn write-file
   "Write string to disk at the given file path."
@@ -41,7 +41,7 @@
                      serialized)
         hash       (crypto/sha2-256 bytes)
         path       (str path (when content-address? hash))
-        file-path  (str base-path path )]
+        file-path  (str base-path path)]
     (try
       (with-open [out (io/output-stream (io/file file-path))]
         (.write out ^bytes bytes))
@@ -102,13 +102,13 @@
   (stop [store] (stop-file-store store))
 
   store-proto/Store
-  (address [_ type k] (address-file type k))
-  (read [_ k] (go-try (read-file storage-path k serialize-to {})))
-  (read [_ k opts] (go-try (read-file storage-path k serialize-to opts)))
+  (address [_ type path] (address-file type path))
+  (read [_ path] (go-try (read-file storage-path path serialize-to {})))
+  (read [_ path opts] (go-try (read-file storage-path path serialize-to opts)))
   (list [_ prefix] (go-try (list-files storage-path prefix serialize-to)))
-  (write [_ k data] (go-try (write-file storage-path k data serialize-to {})))
-  (write [_ k data opts] (go-try (write-file storage-path k data serialize-to opts)))
-  (delete [_ k] (go-try (delete-file storage-path k)))
+  (write [_ path data] (go-try (write-file storage-path path data serialize-to {})))
+  (write [_ path data opts] (go-try (write-file storage-path path data serialize-to opts)))
+  (delete [_ path] (go-try (delete-file storage-path path)))
 
   fluree.db.index/Resolver
   (resolve [store node] (resolver/resolve-node store async-cache node)))

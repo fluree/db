@@ -19,17 +19,17 @@
   :stopped)
 
 (defn address-memory
-  [type k]
-  (ident/create-address type :memory k))
+  [type path]
+  (ident/create-address type :memory path))
 
 (defn memory-write
-  [storage-atom k data {:keys [serializer content-address?] :as _opts}]
+  [storage-atom path data {:keys [serializer content-address?] :as _opts}]
   (let [serializer (or serializer pr-str)
         serialized (serializer data)
         hash       (crypto/sha2-256 serialized)
         path       (if content-address?
-                     (str k hash)
-                     k)]
+                     (str path hash)
+                     path)]
     ;; for convenience, store the clj data instead of the serialized data
     (swap! storage-atom assoc path data)
     {:path    path
@@ -38,8 +38,8 @@
      :hash    hash}))
 
 (defn memory-read
-  [storage-atom k {:keys [deserializer] :as _opts}]
-  (let [data (get @storage-atom k)]
+  [storage-atom path {:keys [deserializer] :as _opts}]
+  (let [data (get @storage-atom path)]
     (if deserializer
       (deserializer data)
       data)))
@@ -50,13 +50,13 @@
   (stop [store] (stop-memory-store store))
 
   store-proto/Store
-  (address [_ type k] (address-memory type k))
-  (read [_ k] (async/go (memory-read storage-atom k {})))
-  (read [_ k opts] (async/go (memory-read storage-atom k opts)))
+  (address [_ type path] (address-memory type path))
+  (read [_ path] (async/go (memory-read storage-atom path {})))
+  (read [_ path opts] (async/go (memory-read storage-atom path opts)))
   (list [_ prefix]  (async/go (filter #(str/starts-with? % prefix) (keys @storage-atom))))
-  (write [_ k data] (async/go (memory-write storage-atom k data {})))
-  (write [_ k data opts] (async/go (memory-write storage-atom k data opts)))
-  (delete [_ k] (async/go (swap! storage-atom dissoc k) :deleted))
+  (write [_ path data] (async/go (memory-write storage-atom path data {})))
+  (write [_ path data opts] (async/go (memory-write storage-atom path data opts)))
+  (delete [_ path] (async/go (swap! storage-atom dissoc path) :deleted))
 
   fluree.db.index/Resolver
   (resolve [store node]

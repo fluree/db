@@ -26,51 +26,48 @@
     ledger-address))
 
 (defn fluree-subscribe
-  [{:keys [subscriptions publisher] :as conn} ledger-address cb {:keys [auth-claims] :as opts}]
-  (if-let [ledger (pub/pull publisher ledger-address)]
+  [{:keys [subscriptions publisher] :as conn} ledger-name cb {:keys [auth-claims] :as opts}]
+  (if-let [ledger (pub/resolve publisher ledger-name)]
     (let [subscription-key (str (random-uuid))]
-      (swap! subscriptions assoc-in [ledger-address subscription-key] {:subscription/opts opts :subscription/cb cb})
+      (swap! subscriptions assoc-in [ledger-name subscription-key] {:subscription/opts opts :subscription/cb cb})
       subscription-key)
     (throw (ex-info "No ledger for ledger-address."
-                    {:error :connection/invalid-subscription :ledger-address ledger-address}))))
+                    {:error :connection/invalid-subscription :ledger-name ledger-name}))))
 
 (defn fluree-unsubscribe
-  [{:keys [subscriptions] :as idxr} ledger-address subscription-key]
-  (swap! subscriptions update ledger-address dissoc subscription-key)
+  [{:keys [subscriptions] :as idxr} ledger-name subscription-key]
+  (swap! subscriptions update ledger-name dissoc subscription-key)
   :unsubscribed)
 
 (defn fluree-broadcast
   "Broadcast the latest block to all subscribers."
-  [{:keys [subscriptions indexer publisher] :as idxr} ledger-address]
-  (let [ledger     (pub/pull publisher ledger-address)
-        db-address (-> ledger (get iri/LedgerHead) (get iri/LedgerEntryDb) (get iri/DbBlockAddress))
+  [{:keys [subscriptions indexer publisher] :as idxr} ledger-name]
+  (let [ledger     (pub/resolve publisher ledger-name)
+        db-address (-> ledger (get iri/LedgerHead) (get iri/LedgerDbHead) (get iri/DbBlockAddress))
         db-block   (idxr/resolve indexer db-address)]
-    (doseq [[subscription-key {:keys [subscription/opts subscription/cb]}] (get @subscriptions ledger-address)]
+    (doseq [[subscription-key {:keys [subscription/opts subscription/cb]}] (get @subscriptions ledger-name)]
       (log/info "Broadcasting from db-address to" subscription-key "with opts " opts ".")
       ;; TODO: filter db-block for cb auth (:authClaims opt)
       (cb db-block opts))))
 
 (defn fluree-transact
-  [conn ledger-address tx opts]
+  [conn ledger-name tx opts]
   (let [{txr :transactor pub :publisher idxr :indexer} conn
 
-        ledger (pub/pull pub ledger-address)
-
-        {ledger-name iri/LedgerName} (get ledger :cred/credential-subject ledger)
-
-        ;; lookup latest db
-        db-address (-> ledger (get iri/LedgerHead) (get iri/LedgerEntryDb) (get iri/DbBlockAddress))
+        ledger (pub/resolve pub ledger-name)
+        ledger (get ledger :cred/credential-subject ledger)
 
         ;; save transaction
         tx-head (txr/transact txr ledger-name tx)
 
-        ;; submit tx for indexing
+        ;; submit tx for indexing on top of latest db
+        db-address (-> ledger (get iri/LedgerHead) (get iri/LedgerDbHead) (get iri/DbBlockAddress))
         db-summary (idxr/stage idxr db-address tx {:tx-id (get tx-head iri/TxSummaryTxId)})
 
         ;; update ledger head
-        new-ledger (pub/push pub ledger-address {:db-summary db-summary :commit-summary tx-head})]
+        new-ledger (pub/publish pub ledger-name {:db-summary db-summary :tx-summary tx-head})]
     ;; broadcast to subscribers
-    (fluree-broadcast conn ledger-address)
+    (fluree-broadcast conn ledger-name)
     ;; return new ledger
     new-ledger))
 
@@ -97,22 +94,21 @@
 (defn fluree-load
   "Load the index and make sure it's up-to-date to ensure it is ready to handle new
   transactions and queries."
-  [conn ledger-address opts]
+  [conn ledger-name opts]
   (let [{txr :transactor pub :publisher idxr :indexer} conn
 
-        ledger (pub/pull pub ledger-address)
+        ledger (pub/resolve pub ledger-name)
 
         _ (when-not ledger
-            (throw (ex-info "No ledger found for ledger-address." {:ledger-address ledger-address})))
+            (throw (ex-info "No ledger found for ledger-name." {:ledger-name ledger-name})))
 
         {head iri/LedgerHead} (get ledger :cred/credential-subject ledger)
 
         {indexed-tx-id iri/DbBlockTxId
          db-address iri/DbBlockAddress} (-> head (get iri/LedgerEntryDb))
 
-
         ;; load the un-indexed txs
-        txs    (load-txs conn (get ledger iri/LedgerName) indexed-tx-id)
+        txs    (load-txs conn ledger-name indexed-tx-id)
         ;; re-stage the unindexed txs in order
         db-summary (reduce (fn [{db-address iri/DbBlockAddress} {:keys [commit/tx]}]
                              (idxr/stage idxr db-address tx))
@@ -122,11 +118,11 @@
     ledger))
 
 (defn fluree-query
-  [conn ledger-address query opts]
-  (let [ledger              (pub/pull (:publisher conn) ledger-address)
+  [conn ledger-name query opts]
+  (let [ledger              (pub/resolve (:publisher conn) ledger-name)
         ledger              (get ledger :cred/credential-subject ledger)
 
-        db-address          (-> ledger (get iri/LedgerHead) (get iri/LedgerEntryDb) (get iri/DbBlockAddress))]
+        db-address          (-> ledger (get iri/LedgerHead) (get iri/LedgerDbHead) (get iri/DbBlockAddress))]
     (idxr/query (:indexer conn) db-address query)))
 
 (defrecord FlureeConnection [id transactor indexer publisher]
@@ -136,14 +132,14 @@
 
   conn-proto/Connection
   (create [conn ledger-name opts] (fluree-create conn ledger-name opts))
-  (load [conn ledger-address opts] (fluree-load conn ledger-address opts))
+  (load [conn ledger-name opts] (fluree-load conn ledger-name opts))
   (list [conn] (pub/list (:publisher conn)))
 
-  (transact [conn ledger-address tx opts] (fluree-transact conn ledger-address tx opts))
-  (query [conn ledger-address query opts] (fluree-query conn ledger-address query opts))
+  (transact [conn ledger-name tx opts] (fluree-transact conn ledger-name tx opts))
+  (query [conn ledger-name query opts] (fluree-query conn ledger-name query opts))
 
-  (subscribe [idxr ledger-address cb opts] (fluree-subscribe idxr ledger-address cb opts))
-  (unsubscribe [idxr ledger-address subscription-key] (fluree-unsubscribe idxr ledger-address subscription-key)))
+  (subscribe [idxr ledger-name cb opts] (fluree-subscribe idxr ledger-name cb opts))
+  (unsubscribe [idxr ledger-name subscription-key] (fluree-unsubscribe idxr ledger-name subscription-key)))
 
 (defn create-fluree-conn
   [{:keys [:conn/id :conn/store-config :conn/did :conn/trust :conn/distrust

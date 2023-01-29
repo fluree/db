@@ -31,7 +31,7 @@
    [iri/type [:enum iri/LedgerEntry]]
    [iri/LedgerEntryCreated :string]
    [iri/LedgerTxHead {:optional true} txr/TxHead]
-   [iri/LedgerEntryDb {:optional true} idxr/DbBlockSummary]])
+   [iri/LedgerDbHead {:optional true} idxr/DbBlockSummary]])
 
 (def Ledger
   [:map

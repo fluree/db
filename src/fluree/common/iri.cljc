@@ -102,4 +102,5 @@
 (def LedgerEntryPrevious (iri "LedgerEntry" "previous"))
 (def LedgerEntryCommit (iri "LedgerEntry" "commit"))
 (def LedgerTxHead (iri "LedgerEntry" "txHead"))
+(def LedgerDbHead (iri "LedgerEntry" "dbHead"))
 (def LedgerEntryDb (iri "LedgerEntry" "db"))

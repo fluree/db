@@ -1,5 +1,5 @@
 (ns fluree.publisher.core
-  (:refer-clojure :exclude [list])
+  (:refer-clojure :exclude [list resolve])
   (:require
    [fluree.common.identity :as ident]
    [fluree.common.iri :as iri]
@@ -11,7 +11,8 @@
    [fluree.publisher.ledger :as ledger]
    [fluree.publisher.model :as pub-model]
    [fluree.publisher.protocols :as pub-proto]
-   [fluree.store.api :as store]))
+   [fluree.store.api :as store]
+   [clojure.string :as str]))
 
 (defn stop-publisher
   [pub]
@@ -19,57 +20,53 @@
   (store/stop (:store pub))
   :stopped)
 
-(defn pull-publisher
-  [pub address]
-  (let [{:keys [address/path]} (ident/address-parts address)]
-    (<?? (store/read (:store pub) path))))
+(defn resolve-ledger
+  [pub ledger-name]
+  (<?? (store/read (:store pub) (ledger/ledger-path ledger-name))))
 
 (defn init-ledger
-  [pub ledger-name {:keys [context tx-address db-address] :as opts}]
-  (let [store  (:store pub)
-        ledger (ledger/create-ledger store ledger-name opts)
-
-        ledger-address (get ledger iri/LedgerAddress)
-        existing?      (pull-publisher pub ledger-address)
+  [{:keys [store] :as pub} ledger-name {:keys [context tx-address db-address] :as opts}]
+  (let [ledger-path (ledger/ledger-path ledger-name)
+        existing?   (resolve-ledger pub ledger-name)
 
         _ (when existing? (throw (ex-info (str "Cannot initialize ledger: " (pr-str ledger-name)
                                                " already exists.")
-                                          {:ledger-name    ledger-name
-                                           :ledger-address ledger-address
-                                           :opts           opts})))
-        final-ledger  (if (:did pub)
-                        ledger
-                        ;; TODO: actually generate
-                        #_(credential/generate ledger (:did pub))
-                        ledger)
+                                          {:ledger-name ledger-name
+                                           :opts        opts})))
 
-        ledger-path (ledger/ledger-path ledger-name)]
+        ledger       (ledger/create-ledger store ledger-name opts)
+        final-ledger (if (:did pub)
+                       ledger
+                       ;; TODO: actually generate
+                       #_(credential/generate ledger (:did pub))
+                       ledger)]
     ;; create the ledger in the store
     (<?? (store/write store ledger-path final-ledger))
-    ledger-address))
+    final-ledger))
 
 (defn list-ledgers
   [{:keys [store] :as pub}]
   (let [ledger-head-paths (<?? (store/list store "ledger/"))]
-    (map (fn [head-path] (<?? (store/read store head-path))) (sort ledger-head-paths))))
+    (map (fn [head-path]
+           ;; manually construct ledger-name from head-path (chop "ledger/" off front)
+           (resolve-ledger pub (subs head-path (count "ledger/"))))
+         (sort ledger-head-paths))))
 
-(defn push-publisher
-  [pub ledger-address {:keys [commit-summary db-summary]}]
+(defn publish-ledger
+  [pub ledger-name {:keys [tx-summary db-summary]}]
   (let [store        (:store pub)
-        prev-ledger  (pull-publisher pub ledger-address)
+        prev-ledger  (resolve-ledger pub ledger-name)
         ;; unwrap ledger from credential if it's wrapped
         prev-ledger  (get prev-ledger :cred/credential-subject prev-ledger)
-        new-head     (ledger/create-ledger-entry prev-ledger commit-summary db-summary)
+        new-head     (ledger/create-ledger-entry prev-ledger tx-summary db-summary)
         ledger       (assoc prev-ledger iri/LedgerHead new-head)
         final-ledger (if (:did pub)
                        ledger
                        ;; TODO: actually generate
                        #_(credential/generate ledger (:did pub))
-                       ledger)
-
-        {ledger-path :address/path} (ident/address-parts ledger-address)]
+                       ledger)]
     ;; mutate the head in store
-    (<?? (store/write store ledger-path final-ledger))
+    (<?? (store/write store (ledger/ledger-path ledger-name) final-ledger))
     final-ledger))
 
 (defrecord Publisher [id store]
@@ -80,8 +77,8 @@
   pub-proto/Publisher
   (init [pub ledger-name opts] (init-ledger pub ledger-name opts))
   (list [pub] (list-ledgers pub))
-  (push [pub ledger-address info] (push-publisher pub ledger-address info))
-  (pull [pub ledger-address] (pull-publisher pub ledger-address)))
+  (publish [pub ledger-name info] (publish-ledger pub ledger-name info))
+  (resolve [pub ledger-name] (resolve-ledger pub ledger-name)))
 
 (defn create-publisher
   [{:keys [:pub/id :pub/did :pub/store-config :pub/store] :as config}]
@@ -110,10 +107,10 @@
   [publisher]
   (pub-proto/list publisher))
 
-(defn push
-  [publisher ledger-address summary]
-  (pub-proto/push publisher ledger-address summary))
+(defn publish
+  [publisher ledger-name summary]
+  (pub-proto/publish publisher ledger-name summary))
 
-(defn pull
-  [publisher address]
-  (pub-proto/pull publisher address))
+(defn resolve
+  [publisher ledger-name]
+  (pub-proto/resolve publisher ledger-name))

@@ -17,10 +17,17 @@
 
 (defn create-address
   "An address reveals how to access the subject it addresses, by answering 1) what type of
-  subject it is (so the resolver can be determined), 2) how to access it (the method),
+  subject it is (so the resolver can be determined), 2) how to access it (the store),
   and 3) where it is (the path)."
-  [class method path]
-  (str "fluree:" (name class) ":" (name method) ":" path))
+  [type store path]
+  (str "fluree:" (name type) ":" (name store) ":" path))
+
+(defn path-parts
+  [path]
+  (let [[ledger-name type id] (str/split path #"/")]
+    {:path/ledger-name ledger-name
+     :path/type type
+     :path/id id}))
 
 (defn address-parts
   [address]

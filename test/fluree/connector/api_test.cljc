@@ -4,7 +4,8 @@
             [fluree.store.api :as store]
             [fluree.connector.model :as conn-model]
             [fluree.db.did :as did]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.common.iri :as iri]))
 
 (deftest connector
   (with-redefs [fluree.common.util/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
@@ -19,79 +20,76 @@
                                                :conn/did          did
                                                :conn/trust        :all
                                                :conn/store-config {:store/method :memory}})
-              ledger-address    (conn/create conn "testconn")
+              ledger-name       "testconn"
+              ledger-init       (conn/create conn ledger-name)
               after-ledger-init @(-> conn :store :storage-atom)
 
               subscription-result (atom [])
               subscription-cb     (fn [block opts] (swap! subscription-result conj [block opts]))
-              subscription-key    (conn/subscribe conn ledger-address subscription-cb {:authClaims {}})
+              subscription-key    (conn/subscribe conn ledger-name subscription-cb {:authClaims {}})
 
-              ledger          (conn/transact conn ledger-address tx)
+              ledger          (conn/transact conn ledger-name tx)
               after-ledger-tx @(-> conn :store :storage-atom)
 
-              query-results (conn/query conn ledger-address {:context context
-                                                             :select  {"?s" [:*]}
-                                                             :where   [["?s" "@id" "ex:dan"]]})
-              everything    (conn/query conn ledger-address {:context context
-                                                             :select  ["?s" "?p" "?o"]
-                                                             :where   [["?s" "?p" "?o"]]})]
+              query-results (conn/query conn ledger-name {:context context
+                                                          :select  {"?s" [:*]}
+                                                          :where   [["?s" "@id" "ex:dan"]]})
+              everything    (conn/query conn ledger-name {:context context
+                                                          :select  ["?s" "?p" "?o"]
+                                                          :where   [["?s" "?p" "?o"]]})]
           (testing "wrote ledger head, commit head, and init commit"
             (is (= "fluree:ledger:memory:ledger/testconn"
-                   ledger-address))
+                   (get ledger-init iri/LedgerAddress)))
             (is (= ["ledger/testconn"
                     "testconn/tx-summary/HEAD"
                     "testconn/tx-summary/init"]
                    (sort (keys after-ledger-init)))))
           (testing "subscription was called"
-            (is (= [[{"https://ns.flur.ee/DbBlock#reindexMin" 100000,
-                      "https://ns.flur.ee/DbBlock#reindexMax" 1000000,
-                      "https://ns.flur.ee/DbBlock#size" 844,
-                      "https://ns.flur.ee/DbBlock#v" 0,
+            (is (= [[{"https://ns.flur.ee/DbBlock#reindexMin" 100000
+                      "https://ns.flur.ee/DbBlock#reindexMax" 1000000
+                      "https://ns.flur.ee/DbBlock#size"       844
+                      "https://ns.flur.ee/DbBlock#v"          0
                       "https://ns.flur.ee/DbBlock#assert"
-                      [{"https://example.com/foo" "bar",
-                        "@id" "https://example.com/dan"}],
+                      [{"https://example.com/foo" "bar"
+                        "@id"                     "https://example.com/dan"}]
                       "https://ns.flur.ee/DbBlock#txId"
-                      "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212",
-                      "https://ns.flur.ee/DbBlock#retract" [],
-                      "@type" "https://ns.flur.ee/DbBlock/",
-                      "https://ns.flur.ee/DbBlock#t" 1}
+                      "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212"
+                      "https://ns.flur.ee/DbBlock#retract"    []
+                      "@type"                                 "https://ns.flur.ee/DbBlock/"
+                      "https://ns.flur.ee/DbBlock#t"          1}
                      {:authClaims {}}]]
                    @subscription-result)))
 
           (testing "added commit and db summaries to ledger"
-            (is (= {"@type"                             "https://ns.flur.ee/Ledger/",
-                    "@id"                               "fluree:ledger:memory:ledger/testconn",
-                    "https://ns.flur.ee/Ledger#name"    "testconn",
-                    "https://ns.flur.ee/Ledger#address"
-                    "fluree:ledger:memory:ledger/testconn",
-                    "https://ns.flur.ee/Ledger#v"       0,
-                    "https://ns.flur.ee/Ledger#context" nil,
+            (is (= {"@type" "https://ns.flur.ee/Ledger/"
+                    "@id" "fluree:ledger:memory:ledger/testconn"
+                    "https://ns.flur.ee/Ledger#name" "testconn"
+                    "https://ns.flur.ee/Ledger#address" "fluree:ledger:memory:ledger/testconn"
+                    "https://ns.flur.ee/Ledger#v" 0
+                    "https://ns.flur.ee/Ledger#context" nil
+
                     "https://ns.flur.ee/Ledger#head"
-                    {"@type" "https://ns.flur.ee/LedgerEntry/",
-                     "https://ns.flur.ee/LedgerEntry#created"
-                     "1970-01-01T00:00:00.00000Z",
-                     "https://ns.flur.ee/LedgerEntry#commit"
-                     {"@type"                                  "https://ns.flur.ee/TxHead/",
-                      "https://ns.flur.ee/TxSummary#txAddress" "",
-                      "https://ns.flur.ee/TxSummary#txId"
-                      "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212",
-                      "https://ns.flur.ee/TxSummary#size"      3,
-                      "https://ns.flur.ee/TxSummary#v"         0,
-                      "https://ns.flur.ee/TxSummary#previous"
-                      "fluree:tx-summary:memory:testconn/tx-summary/init",
-                      "https://ns.flur.ee/TxHead#address"
-                      "fluree:tx-summary:memory:testconn/tx-summary/fef7fac7e4979ca2e917304de3480d384b07c96b1fad1ee91b5d41d3fa514df8"},
-                     "https://ns.flur.ee/LedgerEntry#db"
-                     {"https://ns.flur.ee/DbBlock#reindexMin" 100000,
-                      "https://ns.flur.ee/DbBlock#address"
-                      "fluree:db:memory:testconn/db/263d0466196176ea76604db350408922df88698e42e3c79b283dce70d26114c7",
-                      "https://ns.flur.ee/DbBlock#reindexMax" 1000000,
-                      "https://ns.flur.ee/DbBlock#size"       844,
-                      "https://ns.flur.ee/DbBlock#v"          0,
-                      "https://ns.flur.ee/DbBlock#txId"
-                      "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212",
-                      "@type"                                 "https://ns.flur.ee/DbBlockSummary/",
-                      "https://ns.flur.ee/DbBlock#t"          1}}}
+                    {"@type" "https://ns.flur.ee/LedgerEntry/"
+                     "https://ns.flur.ee/LedgerEntry#created" "1970-01-01T00:00:00.00000Z"
+
+                     "https://ns.flur.ee/LedgerEntry#txHead"
+                     {"@type" "https://ns.flur.ee/TxHead/"
+                      "https://ns.flur.ee/TxSummary#txAddress" ""
+                      "https://ns.flur.ee/TxSummary#txId" "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212"
+                      "https://ns.flur.ee/TxSummary#size" 3
+                      "https://ns.flur.ee/TxSummary#v" 0
+                      "https://ns.flur.ee/TxSummary#previous" "fluree:tx-summary:memory:testconn/tx-summary/init"
+                      "https://ns.flur.ee/TxHead#address" "fluree:tx-summary:memory:testconn/tx-summary/fef7fac7e4979ca2e917304de3480d384b07c96b1fad1ee91b5d41d3fa514df8"}
+
+                     "https://ns.flur.ee/LedgerEntry#dbHead"
+                     {"https://ns.flur.ee/DbBlock#reindexMin" 100000
+                      "https://ns.flur.ee/DbBlock#address" "fluree:db:memory:testconn/db/263d0466196176ea76604db350408922df88698e42e3c79b283dce70d26114c7"
+                      "https://ns.flur.ee/DbBlock#reindexMax" 1000000
+                      "https://ns.flur.ee/DbBlock#size" 844
+                      "https://ns.flur.ee/DbBlock#v" 0
+                      "https://ns.flur.ee/DbBlock#txId" "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212"
+                      "@type" "https://ns.flur.ee/DbBlockSummary/"
+                      "https://ns.flur.ee/DbBlock#t" 1}}}
                    ledger)))
 
           (testing "query results"
@@ -122,18 +120,19 @@
                                                     {:idxr/store-config {:store/method :memory}
                                                      :idxr/did          did
                                                      :idxr/trust        :all}})
-              ledger-address         (conn/create conn "testconn")
+              ledger-name            "testconn"
+              ledger-init            (conn/create conn ledger-name)
               txr-after-ledger-init  @(-> conn :transactor :store :storage-atom)
               pub-after-ledger-init  @(-> conn :publisher :store :storage-atom)
               idxr-after-ledger-init @(-> conn :indexer :store :storage-atom)
-              ledger                 (conn/transact conn ledger-address tx)
+              ledger                 (conn/transact conn ledger-name tx)
               txr-after-ledger-tx    @(-> conn :transactor :store :storage-atom)
               pub-after-ledger-tx    @(-> conn :publisher :store :storage-atom)
               idxr-after-ledger-tx   @(-> conn :indexer :store :storage-atom)
 
-              query-results (conn/query conn ledger-address {:context context
-                                                             :select  {"?s" [:*]}
-                                                             :where   [["?s" "@id" "ex:dan"]]})]
+              query-results (conn/query conn ledger-name {:context context
+                                                          :select  {"?s" [:*]}
+                                                          :where   [["?s" "@id" "ex:dan"]]})]
           (testing "txr init writes nothing"
             (is (= ["testconn/tx-summary/HEAD" "testconn/tx-summary/init"]
                    (sort (keys txr-after-ledger-init)))))
@@ -155,38 +154,34 @@
                    (count pub-after-ledger-tx))))
 
           (testing "transact"
-            (is (= {"@type" "https://ns.flur.ee/Ledger/"
-                    "@id" "fluree:ledger:memory:ledger/testconn"
-                    "https://ns.flur.ee/Ledger#name" "testconn"
-                    "https://ns.flur.ee/Ledger#address"
-                    "fluree:ledger:memory:ledger/testconn"
-                    "https://ns.flur.ee/Ledger#v" 0
-                    "https://ns.flur.ee/Ledger#context" nil
+            (is (= {"@type" "https://ns.flur.ee/Ledger/",
+                    "@id" "fluree:ledger:memory:ledger/testconn",
+                    "https://ns.flur.ee/Ledger#name" "testconn",
+                    "https://ns.flur.ee/Ledger#address" "fluree:ledger:memory:ledger/testconn",
+                    "https://ns.flur.ee/Ledger#v" 0,
+                    "https://ns.flur.ee/Ledger#context" nil,
+
                     "https://ns.flur.ee/Ledger#head"
-                    {"@type" "https://ns.flur.ee/LedgerEntry/"
-                     "https://ns.flur.ee/LedgerEntry#created"
-                     "1970-01-01T00:00:00.00000Z"
-                     "https://ns.flur.ee/LedgerEntry#commit"
-                     {"@type" "https://ns.flur.ee/TxHead/"
-                      "https://ns.flur.ee/TxSummary#txAddress" ""
-                      "https://ns.flur.ee/TxSummary#txId"
-                      "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212"
-                      "https://ns.flur.ee/TxSummary#size" 3
-                      "https://ns.flur.ee/TxSummary#v" 0
-                      "https://ns.flur.ee/TxSummary#previous"
-                      "fluree:tx-summary:memory:testconn/tx-summary/init"
-                      "https://ns.flur.ee/TxHead#address"
-                      "fluree:tx-summary:memory:testconn/tx-summary/fef7fac7e4979ca2e917304de3480d384b07c96b1fad1ee91b5d41d3fa514df8"}
-                     "https://ns.flur.ee/LedgerEntry#db"
-                     {"https://ns.flur.ee/DbBlock#reindexMin" 100000
-                      "https://ns.flur.ee/DbBlock#address"
-                      "fluree:db:memory:testconn/db/263d0466196176ea76604db350408922df88698e42e3c79b283dce70d26114c7"
-                      "https://ns.flur.ee/DbBlock#reindexMax" 1000000
-                      "https://ns.flur.ee/DbBlock#size" 844
-                      "https://ns.flur.ee/DbBlock#v" 0
-                      "https://ns.flur.ee/DbBlock#txId"
-                      "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212"
-                      "@type" "https://ns.flur.ee/DbBlockSummary/"
+                    {"@type" "https://ns.flur.ee/LedgerEntry/",
+                     "https://ns.flur.ee/LedgerEntry#created" "1970-01-01T00:00:00.00000Z",
+
+                     "https://ns.flur.ee/LedgerEntry#txHead"
+                     {"@type" "https://ns.flur.ee/TxHead/",
+                      "https://ns.flur.ee/TxSummary#txAddress" "",
+                      "https://ns.flur.ee/TxSummary#txId" "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212",
+                      "https://ns.flur.ee/TxSummary#size" 3,
+                      "https://ns.flur.ee/TxSummary#v" 0,
+                      "https://ns.flur.ee/TxSummary#previous" "fluree:tx-summary:memory:testconn/tx-summary/init",
+                      "https://ns.flur.ee/TxHead#address" "fluree:tx-summary:memory:testconn/tx-summary/fef7fac7e4979ca2e917304de3480d384b07c96b1fad1ee91b5d41d3fa514df8"},
+
+                     "https://ns.flur.ee/LedgerEntry#dbHead"
+                     {"https://ns.flur.ee/DbBlock#reindexMin" 100000,
+                      "https://ns.flur.ee/DbBlock#address" "fluree:db:memory:testconn/db/263d0466196176ea76604db350408922df88698e42e3c79b283dce70d26114c7",
+                      "https://ns.flur.ee/DbBlock#reindexMax" 1000000,
+                      "https://ns.flur.ee/DbBlock#size" 844,
+                      "https://ns.flur.ee/DbBlock#v" 0,
+                      "https://ns.flur.ee/DbBlock#txId" "feae031efbec78a61d38c2d4bdd6f23ac4e287c95f9c142fc93e1e977675f212",
+                      "@type" "https://ns.flur.ee/DbBlockSummary/",
                       "https://ns.flur.ee/DbBlock#t" 1}}}
                    ledger)))
 

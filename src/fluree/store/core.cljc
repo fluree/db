@@ -27,21 +27,21 @@
   (service-proto/stop store))
 
 (defn write
-  [store k data opts]
-  (store-proto/write store k data opts))
+  [store path data opts]
+  (store-proto/write store path data opts))
 
 (defn read
-  [store k opts]
-  (store-proto/read store k opts))
+  [store path opts]
+  (store-proto/read store path opts))
 
 (defn list
   [store prefix]
   (store-proto/list store prefix))
 
 (defn delete
-  [store k]
-  (store-proto/delete store k))
+  [store path]
+  (store-proto/delete store path))
 
 (defn address
-  [store class k]
-  (store-proto/address store class k))
+  [store class path]
+  (store-proto/address store class path))

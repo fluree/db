@@ -4,7 +4,7 @@
   a given ledger. It also has a Store where it stores the LedgerCreds, verifiable
   credentials wrapping the Ledger, a durable, verifiable record of the commit and index
   updates."
-  (:refer-clojure :exclude [list])
+  (:refer-clojure :exclude [list resolve])
   (:require [fluree.publisher.core :as pub-impl]
             [fluree.publisher.model :as pub-model]))
 
@@ -21,24 +21,23 @@
 (defn init
   "Initialize a ledger with the given name, returns the ledger address."
   #_:clj-kondo/ignore
-  [publisher ledger-name {:keys [context head-address db-address] :as opts}]
+  [publisher ledger-name {:keys [context tx-address db-address] :as opts}]
   (pub-impl/init publisher ledger-name opts))
 
 (defn list
   [publisher]
   (pub-impl/list publisher))
 
-(defn push
+(defn publish
   "Creates a ledger entry and stores it in store under its id. Returns a ledger document
   with links to the head db and the head commit."
-  [publisher ledger-address {:keys [commit-summary db-summary] :as summary}]
-  (pub-impl/push publisher ledger-address summary))
+  [publisher ledger-path {:keys [tx-summary db-summary] :as summary}]
+  (pub-impl/publish publisher ledger-path summary))
 
-(defn pull
-  "If address is an entry-address, returns the corresponding entry. If address is a
-  ledger-address, fetches the latest entry ledger document."
+(defn resolve
+  "Fetch the latest"
   [publisher address]
-  (pub-impl/pull publisher address))
+  (pub-impl/resolve publisher address))
 
 ;; models
 

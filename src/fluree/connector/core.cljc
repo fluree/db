@@ -28,21 +28,21 @@
   (conn-proto/create conn ledger-name opts))
 
 (defn load
-  [conn ledger-address opts]
-  (conn-proto/load conn ledger-address opts))
+  [conn ledger-name opts]
+  (conn-proto/load conn ledger-name opts))
 
 (defn transact
-  [conn ledger-address tx opts]
-  (conn-proto/transact conn ledger-address tx opts))
+  [conn ledger-name tx opts]
+  (conn-proto/transact conn ledger-name tx opts))
 
 (defn query
-  [conn ledger-address query opts]
-  (conn-proto/query conn ledger-address query opts))
+  [conn ledger-name query opts]
+  (conn-proto/query conn ledger-name query opts))
 
 (defn subscribe
-  [conn ledger-address cb opts]
-  (conn-proto/subscribe conn ledger-address cb opts))
+  [conn ledger-name cb opts]
+  (conn-proto/subscribe conn ledger-name cb opts))
 
 (defn unsubscribe
-  [conn ledger-address subscription-key]
-  (conn-proto/unsubscribe conn ledger-address subscription-key))
+  [conn ledger-name subscription-key]
+  (conn-proto/unsubscribe conn ledger-name subscription-key))

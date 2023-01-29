@@ -27,34 +27,34 @@
 
 (defn load
   "Prepare a ledger for transacting and querying."
-  ([conn ledger-address]
-   (conn-impl/load conn ledger-address {}))
-  ([conn ledger-address opts]
-   (conn-impl/load conn ledger-address opts)))
+  ([conn ledger-name]
+   (conn-impl/load conn ledger-name {}))
+  ([conn ledger-name opts]
+   (conn-impl/load conn ledger-name opts)))
 
 (defn transact
   "Transact data into a ledger."
-  ([conn ledger-address tx]
-   (transact conn ledger-address tx {}))
-  ([conn ledger-address tx opts]
-   (conn-impl/transact conn ledger-address tx opts)))
+  ([conn ledger-name tx]
+   (transact conn ledger-name tx {}))
+  ([conn ledger-name tx opts]
+   (conn-impl/transact conn ledger-name tx opts)))
 
 (defn query
   "Query a ledger."
-  ([conn ledger-address query]
-   (conn-impl/query conn ledger-address query {}))
-  ([conn ledger-address query opts]
-   (conn-impl/query conn ledger-address query opts)))
+  ([conn ledger-name query]
+   (conn-impl/query conn ledger-name query {}))
+  ([conn ledger-name query opts]
+   (conn-impl/query conn ledger-name query opts)))
 
 (defn subscribe
   "Register a listener with a ledger to receive new db-blocks and new db-root notifications."
-  [conn ledger-address cb opts]
-  (conn-impl/subscribe conn ledger-address cb opts))
+  [conn ledger-name cb opts]
+  (conn-impl/subscribe conn ledger-name cb opts))
 
 (defn unsubscribe
   "Unregister the listener to stop receiving updates."
-  [conn ledger-address subscription-key]
-  (conn-impl/unsubscribe conn ledger-address subscription-key))
+  [conn ledger-name subscription-key]
+  (conn-impl/unsubscribe conn ledger-name subscription-key))
 
 ;; models
 
