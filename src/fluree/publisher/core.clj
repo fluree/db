@@ -50,7 +50,7 @@
 
 (defn list-ledgers
   [{:keys [store] :as pub}]
-  (let [ledger-head-paths (<?? (store/list store "head/"))]
+  (let [ledger-head-paths (<?? (store/list store "ledger/"))]
     (map (fn [head-path] (<?? (store/read store head-path))) (sort ledger-head-paths))))
 
 (defn push-publisher

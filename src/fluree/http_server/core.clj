@@ -10,31 +10,40 @@
    [reitit.ring.middleware.muuntaja :as muuntaja]
    [reitit.swagger :as swagger]
    [reitit.swagger-ui :as swagger-ui]
-   [ring.adapter.jetty9 :as jetty9]))
+   [ring.adapter.jetty9 :as jetty9]
+   [fluree.db.util.log :as log]))
+
+(defn ws-send!
+  [ws msg]
+  (jetty9/send! ws msg))
 
 (defn websocket-handler
-  [upgrade-request]
-  (let [provided-subprotocols (:websocket-subprotocols upgrade-request)
-        provided-extensions (:websocket-extensions upgrade-request)]
-    {;; provide websocket callbacks
-     :on-connect (fn on-connect [_]
-                   (tap> [:ws :connect]))
-     :on-text (fn on-text [ws text-message]
-                (tap> [:ws :msg text-message])
-                (jetty9/send! ws (str "echo: " text-message)))
-     :on-bytes (fn on-bytes [_ _ _ _]
-                 (tap> [:ws :bytes]))
-     :on-close (fn on-close [_ status-code reason]
-                 (tap> [:ws :close status-code reason]))
-     :on-ping (fn on-ping [ws payload]
-                (tap> [:ws :ping])
-                (jetty9/send! ws payload))
-     :on-pong (fn on-pong [_ _]
-                (tap> [:ws :pong]))
-     :on-error (fn on-error [_ e]
-                 (tap> [:ws :error e]))
-     :subprotocol (first provided-subprotocols)
-     :extensions provided-extensions}))
+  [ws-callbacks]
+  (let [{:keys [on-connect on-text on-bytes on-close on-ping on-pong on-error]} ws-callbacks]
+    (fn [req]
+      (if (jetty9/ws-upgrade-request? req)
+        (jetty9/ws-upgrade-response
+          (fn [upgrade-request]
+            (let [provided-subprotocols (:websocket-subprotocols upgrade-request)
+                  provided-extensions (:websocket-extensions upgrade-request)]
+              {:on-connect (fn on-connect [ws]
+                             (when on-connect (on-connect ws)))
+               :on-text (fn on-text [ws text-message]
+                          (when on-text (on-text ws text-message)))
+               :on-bytes (fn on-bytes [ws bytes offset len]
+                           (when on-bytes (on-bytes ws bytes offset len)))
+               :on-error (fn on-error [ws error]
+                           (when on-error (on-error ws error)))
+               :on-close (fn on-close [ws status-code reason]
+                           (when on-close (on-close ws status-code reason)))
+               :on-ping (fn on-ping [ws bytebuffer]
+                          (when on-ping (on-ping ws bytebuffer)))
+               :on-pong (fn on-pong [ws bytebuffer]
+                          (when on-pong (on-pong ws bytebuffer)))
+               :subprotocol (first provided-subprotocols)
+               :extensions provided-extensions})))
+        {:status 400
+         :body "Invalid websocket upgrade request"}))))
 
 (defn app
   [routes]
@@ -58,13 +67,6 @@
                            coercion/coerce-response-middleware
                            coercion/coerce-request-middleware]}})
     (ring/routes
-      (ring/ring-handler
-        (ring/router
-          [["/ws" {:get (fn [req]
-                          (if (jetty9/ws-upgrade-request? req)
-                            (jetty9/ws-upgrade-response websocket-handler)
-                            {:status 400
-                             :body "Invalid websocket upgrade request"}))}]]))
       (swagger-ui/create-swagger-ui-handler
         {:path "/api-docs"
          :config {:validatorUrl nil
@@ -73,6 +75,7 @@
 
 (defn start
   [config]
+  (log/info "Starting http-server." config)
   (if-let [validation-error (model/explain server-model/HttpServerConfig config)]
     (throw (ex-info "Invalid publisher config." {:errors (model/report validation-error)
                                                  :config config}))

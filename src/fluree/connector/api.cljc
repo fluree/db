@@ -13,6 +13,11 @@
   [conn]
   (conn-impl/close conn))
 
+(defn list
+  "List ledgers on this connection."
+  [conn]
+  (conn-impl/list conn))
+
 (defn create
   "Create a ledger and return its address."
   ([conn ledger-name]
@@ -26,11 +31,6 @@
    (conn-impl/load conn ledger-address {}))
   ([conn ledger-address opts]
    (conn-impl/load conn ledger-address opts)))
-
-(defn list
-  "List ledgers on this connection."
-  [conn]
-  (conn-impl/list conn))
 
 (defn transact
   "Transact data into a ledger."

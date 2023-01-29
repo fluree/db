@@ -7,7 +7,7 @@
 
 (defn ledger-path
   [ledger-name]
-  (str "head/" ledger-name))
+  (str "ledger/" ledger-name))
 
 (defn create-ledger-address
   [store ledger-name]

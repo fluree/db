@@ -19,6 +19,10 @@
   [conn]
   (service-proto/stop conn))
 
+(defn list
+  [conn]
+  (conn-proto/list conn))
+
 (defn create
   [conn ledger-name opts]
   (conn-proto/create conn ledger-name opts))
@@ -34,10 +38,6 @@
 (defn query
   [conn ledger-address query opts]
   (conn-proto/query conn ledger-address query opts))
-
-(defn list
-  [conn]
-  (conn-proto/list conn))
 
 (defn subscribe
   [conn ledger-address cb opts]

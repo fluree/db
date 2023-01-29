@@ -36,9 +36,9 @@
                                                              :select  ["?s" "?p" "?o"]
                                                              :where   [["?s" "?p" "?o"]]})]
           (testing "wrote ledger head, commit head, and init commit"
-            (is (= "fluree:ledger:memory:head/testconn"
+            (is (= "fluree:ledger:memory:ledger/testconn"
                    ledger-address))
-            (is (= ["head/testconn"
+            (is (= ["ledger/testconn"
                     "testconn/tx-summary/HEAD"
                     "testconn/tx-summary/init"]
                    (sort (keys after-ledger-init)))))
@@ -60,10 +60,10 @@
 
           (testing "added commit and db summaries to ledger"
             (is (= {"@type"                             "https://ns.flur.ee/Ledger/",
-                    "@id"                               "fluree:ledger:memory:head/testconn",
+                    "@id"                               "fluree:ledger:memory:ledger/testconn",
                     "https://ns.flur.ee/Ledger#name"    "testconn",
                     "https://ns.flur.ee/Ledger#address"
-                    "fluree:ledger:memory:head/testconn",
+                    "fluree:ledger:memory:ledger/testconn",
                     "https://ns.flur.ee/Ledger#v"       0,
                     "https://ns.flur.ee/Ledger#context" nil,
                     "https://ns.flur.ee/Ledger#head"
@@ -138,7 +138,7 @@
             (is (= ["testconn/tx-summary/HEAD" "testconn/tx-summary/init"]
                    (sort (keys txr-after-ledger-init)))))
           (testing "pub init sets head"
-            (is (= ["head/testconn"]
+            (is (= ["ledger/testconn"]
                    (sort (keys pub-after-ledger-init)))))
 
           (testing "db is initialized after conn create"
@@ -156,10 +156,10 @@
 
           (testing "transact"
             (is (= {"@type" "https://ns.flur.ee/Ledger/"
-                    "@id" "fluree:ledger:memory:head/testconn"
+                    "@id" "fluree:ledger:memory:ledger/testconn"
                     "https://ns.flur.ee/Ledger#name" "testconn"
                     "https://ns.flur.ee/Ledger#address"
-                    "fluree:ledger:memory:head/testconn"
+                    "fluree:ledger:memory:ledger/testconn"
                     "https://ns.flur.ee/Ledger#v" 0
                     "https://ns.flur.ee/Ledger#context" nil
                     "https://ns.flur.ee/Ledger#head"

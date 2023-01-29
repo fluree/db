@@ -42,25 +42,25 @@
           ledger2        (pub/push pub ledger-address {:commit-summary commit-summary
                                                        :db-summary     db-summary})]
       (testing "init"
-        (is (= "fluree:ledger:memory:head/testpub1"
+        (is (= "fluree:ledger:memory:ledger/testpub1"
                ledger-address))
         (is (= {:ledger-name    "testpub1",
-                :ledger-address "fluree:ledger:memory:head/testpub1",
+                :ledger-address "fluree:ledger:memory:ledger/testpub1",
                 :opts           opts}
                dup-ledger-err)))
 
       (testing "list"
-        (is (= ["fluree:ledger:memory:head/testpub1"
-                "fluree:ledger:memory:head/testpub2"
-                "fluree:ledger:memory:head/testpub3"]
+        (is (= ["fluree:ledger:memory:ledger/testpub1"
+                "fluree:ledger:memory:ledger/testpub2"
+                "fluree:ledger:memory:ledger/testpub3"]
                (map #(get % iri/LedgerAddress) (pub/list pub)))))
 
       (testing "pull"
         (is (= {"@type"                             "https://ns.flur.ee/Ledger/",
-                "@id"                               "fluree:ledger:memory:head/testpub1",
+                "@id"                               "fluree:ledger:memory:ledger/testpub1",
                 "https://ns.flur.ee/Ledger#name"    "testpub1",
                 "https://ns.flur.ee/Ledger#address"
-                "fluree:ledger:memory:head/testpub1",
+                "fluree:ledger:memory:ledger/testpub1",
                 "https://ns.flur.ee/Ledger#v"       0,
                 "https://ns.flur.ee/Ledger#context" {"foo" "foo:bar"},
                 "https://ns.flur.ee/Ledger#head"
