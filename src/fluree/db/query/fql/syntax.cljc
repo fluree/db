@@ -61,14 +61,24 @@
      ::parseJSON boolean?
      ::parse-json ::parseJSON
      ::js? boolean?
-     ::opts [:map
+     ::sources any? ; TODO: Refine the validations for `sources`, `meta`,
+                    ; `issuer`, and `fuel` after we separate user and system
+                    ; options
+     ::meta any?
+     ::issuer any?
+     ::fuel any?
+     ::opts [:map {:closed true}
              [:maxFuel {:optional true} ::maxFuel]
              [:max-fuel {:optional true} ::maxFuel]
              [:parseJSON {:optional true} ::parseJSON]
              [:parse-json {:optional true} ::parse-json]
              [:prettyPrint {:optional true} ::prettyPrint]
              [:pretty-print {:optional true} ::pretty-print]
-             [:js {:optional true} ::js?]]
+             [:js {:optional true} ::js?]
+             [:sources {:optional true} ::sources]
+             [:meta {:optional true} ::meta]
+             [:issuer {:optional true} ::issuer]
+             [:fuel {:optional true} ::fuel]]
      ::function [:orn
                  [:string [:fn fn-string?]]
                  [:list [:fn fn-list?]]]
