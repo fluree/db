@@ -39,9 +39,9 @@
 (defn subj-perm-filter-fn
   "Returns a specific filtering function which takes all subject flakes and
   returns the flakes allowed, or nil if none are allowed."
-  [{:keys [permissions] :as db}]
-  (let [pred-permissions?  (contains? permissions :predicate)
-        coll-permissions   (:collection permissions)
+  [{:keys [policy] :as db}]
+  (let [pred-permissions?  (contains? policy :predicate)
+        coll-permissions   (:collection policy)
         filter-cache       (atom {})
         default-deny?      (if (true? (:default coll-permissions))
                              false

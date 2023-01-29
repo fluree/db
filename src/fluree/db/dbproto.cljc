@@ -1,7 +1,7 @@
 (ns fluree.db.dbproto)
 
 (defprotocol IFlureeDb
-  (-latest-db [db] "Updates a db to the most current version of the db known to this server. Maintains existing permissions")
+  (-latest-db [db] "Updates a db to the most current version of the db known to this server. Maintains existing policy.")
   (-rootdb [db] "Returns root db version of this db.")
   (-forward-time-travel [db flakes] [db tt-id flakes])
   ;; schema-related

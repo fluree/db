@@ -106,3 +106,18 @@
   [ledger data]
   (->> @(fluree/stage (fluree/db ledger) data)
        (fluree/commit! ledger)))
+
+(defn retry-load
+  "Retry loading a ledger until max-attempts. Hopefully not needed once JSON-LD
+  code has an equivalent to :syncTo"
+  [conn ledger-alias max-attempts]
+  (loop [attempt 0]
+    (let [ledger (try
+                   @(fluree/load conn ledger-alias)
+                   (catch Exception e
+                     (when (= (inc attempt) max-attempts)
+                       (throw e)
+                       (Thread/sleep 100))))]
+      (if ledger
+        ledger
+        (recur (inc attempt))))))

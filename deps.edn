@@ -60,9 +60,11 @@
 
   :cljtest
   {:extra-paths ["test" "dev-resources"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.71.1119"}
-                 org.clojure/test.check {:mvn/version "1.1.1"}}
-   :main-opts   ["-m" "kaocha.runner"]}
+   :extra-deps  {lambdaisland/kaocha         {:mvn/version "1.71.1119"}
+                 org.clojure/test.check      {:mvn/version "1.1.1"}
+                 com.magnars/test-with-files {:mvn/version "2021-02-17"}}
+   :exec-fn     kaocha.runner/exec-fn
+   :exec-args   {}}
 
   :js-deps
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
