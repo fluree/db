@@ -77,7 +77,7 @@
 
 
 (defn- get-sources
-  [conn network auth prefixes]
+  [conn auth prefixes]
   (reduce-kv (fn [acc key val]
                (when-not (re-matches #"[a-z]+" (util/keyword->str key))
                  (throw (ex-info (str "Source name must be only lowercase letters. Provided: " (util/keyword->str key))
@@ -270,111 +270,94 @@
   Returns core async channel containing result."
   [sources query]
   (go-try
-    (let [{query :subject issuer :issuer} (or (<? (cred/verify query))
-                                              {:subject query})
-          {:keys [prefixes opts t]} query
-          db            (if (async-util/channel? sources) ;; only support 1 source currently
-                          (<? sources)
-                          sources)
-          db*           (-> (if t
-                              (<? (time-travel/as-of db t))
-                              db)
-                            (assoc-in [:policy :cache] (atom {})))
-          source-opts   (if prefixes
-                          (get-sources (:conn db*) (:network db*) (:auth-id db*) prefixes)
-                          {})
+   (let [{query :subject, issuer :issuer}
+         (or (<? (cred/verify query))
+             {:subject query})
+
+         {:keys [opts t]} query
+         db               (if (async-util/channel? sources) ;; only support 1 source currently
+                            (<? sources)
+                            sources)
+         db*              (-> (if t
+                                (<? (time-travel/as-of db t))
+                                db)
+                              (assoc-in [:policy :cache] (atom {})))
           meta?         (:meta opts)
-          fuel          (when (or (:fuel opts) meta?) (volatile! 0)) ;; only measure fuel if fuel budget provided, or :meta true
-          opts*         (assoc opts :sources source-opts
-                               :max-fuel (or (:fuel opts) 1000000)
-                               :fuel fuel
-                               :issuer issuer)
+          opts*         (assoc opts :issuer issuer)
           start         #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
-          result        (<? (fql/query db* (assoc query :opts opts*)))]
+         result        (<? (fql/query db* (assoc query :opts opts*)))]
       (if meta?
         {:status 200
          :result result
-         :fuel   @fuel
-         :time   (util/response-time-formatted start)
-         :block  (:block db*)}
+         :time   (util/response-time-formatted start)}
         result))))
-
 
 (defn multi-query-async
   "Performs multiple queries in a map, with the key being the alias for the query
-  and the value being the query itself - standard, history, and block queries are all supported.
-  Each query result will be in a response map with its respective alias as the key.
+  and the value being the query itself. Each query result will be in a response
+  map with its respective alias as the key.
 
-  If a :block is specified at the top level, it will be used as a default for all queries
-
-  If any errors occur, an :errors key will be present with a map of each alias to its error
-  information. Check for the presence of this key if detection of an error is important.
+  If any errors occur, an :errors key will be present with a map of each alias
+  to its error information. Check for the presence of this key if detection of
+  an error is important.
 
   An optional :opts key contains options, which for now is limited to:
    - meta: true or false - If false, will just report out the result as a map.
-           If true will roll up all status and fuel consumption. Response map will contain keys:
+           If true will roll up all status. Response map will contain keys:
            - status - aggregate status (200 all good, 207 some good, or 400+ for differing errors
-           - fuel   - aggregate fuel for all queries
            - result - query result
            - errors - map of query alias to their respective error"
   [source flureeQL]
-  (async/go
-    (try*
-      (let [global-block       (:block flureeQL)            ;; use as default for queries
-            global-meta?       (get-in flureeQL [:opts :meta]) ;; if true, need to collect meta for each query to total up
-            ;; update individual queries for :meta and :block if not otherwise specified
-            queries            (reduce-kv
-                                 (fn [acc alias query]
-                                   ;; block globally to all sub-queries unless already specified
-                                   (let [query-meta?  (get-in query [:opts :meta])
-                                         meta?        (or global-meta? query-meta?)
-                                         remove-meta? (and meta? (not query-meta?)) ;; query didn't ask for meta, but multiquery did so must strip it
+  (go-try
+   (let [global-meta?       (get-in flureeQL [:opts :meta]) ;; if true, need to collect meta for each query to total up
+         ;; update individual queries for :meta and :block if not otherwise specified
+         queries            (reduce-kv
+                             (fn [acc alias query]
+                               ;; block globally to all sub-queries unless already specified
+                               (let [query-meta?  (get-in query [:opts :meta])
+                                     meta?        (or global-meta? query-meta?)
+                                     remove-meta? (and meta? (not query-meta?)) ;; query didn't ask for meta, but multiquery did so must strip it
 
-                                         opts*        (assoc (:opts query) :meta meta?
-                                                                           :_remove-meta? remove-meta?)
-                                         query*       (assoc query :opts opts*
-                                                                   :block (or (:block query) global-block))]
-                                     (assoc acc alias query*)))
-                                 {} (dissoc flureeQL :opts :block))
-            start-time #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
-            ;; kick off all queries in parallel, each alias now mapped to core async channel
-            pending-resp       (map (fn [[alias q]] [alias (query source q)]) queries)]
-        (loop [[[alias port] & r] pending-resp
-               status-global nil                            ;; overall status.
-               fuel-global   0
-               response      {}]
-          (if (nil? port)                                   ;; done?
-            (if global-meta?
-              {:result response
-               :fuel   fuel-global
-               :status status-global
-               :time   (util/response-time-formatted start-time)}
-              response)
-            (let [{:keys [meta _remove-meta?]} (get-in queries [alias :opts])
-                  res            (async/<! port)
-                  error?         (:error res)               ;; if error key is present in response, it is an error
-                  status-global* (when meta
-                                   (let [status (:status res)]
-                                     (cond
-                                       (nil? status-global)
-                                       status
+                                     opts*        (assoc (:opts query) :meta meta?
+                                                         :-remove-meta? remove-meta?)
+                                     query*       (assoc query :opts opts*)]
+                                 (assoc acc alias query*)))
+                             {} (dissoc flureeQL :opts))
+         start-time #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
+         ;; kick off all queries in parallel, each alias now mapped to core async channel
+         pending-resp       (map (fn [[alias q]] [alias (query source q)]) queries)]
+     (loop [[[alias port] & r] pending-resp
+            status-global nil                            ;; overall status.
+            response      {}]
+       (if (nil? port)                                   ;; done?
+         (if global-meta?
+           {:result response
+            :status status-global
+            :time   (util/response-time-formatted start-time)}
+           response)
+         (let [{:keys [meta -remove-meta?]} (get-in queries [alias :opts])
+               res            (async/<! port)
+               error?         (:error res)               ;; if error key is present in response, it is an error
+               status-global* (when meta
+                                (let [status (:status res)]
+                                  (cond
+                                    (nil? status-global)
+                                    status
 
-                                       (= status-global status)
-                                       status
+                                    (= status-global status)
+                                    status
 
-                                       ;; any 200 response with any other is a 207
-                                       (or (= 200 status) (= 200 status-global) (= 207 status-global))
-                                       207
+                                    ;; any 200 response with any other is a 207
+                                    (or (= 200 status) (= 200 status-global) (= 207 status-global))
+                                    207
 
-                                       ;; else take the max status
-                                       :else
-                                       (max status status-global))))
-                  fuel*          (when meta (+ fuel-global (get res :fuel 0)))
-                  response*      (if error?
-                                   (assoc-in response [:errors alias] res)
-                                   (assoc response alias (if _remove-meta?
-                                                           (:result res)
-                                                           res)))]
-              (recur r status-global* fuel* response*)))))
-      (catch* e e))))
+                                    ;; else take the max status
+                                    :else
+                                    (max status status-global))))
+               response*      (if error?
+                                (assoc-in response [:errors alias] res)
+                                (assoc response alias (if -remove-meta?
+                                                        (:result res)
+                                                        res)))]
+           (recur r status-global* response*)))))))
