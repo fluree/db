@@ -25,3 +25,30 @@
                 ["Cam" ["cam@example.org" "cam@example.org"] [34 34] [5 10]]]
                subject)
             "returns grouped results")))))
+
+(deftest ^:integration multi-query-test
+  (let [conn   (test-utils/create-conn)
+        people (test-utils/load-people conn)
+        db     (fluree/db people)]
+    (testing "multi queries"
+      (let [q '{"alice" {:select {?s [:*]}
+                         :where  [[?s :schema/email "alice@example.org"]]}
+                "brian" {:select {?s [:*]}
+                         :where  [[?s :schema/email "brian@example.org"]]}}
+            subject @(fluree/multi-query db q)]
+        (is (= {"alice"
+                [{:id "http://example.org/ns/alice",
+                  :rdf/type ["http://example.org/ns/User"],
+                  :schema/name "Alice",
+                  :schema/email "alice@example.org",
+                  :schema/age 50,
+                  "http://example.org/ns/favNums" [9 42 76]}],
+                "brian"
+                [{:id "http://example.org/ns/brian",
+                  :rdf/type ["http://example.org/ns/User"],
+                  :schema/name "Brian",
+                  :schema/email "brian@example.org",
+                  :schema/age 50,
+                  "http://example.org/ns/favNums" 7}]}
+               subject)
+            "returns all results in a map keyed by alias.")))))
