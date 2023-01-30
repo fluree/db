@@ -265,10 +265,9 @@
   [source flureeQL]
   (go-try
    (let [global-meta?       (get-in flureeQL [:opts :meta]) ;; if true, need to collect meta for each query to total up
-         ;; update individual queries for :meta and :block if not otherwise specified
+         ;; update individual queries for :meta if not otherwise specified
          queries            (reduce-kv
                              (fn [acc alias query]
-                               ;; block globally to all sub-queries unless already specified
                                (let [query-meta?  (get-in query [:opts :meta])
                                      meta?        (or global-meta? query-meta?)
                                      remove-meta? (and meta? (not query-meta?)) ;; query didn't ask for meta, but multiquery did so must strip it
