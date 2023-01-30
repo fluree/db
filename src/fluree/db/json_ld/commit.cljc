@@ -278,49 +278,54 @@
           next-sid (fn [] (vswap! last-sid inc))
 
           {:keys [message tag time id data previous issuer]} commit
-          {db-id :id, db-address :address, db-t :t}          data
+          {db-id :id, db-address :address, db-t :t :keys [size flakes]} data
 
           t             (- db-t)
           commit-sid    (next-sid)
+          db-sid        (next-sid)
 
-          base-flakes   [(flake/create t const/$iri db-id const/$xsd:string t true nil)
-                         ;; TODO - add @type: DB into default data flakes?
-                         ;; link db to associated commit meta
+          base-flakes   [ ;; link db to associated commit meta
                          (flake/create t const/$_commit:idRef commit-sid const/$xsd:anyURI t true nil)
-                         ;; commit flakes below
+
+                         ;; commit flakes
+                         ;; @id
                          (flake/create commit-sid const/$iri id const/$xsd:string t true nil)
-                         (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:dateTime t true nil)]
-          tag-flakes     (when tag
-                           (loop [[tag & r] (util/sequential tag)
-                                  flakes []]
-                             (if tag
-                               (if-let [existing-tag-sid (<? (dbproto/-subid db tag))]
-                                 (recur r (conj flakes (flake/create commit-sid const/$_commit:tag existing-tag-sid const/$xsd:anyURI t true nil)))
-                                 (let [new-tag-sid (next-sid)]
-                                   (recur r (conj flakes
-                                                  (flake/create new-tag-sid const/$iri tag const/$xsd:string t true nil)
-                                                  (flake/create t const/$_commit:tag new-tag-sid const/$xsd:anyURI t true nil)))))
-                               flakes)))
-          issuer-flakes (when-let [issuer-iri (:id issuer)]
-                          (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
-                            ;; create reference to existing issuer
-                            [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true nil)]
-                            ;; create new issuer flake and a reference to it
-                            (let [new-issuer-sid (next-sid)]
-                              [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t true nil)
-                               (flake/create new-issuer-sid const/$iri issuer-iri const/$xsd:string t true nil)])))
+                         ;; @type
+                         ;; (flake/create commit-sid const/$rdf:type const/iri-Commit const/$xsd:anyURI t true nil)
+                         ;; v
+                         (flake/create commit-sid const/$_commit:v 0 const/$xsd:int t true nil)
+                         ;; time
+                         (flake/create commit-sid const/$_commit:time (util/str->epoch-ms time) const/$xsd:dateTime t true nil)
+                         ;; data
+                         (flake/create commit-sid const/$_commit:data db-sid const/$xsd:anyURI t true nil)
 
-
-          db-flakes (when db-address
-                      (let [db-address-sid (next-sid)]
-                        [(flake/create t const/$_commit:dbId db-address-sid const/$xsd:anyURI t true nil)
-                         (flake/create db-address-sid const/$iri db-address const/$xsd:string t true nil)]))
-
-          message-flakes (when message [(flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil)])
+                         ;; db flakes
+                         ;; @id
+                         (flake/create db-sid const/$iri db-id const/$xsd:string t true nil)
+                         ;; @type
+                         ;; (flake/create db-sid const/$rdf:type const/iri-DB const/$xsd:anyURI t true nil)
+                         ;; t
+                         (flake/create db-sid const/$_commitdata:t db-t const/$xsd:anyURI t true nil)
+                         ;; address
+                         (flake/create db-sid const/$_commitdata:address db-address const/$xsd:string t true nil)
+                         ;; size
+                         (flake/create db-sid const/$_commitdata:size size const/$xsd:int t true nil)
+                         ;; flakes
+                         (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true nil)
+                         ]
+          issuer-flakes  (when-let [issuer-iri (:id issuer)]
+                           (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
+                             ;; create reference to existing issuer
+                             [(flake/create commit-sid const/$_commit:signer issuer-sid const/$xsd:anyURI t true nil)]
+                             ;; create new issuer flake and a reference to it
+                             (let [new-issuer-sid (next-sid)]
+                               [(flake/create commit-sid const/$_commit:signer new-issuer-sid const/$xsd:anyURI t true nil)
+                                (flake/create new-issuer-sid const/$iri issuer-iri const/$xsd:string t true nil)])))
+          message-flakes (when message
+                           [(flake/create commit-sid const/$_commit:message message const/$xsd:string t true nil)])
 
           flakes (cond-> base-flakes
                    issuer-flakes  (into issuer-flakes)
-                   db-flakes      (into db-flakes)
                    message-flakes (into message-flakes))]
       [@last-sid flakes])))
 

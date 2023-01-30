@@ -14,6 +14,20 @@
 (def ^:const iri-DB "https://ns.flur.ee/ledger#DB")
 (def ^:const iri-data "https://ns.flur.ee/ledger#data")
 (def ^:const iri-t "https://ns.flur.ee/ledger#t")
+
+(def ^:const iri-commit-address "https://ns.flur.ee/commit#address")
+(def ^:const iri-commit-data "https://ns.flur.ee/commit#data")
+(def ^:const iri-commit-time "https://ns.flur.ee/commit#time")
+(def ^:const iri-commit-message "https://ns.flur.ee/commit#message")
+(def ^:const iri-commit-v "https://ns.flur.ee/commit#v")
+
+(def ^:const iri-commitdata-assert "https://ns.flur.ee/commitdata#assert")
+(def ^:const iri-commitdata-retract "https://ns.flur.ee/commitdata#retract")
+(def ^:const iri-commitdata-flakes "https://ns.flur.ee/commitdata#flakes")
+(def ^:const iri-commitdata-size "https://ns.flur.ee/commitdata#size")
+(def ^:const iri-commitdata-t "https://ns.flur.ee/commitdata#t")
+(def ^:const iri-commitdata-v "https://ns.flur.ee/commitdata#v")
+
 (def ^:const iri-address "https://ns.flur.ee/ledger#address")
 (def ^:const iri-v "https://ns.flur.ee/ledger#v")
 (def ^:const iri-flakes "https://ns.flur.ee/ledger#flakes")
