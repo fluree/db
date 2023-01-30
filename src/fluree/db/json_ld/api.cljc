@@ -267,6 +267,12 @@
   (let [res-chan (query-api/query db query)]
     (promise-wrap res-chan)))
 
+(defn multi-query
+  [db multi-query]
+  (-> db
+      (query-api/multi-query-async multi-query)
+      promise-wrap))
+
 (defn history
   "Return the history of the specified subject in the given time range. Optionally return
   history of multiple subjects according to flake pattern matching."
