@@ -67,7 +67,7 @@
      ::meta any?
      ::issuer any?
      ::fuel any?
-     ::opts [:map {:closed true}
+     ::opts [:map
              [:maxFuel {:optional true} ::maxFuel]
              [:max-fuel {:optional true} ::maxFuel]
              [:parseJSON {:optional true} ::parseJSON]

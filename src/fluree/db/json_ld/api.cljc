@@ -270,7 +270,7 @@
 (defn multi-query
   [db multi-query]
   (-> db
-      (query-api/multi-query-async multi-query)
+      (query-api/multi-query multi-query)
       promise-wrap))
 
 (defn history

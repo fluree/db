@@ -247,7 +247,7 @@
          :time   (util/response-time-formatted start)}
         result))))
 
-(defn multi-query-async
+(defn multi-query
   "Performs multiple queries in a map, with the key being the alias for the query
   and the value being the query itself. Each query result will be in a response
   map with its respective alias as the key.
