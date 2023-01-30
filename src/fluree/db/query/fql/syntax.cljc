@@ -167,7 +167,7 @@
                                         [:where ::where]
                                         [:vars {:optional true} ::vars]]
      ::context [:map-of :any :any]
-     ::analytical-query [:map {:closed true}
+     ::analytical-query [:map
                          [:where ::where]
                          [:t {:optional true} ::t]
                          [:context {:optional true} ::context]
