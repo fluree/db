@@ -193,14 +193,14 @@
               "_predicate" {:name "_predicate" :id 0 :sid nil}
               11           {:name "_default" :id 11 :sid nil}
               "_default"   {:name "_default" :id 11 :sid nil}}
-        pred (map-pred-id+iri [{:iri  "@id"
+        pred (map-pred-id+iri [{:iri const/iri-id
                                 :idx? true
                                 :id   0}
-                               {:iri  "@type"
+                               {:iri  const/iri-type
                                 :ref? true
                                 :idx? true
                                 :id   200}
-                               {:iri  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                               {:iri   const/iri-rdf-type
                                 :ref? true
                                 :idx? true
                                 :id   200}])]

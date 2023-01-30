@@ -7,7 +7,8 @@
             [fluree.db.dbproto :as db-proto]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.flake :as flake]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.json-ld.vocab :as vocab]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -168,4 +169,5 @@
         (update-in [:novelty :tspo] into base-flakes)
         (update-in [:novelty :size] + size)
         (update-in [:stats :size] + size)
-        (update-in [:stats :flakes] + (count base-flakes)))))
+        (update-in [:stats :flakes] + (count base-flakes))
+        (vocab/update-with t (-> blank-db :schema :refs) base-flakes))))
