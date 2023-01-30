@@ -120,4 +120,29 @@
                _            @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded       (test-utils/retry-load conn ledger-alias 100)]
-           (is (= (:t db) (:t (fluree/db loaded)))))))))
+           (is (= (:t db) (:t (fluree/db loaded)))))))
+
+     (testing "can load a file ledger with its own context"
+       (with-tmp-dir storage-path
+         (let [conn-context {:id "@id", :type "@type"}
+               ledger-context {:ex "http://example.com/"
+                               :schema "http://schema.org/"}
+               conn @(fluree/connect
+                       {:method :file :storage-path storage-path
+                        :defaults {:context conn-context}})
+               ledger-alias "load-from-file-with-context"
+               ledger @(fluree/create conn ledger-alias
+                                      {:context ledger-context})
+               db @(fluree/stage
+                     (fluree/db ledger)
+                     [{:id :ex/wes
+                       :type :ex/User
+                       :schema/name "Wes"
+                       :schema/email "wes@example.org"
+                       :schema/age 42
+                       :schema/favNums [1 2 3]}])
+               db @(fluree/commit! ledger db)
+               loaded (test-utils/retry-load conn ledger-alias 100)]
+           (is (= (:t db) (:t (fluree/db loaded))))
+           (is (= (merge conn-context ledger-context) (:context loaded))))))))
+
