@@ -75,52 +75,6 @@
      ;; return promise chan immediately
      pc)))
 
-
-(defn- get-sources
-  [conn auth prefixes]
-  (reduce-kv (fn [acc key val]
-               (when-not (re-matches #"[a-z]+" (util/keyword->str key))
-                 (throw (ex-info (str "Source name must be only lowercase letters. Provided: " (util/keyword->str key))
-                                 {:status 400
-                                  :error  :db/invalid-query})))
-               (let [db-ident? (db-ident? val)]
-                 (if db-ident?
-                   (let [ledger (isolate-ledger-id val)
-                         opts   (if auth {:auth auth} {})
-                         db     (db conn ledger opts)]
-                     (assoc acc val db))
-                   acc))) {} prefixes))
-
-
-(defn resolve-block-range
-  [db query-map]
-  (go-try
-    (let [range     (if (sequential? (:block query-map))
-                      (:block query-map)
-                      [(:block query-map) (:block query-map)])
-          [block-start block-end]
-          (if (some string? range)                          ;; do we need to convert any times to block integers?
-            [(<? (time-travel/block-to-int-format db (first range)))
-             (when-let [end (second range)]
-               (<? (time-travel/block-to-int-format db end)))] range)
-          db-block  (:block db)
-          _         (when (> block-start db-block)
-                      (throw (ex-info (str "Start block is out of range for this ledger. Start block provided: " (pr-str block-start) ". Database block: " (pr-str db-block)) {:status 400 :error :db/invalid-query})))
-          [block-start block-end]
-          (cond
-            (and block-start block-end) [block-start block-end]
-            block-start [block-start (:block db)]
-            :else (throw (ex-info (str "Invalid block range provided: " (pr-str range)) {:status 400 :error :db/invalid-query})))
-          _         (when (not (and (pos-int? block-start) (pos-int? block-end)))
-                      (throw (ex-info (str "Invalid block range provided: " (pr-str range)) {:status 400 :error :db/invalid-query})))
-          [block-start block-end]
-          (if (< block-end block-start)
-            [block-end block-start]                         ;; make sure smallest number comes first
-            [block-start block-end])
-          block-end (if (> block-end db-block)
-                      db-block block-end)]
-      [block-start block-end])))
-
 (defn t-flakes->json-ld
   [db compact cache fuel error-ch t-flakes]
   (async/go
