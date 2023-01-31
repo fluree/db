@@ -35,7 +35,6 @@
         ssc-q1-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
                                                       :where  [["?s" :schema/name "Alice"]]}
                                                      db)
-
         ssc-q2-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
                                                       :where  [["?s" :schema/age 50]
                                                                ["?s" :ex/favColor "Blue"]]}
@@ -57,7 +56,10 @@
         vars-query-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
                                                           :where  [["?s" :schema/name '?name]]
                                                           :vars {'?name "Alice"}}
-                                                         db)]
+                                                         db)
+        s+p+o-parsed (parse/parse-analytical-query {:select {"?s" [:*]}
+                                                    :where  [["?s" "?p" "?o"]]}
+                                                   db)]
     (testing "simple-subject-crawl?"
       (is (= true
              (reparse/simple-subject-crawl? ssc-q1-parsed)))
@@ -65,7 +67,8 @@
              (reparse/simple-subject-crawl? ssc-q2-parsed)))
       (is (not (reparse/simple-subject-crawl? vars-query-parsed)))
       (is (not (reparse/simple-subject-crawl? not-ssc-parsed)))
-      (is (not (reparse/simple-subject-crawl? order-group-parsed))))
+      (is (not (reparse/simple-subject-crawl? order-group-parsed)))
+      (is (not (reparse/simple-subject-crawl? s+p+o-parsed))))
     (testing "reparse"
       (let [ssc-q1-reparsed (reparse/re-parse-as-simple-subj-crawl ssc-q1-parsed)
             {:keys [where context]} ssc-q1-reparsed
