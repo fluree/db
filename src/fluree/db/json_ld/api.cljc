@@ -264,8 +264,14 @@
 
 (defn query
   [db query]
-  (let [res-chan (query-api/query-async db query)]
+  (let [res-chan (query-api/query db query)]
     (promise-wrap res-chan)))
+
+(defn multi-query
+  [db multi-query]
+  (-> db
+      (query-api/multi-query multi-query)
+      promise-wrap))
 
 (defn history
   "Return the history of the specified subject in the given time range. Optionally return

@@ -1,5 +1,5 @@
 (ns fluree.db.query.fql
-  (:require [clojure.core.async :as async :refer [<! >! go]]
+  (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
@@ -32,7 +32,8 @@
 (defn cache?
   "Returns true if query was requested to run from the cache."
   [{:keys [opts] :as _query-map}]
-  #?(:clj (:cache opts) :cljs false))
+  #?(:clj (:cache opts)
+     :cljs false))
 
 (defn query
   "Returns core async channel with results or exception"
