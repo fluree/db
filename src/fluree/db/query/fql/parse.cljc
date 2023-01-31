@@ -1,10 +1,8 @@
 (ns fluree.db.query.fql.parse
-  (:require [fluree.db.query.exec :as exec]
-            [fluree.db.query.exec.where :as where]
+  (:require [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
-            [fluree.db.query.subject-crawl.legacy :refer [basic-to-analytical-transpiler]]
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.string :as str]
@@ -15,13 +13,10 @@
             [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            #?(:cljs [cljs.reader :refer [read-string]])))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn basic-query?
-  [q]
-  (contains? q :from))
 
 (defn parse-context
   [q db]
@@ -66,19 +61,17 @@
   [x]
   (map? x))
 
-(def read-str #?(:clj read-string :cljs cljs.reader/read-string))
-
 (defn safe-read
   [code-str]
   (try*
-    (let [code (read-str code-str)]
+    (let [code (read-string code-str)]
       (when-not (list? code)
         (throw (ex-info (code-str "Invalid function: " code-str)
                         {:status 400 :error :db/invalid-query})))
       code)
     (catch* e
-            (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
-            (throw (ex-info (code-str "Invalid query function: " code-str)
+            (log/warn e "Invalid query function attempted: " code-str)
+            (throw (ex-info (str "Invalid query function: " code-str)
                             {:status 400 :error :db/invalid-query})))))
 
 (defn variables
@@ -244,13 +237,13 @@
                     {:status 400 :error :db/invalid-query}))))
 
 (defn parse-object-pattern
-  [o-pat context]
+  [o-pat]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
       (where/->value o-pat)))
 
 (defmulti parse-pattern
-  (fn [pattern vars db context]
+  (fn [pattern _vars _db _context]
     (if (map? pattern)
       (->> pattern keys first)
       :triple)))
@@ -299,7 +292,7 @@
                     (json-ld/expand-iri context)
                     where/->value)]
           (where/->pattern :iri [s p o]))
-        (let [o (parse-object-pattern o-pat context)]
+        (let [o (parse-object-pattern o-pat)]
           [s p o])))))
 
 (defmethod parse-pattern :triple
@@ -386,9 +379,8 @@
                          [v :asc]
                          [v :desc])))))))
 
-(defn parse-analytical-query
+(defn parse-analytical-query*
   [q db]
-  (syntax/validate q)
   (let [context  (parse-context q db)
         vars     (parse-vars q)
         where    (parse-where q vars db context)
@@ -402,18 +394,16 @@
                 ordering (assoc :order-by ordering))
         (parse-select db context))))
 
-(defn parse-basic-query
+(defn parse-analytical-query
   [q db]
-  (let [q (basic-to-analytical-transpiler db q)]
-    (parse-analytical-query q db)))
+  (let [parsed (parse-analytical-query* q db)]
+    (or (re-parse-as-simple-subj-crawl parsed)
+        parsed)))
 
 (defn parse
   [q db]
-  (if (basic-query? q)
-    (parse-basic-query q db)
-    (let [parsed (parse-analytical-query q db)]
-      (or (re-parse-as-simple-subj-crawl parsed)
-          parsed))))
+  (syntax/validate q)
+  (parse-analytical-query q db))
 
 (defn parse-delete
   [q db]

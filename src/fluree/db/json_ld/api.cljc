@@ -18,7 +18,7 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn- promise-wrap
+(defn promise-wrap
   "Wraps an async channel that will contain a response in a promise."
   [port]
   #?(:clj
@@ -264,7 +264,7 @@
 
 (defn query
   [db query]
-  (let [res-chan (query-api/query-async db query)]
+  (let [res-chan (query-api/query db query)]
     (promise-wrap res-chan)))
 
 (defn commit-details
@@ -272,6 +272,12 @@
   (let [latest-db (ledger-proto/-db ledger)
         res-chan (query-api/commit-details latest-db query)]
     (promise-wrap res-chan)))
+
+(defn multi-query
+  [db multi-query]
+  (-> db
+      (query-api/multi-query multi-query)
+      promise-wrap))
 
 (defn history
   "Return the history of the specified subject in the given time range. Optionally return

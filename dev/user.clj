@@ -1,5 +1,6 @@
 (ns user
-  (:require [clojure.tools.namespace.repl :as tn :refer [refresh refresh-all]]
+  (:require [fluree.db.json-ld.api :as fluree]
+            [clojure.tools.namespace.repl :as tn :refer [refresh refresh-all]]
             [clojure.core.async :as async]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]

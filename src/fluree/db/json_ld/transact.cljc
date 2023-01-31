@@ -2,14 +2,12 @@
   (:require [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [clojure.string :as str]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.reify :as jld-reify]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util :refer [try* catch* vswap!]]
-            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.datatype :as datatype]
@@ -17,8 +15,7 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec.where :as where]
-            [clojure.core.async :as async :refer [>!]]
-            [fluree.db.dbproto :as dbproto]
+            [clojure.core.async :as async]
             [fluree.db.json-ld.credential :as cred])
   (:refer-clojure :exclude [vswap!]))
 
@@ -243,7 +240,6 @@
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
-     :new?          (zero? db-t)
      :block         block
      :last-pid      last-pid
      :last-sid      last-sid
@@ -436,16 +432,14 @@
       (assoc staged-map :db-after db-after))))
 
 (defn stage-flakes
-  [json-ld {:keys [new? t] :as tx-state}]
+  [flakeset tx-state nodes]
   (go-try
-    (let [ss (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                     new? (into (base-flakes t)))]
-      (loop [[node & r] (util/sequential json-ld)
-             flakes* ss]
-        (if node
-          (let [[node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
-            (recur r (into flakes* node-flakes)))
-          flakes*)))))
+   (loop [[node & r] nodes
+          flakes*    flakeset]
+     (if node
+       (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
+         (recur r (into flakes* node-flakes)))
+       flakes*))))
 
 (defn validate-rules
   [{:keys [db-after add]} {:keys [subj-mods] :as _tx-state}]
@@ -469,15 +463,22 @@
               (vocab/reset-shapes (:schema db-after)))
             db-after))))))
 
+(defn init-db?
+  [db]
+  (-> db :t zero?))
+
 (defn insert
   "Performs insert transaction"
-  [{:keys [schema issuer] :as db} json-ld opts]
+  [{:keys [schema t] :as db} json-ld opts]
   (go-try
     (let [default-ctx (if (:js? opts) (:context-str schema) (:context schema))
           tx-state    (->tx-state db opts)
-          db*         (-> json-ld
+          nodes       (-> json-ld
                           (json-ld/expand default-ctx)
-                          (stage-flakes tx-state)
+                          util/sequential)
+          flakeset    (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
+                        (init-db? db) (into (base-flakes t)))
+          db*         (-> (stage-flakes flakeset tx-state nodes)
                           <?
                           (final-db tx-state)
                           <?

@@ -1,6 +1,5 @@
 (ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
-            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.util.schema :as schema-util]
@@ -9,9 +8,9 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <!] :as async])
+            [fluree.db.util.async :refer [<? go-try]]
+            #?(:clj  [clojure.core.async :refer [go] :as async]
+               :cljs [cljs.core.async :refer [go] :as async])
             [clojure.string :as str]
             [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.vocab :as vocab]
@@ -23,6 +22,12 @@
   #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(def root-policy-map
+  "Base policy (permissions) map that will give access to all flakes."
+  {:f/view   {:root? true}
+   :f/modify {:root? true}})
+
 
 (defn validate-ledger-name
   "Returns when ledger name is valid.
@@ -325,13 +330,13 @@
 
 ;; ================ GraphDB record support fns ================================
 
-(defn- graphdb-latest-db [{:keys [current-db-fn permissions]}]
+(defn- graphdb-latest-db [{:keys [current-db-fn policy]}]
   (go-try
     (let [current-db (<? (current-db-fn))]
-      (assoc current-db :permissions permissions))))
+      (assoc current-db :policy policy))))
 
 (defn- graphdb-root-db [this]
-  (assoc this :permissions {:root?      true}))
+  (assoc this :policy root-policy-map))
 
 (defn- graphdb-c-prop [{:keys [schema]} property collection]
   ;; collection properties TODO-deprecate :id property below in favor of :partition
@@ -419,7 +424,7 @@
 (defrecord JsonLdDb [ledger conn method alias branch commit block t tt-id stats
                      spot psot post opst tspo
                      schema comparators novelty
-                     permissions ecount]
+                     policy ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
@@ -461,14 +466,14 @@
        (-write w "#FlureeJsonLdDb ")
        (-write w (pr {:method      (:method db) :alias (:alias db) :block (:block db)
                       :t           (:t db) :stats (:stats db)
-                      :permissions (:permissions db)})))))
+                      :policy      (:policy db)})))))
 
 #?(:clj
    (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
      (.write w (str "#FlureeJsonLdDb "))
      (binding [*out* w]
        (pr {:method (:method db) :alias (:alias db) :block (:block db)
-            :t      (:t db) :stats (:stats db) :permissions (:permissions db)}))))
+            :t      (:t db) :stats (:stats db) :policy (:policy db)}))))
 
 (defn new-novelty-map
   [comparators]
@@ -495,10 +500,6 @@
 (defn create
   [{:keys [method alias conn] :as ledger}]
   (let [novelty     (new-novelty-map index/default-comparators)
-        permissions {:collection {:all? false}
-                     :predicate  {:all? true}
-                     :root?      true}
-
         {spot-cmp :spot
          psot-cmp :psot
          post-cmp :post
@@ -531,10 +532,5 @@
                     :schema      schema
                     :comparators index/default-comparators
                     :novelty     novelty
-                    :permissions permissions
+                    :policy      root-policy-map
                     :ecount      genesis-ecount})))
-
-
-(defn json-ld-db?
-  [db]
-  (instance? JsonLdDb db))

@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -195,22 +196,26 @@
               "_default"   {:name "_default" :id 11 :sid nil}}
         pred (map-pred-id+iri [{:iri const/iri-id
                                 :idx? true
-                                :id   0}
-                               {:iri  const/iri-type
+                                :id   const/$iri}
+                               {:iri  "@type"
                                 :ref? true
                                 :idx? true
-                                :id   200}
-                               {:iri   const/iri-rdf-type
+                                :id   const/$rdf:type}
+                               {:iri  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                                 :ref? true
                                 :idx? true
-                                :id   200}])]
+                                :id   const/$rdf:type}
+                               {:iri "http://www.w3.org/2000/01/rdf-schema#Class"
+                                :ref? true
+                                :idx? true
+                                :id   const/$rdfs:Class}])]
     {:t           0
      :refs        #{}
      :coll        coll
      :pred        pred
      :context     nil
      :context-str nil
-     :shapes (atom {:class {}
+     :shapes (atom {:class {} ; TODO: Does this need to be an atom?
                     :pred {}})
      :prefix      {}
      :fullText    #{}
@@ -233,7 +238,7 @@
   [{:keys [t] :as db}]
   (go-try
     (let [vocab-flakes (<? (query-range/index-range db :spot
-                                                    >= [(flake/max-subject-id const/$_collection)]
+                                                    >= [schema-util/schema-sid-end]
                                                     <= [0]))
           base-schema  (base-schema)
           schema       (update-with* base-schema t vocab-flakes)

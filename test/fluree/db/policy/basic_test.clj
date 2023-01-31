@@ -45,17 +45,17 @@
                        db
                        ;; add policy targeting :ex/rootRole that can view and modify everything
                        [{:id           :ex/rootPolicy,
-                         :type         [:f/Policy],
-                         :f/targetNode :f/allNodes
+                         :type         [:f/Policy],         ;; must be of type :f/Policy, else it won't be treated as a policy
+                         :f/targetNode :f/allNodes          ;; :f/allNodes special keyword meaning every node (everything)
                          :f/allow      [{:id           :ex/rootAccessAllow
-                                         :f/targetRole :ex/rootRole ;; keyword for a global role
+                                         :f/targetRole :ex/rootRole ;; our name for global / root role
                                          :f/action     [:f/view :f/modify]}]}
                         ;; add a policy targeting :ex/userRole that can see all users, but only SSN if belonging to themselves
                         {:id            :ex/UserPolicy,
                          :type          [:f/Policy],
                          :f/targetClass :ex/User
                          :f/allow       [{:id           :ex/globalViewAllow
-                                          :f/targetRole :ex/userRole ;; keyword for a global role
+                                          :f/targetRole :ex/userRole ;; our assigned name for standard user's role (given to Alice above)
                                           :f/action     [:f/view]}]
                          :f/property    [{:f/path  :schema/ssn
                                           :f/allow [{:id           :ex/ssnViewRule
@@ -68,9 +68,7 @@
                                                     :f/role      :ex/userRole})]
 
       ;; root can see all user data
-      (is (= @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
-                                     :where  [['?s :rdf/type :ex/User]]})
-             [{:id               :ex/john,
+      (is (= [{:id               :ex/john,
                :rdf/type         [:ex/User],
                :schema/name      "John",
                :schema/email     "john@flur.ee",
@@ -84,28 +82,28 @@
                :schema/ssn       "111-11-1111",
                :ex/location      {:id         "_:f211106232532993",
                                   :ex/state   "NC",
-                                  :ex/country "USA"}}])
+                                  :ex/country "USA"}}]
+             @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
+                                     :where  [['?s :rdf/type :ex/User]]}))
           "Both user records + all attributes should show")
 
       ;; root can see all product data
-      (is (= @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
-                                     :where  [['?s :rdf/type :ex/Product]]})
-             [{:id                   :ex/widget,
+      (is (= [{:id                   :ex/widget,
                :rdf/type             [:ex/Product],
                :schema/name          "Widget",
                :schema/price         99.99,
-               :schema/priceCurrency "USD"}])
+               :schema/priceCurrency "USD"}]
+             @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
+                                     :where  [['?s :rdf/type :ex/Product]]}))
           "The product record should show with all attributes")
 
       ;; Alice cannot see product data as it was not explicitly allowed
-      (is (= @(fluree/query alice-db {:select {'?s [:*]}
-                                      :where  [['?s :rdf/type :ex/Product]]})
-             []))
+      (is (= []
+             @(fluree/query alice-db {:select {'?s [:*]}
+                                      :where  [['?s :rdf/type :ex/Product]]})))
 
       ;; Alice can see all users, but can only see SSN for herself, and can't see the nested location
-      (is (= @(fluree/query alice-db {:select {'?s [:* {:ex/location [:*]}]}
-                                      :where  [['?s :rdf/type :ex/User]]})
-             [{:id               :ex/john,
+      (is (= [{:id               :ex/john,
                :rdf/type         [:ex/User],
                :schema/name      "John",
                :schema/email     "john@flur.ee",
@@ -115,5 +113,15 @@
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
-               :schema/ssn       "111-11-1111"}])
-          "Both users should show, but only SSN for Alice"))))
+               :schema/ssn       "111-11-1111"}]
+             @(fluree/query alice-db {:select {'?s [:* {:ex/location [:*]}]}
+                                      :where  [['?s :rdf/type :ex/User]]}))
+          "Both users should show, but only SSN for Alice")
+
+      ;; Alice can only see her allowed data in a non-graph-crawl query too
+      (is (= [["John" nil] ["Alice" "111-11-1111"]]
+             @(fluree/query alice-db {:select '[?name ?ssn]
+                                      :where  '[[?p :schema/name ?name]
+                                                {:optional [?p :schema/ssn ?ssn]}]}))
+          "Both user names should show, but only SSN for Alice"))))
+

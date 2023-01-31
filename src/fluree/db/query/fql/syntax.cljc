@@ -151,40 +151,44 @@
                            [:where-map ::where-map]
                            [:tuple ::where-tuple]]]
      ::vars [:map-of ::var :any]
-     ::from [:orn
-             [:subj ::subject]
-             [:coll [:sequential [:fn sid?]]]]
-     ::basic-query [:map
-                    [:from ::from]]
+     ::t [:or :int :string]
      ::delete ::triple     ::delete-op [:map
                                         [:delete ::delete]
                                         [:where ::where]
                                         [:vars {:optional true} ::vars]]
      ::context [:map-of :any :any]
-     ::analytical-query
-     [:map
-      [:where ::where]
-      [:context {:optional true} ::context]
-      [:select {:optional true} ::select]
-      [:selectOne {:optional true} ::selectOne]
-      [:select-one {:optional true} ::select-one]
-      [:orderBy {:optional true} ::orderBy]
-      [:order-by {:optional true} ::order-by]
-      [:groupBy {:optional true} ::groupBy]
-      [:group-by {:optional true} ::group-by]
-      [:filter {:optional true} ::filter]
-      [:vars {:optional true} ::vars]
-      [:limit {:optional true} ::limit]
-      [:offset {:optional true} ::offset]
-      [:maxFuel {:optional true} ::maxFuel]
-      [:max-fuel {:optional true} ::max-fuel]
-      [:depth {:optional true} ::depth]
-      [:opts {:optional true} ::opts]
-      [:prettyPrint {:optional true} ::prettyPrint]
-      [:pretty-print {:optional true} ::pretty-print]]}))
+     ::analytical-query [:map
+                         [:where ::where]
+                         [:t {:optional true} ::t]
+                         [:context {:optional true} ::context]
+                         [:select {:optional true} ::select]
+                         [:selectOne {:optional true} ::selectOne]
+                         [:select-one {:optional true} ::select-one]
+                         [:delete {:optional true} ::delete]
+                         [:orderBy {:optional true} ::orderBy]
+                         [:order-by {:optional true} ::order-by]
+                         [:groupBy {:optional true} ::groupBy]
+                         [:group-by {:optional true} ::group-by]
+                         [:filter {:optional true} ::filter]
+                         [:vars {:optional true} ::vars]
+                         [:limit {:optional true} ::limit]
+                         [:offset {:optional true} ::offset]
+                         [:maxFuel {:optional true} ::maxFuel]
+                         [:max-fuel {:optional true} ::max-fuel]
+                         [:depth {:optional true} ::depth]
+                         [:opts {:optional true} ::opts]
+                         [:prettyPrint {:optional true} ::prettyPrint]
+                         [:pretty-print {:optional true} ::pretty-print]]
+     ::multi-query [:map-of :string ::analytical-query]
+     ::query [:orn
+              [:single ::analytical-query]
+              [:multi ::multi-query]]}))
 
 (def query-validator
-  (m/validator ::analytical-query {:registry registry}))
+  (m/validator ::query {:registry registry}))
+
+(def multi-query?
+  (m/validator ::multi-query {:registry registry}))
 
 (defn validate
   [qry]
