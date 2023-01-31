@@ -4,130 +4,77 @@
             [fluree.http-server.api :as http-server]
             [clojure.java.io :as io]
             [clojure.walk :as walk]
+            [fluree.fluree-server.fluree :as fluree-api]
+            [fluree.fluree-server.transactor :as transactor-api]
             [fluree.db.util.log :as log]
             [fluree.transactor.api :as txr]
             [fluree.indexer.api :as idxr]
-            [fluree.publisher.api :as pub])
+            [fluree.publisher.api :as pub]
+            [org.httpkit.client :as http])
   (:gen-class))
 
-(defn transaction-server-api
-  [txr]
-  ["/transactor"
-   ["/commit" {:post {:summary "Commit a transaction."
-                      :parameters {:body [:map
-                                          [:tx [:map-of :string :any]]
-                                          [:tx-info [:map
-                                                     [:ledger-name :string]
-                                                     [:commit-t :int]
-                                                     [:commit-prev :string]]]
-                                          [:opts {:optional true} [:map-of :string :any]]]}
-                      :handler (fn [{{{:keys [tx tx-info] :as params} :body} :parameters}]
-                                 (println "commiting" (pr-str params))
-                                 (let [res (txr/commit txr tx tx-info)]
-                                   {:status 200 :body res}))}}]
-   ["/resolve" {:post {:summary "Retrieve a commit."
-                       :parameters {:body [:map
-                                           [:commit-address :string]]}
-                       :handler (fn [{{{:keys [commit-address] :as params} :body} :parameters}]
-                                  (println "resolving" (pr-str params))
-                                  (let [res (txr/resolve txr commit-address)]
-                                    {:status 200 :body res}))}}]])
+(def fluree-server-config
+  {:conn/mode :fluree
+   :conn/did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
+              :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
+              :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}
+   :conn/trust :all
+   :conn/store-config {:store/method :file
+                       :file-store/storage-path "dev/data/fluree"
+                       :file-store/serialize-to :edn}})
 
-(defn name-server-api
-  [pub]
-  ["/ledger"
-   ["/list" {:get {:summary "List all ledgers tracked by name server."
-                   :handler (fn []
-                               (println "listing")
-                               (let [res (pub/list pub)]
-                                 {:status 200 :body res}))}}]
-   ["/push" {:post {:summary "Publish a new ledger head."
-                    :parameters {:body [:map
-                                        [:ledger-address :string]
-                                        [:summary
-                                         [:map
-                                          [:commit-summary {:optional true} txr/CommitSummary]
-                                          [:db-summary {:optional true} idxr/DbSummary]]]]}
-                    :handler (fn [{{{:keys [ledger-address summary] :as params} :body} :parameters}]
-                               (println "pushing" (pr-str params))
-                               (let [res (pub/push pub ledger-address summary)]
-                                 {:status 200 :body res}))}}]
-   ["/pull" {:post {:summary "Retrieve ledger summary."
-                    :parameters {:body [:map
-                                        [:ledger-address :string]]}
-                    :handler (fn [{{{:keys [ledger-address] :as params} :body} :parameters}]
-                               (println "pushing" (pr-str params))
-                               (let [res (pub/pull pub ledger-address)]
-                                 {:status 200 :body res}))}}]])
+(def query-server-config
+  {:conn/mode :query
+   :conn/did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
+              :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
+              :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}
+   :conn/trust :all
+   :conn/store-config {:store/method :file
+                       :file-store/storage-path "dev/data/query"
+                       :file-store/serialize-to :edn}})
 
-(defn indexing-server-api
-  [idxr]
-  ["/index"
-   ["/init" {:post {:summary "Create a new ledger index."
-                     :parameters {:body [:map
-                                         [:ledger-name :string]
-                                         [:opts {:optional true}
-                                          [:map
-                                           [:reindex-min-bytes {:optional true} :int]
-                                           [:reindex-max-bytes {:optional true} :int]]]]}
-                     :handler (fn [{{{:keys [ledger-name opts] :as params} :body} :parameters}]
-                                (println "pushing" (pr-str params))
-                                (let [res (idxr/init ledger-name opts)]
-                                  {:status 200 :body res}))}}]
-   ["/load" {:post {:summary "Load an existing ledger index."
-                     :parameters {:body [:map
-                                         [:db-address :string]
-                                         [:opts {:optional true}
-                                          [:map
-                                           [:reindex-min-bytes {:optional true} :int]
-                                           [:reindex-max-bytes {:optional true} :int]]]]}
-                     :handler (fn [{{{:keys [db-address opts] :as params} :body} :parameters}]
-                                (println "pushing" (pr-str params))
-                                (let [res (idxr/load db-address opts)]
-                                  {:status 200 :body res}))}}]
-   ["/stage" {:post {:summary "Index some data."
-                     :parameters {:body [:map
-                                         [:db-address :string]
-                                         [:data [:map-of :string :any]]]}
-                     :handler (fn [{{{:keys [db-address data] :as params} :body} :parameters}]
-                                (println "pushing" (pr-str params))
-                                (let [res (idxr/stage db-address data)]
-                                  {:status 200 :body res}))}}]
-   ["/query" {:post {:summary "Query an index."
-                     :parameters {:body [:map
-                                         [:db-address :string]
-                                         [:query [:map-of :string :any]]]}
-                     :handler (fn [{{{:keys [db-address query] :as params} :body} :parameters}]
-                                (println "pushing" (pr-str params))
-                                (let [res (idxr/query db-address query)]
-                                  {:status 200 :body res}))}}]])
+(def transaction-server-config
+  {:conn/mode :transactor
+   :txr/did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
+             :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
+             :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}
+   :txr/trust :all
+   :txr/store-config {:store/method :file
+                      :file-store/storage-path "dev/data/txr"
+                      :file-store/serialize-to :edn}})
 
+(def name-server-config
+  {:conn/mode :publisher
+   :pub/did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
+             :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
+             :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}
+   :pub/trust :all
+   :pub/store-config {:store/method :file
+                      :file-store/storage-path "dev/data/pub"
+                      :file-store/serialize-to :edn}})
 
-(defn initialize-fluree-server
-  "Load all ledgers."
-  [conn config]
-  (log/info "Initializing fluree-server." {:config config})
-  (doseq [ledger (conn/list conn)]
-    (conn/load conn (:ledger/address ledger))))
+(def indexer-server-config
+  {:conn/mode :indexer
+   :idxr/did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
+              :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
+              :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}
+   :idxr/trust :all
+   :idxr/store-config {:store/method :file
+                       :file-store/storage-path "dev/data/idxr"
+                       :file-store/serialize-to :edn}})
+
+(defn start-api
+  [config])
 
 (def system
   {::ds/defs
    {:config {:fluree/http-server {:port 58090}
              :fluree/connection
-             {:conn/mode :fluree
-              :conn/did {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
-                         :public "030be728546a7fe37bb527749e19515bd178ba8a5485ebd1c37cdf093cf2c247ca",
-                         :private "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"}
-              :conn/trust :all
-              :conn/store-config {:store/method :file
-                                  :file-store/storage-path "dev/data"
-                                  :file-store/serialize-to :edn}}}
+             {}}
     :services
     {:http-server #::ds{:start (fn [{{:keys [port conn]} ::ds/config}]
-                                 (initialize-fluree-server conn {})
-                                 (log/info "Starting fluree-server http-server." {:port port})
                                  (http-server/start {:http/port port
-                                                     :http/routes (fluree-api/fluree-server-api-routes conn)}))
+                                                     :http/routes (fluree-api/start-fluree-server)}))
                         :stop (fn [{http-server ::ds/instance}]
                                 (http-server/stop http-server))
                         :config {:port (ds/ref [:config :fluree/http-server :port])

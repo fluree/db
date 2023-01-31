@@ -10,7 +10,7 @@
 
 (defn stop-fluree-conn
   [{:keys [transactor indexer publisher] :as conn}]
-  (log/info "Stopping Connection " (service-proto/id conn) ".")
+  (log/info "Stopping FlureeConnection " (service-proto/id conn) ".")
   (when transactor (service-proto/stop transactor))
   (when indexer (service-proto/stop indexer))
   (when publisher (service-proto/stop publisher))
