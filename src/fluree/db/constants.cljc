@@ -82,13 +82,31 @@
 ;; predicate id constants
 
 ;;TODO commit address?
+
+
 (def ^:const $_commit:dbId 51)                                ;; JSON-LD: turning into data/db id
-(def ^:const $_block:prevHash 52)
-(def ^:const $_commit:idRef 53)                        
-(def ^:const $_commit:message 54)                     
+(def ^:const $_commit:prevHash 52)
+(def ^:const $_commit:idRef 53)
+(def ^:const $_commit:message 54)
 (def ^:const $_commit:time 55)
-(def ^:const $_commit:tag 56)                        
-(def ^:const $_commit:signer 57)                    
+(def ^:const $_commit:tag 56)
+(def ^:const $_commit:signer 57)
+(def ^:const $_commit:v 58)
+(def ^:const $_commit:address 59)
+(def ^:const $_commit:data 160)
+
+(def ^:const $_ledger:alias 170)
+(def ^:const $_ledger:branch 171)
+
+(def ^:const $_commitdata:address 180)
+(def ^:const $_commitdata:flakes 182)
+(def ^:const $_commitdata:size 183)
+(def ^:const $_commitdata:t 184)
+(def ^:const $_commitdata:v 185)
+
+
+
+
 
 
 
