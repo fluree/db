@@ -27,6 +27,7 @@
 (def ^:const iri-commitdata-size "https://ns.flur.ee/commitdata#size")
 (def ^:const iri-commitdata-t "https://ns.flur.ee/commitdata#t")
 (def ^:const iri-commitdata-v "https://ns.flur.ee/commitdata#v")
+(def ^:const iri-commitdata-address "https://ns.flur.ee/commitdata#address")
 
 (def ^:const iri-address "https://ns.flur.ee/ledger#address")
 (def ^:const iri-v "https://ns.flur.ee/ledger#v")

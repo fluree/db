@@ -68,11 +68,24 @@
                 [:ex/alice :schema/name "Alice"]
                 [:ex/alice :schema/email "alice@flur.ee"]
                 [:ex/alice :schema/age 42]
-                ["fluree:memory://cdfbc32cddc850f1766742d08f20e52bc1d587e7f2b6384c1703f2e8b0c8971b" :id "fluree:memory://cdfbc32cddc850f1766742d08f20e52bc1d587e7f2b6384c1703f2e8b0c8971b"]
-                ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k" :id "fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"]
-                ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k" :f/time 720000]
-                ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k" "https://www.w3.org/2018/credentials#issuer" "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
+                 :id
+                 "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                ["fluree:db:sha256:bbfcuiy4ja4gmeti55i6nyubvvpocjw4q6mztopxxnykc5w24odem"
+                 :id
+                 "fluree:db:sha256:bbfcuiy4ja4gmeti55i6nyubvvpocjw4q6mztopxxnykc5w24odem"]
+                ["fluree:db:sha256:bbfcuiy4ja4gmeti55i6nyubvvpocjw4q6mztopxxnykc5w24odem"
+                 "https://ns.flur.ee/commitdata#address"
+                 "fluree:memory://dc2f3160e6ddcf3d271c6873c0a72a2a35519743f7c69a58c07238241561601a"]
+                ["fluree:db:sha256:bbfcuiy4ja4gmeti55i6nyubvvpocjw4q6mztopxxnykc5w24odem"
+                 "https://ns.flur.ee/commitdata#flakes"
+                 62]
+                ["fluree:db:sha256:bbfcuiy4ja4gmeti55i6nyubvvpocjw4q6mztopxxnykc5w24odem"
+                 "https://ns.flur.ee/commitdata#size"
+                 5450]
+                ["fluree:db:sha256:bbfcuiy4ja4gmeti55i6nyubvvpocjw4q6mztopxxnykc5w24odem"
+                 "https://ns.flur.ee/commitdata#t"
+                 1]
                 [:schema/age :id "http://schema.org/age"]
                 [:schema/email :id "http://schema.org/email"]
                 [:schema/name :id "http://schema.org/name"]
@@ -83,22 +96,80 @@
                 [:f/context :id "https://ns.flur.ee/ledger#context"]
                 [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
                 [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
+                ["https://ns.flur.ee/commitdata#v"
+                 :id
+                 "https://ns.flur.ee/commitdata#v"]
+                ["https://ns.flur.ee/commitdata#v" :rdf/type :id]
+                ["https://ns.flur.ee/commitdata#t"
+                 :id
+                 "https://ns.flur.ee/commitdata#t"]
+                ["https://ns.flur.ee/commitdata#t" :rdf/type :id]
+                ["https://ns.flur.ee/commitdata#size"
+                 :id
+                 "https://ns.flur.ee/commitdata#size"]
+                ["https://ns.flur.ee/commitdata#size" :rdf/type :id]
+                ["https://ns.flur.ee/commitdata#flakes"
+                 :id
+                 "https://ns.flur.ee/commitdata#flakes"]
+                ["https://ns.flur.ee/commitdata#flakes" :rdf/type :id]
+                ["https://ns.flur.ee/commitdata#address"
+                 :id
+                 "https://ns.flur.ee/commitdata#address"]
+                ["https://ns.flur.ee/commitdata#address" :rdf/type :id]
+                [:f/branch :id "https://ns.flur.ee/ledger#branch"]
+                [:f/branch :rdf/type :id]
+                [:f/alias :id "https://ns.flur.ee/ledger#alias"]
+                [:f/alias :rdf/type :id]
+                ["https://ns.flur.ee/commit#data"
+                 :id
+                 "https://ns.flur.ee/commit#data"]
+                ["https://ns.flur.ee/commit#data" :rdf/type :id]
                 ["fluree-default-context" :id "fluree-default-context"]
                 ["fluree-default-context" :rdf/type :f/Context]
-                ["fluree-default-context" :f/context "{\"schema\":\"http://schema.org/\",\"wiki\":\"https://www.wikidata.org/wiki/\",\"xsd\":\"http://www.w3.org/2001/XMLSchema#\",\"type\":\"@type\",\"rdfs\":\"http://www.w3.org/2000/01/rdf-schema#\",\"ex\":\"http://example.org/ns/\",\"id\":\"@id\",\"f\":\"https://ns.flur.ee/ledger#\",\"sh\":\"http://www.w3.org/ns/shacl#\",\"skos\":\"http://www.w3.org/2008/05/skos#\",\"rdf\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"}"]
-                ["https://www.w3.org/2018/credentials#issuer" :id "https://www.w3.org/2018/credentials#issuer"]
+                ["fluree-default-context"
+                 :f/context
+                 "{\"schema\":\"http://schema.org/\",\"wiki\":\"https://www.wikidata.org/wiki/\",\"xsd\":\"http://www.w3.org/2001/XMLSchema#\",\"type\":\"@type\",\"rdfs\":\"http://www.w3.org/2000/01/rdf-schema#\",\"ex\":\"http://example.org/ns/\",\"id\":\"@id\",\"f\":\"https://ns.flur.ee/ledger#\",\"sh\":\"http://www.w3.org/ns/shacl#\",\"skos\":\"http://www.w3.org/2008/05/skos#\",\"rdf\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"}"]
+                ["https://ns.flur.ee/commit#address"
+                 :id
+                 "https://ns.flur.ee/commit#address"]
+                ["https://ns.flur.ee/commit#address" :rdf/type :id]
+                ["https://ns.flur.ee/commit#v" :id "https://ns.flur.ee/commit#v"]
+                ["https://ns.flur.ee/commit#v" :rdf/type :id]
+                ["https://www.w3.org/2018/credentials#issuer"
+                 :id
+                 "https://www.w3.org/2018/credentials#issuer"]
                 ["https://www.w3.org/2018/credentials#issuer" :rdf/type :id]
                 [:f/tag :id "https://ns.flur.ee/ledger#tag"]
-                [:f/time :id "https://ns.flur.ee/ledger#time"]
+                [:f/tag :rdf/type :id]
+                ["https://ns.flur.ee/commit#time"
+                 :id
+                 "https://ns.flur.ee/commit#time"]
+                ["https://ns.flur.ee/commit#time" :rdf/type :id]
                 [:f/message :id "https://ns.flur.ee/ledger#message"]
+                [:f/message :rdf/type :id]
                 [:f/commit :id "https://ns.flur.ee/ledger#commit"]
                 [:f/commit :rdf/type :id]
+                [:f/previous :id "https://ns.flur.ee/ledger#previous"]
+                [:f/previous :rdf/type :id]
                 [:f/address :id "https://ns.flur.ee/ledger#address"]
                 [:f/address :rdf/type :id]
                 [:id :id "@id"]
-                ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6" :id "fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"]
-                ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6" :f/address "fluree:memory://cdfbc32cddc850f1766742d08f20e52bc1d587e7f2b6384c1703f2e8b0c8971b"]
-                ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6" :f/commit "fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"]]
+                ["fluree:commit:sha256:bb4qxlsmiryknqoqxlwegfnk4v4gq5qmxhkieds6ccew5utaq2adc"
+                 :id
+                 "fluree:commit:sha256:bb4qxlsmiryknqoqxlwegfnk4v4gq5qmxhkieds6ccew5utaq2adc"]
+                ["fluree:commit:sha256:bb4qxlsmiryknqoqxlwegfnk4v4gq5qmxhkieds6ccew5utaq2adc"
+                 "https://ns.flur.ee/commit#time"
+                 720000]
+                ["fluree:commit:sha256:bb4qxlsmiryknqoqxlwegfnk4v4gq5qmxhkieds6ccew5utaq2adc"
+                 "https://www.w3.org/2018/credentials#issuer"
+                 "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                ["fluree:commit:sha256:bb4qxlsmiryknqoqxlwegfnk4v4gq5qmxhkieds6ccew5utaq2adc"
+                 "https://ns.flur.ee/commit#v"
+                 0]
+                ["fluree:commit:sha256:bb4qxlsmiryknqoqxlwegfnk4v4gq5qmxhkieds6ccew5utaq2adc"
+                 "https://ns.flur.ee/commit#data"
+                 "fluree:db:sha256:bbfcuiy4ja4gmeti55i6nyubvvpocjw4q6mztopxxnykc5w24odem"]]
+
                @(fluree/query db {:select ['?s '?p '?o]
                                   :where  [['?s '?p '?o]]}))
             "Entire database should be pulled.")))))

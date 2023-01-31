@@ -339,11 +339,11 @@
    (flake/create const/$_commit:data const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
 
    ;; commitdata schema
-   (flake/create const/$_commitdata:assert const/$iri const/iri-commitdata-assert const/$xsd:string t true nil)
-   (flake/create const/$_commitdata:assert const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
+   ;; (flake/create const/$_commitdata:assert const/$iri const/iri-commitdata-assert const/$xsd:string t true nil)
+   ;; (flake/create const/$_commitdata:assert const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
 
-   (flake/create const/$_commitdata:retract const/$iri const/iri-commitdata-retract const/$xsd:string t true nil)
-   (flake/create const/$_commitdata:retract const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
+   ;; (flake/create const/$_commitdata:retract const/$iri const/iri-commitdata-retract const/$xsd:string t true nil)
+   ;; (flake/create const/$_commitdata:retract const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
 
    (flake/create const/$_commitdata:flakes const/$iri const/iri-commitdata-flakes const/$xsd:string t true nil)
    (flake/create const/$_commitdata:flakes const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
@@ -353,6 +353,9 @@
 
    (flake/create const/$_commitdata:t const/$iri const/iri-commitdata-t const/$xsd:string t true nil)
    (flake/create const/$_commitdata:t const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
+
+   (flake/create const/$_commitdata:address const/$iri const/iri-commitdata-address const/$xsd:string t true nil)
+   (flake/create const/$_commitdata:address const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
 
    (flake/create const/$_commitdata:v const/$iri const/iri-commitdata-v const/$xsd:string t true nil)
    (flake/create const/$_commitdata:v const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
