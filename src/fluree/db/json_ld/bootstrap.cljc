@@ -170,4 +170,4 @@
         (update-in [:novelty :size] + size)
         (update-in [:stats :size] + size)
         (update-in [:stats :flakes] + (count base-flakes))
-        (vocab/update-with t (-> blank-db :schema :refs) base-flakes))))
+        (update-in [:schema] vocab/update-with* t base-flakes))))
