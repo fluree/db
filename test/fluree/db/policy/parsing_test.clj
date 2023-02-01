@@ -1,4 +1,4 @@
-(ns fluree.db.policy.parsing
+(ns fluree.db.policy.parsing-test
   (:require
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
@@ -99,17 +99,17 @@
                                                                     {:id :ex/user}]
                                                      :f/targetRole {:_id sid-userRole}
                                                      :function     [true
-                                                                    :fluree.db.policy.parsing/replaced-policy-function]
+                                                                    ::replaced-policy-function]
                                                      :id           "_:f211106232533008"}}}}
               :f/view   {:class {sid-User {sid-ssn  {:f/equals     [{:id :f/$identity}
                                                                     {:id :ex/user}]
                                                      :f/targetRole {:_id sid-userRole}
                                                      :function     [true
-                                                                    :fluree.db.policy.parsing/replaced-policy-function]
+                                                                    ::replaced-policy-function]
                                                      :id           :ex/ssnViewRule}
                                            :default {:f/targetRole {:_id sid-userRole}
                                                      :function     [false
-                                                                    :fluree.db.policy.parsing/replaced-policy-function]
+                                                                    ::replaced-policy-function]
                                                      :id           :ex/globalViewAllow}}}}
               :ident    sid-alice
               :roles    #{sid-userRole}}
