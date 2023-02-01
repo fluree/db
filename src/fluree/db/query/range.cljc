@@ -77,16 +77,12 @@
     :tspo txn-max-match))
 
 (defn resolve-subid
+  "Expands an IRI @id for a subject and returns the index's subject-id integer (sid).
+
+  Only called when integer or nil is not provided, so can assume always have a compact
+  or full IRI as either a keyword or string."
   [db id]
-  (let [out (chan)]
-    (if-not id
-      (async/close! out)
-      (if (util/pred-ident? id)
-        (-> db
-            (dbproto/-subid id)
-            (async/pipe out))
-        (async/put! out id)))
-    out))
+  (dbproto/-subid db id))
 
 (defn resolve-match-flake
   [test s p o t op m]
@@ -340,12 +336,20 @@
                                [[o1 o2] object-fn])]
 
      (go-try
-       (let [start-flake (if (or (number? s1) (nil? s1))
-                           (resolve-match-flake start-test s1 p1 o1 t1 op1 m1)
-                           (resolve-match-flake start-test (<? (resolve-subid db s1)) p1 o1 t1 op1 m1))
-             end-flake   (if (or (number? s2) (nil? s2))
-                           (resolve-match-flake end-test s2 p2 o2 t2 op2 m2)
-                           (resolve-match-flake end-test (<? (resolve-subid db 2)) p2 o2 t2 op2 m2))
+       (let [s1*         (if (or (number? s1) (nil? s1))
+                           s1
+                           (<? (resolve-subid db s1)))
+             start-flake (resolve-match-flake start-test s1* p1 o1 t1 op1 m1)
+             s2*         (cond
+                           (or (number? s2) (nil? s2))
+                           s2
+
+                           (= s2 s1)                        ;; common case when 'test' is =
+                           s1*
+
+                           :else
+                           (<? (resolve-subid db s2)))
+             end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
              range-ch    (index-range* db
                                        error-ch
