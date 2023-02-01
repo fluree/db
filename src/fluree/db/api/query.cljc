@@ -20,7 +20,8 @@
             [fluree.db.db.json-ld :as jld-db]
             [malli.core :as m]
             [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -188,12 +189,16 @@
    [:t {:optional true}
     [:and
      [:map
-      [:from {:optional true} pos-int?]
-      [:to {:optional true} pos-int?]]
+      [:from {:optional true} [:or
+                               pos-int?
+                               datatype/iso8601-datetime-re]]
+      [:to {:optional true} [:or
+                             pos-int?
+                             datatype/iso8601-datetime-re]]]
      [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
       (fn [{:keys [from to]}] (or from to))]
      [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
-      (fn [{:keys [from to]}] (if (and from to)
+      (fn [{:keys [from to]}] (if (and from to (number? from) (number? to))
                                 (<= from to)
                                 true))]]]])
 
@@ -238,11 +243,15 @@
             [pattern idx] (get-history-pattern query)
 
             ;; from and to are positive ints, need to convert to negative or fill in default values
-            {:keys [from to]}  t
-            [from-t to-t]      [(if from (- from) -1) (if to (- to) (:t db))]
-
-            flakes  (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
-            results (<? (history-flakes->json-ld db query-map flakes))]
+            {:keys [from to]} t
+            [from-t to-t]     [(cond (string? from) (<? (time-travel/datetime->t db from))
+                                     (number? from) (- from)
+                                     :else          -1)
+                               (cond (string? to) (<? (time-travel/datetime->t db to))
+                                     (number? to) (- to)
+                                     :else        (:t db))]
+            flakes            (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
+            results           (<? (history-flakes->json-ld db query-map flakes))]
         results))))
 
 (defn query
