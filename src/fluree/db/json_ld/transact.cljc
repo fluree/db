@@ -301,69 +301,7 @@
   [t]
   [(flake/create const/$rdf:type const/$iri const/iri-rdf-type const/$xsd:string t true nil)
    (flake/create const/$rdfs:Class const/$iri const/iri-class const/$xsd:string t true nil)
-   (flake/create const/$iri const/$iri "@id" const/$xsd:string t true nil)
-
-   ;; commit schema
-   (flake/create const/$_ledger:alias const/$iri const/iri-alias const/$xsd:string t true nil)
-   (flake/create const/$_ledger:alias const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_ledger:branch const/$iri const/iri-branch const/$xsd:string t true nil)
-   (flake/create const/$_ledger:branch const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:tag const/$iri const/iri-tag const/$xsd:string t true nil)
-   (flake/create const/$_commit:tag const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:signer const/$iri const/iri-issuer const/$xsd:string t true nil)
-   (flake/create const/$_commit:signer const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:address const/$iri const/iri-commit-address const/$xsd:string t true nil)
-   (flake/create const/$_commit:address const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:string t true nil)
-   (flake/create const/$_commit:message const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:time const/$iri const/iri-commit-time const/$xsd:string t true nil)
-   (flake/create const/$_commit:time const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:v const/$iri const/iri-commit-v const/$xsd:string t true nil)
-   (flake/create const/$_commit:v const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:prevHash const/$iri const/iri-previous const/$xsd:string t true nil)
-   (flake/create const/$_commit:prevHash const/$rdf:type const/$iri  const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commit:data const/$iri const/iri-commit-data const/$xsd:string t true nil)
-   (flake/create const/$_commit:data const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   ;; commitdata schema
-   ;; (flake/create const/$_commitdata:assert const/$iri const/iri-commitdata-assert const/$xsd:string t true nil)
-   ;; (flake/create const/$_commitdata:assert const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   ;; (flake/create const/$_commitdata:retract const/$iri const/iri-commitdata-retract const/$xsd:string t true nil)
-   ;; (flake/create const/$_commitdata:retract const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commitdata:flakes const/$iri const/iri-commitdata-flakes const/$xsd:string t true nil)
-   (flake/create const/$_commitdata:flakes const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commitdata:size const/$iri const/iri-commitdata-size const/$xsd:string t true nil)
-   (flake/create const/$_commitdata:size const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commitdata:t const/$iri const/iri-commitdata-t const/$xsd:string t true nil)
-   (flake/create const/$_commitdata:t const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commitdata:address const/$iri const/iri-commitdata-address const/$xsd:string t true nil)
-   (flake/create const/$_commitdata:address const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   (flake/create const/$_commitdata:v const/$iri const/iri-commitdata-v const/$xsd:string t true nil)
-   (flake/create const/$_commitdata:v const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   ;; used to link t to commit-data
-   (flake/create const/$_commit:dbId const/$iri const/iri-address const/$xsd:string t true nil)
-   (flake/create const/$_commit:dbId const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-
-   ;; used to link t to commit
-   (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:string t true nil)
-   (flake/create const/$_commit:idRef const/$rdf:type const/$iri const/$xsd:anyURI t true nil)
-   ])
+   (flake/create const/$iri const/$iri "@id" const/$xsd:string t true nil)])
 
 (defn ref-flakes
   "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."

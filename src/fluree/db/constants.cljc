@@ -21,8 +21,6 @@
 (def ^:const iri-commit-message "https://ns.flur.ee/commit#message")
 (def ^:const iri-commit-v "https://ns.flur.ee/commit#v")
 
-(def ^:const iri-commitdata-assert "https://ns.flur.ee/commitdata#assert")
-(def ^:const iri-commitdata-retract "https://ns.flur.ee/commitdata#retract")
 (def ^:const iri-commitdata-flakes "https://ns.flur.ee/commitdata#flakes")
 (def ^:const iri-commitdata-size "https://ns.flur.ee/commitdata#size")
 (def ^:const iri-commitdata-t "https://ns.flur.ee/commitdata#t")
@@ -50,7 +48,6 @@
 
 (def ^:const iri-id "@id")
 (def ^:const iri-type "@type")
-(def ^:const iri-context "@context")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
 (def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
