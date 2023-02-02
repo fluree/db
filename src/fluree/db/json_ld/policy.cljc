@@ -53,15 +53,17 @@
                              ;; each explicit property can have multiple :f/allow targeting different roles
                              ;; We only want :f/allow that target provided roles, and only want properties
                              ;; returned tht contain at least one relevant :f/allow
-                             (filter
-                               (fn [prop-policy]
-                                 (let [roles-policies (->> (get prop-policy :f/allow)
-                                                           util/sequential
-                                                           (filter #(roles (get-in % [:f/targetRole :_id])))
-                                                           not-empty)]
-                                   (when roles-policies
-                                     (assoc prop-policy :f/allow roles-policies))))
-                               (util/sequential all-prop-policies)))]
+                             (->> all-prop-policies
+                                  util/sequential
+                                  (filter
+                                    (fn [prop-policy]
+                                      (let [roles-policies (->> (get prop-policy :f/allow)
+                                                                util/sequential
+                                                                (filter #(roles (get-in % [:f/targetRole :_id])))
+                                                                not-empty)]
+                                        (when roles-policies
+                                          (assoc prop-policy :f/allow roles-policies)))))
+                                  not-empty))]
         (when (or class-policies prop-policies)
           (cond-> policy
                   class-policies (assoc :f/allow class-policies)
