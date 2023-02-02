@@ -153,20 +153,6 @@
         query-xf  (extract-query-flakes opts)]
     (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
 
-(defn resolve-flake-slices2
-  "Returns a channel that will contain a stream of chunked flake collections that
-  contain the flakes between `start-flake` and `end-flake` and are within the
-  transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [async-cache] :as conn} root novelty error-ch
-   {:keys [from-t to-t start-flake end-flake] :as opts}]
-  (let [resolver  (index/->CachedTRangeResolver2 conn novelty from-t to-t async-cache)
-        cmp       (:comparator root)
-        range-set (flake/sorted-set-by cmp start-flake end-flake)
-        in-range? (fn [node]
-                    (intersects-range? node range-set))
-        query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
-
 (defn unauthorized?
   [f]
   (= f ::unauthorized))
@@ -250,19 +236,6 @@
          (filter-authorized db start-flake end-flake error-ch)
          (into-page limit offset flake-limit))))
 
-(defn index-range*2
-  "Return a channel that will eventually hold a sorted vector of the range of
-  flakes from `db` that meet the criteria specified in the `opts` map."
-  [{:keys [conn] :as db}
-   error-ch
-   {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
-  (let [idx-root (get db idx)
-        idx-cmp  (get-in db [:comparators idx])
-        novelty  (get-in db [:novelty idx])]
-    (->> (resolve-flake-slices2 conn idx-root novelty error-ch opts)
-         (filter-authorized db start-flake end-flake error-ch)
-         (into-page limit offset flake-limit))))
-
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
   tests when only one test is provided"
@@ -291,42 +264,50 @@
   :to-t - stop transaction - can be null, which pulls full history
   :xform - xform applied to each result individually. This is not used
            when :chan is supplied.
-  :limit - max number of flakes to return"
-  ([db idx] (time-range db idx {}))
-  ([db idx opts] (time-range db idx >= (min-match idx) <= (max-match idx) opts))
-  ([db idx test match] (time-range db idx test match {}))
+  :flake-limit - max number of flakes to return"
   ([db idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
      (time-range db idx start-test start-match end-test end-match opts)))
-  ([db idx start-test start-match end-test end-match]
-   (time-range db idx start-test start-match end-test end-match {}))
-  ([{t :t :as db} idx start-test start-match end-test end-match opts]
-   (let [{:keys [limit from-t to-t]
+  ([{:keys [t conn ] :as db} idx start-test start-match end-test end-match opts]
+   (let [{:keys [limit offset flake-limit from-t to-t]
           :or   {from-t t, to-t t}}
          opts
 
          start-parts (match->flake-parts db idx start-match)
-         end-parts   (match->flake-parts db idx end-match)]
+         end-parts   (match->flake-parts db idx end-match)
+
+         start-flake (apply resolve-match-flake start-test start-parts)
+         end-flake   (apply resolve-match-flake end-test end-parts)
+         error-ch    (chan)
+
+         ;; index-range*
+         idx-root (get db idx)
+         idx-cmp  (get-in db [:comparators idx])
+         novelty  (get-in db [:novelty idx])
+
+         ;; resolve-flake-slices
+         resolver  (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:async-cache conn))
+         cmp       (:comparator idx-root)
+         range-set (flake/sorted-set-by cmp start-flake end-flake)
+         in-range? (fn [node] (intersects-range? node range-set))
+         query-xf  (extract-query-flakes {:idx         idx
+                                          :from-t      from-t
+                                          :to-t        to-t
+                                          :start-test  start-test
+                                          :start-flake start-flake
+                                          :end-test    end-test
+                                          :end-flake   end-flake
+                                          :flake-limit limit})]
      (go-try
-      (let [start-flake (apply resolve-match-flake start-test start-parts)
-            end-flake   (apply resolve-match-flake end-test end-parts)
-            error-ch    (chan)
-            range-ch    (index-range*2 db
-                                      error-ch
-                                      {:idx idx
-                                       :from-t from-t
-                                       :to-t to-t
-                                       :start-test start-test
-                                       :start-flake start-flake
-                                       :end-test end-test
-                                       :end-flake end-flake
-                                       :flake-limit limit})]
-        (async/alt!
-          error-ch ([e]
-                    (throw e))
-          range-ch ([hist-range]
-                    hist-range)))))))
+       (let [history-ch (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
+                             (filter-authorized db start-flake end-flake error-ch)
+                             (into-page limit offset flake-limit))]
+         (async/alt!
+           error-ch ([e]
+                     (throw e))
+           history-ch ([hist-range]
+                       hist-range)))))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.

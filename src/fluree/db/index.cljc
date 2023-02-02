@@ -267,19 +267,6 @@
          out-of-range (concat stale-flakes subsequent)]
      (flake/disj-all latest out-of-range))))
 
-(defn t-range2
-  "Returns a sorted set of flakes that are not out of date between the
-  transactions `from-t` and `to-t`."
-  ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
-   (let [latest       (cond-> flakes
-                        (> leaf-t to-t)
-                        (flake/conj-all (novelty-subrange leaf to-t novelty)))
-         ;; flakes that happen after to-t
-         subsequent   (filter-after to-t latest)
-         previous     (filter (partial before-t? from-t) latest)
-         out-of-range (concat subsequent previous)]
-     (flake/disj-all latest out-of-range))))
-
 (defrecord CachedTRangeResolver [node-resolver novelty from-t to-t async-cache]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
@@ -297,7 +284,19 @@
                          :to-t   to-t
                          :flakes  flakes)))))))))
 
-(defrecord CachedTRangeResolver2 [node-resolver novelty from-t to-t async-cache]
+(defn history-t-range
+  "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
+  ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
+   (let [latest       (cond-> flakes
+                        (> leaf-t to-t)
+                        (flake/conj-all (novelty-subrange leaf to-t novelty)))
+         ;; flakes that happen after to-t
+         subsequent   (filter-after to-t latest)
+         previous     (filter (partial before-t? from-t) latest)
+         out-of-range (concat subsequent previous)]
+     (flake/disj-all latest out-of-range))))
+
+(defrecord CachedHistoryRangeResolver [node-resolver novelty from-t to-t async-cache]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
@@ -307,7 +306,7 @@
        (fn [_]
          (go-try
           (let [resolved (<? (resolve node-resolver node))
-                flakes   (t-range2 resolved novelty from-t to-t)]
+                flakes   (history-t-range resolved novelty from-t to-t)]
             (-> resolved
                 (dissoc :t)
                 (assoc :from-t from-t
