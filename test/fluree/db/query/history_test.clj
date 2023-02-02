@@ -14,17 +14,18 @@
         db1 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-1"
                                           :ex/y "bar-1"})
-        ts1 (util/current-time-iso)
+        ts1 (-> db1 :commit :time)
         db2 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-2"
                                           :ex/y "bar-2"})
         db3 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-3"
                                           :ex/y "bar-3"})
+
+        ts3 (-> db3 :commit :time)
         db4 @(test-utils/transact ledger {:id :ex/cat
                                           :ex/x "foo-cat"
                                           :ex/y "bar-cat"})
-        ts4 (util/current-time-iso)
         db5 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-cat"
                                           :ex/y "bar-cat"})]
@@ -133,7 +134,8 @@
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
                :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
               {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}]
-             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from ts1 :to ts4}})))
+             @(fluree/history ledger {:history [nil :ex/x] :t {:from ts1 :to ts3}}))
+          "does not include t 4 or 5")
       (is (= [{:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from (util/current-time-iso)}}))
           "timestamp translates to first t before ts")
