@@ -13,8 +13,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.storage.core :as storage]
             [fluree.db.indexer.default :as idx-default]
-            #?(:clj [fluree.db.serde.avro :as avro-serde])
-            #?(:cljs [fluree.db.serde.json :as json-serde])
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
@@ -297,8 +295,6 @@
       (map->FileConnection {:id              conn-id
                             :storage-path    storage-path
                             :ledger-defaults (ledger-defaults defaults)
-                            :serializer      #?(:clj  (avro-serde/avro-serde)
-                                                :cljs (json-serde/json-serde))
                             :commit          commit
                             :push            push
                             :parallelism     parallelism
