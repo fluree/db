@@ -23,9 +23,12 @@
                                           :ex/y "bar-3"})
 
         ts3 (-> db3 :commit :time)
-        db4 @(test-utils/transact ledger {:id :ex/cat
-                                          :ex/x "foo-cat"
-                                          :ex/y "bar-cat"})
+        db4 @(test-utils/transact ledger [{:id :ex/cat
+                                           :ex/x "foo-cat"
+                                           :ex/y "bar-cat"}
+                                          {:id :ex/dog
+                                           :ex/x "foo-dog"
+                                           :ex/y "bar-dog"}])
         db5 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-cat"
                                           :ex/y "bar-cat"})]
@@ -74,7 +77,8 @@
                :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
                :f/retract [{:ex/x "foo-3" :id :ex/dan}]}
               {:f/t 4
-               :f/assert [{:ex/x "foo-cat" :id :ex/cat}]
+               :f/assert [{:ex/x "foo-dog" :id :ex/dog}
+                          {:ex/x "foo-cat" :id :ex/cat}]
                :f/retract []}
               {:f/t 3
                :f/assert [{:ex/x "foo-3" :id :ex/dan}]

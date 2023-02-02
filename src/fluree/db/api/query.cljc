@@ -95,20 +95,22 @@
 (defn t-flakes->json-ld
   [db compact cache fuel error-ch t-flakes]
   (go-try
-    (let [assert-flakes (not-empty (filter flake/op t-flakes))
-          retract-flakes (not-empty (filter (complement flake/op) t-flakes))
+    (let [{assert-flakes  true
+           retract-flakes false} (group-by flake/op t-flakes)
 
-          s-asserts-ch (->> (sort-by flake/s assert-flakes)
-                            (partition-by flake/s)
-                            (async/to-chan!))
-          s-retracts-ch (->> (sort-by flake/s retract-flakes)
-                             (partition-by flake/s)
-                             (async/to-chan!))
+          s-flake-partitions (fn [flakes]
+                               (->> flakes
+                                    (group-by flake/s)
+                                    (vals)
+                                    (async/to-chan!)))
 
-          s-asserts-out-ch (async/chan)
+          s-asserts-ch  (s-flake-partitions assert-flakes)
+          s-retracts-ch (s-flake-partitions retract-flakes)
+
+          s-asserts-out-ch  (async/chan)
           s-retracts-out-ch (async/chan)
 
-          s-asserts-json-ch (async/into [] s-asserts-out-ch)
+          s-asserts-json-ch  (async/into [] s-asserts-out-ch)
           s-retracts-json-ch (async/into [] s-retracts-out-ch)]
       ;; process asserts
       (async/pipeline-async 2
@@ -125,8 +127,8 @@
                                   (async/pipe ch)))
                             s-retracts-ch)
       {(json-ld/compact const/iri-t compact) (- (flake/t (first t-flakes)))
-       (json-ld/compact const/iri-assert compact) (<? s-asserts-json-ch)
-       (json-ld/compact const/iri-retract compact) (<? s-retracts-json-ch)})))
+       (json-ld/compact const/iri-assert compact) (async/<! s-asserts-json-ch)
+       (json-ld/compact const/iri-retract compact) (async/<! s-retracts-json-ch)})))
 
 (defn history-flakes->json-ld
   [db q flakes]
