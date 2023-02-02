@@ -256,7 +256,8 @@
           error-ch   (async/chan)
           out-ch     (async/chan)
           results-ch (async/into [] out-ch)
-          non-iri-flakes (remove #(= const/$iri (flake/p %)) flakes)
+          non-iri-flakes (remove #(or (= const/$iri (flake/p %))
+                                      (= const/$rdfs:Class (flake/o %))) flakes)
           t-flakes-ch (->> (sort-by flake/t non-iri-flakes)
                            (partition-by flake/t)
                            (async/to-chan!))]
