@@ -153,6 +153,20 @@
         query-xf  (extract-query-flakes opts)]
     (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
 
+(defn resolve-flake-slices2
+  "Returns a channel that will contain a stream of chunked flake collections that
+  contain the flakes between `start-flake` and `end-flake` and are within the
+  transaction range starting at `from-t` and ending at `to-t`."
+  [{:keys [async-cache] :as conn} root novelty error-ch
+   {:keys [from-t to-t start-flake end-flake] :as opts}]
+  (let [resolver  (index/->CachedTRangeResolver2 conn novelty from-t to-t async-cache)
+        cmp       (:comparator root)
+        range-set (flake/sorted-set-by cmp start-flake end-flake)
+        in-range? (fn [node]
+                    (intersects-range? node range-set))
+        query-xf  (extract-query-flakes opts)]
+    (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
+
 (defn unauthorized?
   [f]
   (= f ::unauthorized))
@@ -236,6 +250,19 @@
          (filter-authorized db start-flake end-flake error-ch)
          (into-page limit offset flake-limit))))
 
+(defn index-range*2
+  "Return a channel that will eventually hold a sorted vector of the range of
+  flakes from `db` that meet the criteria specified in the `opts` map."
+  [{:keys [conn] :as db}
+   error-ch
+   {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
+  (let [idx-root (get db idx)
+        idx-cmp  (get-in db [:comparators idx])
+        novelty  (get-in db [:novelty idx])]
+    (->> (resolve-flake-slices2 conn idx-root novelty error-ch opts)
+         (filter-authorized db start-flake end-flake error-ch)
+         (into-page limit offset flake-limit))))
+
 (defn expand-range-interval
   "Finds the full index or time range interval including the maximum and minimum
   tests when only one test is provided"
@@ -285,7 +312,7 @@
       (let [start-flake (apply resolve-match-flake start-test start-parts)
             end-flake   (apply resolve-match-flake end-test end-parts)
             error-ch    (chan)
-            range-ch    (index-range* db
+            range-ch    (index-range*2 db
                                       error-ch
                                       {:idx idx
                                        :from-t from-t

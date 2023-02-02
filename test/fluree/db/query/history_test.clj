@@ -11,13 +11,19 @@
         conn (test-utils/create-conn)
         ledger @(fluree/create conn "historytest" {:context {:ex "http://example.org/ns/"}})
 
-        db1 @(test-utils/transact ledger {:id :ex/dan
-                                          :ex/x "foo-1"
-                                          :ex/y "bar-1"})
-        ts1 (-> db1 :commit :time)
+        db1 @(test-utils/transact ledger [{:id :ex/dan
+                                           :ex/x "foo-1"
+                                           :ex/y "bar-1"}
+                                          {:id :ex/cat
+                                           :ex/x "foo-1"
+                                           :ex/y "bar-1"}
+                                          {:id :ex/dog
+                                           :ex/x "foo-1"
+                                           :ex/y "bar-1"}])
         db2 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-2"
                                           :ex/y "bar-2"})
+        ts2 (-> db2 :commit :time)
         db3 @(test-utils/transact ledger {:id :ex/dan
                                           :ex/x "foo-3"
                                           :ex/y "bar-3"})
@@ -79,14 +85,17 @@
               {:f/t 4
                :f/assert [{:ex/x "foo-dog" :id :ex/dog}
                           {:ex/x "foo-cat" :id :ex/cat}]
-               :f/retract []}
+               :f/retract [{:ex/x "foo-1", :id :ex/dog}
+                           {:ex/x "foo-1", :id :ex/cat}]}
               {:f/t 3
                :f/assert [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
               {:f/t 2
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
                :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
-              {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}]
+              {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dog}
+                                 {:ex/x "foo-1" :id :ex/cat}
+                                 {:ex/x "foo-1" :id :ex/dan}]
                :f/retract []}]
              @(fluree/history ledger {:history [nil :ex/x]}))))
     (testing "three-tuple flake history"
@@ -104,13 +113,17 @@
              @(fluree/history ledger {:history [:ex/dan :ex/x "foo-cat"]}))))
 
     (testing "at-t"
-      (is (= [{:f/t 3 :f/assert [{:ex/x "foo-3" :id :ex/dan}] :f/retract []}]
+      (is (= [{:f/t 3
+               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2", :id :ex/dan}]}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 3 :to 3}}))))
     (testing "from-t"
       (is (= [{:f/t 5
                :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
                :f/retract [{:ex/x "foo-3" :id :ex/dan}]}
-              {:f/t 3 :f/assert [{:ex/x "foo-3" :id :ex/dan}] :f/retract []}]
+              {:f/t 3
+               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 3}}))))
     (testing "to-t"
       (is (= [{:f/t 3
@@ -122,24 +135,25 @@
               {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:to 3}}))))
     (testing "t-range"
-      (is (= [{:f/t 3
-               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
-              {:f/t 2
-               :f/assert [{:ex/x "foo-2" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
-              {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}]
-             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 1 :to 3}}))))
+      (is (= [{:f/t 4
+                 :f/assert [{:ex/x "foo-dog" :id :ex/dog} {:ex/x "foo-cat" :id :ex/cat}]
+                 :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}
+                {:f/t 3
+                 :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+                 :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
+                {:f/t 2
+                 :f/assert [{:ex/x "foo-2" :id :ex/dan}]
+                 :f/retract [{:ex/x "foo-1" :id :ex/dan}]}]
+               @(fluree/history ledger {:history [nil :ex/x] :t {:from 2 :to 4}}))))
     (testing "datetime-t"
       (is (= [{:f/t 3
                :f/assert [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
               {:f/t 2
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
-              {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}]
-             @(fluree/history ledger {:history [nil :ex/x] :t {:from ts1 :to ts3}}))
-          "does not include t 4 or 5")
+               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}]
+             @(fluree/history ledger {:history [nil :ex/x] :t {:from ts2 :to ts3}}))
+          "does not include t 1, 4, or 5")
       (is (= [{:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from (util/current-time-iso)}}))
           "timestamp translates to first t before ts")
