@@ -42,20 +42,86 @@
           false)))))
 
 
-(defn allow-flakes?
-  "Like allow-flake, but filters a sequence of flakes to only
-  allow those whose policy do not return 'false'."
-  [db flakes]
-  (async/go
-    (loop [[flake & r] flakes
-           acc []]
-      (if flake
-        (if (schema-util/is-schema-flake? flake) ;; always allow schema flakes
-          (recur r (conj acc flake))
-          (let [res (async/<! (allow-flake? db flake))]
-            (if (util/exception? res)
-              res
-              (if res
-                (recur r (conj acc flake))
-                (recur r acc)))))
-        acc))))
+(defn- group-policy-by-default
+  "Returns map with :default and :property keys, each having k-v tuples of
+  their respective policies."
+  [policy-maps]
+  (comp (mapcat identity))
+  (->> policy-maps
+       (mapcat identity)
+       (group-by (fn [policy-map]
+                   (if (= :default (key policy-map))
+                     :default
+                     :property)))))
+
+
+(defn- group-property-policies
+  "Returns a map of property policies grouped by property-id (pid).
+  For each pid key, returns a vector containing only the function tuples (not entire policy map) of
+  [async? fn]. Note while many will have only one fn per pid, there can be multiple - and the first
+  truthy response allows access."
+  [property-policies]
+  (reduce (fn [acc [pid policy-m]]
+            (assoc acc pid (conj (get acc pid []) (:function policy-m))))
+          {} property-policies))
+
+
+(defn- evaluate-subject-properties
+  [db property-policies default-allow? flakes]
+  (go-try
+    (let [policies-by-pid (group-property-policies property-policies)]
+      (loop [[flake & r] flakes
+             acc []]
+        (if flake
+          (let [p-policies (->> flake flake/p (get policies-by-pid))]
+            (cond
+              p-policies (let [allow? (loop [[[async? f] & r] p-policies]
+                                        ;; return first truthy response, else false
+                                        (if f
+                                          (let [res (if async?
+                                                      (<? (f db flake))
+                                                      (f db flake))]
+                                            (or res
+                                                (recur r)))
+                                          ;; always default to false! (deny)
+                                          false))]
+                           (if allow?
+                             (recur r (conj acc flake))
+                             (recur r acc)))
+              default-allow? (recur r (conj acc flake))
+              :else (recur r acc)))
+          acc)))))
+
+
+(defn filter-subject-flakes
+  "Takes multiple flakes for the *same* subject and optimizes evaluation
+  for the group. Returns the allowed flakes, or an empty vector if none
+  are allowed.
+
+  If specific property policies are not defined, a single evaluation for
+  the subject can be done and each flake does not need to be checked."
+  [{:keys [policy] :as db} flakes]
+  (go-try
+    (let [fflake         (first flakes)
+          class-ids      (<? (dbproto/-class-ids
+                               (dbproto/-rootdb db)
+                               (flake/s fflake)))
+          class-policies (keep #(get-in policy [:f/view :class %]) class-ids)
+          {defaults :default props :property} (group-policy-by-default class-policies)
+          ;; default-allow? will be the default for all flakes that don't have a property-specific policy
+          default-allow? (loop [[[async? f] & r] (eduction
+                                                   (map second) (map :function)
+                                                   defaults)]
+                           ;; return first truthy response, else false
+                           (if f
+                             (let [res (if async?
+                                         (<? (f db fflake))
+                                         (f db fflake))]
+                               (or res
+                                   (recur r)))
+                             ;; always default to false! (deny)
+                             false))]
+      (cond
+        props (<? (evaluate-subject-properties db props default-allow? flakes))
+        default-allow? flakes
+        :else []))))
