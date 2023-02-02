@@ -7,10 +7,7 @@
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.range :as query-range]
-            [fluree.db.session :as session]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.permissions :as permissions]
-            [fluree.db.auth :as auth]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
@@ -38,42 +35,6 @@
   [ledger-id]
   (re-find #"[a-z0-9]+/[a-z0-9]+" ledger-id))
 
-;; TODO - not using new policy below, needs to have updated logic to lookup user roles!
-(defn db
-  "Returns a queryable database as a promise channel from the connection for the specified ledger."
-  ([conn ledger]
-   (session/db conn ledger nil))
-  ([conn ledger opts]
-   (let [pc (async/promise-chan)]
-     (async/go
-       (try*
-         (let [rootdb        (<? (session/db conn ledger nil))
-               {:keys [roles user auth block]} opts
-               auth_id       (when (and auth (not= 0 auth))
-                               (or
-                                 (<? (dbproto/-subid rootdb auth))
-                                 (throw (ex-info (str "Auth id: " auth " unknown.")
-                                                 {:status 401
-                                                  :error  :db/invalid-auth}))))
-               roles         (or roles (if auth_id
-                                         (<? (auth/roles rootdb auth_id)) nil))
-
-               permissions-c (when roles (permissions/permission-map rootdb roles :query))
-               dbt           (if block
-                               (<? (time-travel/as-of-block rootdb (:block opts)))
-                               rootdb)
-               dba           (if auth
-                               (assoc dbt :auth auth)
-                               dbt)
-               permdb        (if roles
-                               (assoc dba :permissions (<? permissions-c))
-                               dba)]
-           (async/put! pc permdb))
-         (catch* e
-                 (async/put! pc e)
-                 (async/close! pc))))
-     ;; return promise chan immediately
-     pc)))
 
 (defn t-flakes->json-ld
   [db compact cache fuel error-ch t-flakes]
