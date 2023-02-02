@@ -29,9 +29,9 @@
                              :id         :ex/alice,
                              :schema/age nil})]
       (is (= @(fluree/query db-age-retract
-                            {:context {:ex "http://example.org/ns/"}
-                             :select  [:*]
-                             :from    :ex/alice})
+                            '{:context {:ex "http://example.org/ns/"},
+                              :select {?s [:*]},
+                              :where [[?s :id :ex/alice]]})
              [{:id           :ex/alice,
                :rdf/type     [:ex/User],
                :schema/name  "Alice"}])

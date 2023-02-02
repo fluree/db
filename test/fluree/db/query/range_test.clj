@@ -3,7 +3,6 @@
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
-    [fluree.db.util.log :as log]
     [fluree.db.dbproto :as dbproto]
     [clojure.core.async :as async]))
 
@@ -43,10 +42,6 @@
           alice-flakes         @(fluree/range db :spot = [:ex/alice])
           widget-flakes        @(fluree/range db :spot = [:ex/widget])]
 
-
-      (log/warn "john-flakes: \n" john-flakes-expanded)
-      ;(log/warn "alice-flakes: \n" alice-flakes)
-      ;(log/warn "widget-flakes: \n" widget-flakes)
 
       ;; root can see all user data
       (is (= john-flakes-compact

@@ -54,8 +54,8 @@
           "Only Jane and Bob should be left in the db.")
 
       (is (= @(fluree/query db-subj-pred-del
-                            {:selectOne [:*]
-                             :from      :ex/bob})
+                            '{:selectOne {?s [:*]}
+                              :where [[?s :id :ex/bob]]})
              {:id          :ex/bob,
               :rdf/type    [:ex/User],
               :schema/name "Bob"})

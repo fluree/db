@@ -21,9 +21,9 @@
                         :id                 :ex/myClassInstance,
                         :type               [:ex/MyClass]
                         :schema/description "Now a new subject uses MyClass as a Class"})
-          query-res @(fluree/query db2 {:context {:ex "http://example.org/ns/"}
-                                        :select  [:*]
-                                        :from    :ex/myClassInstance})]
+          query-res @(fluree/query db2 '{:context {:ex "http://example.org/ns/"},
+                                         :select {?s [:*]},
+                                         :where [[?s :id :ex/myClassInstance]]})]
       (is (= query-res
              [{:id                 :ex/myClassInstance,
                :rdf/type           [:ex/MyClass],
