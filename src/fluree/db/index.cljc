@@ -199,7 +199,7 @@
   (< (flake/t flake) t))
 
 (defn before-t?
-  "Returns `true` if `flake` has a transaction value after the provided `t`"
+  "Returns `true` if `flake` has a transaction value before the provided `t`"
   [t flake]
   (> (flake/t flake) t))
 
@@ -292,6 +292,7 @@
                         (flake/conj-all (novelty-subrange leaf to-t novelty)))
          ;; flakes that happen after to-t
          subsequent   (filter-after to-t latest)
+         ;; flakes that happen before from-t
          previous     (filter (partial before-t? from-t) latest)
          out-of-range (concat subsequent previous)]
      (flake/disj-all latest out-of-range))))

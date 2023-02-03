@@ -250,9 +250,6 @@
 (defn time-range
   "Range query across an index.
 
-  Uses a DB, but in the future support supplying a connection and db name, as we
-  don't need a 't'
-
   Ranges take the natural numeric sort orders, but all results will return in
   reverse order (newest subjects and predicates first).
 
