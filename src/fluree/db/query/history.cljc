@@ -205,6 +205,9 @@
   (= (flake/s f) (flake/t f)))
 
 (defn commit-data-flake?
+  "These are flakes that describe the data,
+  and belong outside of the list of asserts
+  themselves"
   [f]
   (#{const/$_commitdata:t
      const/$_commitdata:size
@@ -237,10 +240,10 @@
             retracts (json-ld/compact const/iri-retract compact)} (<? (t-flakes->json-ld2 db compact cache fuel error-ch data-flakes))
            ;; t is always positive for users
            result         (assoc {(json-ld/compact const/iri-commit compact) commit-meta}
-                                 (json-ld/compact const/iri-commit-data compact ) commit-data)]
+                                 (json-ld/compact const/iri-data compact ) commit-data)]
        (-> result
-           (assoc-in  [(json-ld/compact const/iri-commit-data compact)(json-ld/compact const/iri-assert compact)] asserts)
-           (assoc-in  [(json-ld/compact const/iri-commit-data compact)(json-ld/compact const/iri-retract compact)] retracts)))
+           (assoc-in  [(json-ld/compact const/iri-data compact)(json-ld/compact const/iri-assert compact)] asserts)
+           (assoc-in  [(json-ld/compact const/iri-data compact)(json-ld/compact const/iri-retract compact)] retracts)))
      (catch* e
              (log/error e "Error converting commit flakes.")
              (async/>! error-ch e)))))

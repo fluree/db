@@ -75,16 +75,16 @@
                  :id
                  "fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"]
                 ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"
-                 "https://ns.flur.ee/commitdata#address"
+                 :f/address
                  "fluree:memory://cdfbc32cddc850f1766742d08f20e52bc1d587e7f2b6384c1703f2e8b0c8971b"]
                 ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"
-                 "https://ns.flur.ee/commitdata#flakes"
+                 :f/flakes
                  28]
                 ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"
-                 "https://ns.flur.ee/commitdata#size"
+                 :f/size
                  2776]
                 ["fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"
-                 "https://ns.flur.ee/commitdata#t"
+                 :f/t
                  1]
                 [:schema/age :id "http://schema.org/age"]
                 [:schema/email :id "http://schema.org/email"]
@@ -96,45 +96,28 @@
                 [:f/context :id "https://ns.flur.ee/ledger#context"]
                 [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
                 [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
-                ["https://ns.flur.ee/commitdata#v"
-                 :id
-                 "https://ns.flur.ee/commitdata#v"]
-                ["https://ns.flur.ee/commitdata#t"
-                 :id
-                 "https://ns.flur.ee/commitdata#t"]
-                ["https://ns.flur.ee/commitdata#size"
-                 :id
-                 "https://ns.flur.ee/commitdata#size"]
-                ["https://ns.flur.ee/commitdata#flakes"
-                 :id
-                 "https://ns.flur.ee/commitdata#flakes"]
-                ["https://ns.flur.ee/commitdata#address"
-                 :id
-                 "https://ns.flur.ee/commitdata#address"]
+                [:f/v :id "https://ns.flur.ee/ledger#v"]
+                [:f/t :id "https://ns.flur.ee/ledger#t"]
+                [:f/size :id "https://ns.flur.ee/ledger#size"]
+                [:f/flakes :id "https://ns.flur.ee/ledger#flakes"]
+                [:f/address :id "https://ns.flur.ee/ledger#address"]
                 [:f/branch :id "https://ns.flur.ee/ledger#branch"]
                 [:f/alias :id "https://ns.flur.ee/ledger#alias"]
-                ["https://ns.flur.ee/commit#data"
-                 :id
-                 "https://ns.flur.ee/commit#data"]
+                [:f/data :id "https://ns.flur.ee/ledger#data"]
                 ["fluree-default-context" :id "fluree-default-context"]
                 ["fluree-default-context" :rdf/type :f/Context]
                 ["fluree-default-context"
                  :f/context
                  "{\"schema\":\"http://schema.org/\",\"wiki\":\"https://www.wikidata.org/wiki/\",\"xsd\":\"http://www.w3.org/2001/XMLSchema#\",\"type\":\"@type\",\"rdfs\":\"http://www.w3.org/2000/01/rdf-schema#\",\"ex\":\"http://example.org/ns/\",\"id\":\"@id\",\"f\":\"https://ns.flur.ee/ledger#\",\"sh\":\"http://www.w3.org/ns/shacl#\",\"skos\":\"http://www.w3.org/2008/05/skos#\",\"rdf\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"}"]
-                ["https://ns.flur.ee/commit#address"
-                 :id
-                 "https://ns.flur.ee/commit#address"]
-                ["https://ns.flur.ee/commit#v" :id "https://ns.flur.ee/commit#v"]
+                [:f/address :id "https://ns.flur.ee/ledger#address"]
+                [:f/v :id "https://ns.flur.ee/ledger#v"]
                 ["https://www.w3.org/2018/credentials#issuer"
                  :id
                  "https://www.w3.org/2018/credentials#issuer"]
                 [:f/tag :id "https://ns.flur.ee/ledger#tag"]
-                ["https://ns.flur.ee/commit#time"
-                 :id
-                 "https://ns.flur.ee/commit#time"]
+                [:f/time :id "https://ns.flur.ee/ledger#time"]
                 [:f/message :id "https://ns.flur.ee/ledger#message"]
                 [:f/commit :id "https://ns.flur.ee/ledger#commit"]
-                [:f/commit :rdf/type :id]
                 [:f/previous :id "https://ns.flur.ee/ledger#previous"]
                 [:f/address :id "https://ns.flur.ee/ledger#address"]
                 [:id :id "@id"]
@@ -142,17 +125,17 @@
                  :id
                  "fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"]
                 ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"
-                 "https://ns.flur.ee/commit#time"
+                 :f/time
                  720000]
                 ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"
                  "https://www.w3.org/2018/credentials#issuer"
                  "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
                 ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"
-                 "https://ns.flur.ee/commit#v"
+                 :f/v
                  0]
                 ["fluree:commit:sha256:bbtbzn3tluco6xymscko5d43zu3omzmx34aoap54zxsrartydn7k"
-                 "https://ns.flur.ee/commit#data"
-                 "fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"]]
+                 :f/data
+                 "fluree:db:sha256:blioopzpwrymcvy33ejurlazxc4b3sdwvi2xqovgic3f4cmv7nq6"]] 
                @(fluree/query db {:select ['?s '?p '?o]
                                   :where  [['?s '?p '?o]]}))
             "Entire database should be pulled.")))))

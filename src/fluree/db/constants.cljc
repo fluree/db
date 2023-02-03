@@ -15,18 +15,6 @@
 (def ^:const iri-data "https://ns.flur.ee/ledger#data")
 (def ^:const iri-t "https://ns.flur.ee/ledger#t")
 
-(def ^:const iri-commit-address "https://ns.flur.ee/commit#address")
-(def ^:const iri-commit-data "https://ns.flur.ee/commit#data")
-(def ^:const iri-commit-time "https://ns.flur.ee/commit#time")
-(def ^:const iri-commit-message "https://ns.flur.ee/commit#message")
-(def ^:const iri-commit-v "https://ns.flur.ee/commit#v")
-
-(def ^:const iri-commitdata-flakes "https://ns.flur.ee/commitdata#flakes")
-(def ^:const iri-commitdata-size "https://ns.flur.ee/commitdata#size")
-(def ^:const iri-commitdata-t "https://ns.flur.ee/commitdata#t")
-(def ^:const iri-commitdata-v "https://ns.flur.ee/commitdata#v")
-(def ^:const iri-commitdata-address "https://ns.flur.ee/commitdata#address")
-
 (def ^:const iri-address "https://ns.flur.ee/ledger#address")
 (def ^:const iri-v "https://ns.flur.ee/ledger#v")
 (def ^:const iri-flakes "https://ns.flur.ee/ledger#flakes")
@@ -78,9 +66,6 @@
 
 ;; predicate id constants
 
-;;TODO commit address?
-
-
 (def ^:const $_commit:dbId 51)                                ;; JSON-LD: turning into data/db id
 (def ^:const $_commit:prevHash 52)
 (def ^:const $_commit:idRef 53)
@@ -90,11 +75,12 @@
 (def ^:const $_commit:signer 57)
 (def ^:const $_commit:v 58)
 (def ^:const $_commit:address 59)
-(def ^:const $_commit:data 160)
 
 (def ^:const $_ledger:alias 170)
 (def ^:const $_ledger:branch 171)
 
+
+(def ^:const $_commit:data 160)
 (def ^:const $_commitdata:address 180)
 (def ^:const $_commitdata:flakes 182)
 (def ^:const $_commitdata:size 183)
