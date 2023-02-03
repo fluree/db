@@ -303,7 +303,7 @@
     (if (branch? node)
       (resolve node-resolver node)
       (async-cache
-       [::t-range id tempid tt-id from-t to-t]
+       [::history-t-range id tempid tt-id from-t to-t]
        (fn [_]
          (go-try
           (let [resolved (<? (resolve node-resolver node))

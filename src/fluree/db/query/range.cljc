@@ -289,13 +289,10 @@
          range-set (flake/sorted-set-by cmp start-flake end-flake)
          in-range? (fn [node] (intersects-range? node range-set))
          query-xf  (extract-query-flakes {:idx         idx
-                                          :from-t      from-t
-                                          :to-t        to-t
                                           :start-test  start-test
                                           :start-flake start-flake
                                           :end-test    end-test
-                                          :end-flake   end-flake
-                                          :flake-limit limit})]
+                                          :end-flake   end-flake})]
      (go-try
        (let [history-ch (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
                              (filter-authorized db start-flake end-flake error-ch)

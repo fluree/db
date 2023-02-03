@@ -132,19 +132,21 @@
               {:f/t 2
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
                :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
-              {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}]
+              {:f/t 1
+               :f/assert [{:ex/x "foo-1" :id :ex/dan}]
+               :f/retract []}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:to 3}}))))
     (testing "t-range"
       (is (= [{:f/t 4
-                 :f/assert [{:ex/x "foo-dog" :id :ex/dog} {:ex/x "foo-cat" :id :ex/cat}]
-                 :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}
-                {:f/t 3
-                 :f/assert [{:ex/x "foo-3" :id :ex/dan}]
-                 :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
-                {:f/t 2
-                 :f/assert [{:ex/x "foo-2" :id :ex/dan}]
-                 :f/retract [{:ex/x "foo-1" :id :ex/dan}]}]
-               @(fluree/history ledger {:history [nil :ex/x] :t {:from 2 :to 4}}))))
+               :f/assert [{:ex/x "foo-dog" :id :ex/dog} {:ex/x "foo-cat" :id :ex/cat}]
+               :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}
+              {:f/t 3
+               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
+              {:f/t 2
+               :f/assert [{:ex/x "foo-2" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}]
+             @(fluree/history ledger {:history [nil :ex/x] :t {:from 2 :to 4}}))))
     (testing "datetime-t"
       (is (= [{:f/t 3
                :f/assert [{:ex/x "foo-3" :id :ex/dan}]
@@ -154,7 +156,9 @@
                :f/retract [{:ex/x "foo-1" :id :ex/dan}]}]
              @(fluree/history ledger {:history [nil :ex/x] :t {:from ts2 :to ts3}}))
           "does not include t 1, 4, or 5")
-      (is (= [{:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}]
+      (is (= [{:f/t 5
+               :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-3" :id :ex/dan}]}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from (util/current-time-iso)}}))
           "timestamp translates to first t before ts")
 
@@ -168,4 +172,20 @@
       (is (= "History query not properly formatted. Provided {:history []}"
              (-> @(fluree/history ledger {:history []})
                  (Throwable->map)
-                 :cause))))))
+                 :cause))))
+
+    (testing "small cache"
+      (let [conn (test-utils/create-conn)
+            ledger @(fluree/create conn "historycachetest" {:context {:ex "http://example.org/ns/"}})
+
+            db1 @(test-utils/transact ledger [{:id :ex/dan
+                                               :ex/x "foo-1"
+                                               :ex/y "bar-1"}])
+            db2 @(test-utils/transact ledger {:id :ex/dan
+                                              :ex/x "foo-2"
+                                              :ex/y "bar-2"})]
+        (testing "no t-range cache collision"
+          (is (= [#:f{:t 2,
+                      :assert [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/dan}],
+                      :retract [{:ex/x "foo-1", :ex/y "bar-1", :id :ex/dan}]}]
+                 @(fluree/history ledger {:history [:ex/dan] :t {:from 2}}))))))))
