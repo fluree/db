@@ -46,7 +46,6 @@
   "Returns map with :default and :property keys, each having k-v tuples of
   their respective policies."
   [policy-maps]
-  (comp (mapcat identity))
   (->> policy-maps
        (mapcat identity)
        (group-by (fn [policy-map]
