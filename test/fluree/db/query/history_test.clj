@@ -118,7 +118,9 @@
                    {:id
                     "fluree:db:sha256:bkvjivpfq55d2vfh3ttehckx5fdmkkxb5cqggwhuejfdkm5d6f2j"}},
                   :f/data
-                  {:f/flakes 14,
+                  {:f/address
+                   "fluree:memory://72711dc8318d4a0fb198ded6b20dad90a14339b67e52c628767451dfba32d044",
+                   :f/flakes 14,
                    :f/size 1884,
                    :f/t 1,
                    :f/assert
@@ -126,10 +128,6 @@
                      :f/context
                      "{\"schema\":\"http://schema.org/\",\"wiki\":\"https://www.wikidata.org/wiki/\",\"xsd\":\"http://www.w3.org/2001/XMLSchema#\",\"type\":\"@type\",\"rdfs\":\"http://www.w3.org/2000/01/rdf-schema#\",\"ex\":\"http://example.org/ns/\",\"id\":\"@id\",\"f\":\"https://ns.flur.ee/ledger#\",\"sh\":\"http://www.w3.org/ns/shacl#\",\"skos\":\"http://www.w3.org/2008/05/skos#\",\"rdf\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"}",
                      :id "fluree-default-context"}
-                    {:f/address
-                     "fluree:memory://72711dc8318d4a0fb198ded6b20dad90a14339b67e52c628767451dfba32d044",
-                     :id
-                     "fluree:db:sha256:bkvjivpfq55d2vfh3ttehckx5fdmkkxb5cqggwhuejfdkm5d6f2j"}
                     {:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}],
                    :f/retract []}}
                  commit)))))))

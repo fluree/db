@@ -211,7 +211,8 @@
   [f]
   (#{const/$_commitdata:t
      const/$_commitdata:size
-     const/$_commitdata:flakes} (flake/p f)))
+     const/$_commitdata:flakes
+     const/$_commitdata:address} (flake/p f)))
 
 (defn commit-t-flakes->json-ld
   [db compact cache fuel error-ch t-flakes]
