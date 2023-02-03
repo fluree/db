@@ -309,8 +309,7 @@
                        ;; used to link t to commit-data
                        (flake/create const/$_commit:dbId const/$iri const/iri-address const/$xsd:string t true nil)
                        ;; used to link t to commit
-                       (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:string t true nil)
-                       (flake/create const/$_commit:idRef const/$rdf:type const/$iri const/$xsd:anyURI t true nil)]
+                       (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:string t true nil)]
         db* (add-commit-flakes-to-db db schema-flakes)]
     (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
 
