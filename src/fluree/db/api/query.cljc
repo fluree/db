@@ -85,8 +85,8 @@
                           (pr-str query-map))
                      {:status 400
                       :error  :db/invalid-query}))
-     (let [{:keys [commit-details from to]} (history/commit-details-query-parser query-map)
-           [from-t to-t] [(if from (- from) -1) (if to (- to) (:t db))]
+     (let [{{from :from  to :to} :commit-details} (history/commit-details-query-parser query-map)
+           [from-t to-t] [(if from (- from) (:t db)) (if to (- to) (:t db))]
            flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
            results (<? (history/commit-flakes->json-ld db {} flakes))]
        results))))
