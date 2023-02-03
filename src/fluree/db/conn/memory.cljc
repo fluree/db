@@ -179,18 +179,21 @@
   "Creates a new memory connection."
   [{:keys [parallelism async-cache memory defaults]}]
   (go-try
-    (let [ledger-defaults    (<? (ledger-defaults defaults))
-          conn-id            (str (random-uuid))
-          data-atom          (atom {})
-          state              (state-machine/blank-state)
-          async-cache-fn     (or async-cache
-                                 (conn-cache/default-async-cache-fn memory))]
-      (map->MemoryConnection {:id              conn-id
-                              :ledger-defaults ledger-defaults
-                              :data-atom       data-atom
-                              :parallelism     parallelism
-                              :msg-in-ch       (async/chan)
-                              :msg-out-ch      (async/chan)
-                              :memory          true
-                              :state           state
-                              :async-cache     async-cache-fn}))))
+    (let [ledger-defaults (<? (ledger-defaults defaults))
+          conn-id         (str (random-uuid))
+          data-atom       (atom {})
+          state           (state-machine/blank-state)
+
+          async-cache-atom (atom {})
+          async-cache-fn   (or async-cache
+                               (conn-cache/default-async-cache-fn memory async-cache-atom))]
+      (map->MemoryConnection {:id               conn-id
+                              :ledger-defaults  ledger-defaults
+                              :data-atom        data-atom
+                              :parallelism      parallelism
+                              :msg-in-ch        (async/chan)
+                              :msg-out-ch       (async/chan)
+                              :memory           true
+                              :state            state
+                              :async-cache-atom async-cache-atom
+                              :async-cache      async-cache-fn}))))

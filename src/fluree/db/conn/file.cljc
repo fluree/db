@@ -288,21 +288,23 @@
   "Create a new file system connection."
   [{:keys [defaults parallelism storage-path async-cache memory] :as opts}]
   (go
-    (let [storage-path   (trim-last-slash storage-path)
-          conn-id        (str (random-uuid))
-          state          (state-machine/blank-state)
-          async-cache-fn (or async-cache
-                             (conn-cache/default-async-cache-fn memory))]
+    (let [storage-path     (trim-last-slash storage-path)
+          conn-id          (str (random-uuid))
+          state            (state-machine/blank-state)
+          async-cache-atom (atom {})
+          async-cache-fn   (or async-cache
+                               (conn-cache/default-async-cache-fn memory async-cache-atom))]
       ;; TODO - need to set up monitor loops for async chans
-      (map->FileConnection {:id              conn-id
-                            :storage-path    storage-path
-                            :ledger-defaults (ledger-defaults defaults)
-                            :serializer      #?(:clj  (avro-serde/avro-serde)
+      (map->FileConnection {:id               conn-id
+                            :storage-path     storage-path
+                            :ledger-defaults  (ledger-defaults defaults)
+                            :serializer       #?(:clj  (avro-serde/avro-serde)
                                                 :cljs (json-serde/json-serde))
-                            :commit          commit
-                            :push            push
-                            :parallelism     parallelism
-                            :msg-in-ch       (async/chan)
-                            :msg-out-ch      (async/chan)
-                            :state           state
-                            :async-cache     async-cache-fn}))))
+                            :commit           commit
+                            :push             push
+                            :parallelism      parallelism
+                            :msg-in-ch        (async/chan)
+                            :msg-out-ch       (async/chan)
+                            :state            state
+                            :async-cache-atom async-cache-atom
+                            :async-cache      async-cache-fn}))))

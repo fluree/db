@@ -14,7 +14,8 @@
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.indexer.default :as idx-default]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.conn.cache :as conn-cache]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -154,46 +155,6 @@
                          {:status 500 :error :db/unexpected-error})))]))
 
 
-;; TODO - the following few functions are duplicated from fluree.db.connection
-;; TODO - should move to a common space
-
-(defn- lookup-cache
-  [cache-atom k value-fn]
-  (if (nil? value-fn)
-    (swap! cache-atom cache/evict k)
-    (when-let [v (get @cache-atom k)]
-      (do (swap! cache-atom cache/hit k)
-          v))))
-
-(defn- default-object-cache-fn
-  "Default synchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (if-let [v (lookup-cache cache-atom k value-fn)]
-      v
-      (let [v (value-fn k)]
-        (swap! cache-atom cache/miss k v)
-        v))))
-
-(defn- default-async-cache-fn
-  "Default asynchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (let [out (async/chan)]
-      (if-let [v (lookup-cache cache-atom k value-fn)]
-        (async/put! out v)
-        (go
-          (let [v (<! (value-fn k))]
-            (when-not (exception? v)
-              (swap! cache-atom cache/miss k v))
-            (async/put! out v))))
-      out)))
-
-(defn- default-object-cache-factory
-  "Generates a default object cache."
-  [cache-size]
-  (cache/lru-cache-factory {} :threshold cache-size))
-
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
   [ipfs-endpoint {:keys [ipns context did indexer] :as defaults}]
@@ -238,17 +199,18 @@
           _                  (when (< memory-object-size 10)
                                (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
 
-          default-cache-atom (atom (default-object-cache-factory memory-object-size))
+          default-cache-atom (atom {})
           async-cache-fn     (or async-cache
-                                 (default-async-cache-fn default-cache-atom))]
+                                 (conn-cache/default-async-cache-fn default-cache-atom))]
       ;; TODO - need to set up monitor loops for async chans
-      (map->IPFSConnection {:id              conn-id
-                            :ipfs-endpoint   ipfs-endpoint
-                            :ledger-defaults ledger-defaults
-                            :serializer      serializer
-                            :parallelism     parallelism
-                            :msg-in-ch       (async/chan)
-                            :msg-out-ch      (async/chan)
-                            :memory          true
-                            :state           state
-                            :async-cache     async-cache-fn}))))
+      (map->IPFSConnection {:id               conn-id
+                            :ipfs-endpoint    ipfs-endpoint
+                            :ledger-defaults  ledger-defaults
+                            :serializer       serializer
+                            :parallelism      parallelism
+                            :msg-in-ch        (async/chan)
+                            :msg-out-ch       (async/chan)
+                            :memory           true
+                            :state            state
+                            :async-cache-atom default-cache-atom
+                            :async-cache      async-cache-fn}))))

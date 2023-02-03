@@ -14,22 +14,12 @@
       (do (swap! cache-atom cache/hit k)
           v))))
 
-(defn- default-object-cache-fn
-  "Default synchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (if-let [v (lookup-cache cache-atom k value-fn)]
-      v
-      (let [v (value-fn k)]
-        (swap! cache-atom cache/miss k v)
-        v))))
-
-(defn- default-object-cache-factory
+(defn default-object-cache-factory
   "Generates a default object cache."
   [cache-size]
   (cache/lru-cache-factory {} :threshold cache-size))
 
-(defn- default-async-cache-fn*
+(defn default-async-cache-fn*
   [cache-atom]
   (fn [k value-fn]
     (let [out (async/chan)]
@@ -42,13 +32,12 @@
             (async/put! out v))))
       out)))
 
-
 (defn default-async-cache-fn
   "Default asynchronous object cache to use for ledger."
-  [memory]
+  [memory async-cache-atom]
   (let [memory             (or memory 1000000) ; default 1MB memory
         memory-object-size (quot memory 100000)]
     (when (< memory-object-size 10)
       (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.")
                       {:status 400 :error :db/invalid-configuration})))
-    (default-async-cache-fn* (atom (default-object-cache-factory memory-object-size)))))
+    (default-async-cache-fn* (reset! async-cache-atom (default-object-cache-factory memory-object-size)))))
