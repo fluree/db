@@ -228,7 +228,7 @@
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap? issuer] :as _opts}]
+  [db {:keys [bootstrap? issuer js?] :as _opts}]
   (let [{:keys [block ecount schema branch ledger], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
@@ -237,6 +237,7 @@
     {:issuer        issuer
      :db-before     db
      :bootstrap?    bootstrap?
+     :default-ctx   (if js? (:context-str schema) (:context schema))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
@@ -406,33 +407,21 @@
   (-> db :t zero?))
 
 (defn insert
-  "Performs insert transaction"
-  [{:keys [schema t] :as db} json-ld opts]
-  (go-try
-    (let [default-ctx (if (:js? opts) (:context-str schema) (:context schema))
-          tx-state    (->tx-state db opts)
-          nodes       (-> json-ld
-                          (json-ld/expand default-ctx)
-                          util/sequential)
-          flakeset    (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                              (init-db? db) (into (base-flakes t)))
-          db*         (-> (stage-flakes flakeset tx-state nodes)
-                          <?
-                          (final-db tx-state)
-                          <?
-                          (validate-rules tx-state)
-                          <?)]
-      db*)))
+  "Performs insert transaction. Returns async chan with resulting flakes."
+  [{:keys [schema t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
+  (let [nodes    (-> json-ld
+                     (json-ld/expand default-ctx)
+                     util/sequential)
+        flakeset (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
+                         (init-db? db) (into (base-flakes t)))]
+    (stage-flakes flakeset tx-state nodes)))
 
 ;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
 (defn delete
   "Executes a delete statement"
-  [{:keys [t] :as db} max-fuel json-ld opts]
+  [db max-fuel json-ld {:keys [t] :as tx-state}]
   (go-try
-    (let [{:keys [db-before t] :as tx-state}
-          (->tx-state db opts)
-
-          {:keys [delete] :as parsed-query}
+    (let [{:keys [delete] :as parsed-query}
           (-> json-ld
               syntax/validate
               (q-parse/parse-delete db))
@@ -469,11 +458,18 @@
                                   (throw e))
                         delete-ch ([flakes]
                                    flakes))]
-        (-> flakes
-            (final-db tx-state)
-            <?
-            (validate-rules tx-state)
-            <?)))))
+        flakes))))
+
+(defn flakes->final-db
+  "Takes final set of proposed staged flakes and turns them into a new db value
+  along with performing any final validation and policy enforcement."
+  [tx-state flakes]
+  (go-try
+    (-> flakes
+        (final-db tx-state)
+        <?
+        (validate-rules tx-state)
+        <?)))
 
 (defn stage
   "Stages changes, but does not commit.
@@ -481,8 +477,10 @@
   [db json-ld opts]
   (go-try
     (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
-                                           {:subject json-ld})]
-      (if (and (contains? tx :delete)
-               (contains? tx :where))
-        (<? (delete db util/max-integer tx (assoc opts :issuer issuer)))
-        (<? (insert db tx (assoc opts :issuer issuer)))))))
+                                           {:subject json-ld})
+          tx-state (->tx-state db (assoc opts :issuer issuer))
+          flakes   (if (and (contains? tx :delete)
+                            (contains? tx :where))
+                     (<? (delete db util/max-integer tx tx-state))
+                     (<? (insert db tx tx-state)))]
+      (<? (flakes->final-db tx-state flakes)))))
