@@ -317,9 +317,10 @@
   "Returns list of class-ids for given subject-id"
   [db subject-id]
   (go-try
-    (->>
-      (<? (query-range/index-range db :spot = [subject-id const/$rdf:type]))
-      (map flake/o))))
+    (map flake/o
+         (-> (dbproto/-rootdb db)
+             (query-range/index-range :spot = [subject-id const/$rdf:type])
+             <?))))
 
 (defn iri
   "Returns the iri for a given subject ID"

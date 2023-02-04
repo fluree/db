@@ -23,9 +23,7 @@
     (let [s         (flake/s flake)
           p         (flake/p flake)
           class-ids (or (get @(:cache policy) s)
-                        (let [classes (<? (dbproto/-class-ids
-                                            (dbproto/-rootdb db)
-                                            (flake/s flake)))]
+                        (let [classes (<? (dbproto/-class-ids db (flake/s flake)))]
                           ;; note, classes will return empty list if none found ()
                           (swap! (:cache policy) assoc s classes)
                           classes))
