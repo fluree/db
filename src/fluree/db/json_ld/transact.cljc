@@ -388,12 +388,12 @@
              all-classes #{}]
         (if s-flakes
           (let [sid        (flake/s (first s-flakes))
-                {:keys [new? classes shacl]} (get subj-mods' sid)
-                all-flakes (if new?
-                             s-flakes
-                             (<? (query-range/index-range db-after :spot = [sid])))]
+                {:keys [new? classes shacl]} (get subj-mods' sid)]
             (when shacl
-              (<? (shacl/validate-target db-after shacl all-flakes)))
+              (let [all-flakes (if new?
+                                 s-flakes
+                                 (<? (query-range/index-range db-after :spot = [sid])))]
+                (<? (shacl/validate-target db-after shacl all-flakes))))
             (recur r (into all-classes classes)))
           (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
                                (contains? all-classes const/$sh:PropertyShape))]
