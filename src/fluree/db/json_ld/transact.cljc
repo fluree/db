@@ -16,7 +16,9 @@
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec.where :as where]
             [clojure.core.async :as async]
-            [fluree.db.json-ld.credential :as cred])
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.policy.enforce-tx :as policy]
+            [fluree.db.dbproto :as dbproto])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -229,13 +231,14 @@
 
 (defn ->tx-state
   [db {:keys [bootstrap? issuer js?] :as _opts}]
-  (let [{:keys [block ecount schema branch ledger], db-t :t} db
+  (let [{:keys [block ecount schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t        (-> commit-t inc -)] ;; commit-t is always positive, need to make negative for internal indexing
     {:issuer        issuer
-     :db-before     db
+     :db-before     (dbproto/-rootdb db)
+     :policy        policy
      :bootstrap?    bootstrap?
      :default-ctx   (if js? (:context-str schema) (:context schema))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
@@ -328,10 +331,11 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn db-after
-  [{:keys [add remove ref-add ref-remove size count] :as staged} {:keys [db-before bootstrap? t block] :as tx-state}]
+  [{:keys [add remove ref-add ref-remove size count] :as staged} {:keys [db-before policy bootstrap? t block] :as tx-state}]
   (let [{:keys [novelty]} db-before
         {:keys [spot psot post opst tspo]} novelty
         new-db (assoc db-before :ecount (final-ecount tx-state)
+                                :policy policy ;; re-apply policy to db-after
                                 :t t
                                 :block block
                                 :novelty {:spot (update-novelty-idx spot add remove)
@@ -381,26 +385,27 @@
         flakes*))))
 
 (defn validate-rules
-  [{:keys [db-after add]} {:keys [subj-mods] :as _tx-state}]
-  (let [subj-mods' @subj-mods]
+  [{:keys [db-after add] :as staged-map} {:keys [subj-mods] :as _tx-state}]
+  (let [subj-mods' @subj-mods
+        root-db    (dbproto/-rootdb db-after)]
     (go-try
       (loop [[s-flakes & r] (partition-by flake/s add)
              all-classes #{}]
         (if s-flakes
-          (let [sid        (flake/s (first s-flakes))
+          (let [sid (flake/s (first s-flakes))
                 {:keys [new? classes shacl]} (get subj-mods' sid)]
             (when shacl
               (let [all-flakes (if new?
                                  s-flakes
-                                 (<? (query-range/index-range db-after :spot = [sid])))]
-                (<? (shacl/validate-target db-after shacl all-flakes))))
+                                 (<? (query-range/index-range root-db :spot = [sid])))]
+                (<? (shacl/validate-target root-db shacl all-flakes))))
             (recur r (into all-classes classes)))
           (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
                                (contains? all-classes const/$sh:PropertyShape))]
             (when new-shacl?
               ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
               (vocab/reset-shapes (:schema db-after)))
-            db-after))))))
+            staged-map))))))
 
 (defn init-db?
   [db]
@@ -469,6 +474,8 @@
         (final-db tx-state)
         <?
         (validate-rules tx-state)
+        <?
+        (policy/allowed? tx-state)
         <?)))
 
 (defn stage
