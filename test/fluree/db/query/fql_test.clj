@@ -4,27 +4,38 @@
             [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration grouping-test
-  (let [conn   (test-utils/create-conn)
-        people (test-utils/load-people conn)
-        db     (fluree/db people)]
-    (testing "multiple grouped fields"
-      (let [qry     '{:context  {:ex "http://example.org/ns/"}
-                      :select   [?name ?email ?age ?favNums]
-                      :where    [[?s :schema/name ?name]
-                                 [?s :schema/email ?email]
-                                 [?s :schema/age ?age]
-                                 [?s :ex/favNums ?favNums]]
-                      :group-by ?name
-                      :order-by ?name}
-            subject @(fluree/query db qry)]
-        (is (= [["Alice"
-                 ["alice@example.org" "alice@example.org" "alice@example.org"]
-                 [50 50 50]
-                 [9 42 76]]
-                ["Brian" ["brian@example.org"] [50] [7]]
-                ["Cam" ["cam@example.org" "cam@example.org"] [34 34] [5 10]]]
-               subject)
-            "returns grouped results")))))
+  (testing "grouped queries"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+      (testing "with multiple grouped fields"
+        (let [qry     '{:context  {:ex "http://example.org/ns/"}
+                        :select   [?name ?email ?age ?favNums]
+                        :where    [[?s :schema/name ?name]
+                                   [?s :schema/email ?email]
+                                   [?s :schema/age ?age]
+                                   [?s :ex/favNums ?favNums]]
+                        :group-by ?name
+                        :order-by ?name}
+              subject @(fluree/query db qry)]
+          (is (= [["Alice"
+                   ["alice@example.org" "alice@example.org" "alice@example.org"]
+                   [50 50 50]
+                   [9 42 76]]
+                  ["Brian" ["brian@example.org"] [50] [7]]
+                  ["Cam" ["cam@example.org" "cam@example.org"] [34 34] [5 10]]]
+                 subject)
+              "returns grouped results")))
+
+      (testing "with having clauses"
+        (is (= [["Cam" [5 10]] ["Alice" [9 42 76]]]
+               @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
+                                   :select   [?name ?favNums]
+                                   :where    [[?s :schema/name ?name]
+                                              [?s :ex/favNums ?favNums]]
+                                   :group-by ?name
+                                   :having   (>= (count ?favNums) 2)}))
+            "filters results according to the supplied having function code")))))
 
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)

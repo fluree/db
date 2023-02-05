@@ -5,6 +5,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.order :as order]
+            [fluree.db.query.exec.having :as having]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -53,6 +54,7 @@
                         (order/arrange q)
                         (drop-offset q)
                         (take-limit q)
+                        (having/filter q error-ch)
                         (select/format db q error-ch)
                         (collect-results q))]
      (async/alt!

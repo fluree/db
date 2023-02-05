@@ -1,5 +1,6 @@
 (ns fluree.db.query.fql.parse
-  (:require [fluree.db.query.exec.where :as where]
+  (:require [fluree.db.query.exec.eval :as eval]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
@@ -379,6 +380,18 @@
                          [v :asc]
                          [v :desc])))))))
 
+(defn parse-code
+  [x]
+  (if (list? x)
+    x
+    (safe-read x)))
+
+(defn parse-having
+  [q]
+  (if-let [code (some-> q :having parse-code)]
+    (assoc q :having (eval/compile code))
+    q))
+
 (defn parse-analytical-query*
   [q db]
   (let [context  (parse-context q db)
@@ -392,6 +405,7 @@
                :where   where)
         (cond-> grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
+        parse-having
         (parse-select db context))))
 
 (defn parse-analytical-query
