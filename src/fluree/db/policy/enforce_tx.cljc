@@ -1,9 +1,9 @@
 (ns fluree.db.policy.enforce-tx
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.permissions-validate :as validate]
-            [fluree.db.util.log :as log]))
+            [fluree.db.permissions-validate :as validate]))
 
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn root?
   "Returns true if policy has root modify permissions."
