@@ -14,7 +14,8 @@
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.indexer.default :as idx-default]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.conn.cache :as conn-cache]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -75,7 +76,7 @@
               ledgers   (<? (ipfs-dir/list-all ipfs-endpoint ipfs-addr))]
           (contains? ledgers ledger))))))
 
-(defrecord IPFSConnection [id memory state ledger-defaults async-cache
+(defrecord IPFSConnection [id memory state ledger-defaults lru-cache-atom
                            serializer parallelism msg-in-ch msg-out-ch
                            ipfs-endpoint]
 
@@ -138,14 +139,15 @@
   index/Resolver
   (resolve
     [conn {:keys [id leaf tempid] :as node}]
-    (if (= :empty id)
-      (storage/resolve-empty-leaf node)
-      (async-cache
-          [::resolve id tempid]
+    (let [cache-key [::resolve id tempid]]
+      (if (= :empty id)
+        (storage/resolve-empty-leaf node)
+        (conn-cache/lru-lookup
+          lru-cache-atom
+          cache-key
           (fn [_]
             (storage/resolve-index-node conn node
-                                        (fn []
-                                          (async-cache [::resolve id tempid] nil)))))))
+                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
 
   #?@(:clj
       [full-text/IndexConnection
@@ -153,46 +155,6 @@
          (throw (ex-info "IPFS connection does not support full text operations."
                          {:status 500 :error :db/unexpected-error})))]))
 
-
-;; TODO - the following few functions are duplicated from fluree.db.connection
-;; TODO - should move to a common space
-
-(defn- lookup-cache
-  [cache-atom k value-fn]
-  (if (nil? value-fn)
-    (swap! cache-atom cache/evict k)
-    (when-let [v (get @cache-atom k)]
-      (do (swap! cache-atom cache/hit k)
-          v))))
-
-(defn- default-object-cache-fn
-  "Default synchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (if-let [v (lookup-cache cache-atom k value-fn)]
-      v
-      (let [v (value-fn k)]
-        (swap! cache-atom cache/miss k v)
-        v))))
-
-(defn- default-async-cache-fn
-  "Default asynchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (let [out (async/chan)]
-      (if-let [v (lookup-cache cache-atom k value-fn)]
-        (async/put! out v)
-        (go
-          (let [v (<! (value-fn k))]
-            (when-not (exception? v)
-              (swap! cache-atom cache/miss k v))
-            (async/put! out v))))
-      out)))
-
-(defn- default-object-cache-factory
-  "Generates a default object cache."
-  [cache-size]
-  (cache/lru-cache-factory {} :threshold cache-size))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
@@ -225,22 +187,18 @@
 
 (defn connect
   "Creates a new IPFS connection."
-  [{:keys [server parallelism async-cache memory defaults serializer]
+  [{:keys [server parallelism lru-cache-atom memory defaults serializer]
     :or   {server     "http://127.0.0.1:5001/"
            serializer (json-serde)}}]
   (go-try
-    (let [ipfs-endpoint      (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
-          ledger-defaults    (<? (ledger-defaults ipfs-endpoint defaults))
-          memory             (or memory 1000000)            ;; default 1MB memory
-          conn-id            (str (random-uuid))
-          state              (state-machine/blank-state)
-          memory-object-size (quot memory 100000)           ;; avg 100kb per cache object
-          _                  (when (< memory-object-size 10)
-                               (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.") {:status 400 :error :db/invalid-configuration})))
+    (let [ipfs-endpoint   (or server "http://127.0.0.1:5001/") ;; TODO - validate endpoint looks like a good URL and ends in a '/' or add it
+          ledger-defaults (<? (ledger-defaults ipfs-endpoint defaults))
+          memory          (or memory 1000000) ;; default 1MB memory
+          conn-id         (str (random-uuid))
+          state           (state-machine/blank-state)
 
-          default-cache-atom (atom (default-object-cache-factory memory-object-size))
-          async-cache-fn     (or async-cache
-                                 (default-async-cache-fn default-cache-atom))]
+          cache-size     (conn-cache/memory->cache-size memory)
+          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
                             :ipfs-endpoint   ipfs-endpoint
@@ -251,4 +209,4 @@
                             :msg-out-ch      (async/chan)
                             :memory          true
                             :state           state
-                            :async-cache     async-cache-fn}))))
+                            :lru-cache-atom  lru-cache-atom}))))

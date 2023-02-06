@@ -2,53 +2,42 @@
   "A simple default connection-level cache."
   (:require [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.core.async :as async]
-            [fluree.db.util.core :as util
-             #?@(:clj [:refer [try* catch* exception?]])
-             #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])]))
+            [fluree.db.util.core :as util :refer [exception?]]))
 
-(defn- lookup-cache
-  [cache-atom k value-fn]
-  (if (nil? value-fn)
-    (swap! cache-atom cache/evict k)
-    (when-let [v (get @cache-atom k)]
-      (do (swap! cache-atom cache/hit k)
-          v))))
-
-(defn- default-object-cache-fn
-  "Default synchronous object cache to use for ledger."
-  [cache-atom]
-  (fn [k value-fn]
-    (if-let [v (lookup-cache cache-atom k value-fn)]
-      v
-      (let [v (value-fn k)]
-        (swap! cache-atom cache/miss k v)
-        v))))
-
-(defn- default-object-cache-factory
-  "Generates a default object cache."
+(defn create-lru-cache
+  "Create a cache that holds `cache-size` number of entries, bumping out the least
+  recently used value after the size is exceeded."
   [cache-size]
   (cache/lru-cache-factory {} :threshold cache-size))
 
-(defn- default-async-cache-fn*
-  [cache-atom]
-  (fn [k value-fn]
-    (let [out (async/chan)]
-      (if-let [v (lookup-cache cache-atom k value-fn)]
-        (async/put! out v)
-        (async/go
-          (let [v (async/<! (value-fn k))]
-            (when-not (exception? v)
-              (swap! cache-atom cache/miss k v))
-            (async/put! out v))))
-      out)))
-
-
-(defn default-async-cache-fn
-  "Default asynchronous object cache to use for ledger."
+(defn memory->cache-size
+  "Validate system memory is enough to build a usable cache, then derive cache size."
   [memory]
-  (let [memory             (or memory 1000000) ; default 1MB memory
-        memory-object-size (quot memory 100000)]
-    (when (< memory-object-size 10)
+  (let [memory      (or memory 1000000)        ; default 1MB memory
+        object-size 100000                     ; estimate 100kb index node size
+        cache-size  (quot memory object-size)] ; number of objects to keep in cache
+    (when (< cache-size 10)
       (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.")
                       {:status 400 :error :db/invalid-configuration})))
-    (default-async-cache-fn* (atom (default-object-cache-factory memory-object-size)))))
+    cache-size))
+
+(defn lru-lookup
+  "Given an LRU cache atom, look up value for `k`. If not found, use `value-fn` (a
+  function that accepts `k` as its only argument and returns an async channel) to
+  produce the value and add it to the cache."
+  [cache-atom k value-fn]
+  (let [out (async/chan)]
+    (if-let [v (get @cache-atom k)]
+      (do (swap! cache-atom cache/hit k)
+          (async/put! out v))
+      (async/go
+        (let [v (async/<! (value-fn k))]
+          (when-not (exception? v)
+            (swap! cache-atom cache/miss k v))
+          (async/put! out v))))
+    out))
+
+(defn lru-evict
+  "Evict the key `k` from the cache."
+  [cache-atom k]
+  (swap! cache-atom cache/evict k))

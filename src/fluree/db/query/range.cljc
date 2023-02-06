@@ -143,9 +143,9 @@
   "Returns a channel that will contain a stream of chunked flake collections that
   contain the flakes between `start-flake` and `end-flake` and are within the
   transaction range starting at `from-t` and ending at `to-t`."
-  [{:keys [async-cache] :as conn} root novelty error-ch
+  [{:keys [lru-cache-atom] :as conn} root novelty error-ch
    {:keys [from-t to-t start-flake end-flake] :as opts}]
-  (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t async-cache)
+  (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
         cmp       (:comparator root)
         range-set (flake/sorted-set-by cmp start-flake end-flake)
         in-range? (fn [node]
@@ -284,7 +284,7 @@
          novelty  (get-in db [:novelty idx])
 
          ;; resolve-flake-slices
-         resolver  (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:async-cache conn))
+         resolver  (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:lru-cache-atom conn))
          cmp       (:comparator idx-root)
          range-set (flake/sorted-set-by cmp start-flake end-flake)
          in-range? (fn [node] (intersects-range? node range-set))

@@ -187,7 +187,7 @@
     (str (local-path store) "/" ledger "/" "indexes" "/" (str/join "/" r))))
 
 (defrecord FileConnection [id memory state ledger-defaults push commit
-                           parallelism msg-in-ch msg-out-ch async-cache]
+                           parallelism msg-in-ch msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (go (read-commit conn commit-key)))
@@ -286,13 +286,14 @@
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path async-cache memory] :as opts}]
+  [{:keys [defaults parallelism storage-path lru-cache-atom memory] :as opts}]
   (go
-    (let [storage-path   (trim-last-slash storage-path)
-          conn-id        (str (random-uuid))
-          state          (state-machine/blank-state)
-          async-cache-fn (or async-cache
-                             (conn-cache/default-async-cache-fn memory))]
+    (let [storage-path (trim-last-slash storage-path)
+          conn-id      (str (random-uuid))
+          state        (state-machine/blank-state)
+
+          cache-size     (conn-cache/memory->cache-size memory)
+          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
                             :storage-path    storage-path
@@ -305,4 +306,4 @@
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)
                             :state           state
-                            :async-cache     async-cache-fn}))))
+                            :lru-cache-atom  lru-cache-atom}))))
