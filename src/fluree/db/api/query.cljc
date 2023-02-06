@@ -51,7 +51,7 @@
      (let [{{from :from  to :to} :commit-details} (history/commit-details-query-parser query-map)
            [from-t to-t] [(if from (- from) (:t db)) (if to (- to) (:t db))]
            flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
-           results (<? (history/commit-flakes->json-ld db {} flakes))]
+           results (<? (history/commit-flakes->json-ld db query-map flakes))]
        results))))
 
 
