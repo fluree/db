@@ -250,9 +250,6 @@
 (defn time-range
   "Range query across an index.
 
-  Uses a DB, but in the future support supplying a connection and db name, as we
-  don't need a 't'
-
   Ranges take the natural numeric sort orders, but all results will return in
   reverse order (newest subjects and predicates first).
 
@@ -264,42 +261,47 @@
   :to-t - stop transaction - can be null, which pulls full history
   :xform - xform applied to each result individually. This is not used
            when :chan is supplied.
-  :limit - max number of flakes to return"
-  ([db idx] (time-range db idx {}))
-  ([db idx opts] (time-range db idx >= (min-match idx) <= (max-match idx) opts))
-  ([db idx test match] (time-range db idx test match {}))
+  :flake-limit - max number of flakes to return"
   ([db idx test match opts]
    (let [[start-test start-match end-test end-match]
          (expand-range-interval idx test match)]
      (time-range db idx start-test start-match end-test end-match opts)))
-  ([db idx start-test start-match end-test end-match]
-   (time-range db idx start-test start-match end-test end-match {}))
-  ([{t :t :as db} idx start-test start-match end-test end-match opts]
-   (let [{:keys [limit from-t to-t]
+  ([{:keys [t conn ] :as db} idx start-test start-match end-test end-match opts]
+   (let [{:keys [limit offset flake-limit from-t to-t]
           :or   {from-t t, to-t t}}
          opts
 
          start-parts (match->flake-parts db idx start-match)
-         end-parts   (match->flake-parts db idx end-match)]
+         end-parts   (match->flake-parts db idx end-match)
+
+         start-flake (apply resolve-match-flake start-test start-parts)
+         end-flake   (apply resolve-match-flake end-test end-parts)
+         error-ch    (chan)
+
+         ;; index-range*
+         idx-root (get db idx)
+         idx-cmp  (get-in db [:comparators idx])
+         novelty  (get-in db [:novelty idx])
+
+         ;; resolve-flake-slices
+         resolver  (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:async-cache conn))
+         cmp       (:comparator idx-root)
+         range-set (flake/sorted-set-by cmp start-flake end-flake)
+         in-range? (fn [node] (intersects-range? node range-set))
+         query-xf  (extract-query-flakes {:idx         idx
+                                          :start-test  start-test
+                                          :start-flake start-flake
+                                          :end-test    end-test
+                                          :end-flake   end-flake})]
      (go-try
-      (let [start-flake (apply resolve-match-flake start-test start-parts)
-            end-flake   (apply resolve-match-flake end-test end-parts)
-            error-ch    (chan)
-            range-ch    (index-range* db
-                                      error-ch
-                                      {:idx idx
-                                       :from-t from-t
-                                       :to-t to-t
-                                       :start-test start-test
-                                       :start-flake start-flake
-                                       :end-test end-test
-                                       :end-flake end-flake
-                                       :flake-limit limit})]
-        (async/alt!
-          error-ch ([e]
-                    (throw e))
-          range-ch ([hist-range]
-                    hist-range)))))))
+       (let [history-ch (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
+                             (filter-authorized db start-flake end-flake error-ch)
+                             (into-page limit offset flake-limit))]
+         (async/alt!
+           error-ch ([e]
+                     (throw e))
+           history-ch ([hist-range]
+                       hist-range)))))))
 
 (defn index-range
   "Range query across an index as of a 't' defined by the db.
