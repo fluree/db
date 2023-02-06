@@ -139,14 +139,15 @@
   index/Resolver
   (resolve
     [conn {:keys [id leaf tempid] :as node}]
-    (if (= :empty id)
-      (storage/resolve-empty-leaf node)
-      (conn-cache/lru-lookup
-        lru-cache-atom
-        [::resolve id tempid]
-        (fn [_]
-          (storage/resolve-index-node conn node
-                                      (fn [] (conn-cache/lru-lookup lru-cache-atom [::resolve id tempid] nil)))))))
+    (let [cache-key [::resolve id tempid]]
+      (if (= :empty id)
+        (storage/resolve-empty-leaf node)
+        (conn-cache/lru-lookup
+          lru-cache-atom
+          cache-key
+          (fn [_]
+            (storage/resolve-index-node conn node
+                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
 
   #?@(:clj
       [full-text/IndexConnection

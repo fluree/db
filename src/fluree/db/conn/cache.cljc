@@ -6,14 +6,6 @@
              #?@(:clj [:refer [try* catch* exception?]])
              #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])]))
 
-(defn lookup-or-evict
-  [cache-atom k value-fn]
-  (if (nil? value-fn)
-    (swap! cache-atom cache/evict k)
-    (when-let [v (get @cache-atom k)]
-      (do (swap! cache-atom cache/hit k)
-          v))))
-
 (defn create-lru-cache
   "Create a cache that starts holds `cache-size` number of entries, bumping out the least
   recently used value after the size is exceeded.."
@@ -35,13 +27,19 @@
   [cache-atom k value-fn]
   "Given an LRU cache atom, look up value for `k`. If not found, use `value-fn` (a
   function that accepts `k` as its only argument) to produce the value and add it to the
-  cache.  If `value-fn` is `nil`, evict the key from the cache."
+  cache."
   (let [out (async/chan)]
-    (if-let [v (lookup-or-evict cache-atom k value-fn)]
-      (async/put! out v)
+    (if-let [v (get @cache-atom k)]
+      (do (swap! cache-atom cache/hit k)
+          (async/put! out v))
       (async/go
         (let [v (async/<! (value-fn k))]
           (when-not (exception? v)
             (swap! cache-atom cache/miss k v))
           (async/put! out v))))
     out))
+
+(defn lru-evict
+  "Evict the key `k` from the cache."
+  [cache-atom k]
+  (swap! cache-atom cache/evict k))
