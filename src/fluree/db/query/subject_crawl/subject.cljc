@@ -9,8 +9,9 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.exec :refer [drop-offset take-limit]]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
-                                                          subj-perm-filter-fn filter-subject]]
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af
+                                                          resolve-ident-vars filter-subject]]
+            [fluree.db.permissions-validate :refer [filter-subject-flakes]]
             [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -74,23 +75,21 @@
 
 (defn flakes-xf
   [{:keys [db fuel-vol max-fuel error-ch vars filter-map permissioned?] :as _opts}]
-  (let [permissions (when permissioned?
-                      (subj-perm-filter-fn db))]
-    (fn [sid port]
-      (async/go
-        (try*
-          ;; TODO: Right now we enforce permissions after the index-range call, but
-          ;; TODO: in some circumstances we can know user can see no subject flakes
-          ;; TODO: and if detected, could avoid index-range call entirely.
-          (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
-                                filter-map (filter-subject vars filter-map)
-                                permissioned? permissions
-                                permissioned? <?)]
-            (when (seq flakes)
-              (async/put! port flakes))
+  (fn [sid port]
+    (async/go
+      (try*
+        ;; TODO: Right now we enforce permissions after the index-range call, but
+        ;; TODO: in some circumstances we can know user can see no subject flakes
+        ;; TODO: and if detected, could avoid index-range call entirely.
+        (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
+                              filter-map (filter-subject vars filter-map)
+                              permissioned? (filter-subject-flakes db)
+                              permissioned? <?)]
+          (when (seq flakes)
+            (async/put! port flakes))
 
-            (async/close! port))
-          (catch* e (async/put! error-ch e) (async/close! port) nil))))))
+          (async/close! port))
+        (catch* e (async/put! error-ch e) (async/close! port) nil)))))
 
 
 (defn subjects-id-chan

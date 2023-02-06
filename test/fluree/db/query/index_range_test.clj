@@ -89,4 +89,14 @@
             (is (= (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 8]])
                         (mapv flake/Flake->parts))
                    [])
-                "We specify a different datatype for the value, nothing should be returned")))))))
+                "We specify a different datatype for the value, nothing should be returned")))
+
+
+        (testing "Subject IRI resolution for index-range automatically happens"
+          (let [with-compact-iri @(fluree/range db :spot = [:ex/alice])
+                with-full-iri    @(fluree/range db :spot = [(fluree/expand-iri db :ex/alice)])
+                with-sid         @(fluree/range db :spot = [@(fluree/internal-id db :ex/alice)])]
+            (is (= with-compact-iri
+                   with-full-iri
+                   with-sid)
+                "Compact IRIs and expanded string IRIs should automatically resolve to subject ids.")))))))
