@@ -251,7 +251,6 @@
 
 (defn commit-flakes->json-ld
   [db q flakes]
-  (def flakes flakes)
   (go-try
     (let [fuel    (volatile! 0)
           cache   (volatile! {})
