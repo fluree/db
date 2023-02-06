@@ -93,10 +93,15 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.3.0"}}
-   :main-opts  ["-m" "eastwood.lint"
-                {:source-paths ["src" "src-docs"]
-                 :test-paths   ["test"]}]}
+  {:extra-deps  {jonase/eastwood {:mvn/version "1.3.0"}}
+   :main-opts   ["-m" "eastwood.lint"
+                 {:source-paths ["src" "src-docs"]
+                  :test-paths   ["test"]
+                  ;; TODO: Un-exclude this when it stops triggering false
+                  ;;       positives on "UnsupportedOperationException empty is
+                  ;;       not supported on Flake" when using the #Flake data
+                  ;;       reader - WSM 2023-02-01
+                  :exclude-linters [:implicit-dependencies]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}

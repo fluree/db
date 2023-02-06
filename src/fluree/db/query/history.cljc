@@ -4,6 +4,7 @@
    [malli.core :as m]
    [fluree.json-ld :as json-ld]
    [fluree.db.constants :as const]
+   [fluree.db.datatype :as datatype]
    [fluree.db.dbproto :as dbproto]
    [fluree.db.flake :as flake]
    [fluree.db.query.json-ld.response :as json-ld-resp]
@@ -34,12 +35,16 @@
    [:t {:optional true}
     [:and
      [:map
-      [:from {:optional true} pos-int?]
-      [:to {:optional true} pos-int?]]
+      [:from {:optional true} [:or
+                               pos-int?
+                               datatype/iso8601-datetime-re]]
+      [:to {:optional true} [:or
+                             pos-int?
+                             datatype/iso8601-datetime-re]]]
      [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
       (fn [{:keys [from to]}] (or from to))]
      [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
-      (fn [{:keys [from to]}] (if (and from to)
+      (fn [{:keys [from to]}] (if (and from to (number? from) (number? to))
                                 (<= from to)
                                 true))]]]])
 
@@ -59,38 +64,66 @@
   [query]
   (history-query-validator query))
 
-(defn t-flakes->json-ld
-  [db compact cache fuel error-ch t-flakes]
+
+(defn s-flakes->json-ld
+  [db cache compact fuel error-ch s-flakes]
   (async/go
     (try*
-      (let [assert-flakes  (not-empty (filter flake/op t-flakes))
-            retract-flakes (not-empty (filter (complement flake/op) t-flakes))
-
-            asserts-chan   (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                     {:wildcard? true, :depth 0}
-                                                     0 assert-flakes)
-            retracts-chan  (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                     {:wildcard? true, :depth 0}
-                                                     0 retract-flakes)
-
-            asserts (<? asserts-chan)
-            retracts (<? retracts-chan)
-
-            ;; t is always positive for users
-            result         (cond-> {:t (- (flake/t (first t-flakes)))}
-                             asserts (assoc :assert asserts)
-                             retracts (assoc :retract retracts))]
-        result)
+      (let [json-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                {:wildcard? true, :depth 0}
+                                                0 s-flakes)]
+        (-> (<? json-chan)
+            ;; add the id in case the iri flake isn't present in s-flakes
+            (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
       (catch* e
               (log/error e "Error converting history flakes.")
               (async/>! error-ch e)))))
+
+(defn t-flakes->json-ld
+  [db compact cache fuel error-ch t-flakes]
+  (go-try
+    (let [{assert-flakes  true
+           retract-flakes false} (group-by flake/op t-flakes)
+
+          s-flake-partitions (fn [flakes]
+                               (->> flakes
+                                    (group-by flake/s)
+                                    (vals)
+                                    (async/to-chan!)))
+
+          s-asserts-ch  (s-flake-partitions assert-flakes)
+          s-retracts-ch (s-flake-partitions retract-flakes)
+
+          s-asserts-out-ch  (async/chan)
+          s-retracts-out-ch (async/chan)
+
+          s-asserts-json-ch  (async/into [] s-asserts-out-ch)
+          s-retracts-json-ch (async/into [] s-retracts-out-ch)]
+      ;; process asserts
+      (async/pipeline-async 2
+                            s-asserts-out-ch
+                            (fn [assert-flakes ch]
+                              (-> (s-flakes->json-ld db cache compact fuel error-ch assert-flakes)
+                                  (async/pipe ch)))
+                            s-asserts-ch)
+      ;; process retracts
+      (async/pipeline-async 2
+                            s-retracts-out-ch
+                            (fn [retract-flakes ch]
+                              (-> (s-flakes->json-ld db cache compact fuel error-ch retract-flakes)
+                                  (async/pipe ch)))
+                            s-retracts-ch)
+      {(json-ld/compact const/iri-t compact) (- (flake/t (first t-flakes)))
+       (json-ld/compact const/iri-assert compact) (async/<! s-asserts-json-ch)
+       (json-ld/compact const/iri-retract compact) (async/<! s-retracts-json-ch)})))
 
 (defn history-flakes->json-ld
   [db q flakes]
   (go-try
     (let [fuel    (volatile! 0)
           cache   (volatile! {})
-          compact (json-ld/compact-fn (fql-parse/parse-context q db))
+          context (fql-parse/parse-context q db)
+          compact (json-ld/compact-fn context)
 
           error-ch   (async/chan)
           out-ch     (async/chan)
@@ -150,55 +183,6 @@
   [query]
   (commit-details-query-validator query))
 
-(defn s-flakes->json-ld
-  [db cache compact fuel error-ch s-flakes]
-  (async/go
-    (try*
-      (let [json-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                {:wildcard? true, :depth 0}
-                                                0 s-flakes)]
-        (-> (<? json-chan)
-            ;; add the id in case the iri flake isn't present in s-flakes
-            (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
-      (catch* e
-              (log/error e "Error converting history flakes.")
-              (async/>! error-ch e)))))
-
-(defn t-flakes->json-ld2
-  [db compact cache fuel error-ch t-flakes]
-  (go-try
-    (let [assert-flakes (not-empty (filter flake/op t-flakes))
-          retract-flakes (not-empty (filter (complement flake/op) t-flakes))
-
-          s-asserts-ch (->> (sort-by flake/s assert-flakes)
-                            (partition-by flake/s)
-                            (async/to-chan!))
-          s-retracts-ch (->> (sort-by flake/s retract-flakes)
-                             (partition-by flake/s)
-                             (async/to-chan!))
-
-          s-asserts-out-ch (async/chan)
-          s-retracts-out-ch (async/chan)
-
-          s-asserts-json-ch (async/into [] s-asserts-out-ch)
-          s-retracts-json-ch (async/into [] s-retracts-out-ch)]
-      ;; process asserts
-      (async/pipeline-async 2
-                            s-asserts-out-ch
-                            (fn [assert-flakes ch]
-                              (-> (s-flakes->json-ld db cache compact fuel error-ch assert-flakes)
-                                  (async/pipe ch)))
-                            s-asserts-ch)
-      ;; process retracts
-      (async/pipeline-async 2
-                            s-retracts-out-ch
-                            (fn [retract-flakes ch]
-                              (-> (s-flakes->json-ld db cache compact fuel error-ch retract-flakes)
-                                  (async/pipe ch)))
-                            s-retracts-ch)
-      {(json-ld/compact const/iri-t compact) (- (flake/t (first t-flakes)))
-       (json-ld/compact const/iri-assert compact) (<? s-asserts-json-ch)
-       (json-ld/compact const/iri-retract compact) (<? s-retracts-json-ch)})))
 
 (defn commit-metadata-flake?
   [f]
@@ -238,7 +222,7 @@
            commit-data (<? commit-data-chan)
 
            {asserts (json-ld/compact const/iri-assert compact)
-            retracts (json-ld/compact const/iri-retract compact)} (<? (t-flakes->json-ld2 db compact cache fuel error-ch data-flakes))
+            retracts (json-ld/compact const/iri-retract compact)} (<? (t-flakes->json-ld db compact cache fuel error-ch data-flakes))
            ;; t is always positive for users
            result         (assoc {(json-ld/compact const/iri-commit compact) commit-meta}
                                  (json-ld/compact const/iri-data compact ) commit-data)]

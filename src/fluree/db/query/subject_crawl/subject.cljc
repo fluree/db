@@ -9,8 +9,9 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.exec :refer [drop-offset take-limit]]
             [fluree.db.query.exec.where :as where]
-            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af resolve-ident-vars
-                                                          subj-perm-filter-fn filter-subject]]
+            [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af
+                                                          resolve-ident-vars filter-subject]]
+            [fluree.db.permissions-validate :refer [filter-subject-flakes]]
             [fluree.db.dbproto :as dbproto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -24,7 +25,7 @@
                       (when-let [variable (:variable o)]
                         (get vars variable)))
         p*          (:value p)
-        idx*        (where/idx-for nil p* o*) 
+        idx*        (where/idx-for nil p* o*)
         o-dt        (:datatype o)
         [fflake lflake] (case idx*
                           :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
@@ -53,7 +54,7 @@
                                     :xf          (when filter-fn
                                                    (map (fn [flakes]
                                                           (filter filter-fn flakes))))})
-          resolver  (index/->CachedTRangeResolver conn (get novelty idx*) t t (:async-cache conn))
+          resolver  (index/->CachedTRangeResolver conn (get novelty idx*) t t (:lru-cache-atom conn))
           tree-chan (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
       (async/go-loop []
         (let [next-chunk (<! tree-chan)]
@@ -74,23 +75,21 @@
 
 (defn flakes-xf
   [{:keys [db fuel-vol max-fuel error-ch vars filter-map permissioned?] :as _opts}]
-  (let [permissions (when permissioned?
-                      (subj-perm-filter-fn db))]
-    (fn [sid port]
-      (async/go
-        (try*
-          ;; TODO: Right now we enforce permissions after the index-range call, but
-          ;; TODO: in some circumstances we can know user can see no subject flakes
-          ;; TODO: and if detected, could avoid index-range call entirely.
-          (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
-                                filter-map (filter-subject vars filter-map)
-                                permissioned? permissions
-                                permissioned? <?)]
-            (when (seq flakes)
-              (async/put! port flakes))
+  (fn [sid port]
+    (async/go
+      (try*
+        ;; TODO: Right now we enforce permissions after the index-range call, but
+        ;; TODO: in some circumstances we can know user can see no subject flakes
+        ;; TODO: and if detected, could avoid index-range call entirely.
+        (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
+                              filter-map (filter-subject vars filter-map)
+                              permissioned? (filter-subject-flakes db)
+                              permissioned? <?)]
+          (when (seq flakes)
+            (async/put! port flakes))
 
-            (async/close! port))
-          (catch* e (async/put! error-ch e) (async/close! port) nil))))))
+          (async/close! port))
+        (catch* e (async/put! error-ch e) (async/close! port) nil)))))
 
 
 (defn subjects-id-chan

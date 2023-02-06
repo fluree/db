@@ -1,13 +1,11 @@
-(ns fluree.db.policy.parsing
+(ns fluree.db.policy.parsing-test
   (:require
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.did :as did]
     [fluree.db.json-ld.policy :as policy]
-    [fluree.db.util.async :refer [<? <?? go-try]]
-    [fluree.db.util.log :as log]
-    [fluree.db.dbproto :as dbproto]))
+    [fluree.db.util.async :refer [<? <?? go-try]]))
 
 ;; tests to ensure policy enforcement parsing is accurate
 
@@ -84,34 +82,44 @@
                                              :f/allow [{:id           :ex/ssnViewRule
                                                         :f/targetRole :ex/userRole
                                                         :f/action     [:f/view]
-                                                        :f/equals     {:list [:f/$identity :ex/user]}}]}]}])
-          sid-userRole @(fluree/promise-wrap (dbproto/-subid db :ex/userRole))
-          sid-alice    @(fluree/promise-wrap (dbproto/-subid db alice-did))
-          sid-User     @(fluree/promise-wrap (dbproto/-subid db :ex/User))
-          sid-ssn      @(fluree/promise-wrap (dbproto/-subid db :schema/ssn))
-          ;; create optimized policy map for ex:userRole
-          policy-alice (-> @(fluree/promise-wrap (policy/policy-map db alice-did :ex/userRole nil))
-                           replace-policy-fns)
-          policy-root  @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))]
+                                                        :f/equals     {:list [:f/$identity :ex/user]}}]}]}])]
 
-      ;; look at  policy for user
-      (is (= {:f/modify {:class {sid-User {:default {:f/equals     [{:id :f/$identity}
-                                                                    {:id :ex/user}]
-                                                     :f/targetRole {:_id sid-userRole}
-                                                     :function     [true
-                                                                    :fluree.db.policy.parsing/replaced-policy-function]
-                                                     :id           "_:f211106232533008"}}}}
-              :f/view   {:class {sid-User {sid-ssn  {:f/equals     [{:id :f/$identity}
-                                                                    {:id :ex/user}]
-                                                     :f/targetRole {:_id sid-userRole}
-                                                     :function     [true
-                                                                    :fluree.db.policy.parsing/replaced-policy-function]
-                                                     :id           :ex/ssnViewRule}
-                                           :default {:f/targetRole {:_id sid-userRole}
-                                                     :function     [false
-                                                                    :fluree.db.policy.parsing/replaced-policy-function]
-                                                     :id           :ex/globalViewAllow}}}}
-              :ident    sid-alice
-              :roles    #{sid-userRole}}
-             policy-alice)
-          "Policies for only :ex/userRole should return"))))
+      (testing "Policy map for classes and props within classes is properly formed"
+        (let [policy-alice  (-> @(fluree/promise-wrap (policy/policy-map db alice-did :ex/userRole nil))
+                                replace-policy-fns)
+              sid-User      @(fluree/internal-id db :ex/User)
+              sid-ssn       @(fluree/internal-id db :schema/ssn)
+              sid-alice-did @(fluree/internal-id db alice-did)
+              sid-userRole  @(fluree/internal-id db :ex/userRole)]
+          (is (= {:f/modify {:class {sid-User {:default {:f/equals     [{:id :f/$identity}
+                                                                        {:id :ex/user}]
+                                                         :f/targetRole {:_id sid-userRole}
+                                                         :function     [true
+                                                                        ::replaced-policy-function]
+                                                         :id           "_:f211106232533008"}}}}
+                  :f/view   {:class {sid-User {sid-ssn  {:f/equals     [{:id :f/$identity}
+                                                                        {:id :ex/user}]
+                                                         :f/targetRole {:_id sid-userRole}
+                                                         :function     [true
+                                                                        ::replaced-policy-function]
+                                                         :id           :ex/ssnViewRule}
+                                               :default {:f/targetRole {:_id sid-userRole}
+                                                         :function     [false
+                                                                        ::replaced-policy-function]
+                                                         :id           :ex/globalViewAllow}}}}
+                  :ident    sid-alice-did
+                  :roles    #{sid-userRole}}
+                 policy-alice)
+              "Policies for only :ex/userRole should return")))
+
+
+      (testing "Root policy contains {:root? true} for each applicable :f/action"
+        (let [policy-root  (-> @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))
+                               replace-policy-fns)
+              sid-root-did @(fluree/internal-id db root-did)
+              sid-rootRole @(fluree/internal-id db :ex/rootRole)]
+          (is (= {:f/modify {:root? true}
+                  :f/view   {:root? true}
+                  :ident    sid-root-did
+                  :roles    #{sid-rootRole}}
+                 policy-root)))))))

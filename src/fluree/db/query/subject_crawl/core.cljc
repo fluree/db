@@ -4,7 +4,6 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.subject :refer [subj-crawl]]
-            [fluree.db.query.subject-crawl.rdf-type :refer [collection-crawl]]
             [fluree.db.query.subject-crawl.common :refer [order-results]]
             [fluree.db.query.fql.resp :as legacy-resp]
             [fluree.db.query.json-ld.response :as json-ld-resp]
@@ -21,14 +20,12 @@
   (:spec select))
 
 (defn relationship-binding
-  [{:keys [collection? vars] :as opts}]
+  [{:keys [vars] :as opts}]
   (async/go-loop [[next-vars & rest-vars] vars
                   acc []]
     (if next-vars
       (let [opts' (assoc opts :vars next-vars)
-            res   (if collection?
-                    (<? (collection-crawl opts'))
-                    (<? (subj-crawl opts')))]
+            res   (<? (subj-crawl opts'))]
         (recur rest-vars (into acc res)))
       acc)))
 
@@ -70,7 +67,6 @@
   (let [error-ch    (async/chan)
         f-where     (first where)
         rdf-type?   (= :rdf/type (:type f-where))
-        collection? (= :collection (:type f-where))
         filter-map  (:s-filter (second where))
         cache       (volatile! {})
         fuel-vol    (volatile! 0)
@@ -79,7 +75,6 @@
         result-fn   (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
-                     :collection?   collection?
                      :db            db
                      :cache         cache
                      :fuel-vol      fuel-vol
@@ -101,6 +96,4 @@
     (log/trace "simple-subject-crawl opts:" opts)
     (if rel-binding?
       (relationship-binding opts)
-      (if collection?
-        (collection-crawl opts)
-        (subj-crawl opts)))))
+      (subj-crawl opts))))

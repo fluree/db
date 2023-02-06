@@ -36,46 +36,6 @@
         (catch* e (async/put! error-ch e) (async/close! port) nil)))))
 
 
-(defn subj-perm-filter-fn
-  "Returns a specific filtering function which takes all subject flakes and
-  returns the flakes allowed, or nil if none are allowed."
-  [{:keys [policy] :as db}]
-  (let [pred-permissions?  (contains? policy :predicate)
-        coll-permissions   (:collection policy)
-        filter-cache       (atom {})
-        default-deny?      (if (true? (:default coll-permissions))
-                             false
-                             true)
-        filter-predicates? (fn [cid]
-                             (if-some [cached (get @filter-cache cid)]
-                               cached
-                               (let [coll-perm (get coll-permissions cid)
-                                     filter?   (cond
-                                                 (schema-util/is-schema-cid? cid)
-                                                 false
-
-                                                 pred-permissions?
-                                                 true
-
-                                                 (nil? coll-perm)
-                                                 default-deny?
-
-                                                 (and (contains? coll-perm :all)
-                                                      (= 1 (count coll-perm)))
-                                                 false
-
-                                                 :else true)]
-                                 (swap! filter-cache assoc cid filter?)
-                                 filter)))]
-    (fn [flakes]
-      (go-try
-        (let [fflake (first flakes)]
-          (if (-> fflake flake/s flake/sid->cid filter-predicates?)
-            (<? (perm-validate/allow-flakes? db flakes))
-            (when (<? (perm-validate/allow-flake? db fflake))
-              flakes)))))))
-
-
 (defn passes-filter?
   [filter-fn vars pred-flakes]
   (some #(filter-fn % vars) pred-flakes))

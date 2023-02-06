@@ -8,10 +8,7 @@
             [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
-            [fluree.db.session :as session]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.permissions :as permissions]
-            [fluree.db.auth :as auth]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
@@ -20,7 +17,9 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.db.json-ld :as jld-db]
             [malli.core :as m]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -39,42 +38,6 @@
   [ledger-id]
   (re-find #"[a-z0-9]+/[a-z0-9]+" ledger-id))
 
-;; TODO - not using new policy below, needs to have updated logic to lookup user roles!
-(defn db
-  "Returns a queryable database as a promise channel from the connection for the specified ledger."
-  ([conn ledger]
-   (session/db conn ledger nil))
-  ([conn ledger opts]
-   (let [pc (async/promise-chan)]
-     (async/go
-       (try*
-         (let [rootdb        (<? (session/db conn ledger nil))
-               {:keys [roles user auth block]} opts
-               auth_id       (when (and auth (not= 0 auth))
-                               (or
-                                 (<? (dbproto/-subid rootdb auth))
-                                 (throw (ex-info (str "Auth id: " auth " unknown.")
-                                                 {:status 401
-                                                  :error  :db/invalid-auth}))))
-               roles         (or roles (if auth_id
-                                         (<? (auth/roles rootdb auth_id)) nil))
-
-               permissions-c (when roles (permissions/permission-map rootdb roles :query))
-               dbt           (if block
-                               (<? (time-travel/as-of-block rootdb (:block opts)))
-                               rootdb)
-               dba           (if auth
-                               (assoc dbt :auth auth)
-                               dbt)
-               permdb        (if roles
-                               (assoc dba :permissions (<? permissions-c))
-                               dba)]
-           (async/put! pc permdb))
-         (catch* e
-                 (async/put! pc e)
-                 (async/close! pc))))
-     ;; return promise chan immediately
-     pc)))
 
 
 (defn commit-details
@@ -90,6 +53,7 @@
            flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
            results (<? (history/commit-flakes->json-ld db {} flakes))]
        results))))
+
 
 (defn history
   [db query-map]
@@ -116,11 +80,15 @@
             [pattern idx] (history/get-history-pattern query)
 
             ;; from and to are positive ints, need to convert to negative or fill in default values
-            {:keys [from to]}  t
-            [from-t to-t]      [(if from (- from) -1) (if to (- to) (:t db))]
-
-            flakes  (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
-            results (<? (history/history-flakes->json-ld db query-map flakes))]
+            {:keys [from to]} t
+            [from-t to-t]     [(cond (string? from) (<? (time-travel/datetime->t db from))
+                                     (number? from) (- from)
+                                     :else          -1)
+                               (cond (string? to) (<? (time-travel/datetime->t db to))
+                                     (number? to) (- to)
+                                     :else        (:t db))]
+            flakes            (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
+            results           (<? (history/history-flakes->json-ld db query-map flakes))]
         results))))
 
 (defn query

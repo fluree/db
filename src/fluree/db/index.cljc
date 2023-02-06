@@ -6,7 +6,8 @@
                :cljs [cljs.core.async :refer [chan go <!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]))
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.conn.cache :as conn-cache]))
 
 (def default-comparators
   "Map of default index comparators for the five index types"
@@ -196,7 +197,12 @@
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
   [t flake]
-  (-> flake flake/t (< t)))
+  (< (flake/t flake) t))
+
+(defn before-t?
+  "Returns `true` if `flake` has a transaction value before the provided `t`"
+  [t flake]
+  (> (flake/t flake) t))
 
 (defn filter-after
   "Returns a sequence containing only flakes from the flake set `flakes` with
@@ -235,14 +241,16 @@
 
 (defn stale-by
   "Returns a sequence of flakes from the sorted set `flakes` that are out of date
-  by the transaction `t` because `flakes` contains another flake with the same
-  subject and predicate and a transaction value later than that flake but on or
-  before `t`."
-  [t flakes]
+  by the transaction `from-t` because `flakes` contains another flake with the same
+  subject and predicate and a t-value later than that flake but on or before `from-t`."
+  [from-t flakes]
   (->> flakes
-       (filter (complement (partial after-t? t)))
+       (remove (partial after-t? from-t))
        (partition-by (juxt flake/s flake/p flake/o))
        (mapcat (fn [flakes]
+                 ;; if the last flake for a subject/predicate/object combo is an assert,
+                 ;; then everything before that is stale (object is necessary for
+                 ;; multicardinality flakes)
                  (let [last-flake (last flakes)]
                    (if (flake/op last-flake)
                      (butlast flakes)
@@ -260,22 +268,54 @@
          out-of-range (concat stale-flakes subsequent)]
      (flake/disj-all latest out-of-range))))
 
-(defrecord CachedTRangeResolver [node-resolver novelty from-t to-t async-cache]
+(defrecord CachedTRangeResolver [node-resolver novelty from-t to-t lru-cache-atom]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
     (if (branch? node)
       (resolve node-resolver node)
-      (async-cache
-       [::t-range id tempid tt-id from-t to-t]
-       (fn [_]
-         (go-try
-          (let [resolved (<? (resolve node-resolver node))
-                flakes   (t-range resolved novelty from-t to-t)]
-            (-> resolved
-                (dissoc :t)
-                (assoc :from-t from-t
-                       :to-t   to-t
-                       :flakes  flakes)))))))))
+      (conn-cache/lru-lookup
+        lru-cache-atom
+        [::t-range id tempid tt-id from-t to-t]
+        (fn [_]
+          (go-try
+            (let [resolved (<? (resolve node-resolver node))
+                  flakes   (t-range resolved novelty from-t to-t)]
+              (-> resolved
+                  (dissoc :t)
+                  (assoc :from-t from-t
+                         :to-t   to-t
+                         :flakes  flakes)))))))))
+
+(defn history-t-range
+  "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
+  ([{:keys [flakes] leaf-t :t :as leaf} novelty from-t to-t]
+   (let [latest       (cond-> flakes
+                        (> leaf-t to-t)
+                        (flake/conj-all (novelty-subrange leaf to-t novelty)))
+         ;; flakes that happen after to-t
+         subsequent   (filter-after to-t latest)
+         ;; flakes that happen before from-t
+         previous     (filter (partial before-t? from-t) latest)
+         out-of-range (concat subsequent previous)]
+     (flake/disj-all latest out-of-range))))
+
+(defrecord CachedHistoryRangeResolver [node-resolver novelty from-t to-t lru-cache-atom]
+  Resolver
+  (resolve [_ {:keys [id tempid tt-id] :as node}]
+    (if (branch? node)
+      (resolve node-resolver node)
+      (conn-cache/lru-lookup
+        lru-cache-atom
+        [::history-t-range id tempid tt-id from-t to-t]
+        (fn [_]
+          (go-try
+            (let [resolved (<? (resolve node-resolver node))
+                  flakes   (history-t-range resolved novelty from-t to-t)]
+              (-> resolved
+                  (dissoc :t)
+                  (assoc :from-t from-t
+                         :to-t   to-t
+                         :flakes  flakes)))))))))
 
 (defn at-t
   "Find the value of `leaf` at transaction `t` by adding new flakes from

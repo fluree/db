@@ -1,14 +1,10 @@
 (ns fluree.sdk.webworker
   (:require [cljs.core.async :as async]
-            [fluree.db.session :as session]
-            [fluree.db.connection :as connection]
             [fluree.db.api.query :as q]
-            [fluree.db.api.ledger :as l]
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [goog.object]
-            [fluree.db.connection-js :as conn-handler]))
+            [goog.object]))
 
 
 (def ^:private conn-register (atom {}))
@@ -21,7 +17,7 @@
 (defn- conn-id->db
   [conn-id time]
   (let [{:keys [conn ledger]} (get @conn-register conn-id)]
-    (l/root-db conn ledger {:block time})))
+    :TODO #_(l/root-db conn ledger {:block time})))
 
 
 (defn- obj->clj
@@ -52,20 +48,6 @@
   (postMessage {:conn  conn-id
                 :event "connStatus"
                 :ref   id
-                :data  (clj->js response)}))
-
-(defmethod worker-action :login
-  [conn-id _ ref response]
-  (postMessage {:conn  conn-id
-                :event "login"
-                :ref   ref
-                :data  (clj->js response)}))
-
-(defmethod worker-action :pwGenerate
-  [conn-id _ ref response]
-  (postMessage {:conn  conn-id
-                :event "pwGenerate"
-                :ref   ref
                 :data  (clj->js response)}))
 
 (defmethod worker-action :connClosed
@@ -153,7 +135,8 @@
 
 (defn- ledger-listener
   [conn ledger conn-id]
-  (let [[network ledger-id] (session/resolve-ledger conn ledger)
+  :TODO
+  #_(let [[network ledger-id] (session/resolve-ledger conn ledger)
         cb (fn [header data]
              (async/go
                (async/<! (async/timeout 100))
@@ -163,7 +146,8 @@
 
 (defn- remove-conn-listener
   [conn conn-id ledger]
-  (let [[network ledger-id] (session/resolve-ledger conn ledger)]
+  :TODO
+  #_(let [[network ledger-id] (session/resolve-ledger conn ledger)]
     (connection/remove-listener conn network ledger-id conn-id)))
 
 
@@ -195,11 +179,11 @@
                         (connect* id ref)))
                     nil)
         opts      (assoc-in config [:keep-alive-fn] cb)]
-    (-> (conn-handler/connect-p servers opts)
+    (-> :TODO #_(conn-handler/connect-p servers opts)
         (.then (fn [conn]
                  (do
                    (when jwt
-                     (conn-handler/check-connection conn {:jwt jwt}))
+                     :TODO #_(conn-handler/check-connection conn {:jwt jwt}))
                    (register-connection conn config queries)
                    (ledger-listener conn ledger id)
                    (worker-action conn-id :connReset ref {:status  200
@@ -230,7 +214,7 @@
                         :error  :db/invalid-connection}))
        (do
          (remove-conn-listener conn conn-id ledger)
-         (conn-handler/close conn)
+         :TODO #_(conn-handler/close conn)
          (swap! conn-register assoc conn-id new-config)
          {:status  200
           :message "Connection closed."})))))
@@ -274,7 +258,7 @@
                       (connect* id ref)))
                   nil)
         opts    (assoc-in config* [:keep-alive-fn] cb)]
-    (-> (conn-handler/connect-p servers opts)
+    (-> :TODO #_(conn-handler/connect-p servers opts)
         (.then (fn [conn]
                  (do
                    (register-connection conn config* nil)
@@ -292,90 +276,6 @@
   [conn-id]
   (get-in @conn-register [conn-id :closed]))
 
-
-(defn- login
-  "Authenticate with ledger via username and password.
-
-   If authentication is successful, a 200 status is returned with a JSON web token.
-   Otherwise, an error status is returned."
-  [conn-id ref username password & [expire]]
-  (let [{:keys [conn ledger jwt]} (get @conn-register conn-id)
-        _    (when-not ledger
-               (worker-action conn-id :login ref
-                              {:status  400
-                               :message "Connection missing Ledger information. Password authentication is specific to a ledger."}))
-        auth nil]
-    (async/go
-      (try
-        ; If a token exists, should we reset the existing connection?
-        (-> (conn-handler/password-login conn ledger password username auth expire)
-            (.then (fn [token]
-                     (do
-                       (swap! conn-register assoc-in [conn-id :jwt] token)
-                       (worker-action conn-id :login ref {:status 200 :result {:username username :token token}}))))
-            (.catch (fn [resp]
-                      (let [err    (try
-                                     (js->clj resp :keywordize-keys true)
-                                     (catch :default _
-                                       nil))
-                            status (:status err)]
-                        (cond
-
-                          (not (nil? status))
-                          (let [message (or (:message err) "Authentication failed: unknown authentication error")
-                                error   (or (:error err) :db/invalid-request)]
-                            (worker-action conn-id :login ref {:status status :message message :error error}))
-
-                          :else
-                          (worker-action conn-id :login ref {:status 401 :message (str "Authentication failed: " resp)}))))))
-
-        (catch :default e
-          (worker-action conn-id :login ref {:status 400 :message (str e)}))))
-    true))
-
-
-
-(defn- pw-generate
-  "Attempts to generate a new user auth record account.
-
-   If request is successful, a 200 status is returned with a JSON web token.
-   Otherwise, an error status is returned."
-  [conn-id ref map-data]
-  (let [;data (obj->clj js-data)
-        {:keys [conn ledger]} (get @conn-register conn-id)
-        _    (when-not ledger
-               (worker-action conn-id :login ref
-                              {:status  400
-                               :message "Connection missing Ledger information. Password authentication is specific to a ledger."}))
-        {:keys [username password options]} map-data
-        opts (-> (select-keys options (keys options))
-                 (assoc :user username))]
-    (async/go
-      (try
-        (-> (conn-handler/password-generate conn ledger password opts)
-            (.then (fn [token]
-                     (do
-                       (swap! conn-register assoc-in [conn-id :jwt] token)
-                       (worker-action conn-id :pwGenerate ref {:status 200 :result {:username username :token token}}))))
-            (.catch (fn [resp]
-                      (let [err    (try
-                                     (js->clj resp :keywordize-keys true)
-                                     (catch :default _
-                                       nil))
-                            status (:status err)]
-                        (cond
-
-                          (not (nil? status))
-                          (let [message (or (:message err) "Password Generation failed: unknown error")
-                                error   (or (:error err) :db/invalid-request)]
-                            (worker-action conn-id :pwGenerate ref {:status status :message message :error error}))
-
-                          :else
-                          (worker-action conn-id :pwGenerate ref {:status 401 :message (str "Password Generation failed: " resp)}))))))
-
-        (catch :default e
-          (worker-action conn-id :pwGenerate ref {:status 400 :message (str e)}))))
-    true))
 
 (defn- unregisterQuery
   [conn-id ref]
@@ -473,20 +373,11 @@
           (= action-str "reset")
           (reset-connection conn-id ref)
 
-          ;(= action-str "logout")
-          ;(logout conn-id ref)
-
           (= action-str "registerQuery")
           (apply registerQuery conn-id params)
 
           (= action-str "unregisterQuery")
           (unregisterQuery conn-id ref)
-
-          (= action-str "login")
-          (apply login conn-id ref params)
-
-          (= action-str "pwGenerate")
-          (pw-generate conn-id ref params)
 
           (= action-str "transact")
           (transact conn-id ref params)

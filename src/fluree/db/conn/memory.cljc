@@ -75,7 +75,7 @@
   ledger-data)
 
 
-(defrecord MemoryConnection [id memory state ledger-defaults async-cache
+(defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom
                              parallelism msg-in-ch msg-out-ch data-atom]
 
   conn-proto/iStorage
@@ -177,14 +177,15 @@
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [parallelism async-cache memory defaults]}]
+  [{:keys [parallelism lru-cache-atom memory defaults]}]
   (go-try
-    (let [ledger-defaults    (<? (ledger-defaults defaults))
-          conn-id            (str (random-uuid))
-          data-atom          (atom {})
-          state              (state-machine/blank-state)
-          async-cache-fn     (or async-cache
-                                 (conn-cache/default-async-cache-fn memory))]
+    (let [ledger-defaults (<? (ledger-defaults defaults))
+          conn-id         (str (random-uuid))
+          data-atom       (atom {})
+          state           (state-machine/blank-state)
+
+          cache-size     (conn-cache/memory->cache-size memory)
+          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom
@@ -193,4 +194,4 @@
                               :msg-out-ch      (async/chan)
                               :memory          true
                               :state           state
-                              :async-cache     async-cache-fn}))))
+                              :lru-cache-atom  lru-cache-atom}))))
