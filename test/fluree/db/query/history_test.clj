@@ -227,10 +227,10 @@
                    :f/size 1884,
                    :f/t 1,
                    :f/assert
-                   [{:rdf/type [:f/Context],
+                   [{:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}
+                    {:rdf/type [:f/Context],
                      :f/context
                      "{\"schema\":\"http://schema.org/\",\"wiki\":\"https://www.wikidata.org/wiki/\",\"xsd\":\"http://www.w3.org/2001/XMLSchema#\",\"type\":\"@type\",\"rdfs\":\"http://www.w3.org/2000/01/rdf-schema#\",\"ex\":\"http://example.org/ns/\",\"id\":\"@id\",\"f\":\"https://ns.flur.ee/ledger#\",\"sh\":\"http://www.w3.org/ns/shacl#\",\"skos\":\"http://www.w3.org/2008/05/skos#\",\"rdf\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"}",
-                     :id "fluree-default-context"}
-                    {:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}],
+                     :id "fluree-default-context"}]
                    :f/retract []}}
                  commit)))))))
