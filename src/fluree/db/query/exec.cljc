@@ -51,10 +51,10 @@
    (let [error-ch  (async/chan)
          result-ch (->> (where/search db q error-ch)
                         (group/combine q)
+                        (having/filter q error-ch)
                         (order/arrange q)
                         (drop-offset q)
                         (take-limit q)
-                        (having/filter q error-ch)
                         (select/format db q error-ch)
                         (collect-results q))]
      (async/alt!
