@@ -186,7 +186,7 @@
 
           async-cache-atom (atom {})
           async-cache-fn   (or async-cache
-                               (conn-cache/default-async-cache-fn memory async-cache-atom))]
+                               (conn-cache/async-cache-fn memory async-cache-atom))]
       (map->MemoryConnection {:id               conn-id
                               :ledger-defaults  ledger-defaults
                               :data-atom        data-atom

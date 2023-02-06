@@ -201,7 +201,7 @@
 
           default-cache-atom (atom {})
           async-cache-fn     (or async-cache
-                                 (conn-cache/default-async-cache-fn default-cache-atom))]
+                                 (conn-cache/async-cache-fn default-cache-atom))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id               conn-id
                             :ipfs-endpoint    ipfs-endpoint

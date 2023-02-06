@@ -293,7 +293,7 @@
           state            (state-machine/blank-state)
           async-cache-atom (atom {})
           async-cache-fn   (or async-cache
-                               (conn-cache/default-async-cache-fn memory async-cache-atom))]
+                               (conn-cache/async-cache-fn memory async-cache-atom))]
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id               conn-id
                             :storage-path     storage-path

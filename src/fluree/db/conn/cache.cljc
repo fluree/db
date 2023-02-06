@@ -6,7 +6,13 @@
              #?@(:clj [:refer [try* catch* exception?]])
              #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])]))
 
-(defn- lookup-cache
+(defn create-lru-cache
+  "Create a cache that starts holds `cache-size` number of entries, bumping out the least
+  recently used value after the size is exceeded.."
+  [cache-size]
+  (cache/lru-cache-factory {} :threshold cache-size))
+
+(defn lookup
   [cache-atom k value-fn]
   (if (nil? value-fn)
     (swap! cache-atom cache/evict k)
@@ -14,30 +20,22 @@
       (do (swap! cache-atom cache/hit k)
           v))))
 
-(defn default-object-cache-factory
-  "Generates a default object cache."
-  [cache-size]
-  (cache/lru-cache-factory {} :threshold cache-size))
-
-(defn default-async-cache-fn*
-  [cache-atom]
-  (fn [k value-fn]
-    (let [out (async/chan)]
-      (if-let [v (lookup-cache cache-atom k value-fn)]
-        (async/put! out v)
-        (async/go
-          (let [v (async/<! (value-fn k))]
-            (when-not (exception? v)
-              (swap! cache-atom cache/miss k v))
-            (async/put! out v))))
-      out)))
-
-(defn default-async-cache-fn
-  "Default asynchronous object cache to use for ledger."
-  [memory async-cache-atom]
+(defn async-cache-fn
+  "Create an async cache lookup function."
+  [memory cache-atom]
   (let [memory             (or memory 1000000) ; default 1MB memory
         memory-object-size (quot memory 100000)]
     (when (< memory-object-size 10)
       (throw (ex-info (str "Must allocate at least 1MB of memory for Fluree. You've allocated: " memory " bytes.")
                       {:status 400 :error :db/invalid-configuration})))
-    (default-async-cache-fn* (reset! async-cache-atom (default-object-cache-factory memory-object-size)))))
+
+    (fn [k value-fn]
+      (let [out (async/chan)]
+        (if-let [v (lookup cache-atom k value-fn)]
+          (async/put! out v)
+          (async/go
+            (let [v (async/<! (value-fn k))]
+              (when-not (exception? v)
+                (swap! cache-atom cache/miss k v))
+              (async/put! out v))))
+        out))))
