@@ -274,7 +274,7 @@
 (defn add-commit-flakes-to-db
   "ecount and sid must be updated prior to calling this."
   [db flakes]
-  (let [{:keys [novelty schema]} db
+  (let [{:keys [novelty]} db
         {:keys [spot psot post opst tspo]} novelty
         size (flake/size-bytes flakes)]
     (-> db
@@ -384,8 +384,7 @@
                           jld-commit)
           commit-res    (<? (conn-proto/-c-write conn db signed-commit)) ;; write commit credential
           new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
-          db*           (assoc db :commit new-commit**
-                               :jld-commit jld-commit)     ;; branch published to
+          db*           (assoc db :commit new-commit**)     ;; branch published to
           db**          (if new-t?
                           (<? (add-commit-flakes db*))
                           db*)
