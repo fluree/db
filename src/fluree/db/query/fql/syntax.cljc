@@ -170,6 +170,7 @@
                          [:groupBy {:optional true} ::groupBy]
                          [:group-by {:optional true} ::group-by]
                          [:filter {:optional true} ::filter]
+                         [:having {:optional true} ::function]
                          [:vars {:optional true} ::vars]
                          [:limit {:optional true} ::limit]
                          [:offset {:optional true} ::offset]

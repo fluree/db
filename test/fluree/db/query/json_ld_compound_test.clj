@@ -34,11 +34,11 @@
                      :ex/friend    [:ex/brian :ex/alice]}])
 
           two-tuple-select-with-crawl
-          @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                             :select  ['?age {'?f [:*]}]
-                             :where   [['?s :schema/name "Cam"]
-                                       ['?s :ex/friend '?f]
-                                       ['?f :schema/age '?age]]})
+          @(fluree/query db '{:context {:ex "http://example.org/ns/"}
+                              :select  [?age {?f [:*]}]
+                              :where   [[?s :schema/name "Cam"]
+                                        [?s :ex/friend ?f]
+                                        [?f :schema/age ?age]]})
 
           two-tuple-select-with-crawl+var
           @(fluree/query db {:context {:ex "http://example.org/ns/"}

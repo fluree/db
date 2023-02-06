@@ -148,32 +148,6 @@
                   {:status 400
                    :error  :db/invalid-query})))
 
-(defn get-filters
-  ;; TODO - refactor now that optional filters can also be non-labelled filters inside optional map
-  "optional? indicates we are looking for optional filters. "
-  [filters optional?]
-  (reduce (fn [acc fil]
-            (cond (string? fil) (if optional? acc (conj acc fil))
-
-                  (and (vector? fil) optional?
-                       (= "optional" (str/lower-case (first fil)))) (conj acc (second fil))
-
-                  (and (map? fil)
-                       (= "clojure" (str/lower-case (:language fil)))
-                       (if optional?
-                         (:optional fil)
-                         (not (true? (:optional fil))))
-                       (contains? fil :code)) (conj acc (:code fil))
-
-                  (and (map? fil)
-                       (= "sparql" (str/lower-case (:language fil)))
-                       (if optional?
-                         (:optional fil)
-                         (not (true? (:optional fil))))
-                       (contains? fil :code)) (conj acc (SPARQL-filter-parser fil))
-
-                  :else acc)) [] filters))
-
 (defn extract-combined-filter
   [filter-maps]
   (some->> filter-maps
