@@ -141,33 +141,33 @@
 
 (defn variables
   "Returns the set of items within the arbitrary data structure `code` that
-  are variables ."
+  are variables."
   [code]
   (->> code
        symbols
        (filter variable?)))
 
 (def qualified-symbols
-  {'abs         'fluree.db.query.exec.eval/abs
-   'avg         'fluree.db.query.exec.eval/avg
-   'bound       'fluree.db.query.exec.eval/bound
-   'ceil        'fluree.db.query.exec.eval/ceil
-   'coalesce    'fluree.db.query.exec.eval/coalesce
-   'count       'fluree.db.query.exec.eval/count-distinct
-   'floor       'fluree.db.query.exec.eval/floor
-   'groupconcat 'fluree.db.query.exec.eval/groupconcat
-   'median      'fluree.db.query.exec.eval/median
-   'now         'fluree.db.query.exec.eval/now
-   'rand        'fluree.db.query.exec.eval/rand
-   'sample      'fluree.db.query.exec.eval/sample
-   'stddev      'fluree.db.query.exec.eval/stddev
-   'strStarts   'fluree.db.query.exec.eval/strStarts
-   'strEnds     'fluree.db.query.exec.eval/strEnds
-   'sum         'fluree.db.query.exec.eval/sum
-   'variance    'fluree.db.query.exec.eval/variance
-   '!           'fluree.db.query.exec.eval/!
-   '&&          'fluree.db.query.exec.eval/&&
-   '||          'fluree.db.query.exec.eval/||})
+  '{abs         fluree.db.query.exec.eval/abs
+    avg         fluree.db.query.exec.eval/avg
+    bound       fluree.db.query.exec.eval/bound
+    ceil        fluree.db.query.exec.eval/ceil
+    coalesce    fluree.db.query.exec.eval/coalesce
+    count       fluree.db.query.exec.eval/count-distinct
+    floor       fluree.db.query.exec.eval/floor
+    groupconcat fluree.db.query.exec.eval/groupconcat
+    median      fluree.db.query.exec.eval/median
+    now         fluree.db.query.exec.eval/now
+    rand        fluree.db.query.exec.eval/rand
+    sample      fluree.db.query.exec.eval/sample
+    stddev      fluree.db.query.exec.eval/stddev
+    strStarts   fluree.db.query.exec.eval/strStarts
+    strEnds     fluree.db.query.exec.eval/strEnds
+    sum         fluree.db.query.exec.eval/sum
+    variance    fluree.db.query.exec.eval/variance
+    !           fluree.db.query.exec.eval/!
+    &&          fluree.db.query.exec.eval/&&
+    ||          fluree.db.query.exec.eval/||})
 
 (defn qualify
   [sym]
