@@ -75,7 +75,7 @@
   ledger-data)
 
 
-(defrecord MemoryConnection [id memory state ledger-defaults async-cache
+(defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom
                              parallelism msg-in-ch msg-out-ch data-atom]
 
   conn-proto/iStorage
@@ -177,23 +177,21 @@
 
 (defn connect
   "Creates a new memory connection."
-  [{:keys [parallelism async-cache memory defaults]}]
+  [{:keys [parallelism lru-cache-atom memory defaults]}]
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
           data-atom       (atom {})
           state           (state-machine/blank-state)
 
-          async-cache-atom (atom {})
-          async-cache-fn   (or async-cache
-                               (conn-cache/async-cache-fn memory async-cache-atom))]
-      (map->MemoryConnection {:id               conn-id
-                              :ledger-defaults  ledger-defaults
-                              :data-atom        data-atom
-                              :parallelism      parallelism
-                              :msg-in-ch        (async/chan)
-                              :msg-out-ch       (async/chan)
-                              :memory           true
-                              :state            state
-                              :async-cache-atom async-cache-atom
-                              :async-cache      async-cache-fn}))))
+          cache-size     (conn-cache/memory->cache-size memory)
+          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+      (map->MemoryConnection {:id              conn-id
+                              :ledger-defaults ledger-defaults
+                              :data-atom       data-atom
+                              :parallelism     parallelism
+                              :msg-in-ch       (async/chan)
+                              :msg-out-ch      (async/chan)
+                              :memory          true
+                              :state           state
+                              :lru-cache-atom  lru-cache-atom}))))

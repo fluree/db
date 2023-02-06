@@ -25,7 +25,7 @@
                       (when-let [variable (:variable o)]
                         (get vars variable)))
         p*          (:value p)
-        idx*        (where/idx-for nil p* o*) 
+        idx*        (where/idx-for nil p* o*)
         o-dt        (:datatype o)
         [fflake lflake] (case idx*
                           :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
@@ -54,7 +54,7 @@
                                     :xf          (when filter-fn
                                                    (map (fn [flakes]
                                                           (filter filter-fn flakes))))})
-          resolver  (index/->CachedTRangeResolver conn (get novelty idx*) t t (:async-cache conn))
+          resolver  (index/->CachedTRangeResolver conn (get novelty idx*) t t (:lru-cache-atom conn))
           tree-chan (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
       (async/go-loop []
         (let [next-chunk (<! tree-chan)]
