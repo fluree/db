@@ -103,9 +103,11 @@
     ledger))
 
 (defn transact
-  [ledger data]
-  (->> @(fluree/stage (fluree/db ledger) data)
-       (fluree/commit! ledger)))
+  ([ledger data]
+   (transact ledger data {}))
+  ([ledger data commit-opts]
+   (let [staged @(fluree/stage (fluree/db ledger) data)]
+     (fluree/commit! ledger staged commit-opts))))
 
 (defn retry-load
   "Retry loading a ledger until max-attempts. Hopefully not needed once JSON-LD
