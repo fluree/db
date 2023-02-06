@@ -184,14 +184,19 @@
   (commit-details-query-validator query))
 
 
-(defn commit-metadata-flake?
+(defn commit-wrapper-flake?
+  "Returns `true` for a flake that represents
+  data from the outer wrapper of a commit
+  (eg commit message, time, v)"
   [f]
   (= (flake/s f) (flake/t f)))
 
-(defn commit-data-flake?
-  "These are flakes that describe the data,
-  and belong outside of the list of asserts
-  themselves"
+(defn commit-metadata-flake?
+  "Returns `true` if a flake is part of commit metadata.
+  
+  These are flakes that we insert which describe
+  the data, but are not part of the data asserted
+  by the user. "
   [f]
   (#{const/$_commitdata:t
      const/$_commitdata:size
@@ -206,8 +211,8 @@
             commit-data-flakes :commit-data
             data-flakes :data} (group-by (fn [f]
                                            (cond
-                                             (commit-metadata-flake? f) :commit-meta
-                                             (commit-data-flake?  f) :commit-data
+                                             (commit-wrapper-flake? f) :commit-meta
+                                             (commit-metadata-flake?  f) :commit-data
                                              :else :data)) t-flakes)
 
            commit-meta-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
@@ -221,14 +226,19 @@
 
            commit-data (<? commit-data-chan)
 
-           {asserts (json-ld/compact const/iri-assert compact)
-            retracts (json-ld/compact const/iri-retract compact)} (<? (t-flakes->json-ld db compact cache fuel error-ch data-flakes))
-           ;; t is always positive for users
-           result         (assoc {(json-ld/compact const/iri-commit compact) commit-meta}
-                                 (json-ld/compact const/iri-data compact ) commit-data)]
+           assert-key (json-ld/compact const/iri-assert compact) 
+           retract-key (json-ld/compact const/iri-retract compact)
+           data-key  (json-ld/compact const/iri-data compact)
+           commit-key (json-ld/compact const/iri-commit compact)
+
+           {asserts assert-key 
+            retracts retract-key} (<? (t-flakes->json-ld db compact cache fuel error-ch data-flakes))
+
+           result         (assoc {commit-key commit-meta}
+                                 data-key commit-data)]
        (-> result
-           (assoc-in  [(json-ld/compact const/iri-data compact)(json-ld/compact const/iri-assert compact)] asserts)
-           (assoc-in  [(json-ld/compact const/iri-data compact)(json-ld/compact const/iri-retract compact)] retracts)))
+           (assoc-in  [data-key assert-key] asserts)
+           (assoc-in  [data-key retract-key] retracts)))
      (catch* e
              (log/error e "Error converting commit flakes.")
              (async/>! error-ch e)))))
