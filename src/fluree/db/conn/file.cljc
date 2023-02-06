@@ -299,7 +299,7 @@
                             :storage-path    storage-path
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      #?(:clj  (avro-serde/avro-serde)
-                                                 :cljs (json-serde/json-serde))
+                                                :cljs (json-serde/json-serde))
                             :commit          commit
                             :push            push
                             :parallelism     parallelism

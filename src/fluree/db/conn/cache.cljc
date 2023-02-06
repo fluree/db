@@ -2,13 +2,11 @@
   "A simple default connection-level cache."
   (:require [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [clojure.core.async :as async]
-            [fluree.db.util.core :as util
-             #?@(:clj [:refer [try* catch* exception?]])
-             #?@(:cljs [:refer-macros [try* catch*] :refer [exception?]])]))
+            [fluree.db.util.core :as util :refer [exception?]]))
 
 (defn create-lru-cache
-  "Create a cache that starts holds `cache-size` number of entries, bumping out the least
-  recently used value after the size is exceeded.."
+  "Create a cache that holds `cache-size` number of entries, bumping out the least
+  recently used value after the size is exceeded."
   [cache-size]
   (cache/lru-cache-factory {} :threshold cache-size))
 
@@ -24,10 +22,10 @@
     cache-size))
 
 (defn lru-lookup
-  [cache-atom k value-fn]
   "Given an LRU cache atom, look up value for `k`. If not found, use `value-fn` (a
-  function that accepts `k` as its only argument) to produce the value and add it to the
-  cache."
+  function that accepts `k` as its only argument and returns an async channel) to
+  produce the value and add it to the cache."
+  [cache-atom k value-fn]
   (let [out (async/chan)]
     (if-let [v (get @cache-atom k)]
       (do (swap! cache-atom cache/hit k)
