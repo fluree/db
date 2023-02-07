@@ -32,14 +32,14 @@
   [sid s-flakes]
   (loop [[f & r] s-flakes
          details (if (= sid const/$rdf:type)
-                   {:id    sid                              ;; rdf:type is predefined, so flakes to build map won't be present.
+                   {:id    sid ;; rdf:type is predefined, so flakes to build map won't be present.
                     :class false
                     :idx?  true
                     :ref?  true}
                    {:id                 sid
-                    :class              true                ;; default
+                    :class              true ;; default
                     :idx?               true
-                    :ref?               false               ;; could go from false->true if defined in vocab but hasn't been used yet
+                    :ref?               false ;; could go from false->true if defined in vocab but hasn't been used yet
                     :subclassOf         []
                     :equivalentProperty []})]
     (if f
@@ -131,47 +131,20 @@
   [property-maps]
   (into #{} (keep #(when (true? (:ref? %)) (:id %)) property-maps)))
 
-(defn parse-new-context
-  "Retrieve context json out of default context flakes, and returns a fully parsed context."
-  [context-flakes]
-  (let [context-json (some #(when (= const/$fluree:context (flake/p %))
-                              (flake/o %))
-                           context-flakes)]
-    (try*
-      (let [keywordized (-> context-json
-                            json/parse
-                            json-ld/parse-context)
-            stringified (-> context-json
-                            (json/parse false)
-                            json-ld/parse-context)]
-        [keywordized stringified])
-      (catch* e (log/warn (str "Invalid db default context, unable to parse: " (pr-str context-json)))
-              nil))))
 
 (defn update-with*
   [{:keys [pred] :as schema} t vocab-flakes]
   (loop [[s-flakes & r] (partition-by flake/s vocab-flakes)
-         pred*       pred
-         context-kw  nil
-         context-str nil]
+         pred* pred]
     (if s-flakes
-      (let [sid (flake/s (first s-flakes))]
-        (cond
-          (= sid const/$fluree:default-context)
-          (let [[context-kw context-str] (parse-new-context s-flakes)]
-            (recur r pred* context-kw context-str))
-
-          :else
-          (let [prop-map (schema-details sid s-flakes)]
-            (recur r
-                   (assoc pred* (:id prop-map) prop-map
-                                (:iri prop-map) prop-map)
-                   context-kw context-str))))
-      (cond-> (assoc schema :t t
-                            :pred pred*
-                            :subclasses (delay (calc-subclass pred*)))
-              context-kw (assoc :context context-kw
-                                :context-str context-str)))))
+      (let [sid      (flake/s (first s-flakes))
+            prop-map (schema-details sid s-flakes)]
+        (recur r
+               (assoc pred* (:id prop-map) prop-map
+                            (:iri prop-map) prop-map)))
+      (assoc schema :t t
+                    :pred pred*
+                    :subclasses (delay (calc-subclass pred*))))))
 
 
 (defn update-with
@@ -205,7 +178,7 @@
                                 :ref? true
                                 :idx? true
                                 :id   const/$rdf:type}
-                               {:iri "http://www.w3.org/2000/01/rdf-schema#Class"
+                               {:iri  "http://www.w3.org/2000/01/rdf-schema#Class"
                                 :ref? true
                                 :idx? true
                                 :id   const/$rdfs:Class}])]
@@ -215,8 +188,8 @@
      :pred        pred
      :context     nil
      :context-str nil
-     :shapes (atom {:class {} ; TODO: Does this need to be an atom?
-                    :pred {}})
+     :shapes      (atom {:class {} ; TODO: Does this need to be an atom?
+                         :pred  {}})
      :prefix      {}
      :fullText    #{}
      :subclasses  (delay {})}))
@@ -225,7 +198,7 @@
   "Resets the shapes cache - called when new shapes added to db"
   [{:keys [shapes] :as _schema}]
   (reset! shapes {:class {}
-                  :pred {}}))
+                  :pred  {}}))
 
 (defn vocab-map
   "Returns a map of the schema for a db to allow quick lookups of schema properties.
@@ -250,5 +223,8 @@
   "Updates the schema map of a db."
   [db]
   (go-try
-    (let [schema (<? (vocab-map db))]
-      (assoc db :schema schema))))
+    (let [{{:keys [context context-str]} :schema} db
+          _       (log/debug "refresh-schema existing context:" context)
+          schema  (<? (vocab-map db))
+          schema* (assoc schema :context context :context-str context-str)]
+      (assoc db :schema schema*))))

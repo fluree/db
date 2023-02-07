@@ -16,10 +16,11 @@
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
   (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))
 
-
 (defprotocol iStorage
   (-c-read [conn commit-key] "Reads a commit from storage")
-  (-c-write [conn commit-data] [conn db commit-data] "Writes a commit to storage"))
+  (-c-write [conn ledger commit-data] "Writes a commit to storage")
+  (-ctx-write [conn ledger context-data] "Writes a context to storage and returns the key. Expects string keys.")
+  (-ctx-read [conn context-key] "Reads a context from storage"))
 
 (defprotocol iNameService
   (-push [conn address commit-data] "Pushes ledger metadata to all name service destinations")

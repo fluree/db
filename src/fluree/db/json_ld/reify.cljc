@@ -19,6 +19,28 @@
 
 (def ^:const max-vocab-sid (flake/max-subject-id const/$_collection))
 
+(defn node?
+  "Returns true if a nested value is itself another node in the graph.
+  Only need to test maps that have :id - and if they have other properties they
+  are defining then we know it is a node and have additional data to include."
+  [mapx]
+  (cond
+    (contains? mapx :value)
+    false
+
+    (and
+      (contains? mapx :list)
+      (= #{:list :idx} (set (keys mapx))))
+    false
+
+    (and
+      (contains? mapx :set)
+      (= #{:set :idx} (set (keys mapx))))
+    false
+
+    :else
+    true))
+
 (defn get-iri-sid
   "Gets the IRI for any existing subject ID."
   [iri db iris]
@@ -117,24 +139,28 @@
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
-      (log/debug "assert v-map:" v-map)
+      (log/debug "assert-v-maps v-map:" v-map)
+      (log/debug "assert-v-maps id:" id)
       (let [acc**
             (cond->
-              (if id ;; is a ref to another IRI
+              (if (and id (node? v-map)) ;; is a ref to another IRI
                 (let [existing-sid (<? (get-iri-sid id db iris))
                       ref-sid      (or existing-sid
                                        (jld-ledger/generate-new-sid
-                                         v-map pid iris next-pid next-sid))]
-                  (cond-> (conj acc*
-                                (flake/create sid pid ref-sid const/$xsd:anyURI
-                                              t true nil))
+                                         v-map pid iris next-pid next-sid))
+                      new-flake    (flake/create sid pid ref-sid
+                                                 const/$xsd:anyURI t true nil)]
+                  (log/debug "creating ref flake:" new-flake)
+                  (cond-> (conj acc* new-flake)
                           (nil? existing-sid) (conj
                                                 (flake/create ref-sid const/$iri
                                                               id
                                                               const/$xsd:string
                                                               t true nil))))
-                (let [[value dt] (datatype/from-expanded v-map nil)]
-                  (conj acc* (flake/create sid pid value dt t true nil))))
+                (let [[value dt] (datatype/from-expanded v-map nil)
+                      new-flake  (flake/create sid pid value dt t true nil)]
+                  (log/debug "creating value flake:" new-flake)
+                  (conj acc* new-flake)))
               (nil? existing-pid) (conj (flake/create pid const/$iri k
                                                       const/$xsd:string t true
                                                       nil)))]
@@ -191,6 +217,7 @@
 (defn assert-node
   [db node t iris refs next-pid next-sid]
   (go-try
+    (log/debug "assert-node:" node)
     (let [{:keys [id type]} node
           existing-sid    (<? (get-iri-sid id db iris))
           sid             (or existing-sid
@@ -210,7 +237,6 @@
           context*        (assoc context :base-flakes base-flakes)]
       (<? (assert-node* context* node)))))
 
-
 (defn assert-flakes
   [db assertions t iris refs]
   (go-try
@@ -221,7 +247,8 @@
           flakes   (loop [[node & r] assertions
                           acc []]
                      (if node
-                       (let [assert-flakes (<? (assert-node db node t iris refs next-pid next-sid))]
+                       (let [assert-flakes (<? (assert-node db node t iris refs
+                                                            next-pid next-sid))]
                          (recur r (into acc assert-flakes)))
                        acc))]
       {:flakes flakes
@@ -303,6 +330,7 @@
           refs           (volatile! (-> db :schema :refs))
           db-address     (get-in commit [const/iri-data const/iri-address :value])
           db-data        (<? (read-commit conn db-address))
+          _              (log/debug "merge-commit read commit:" db-data)
           t-new          (- (db-t db-data))
           _              (when (and (not= t-new (dec t))
                                     (not merged-db?)) ;; when including multiple dbs, t values will get reused.
@@ -370,7 +398,6 @@
             (recur commit commit-t commits*)))))))
 
 
-
 (defn load-db
   [{:keys [ledger] :as db} latest-commit merged-db?]
   (go-try
@@ -395,6 +422,7 @@
           commit-map (commit-data/json-ld->map latest-commit
                                                (-> (select-keys db-base index/types)
                                                    (assoc :commit-address commit-address)))
+          _          (log/debug "load-db-idx commit-map:" commit-map)
           db-base*   (assoc db-base :commit commit-map)
           index-t    (commit-data/index-t commit-map)
           commit-t   (commit-data/t commit-map)]
@@ -406,3 +434,13 @@
             (let [new-db (<? (merge-commit conn db* commit merged-db?))]
               (recur r new-db))
             db*))))))
+
+(defn load-default-context
+  "Loads the default context from the given conn's storage using the given key.
+  Returns a core.async channel with the context map."
+  [conn key]
+  (go-try
+    (log/debug "loading default context from storage w/ key:" key)
+    (->> key
+         (conn-proto/-ctx-read conn)
+         <?)))

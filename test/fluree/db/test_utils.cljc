@@ -113,7 +113,10 @@
   [conn ledger-alias max-attempts]
   (loop [attempt 0]
     (let [ledger (try
-                   @(fluree/load conn ledger-alias)
+                   (let [res @(fluree/load conn ledger-alias)]
+                     (if (instance? Throwable res)
+                       (throw res)
+                       res))
                    (catch Exception e
                      (when (= (inc attempt) max-attempts)
                        (throw e)

@@ -1,6 +1,8 @@
 (ns fluree.db.json-ld.bootstrap
   (:require [clojure.string :as str]
+            [clojure.core.async :refer [go]]
             [fluree.crypto :as crypto]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.json-ld :as json-ld]
@@ -133,27 +135,15 @@
                          "Must be a valid JSON context, or a valid context map or array/vector. Provided: " default-ctx)
                     {:status 400 :error :db/invalid-context}))))
 
-
-(defn bootstrap-tx
-  [default-ctx]
-  (let [ctx    (when default-ctx
-                 (let [default-ctx* (normalize-default-ctx default-ctx)]
-                   {"@id"     "fluree-default-context"
-                    "@type"   ["Context"]
-                    "context" default-ctx*}))
-        graph (cond-> []
-                      ctx (conj ctx))]
-    (when (seq graph)
-      {"@context" "https://ns.flur.ee/ledger/v1"
-       "@graph"   graph})))
-
 (defn bootstrap
   "Bootstraps a permissioned JSON-LD db. Returns async channel."
-  [blank-db default-ctx]
-  (let [tx (bootstrap-tx default-ctx)]
-    (if tx
-      (db-proto/-stage blank-db tx {:bootstrap? true})
-      blank-db)))
+  ([blank-db] (bootstrap blank-db nil))
+  ([blank-db initial-tx]
+   (if-let [tx (when initial-tx
+                 {"@context" "https://ns.flur.ee/ledger/v1"
+                  "@graph"   initial-tx})]
+     (db-proto/-stage blank-db tx {:bootstrap? true})
+     (go blank-db))))
 
 (defn blank-db
   "When not bootstrapping with a transaction, bootstraps initial base set of flakes required for a db."
