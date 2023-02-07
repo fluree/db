@@ -195,8 +195,8 @@
   [conn context-key]
   (json/parse (read-address conn context-key) true))
 
-(defrecord FileConnection [id memory state ledger-defaults push commit
-                           parallelism msg-in-ch msg-out-ch lru-cache-atom]
+(defrecord FileConnection [id memory state ledger-defaults parallelism msg-in-ch
+                           msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (go (read-commit conn commit-key)))
