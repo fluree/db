@@ -5,7 +5,6 @@
     [fluree.db.json-ld.api :as fluree]
     [fluree.db.did :as did]
     [fluree.db.permissions-validate :as policy-enforce]
-    [fluree.db.util.log :as log]
     [clojure.core.async :as async]))
 
 ;; tests for the optimized policy filtering for groups of flakes of the same subject
@@ -78,32 +77,31 @@
           ;; john's flakes filtered using alice's policy-enforced db
           alice-db-john   (->> john-flakes
                                (policy-enforce/filter-subject-flakes alice-db)
-                               (async/<!!))
+                               async/<!!)
           ;; alice's flakes filtered using alice's policy-enforced db
           alice-db-alice  (->> alice-flakes
                                (policy-enforce/filter-subject-flakes alice-db)
-                               (async/<!!))
+                               async/<!!)
           ;; widget flakes filtered using alice's policy-enforced db
           alice-db-widget (->> widget-flakes
                                (policy-enforce/filter-subject-flakes alice-db)
-                               (async/<!!))]
-
+                               async/<!!)]
 
       (is (= [#Flake [211106232532994 0 "http://example.org/ns/john" 1 -1 true nil]
-              #Flake [211106232532994 200 1002 0 -1 true nil]
-              #Flake [211106232532994 1003 "John" 1 -1 true nil]
-              #Flake [211106232532994 1004 "john@flur.ee" 1 -1 true nil]
-              #Flake [211106232532994 1005 "2021-08-17" 1 -1 true nil]]
+              #Flake [211106232532994 200 1001 0 -1 true nil]
+              #Flake [211106232532994 1002 "John" 1 -1 true nil]
+              #Flake [211106232532994 1003 "john@flur.ee" 1 -1 true nil]
+              #Flake [211106232532994 1004 "2021-08-17" 1 -1 true nil]]
              alice-db-john)
           "Alice cannot see John's ssn, but can see everything else.")
 
       (is (= [#Flake [211106232532992 0 "http://example.org/ns/alice" 1 -1 true nil]
-              #Flake [211106232532992 200 1002 0 -1 true nil]
-              #Flake [211106232532992 1003 "Alice" 1 -1 true nil]
-              #Flake [211106232532992 1004 "alice@flur.ee" 1 -1 true nil]
-              #Flake [211106232532992 1005 "2022-08-17" 1 -1 true nil]
-              #Flake [211106232532992 1006 "111-11-1111" 1 -1 true nil]
-              #Flake [211106232532992 1007 211106232532993 0 -1 true nil]]
+              #Flake [211106232532992 200 1001 0 -1 true nil]
+              #Flake [211106232532992 1002 "Alice" 1 -1 true nil]
+              #Flake [211106232532992 1003 "alice@flur.ee" 1 -1 true nil]
+              #Flake [211106232532992 1004 "2022-08-17" 1 -1 true nil]
+              #Flake [211106232532992 1005 "111-11-1111" 1 -1 true nil]
+              #Flake [211106232532992 1006 211106232532993 0 -1 true nil]]
              alice-db-alice)
           "Alice can see all flakes for herself, including her ssn.")
 
