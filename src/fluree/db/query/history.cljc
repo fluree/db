@@ -13,12 +13,13 @@
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
    [fluree.db.util.log :as log]
-   [fluree.db.query.range :as query-range]))
+   [fluree.db.query.range :as query-range]
+   [fluree.db.db.json-ld :as jld-db]))
 
 (def History
   [:map {:registry {::iri [:or :keyword :string]
                     ::context [:map-of :any :any]}}
-   [:history
+   [:history {:optional true}
     [:orn
      [:subject ::iri]
      [:flake
@@ -49,6 +50,78 @@
       (fn [{:keys [from to]}] (if (and from to (number? from) (number? to))
                                 (<= from to)
                                 true))]]]])
+
+(def RangeQuery
+  [:and
+   [:map {:registry {::iri [:or :keyword :string]
+                     ::context [:map-of :any :any]}}
+    [:select {:optional true}
+     [:orn
+      [:subject ::iri]
+      [:flake
+       [:or
+        [:catn
+         [:s ::iri]]
+        [:catn
+         [:s [:maybe ::iri]]
+         [:p ::iri]]
+        [:catn
+         [:s [:maybe ::iri]]
+         [:p ::iri]
+         [:o [:not :nil]]]]]]]
+    [:commit-details {:optional true} :boolean]
+    [:context {:optional true} ::context]
+    [:t {:optional true}
+     [:and
+      [:map
+       [:from {:optional true} [:or
+                                [:enum :latest]
+                                pos-int?
+                                datatype/iso8601-datetime-re]]
+       [:to {:optional true} [:or
+                              [:enum :latest]
+                              pos-int?
+                              datatype/iso8601-datetime-re]]
+       [:at {:optional true} [:or
+                              [:enum :latest]
+                              pos-int?
+                              datatype/iso8601-datetime-re]]]
+      [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+       (fn [{:keys [from to at]}]
+         ;; if you have :at, you cannot have :from or :to
+         (if at
+           (not (or from to))
+           (or from to)))]
+      [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+       (fn [{:keys [from to]}] (if (and (number? from) (number? to))
+                                 (<= from to)
+                                 true))]]]]
+   [:fn (fn [{:keys [select commit-details t]}]
+          (or
+            ;; history query
+            select
+            ;; commit query
+            (and commit-details t)))]])
+
+
+{:commit-details true
+ :t {:from :latest}}
+
+{:commit-details true
+ :t {:at :latest}}
+
+{:commit-details true
+ :t :latest}
+
+(def range-query-validator
+  (m/validator RangeQuery))
+
+(def range-query-parser
+  (m/parser RangeQuery))
+
+(defn range-query?
+  [query]
+  (range-query-validator query))
 
 (def history-query-validator
   (m/validator History))
@@ -142,6 +215,31 @@
         [pattern idx] (cond
                         (not (nil? s))
                         [history :spot]
+
+                        (and (nil? s) (not (nil? p)) (nil? o))
+                        [[p s o t] :psot]
+
+                        (and (nil? s) (not (nil? p)) (not (nil? o)))
+                        [[p o s t] :post])]
+    [pattern idx]))
+
+(defn select-pattern
+  [db context select]
+  (let [ ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
+        [query-type parsed-query] select
+
+        {:keys [s p o]} (if (= :subject query-type)
+                          {:s parsed-query}
+                          parsed-query)
+
+        query [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
+               (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
+               (when o (jld-db/expand-iri db o context))]
+
+        [s p o t] [(get select 0) (get select 1) (get select 2) (get select 3)]
+        [pattern idx] (cond
+                        (not (nil? s))
+                        [select :spot]
 
                         (and (nil? s) (not (nil? p)) (nil? o))
                         [[p s o t] :psot]

@@ -103,29 +103,78 @@
           (<? (history/with-commit-details db parsed-context results))
           results)))))
 
+(defn history2
+  [db query-map]
+  (go-try
+    (if-not (history/range-query? query-map)
+      (throw (ex-info (str "History query not properly formatted. Provided "
+                           (pr-str query-map))
+                      {:status 400
+                       :error  :db/invalid-query}))
+
+
+      (let [{:keys [context select t commit-details]} (history/range-query-parser query-map)
+
+            [pattern idx] (if select
+                            (history/select-pattern db context select)
+                            [[] :tspo])
+
+            ;; from and to are positive ints, need to convert to negative or fill in default values
+            {:keys [from to at]} t
+            [from-t to-t]        (if at
+                                   (let [t (cond (= :latest at) (:t db)
+                                                 (string? at)   (<? (time-travel/datetime->t db from))
+                                                 :else          (- at))]
+                                     [t t])
+
+                                   [(cond (= :latest from) (:t db)
+                                          (string? from)   (<? (time-travel/datetime->t db from))
+                                          (number? from)   (- from)
+                                          :else            -1)
+                                    (cond (= :latest to) (:t db)
+                                          (string? to)   (<? (time-travel/datetime->t db to))
+                                          (number? to)   (- to)
+                                          :else          (:t db))])
+
+            flakes         (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
+            parsed-context (fql-parse/parse-context query-map db)]
+        (cond (and select commit-details)
+              ;; history for a particular pattern, with commit details
+              (->> (<? (history/history-flakes->json-ld db parsed-context flakes))
+                   (history/with-commit-details db parsed-context)
+                   (<?))
+
+              select
+              ;; history for a particular pattern
+              (<? (history/history-flakes->json-ld db parsed-context flakes))
+
+              :else
+              ;; just commits over a range of time
+              (<? (history/commit-details db context from-t to-t)))))))
+
 (defn query
   "Execute a query against a database source, or optionally
   additional sources if the query spans multiple data sets.
   Returns core async channel containing result."
   [sources query]
   (go-try
-   (let [{query :subject, issuer :issuer}
-         (or (<? (cred/verify query))
-             {:subject query})
+    (let [{query :subject, issuer :issuer}
+          (or (<? (cred/verify query))
+              {:subject query})
 
-         {:keys [opts t]} query
-         db               (if (async-util/channel? sources) ;; only support 1 source currently
-                            (<? sources)
-                            sources)
-         db*              (-> (if t
-                                (<? (time-travel/as-of db t))
-                                db)
-                              (assoc-in [:policy :cache] (atom {})))
+          {:keys [opts t]} query
+          db               (if (async-util/channel? sources) ;; only support 1 source currently
+                             (<? sources)
+                             sources)
+          db*              (-> (if t
+                                 (<? (time-travel/as-of db t))
+                                 db)
+                               (assoc-in [:policy :cache] (atom {})))
           meta?         (:meta opts)
           opts*         (assoc opts :issuer issuer)
           start         #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
-         result        (<? (fql/query db* (assoc query :opts opts*)))]
+          result        (<? (fql/query db* (assoc query :opts opts*)))]
       (if meta?
         {:status 200
          :result result
