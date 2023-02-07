@@ -5,7 +5,9 @@
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
-            #?(:clj [test-with-files.tools :refer [with-tmp-dir]])))
+            #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
+                      :as twf]
+               :cljs [test-with-files.tools :as-alias twf])))
 
 (deftest exists?-test
   (testing "returns true after committing data to a ledger"
@@ -127,9 +129,9 @@
            (is (= (:context ledger) (:context loaded))))))
 
      (testing "can load a file ledger with its own context"
-       (with-tmp-dir storage-path
-         (let [conn-context {:id "@id", :type "@type"}
-               ledger-context {:ex "http://example.com/"
+       (with-tmp-dir storage-path #_{::twf/delete-dir false}
+         (let [conn-context   {:id "@id", :type "@type"}
+               ledger-context {:ex     "http://example.com/"
                                :schema "http://schema.org/"}
                conn           @(fluree/connect
                                  {:method :file :storage-path storage-path
