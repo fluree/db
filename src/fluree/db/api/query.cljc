@@ -64,7 +64,6 @@
            results (<? (history/commit-details db context from-t to-t))]
        results))))
 
-
 (defn history
   [db query-map]
   (go-try
@@ -99,8 +98,10 @@
             flakes            (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
 
             parsed-context   (fql-parse/parse-context query-map db)
-            results           (<? (history/history-flakes->json-ld db parsed-context flakes))]
-        results))))
+            results          (<? (history/history-flakes->json-ld db parsed-context flakes))]
+        (if commit-details
+          (<? (history/with-commit-details db parsed-context results))
+          results)))))
 
 (defn query
   "Execute a query against a database source, or optionally

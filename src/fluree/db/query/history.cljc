@@ -269,3 +269,29 @@
     (let [flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
           results (<? (commit-flakes->json-ld db context flakes))]
       results)))
+
+(defn with-commit-details
+  "Annotate the results of a history query with by associng the commit for each `t` into
+  the history results."
+  [db context history-results]
+  (go-try
+    (let [error-ch   (async/chan)
+          out-ch     (async/chan)
+          results-ch (async/into [] out-ch)]
+      (async/pipeline-async 2
+                            out-ch
+                            (fn [result ch]
+                              (-> (async/go
+                                    (try*
+                                      (let [t-key     (json-ld/compact const/iri-t context)
+                                            commit-t  (- (get result t-key))
+                                            [details] (<? (commit-details db context commit-t commit-t))]
+                                        (assoc result (json-ld/compact const/iri-commit context) details))
+                                      (catch* e
+                                              (log/error e "Error fetching commit details.")
+                                              (async/>! error-ch e))))
+                                  (async/pipe ch)))
+                            (async/to-chan! history-results))
+      (async/alt!
+        error-ch ([e] e)
+        results-ch ([result] result)))))
