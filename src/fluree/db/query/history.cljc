@@ -202,26 +202,26 @@
   [db compact cache fuel error-ch t-flakes]
   (async/go
     (try*
-      (let [{commit-metadata-flakes :commit-meta
-             commit-data-flakes     :commit-data
+      (let [{commit-wrapper-flakes :commit-wrapper
+             commit-meta-flakes     :commit-meta
              assert-flakes          :assert-flakes
              retract-flakes         :retract-flakes} (group-by (fn [f]
                                                                  (cond
-                                                                   (commit-wrapper-flake? f)  :commit-meta
-                                                                   (commit-metadata-flake? f) :commit-data
+                                                                   (commit-wrapper-flake? f)  :commit-wrapper
+                                                                   (commit-metadata-flake? f) :commit-meta
                                                                    (flake/op f)               :assert-flakes
                                                                    :else                      :retract-flakes))
              t-flakes)
 
+            commit-wrapper-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                       {:wildcard? true, :depth 0}
+                                                       0 commit-wrapper-flakes)
+
             commit-meta-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
                                                        {:wildcard? true, :depth 0}
-                                                       0 commit-metadata-flakes)
-
-            commit-data-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                       {:wildcard? true, :depth 0}
-                                                       0 commit-data-flakes)
+                                                       0 commit-meta-flakes)
+            commit-wrapper      (<? commit-wrapper-chan)
             commit-meta      (<? commit-meta-chan)
-            commit-data      (<? commit-data-chan)
             asserts          (<? (t-flakes->json-ld db compact cache fuel error-ch assert-flakes))
             retracts         (<? (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))
 
@@ -230,10 +230,9 @@
             data-key    (json-ld/compact const/iri-data compact)
             commit-key  (json-ld/compact const/iri-commit compact)]
 
-        (-> {commit-key commit-meta
-             data-key commit-data}
-            (assoc-in  [data-key assert-key] asserts)
-            (assoc-in  [data-key retract-key] retracts)))
+        (-> {commit-key (merge commit-wrapper commit-meta)}
+            (assoc-in  [commit-key data-key assert-key] asserts)
+            (assoc-in  [commit-key data-key retract-key] retracts)))
      (catch* e
              (log/error e "Error converting commit flakes.")
              (async/>! error-ch e)))))
