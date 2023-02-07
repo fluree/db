@@ -12,8 +12,7 @@
             [clojure.string :as str]
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
-            [clojure.walk :as walk])
+            [fluree.db.util.log :as log])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -27,7 +26,7 @@
                       ;; default branch
                       (get branches branch))
         context-kw  (json-ld/parse-context context)
-        context-str (-> context walk/stringify-keys json-ld/parse-context)]
+        context-str (-> context util/stringify-keys json-ld/parse-context)]
     (-> branch
         (assoc-in [:latest-db :schema :context] context-kw)
         (assoc-in [:latest-db :schema :context-str] context-str))))

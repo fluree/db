@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.commit
-  (:require [clojure.walk :as walk]
-            [fluree.json-ld :as json-ld]
+  (:require [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
@@ -360,7 +359,7 @@
     (let [context (get commit (keyword const/iri-default-context))
           stringify? (-> context keys first keyword?) ; (too?) simple check if we need to stringify the keys before storing
           context-str (if stringify?
-                        (walk/stringify-keys context)
+                        (util/stringify-keys context)
                         context)
           {:keys [address]} (<? (conn-proto/-ctx-write conn ledger context-str))]
       (assoc commit (keyword const/iri-default-context) address))))
