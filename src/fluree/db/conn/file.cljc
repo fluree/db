@@ -35,11 +35,11 @@
   [{:keys [storage-path] :as _conn}]
   (let [abs-path? #?(:clj (.isAbsolute (io/file storage-path))
                      :cljs (path/isAbsolute storage-path))
-        abs-root          (if abs-path?
-                            ""
-                            (str #?(:clj  (.getAbsolutePath (io/file ""))
-                                    :cljs (path/resolve ".")) "/"))
-        path              (str abs-root storage-path "/")]
+        abs-root  (if abs-path?
+                    ""
+                    (str #?(:clj  (.getAbsolutePath (io/file ""))
+                            :cljs (path/resolve ".")) "/"))
+        path      (str abs-root storage-path "/")]
     #?(:clj  (-> path io/file .getCanonicalPath)
        :cljs (path/resolve path))))
 
