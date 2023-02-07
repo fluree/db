@@ -234,24 +234,28 @@
                     :id "fluree-default-context"}]
                   :f/retract []}}]
                @(fluree/commit-details ledger {:commit-details {:from 1 :to 1}})))
-        (is (= [{:f/commit	  
-                 {:f/message "meow"
-                  :f/time 720000,
-                  "https://www.w3.org/2018/credentials#issuer"
-                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                  :f/v 0,
-                  :f/data
-                  {:id
-                   "fluree:db:sha256:bpld3cjgz6belghbg3hqic4vttng7aumavfd66gkvozfq55sgfid"}},
-                 :f/data
-                 {:f/address
-                  "fluree:memory://f6fe35ec12acc2b0290e46f7f25c78c324f3a06f25798b5c052c90b42ea4f364",
-                  :f/flakes 87,
-                  :f/size 8260,
-                  :f/t 5,
-                  :f/assert [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
-                  :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]}}]
-               @(fluree/commit-details ledger {:commit-details {:from 5 :to 5}}))))
+        (let [commit-5 {:f/commit	  
+                        {:f/message "meow"
+                         :f/time 720000,
+                         "https://www.w3.org/2018/credentials#issuer"
+                         {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
+                         :f/v 0,
+                         :f/data
+                         {:id
+                          "fluree:db:sha256:bpld3cjgz6belghbg3hqic4vttng7aumavfd66gkvozfq55sgfid"}},
+                        :f/data
+                        {:f/address
+                         "fluree:memory://f6fe35ec12acc2b0290e46f7f25c78c324f3a06f25798b5c052c90b42ea4f364",
+                         :f/flakes 87,
+                         :f/size 8260,
+                         :f/t 5,
+                         :f/assert [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
+                         :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]}}]
+          (is (= [commit-5]
+                 @(fluree/commit-details ledger {:commit-details {:from 5 :to 5}})))
+          (is (= [commit-5]
+                 @(fluree/commit-details ledger {:commit-details :latest})))))
+
       (testing "time range"
         (let [[c4 c3 c2 :as response] @(fluree/commit-details ledger {:commit-details {:from 2 :to 4}})]
           (testing "all commits in time range are returned"

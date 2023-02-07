@@ -160,16 +160,19 @@
 (def CommitDetails
   [:map 
    [:commit-details
-    [:and
-     [:map
-      [:from {:optional true} pos-int?]
-      [:to {:optional true} pos-int?]]
-     [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
-      (fn [{:keys [from to]}] (or from to))]
-     [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
-      (fn [{:keys [from to]}] (if (and from to)
-                                (<= from to)
-                                true))]]]])
+    [:orn
+     [:latest [:enum :latest]]
+     [:bounded 
+      [:and
+       [:map
+        [:from {:optional true} pos-int?]
+        [:to {:optional true} pos-int?]]
+       [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+        (fn [{:keys [from to]}] (or from to))]
+       [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+        (fn [{:keys [from to]}] (if (and from to)
+                                  (<= from to)
+                                  true))]]]]]]) 
 
 (def commit-details-query-validator
   (m/validator CommitDetails))
@@ -182,7 +185,6 @@
   TODO"
   [query]
   (commit-details-query-validator query))
-
 
 (defn commit-wrapper-flake?
   "Returns `true` for a flake that represents
