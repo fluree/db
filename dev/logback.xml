@@ -3,7 +3,7 @@
 
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
-            <pattern>%highlight(%-5level) %white(%logger{24}) - %msg%n</pattern>
+            <pattern>%highlight(%-5level) %cyan(%logger{24}) - %msg%n</pattern>
         </encoder>
     </appender>
 
