@@ -16,7 +16,8 @@
 
 (deftest test-parse-query
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/parse" {:context {:ex "http://example.org/ns/"}})
+        ledger @(fluree/create conn "query/parse"
+                               {:context {:ex "http://example.org/ns/"}})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/brian,
@@ -50,7 +51,7 @@
                 :spec      {:depth 0 :wildcard? true}}
                (de-recordify-select select)))
         (is (= [[{::where/var '?s}
-                 {::where/val 1003 ::where/datatype 7}
+                 {::where/val 1002 ::where/datatype 7}
                  {::where/val "Alice" ::where/datatype 1}]]
                patterns)))
       (let [vars-query {:select {"?s" ["*"]}
@@ -68,7 +69,7 @@
                 :spec      {:depth 0 :wildcard? true}}
                (de-recordify-select select)))
         (is (= [[{::where/var '?s}
-                 {::where/val      1003
+                 {::where/val      1002
                   ::where/datatype 7}
                  {::where/var '?name}]]
                patterns)))
@@ -86,24 +87,24 @@
                 {:var '?email}]
                (de-recordify-select select)))
         (is (= [[{::where/var '?s}
-                 {::where/val      1003
+                 {::where/val      1002
                   ::where/datatype 7}
                  {::where/val      "Cam"
                   ::where/datatype 1}]
                 [{::where/var '?s}
-                 {::where/val      1009
+                 {::where/val      1008
                   ::where/datatype 7}
                  {::where/var '?f}]
                 [{::where/var '?f}
-                 {::where/val      1003
+                 {::where/val      1002
                   ::where/datatype 7}
                  {::where/var '?name}]
                 [{::where/var '?f}
-                 {::where/val      1005
+                 {::where/val      1004
                   ::where/datatype 7}
                  {::where/var '?age}]
                 [{::where/var '?f}
-                 {::where/val      1008
+                 {::where/val      1007
                   ::where/datatype 7}
                  {::where/var '?email}]]
                patterns)))
@@ -120,16 +121,16 @@
                    [{::where/var '?s}
                     {::where/val      200
                      ::where/datatype 7}
-                    {::where/val      1002
+                    {::where/val      1001
                      ::where/datatype 0}]]
                   [{::where/var '?s}
-                   {::where/val      1003
+                   {::where/val      1002
                     ::where/datatype 7}
                    {::where/var '?name}]
                   [:optional
                    {::where/patterns
                     [[{::where/var '?s}
-                      {::where/val      1007
+                      {::where/val      1006
                        ::where/datatype 7}
                       {::where/var '?favColor}]]
                     ::where/filters {}}]]
@@ -147,18 +148,18 @@
                    [{::where/var '?s}
                     {::where/val      200
                      ::where/datatype 7}
-                    {::where/val      1002
+                    {::where/val      1001
                      ::where/datatype 0}]]
                   [:union
                    [{::where/patterns
                      [[{::where/var '?s}
-                       {::where/val      1008
+                       {::where/val      1007
                         ::where/datatype 7}
                        {::where/var '?email1}]]
                      ::where/filters {}}
                     {::where/patterns
                      [[{::where/var '?s}
-                       {::where/val      1004
+                       {::where/val      1003
                         ::where/datatype 7}
                        {::where/var '?email2}]]
                      ::where/filters {}}]]]
@@ -177,14 +178,14 @@
                    [{::where/var '?s}
                     {::where/val      200
                      ::where/datatype 7}
-                    {::where/val      1002
+                    {::where/val      1001
                      ::where/datatype 0}]]
                   [{::where/var '?s}
-                   {::where/val      1005
+                   {::where/val      1004
                     ::where/datatype 7}
                    {::where/var '?age}]
                   [{::where/var '?s}
-                   {::where/val      1003
+                   {::where/val      1002
                     ::where/datatype 7}
                    {::where/var '?name}]]
                  patterns))))

@@ -1,22 +1,24 @@
 (ns fluree.db.json-ld.commit
-  (:require [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto]
-            [fluree.db.flake :as flake]
-            [fluree.db.constants :as const]
-            [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.util.core :as util :refer [vswap!]]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.json-ld.branch :as branch]
-            [fluree.db.util.async :refer [<? go-try channel?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <! put!] :as async])
-            [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.json-ld.vocab :as vocab])
+  (:require
+    [clojure.walk :as walk]
+    [fluree.json-ld :as json-ld]
+    [fluree.crypto :as crypto]
+    [fluree.db.flake :as flake]
+    [fluree.db.constants :as const]
+    [fluree.db.json-ld.ledger :as jld-ledger]
+    [fluree.db.util.core :as util :refer [vswap!]]
+    [fluree.db.json-ld.credential :as cred]
+    [fluree.db.conn.proto :as conn-proto]
+    [fluree.db.ledger.proto :as ledger-proto]
+    [fluree.db.json-ld.branch :as branch]
+    [fluree.db.util.async :refer [<? go-try channel?]]
+    #?(:clj  [clojure.core.async :refer [go <!] :as async]
+       :cljs [cljs.core.async :refer [go <! put!] :as async])
+    [fluree.db.indexer.proto :as idx-proto]
+    [fluree.db.json-ld.commit-data :as commit-data]
+    [fluree.db.dbproto :as dbproto]
+    [fluree.db.util.log :as log :include-macros true]
+    [fluree.db.json-ld.vocab :as vocab])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -136,7 +138,7 @@
                      (cond-> retract
                              s-retract (conj s-retract))]))]
             (recur r assert* retract*))
-          {:refs-ctx (dissoc @ctx type-key)                 ; @type will be marked as @type: @id, which is implied
+          {:refs-ctx (dissoc @ctx type-key) ; @type will be marked as @type: @id, which is implied
            :assert   assert
            :retract  retract
            :flakes   flakes})))))
@@ -194,7 +196,7 @@
      :v              0
      :prev-commit    (:address commit)
      :prev-dbid      (:dbid commit)
-     :ledger-address nil                                    ;; TODO
+     :ledger-address nil ;; TODO
      :time           commit-time
      :context        context*
      :private        private*
@@ -253,7 +255,7 @@
                               prev-dbid (assoc-in [prev-db-key "@type"] "@id")
                               (seq assert) (assoc-in [assert-key "@container"] "@graph")
                               (seq retract) (assoc-in [retract-key "@container"] "@graph"))
-          db-json     (cond-> {id-key                nil    ;; comes from hash later
+          db-json     (cond-> {id-key                nil ;; comes from hash later
                                type-key              [(compact const/iri-DB)]
                                (compact const/iri-t) t
                                (compact const/iri-v) v}
@@ -307,7 +309,7 @@
     (let [last-sid       (volatile! (jld-ledger/last-commit-sid db))
           next-sid       (fn [] (vswap! last-sid inc))
           {:keys [message tag time id data previous issuer]} commit
-          epoch-time (util/str->epoch-ms time)
+          epoch-time     (util/str->epoch-ms time)
           {db-id :id, db-address :address, db-t :t} data
           t              (- db-t)
           db*            (if (= 1 db-t)
@@ -350,6 +352,20 @@
           db**           (assoc-in db* [:ecount const/$_shard] @last-sid)]
       (add-commit-flakes-to-db db** flakes))))
 
+(defn link-context-to-commit
+  "Takes a commit with an embedded :context and pulls it out, saves it to
+  storage separately (content-addressed), and puts the address of that data
+  back into the commit under the :context key."
+  [{:keys [conn] :as ledger} commit]
+  (go-try
+    (let [context (get commit (keyword const/iri-default-context))
+          stringify? (-> context keys first keyword?) ; (too?) simple check if we need to stringify the keys before storing
+          context-str (if stringify?
+                        (walk/stringify-keys context)
+                        context)
+          {:keys [address]} (<? (conn-proto/-ctx-write conn ledger context-str))]
+      (assoc commit (keyword const/iri-default-context) address))))
+
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
   [{:keys [ledger commit] :as db} {:keys [branch push? did private] :as _opts}]
@@ -359,23 +375,27 @@
           new-t?        (or (nil? (commit-data/t ledger-commit))
                             (> (commit-data/t commit) (commit-data/t ledger-commit)))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
-          [new-commit* jld-commit] (commit-data/commit-jsonld new-commit)
+          _             (log/debug "do-commit+push new-commit:" new-commit)
+          new-commit*   (<? (link-context-to-commit ledger new-commit))
+          _             (log/debug "do-commit+push new-commit w/ linked context:"
+                                   new-commit*)
+          [new-commit** jld-commit] (commit-data/commit-jsonld new-commit*)
           signed-commit (if did
                           (cred/generate jld-commit private (:id did))
                           jld-commit)
-          commit-res    (<? (conn-proto/-c-write conn db signed-commit)) ;; write commit credential
-          new-commit**  (commit-data/update-commit-address new-commit* (:address commit-res))
-          db*           (assoc db :commit new-commit**)     ;; branch published to
+          commit-res    (<? (conn-proto/-c-write conn ledger signed-commit)) ;; write commit credential
+          new-commit*** (commit-data/update-commit-address new-commit** (:address commit-res))
+          db*           (assoc db :commit new-commit***) ;; branch published to
           db**          (if new-t?
                           (<? (add-commit-flakes db*))
                           db*)
           db***         (ledger-proto/-commit-update ledger branch db**)]
       ;; push is asynchronous!
       (when push?
-        (let [address      (ledger-proto/-address ledger)
-              commit-data* (assoc new-commit** :meta commit-res
+        (let [address     (ledger-proto/-address ledger)
+              commit-data (assoc new-commit*** :meta commit-res
                                                :ledger-state state)]
-          (conn-proto/-push conn address commit-data*)))
+          (conn-proto/-push conn address commit-data)))
       db***)))
 
 (defn update-commit-fn
@@ -404,14 +424,22 @@
   "Finds all uncommitted transactions and wraps them in a Commit document as the subject
   of a VerifiableCredential. Persists according to the :ledger :conn :method and
   returns a db with an updated :commit."
-  [{:keys [conn indexer] :as ledger} {:keys [t stats commit] :as db} {:keys [message tag] :as opts}]
+  [{:keys [conn indexer context] :as ledger} {:keys [t stats commit] :as db}
+   {:keys [message tag] :as opts}]
   (go-try
     (let [{:keys [id-key did] :as opts*} (enrich-commit-opts db opts)]
       (let [ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
-            dbid              (get ledger-update id-key)    ;; sha address of latest "db" point in ledger
-            ledger-update-res (<? (conn-proto/-c-write conn db ledger-update)) ;; write commit data
-            db-address        (:address ledger-update-res)  ;; may not have address (e.g. IPFS) until after writing file
-            new-commit        (commit-data/new-db-commit-map commit did message tag dbid t db-address (:flakes stats) (:size stats))
+            dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
+            ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
+            db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
+            context-key       (keyword const/iri-default-context)
+            base-commit-map   {:old-commit commit, :issuer did
+                               :message    message, :tag tag, :dbid dbid, :t t
+                               :db-address db-address
+                               :flakes     (:flakes stats)
+                               :size       (:size stats)
+                               context-key context}
+            new-commit        (commit-data/new-db-commit-map base-commit-map)
             db*               (assoc db :commit new-commit)
             db**              (<? (do-commit+push db* opts*))]
         (when (idx-proto/-index? indexer db**)

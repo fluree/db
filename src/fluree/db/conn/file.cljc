@@ -33,13 +33,13 @@
 
 (defn local-path
   [{:keys [storage-path] :as _conn}]
-  (let [abs-path? #?(:clj  (.isAbsolute (io/file storage-path))
+  (let [abs-path? #?(:clj (.isAbsolute (io/file storage-path))
                      :cljs (path/isAbsolute storage-path))
-        abs-root  (if abs-path?
-                    ""
-                    (str #?(:clj  (.getAbsolutePath (io/file ""))
-                            :cljs (path/resolve ".")) "/"))
-        path      (str abs-root storage-path "/")]
+        abs-root          (if abs-path?
+                            ""
+                            (str #?(:clj  (.getAbsolutePath (io/file ""))
+                                    :cljs (path/resolve ".")) "/"))
+        path              (str abs-root storage-path "/")]
     #?(:clj  (-> path io/file .getCanonicalPath)
        :cljs (path/resolve path))))
 
@@ -141,28 +141,33 @@
   #?(:clj  (.getBytes ^String s)
      :cljs (js/Uint8Array. (js/Buffer.from s "utf8"))))
 
-(defn commit
-  ([conn data] (commit conn nil data))
-  ([conn db data]
-   (let [ledger      (:ledger db)
-         alias       (ledger-proto/-alias ledger)
-         branch      (name (:name (ledger-proto/-branch ledger)))
+(defn- write-data
+  [conn ledger data-type data]
+  (let [alias      (ledger-proto/-alias ledger)
+        branch     (name (:name (ledger-proto/-branch ledger)))
+        json       (json-ld/normalize-data data)
+        bytes      (->bytes json)
+        hash       (crypto/sha2-256 bytes :hex)
+        type-dir   (-> data-type name (str "s"))
+        path       (str alias
+                        (when branch (str "/" branch))
+                        (str "/" type-dir "/")
+                        hash ".json")
+        write-path (str (local-path conn) "/" path)]
+    (log/debug (str "Writing " (name data-type) " at " write-path))
+    (write-file write-path bytes)
+    {:name    hash
+     :hash    hash
+     :size    (count json)
+     :address (file-address path)}))
 
-         json        (json-ld/normalize-data data)
-         bytes       (->bytes json)
-         hash        (crypto/sha2-256 bytes :hex)
+(defn write-commit
+  [conn ledger commit-data]
+  (write-data conn ledger :commit commit-data))
 
-         commit-path (str alias
-                          (when branch (str "/" branch))
-                          "/commits/"
-                          hash ".json")
-         write-path  (str (local-path conn) "/" commit-path)]
-     (log/debug (str "Writing commit at " write-path))
-     (write-file write-path bytes)
-     {:name    hash
-      :hash    hash
-      :size    (count json)
-      :address (file-address commit-path)})))
+(defn write-context
+  [conn ledger context-data]
+  (write-data conn ledger :context context-data))
 
 (defn push
   "Just write to a different directory?"
@@ -186,13 +191,20 @@
   (let [[_ ledger & r] (str/split k #"_")]
     (str (local-path store) "/" ledger "/" "indexes" "/" (str/join "/" r))))
 
+(defn read-context
+  [conn context-key]
+  (json/parse (read-address conn context-key) true))
+
 (defrecord FileConnection [id memory state ledger-defaults push commit
                            parallelism msg-in-ch msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (go (read-commit conn commit-key)))
-  (-c-write [conn commit-data] (go (commit conn commit-data)))
-  (-c-write [conn db commit-data] (go (commit conn db commit-data)))
+  (-c-write [conn ledger commit-data] (go (write-commit conn ledger
+                                                        commit-data)))
+  (-ctx-read [conn context-key] (go (read-context conn context-key)))
+  (-ctx-write [conn ledger context-data] (go (write-context conn ledger
+                                                            context-data)))
 
   conn-proto/iNameService
   (-pull [conn ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
@@ -286,7 +298,7 @@
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path lru-cache-atom memory] :as opts}]
+  [{:keys [defaults parallelism storage-path lru-cache-atom memory] :as _opts}]
   (go
     (let [storage-path (trim-last-slash storage-path)
           conn-id      (str (random-uuid))
@@ -300,8 +312,6 @@
                             :ledger-defaults (ledger-defaults defaults)
                             :serializer      #?(:clj  (avro-serde/avro-serde)
                                                 :cljs (json-serde/json-serde))
-                            :commit          commit
-                            :push            push
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)

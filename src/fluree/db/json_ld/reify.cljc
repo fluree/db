@@ -434,3 +434,13 @@
             (let [new-db (<? (merge-commit conn db* commit merged-db?))]
               (recur r new-db))
             db*))))))
+
+(defn load-default-context
+  "Loads the default context from the given conn's storage using the given key.
+  Returns a core.async channel with the context map."
+  [conn key]
+  (go-try
+    (log/debug "loading default context from storage w/ key:" key)
+    (->> key
+         (conn-proto/-ctx-read conn)
+         <?)))

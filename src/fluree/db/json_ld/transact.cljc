@@ -19,7 +19,8 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.credential :as cred])
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.util.log :as log])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -392,6 +393,7 @@
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
   [{:keys [schema t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
+  (log/debug "insert default-ctx:" default-ctx)
   (let [nodes    (-> json-ld
                      (json-ld/expand default-ctx)
                      util/sequential)
@@ -411,7 +413,6 @@
 
           [s p o] delete
           parsed-query (assoc parsed-query :delete [s p o])
-
           error-ch     (async/chan)
           flake-ch     (async/chan)
           where-ch     (where/search db parsed-query error-ch)]
@@ -427,8 +428,9 @@
                                     o* (if (::where/val o)
                                          o
                                          (get solution (::where/var o)))]
-                                (-> (where/resolve-flake-range db error-ch [s* p* o*])
-                                    (async/pipe ch))))
+                                (async/pipe
+                                  (where/resolve-flake-range db error-ch [s* p* o*])
+                                  ch)))
                             where-ch)
       (let [delete-ch (async/transduce (comp cat
                                              (map (fn [f]

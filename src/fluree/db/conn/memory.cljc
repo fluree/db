@@ -31,38 +31,61 @@
     (throw (ex-info (str "Incorrectly formatted Fluree memory db address: " address)
                     {:status 500 :error :db/invalid-db}))))
 
-(defn c-write!
-  [data-atom commit-data]
+(defn- write-data!
+  [data-atom data-type data]
   (go-try
-    (let [json (json-ld/normalize-data commit-data)
-          hash (crypto/sha2-256-normalize json)]
+    (let [json (json-ld/normalize-data data)
+          hash (crypto/sha2-256-normalize json)
+          path (if (= data-type :context)
+                 (str "/contexts/" hash)
+                 hash)]
       #?(:cljs (when platform/BROWSER
                  (.setItem js/localStorage hash json)))
-      (swap! data-atom assoc hash commit-data)
+      (swap! data-atom assoc hash data)
       {:name    hash
        :hash    hash
        :size    (count json)
-       :address (memory-address hash)})))
+       :address (memory-address path)})))
 
-(defn read-address
+(defn write-commit!
+  [data-atom commit-data]
+  (write-data! data-atom :commit commit-data))
+
+(defn- read-address
   [data-atom address]
-  #?(:clj (get @data-atom (address-path address))
-     :cljs (or (get @data-atom (address-path address))
-               (and platform/BROWSER (.getItem js/localStorage (address-path address))))))
+  (let [addr-path (address-path address)]
+    #?(:clj  (get @data-atom addr-path)
+       :cljs (or (get @data-atom addr-path)
+                 (and platform/BROWSER (.getItem js/localStorage addr-path))))))
+
+(defn- read-data
+  [data-atom data-type address]
+  (let [addr (if (= data-type :context)
+               (str "/contexts/" address)
+               address)
+        data (read-address data-atom addr)]
+    #?(:cljs (if (and platform/BROWSER (string? data))
+               (js->clj (.parse js/JSON data))
+               data)
+       :clj  data)))
 
 (defn read-commit
   [data-atom address]
-  (let [commit (read-address data-atom address)]
-    #?(:cljs (if (and platform/BROWSER (string? commit))
-               (js->clj (.parse js/JSON commit))
-               commit)
-       :clj commit)))
+  (read-data data-atom :commit address))
+
+(defn write-context!
+  [data-atom context-data]
+  (write-data! data-atom :context context-data))
+
+(defn read-context
+  [data-atom context-key]
+  (read-data data-atom :context context-key))
 
 (defn push!
   [data-atom publish-address ledger-data]
   (let [commit-address (:address ledger-data)
-        commit-path (address-path commit-address)
-        address-path (address-path publish-address)]
+        commit-path    (address-path commit-address)
+        address-path   (address-path publish-address)]
     (swap! data-atom
            (fn [state]
              (let [commit (get state commit-path)]
@@ -80,8 +103,9 @@
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (go (read-commit data-atom commit-key)))
-  (-c-write [_ commit-data] (c-write! data-atom commit-data))
-  (-c-write [_ db commit-data] (c-write! data-atom commit-data))
+  (-c-write [_ _ledger commit-data] (write-commit! data-atom commit-data))
+  (-ctx-write [_ _ledger context-data] (write-context! data-atom context-data))
+  (-ctx-read [_ context-key] (go (read-context data-atom context-key)))
 
   conn-proto/iNameService
   (-pull [this ledger] :TODO)
@@ -124,7 +148,7 @@
   (-parallelism [_] parallelism)
   (-id [_] id)
   (-context [_] (:context ledger-defaults))
-  (-new-indexer [_ opts] (idx-default/create opts))         ;; default new ledger indexer
+  (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine
@@ -185,7 +209,8 @@
           state           (state-machine/blank-state)
 
           cache-size     (conn-cache/memory->cache-size memory)
-          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache
+                                                    cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom

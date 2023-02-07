@@ -18,9 +18,7 @@
                               :schema/name  "Bob"
                               :ex/favArtist {:id          :ex/picasso
                                              :schema/name "Picasso"}}]})]
-      (is (= @(fluree/query db {:select {'?s [:_id :* {:ex/favArtist [:_id :schema/name]}]}
-                                :where  [['?s :type :ex/User]]})
-             [{:_id          211106232532993,
+      (is (= [{:_id          211106232532993,
                :id           :ex/bob,
                :rdf/type     [:ex/User],
                :schema/name  "Bob",
@@ -29,7 +27,9 @@
               {:_id         211106232532992,
                :id          :ex/alice,
                :rdf/type    [:ex/User],
-               :schema/name "Alice"}])))))
+               :schema/name "Alice"}]
+             @(fluree/query db {:select {'?s [:_id :* {:ex/favArtist [:_id :schema/name]}]}
+                                :where  [['?s :type :ex/User]]}))))))
 
 (deftest ^:integration s+p+o-full-db-queries
   (testing "Query that pulls entire database."
@@ -52,9 +52,7 @@
                               :schema/email "jane@flur.ee"
                               :schema/age   30}]})]
 
-      (is (= @(fluree/query db {:select ['?s '?p '?o]
-                                :where  [['?s '?p '?o]]})
-             [[:ex/jane :id "http://example.org/ns/jane"]
+      (is (= [[:ex/jane :id "http://example.org/ns/jane"]
               [:ex/jane :rdf/type :ex/User]
               [:ex/jane :schema/name "Jane"]
               [:ex/jane :schema/email "jane@flur.ee"]
@@ -73,13 +71,9 @@
               [:schema/name :id "http://schema.org/name"]
               [:ex/User :id "http://example.org/ns/User"]
               [:ex/User :rdf/type :rdfs/Class]
-              [:f/Context :id "https://ns.flur.ee/ledger#Context"]
-              [:f/Context :rdf/type :rdfs/Class]
-              [:f/context :id "https://ns.flur.ee/ledger#context"]
               [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
               [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
-              ["fluree-default-context" :id "fluree-default-context"]
-              ["fluree-default-context" :rdf/type :f/Context]
-              ["fluree-default-context" :f/context "{\"schema\":\"http://schema.org/\",\"wiki\":\"https://www.wikidata.org/wiki/\",\"xsd\":\"http://www.w3.org/2001/XMLSchema#\",\"type\":\"@type\",\"rdfs\":\"http://www.w3.org/2000/01/rdf-schema#\",\"ex\":\"http://example.org/ns/\",\"id\":\"@id\",\"f\":\"https://ns.flur.ee/ledger#\",\"sh\":\"http://www.w3.org/ns/shacl#\",\"skos\":\"http://www.w3.org/2008/05/skos#\",\"rdf\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"}"]
-              [:id :id "@id"]])
+              [:id :id "@id"]]
+             @(fluree/query db {:select ['?s '?p '?o]
+                                :where  [['?s '?p '?o]]}))
           "Entire database should be pulled."))))
