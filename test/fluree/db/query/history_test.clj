@@ -167,6 +167,10 @@
                  (Throwable->map)
                  :cause))))
 
+    (testing "commit-details"
+      (is (= []
+             @(fluree/history ledger {:history :ex/dan :commit-details true}))))
+
 
     (testing "invalid query"
       (is (= "History query not properly formatted. Provided {:history []}"
@@ -212,7 +216,7 @@
                                             :ex/y "bar-cat"}
                                     {:message "meow"})]
       (testing "at time t"
-        (is (= [{:f/commit	  
+        (is (= [{:f/commit
                  {:f/time 720000,
                   "https://www.w3.org/2018/credentials#issuer"
                   {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
@@ -234,7 +238,7 @@
                     :id "fluree-default-context"}]
                   :f/retract []}}]
                @(fluree/commit-details ledger {:commit-details {:from 1 :to 1}})))
-        (let [commit-5 {:f/commit	  
+        (let [commit-5 {:f/commit
                         {:f/message "meow"
                          :f/time 720000,
                          "https://www.w3.org/2018/credentials#issuer"
@@ -260,15 +264,15 @@
         (let [[c4 c3 c2 :as response] @(fluree/commit-details ledger {:commit-details {:from 2 :to 4}})]
           (testing "all commits in time range are returned"
             (is (=  3
-                   (count response))))
-          (is (=  {:f/commit	    
+                    (count response))))
+          (is (=  {:f/commit
                    {:f/time 720000,
                     "https://www.w3.org/2018/credentials#issuer"
                     {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
                     :f/v 0,
                     :f/data
                     {:id
-                    "fluree:db:sha256:bbw362vfdfw4jsrbsmgqqxsfdex7wj6qqhtqkq4vmc3lbpwah7se6"}},
+                     "fluree:db:sha256:bbw362vfdfw4jsrbsmgqqxsfdex7wj6qqhtqkq4vmc3lbpwah7se6"}},
                    :f/data
                    {:f/address
                     "fluree:memory://f900a0e4e136554c374299235f022030b63817bf2db6e858d8dcc0e5dc7efef0",
@@ -312,4 +316,3 @@
                    :f/assert [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/alice}],
                    :f/retract [{:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}]}}
                  c2)))))))
-

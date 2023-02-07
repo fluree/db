@@ -71,7 +71,7 @@
                       {:status 400
                        :error  :db/invalid-query}))
 
-      (let [{:keys [history t context]} (history/history-query-parser query-map)
+      (let [{:keys [history t context commit-details]} (history/history-query-parser query-map)
 
             ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
             [query-type parsed-query] history
@@ -94,8 +94,14 @@
                                (cond (string? to) (<? (time-travel/datetime->t db to))
                                      (number? to) (- to)
                                      :else        (:t db))]
-            flakes            (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
-            results           (<? (history/history-flakes->json-ld db query-map flakes))]
+            flakes            (<? (query-range/time-range db idx =
+                                                          (if commit-details
+                                                            []
+                                                            pattern)
+                                                          {:from-t from-t :to-t to-t}))
+            results           (<? (if commit-details
+                                    (history/flakes->json-ld db query-map pattern flakes)
+                                    (history/history-flakes->json-ld db query-map flakes)))]
         results))))
 
 (defn query
