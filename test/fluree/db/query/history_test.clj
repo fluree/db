@@ -305,6 +305,48 @@
                     :f/retract [{:ex/x "foo-1" :ex/y "bar-1" :id :ex/alice}]}}}
                  c2))))
 
+      (testing "time range from"
+        (is (= [{:f/commit
+                  {:f/address
+                   "fluree:memory://f6fe35ec12acc2b0290e46f7f25c78c324f3a06f25798b5c052c90b42ea4f364",
+                   :f/t 5,
+                   :f/v 0,
+                   :f/time 720000,
+                   :f/size 8260,
+                   :f/message "meow",
+                   :f/data
+                   {:f/assert [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
+                    :id
+                    "fluree:db:sha256:bpld3cjgz6belghbg3hqic4vttng7aumavfd66gkvozfq55sgfid",
+                    :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]},
+                   "https://www.w3.org/2018/credentials#issuer"
+                   {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
+                   :f/flakes 87}}]
+                @(fluree/commit-details ledger {:commit-details {:from 5}}))))
+
+      (testing "time range to"
+        (is (= [{:f/commit
+                 {:f/time 720000,
+                  "https://www.w3.org/2018/credentials#issuer"
+                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
+                  :f/v 0,
+                  :f/data
+                  {:f/assert
+                   [{:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}
+                    {:rdf/type [:f/Context],
+                     :f/context
+                     "{\"schema\":\"http://schema.org/\",\"wiki\":\"https://www.wikidata.org/wiki/\",\"xsd\":\"http://www.w3.org/2001/XMLSchema#\",\"type\":\"@type\",\"rdfs\":\"http://www.w3.org/2000/01/rdf-schema#\",\"ex\":\"http://example.org/ns/\",\"id\":\"@id\",\"f\":\"https://ns.flur.ee/ledger#\",\"sh\":\"http://www.w3.org/ns/shacl#\",\"skos\":\"http://www.w3.org/2008/05/skos#\",\"rdf\":\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"}",
+                     :id "fluree-default-context"}],
+                   :id
+                   "fluree:db:sha256:bkvjivpfq55d2vfh3ttehckx5fdmkkxb5cqggwhuejfdkm5d6f2j",
+                   :f/retract []},
+                  :f/address
+                  "fluree:memory://72711dc8318d4a0fb198ded6b20dad90a14339b67e52c628767451dfba32d044",
+                  :f/flakes 14,
+                  :f/size 1884,
+                  :f/t 1}}]
+               @(fluree/commit-details ledger {:commit-details {:to 1}}))))
+
       (testing "history commit details"
         (is (= [{:f/t 5
                  :f/assert [{:ex/x "foo-cat" :ex/y "bar-cat" :id :ex/alice}]
