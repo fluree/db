@@ -51,14 +51,17 @@
      (let [{:keys [commit-details]} (history/commit-details-query-parser query-map)
            [query-type parsed-query] commit-details
            {:keys [from to]} parsed-query
+
            db-t (:t db)
+
            [from-t to-t] (cond
                            (= :latest query-type) [db-t db-t]
                            (and from to) [(- from) (- to)]
-                           from  [(- from) db-t]
+                           from [(- from) db-t]
                            :else [-1 (- to)])
-           flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
-           results (<? (history/commit-flakes->json-ld db query-map flakes))]
+
+           context (fql-parse/parse-context query-map db)
+           results (<? (history/commit-details db context from-t to-t))]
        results))))
 
 
@@ -72,16 +75,15 @@
                        :error  :db/invalid-query}))
 
       (let [{:keys [history t context commit-details]} (history/history-query-parser query-map)
-
             ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
-            [query-type parsed-query] history
+            [query-type parsed-query]                  history
 
             {:keys [s p o]} (if (= :subject query-type)
                               {:s parsed-query}
                               parsed-query)
 
             query [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
-                   (when p (jld-db/expand-iri db p context))
+                   (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
                    (when o (jld-db/expand-iri db o context))]
 
             [pattern idx] (history/get-history-pattern query)
@@ -94,14 +96,10 @@
                                (cond (string? to) (<? (time-travel/datetime->t db to))
                                      (number? to) (- to)
                                      :else        (:t db))]
-            flakes            (<? (query-range/time-range db idx =
-                                                          (if commit-details
-                                                            []
-                                                            pattern)
-                                                          {:from-t from-t :to-t to-t}))
-            results           (<? (if commit-details
-                                    (history/flakes->json-ld db query-map pattern flakes)
-                                    (history/history-flakes->json-ld db query-map flakes)))]
+            flakes            (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
+
+            parsed-context   (fql-parse/parse-context query-map db)
+            results           (<? (history/history-flakes->json-ld db parsed-context flakes))]
         results))))
 
 (defn query

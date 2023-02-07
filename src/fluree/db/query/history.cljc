@@ -12,7 +12,8 @@
    [fluree.db.query.fql.resp :refer [flakes->res]]
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-   [fluree.db.util.log :as log]))
+   [fluree.db.util.log :as log]
+   [fluree.db.query.range :as query-range]))
 
 (def History
   [:map {:registry {::iri [:or :keyword :string]
@@ -80,7 +81,7 @@
               (log/error e "Error converting history flakes.")
               (async/>! error-ch e)))))
 
-(defn t-flakes->json-ld2
+(defn t-flakes->json-ld
   [db compact cache fuel error-ch t-flakes]
   (go-try
     (let [s-flake-partitions (fn [flakes]
@@ -100,50 +101,12 @@
                             s-ch)
       (async/<! s-json-ch))))
 
-(defn t-flakes->json-ld
-  [db compact cache fuel error-ch t-flakes]
-  (go-try
-    (let [{assert-flakes  true
-           retract-flakes false} (group-by flake/op t-flakes)
-
-          s-flake-partitions (fn [flakes]
-                               (->> flakes
-                                    (group-by flake/s)
-                                    (vals)
-                                    (async/to-chan!)))
-
-          s-asserts-ch  (s-flake-partitions assert-flakes)
-          s-retracts-ch (s-flake-partitions retract-flakes)
-
-          s-asserts-out-ch  (async/chan)
-          s-retracts-out-ch (async/chan)
-
-          s-asserts-json-ch  (async/into [] s-asserts-out-ch)
-          s-retracts-json-ch (async/into [] s-retracts-out-ch)]
-      ;; process asserts
-      (async/pipeline-async 2
-                            s-asserts-out-ch
-                            (fn [assert-flakes ch]
-                              (-> (s-flakes->json-ld db cache compact fuel error-ch assert-flakes)
-                                  (async/pipe ch)))
-                            s-asserts-ch)
-      ;; process retracts
-      (async/pipeline-async 2
-                            s-retracts-out-ch
-                            (fn [retract-flakes ch]
-                              (-> (s-flakes->json-ld db cache compact fuel error-ch retract-flakes)
-                                  (async/pipe ch)))
-                            s-retracts-ch)
-      {(json-ld/compact const/iri-t compact) (- (flake/t (first t-flakes)))
-       (json-ld/compact const/iri-assert compact) (async/<! s-asserts-json-ch)
-       (json-ld/compact const/iri-retract compact) (async/<! s-retracts-json-ch)})))
-
 (defn history-flakes->json-ld
-  [db q flakes]
+  [db context flakes]
   (go-try
     (let [fuel    (volatile! 0)
           cache   (volatile! {})
-          context (fql-parse/parse-context q db)
+
           compact (json-ld/compact-fn context)
 
           error-ch   (async/chan)
@@ -157,7 +120,16 @@
       (async/pipeline-async 2
                             out-ch
                             (fn [t-flakes ch]
-                              (-> (t-flakes->json-ld db compact cache fuel error-ch t-flakes)
+                              (-> (go-try
+                                    (let [{assert-flakes  true
+                                           retract-flakes false} (group-by flake/op t-flakes)]
+                                      {(json-ld/compact const/iri-t compact)
+                                       (- (flake/t (first t-flakes)))
+
+                                       (json-ld/compact const/iri-assert compact)
+                                       (async/<! (t-flakes->json-ld db compact cache fuel error-ch assert-flakes))
+                                       (json-ld/compact const/iri-retract compact)
+                                       (async/<! (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))}))
                                   (async/pipe ch)))
                             t-flakes-ch)
       (async/alt!
@@ -230,48 +202,48 @@
   [db compact cache fuel error-ch t-flakes]
   (async/go
     (try*
-     (let [{commit-metadata-flakes :commit-meta
-            commit-data-flakes :commit-data
-            data-flakes :data} (group-by (fn [f]
-                                           (cond
-                                             (commit-wrapper-flake? f) :commit-meta
-                                             (commit-metadata-flake?  f) :commit-data
-                                             :else :data)) t-flakes)
+      (let [{commit-metadata-flakes :commit-meta
+             commit-data-flakes     :commit-data
+             assert-flakes          :assert-flakes
+             retract-flakes         :retract-flakes} (group-by (fn [f]
+                                                                 (cond
+                                                                   (commit-wrapper-flake? f)  :commit-meta
+                                                                   (commit-metadata-flake? f) :commit-data
+                                                                   (flake/op f)               :assert-flakes
+                                                                   :else                      :retract-flakes))
+             t-flakes)
 
-           commit-meta-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                      {:wildcard? true, :depth 0}
-                                                      0 commit-metadata-flakes)
+            commit-meta-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                       {:wildcard? true, :depth 0}
+                                                       0 commit-metadata-flakes)
 
-           commit-data-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                      {:wildcard? true, :depth 0}
-                                                      0 commit-data-flakes)
-           commit-meta (<? commit-meta-chan)
+            commit-data-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
+                                                       {:wildcard? true, :depth 0}
+                                                       0 commit-data-flakes)
+            commit-meta      (<? commit-meta-chan)
+            commit-data      (<? commit-data-chan)
+            asserts          (<? (t-flakes->json-ld db compact cache fuel error-ch assert-flakes))
+            retracts         (<? (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))
 
-           commit-data (<? commit-data-chan)
+            assert-key  (json-ld/compact const/iri-assert compact)
+            retract-key (json-ld/compact const/iri-retract compact)
+            data-key    (json-ld/compact const/iri-data compact)
+            commit-key  (json-ld/compact const/iri-commit compact)]
 
-           assert-key (json-ld/compact const/iri-assert compact)
-           retract-key (json-ld/compact const/iri-retract compact)
-           data-key  (json-ld/compact const/iri-data compact)
-           commit-key (json-ld/compact const/iri-commit compact)
-
-           {asserts assert-key
-            retracts retract-key} (<? (t-flakes->json-ld db compact cache fuel error-ch data-flakes))
-
-           result         (assoc {commit-key commit-meta}
-                                 data-key commit-data)]
-       (-> result
-           (assoc-in  [data-key assert-key] asserts)
-           (assoc-in  [data-key retract-key] retracts)))
+        (-> {commit-key commit-meta
+             data-key commit-data}
+            (assoc-in  [data-key assert-key] asserts)
+            (assoc-in  [data-key retract-key] retracts)))
      (catch* e
              (log/error e "Error converting commit flakes.")
              (async/>! error-ch e)))))
 
 (defn commit-flakes->json-ld
-  [db q flakes]
+  [db context flakes]
   (go-try
     (let [fuel    (volatile! 0)
           cache   (volatile! {})
-          compact (json-ld/compact-fn (fql-parse/parse-context q db))
+          compact (json-ld/compact-fn context)
 
           error-ch   (async/chan)
           out-ch     (async/chan)
@@ -292,88 +264,9 @@
         error-ch ([e] e)
         results-ch ([result] result)))))
 
-(defn commit-history-t-flakes->json-ld
-  [db compact cache fuel error-ch [s p o :as pattern] t-flakes]
-  (async/go
-    (try*
-      (let [{commit-wrapper-flakes  :commit-wrapper
-             commit-metadata-flakes :commit-metadata
-             data-flakes            :data} (group-by (fn [f]
-                                            (cond
-                                              (commit-wrapper-flake? f)   :commit-wrapper
-                                              (commit-metadata-flake?  f) :commit-metadata
-                                              :else                       :data)) t-flakes)
-
-            [sid pid o] [s (dbproto/-subid db p) o]
-
-            {assert-flakes  true
-             retract-flakes false} (->> data-flakes
-                                        (filter (fn [f]
-                                                  (and pattern
-                                                       (or
-                                                         (and sid (= sid (flake/s f)))
-                                                         (and pid (= pid (flake/p f)))
-                                                         (and o (= o (flake/o f)))))))
-                                        (group-by flake/op))
-
-            commit-wrapper-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                          {:wildcard? true, :depth 0}
-                                                          0 commit-wrapper-flakes)
-
-            commit-metadata-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                           {:wildcard? true, :depth 0}
-                                                           0 commit-metadata-flakes)
-            commit-wrapper       (<? commit-wrapper-chan)
-
-            commit-metadata (<? commit-metadata-chan)
-
-            assert-key  (json-ld/compact const/iri-assert compact)
-            retract-key (json-ld/compact const/iri-retract compact)
-            data-key    (json-ld/compact const/iri-data compact)
-            commit-key  (json-ld/compact const/iri-commit compact)
-
-
-            asserts  (if (not-empty assert-flakes)
-                      (<? (t-flakes->json-ld2 db compact cache fuel error-ch assert-flakes))
-                      [])
-            retracts (if (not-empty retract-flakes)
-                       (<? (t-flakes->json-ld2 db compact cache fuel error-ch retract-flakes))
-                       [])
-
-            result (assoc {commit-key commit-wrapper}
-                                  data-key commit-metadata)]
-       (-> result
-           (assoc-in  [data-key assert-key] asserts)
-           (assoc-in  [data-key retract-key] retracts)))
-     (catch* e
-             (log/error e "Error converting commit flakes.")
-             (async/>! error-ch e)))))
-
-(defn flakes->json-ld
-  [db q pattern flakes]
+(defn commit-details
+  [db context from-t to-t]
   (go-try
-    (let [fuel    (volatile! 0)
-          cache   (volatile! {})
-          compact (json-ld/compact-fn (fql-parse/parse-context q db))
-
-          error-ch   (async/chan)
-          out-ch     (async/chan)
-          results-ch (async/into [] out-ch)
-          ;; maybe condidtionalize
-          t-flakes-ch (->> flakes
-                           (remove #(or (= const/$iri (flake/p %))
-                                        (= const/$rdfs:Class (flake/o %))))
-                           (sort-by flake/t)
-                           (partition-by flake/t)
-                           (async/to-chan!))]
-
-      (async/pipeline-async 2
-                            out-ch
-                            (fn [t-flakes ch]
-                              (-> (commit-history-t-flakes->json-ld db compact cache fuel error-ch pattern
-                                                                    t-flakes)
-                                  (async/pipe ch)))
-                            t-flakes-ch)
-      (async/alt!
-        error-ch ([e] e)
-        results-ch ([result] result)))))
+    (let [flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
+          results (<? (commit-flakes->json-ld db context flakes))]
+      results)))
