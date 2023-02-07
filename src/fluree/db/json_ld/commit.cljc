@@ -1,24 +1,23 @@
 (ns fluree.db.json-ld.commit
-  (:require
-    [clojure.walk :as walk]
-    [fluree.json-ld :as json-ld]
-    [fluree.crypto :as crypto]
-    [fluree.db.flake :as flake]
-    [fluree.db.constants :as const]
-    [fluree.db.json-ld.ledger :as jld-ledger]
-    [fluree.db.util.core :as util :refer [vswap!]]
-    [fluree.db.json-ld.credential :as cred]
-    [fluree.db.conn.proto :as conn-proto]
-    [fluree.db.ledger.proto :as ledger-proto]
-    [fluree.db.json-ld.branch :as branch]
-    [fluree.db.util.async :refer [<? go-try channel?]]
-    #?(:clj  [clojure.core.async :refer [go <!] :as async]
-       :cljs [cljs.core.async :refer [go <! put!] :as async])
-    [fluree.db.indexer.proto :as idx-proto]
-    [fluree.db.json-ld.commit-data :as commit-data]
-    [fluree.db.dbproto :as dbproto]
-    [fluree.db.util.log :as log :include-macros true]
-    [fluree.db.json-ld.vocab :as vocab])
+  (:require [clojure.walk :as walk]
+            [fluree.json-ld :as json-ld]
+            [fluree.crypto :as crypto]
+            [fluree.db.flake :as flake]
+            [fluree.db.constants :as const]
+            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.util.core :as util :refer [vswap!]]
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.util.async :refer [<? go-try channel?]]
+            #?(:clj  [clojure.core.async :refer [go <!] :as async]
+               :cljs [cljs.core.async :refer [go <! put!] :as async])
+            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.json-ld.vocab :as vocab])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))

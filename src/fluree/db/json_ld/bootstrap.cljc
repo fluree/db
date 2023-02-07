@@ -135,20 +135,6 @@
                          "Must be a valid JSON context, or a valid context map or array/vector. Provided: " default-ctx)
                     {:status 400 :error :db/invalid-context}))))
 
-
-#_(defn bootstrap-tx
-    [default-ctx]
-    (let [ctx    (when default-ctx
-                   (let [default-ctx* (normalize-default-ctx default-ctx)]
-                     {"@id"     "fluree-default-context"
-                      "@type"   ["Context"]
-                      "context" default-ctx*}))
-          graph (cond-> []
-                        ctx (conj ctx))]
-      (when (seq graph)
-        {"@context" "https://ns.flur.ee/ledger/v1"
-         "@graph"   graph})))
-
 (defn bootstrap
   "Bootstraps a permissioned JSON-LD db. Returns async channel."
   ([blank-db] (bootstrap blank-db nil))

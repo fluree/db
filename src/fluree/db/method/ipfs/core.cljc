@@ -1,13 +1,12 @@
 (ns fluree.db.method.ipfs.core
   (:refer-clojure :exclude [read])
-  (:require
-    [fluree.db.method.ipfs.xhttp :as ipfs]
-    [fluree.db.util.async :refer [<? go-try]]
-    [clojure.string :as str]
-    [fluree.json-ld :as json-ld]
-    [fluree.db.method.ipfs.directory :as ipfs-dir]
-    [fluree.db.method.ipfs.keys :as ipfs-key]
-    [fluree.db.util.log :as log :include-macros true]))
+  (:require [fluree.db.method.ipfs.xhttp :as ipfs]
+            [fluree.db.util.async :refer [<? go-try]]
+            [clojure.string :as str]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.method.ipfs.directory :as ipfs-dir]
+            [fluree.db.method.ipfs.keys :as ipfs-key]
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 

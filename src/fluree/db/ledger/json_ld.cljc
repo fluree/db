@@ -1,20 +1,19 @@
 (ns fluree.db.ledger.json-ld
-  (:require
-    [fluree.db.ledger.proto :as ledger-proto]
-    [fluree.db.conn.proto :as conn-proto]
-    [fluree.db.util.async :refer [<? go-try]]
-    [fluree.db.json-ld.bootstrap :as bootstrap]
-    [fluree.db.json-ld.branch :as branch]
-    [fluree.db.db.json-ld :as jld-db]
-    [fluree.db.json-ld.commit :as jld-commit]
-    [fluree.json-ld :as json-ld]
-    [fluree.db.constants :as const]
-    [fluree.db.json-ld.reify :as jld-reify]
-    [clojure.string :as str]
-    [fluree.db.indexer.proto :as idx-proto]
-    [fluree.db.util.core :as util]
-    [fluree.db.util.log :as log]
-    [clojure.walk :as walk])
+  (:require [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.json-ld.bootstrap :as bootstrap]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.json-ld.commit :as jld-commit]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]
+            [fluree.db.json-ld.reify :as jld-reify]
+            [clojure.string :as str]
+            [fluree.db.indexer.proto :as idx-proto]
+            [fluree.db.util.core :as util]
+            [fluree.db.util.log :as log]
+            [clojure.walk :as walk])
   (:refer-clojure :exclude [load]))
 
 #?(:clj (set! *warn-on-reflection* true))
