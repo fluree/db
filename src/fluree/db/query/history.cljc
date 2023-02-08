@@ -306,30 +306,31 @@
   needed for commit retrieval."
   [db context history-results]
   (go-try
-    (let [t-key (json-ld/compact const/iri-t context)]
-      (loop [[result & r] history-results
-             consecutive-t-results []
-             first-t (get result t-key)
-             last-t nil
-             final []]
-        (if result
-          (let [result-t  (get result t-key)]
-            (if (or (nil? last-t)
-                    (= last-t (inc result-t)))
-              (recur r
-                     (conj consecutive-t-results result)
-                     first-t
-                     result-t
-                     final)
-              (let [from  (- last-t)
-                    to  (- first-t)
-                    consecutive-commit-details (<? (commit-details db context from to))]
-                (recur r
-                       [result]
-                       result-t
-                       result-t
-                       (into final (map into consecutive-t-results consecutive-commit-details))))))
-          (let [from  (- last-t)
-                to  (- first-t)
-                consecutive-commit-details (<? (commit-details db context from to))]
-            (into final (map into consecutive-t-results consecutive-commit-details))))))))
+   (when-not (empty? history-results)
+     (let [t-key (json-ld/compact const/iri-t context)]
+       (loop [[result & r] history-results
+              consecutive-t-results []
+              first-t (get result t-key)
+              last-t nil
+              final []]
+         (if result
+           (let [result-t  (get result t-key)]
+             (if (or (nil? last-t)
+                     (= last-t (inc result-t)))
+               (recur r
+                      (conj consecutive-t-results result)
+                      first-t
+                      result-t
+                      final)
+               (let [from  (- last-t)
+                     to  (- first-t)
+                     consecutive-commit-details (<? (commit-details db context from to))]
+                 (recur r
+                        [result]
+                        result-t
+                        result-t
+                        (into final (map into consecutive-t-results consecutive-commit-details))))))
+           (let [from  (- last-t)
+                 to  (- first-t)
+                 consecutive-commit-details (<? (commit-details db context from to))]
+             (into final (map into consecutive-t-results consecutive-commit-details)))))))))
