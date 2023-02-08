@@ -85,7 +85,7 @@
 
 (defn ->function
   "Build a filter function specification for the variable `var` out of the
-  boolean function `f` with parameters `params`."
+  boolean function `f`."
   [var f]
   (-> var
       ->variable

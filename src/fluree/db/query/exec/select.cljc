@@ -67,10 +67,10 @@
                       (>! error-ch e))))))
 
 (defn aggregate-selector
-  "Returns a selector that extracts the grouped value bound to the specified
-  `variable` from a where solution, formats each item in the group, and
-  processes the formatted group with the supplied `agg-function` to generate the
-  final aggregated result for display."
+  "Returns a selector that extracts the grouped values bound to the specified
+  variables referenced in the supplied `agg-function` from a where solution,
+  formats each item in the group, and processes the formatted group with the
+  supplied `agg-function` to generate the final aggregated result for display."
   [agg-function]
   (->AggregateSelector agg-function))
 
