@@ -2,7 +2,6 @@
   (:require [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select :as select]
-            [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.db.query.fql.syntax :as syntax]
@@ -110,18 +109,22 @@
                       {:status 400
                        :error  :db/invalid-query})))))
 
+(defn parse-code
+  [x]
+  (if (list? x)
+    x
+    (safe-read x)))
+
 (defn parse-filter-function
   "Evals, and returns query function."
-  [code-str vars]
-  (let [code      (safe-read code-str)
+  [fltr vars]
+  (let [code      (parse-code fltr)
         code-vars (or (not-empty (variables code))
-                      (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code-str)
+                      (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code)
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)
-        params    (vec code-vars)
-        [fun _]   (filter/extract-filter-fn code code-vars)
-        f         (filter/make-executable params fun)]
-    (where/->function var-name params f)))
+        f         (eval/compile-filter code var-name)]
+    (where/->function var-name f)))
 
 (def ^:const default-recursion-depth 100)
 
@@ -260,8 +263,8 @@
     (->> filters
          (mapcat vals)
          flatten
-         (map (fn [f-str]
-                (parse-filter-function f-str vars)))
+         (map (fn [fltr]
+                (parse-filter-function fltr vars)))
          (reduce (fn [m fltr]
                    (let [var-name (::where/var fltr)]
                      (update m var-name (fn [var-fltrs]
@@ -324,8 +327,7 @@
   [db context depth s]
   (cond
     (syntax/variable? s) (-> s parse-var-name select/variable-selector)
-    (syntax/query-fn? s) (let [{:keys [variable function]} (parse-aggregate s)]
-                           (select/aggregate-selector variable function))
+    (syntax/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
     (select-map? s)      (let [{:keys [variable selection depth spec]}
                                (parse-subselection db context s depth)]
                            (select/subgraph-selector variable selection depth spec))))
@@ -379,12 +381,6 @@
                        (if (syntax/asc? dir)
                          [v :asc]
                          [v :desc])))))))
-
-(defn parse-code
-  [x]
-  (if (list? x)
-    x
-    (safe-read x)))
 
 (defn parse-having
   [q]
