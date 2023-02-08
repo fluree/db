@@ -292,7 +292,6 @@
 (defn commit-details
   "Given a time range, return a collection of commit maps."
   [db context from-t to-t]
-  (println "COMMIT-DETAILS from to" from-t to-t)
   (go-try
     (let [flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
           results (<? (commit-flakes->json-ld db context flakes))]
