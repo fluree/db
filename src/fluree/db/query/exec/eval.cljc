@@ -209,3 +209,12 @@
     (eval `(fn [~soln-sym]
              (let ~bdg
                ~qualified-code)))))
+
+(defn compile-filter
+  [code var]
+  (let [f        (compile code)
+        soln-sym 'solution]
+    (eval `(fn [~soln-sym ~var]
+             (-> ~soln-sym
+                 (assoc (quote ~var) {::where/val ~var})
+                 ~f)))))

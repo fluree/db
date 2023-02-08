@@ -109,18 +109,22 @@
                       {:status 400
                        :error  :db/invalid-query})))))
 
+(defn parse-code
+  [x]
+  (if (list? x)
+    x
+    (safe-read x)))
+
 (defn parse-filter-function
   "Evals, and returns query function."
-  [code-str vars]
-  (let [code      (safe-read code-str)
+  [fltr vars]
+  (let [code      (parse-code fltr)
         code-vars (or (not-empty (variables code))
-                      (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code-str)
+                      (throw (ex-info (str "Filter function must contain a valid variable. Provided: " code)
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)
-        params    (vec code-vars)
-        [fun _]   (filter/extract-filter-fn code code-vars)
-        f         (filter/make-executable params fun)]
-    (where/->function var-name params f)))
+        f         (eval/compile-filter code var-name)]
+    (where/->function var-name f)))
 
 (def ^:const default-recursion-depth 100)
 
@@ -259,8 +263,8 @@
     (->> filters
          (mapcat vals)
          flatten
-         (map (fn [f-str]
-                (parse-filter-function f-str vars)))
+         (map (fn [fltr]
+                (parse-filter-function fltr vars)))
          (reduce (fn [m fltr]
                    (let [var-name (::where/var fltr)]
                      (update m var-name (fn [var-fltrs]
@@ -318,12 +322,6 @@
   [q vars db context]
   (when-let [where (:where q)]
     (parse-where-clause where vars db context)))
-
-(defn parse-code
-  [x]
-  (if (list? x)
-    x
-    (safe-read x)))
 
 (defn parse-selector
   [db context depth s]
