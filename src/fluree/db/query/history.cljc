@@ -16,46 +16,11 @@
    [fluree.db.query.range :as query-range]
    [fluree.db.db.json-ld :as jld-db]))
 
-(def History
-  [:map {:registry {::iri [:or :keyword :string]
-                    ::context [:map-of :any :any]}}
-   [:history {:optional true}
-    [:orn
-     [:subject ::iri]
-     [:flake
-      [:or
-       [:catn
-        [:s ::iri]]
-       [:catn
-        [:s [:maybe ::iri]]
-        [:p ::iri]]
-       [:catn
-        [:s [:maybe ::iri]]
-        [:p ::iri]
-        [:o [:not :nil]]]]]]]
-   [:context {:optional true} ::context]
-   [:commit-details {:optional true} :boolean]
-   [:t {:optional true}
-    [:and
-     [:map
-      [:from {:optional true} [:or
-                               pos-int?
-                               datatype/iso8601-datetime-re]]
-      [:to {:optional true} [:or
-                             pos-int?
-                             datatype/iso8601-datetime-re]]]
-     [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
-      (fn [{:keys [from to]}] (or from to))]
-     [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
-      (fn [{:keys [from to]}] (if (and from to (number? from) (number? to))
-                                (<= from to)
-                                true))]]]])
-
-(def RangeQuery
+(def HistoryQuery
   [:and
    [:map {:registry {::iri [:or :keyword :string]
                      ::context [:map-of :any :any]}}
-    [:select {:optional true}
+    [:history {:optional true}
      [:orn
       [:subject ::iri]
       [:flake
@@ -71,7 +36,7 @@
          [:o [:not :nil]]]]]]]
     [:commit-details {:optional true} :boolean]
     [:context {:optional true} ::context]
-    [:t {:optional true}
+    [:t
      [:and
       [:map
        [:from {:optional true} [:or
@@ -96,51 +61,39 @@
        (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                  (<= from to)
                                  true))]]]]
-   [:fn (fn [{:keys [select commit-details t]}]
-          (or
-            ;; history query
-            select
-            ;; commit query
-            (and commit-details t)))]])
+   [:fn {:error/message "Must supply either a :history or :commit-details key."}
+    (fn [{:keys [history commit-details t]}]
+      (or history commit-details))]])
 
-
-{:commit-details true
- :t {:from :latest}}
-
-{:commit-details true
- :t {:at :latest}}
-
-{:commit-details true
- :t :latest}
-
-(def range-query-validator
-  (m/validator RangeQuery))
-
-(def range-query-parser
-  (m/parser RangeQuery))
-
-(defn range-query?
-  [query]
-  (range-query-validator query))
 
 (def history-query-validator
-  (m/validator History))
+  (m/validator HistoryQuery))
 
 (def history-query-parser
-  (m/parser History))
+  (m/parser HistoryQuery))
 
 (defn history-query?
-  "Requires:
+  "Provide a time range :t and either :history or :commit-details or both.
+
   :history - either a subject iri or a vector in the pattern [s p o] with either the
   s or the p is required. If the o is supplied it must not be nil.
-  Optional:
   :context - json-ld context to use in expanding the :history iris.
-  :t - a map with keys :from and :to, at least one is required if :t is provided."
+  :commit-details - if true, each result will have a :commit key with the commit map as a value.
+  :t - :at
+     - :from or :to
+     - accepted values:
+       - positive t-value
+       - datetime string
+       - :latest keyword
+"
   [query]
   (history-query-validator query))
 
 
 (defn s-flakes->json-ld
+  "Build a subject map out a set of flakes with the same subject.
+
+  {:id :ex/foo :ex/x 1 :ex/y 2}"
   [db cache compact fuel error-ch s-flakes]
   (async/go
     (try*
@@ -155,6 +108,10 @@
               (async/>! error-ch e)))))
 
 (defn t-flakes->json-ld
+  "Build a collection of subject maps out of a set of flakes with the same t.
+
+  [{:id :ex/foo :ex/x 1 :ex/y 2}...]
+  "
   [db compact cache fuel error-ch t-flakes]
   (go-try
     (let [s-flake-partitions (fn [flakes]
@@ -175,6 +132,11 @@
       (async/<! s-json-ch))))
 
 (defn history-flakes->json-ld
+  "Build a collection of maps for each t that contains the t along with the asserted and
+  retracted subject maps.
+
+  [{:id :ex/foo :f/assert [{},,,} :f/retract [{},,,]]}]
+  "
   [db context flakes]
   (go-try
     (let [fuel    (volatile! 0)
@@ -209,73 +171,32 @@
         error-ch ([e] e)
         results-ch ([result] result)))))
 
-(defn get-history-pattern
-  [history]
-  (let [[s p o t]     [(get history 0) (get history 1) (get history 2) (get history 3)]
-        [pattern idx] (cond
-                        (not (nil? s))
-                        [history :spot]
+(defn history-pattern
+  "Given a parsed ids ids, convert the iris to subject ids and return the best index to ids against."
+  [db context query]
+  (go-try
+    (let [ ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
+          [query-type parsed-query] query
 
-                        (and (nil? s) (not (nil? p)) (nil? o))
-                        [[p s o t] :psot]
+          {:keys [s p o]} (if (= :subject query-type)
+                            {:s parsed-query}
+                            parsed-query)
 
-                        (and (nil? s) (not (nil? p)) (not (nil? o)))
-                        [[p o s t] :post])]
-    [pattern idx]))
-
-(defn select-pattern
-  [db context select]
-  (let [ ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
-        [query-type parsed-query] select
-
-        {:keys [s p o]} (if (= :subject query-type)
-                          {:s parsed-query}
-                          parsed-query)
-
-        query [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
+          ids [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
                (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
                (when o (jld-db/expand-iri db o context))]
 
-        [s p o t] [(get select 0) (get select 1) (get select 2) (get select 3)]
-        [pattern idx] (cond
-                        (not (nil? s))
-                        [select :spot]
+          [s p o] [(get ids 0) (get ids 1) (get ids 2)]
+          [pattern idx] (cond
+                          (not (nil? s))
+                          [ids :spot]
 
-                        (and (nil? s) (not (nil? p)) (nil? o))
-                        [[p s o t] :psot]
+                          (and (nil? s) (not (nil? p)) (nil? o))
+                          [[p s o] :psot]
 
-                        (and (nil? s) (not (nil? p)) (not (nil? o)))
-                        [[p o s t] :post])]
-    [pattern idx]))
-
-(def CommitDetails
-  [:map
-   [:commit-details
-    [:orn
-     [:latest [:enum :latest]]
-     [:bounded
-      [:and
-       [:map
-        [:from {:optional true} pos-int?]
-        [:to {:optional true} pos-int?]]
-       [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
-        (fn [{:keys [from to]}] (or from to))]
-       [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
-        (fn [{:keys [from to]}] (if (and from to)
-                                  (<= from to)
-                                  true))]]]]]])
-
-(def commit-details-query-validator
-  (m/validator CommitDetails))
-
-(def commit-details-query-parser
-  (m/parser CommitDetails))
-
-(defn commit-details-query?
-  "Requires:
-  TODO"
-  [query]
-  (commit-details-query-validator query))
+                          (and (nil? s) (not (nil? p)) (not (nil? o)))
+                          [[p o s] :post])]
+      [pattern idx])))
 
 (defn commit-wrapper-flake?
   "Returns `true` for a flake that represents
@@ -297,6 +218,7 @@
      const/$_commitdata:address} (flake/p f)))
 
 (defn commit-t-flakes->json-ld
+  "Build a commit maps given a set of all flakes with the same t."
   [db compact cache fuel error-ch t-flakes]
   (async/go
     (try*
@@ -312,8 +234,8 @@
              t-flakes)
 
             commit-wrapper-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
-                                                       {:wildcard? true, :depth 0}
-                                                       0 commit-wrapper-flakes)
+                                                          {:wildcard? true, :depth 0}
+                                                          0 commit-wrapper-flakes)
 
             commit-meta-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
                                                        {:wildcard? true, :depth 0}
@@ -331,11 +253,12 @@
         (-> {commit-key (merge commit-wrapper commit-meta)}
             (assoc-in  [commit-key data-key assert-key] asserts)
             (assoc-in  [commit-key data-key retract-key] retracts)))
-     (catch* e
-             (log/error e "Error converting commit flakes.")
-             (async/>! error-ch e)))))
+      (catch* e
+              (log/error e "Error converting commit flakes.")
+              (async/>! error-ch e)))))
 
 (defn commit-flakes->json-ld
+  "Create a collection of commit maps."
   [db context flakes]
   (go-try
     (let [fuel    (volatile! 0)
@@ -362,15 +285,16 @@
         results-ch ([result] result)))))
 
 (defn commit-details
+  "Given a time range, return a collection of commit maps."
   [db context from-t to-t]
   (go-try
     (let [flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
           results (<? (commit-flakes->json-ld db context flakes))]
       results)))
 
-(defn with-commit-details
-  "Annotate the results of a history query with by associng the commit for each `t` into
-  the history results."
+(defn add-commit-details
+  "Annotate the results of a history query by associng the commit map for each `t` into the
+  history result for that t."
   [db context history-results]
   (go-try
     (let [error-ch   (async/chan)
@@ -384,7 +308,7 @@
                                       (let [t-key     (json-ld/compact const/iri-t context)
                                             commit-t  (- (get result t-key))
                                             [details] (<? (commit-details db context commit-t commit-t))]
-                                        (assoc result (json-ld/compact const/iri-commit context) details))
+                                        (merge result details))
                                       (catch* e
                                               (log/error e "Error fetching commit details.")
                                               (async/>! error-ch e))))
