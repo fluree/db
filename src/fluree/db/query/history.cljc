@@ -73,19 +73,23 @@
   (m/parser HistoryQuery))
 
 (defn history-query?
-  "Provide a time range :t and either :history or :commit-details or both.
+  "Provide a time range :t and either :history or :commit-details, or both.
 
   :history - either a subject iri or a vector in the pattern [s p o] with either the
   s or the p is required. If the o is supplied it must not be nil.
+
   :context - json-ld context to use in expanding the :history iris.
+
   :commit-details - if true, each result will have a :commit key with the commit map as a value.
-  :t - :at
-     - :from or :to
-     - accepted values:
+
+  :t  - a map containing either:
+  - :at
+  - either :from or :to
+
+  accepted values for t maps:
        - positive t-value
        - datetime string
-       - :latest keyword
-"
+       - :latest keyword "
   [query]
   (history-query-validator query))
 
@@ -172,7 +176,8 @@
         results-ch ([result] result)))))
 
 (defn history-pattern
-  "Given a parsed ids ids, convert the iris to subject ids and return the best index to ids against."
+  "Given a parsed query, convert the iris from the query
+  to subject ids and return the best index to query against."
   [db context query]
   (go-try
     (let [ ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
