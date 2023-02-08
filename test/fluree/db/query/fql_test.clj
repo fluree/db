@@ -35,6 +35,15 @@
                                               [?s :ex/favNums ?favNums]]
                                    :group-by ?name
                                    :having   (>= (count ?favNums) 2)}))
+            "filters results according to the supplied having function code")
+
+        (is (= [["Cam" [5 10]] ["Alice" [9 42 76]] ["Brian" [7]]]
+               @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
+                                   :select   [?name ?favNums]
+                                   :where    [[?s :schema/name ?name]
+                                              [?s :ex/favNums ?favNums]]
+                                   :group-by ?name
+                                   :having   (>= (avg ?favNums) 2)}))
             "filters results according to the supplied having function code")))))
 
 (deftest ^:integration multi-query-test
