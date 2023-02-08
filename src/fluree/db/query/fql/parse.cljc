@@ -2,7 +2,6 @@
   (:require [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select :as select]
-            [fluree.db.query.parse.aggregate :refer [parse-aggregate]]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.db.query.fql.syntax :as syntax]
@@ -320,12 +319,17 @@
   (when-let [where (:where q)]
     (parse-where-clause where vars db context)))
 
+(defn parse-code
+  [x]
+  (if (list? x)
+    x
+    (safe-read x)))
+
 (defn parse-selector
   [db context depth s]
   (cond
     (syntax/variable? s) (-> s parse-var-name select/variable-selector)
-    (syntax/query-fn? s) (let [{:keys [variable function]} (parse-aggregate s)]
-                           (select/aggregate-selector variable function))
+    (syntax/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
     (select-map? s)      (let [{:keys [variable selection depth spec]}
                                (parse-subselection db context s depth)]
                            (select/subgraph-selector variable selection depth spec))))
@@ -379,12 +383,6 @@
                        (if (syntax/asc? dir)
                          [v :asc]
                          [v :desc])))))))
-
-(defn parse-code
-  [x]
-  (if (list? x)
-    x
-    (safe-read x)))
 
 (defn parse-having
   [q]
