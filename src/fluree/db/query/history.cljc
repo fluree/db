@@ -292,33 +292,45 @@
 (defn commit-details
   "Given a time range, return a collection of commit maps."
   [db context from-t to-t]
+  (println "COMMIT-DETAILS from to" from-t to-t)
   (go-try
     (let [flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
           results (<? (commit-flakes->json-ld db context flakes))]
       results)))
 
+
 (defn add-commit-details
   "Annotate the results of a history query by associng the commit map for each `t` into the
-  history result for that t."
+  history result for that t.
+
+  Chunks together results with consecutive `t`s to reduce number of `time-range` index traversals
+  needed for commit retrieval."
   [db context history-results]
   (go-try
-    (let [error-ch   (async/chan)
-          out-ch     (async/chan)
-          results-ch (async/into [] out-ch)]
-      (async/pipeline-async 2
-                            out-ch
-                            (fn [result ch]
-                              (-> (async/go
-                                    (try*
-                                      (let [t-key     (json-ld/compact const/iri-t context)
-                                            commit-t  (- (get result t-key))
-                                            [details] (<? (commit-details db context commit-t commit-t))]
-                                        (merge result details))
-                                      (catch* e
-                                              (log/error e "Error fetching commit details.")
-                                              (async/>! error-ch e))))
-                                  (async/pipe ch)))
-                            (async/to-chan! history-results))
-      (async/alt!
-        error-ch ([e] e)
-        results-ch ([result] result)))))
+    (let [t-key (json-ld/compact const/iri-t context)]
+      (loop [[result & r] history-results
+             consecutive-t-results []
+             first-t (get result t-key)
+             last-t nil
+             final []]
+        (if result
+          (let [result-t  (get result t-key)]
+            (if (or (nil? last-t)
+                    (= last-t (inc result-t)))
+              (recur r
+                     (conj consecutive-t-results result)
+                     first-t
+                     result-t
+                     final)
+              (let [from  (- last-t)
+                    to  (- first-t)
+                    consecutive-commit-details (<? (commit-details db context from to))]
+                (recur r
+                       [result]
+                       result-t
+                       result-t
+                       (into final (map into consecutive-t-results consecutive-commit-details))))))
+          (let [from  (- last-t)
+                to  (- first-t)
+                consecutive-commit-details (<? (commit-details db context from to))]
+            (into final (map into consecutive-t-results consecutive-commit-details))))))))

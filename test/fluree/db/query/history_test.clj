@@ -367,4 +367,14 @@
                            :f/assert [{:ex/x "foo-cat" :ex/y "bar-cat" :id :ex/alice}]
                            :f/retract [{:ex/x "foo-3" :ex/y "bar-3" :id :ex/alice}]}}
                  :f/retract [{:ex/x "foo-3" :ex/y "bar-3" :id :ex/alice}]}]
-               @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 5}})))))))
+               @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 5}})))
+        (testing "multiple history results"
+          (let [history-with-commits @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 1 :to 5}})]
+            (testing "all `t`s with changes to subject are returned"
+              (is (= [5 3 2 1]
+                     (mapv :f/t history-with-commits))))
+            (testing "all expected commits are present and associated with the correct results"
+              (is (every? (fn [history-map]
+                            (let [commit-t (get-in history-map [:f/commit :f/t])]
+                              (= (:f/t history-map) commit-t)))
+                          history-with-commits)))))))))
