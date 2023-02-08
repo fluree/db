@@ -19,7 +19,7 @@
             [clojure.string :as str]
             [criterium.core :refer [bench]]
             ;; cljs
-            [figwheel-sidecar.repl-api :as ra])) 
+            [figwheel-sidecar.repl-api :as ra]))
 
 
 ;; async/query todo
@@ -41,12 +41,12 @@
 
 
 
-  (do 
+  (do
     (def default-private-key
-      "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c") 
+      "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")
 
 
-    (def did (did/private->did-map default-private-key )) 
+    (def did (did/private->did-map default-private-key ))
 
     (def default-context
       {:id     "@id"
@@ -58,20 +58,19 @@
        :schema "http://schema.org/"
        :skos   "http://www.w3.org/2008/05/skos#"
        :wiki   "https://www.wikidata.org/wiki/"
-       :f      "https://ns.flur.ee/ledger#"}))  
+       :f      "https://ns.flur.ee/ledger#"}))
 
   (def file-conn @(fluree/connect {:method :file
                                    :storage-path "dev/data"
                                    :defaults
                                    {:context (merge default-context {:ex "http://example.org/ns/"})
-                                  ;;  :did did
-                                    }}))       
+                                    :did did}}))
 
 
 
-  (def ledger @(fluree/create file-conn "user/test"))  
+  (def ledger @(fluree/create file-conn "user/test"))
 
-  (def db @(fluree/stage
+  (def db1 @(fluree/stage
             (fluree/db ledger)
             [{:context      {:ex "http://example.org/ns/"}
               :id           :ex/brian,
@@ -79,7 +78,7 @@
               :schema/name  "Brian"
               :schema/email "brian@example.org"
               :schema/age   50
-             ;; :ex/favNums   7
+              :ex/favNums   7
               }
              {:context      {:ex "http://example.org/ns/"}
               :id           :ex/alice,
@@ -87,23 +86,20 @@
               :schema/name  "Alice"
               :schema/email "alice@example.org"
               :schema/age   50
-              ;;:ex/favNums   [42, 76, 9]
+              :ex/favNums   [42, 76, 9]
               }
-             {:context      {:ex "http://example.org/ns/"}  
+             {:context      {:ex "http://example.org/ns/"}
               :id           :ex/cam,
               :type         :ex/User,
               :schema/name  "Cam"
               :schema/email "cam@example.org"
               :schema/age   34
-              ;;:ex/favNums   [5, 10]
-             ;; :ex/friend    [:ex/brian :ex/alice]
-              }]))      
+              :ex/favNums   [5, 10]
+              :ex/friend    [:ex/brian :ex/alice]}]))
 
-  (def comm @(fluree/commit! ledger db {:message "hi"})) 
+  (def db2 @(fluree/commit! ledger db1 {:message "hi"}))
 
-  @(fluree/load file-conn (-> ledger :alias)) 
-
-  #_(def details @(fluree/query db {:commit {} }))
+  @(fluree/load file-conn (-> ledger :alias))
 
   )
 
@@ -120,7 +116,7 @@
 ;; Some sort of defined-size tag lookup cache could make sense. Would need to clear it if a transaction altered any tag
 
 
-;cljs-stuff
+                                        ;cljs-stuff
 (defn start [] (ra/start-figwheel!))
 (defn start-cljs [] (ra/cljs-repl "dev"))
-;(defn stop [] (ra/stop-figwheel!))  ;; errs
+                                        ;(defn stop [] (ra/stop-figwheel!))  ;; errs
