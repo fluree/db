@@ -1,4 +1,3 @@
 {:paths ["script"]
  :tasks {sync-package-json {:requires ([sync-package-json :as spj])
                             :task (apply spj/run *command-line-args*)}}}
-

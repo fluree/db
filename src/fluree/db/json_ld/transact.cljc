@@ -209,7 +209,7 @@
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap? issuer js?] :as _opts}]
+  [db {:keys [bootstrap? issuer context-type] :as _opts}]
   (let [{:keys [block ecount schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
@@ -219,7 +219,9 @@
      :db-before     (dbproto/-rootdb db)
      :policy        policy
      :bootstrap?    bootstrap?
-     :default-ctx   (if js? (:context-str schema) (:context schema))
+     :default-ctx   (if (= :string context-type)
+                      (:context-str schema)
+                      (:context schema))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
@@ -404,7 +406,7 @@
 ;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
 (defn delete
   "Executes a delete statement"
-  [db max-fuel json-ld {:keys [t] :as tx-state}]
+  [db max-fuel json-ld {:keys [t] :as _tx-state}]
   (go-try
     (let [{:keys [delete] :as parsed-query}
           (-> json-ld
