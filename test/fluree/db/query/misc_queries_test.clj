@@ -76,4 +76,8 @@
               [:id :id "@id"]]
              @(fluree/query db {:select ['?s '?p '?o]
                                 :where  [['?s '?p '?o]]}))
-          "Entire database should be pulled.")))))
+          "Entire database should be pulled.")
+      (let [db* @(fluree/commit! ledger db)]
+        (is (= []
+              @(fluree/query db* {:select ['?s '?p '?o]
+                                :where  [['?s '?p '?o]]}) )))))))
