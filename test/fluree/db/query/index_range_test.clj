@@ -45,50 +45,50 @@
       (testing "Slice operations"
         (testing "Slice for subject id only"
           (let [alice-sid @(fluree/internal-id db :ex/alice)]
-            (is (= (->> @(fluree/slice db :spot [alice-sid])
-                        (mapv flake/Flake->parts))
-                   [[alice-sid 0 "http://example.org/ns/alice" 1 -1 true nil]
-                    [alice-sid 200 1002 0 -1 true nil]
-                    [alice-sid 1003 "Alice" 1 -1 true nil]
-                    [alice-sid 1004 "alice@example.org" 1 -1 true nil]
-                    [alice-sid 1005 50 7 -1 true nil]
-                    [alice-sid 1006 9 7 -1 true nil]
-                    [alice-sid 1006 42 7 -1 true nil]
-                    [alice-sid 1006 76 7 -1 true nil]])
+            (is (= [[alice-sid 0 "http://example.org/ns/alice" 1 -1 true nil]
+                    [alice-sid 200 1001 0 -1 true nil]
+                    [alice-sid 1002 "Alice" 1 -1 true nil]
+                    [alice-sid 1003 "alice@example.org" 1 -1 true nil]
+                    [alice-sid 1004 50 7 -1 true nil]
+                    [alice-sid 1005 9 7 -1 true nil]
+                    [alice-sid 1005 42 7 -1 true nil]
+                    [alice-sid 1005 76 7 -1 true nil]]
+                   (->> @(fluree/slice db :spot [alice-sid])
+                        (mapv flake/Flake->parts)))
                 "Slice should return a vector of flakes for only Alice")))
 
         (testing "Slice for subject + predicate"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
-            (is (= (->> @(fluree/slice db :spot [alice-sid favNums-pid])
-                        (mapv flake/Flake->parts))
-                   [[alice-sid favNums-pid 9 7 -1 true nil]
+            (is (= [[alice-sid favNums-pid 9 7 -1 true nil]
                     [alice-sid favNums-pid 42 7 -1 true nil]
-                    [alice-sid favNums-pid 76 7 -1 true nil]])
+                    [alice-sid favNums-pid 76 7 -1 true nil]]
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid])
+                        (mapv flake/Flake->parts)))
                 "Slice should only return Alice's favNums (multi-cardinality)")))
 
         (testing "Slice for subject + predicate + value"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
-            (is (= (->> @(fluree/slice db :spot [alice-sid favNums-pid 42])
-                        (mapv flake/Flake->parts))
-                   [[alice-sid favNums-pid 42 7 -1 true nil]])
+            (is (= [[alice-sid favNums-pid 42 7 -1 true nil]]
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid 42])
+                        (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value")))
 
         (testing "Slice for subject + predicate + value + datatype"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
-            (is (= (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 7]])
-                        (mapv flake/Flake->parts))
-                   [[alice-sid favNums-pid 42 7 -1 true nil]])
+            (is (= [[alice-sid favNums-pid 42 7 -1 true nil]]
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 7]])
+                        (mapv flake/Flake->parts)))
                 "Slice should only return the specified favNum value with matching datatype")))
 
         (testing "Slice for subject + predicate + value + mismatch datatype"
           (let [alice-sid   @(fluree/internal-id db :ex/alice)
                 favNums-pid @(fluree/internal-id db :ex/favNums)]
-            (is (= (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 8]])
-                        (mapv flake/Flake->parts))
-                   [])
+            (is (= []
+                   (->> @(fluree/slice db :spot [alice-sid favNums-pid [42 8]])
+                        (mapv flake/Flake->parts)))
                 "We specify a different datatype for the value, nothing should be returned")))
 
 

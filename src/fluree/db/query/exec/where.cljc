@@ -85,12 +85,11 @@
 
 (defn ->function
   "Build a filter function specification for the variable `var` out of the
-  boolean function `f` with parameters `params`."
-  [var params f]
+  boolean function `f`."
+  [var f]
   (-> var
       ->variable
-      (assoc ::params params
-             ::fn     f)))
+      (assoc ::fn f)))
 
 (defn ->predicate
   "Build a pattern that already matches the explicit predicate value `value`."
@@ -154,6 +153,8 @@
               (assoc component ::val value)
               (let [filter-fn (some->> (get filters variable)
                                        (map ::fn)
+                                       (map (fn [f]
+                                              (partial f solution)))
                                        (apply every-pred))]
                 (assoc component ::fn filter-fn)))
             component))

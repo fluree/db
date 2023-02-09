@@ -65,6 +65,16 @@
                                          ['?s :schema/name '?name]
                                          ['?s :ex/last '?last]
                                          {:filter ["(> ?age 45)", "(strEnds ?last \"ith\")"]}]}))))
+
+    (testing "nested filters"
+      (is (= [["Brian" 50]]
+             @(fluree/query db '{:context {:ex "http://example.org/ns/"}
+                                 :select [?name ?age]
+                                 :where  [[?s :rdf/type :ex/User]
+                                          [?s :schema/age ?age]
+                                          [?s :schema/name ?name]
+                                          {:filter ["(> ?age (/ (+ ?age 47) 2))"]}]}))))
+
     ;;TODO: simple-subject-crawl does not yet support filters.
     ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
@@ -109,4 +119,3 @@
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  [["?s" :ex/favColor "?color"]
                                          {:filter ["(strStarts ?color \"B\")"]}]}))))))
-

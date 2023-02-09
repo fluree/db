@@ -55,3 +55,6 @@
                                (str target) node-arg])]
     (println "cmd args:" (pr-str cmd-args))
     (b/process {:command-args cmd-args})))
+
+(defn print-version [_]
+  (println (pr-str {:version version})))

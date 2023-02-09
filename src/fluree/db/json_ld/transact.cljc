@@ -18,35 +18,14 @@
             [clojure.core.async :as async]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.dbproto :as dbproto])
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.util.log :as log])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (declare json-ld-node->flakes)
-
-(defn node?
-  "Returns true if a nested value is itself another node in the graph.
-  Only need to test maps that have :id - and if they have other properties they
-  are defining then we know it is a node and have additional data to include."
-  [mapx]
-  (cond
-    (contains? mapx :value)
-    false
-
-    (and
-      (contains? mapx :list)
-      (= #{:list :idx} (set (keys mapx))))
-    false
-
-    (and
-      (contains? mapx :set)
-      (= #{:set :idx} (set (keys mapx))))
-    false
-
-    :else
-    true))
-
 
 (defn json-ld-type-data
   "Returns two-tuple of [class-subject-ids class-flakes]
@@ -91,7 +70,7 @@
                         {:i (-> v-map :idx last)})
           flakes      (cond
                         ;; a new node's data is contained, process as another node then link to this one
-                        (node? v-map)
+                        (jld-reify/node? v-map)
                         (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
                           (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
@@ -230,7 +209,7 @@
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap? issuer js?] :as _opts}]
+  [db {:keys [bootstrap? issuer context-type] :as _opts}]
   (let [{:keys [block ecount schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
@@ -240,7 +219,9 @@
      :db-before     (dbproto/-rootdb db)
      :policy        policy
      :bootstrap?    bootstrap?
-     :default-ctx   (if js? (:context-str schema) (:context schema))
+     :default-ctx   (if (= :string context-type)
+                      (:context-str schema)
+                      (:context schema))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
@@ -414,6 +395,7 @@
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
   [{:keys [schema t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
+  (log/debug "insert default-ctx:" default-ctx)
   (let [nodes    (-> json-ld
                      (json-ld/expand default-ctx)
                      util/sequential)
@@ -424,7 +406,7 @@
 ;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
 (defn delete
   "Executes a delete statement"
-  [db max-fuel json-ld {:keys [t] :as tx-state}]
+  [db max-fuel json-ld {:keys [t] :as _tx-state}]
   (go-try
     (let [{:keys [delete] :as parsed-query}
           (-> json-ld
@@ -433,7 +415,6 @@
 
           [s p o] delete
           parsed-query (assoc parsed-query :delete [s p o])
-
           error-ch     (async/chan)
           flake-ch     (async/chan)
           where-ch     (where/search db parsed-query error-ch)]
@@ -449,8 +430,9 @@
                                     o* (if (::where/val o)
                                          o
                                          (get solution (::where/var o)))]
-                                (-> (where/resolve-flake-range db error-ch [s* p* o*])
-                                    (async/pipe ch))))
+                                (async/pipe
+                                  (where/resolve-flake-range db error-ch [s* p* o*])
+                                  ch)))
                             where-ch)
       (let [delete-ch (async/transduce (comp cat
                                              (map (fn [f]

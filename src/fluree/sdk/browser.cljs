@@ -1,12 +1,12 @@
 (ns fluree.sdk.browser
   (:require [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.sdk.version :refer [version]]))
 
 (enable-console-print!)
 
 ;; define your app data so that it doesn't get over-written on reload
-(defonce app-state (atom {:product "FlureeDB APIs"
-                          :version "v0.17.0"}))
+(defonce app-state (atom (assoc (version) :product "Fluree browser SDK")))
 
 (println (:product @app-state) (:version @app-state))
 
@@ -41,10 +41,11 @@
 
 (defn ^:export stage
   ([db-or-ledger json-ld]
-   (fluree/stage db-or-ledger (js->clj json-ld) {:js? true}))
+   (fluree/stage db-or-ledger (js->clj json-ld) {:context-type :string}))
   ([db-or-ledger json-ld opts]
-   (fluree/stage db-or-ledger (js->clj json-ld) (-> (js->clj opts :keywordize-keys true)
-                                                    (assoc :js? true)))))
+   (fluree/stage db-or-ledger (js->clj json-ld)
+                 (-> (js->clj opts :keywordize-keys true)
+                     (assoc :context-type :string)))))
 
 (defn ^:export commit
   ([ledger db] (.then (fluree/commit! ledger db)
@@ -67,7 +68,7 @@
                     (reduce-kv (fn [acc k v]
                                  (assoc acc (keyword k) v))
                                {}))]
-    (.then (fluree/query db (assoc-in query* [:opts :js?] true))
+    (.then (fluree/query db (assoc-in query* [:opts :context-type] :string))
            (fn [result] (clj->js result)))))
 
 

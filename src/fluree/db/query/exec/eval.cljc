@@ -1,6 +1,7 @@
 (ns fluree.db.query.exec.eval
   (:refer-clojure :exclude [compile rand])
-  (:require [fluree.db.query.exec.where :as where]
+  (:require [fluree.db.query.exec.group :as group]
+            [fluree.db.query.exec.where :as where]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]])
@@ -185,11 +186,18 @@
                 x))
             code))
 
+
+
 (defn bind-variables
   [soln-sym var-syms]
   (->> var-syms
        (mapcat (fn [v]
-                 [v `(::where/val (get ~soln-sym (quote ~v)))]))
+                 [v `(let [mch# (get ~soln-sym (quote ~v))
+                           val# (::where/val mch#)
+                           dt#  (::where/datatype mch#)]
+                       (cond->> val#
+                         (= dt# ::group/grouping)
+                         (mapv ::where/val)))]))
        (into [])))
 
 (defn compile
@@ -201,3 +209,12 @@
     (eval `(fn [~soln-sym]
              (let ~bdg
                ~qualified-code)))))
+
+(defn compile-filter
+  [code var]
+  (let [f        (compile code)
+        soln-sym 'solution]
+    (eval `(fn [~soln-sym ~var]
+             (-> ~soln-sym
+                 (assoc (quote ~var) {::where/val ~var})
+                 ~f)))))

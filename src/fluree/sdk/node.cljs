@@ -13,7 +13,8 @@
 (defn ^:export create
   ([conn] (fluree/create conn))
   ([conn ledger-alias] (fluree/create conn ledger-alias))
-  ([conn ledger-alias opts] (fluree/create conn ledger-alias (js->clj opts :keywordize-keys true))))
+  ([conn ledger-alias opts] (fluree/create conn ledger-alias
+                                           (js->clj opts :keywordize-keys true))))
 
 (defn ^:export exists
   [conn alias-or-address]
@@ -29,10 +30,12 @@
 
 (defn ^:export stage
   ([db-or-ledger json-ld]
-   (fluree/stage db-or-ledger (js->clj json-ld) {:js? true}))
+   (fluree/stage db-or-ledger (js->clj json-ld) {:context-type :string}))
   ([db-or-ledger json-ld opts]
-   (fluree/stage db-or-ledger (js->clj json-ld) (-> (js->clj opts :keywordize-keys true)
-                                                    (assoc :js? true)))))
+   (fluree/stage db-or-ledger (js->clj json-ld)
+                 (-> opts
+                     (js->clj :keywordize-keys true)
+                     (assoc :context-type :string)))))
 
 (defn ^:export commit
   ([ledger db] (fluree/commit! ledger db))
@@ -55,7 +58,7 @@
                                               k
                                               (keyword k)) v))
                                {}))]
-    (.then (fluree/query db (assoc-in query* [:opts :js?] true))
+    (.then (fluree/query db (assoc-in query* [:opts :context-type] :string))
            (fn [result] (clj->js result)))))
 
 (log/set-level! :warning)

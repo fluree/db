@@ -83,12 +83,12 @@
   conn-proto/iStorage
   (-c-read [_ commit-key]
     (ipfs/read ipfs-endpoint commit-key))
-
-  (-c-write [_ commit-data]
-    (ipfs/commit ipfs-endpoint commit-data))
-
   (-c-write [_ _ commit-data]
-    (ipfs/commit ipfs-endpoint commit-data))
+    (ipfs/write ipfs-endpoint commit-data))
+  (-ctx-read [_ context-key]
+    (ipfs/read ipfs-endpoint context-key))
+  (-ctx-write [_ _ context-data]
+    (ipfs/write ipfs-endpoint context-data))
 
   conn-proto/iNameService
   (-push [_ address ledger-data]
@@ -129,7 +129,7 @@
   (read [_ k]
     (ipfs/read ipfs-endpoint k true))
   (write [_ k data]
-    (ipfs/commit ipfs-endpoint data))
+    (ipfs/write ipfs-endpoint data))
   (exists? [conn k]
     (storage/read conn k))
   (rename [_ old-key new-key]

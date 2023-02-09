@@ -57,22 +57,22 @@
   [variable]
   (->VariableSelector variable))
 
-(defrecord AggregateSelector [fmt agg-fn]
+(defrecord AggregateSelector [agg-fn]
   ValueSelector
   (format-value
     [_ db iri-cache compact error-ch solution]
-    (let [agg-ch (chan 1 (map agg-fn))]
-      (-> (format-value fmt db iri-cache compact error-ch solution)
-          (async/pipe agg-ch)))))
+    (go (try* (agg-fn solution)
+              (catch* e
+                      (log/error e "Error applying aggregate selector")
+                      (>! error-ch e))))))
 
 (defn aggregate-selector
-  "Returns a selector that extracts the grouped value bound to the specified
-  `variable` from a where solution, formats each item in the group, and
-  processes the formatted group with the supplied `agg-function` to generate the
-  final aggregated result for display."
-  [variable agg-function]
-  (let [var-fmt (variable-selector variable)]
-    (->AggregateSelector var-fmt agg-function)))
+  "Returns a selector that extracts the grouped values bound to the specified
+  variables referenced in the supplied `agg-function` from a where solution,
+  formats each item in the group, and processes the formatted group with the
+  supplied `agg-function` to generate the final aggregated result for display."
+  [agg-function]
+  (->AggregateSelector agg-function))
 
 (defrecord SubgraphSelector [var selection depth spec]
   ValueSelector

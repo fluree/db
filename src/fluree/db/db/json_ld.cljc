@@ -423,8 +423,7 @@
 ;; TODO - conn is included here because current index-range query looks for conn on the db
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
 (defrecord JsonLdDb [ledger conn method alias branch commit block t tt-id stats
-                     spot psot post opst tspo
-                     schema comparators novelty
+                     spot psot post opst tspo schema comparators novelty
                      policy ecount]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))

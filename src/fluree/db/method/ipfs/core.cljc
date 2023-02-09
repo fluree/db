@@ -10,21 +10,22 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn commit
-  "Push to IPFS"
+(defn write
   [ipfs-endpoint data]
   (go-try
-   (let [json (if (string? data)
-                ;; if a string, assume already in JSON.
-                data
-                ;; all other data we'd commit will be a data structure, normalize
-                (json-ld/normalize-data data))
-         res  (<? (ipfs/add ipfs-endpoint json))
-         {:keys [name]} res]
-     (when-not name
-       (throw (ex-info (str "IPFS publish error, unable to retrieve IPFS name. Response object: " res)
-                       {:status 500 :error :db/push-ipfs})))
-     (assoc res :address (str "fluree:ipfs://" name)))))
+    (let [json (if (string? data)
+                 ;; if a string, assume already in JSON.
+                 data
+                 ;; all other data we'd commit will be a data structure, normalize
+                 (json-ld/normalize-data data))
+          {:keys [name] :as res} (<? (ipfs/add ipfs-endpoint json))]
+      (when-not name
+        (throw
+          (ex-info
+            (str "IPFS publish error, unable to retrieve IPFS name. Response object: "
+                 res)
+            {:status 500 :error :db/push-ipfs})))
+      (assoc res :address (str "fluree:ipfs://" name)))))
 
 (defn read
   "Reads either IPFS or IPNS docs. Reads JSON only, returning clojure map with
