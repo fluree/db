@@ -159,5 +159,4 @@
         (update-in [:novelty :tspo] into base-flakes)
         (update-in [:novelty :size] + size)
         (update-in [:stats :size] + size)
-        (update-in [:stats :flakes] + (count base-flakes))
-        (update-in [:schema] vocab/update-with* t base-flakes))))
+        (update-in [:stats :flakes] + (count base-flakes)))))
