@@ -219,8 +219,14 @@
   [f]
   (#{const/$_commitdata:t
      const/$_commitdata:size
+     const/$_previous
      const/$_commitdata:flakes
-     const/$_commitdata:address} (flake/p f)))
+     const/$_address} (flake/p f)))
+
+(defn extra-data-flake?
+  [f]
+  (or (= const/$iri (flake/p f))
+      (= const/$rdfs:Class (flake/o f))))
 
 (defn commit-t-flakes->json-ld
   "Build a commit maps given a set of all flakes with the same t."
@@ -228,16 +234,17 @@
   (async/go
     (try*
       (let [{commit-wrapper-flakes :commit-wrapper
-             commit-meta-flakes     :commit-meta
-             assert-flakes          :assert-flakes
-             retract-flakes         :retract-flakes} (group-by (fn [f]
-                                                                 (cond
-                                                                   (commit-wrapper-flake? f)  :commit-wrapper
-                                                                   (commit-metadata-flake? f) :commit-meta
-                                                                   (flake/op f)               :assert-flakes
-                                                                   :else                      :retract-flakes))
-             t-flakes)
-
+             commit-meta-flakes    :commit-meta
+             assert-flakes         :assert-flakes
+             retract-flakes        :retract-flakes}
+            (group-by (fn [f]
+                        (cond
+                          (commit-wrapper-flake? f)                            :commit-wrapper
+                          (commit-metadata-flake? f)                           :commit-meta
+                          (and (flake/op f) (not (extra-data-flake? f)))       :assert-flakes
+                          (and (not (flake/op f)) (not (extra-data-flake? f))) :retract-flakes
+                          :else                                                :ignore-flakes))
+                      t-flakes)
             commit-wrapper-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
                                                           {:wildcard? true, :depth 0}
                                                           0 commit-wrapper-flakes)
@@ -245,17 +252,20 @@
             commit-meta-chan (json-ld-resp/flakes->res db cache compact fuel 1000000
                                                        {:wildcard? true, :depth 0}
                                                        0 commit-meta-flakes)
-            commit-wrapper      (<? commit-wrapper-chan)
-            commit-meta      (<? commit-meta-chan)
-            asserts          (<? (t-flakes->json-ld db compact cache fuel error-ch assert-flakes))
-            retracts         (<? (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))
+
+
+            commit-wrapper (<? commit-wrapper-chan)
+            commit-meta    (<? commit-meta-chan)
+            asserts        (<? (t-flakes->json-ld db compact cache fuel error-ch assert-flakes))
+            retracts       (<? (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))
 
             assert-key  (json-ld/compact const/iri-assert compact)
             retract-key (json-ld/compact const/iri-retract compact)
             data-key    (json-ld/compact const/iri-data compact)
             commit-key  (json-ld/compact const/iri-commit compact)]
 
-        (-> {commit-key (merge commit-wrapper commit-meta)}
+        (-> {commit-key commit-wrapper}
+            (assoc-in [commit-key data-key] commit-meta)
             (assoc-in  [commit-key data-key assert-key] asserts)
             (assoc-in  [commit-key data-key retract-key] retracts)))
       (catch* e
@@ -273,9 +283,8 @@
           error-ch   (async/chan)
           out-ch     (async/chan)
           results-ch (async/into [] out-ch)
-          non-iri-flakes (remove #(or (= const/$iri (flake/p %))
-                                      (= const/$rdfs:Class (flake/o %))) flakes)
-          t-flakes-ch (->> (sort-by flake/t non-iri-flakes)
+
+          t-flakes-ch (->> (sort-by flake/t flakes)
                            (partition-by flake/t)
                            (async/to-chan!))]
 

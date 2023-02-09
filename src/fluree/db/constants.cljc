@@ -38,6 +38,7 @@
 (def ^:const iri-type "@type")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
+;; TODO, replace usage with iri-context
 (def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
 
 ;; system constants
@@ -66,32 +67,26 @@
 
 ;; predicate id constants
 
+(def ^:const $_previous 52)
+(def ^:const $_v 58)
+(def ^:const $_address 59)
+
 (def ^:const $_commit:dbId 51)                                ;; JSON-LD: turning into data/db id
-(def ^:const $_commit:prevHash 52)
+
 (def ^:const $_commit:idRef 53)
 (def ^:const $_commit:message 54)
 (def ^:const $_commit:time 55)
-(def ^:const $_commit:tag 56)
 (def ^:const $_commit:signer 57)
-(def ^:const $_commit:v 58)
-(def ^:const $_commit:address 59)
+
 
 (def ^:const $_ledger:alias 170)
 (def ^:const $_ledger:branch 171)
-
+(def ^:const $_ledger:context 172)
 
 (def ^:const $_commit:data 160)
-(def ^:const $_commitdata:address 180)
 (def ^:const $_commitdata:flakes 182)
 (def ^:const $_commitdata:size 183)
 (def ^:const $_commitdata:t 184)
-(def ^:const $_commitdata:v 185)
-
-
-
-
-
-
 
 (def ^:const $_predicate:name 10)
 (def ^:const $_predicate:doc 11)

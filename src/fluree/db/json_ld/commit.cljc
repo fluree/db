@@ -291,28 +291,23 @@
 
 (defn add-commit-schema-flakes
   [{:keys [schema] :as db} t]
-  (let [schema-flakes [(flake/create const/$_ledger:alias const/$iri const/iri-alias const/$xsd:string t true nil)
+  (let [schema-flakes [(flake/create const/$_previous const/$iri const/iri-previous const/$xsd:string t true nil)
+                       (flake/create const/$_address const/$iri const/iri-address const/$xsd:string t true nil)
+                       (flake/create const/$_v const/$iri const/iri-v const/$xsd:string t true nil)
+
+                       (flake/create const/$_ledger:alias const/$iri const/iri-alias const/$xsd:string t true nil)
                        (flake/create const/$_ledger:branch const/$iri const/iri-branch const/$xsd:string t true nil)
+                       (flake/create const/$_ledger:context const/$iri const/iri-context const/$xsd:string t true nil)
+
                        (flake/create const/$_commit:tag const/$iri const/iri-tag const/$xsd:string t true nil)
                        (flake/create const/$_commit:signer const/$iri const/iri-issuer const/$xsd:string t true nil)
-                       (flake/create const/$_commit:address const/$iri const/iri-address const/$xsd:string t true nil)
                        (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:string t true nil)
                        (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:string t true nil)
-                       (flake/create const/$_commit:v const/$iri const/iri-v const/$xsd:string t true nil)
-                       (flake/create const/$_commit:prevHash const/$iri const/iri-previous const/$xsd:string t true nil)
-
-
                        (flake/create const/$_commit:data const/$iri const/iri-data const/$xsd:string t true nil)
+
                        (flake/create const/$_commitdata:flakes const/$iri const/iri-flakes const/$xsd:string t true nil)
                        (flake/create const/$_commitdata:size const/$iri const/iri-size const/$xsd:string t true nil)
-                       (flake/create const/$_commitdata:t const/$iri const/iri-t const/$xsd:string t true nil)
-                       (flake/create const/$_commitdata:address const/$iri const/iri-address const/$xsd:string t true nil)
-                       (flake/create const/$_commitdata:v const/$iri const/iri-v const/$xsd:string t true nil)
-
-                       ;; used to link t to commit-data
-                       (flake/create const/$_commit:dbId const/$iri const/iri-address const/$xsd:string t true nil)
-                       ;; used to link t to commit
-                       (flake/create const/$_commit:idRef const/$iri const/iri-commit const/$xsd:string t true nil)]
+                       (flake/create const/$_commitdata:t const/$iri const/iri-t const/$xsd:string t true nil)]
         db* (add-commit-flakes-to-db db schema-flakes)]
     (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
 
