@@ -150,12 +150,12 @@
      ::where [:sequential [:orn
                            [:where-map ::where-map]
                            [:tuple ::where-tuple]]]
-     ::vars [:map-of ::var :any]
+     ::values [:map-of ::var :any]
      ::t [:or :int :string]
      ::delete ::triple     ::delete-op [:map
                                         [:delete ::delete]
                                         [:where ::where]
-                                        [:vars {:optional true} ::vars]]
+                                        [:values {:optional true} ::values]]
      ::context [:map-of :any :any]
      ::analytical-query [:map
                          [:where ::where]
@@ -171,7 +171,7 @@
                          [:group-by {:optional true} ::group-by]
                          [:filter {:optional true} ::filter]
                          [:having {:optional true} ::function]
-                         [:vars {:optional true} ::vars]
+                         [:values {:optional true} ::values]
                          [:limit {:optional true} ::limit]
                          [:offset {:optional true} ::offset]
                          [:maxFuel {:optional true} ::maxFuel]

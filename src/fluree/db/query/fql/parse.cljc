@@ -37,13 +37,13 @@
   (when-let [var-name (parse-var-name x)]
     (where/->variable var-name)))
 
-(defn parse-vars
-  [{:keys [vars] :as _q}]
+(defn parse-values
+  [{:keys [values] :as _q}]
   (reduce-kv (fn [m var val]
                (let [variable (-> (parse-variable var)
                                   (assoc ::where/val val))]
                  (assoc m var variable)))
-             {} vars))
+             {} values))
 
 (def rdf-type-preds #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                       "a"
@@ -390,13 +390,13 @@
 (defn parse-analytical-query*
   [q db]
   (let [context  (parse-context q db)
-        vars     (parse-vars q)
-        where    (parse-where q vars db context)
+        values   (parse-values q)
+        where    (parse-where q values db context)
         grouping (parse-grouping q)
         ordering (parse-ordering q)]
     (-> q
         (assoc :context context
-               :vars    vars
+               :values  values
                :where   where)
         (cond-> grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
@@ -418,10 +418,10 @@
   [q db]
   (when (:delete q)
     (let [context (parse-context q db)
-          vars    (parse-vars q)
-          where   (parse-where q vars db context)]
+          values  (parse-values q)
+          where   (parse-where q values db context)]
       (-> q
           (assoc :context context
                  :where   where
-                 :vars    vars)
+                 :values  values)
           (update :delete parse-triple db context)))))
