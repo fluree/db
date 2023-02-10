@@ -10,7 +10,6 @@
             [clojure.walk :refer [postwalk]]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
