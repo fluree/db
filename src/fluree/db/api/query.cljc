@@ -11,7 +11,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.async :as async-util :refer [<? go-try]]
+            [fluree.db.util.async :as async-util :refer [<? go-try into?]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.json-ld :as json-ld]
@@ -57,14 +57,20 @@
         (if history
           ;; filter flakes for history pattern
           (let [[pattern idx]   (<? (history/history-pattern db context history))
+                history-error-ch   (async/chan)
                 flakes          (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
-                history-results (<? (history/history-flakes->json-ld db parsed-context flakes))]
+                history-results-chan (<? (history/history-flakes->json-ld db parsed-context flakes history-error-ch))]
 
             (if commit-details
               ;; annotate with commit details
-              (<? (history/add-commit-details db parsed-context history-results))
+              (async/alt!
+                (history/add-commit-details db parsed-context history-results-chan) ([result] result)
+                history-error-ch ([e] e))
+
               ;; we're already done
-              history-results))
+              (async/alt!
+                (async/into [] history-results-chan) ([result] result)
+                history-error-ch ([e] e))))
 
           ;; just commits over a range of time
           (<? (history/commit-details db parsed-context from-t to-t)))))))

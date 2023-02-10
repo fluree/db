@@ -141,7 +141,7 @@
 
   [{:id :ex/foo :f/assert [{},,,} :f/retract [{},,,]]}]
   "
-  [db context flakes]
+  [db context flakes error-ch]
   (go-try
     (let [fuel    (volatile! 0)
           cache   (volatile! {})
@@ -150,7 +150,6 @@
 
           error-ch   (async/chan)
           out-ch     (async/chan)
-          results-ch (async/into [] out-ch)
 
           t-flakes-ch (->> (sort-by flake/t flakes)
                            (partition-by flake/t)
@@ -171,9 +170,7 @@
                                        (async/<! (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))}))
                                   (async/pipe ch)))
                             t-flakes-ch)
-      (async/alt!
-        error-ch ([e] e)
-        results-ch ([result] result)))))
+      out-ch)))
 
 (defn history-pattern
   "Given a parsed query, convert the iris from the query
@@ -313,11 +310,11 @@
 
   Chunks together results with consecutive `t`s to reduce number of `time-range` index traversals
   needed for commit retrieval."
-  [db context history-results]
+  [db context history-results-chan]
   (go-try
-   (when-not (empty? history-results)
+    (when-let [first-result (<? history-results-chan)]
      (let [t-key (json-ld/compact const/iri-t context)]
-       (loop [[result & r] history-results
+       (loop [result first-result
               consecutive-t-results []
               first-t (get result t-key)
               last-t nil
@@ -326,7 +323,7 @@
            (let [result-t  (get result t-key)]
              (if (or (nil? last-t)
                      (= last-t (inc result-t)))
-               (recur r
+               (recur (<? history-results-chan)
                       (conj consecutive-t-results result)
                       first-t
                       result-t
@@ -334,7 +331,7 @@
                (let [from  (- last-t)
                      to  (- first-t)
                      consecutive-commit-details (<? (commit-details db context from to))]
-                 (recur r
+                 (recur (<? history-results-chan)
                         [result]
                         result-t
                         result-t
