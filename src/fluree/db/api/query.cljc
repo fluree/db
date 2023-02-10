@@ -39,7 +39,7 @@
             {:keys [from to at]} t
             [from-t to-t]        (if at
                                    (let [t (cond (= :latest at) (:t db)
-                                                 (string? at)   (<? (time-travel/datetime->t db from))
+                                                 (string? at)   (<? (time-travel/datetime->t db at))
                                                  (number? at)   (- at))]
                                      [t t])
                                    ;; either (:from or :to)
