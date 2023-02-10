@@ -5,11 +5,25 @@
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.core :as util]
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
                       :as twf]
                :cljs [test-with-files.tools :as-alias twf])))
 
 (deftest exists?-test
+  (testing "returns false before committing data to a ledger"
+    #?(:clj
+       (let [conn         (test-utils/create-conn)
+             ledger-alias "testledger"
+             check1       @(fluree/exists? conn ledger-alias)
+             ledger       @(fluree/create conn ledger-alias)
+             check2       @(fluree/exists? conn ledger-alias)
+             _            @(fluree/stage (fluree/db ledger)
+                                         [{:id           :f/me
+                                           :type         :schema/Person
+                                           :schema/fname "Me"}])
+             check3       @(fluree/exists? conn ledger-alias)]
+         (is (every? false? [check1 check2 check3])))))
   (testing "returns true after committing data to a ledger"
     #?(:clj
        (let [conn         (test-utils/create-conn)
@@ -37,6 +51,21 @@
              (is (<p! (fluree/exists? conn ledger-alias)))
              (is (not (<p! (fluree/exists? conn "notaledger"))))
              (done)))))))
+
+(deftest create-test
+  (testing "string ledger context gets correctly merged with keyword conn context"
+    #?(:clj
+       (let [conn           (test-utils/create-conn)
+             ledger-alias   "testledger"
+             ledger-context {"ex"  "http://example.com/"
+                             "foo" "http://foobar.com/"}
+             ledger         @(fluree/create conn ledger-alias
+                                            {:context-type :string
+                                             :context      ledger-context})
+             merged-context (merge test-utils/default-context
+                                   (util/keywordize-keys ledger-context))]
+         (println "ledger context:" (pr-str (:context ledger)))
+         (is (= merged-context (:context ledger)))))))
 
 #?(:clj
    (deftest load-from-file-test
@@ -134,26 +163,37 @@
                ledger-context {:ex     "http://example.com/"
                                :schema "http://schema.org/"}
                conn           @(fluree/connect
-                                 {:method :file :storage-path storage-path
+                                 {:method   :file :storage-path storage-path
                                   :defaults {:context conn-context}})
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn ledger-alias
                                               {:context ledger-context})
                db             @(fluree/stage
                                  (fluree/db ledger)
-                                 [{:id :ex/wes
-                                   :type :ex/User
-                                   :schema/name "Wes"
-                                   :schema/email "wes@example.org"
-                                   :schema/age 42
+                                 [{:id             :ex/wes
+                                   :type           :ex/User
+                                   :schema/name    "Wes"
+                                   :schema/email   "wes@example.org"
+                                   :schema/age     42
                                    :schema/favNums [1 2 3]}])
                db             @(fluree/commit! ledger db)
                loaded         (test-utils/retry-load conn ledger-alias 100)
                loaded-db      (fluree/db loaded)
-               merged-ctx     (merge conn-context ledger-context)]
+               merged-ctx     (merge conn-context ledger-context)
+               query          {:where  '[[?p :schema/email "wes@example.org"]]
+                               :select '{?p [:*]}}
+               results        @(fluree/query loaded-db query)
+               full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
            (is (= (:t db) (:t loaded-db)))
            (is (= merged-ctx (:context loaded)))
            (is (= (get-in db [:schema :context])
                   (get-in loaded-db [:schema :context])))
            (is (= (get-in db [:schema :context-str])
-                  (get-in loaded-db [:schema :context-str]))))))))
+                  (get-in loaded-db [:schema :context-str])))
+           (is (= [{full-type-url   [:ex/User]
+                    :id             :ex/wes
+                    :schema/age     42
+                    :schema/email   "wes@example.org"
+                    :schema/favNums [1 2 3]
+                    :schema/name    "Wes"}]
+                  results)))))))
