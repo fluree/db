@@ -35,8 +35,7 @@
 
 (defn parse-variable
   [x]
-  (when-let [var-name (parse-var-name x)]
-    (where/->variable var-name)))
+  (some-> x parse-var-name where/unmatched))
 
 (defn parse-values
   [{:keys [values] :as _q}]
