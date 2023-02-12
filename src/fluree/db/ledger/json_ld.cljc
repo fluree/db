@@ -150,7 +150,7 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [context did branch pub-fn ipns indexer include
+    (let [{:keys [context-type context did branch pub-fn ipns indexer include
                   reindex-min-bytes reindex-max-bytes initial-tx]
            :or   {branch :main}} opts
           did*          (if did
@@ -174,7 +174,9 @@
                                     :reindex-max-bytes reindex-max-bytes})))
           ledger-alias* (normalize-alias ledger-alias)
           address       (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
-          context*      (merge (conn-proto/-context conn) context)
+          context*      (->> context
+                             (util/normalize-context context-type)
+                             (merge (conn-proto/-context conn)))
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
           branches      {branch (branch/new-branch-map nil ledger-alias* branch)}

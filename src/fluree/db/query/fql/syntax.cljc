@@ -60,7 +60,8 @@
      ::pretty-print ::prettyPrint
      ::parseJSON boolean?
      ::parse-json ::parseJSON
-     ::js? boolean?
+     ::contextType [:enum :string :keyword]
+     ::context-type ::contextType
      ::opts [:map
              [:maxFuel {:optional true} ::maxFuel]
              [:max-fuel {:optional true} ::maxFuel]
@@ -68,7 +69,8 @@
              [:parse-json {:optional true} ::parse-json]
              [:prettyPrint {:optional true} ::prettyPrint]
              [:pretty-print {:optional true} ::pretty-print]
-             [:js {:optional true} ::js?]]
+             [:contextType {:optional true} ::contextType]
+             [:context-type {:optional true} ::contextType]]
      ::function [:orn
                  [:string [:fn fn-string?]]
                  [:list [:fn fn-list?]]]
@@ -116,7 +118,6 @@
      ::group-by ::groupBy
      ::where-op [:enum :filter :optional :union :bind]
      ::where-map [:and
-                  #_[:map-of {:max 1} ::where-op :any]
                   [:map-of {:max 1} ::where-op :any]
                   [:multi {:dispatch where-op}
                    [:filter [:map [:filter [:ref ::filter]]]]
@@ -152,10 +153,11 @@
                            [:tuple ::where-tuple]]]
      ::values [:map-of ::var :any]
      ::t [:or :int :string]
-     ::delete ::triple     ::delete-op [:map
-                                        [:delete ::delete]
-                                        [:where ::where]
-                                        [:values {:optional true} ::values]]
+     ::delete ::triple
+     ::delete-op [:map
+                  [:delete ::delete]
+                  [:where ::where]
+                  [:values {:optional true} ::values]]
      ::context [:map-of :any :any]
      ::analytical-query [:map
                          [:where ::where]

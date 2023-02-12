@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
@@ -194,9 +195,9 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context did] :as _defaults}]
+  [{:keys [context-type context did] :as _defaults}]
   (async/go
-    {:context context
+    {:context (util/normalize-context context-type context)
      :did     did}))
 
 (defn connect

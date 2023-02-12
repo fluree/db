@@ -18,8 +18,9 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn parse-context
-  [q db]
-  (let [ctx-key (if (-> q :opts :js?)
+  [{:keys [opts] :as q} db]
+  (let [ctx-key (if (= :string (or (:context-type opts)
+                                   (:contextType opts)))
                   :context-str
                   :context)
         db-ctx (get-in db [:schema ctx-key])

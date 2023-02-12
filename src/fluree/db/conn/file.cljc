@@ -280,8 +280,8 @@
     s))
 
 (defn ledger-defaults
-  [{:keys [context did indexer]}]
-  {:context context
+  [{:keys [context-type context did indexer]}]
+  {:context (util/normalize-context context-type context)
    :did     did
    :indexer (cond
               (fn? indexer)
