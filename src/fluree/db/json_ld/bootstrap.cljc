@@ -9,8 +9,7 @@
             [fluree.db.dbproto :as db-proto]
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.flake :as flake]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.json-ld.vocab :as vocab]))
+            [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
