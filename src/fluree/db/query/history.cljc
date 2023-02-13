@@ -146,7 +146,7 @@
         out-ch   (async/chan)
 
         t-flakes-ch (->> flakes
-                         (sort-by flake/t)
+                         (sort-by flake/t >)
                          (group-by flake/t)
                          (vals)
                          (async/to-chan!))
@@ -291,38 +291,24 @@
 
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."
-  [db context flakes]
-  (go-try
-    (let [fuel    (volatile! 0)
-          cache   (volatile! {})
-          compact (json-ld/compact-fn context)
+  [db context error-ch flakes]
+  (let [fuel    (volatile! 0)
+        cache   (volatile! {})
+        compact (json-ld/compact-fn context)
 
-          error-ch   (async/chan)
-          out-ch     (async/chan)
-          results-ch (async/into [] out-ch)
+        out-ch     (async/chan)
 
-          t-flakes-ch (->> (sort-by flake/t flakes)
-                           (partition-by flake/t)
-                           (async/to-chan!))]
+        t-flakes-ch (->> flakes
+                         (partition-by flake/t)
+                         (async/to-chan!))]
 
-      (async/pipeline-async 2
-                            out-ch
-                            (fn [t-flakes ch]
-                              (-> (commit-t-flakes->json-ld db compact cache fuel error-ch t-flakes)
-                                  (async/pipe ch)))
-                            t-flakes-ch)
-      (async/alt!
-        error-ch ([e] e)
-        results-ch ([result] result)))))
-
-(defn commit-details
-  "Given a time range, return a collection of commit maps."
-  [db context from-t to-t]
-  (go-try
-    (let [flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
-          results (<? (commit-flakes->json-ld db context flakes))]
-      results)))
-
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [t-flakes ch]
+                            (-> (commit-t-flakes->json-ld db compact cache fuel error-ch t-flakes)
+                                (async/pipe ch)))
+                          t-flakes-ch)
+    out-ch))
 
 (defn add-commit-details
   "Annotate the results of a history query by associng the commit map for each `t` into the
@@ -330,7 +316,7 @@
 
   Chunks together results with consecutive `t`s to reduce number of `time-range` index traversals
   needed for commit retrieval."
-  [db context history-results-chan]
+  [db context error-ch history-results-chan]
   (go-try
     (when-let [first-result (<? history-results-chan)]
      (let [t-key (json-ld/compact const/iri-t context)]
@@ -348,15 +334,21 @@
                       first-t
                       result-t
                       final)
-               (let [from  (- last-t)
-                     to  (- first-t)
-                     consecutive-commit-details (<? (commit-details db context from to))]
+               (let [from-t  (- last-t)
+                     to-t  (- first-t)
+                     flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
+                     consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flakes)
+                                                     (async/into [])
+                                                     (async/<!))]
                  (recur (<? history-results-chan)
                         [result]
                         result-t
                         result-t
                         (into final (map into consecutive-t-results consecutive-commit-details))))))
-           (let [from  (- last-t)
-                 to  (- first-t)
-                 consecutive-commit-details (<? (commit-details db context from to))]
+           (let [from-t  (- last-t)
+                 to-t  (- first-t)
+                 flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
+                 consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flakes)
+                                                 (async/into [])
+                                                 (async/<!))]
              (into final (map into consecutive-t-results consecutive-commit-details)))))))))

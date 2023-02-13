@@ -39,75 +39,75 @@
                                           :ex/x "foo-cat"
                                           :ex/y "bar-cat"})]
     (testing "subject history"
-      (is (= [{:f/t 5
-               :f/assert [{:id :ex/dan :ex/x "foo-cat" :ex/y "bar-cat"}]
-               :f/retract [{:id :ex/dan :ex/x "foo-3" :ex/y "bar-3"}]}
-              {:f/t 3
-               :f/assert [{:id :ex/dan :ex/x "foo-3" :ex/y "bar-3"}]
-               :f/retract [{:id :ex/dan :ex/x "foo-2" :ex/y "bar-2"}]}
+      (is (= [{:f/t 1
+               :f/assert [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]
+               :f/retract []}
               {:f/t 2
                :f/assert [{:id :ex/dan :ex/x "foo-2" :ex/y "bar-2"}]
                :f/retract [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]}
-              {:f/t 1
-               :f/assert [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]
-               :f/retract []}]
+              {:f/t 3
+               :f/assert [{:id :ex/dan :ex/x "foo-3" :ex/y "bar-3"}]
+               :f/retract [{:id :ex/dan :ex/x "foo-2" :ex/y "bar-2"}]}
+              {:f/t 5
+               :f/assert [{:id :ex/dan :ex/x "foo-cat" :ex/y "bar-cat"}]
+               :f/retract [{:id :ex/dan :ex/x "foo-3" :ex/y "bar-3"}]}]
              @(fluree/history ledger {:history :ex/dan :t {:from 1}}))))
     (testing "one-tuple flake history"
-      (is (= [{:f/t 5
-               :f/assert [{:ex/x "foo-cat" :ex/y "bar-cat" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-3" :ex/y "bar-3" :id :ex/dan}]}
-              {:f/t 3
-               :f/assert [{:ex/x "foo-3" :ex/y "bar-3" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-2" :ex/y "bar-2" :id :ex/dan}]}
+      (is (= [{:f/t 1
+               :f/assert [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]
+               :f/retract []}
               {:f/t 2
                :f/assert [{:ex/x "foo-2" :ex/y "bar-2" :id :ex/dan}]
                :f/retract [{:ex/x "foo-1" :ex/y "bar-1" :id :ex/dan}]}
-              {:f/t 1
-               :f/assert [{:id :ex/dan :ex/x "foo-1" :ex/y "bar-1"}]
-               :f/retract []}]
+              {:f/t 3
+               :f/assert [{:ex/x "foo-3" :ex/y "bar-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2" :ex/y "bar-2" :id :ex/dan}]}
+              {:f/t 5
+               :f/assert [{:ex/x "foo-cat" :ex/y "bar-cat" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-3" :ex/y "bar-3" :id :ex/dan}]}]
              @(fluree/history ledger {:history [:ex/dan] :t {:from 1}}))))
     (testing "two-tuple flake history"
-      (is (= [{:f/t 5
-               :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-3" :id :ex/dan}]}
-              {:f/t 3
-               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
+      (is (= [{:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}
               {:f/t 2
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
                :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
-              {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dan}] :f/retract []}]
+              {:f/t 3
+               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
+              {:f/t 5
+               :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-3" :id :ex/dan}]}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 1}})))
 
-      (is (= [{:f/t 5
-               :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-3" :id :ex/dan}]}
+      (is (= [{:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dog}
+                                 {:ex/x "foo-1" :id :ex/cat}
+                                 {:ex/x "foo-1" :id :ex/dan}]
+               :f/retract []}
+              {:f/t 2
+               :f/assert [{:ex/x "foo-2" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
+              {:f/t 3
+               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
               {:f/t 4
                :f/assert [{:ex/x "foo-dog" :id :ex/dog}
                           {:ex/x "foo-cat" :id :ex/cat}]
                :f/retract [{:ex/x "foo-1" :id :ex/dog}
                            {:ex/x "foo-1" :id :ex/cat}]}
-              {:f/t 3
-               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
-              {:f/t 2
-               :f/assert [{:ex/x "foo-2" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
-              {:f/t 1 :f/assert [{:ex/x "foo-1" :id :ex/dog}
-                                 {:ex/x "foo-1" :id :ex/cat}
-                                 {:ex/x "foo-1" :id :ex/dan}]
-               :f/retract []}]
+              {:f/t 5
+               :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-3" :id :ex/dan}]}]
              @(fluree/history ledger {:history [nil :ex/x] :t {:from 1}}))))
     (testing "three-tuple flake history"
-      (is (= [{:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}
-              {:f/t 4 :f/assert [{:ex/x "foo-cat" :id :ex/cat}] :f/retract []}]
+      (is (= [{:f/t 4 :f/assert [{:ex/x "foo-cat" :id :ex/cat}] :f/retract []}
+              {:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}]
              @(fluree/history ledger {:history [nil :ex/x "foo-cat"] :t {:from 1}})))
-      (is (= [{:f/t 3
-               :f/assert []
-               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
-              {:f/t 2
+      (is (= [{:f/t 2
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
-               :f/retract []}]
+               :f/retract []}
+              {:f/t 3
+               :f/assert []
+               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
              @(fluree/history ledger {:history [nil :ex/x "foo-2"] :t {:from 1}})))
       (is (= [{:f/t 5 :f/assert [{:ex/x "foo-cat" :id :ex/dan}] :f/retract []}]
              @(fluree/history ledger {:history [:ex/dan :ex/x "foo-cat"] :t {:from 1}}))))
@@ -121,42 +121,42 @@
         (is (= expected
                @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:at 3}})))))
     (testing "from-t"
-      (is (= [{:f/t 5
-               :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-3" :id :ex/dan}]}
-              {:f/t 3
-               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
-             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 3}}))))
-    (testing "to-t"
       (is (= [{:f/t 3
                :f/assert [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
+              {:f/t 5
+               :f/assert [{:ex/x "foo-cat" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-3" :id :ex/dan}]}]
+             @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from 3}}))))
+    (testing "to-t"
+      (is (= [{:f/t 1
+               :f/assert [{:ex/x "foo-1" :id :ex/dan}]
+               :f/retract []}
               {:f/t 2
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
                :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
-              {:f/t 1
-               :f/assert [{:ex/x "foo-1" :id :ex/dan}]
-               :f/retract []}]
+              {:f/t 3
+               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
              @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:to 3}}))))
     (testing "t-range"
-      (is (= [{:f/t 4
-               :f/assert [{:ex/x "foo-dog" :id :ex/dog} {:ex/x "foo-cat" :id :ex/cat}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}
+      (is (= [{:f/t 2
+               :f/assert [{:ex/x "foo-2" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
               {:f/t 3
                :f/assert [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
-              {:f/t 2
-               :f/assert [{:ex/x "foo-2" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}]
+              {:f/t 4
+               :f/assert [{:ex/x "foo-dog" :id :ex/dog} {:ex/x "foo-cat" :id :ex/cat}]
+               :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}]
              @(fluree/history ledger {:history [nil :ex/x] :t {:from 2 :to 4}}))))
     (testing "datetime-t"
-      (is (= [{:f/t 3
-               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
-              {:f/t 2
+      (is (= [{:f/t 2
                :f/assert [{:ex/x "foo-2" :id :ex/dan}]
-               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}]
+               :f/retract [{:ex/x "foo-1" :id :ex/dan}]}
+              {:f/t 3
+               :f/assert [{:ex/x "foo-3" :id :ex/dan}]
+               :f/retract [{:ex/x "foo-2" :id :ex/dan}]}]
              @(fluree/history ledger {:history [nil :ex/x] :t {:from ts2 :to ts3}}))
           "does not include t 1 4 or 5")
       (is (= [{:f/t 5
@@ -263,14 +263,40 @@
                          :f/alias "committest",
                          :f/context
                          "fluree:memory:///contexts/b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
-              ]
-          (is (= [commit-5]
-                 @(fluree/history ledger {:commit-details true :t {:from 5 :to 5}})))
+              commit-4 {:f/commit
+                        {:f/address
+                         "fluree:memory://67df776dd7cee2a21b9c2a513224ad044e2dc613e5be5d6de42478ed69ac7b21",
+                         :f/v 0,
+                         :f/previous
+                         {:id
+                          "fluree:commit:sha256:bzlpatyzpsmdyvr4eywvsa2bctleol5tbupsr35ejxntxnjn7l2q"},
+                         :f/time 720000,
+                         :id
+                         "fluree:commit:sha256:bbr54svhy4ergg3mmed4eugzljonsl7jlfmadsbcq6b7sr2cs7yyl",
+                         :f/branch "main",
+                         :f/data
+                         {:f/previous
+                          {:id
+                           "fluree:db:sha256:blxs4kpvkuwsc76cf2hfgs6housqeoxwvbehect4p47f6ow7fkbb"},
+                          :f/address
+                          "fluree:memory://85e076bdfe8e5c8d53551d290f9e4e716eab86ba8577238d731c51df4f6effba",
+                          :f/flakes 82,
+                          :f/size 7650,
+                          :f/t 4,
+                          :f/assert [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/cat}],
+                          :f/retract []},
+                         "https://www.w3.org/2018/credentials#issuer"
+                         {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
+                         :f/alias "committest",
+                         :f/context
+                         "fluree:memory:///contexts/b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}]
+          (is (= [commit-4 commit-5]
+                 @(fluree/history ledger {:commit-details true :t {:from 4 :to 5}})))
           (is (= [commit-5]
                  @(fluree/history ledger {:commit-details true :t {:at :latest}})))))
 
       (testing "time range"
-        (let [[c4 c3 c2 :as response] @(fluree/history ledger {:commit-details true :t {:from 2 :to 4}})]
+        (let [[c2 c3 c4 :as response] @(fluree/history ledger {:commit-details true :t {:from 2 :to 4}})]
           (testing "all commits in time range are returned"
             (is (=  3
                     (count response))))
@@ -415,7 +441,37 @@
                @(fluree/history ledger {:commit-details true :t {:to 1}}))))
 
       (testing "history commit details"
-        (is (= [{:f/t 5,
+        (is (= [{:f/t 3,
+                 :f/assert [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}],
+                 :f/retract [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/alice}],
+                 :f/commit
+                 {:f/address
+                  "fluree:memory://c5aeefb071f0c42cdbc64ff531b54137395e074880ff153b8bd8712004c6554a",
+                  :f/v 0,
+                  :f/previous
+                  {:id
+                   "fluree:commit:sha256:bbn7ggrkec2gqgkdjh4qisbeklzgx6g5xdxcfepi3mbkresckyncp"},
+                  :f/time 720000,
+                  :id
+                  "fluree:commit:sha256:bzlpatyzpsmdyvr4eywvsa2bctleol5tbupsr35ejxntxnjn7l2q",
+                  :f/branch "main",
+                  :f/data
+                  {:f/previous
+                   {:id
+                    "fluree:db:sha256:bb3hzx3ibkdumy2qf7qzduwfqsxumucjwc334palggyg6qxhfdszh"},
+                   :f/address
+                   "fluree:memory://ec0a4c9ec4ce5597425ed8fbfb6fc518918b92b5ec69e3c3c4b05d17f0965590",
+                   :f/flakes 63,
+                   :f/size 5906,
+                   :f/t 3,
+                   :f/assert [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}],
+                   :f/retract [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/alice}]},
+                  "https://www.w3.org/2018/credentials#issuer"
+                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
+                  :f/alias "committest",
+                  :f/context
+                  "fluree:memory:///contexts/b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
+                {:f/t 5,
                  :f/assert [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
                  :f/commit
                  {:f/address
@@ -446,14 +502,14 @@
                   :f/context
                   "fluree:memory:///contexts/b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"},
                  :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]}]
-               @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 5}})))
+               @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 3}})))
         (testing "multiple history results"
           (let [history-with-commits @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 1 :to 5}})]
             (testing "all `t`s with changes to subject are returned"
-              (is (= [5 3 2 1]
+              (is (= [1 2 3 5]
                      (mapv :f/t history-with-commits))))
             (testing "all expected commits are present and associated with the correct results"
-              (is (= [[5 5] [3 3] [2 2] [1 1]]
+              (is (= [[1 1] [2 2] [3 3] [5 5]]
                      (map (fn [history-map]
                             (let [commit-t (get-in history-map [:f/commit :f/data :f/t])]
                               (vector (:f/t history-map) commit-t)))

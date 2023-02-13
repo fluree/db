@@ -53,19 +53,20 @@
                                           (nil? to)      (:t db))])
 
             parsed-context (fql-parse/parse-context query-map db)
-            error-ch   (async/chan)]
+            error-ch       (async/chan)]
 
         (if history
           ;; filter flakes for history pattern
-          (let [[pattern idx]   (<? (history/history-pattern db context history))
-                flakes          (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
+          (let [[pattern idx] (<? (history/history-pattern db context history))
+                flakes        (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
 
                 history-results-chan (history/history-flakes->json-ld db parsed-context error-ch flakes)]
 
             (if commit-details
               ;; annotate with commit details
               (async/alt!
-                (history/add-commit-details db parsed-context history-results-chan) ([result] result)
+                (history/add-commit-details db parsed-context error-ch history-results-chan)
+                ([result] result)
                 error-ch ([e] e))
 
               ;; we're already done
@@ -74,7 +75,11 @@
                 error-ch ([e] e))))
 
           ;; just commits over a range of time
-          (<? (history/commit-details db parsed-context from-t to-t)))))))
+          (let [flakes            (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
+                commit-results-ch (history/commit-flakes->json-ld db parsed-context error-ch flakes)]
+            (async/alt!
+              (async/into [] commit-results-ch) ([result] result)
+              error-ch ([e] e))))))))
 
 (defn query
   "Execute a query against a database source, or optionally
