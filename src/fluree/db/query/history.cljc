@@ -108,7 +108,7 @@
             ;; add the id in case the iri flake isn't present in s-flakes
             (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
       (catch* e
-              (log/error e "Error converting history flakes.")
+              (log/error e "Error transforming s-flakes.")
               (async/>! error-ch e)))))
 
 (defn t-flakes->json-ld
@@ -117,23 +117,19 @@
   [{:id :ex/foo :ex/x 1 :ex/y 2}...]
   "
   [db compact cache fuel error-ch t-flakes]
-  (go-try
-    (let [s-flake-partitions (fn [flakes]
-                               (->> flakes
-                                    (group-by flake/s)
-                                    (vals)
-                                    (async/to-chan!)))
+  (let [s-flakes-ch (->> t-flakes
+                         (group-by flake/s)
+                         (vals)
+                         (async/to-chan!))
 
-          s-ch      (s-flake-partitions t-flakes)
-          s-out-ch  (async/chan)
-          s-json-ch (async/into [] s-out-ch)]
-      (async/pipeline-async 2
-                            s-out-ch
-                            (fn [assert-flakes ch]
-                              (-> (s-flakes->json-ld db cache compact fuel error-ch assert-flakes)
-                                  (async/pipe ch)))
-                            s-ch)
-      (async/<! s-json-ch))))
+        s-out-ch (async/chan)]
+    (async/pipeline-async 2
+                          s-out-ch
+                          (fn [assert-flakes ch]
+                            (-> (s-flakes->json-ld db cache compact fuel error-ch assert-flakes)
+                                (async/pipe ch)))
+                          s-flakes-ch)
+    s-out-ch))
 
 (defn history-flakes->json-ld
   "Build a collection of maps for each t that contains the t along with the asserted and
@@ -141,36 +137,56 @@
 
   [{:id :ex/foo :f/assert [{},,,} :f/retract [{},,,]]}]
   "
-  [db context flakes error-ch]
-  (go-try
-    (let [fuel    (volatile! 0)
-          cache   (volatile! {})
+  [db context error-ch flakes]
+  (let [fuel  (volatile! 0)
+        cache (volatile! {})
 
-          compact (json-ld/compact-fn context)
+        compact (json-ld/compact-fn context)
 
-          error-ch   (async/chan)
-          out-ch     (async/chan)
+        out-ch   (async/chan)
 
-          t-flakes-ch (->> (sort-by flake/t flakes)
-                           (partition-by flake/t)
-                           (async/to-chan!))]
+        t-flakes-ch (->> flakes
+                         (sort-by flake/t)
+                         (group-by flake/t)
+                         (vals)
+                         (async/to-chan!))
 
-      (async/pipeline-async 2
-                            out-ch
-                            (fn [t-flakes ch]
-                              (-> (go-try
+        ;; We're compacting this static iri for each t. Since the compact iri is
+        ;; constant through repeated invocations of this async function, we should
+        ;; compute it once outside of it. I think we should move this compacting and the
+        ;; compacting of the retract iri to the let binding starting at line 146.
+
+        t-key       (json-ld/compact const/iri-t compact)
+        assert-key  (json-ld/compact const/iri-assert compact)
+        retract-key (json-ld/compact const/iri-retract compact)]
+
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [t-flakes ch]
+                            (-> (async/go
+                                  (try*
                                     (let [{assert-flakes  true
-                                           retract-flakes false} (group-by flake/op t-flakes)]
-                                      {(json-ld/compact const/iri-t compact)
-                                       (- (flake/t (first t-flakes)))
+                                           retract-flakes false} (group-by flake/op t-flakes)
 
-                                       (json-ld/compact const/iri-assert compact)
-                                       (async/<! (t-flakes->json-ld db compact cache fuel error-ch assert-flakes))
-                                       (json-ld/compact const/iri-retract compact)
-                                       (async/<! (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))}))
-                                  (async/pipe ch)))
-                            t-flakes-ch)
-      out-ch)))
+                                          t (- (flake/t (first t-flakes)))
+
+                                          asserts (->> (t-flakes->json-ld db compact cache fuel error-ch assert-flakes)
+                                                       (async/into [])
+                                                       (async/<!))
+
+                                          retracts (->> (t-flakes->json-ld db compact cache fuel error-ch retract-flakes)
+                                                        (async/into [])
+                                                        (async/<!))]
+                                      {t-key       t
+                                       assert-key  asserts
+                                       retract-key retracts})
+                                    (catch* e
+                                            (log/error e "Error converting history flakes.")
+                                            (async/>! error-ch e))))
+
+                                (async/pipe ch)))
+                          t-flakes-ch)
+    out-ch))
 
 (defn history-pattern
   "Given a parsed query, convert the iris from the query
@@ -253,8 +269,12 @@
 
             commit-wrapper (<? commit-wrapper-chan)
             commit-meta    (<? commit-meta-chan)
-            asserts        (<? (t-flakes->json-ld db compact cache fuel error-ch assert-flakes))
-            retracts       (<? (t-flakes->json-ld db compact cache fuel error-ch retract-flakes))
+            asserts        (->> (t-flakes->json-ld db compact cache fuel error-ch assert-flakes)
+                                (async/into [])
+                                (async/<!))
+            retracts       (->> (t-flakes->json-ld db compact cache fuel error-ch retract-flakes)
+                                (async/into [])
+                                (async/<!))
 
             assert-key  (json-ld/compact const/iri-assert compact)
             retract-key (json-ld/compact const/iri-retract compact)
