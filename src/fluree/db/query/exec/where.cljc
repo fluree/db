@@ -69,11 +69,11 @@
           ::val      x
           ::datatype dt)))
 
-(defn ->value
+(defn anonymous-value
   "Build a pattern that already matches an explicit value."
   ([v]
    (let [dt (datatype/infer v)]
-     (->value v dt)))
+     (anonymous-value v dt)))
   ([v dt]
    (-> (unmatched)
        (match-value v dt))))
@@ -109,7 +109,7 @@
 (defn ->predicate
   "Build a pattern that already matches the explicit predicate value `value`."
   ([value]
-   (->value value))
+   (anonymous-value value))
   ([value recur-n]
    (-> value
        ->predicate

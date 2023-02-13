@@ -172,12 +172,12 @@
   [x context]
   (-> x
       (json-ld/expand-iri context)
-      (where/->value const/$xsd:anyURI)))
+      (where/anonymous-value const/$xsd:anyURI)))
 
 (defn parse-sid
   [x]
   (when (syntax/sid? x)
-    (where/->value x)))
+    (where/anonymous-value x)))
 
 (defn parse-subject
   ([x]
@@ -202,7 +202,7 @@
 (defn parse-class-predicate
   [x]
   (when (rdf-type? x)
-    (where/->value const/$rdf:type)))
+    (where/anonymous-value const/$rdf:type)))
 
 (defn parse-iri-predicate
   [x]
@@ -240,7 +240,7 @@
   [x db context]
   (-> x
       (iri->pred-id-strict db context)
-      where/->value))
+      where/anonymous-value))
 
 (defn parse-predicate-pattern
   [p-pat db context]
@@ -254,7 +254,7 @@
 (defn parse-class
   [o-iri db context]
   (if-let [id (iri->pred-id o-iri db context)]
-    (where/->value id const/$xsd:anyURI)
+    (where/anonymous-value id const/$xsd:anyURI)
     (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o-iri context))
                     {:status 400 :error :db/invalid-query}))))
 
@@ -262,7 +262,7 @@
   [o-pat]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
-      (where/->value o-pat)))
+      (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
   (fn [pattern _vars _db _context]
@@ -312,7 +312,7 @@
       (if (= const/$iri (::where/val p))
         (let [o (-> o-pat
                     (json-ld/expand-iri context)
-                    where/->value)]
+                    where/anonymous-value)]
           (where/->pattern :iri [s p o]))
         (let [o (parse-object-pattern o-pat)]
           [s p o])))))
