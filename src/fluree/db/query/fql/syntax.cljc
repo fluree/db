@@ -155,12 +155,11 @@
                            [:where-map ::where-map]
                            [:tuple ::where-tuple]]]
      ::var-collection [:sequential ::var]
-     ::var-list [:sequential ::var]
-     ::val-list [:sequential ::val]
-     ::single-var-binding [:tuple ::var ::val-list]
+     ::val-collection [:sequential ::val]
+     ::single-var-binding [:tuple ::var ::val-collection]
      ::value-binding [:sequential ::val]
      ::multiple-var-binding [:tuple
-                             ::var-list
+                             ::var-collection
                              [:sequential ::value-binding]]
      ::values [:orn
                [:single ::single-var-binding]
