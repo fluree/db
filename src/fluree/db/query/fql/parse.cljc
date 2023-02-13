@@ -416,9 +416,9 @@
     (-> q
         (assoc :context context
                :where   where)
-        (cond-> (not-empty values) (assoc :values values)
-                grouping           (assoc :group-by grouping)
-                ordering           (assoc :order-by ordering))
+        (cond-> (seq values) (assoc :values values)
+                grouping     (assoc :group-by grouping)
+                ordering     (assoc :order-by ordering))
         parse-having
         (parse-select db context))))
 
@@ -436,11 +436,11 @@
 (defn parse-delete
   [q db]
   (when (:delete q)
-    (let [context (parse-context q db)
-          values  (parse-values q)
-          where   (parse-where q values db context)]
+    (let [context       (parse-context q db)
+          [vars values] (parse-values q)
+          where         (parse-where q vars db context)]
       (-> q
           (assoc :context context
                  :where   where)
-          (cond-> (not-empty values) (assoc :values  values))
+          (cond-> (seq values) (assoc :values values))
           (update :delete parse-triple db context)))))
