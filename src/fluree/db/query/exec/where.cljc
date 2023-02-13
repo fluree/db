@@ -340,7 +340,16 @@
 
 (defn search
   [db q error-ch]
-  (let [where-clause     (:where q)
-        initial-solution (or (:vars q)
-                             blank-solution)]
-    (match-clause db initial-solution where-clause error-ch)))
+  (let [where-clause      (:where q)
+        initial-solutions (-> q
+                              :values
+                              not-empty
+                              (or [blank-solution]))
+        out-ch            (async/chan)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [initial-solution ch]
+                            (-> (match-clause db initial-solution where-clause error-ch)
+                                (async/pipe ch)))
+                          (async/to-chan! initial-solutions))
+    out-ch))

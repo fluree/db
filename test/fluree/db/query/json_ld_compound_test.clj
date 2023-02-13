@@ -41,12 +41,12 @@
                                         [?f :schema/age ?age]]})
 
           two-tuple-select-with-crawl+var
-          @(fluree/query db {:context {:ex "http://example.org/ns/"}
-                             :select  ['?age {'?f [:*]}]
-                             :where   [['?s :schema/name '?name]
-                                       ['?s :ex/friend '?f]
-                                       ['?f :schema/age '?age]]
-                             :vars    {'?name "Cam"}})]
+          @(fluree/query db '{:context {:ex "http://example.org/ns/"}
+                              :select  [?age {?f [:*]}]
+                              :where   [[?s :schema/name ?name]
+                                        [?s :ex/friend ?f]
+                                        [?f :schema/age ?age]]
+                              :values  [?name ["Cam"]]})]
 
       (is (= two-tuple-select-with-crawl
              two-tuple-select-with-crawl+var

@@ -27,6 +27,8 @@
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \?))))
 
+(def value? (complement coll?))
+
 (defn sid?
   [x]
   (int? x))
@@ -76,6 +78,7 @@
                  [:list [:fn fn-list?]]]
      ::wildcard [:fn wildcard?]
      ::var [:fn variable?]
+     ::val [:fn value?]
      ::iri [:orn
             [:keyword keyword?]
             [:string string?]]
@@ -151,7 +154,17 @@
      ::where [:sequential [:orn
                            [:where-map ::where-map]
                            [:tuple ::where-tuple]]]
-     ::values [:map-of ::var :any]
+     ::var-collection [:sequential ::var]
+     ::var-list [:sequential ::var]
+     ::val-list [:sequential ::val]
+     ::single-var-binding [:tuple ::var ::val-list]
+     ::value-binding [:sequential ::val]
+     ::multiple-var-binding [:tuple
+                             ::var-list
+                             [:sequential ::value-binding]]
+     ::values [:orn
+               [:single ::single-var-binding]
+               [:multiple ::multiple-var-binding]]
      ::t [:or :int :string]
      ::delete ::triple
      ::delete-op [:map

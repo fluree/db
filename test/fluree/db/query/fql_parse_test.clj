@@ -55,17 +55,18 @@
                  {::where/val "Alice" ::where/datatype 1}]]
                patterns)))
 
-      (let [values-query {:select {"?s" ["*"]}
-                          :where  [["?s" :schema/name '?name]]
-                          :values {'?name "Alice"}}
+      (let [values-query '{:select {"?s" ["*"]}
+                           :where  [["?s" :schema/name ?name]]
+                           :values [?name ["Alice"]]}
 
             {:keys [select where values] :as parsed}
             (parse/parse-analytical-query* values-query db)
 
             {::where/keys [patterns]} where]
-        (is (= {'?name
-                {::where/var '?name
-                 ::where/val "Alice"}}
+        (is (= '[{?name
+                  {::where/var ?name
+                   ::where/val "Alice"
+                   ::where/datatype 1}}]
                values))
         (is (= {:var       '?s
                 :selection ["*"]
