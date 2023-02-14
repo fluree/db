@@ -141,10 +141,11 @@
            acc* acc]
       (log/debug "assert-v-maps v-map:" v-map)
       (log/debug "assert-v-maps id:" id)
-      (let [acc**
+      (let [ref-id (:id v-map)
+            acc**
             (cond->
-              (if (and id (node? v-map)) ;; is a ref to another IRI
-                (let [existing-sid (<? (get-iri-sid id db iris))
+              (if (and ref-id (node? v-map)) ;; is a ref to another IRI
+                (let [existing-sid (<? (get-iri-sid ref-id db iris))
                       ref-sid      (or existing-sid
                                        (jld-ledger/generate-new-sid
                                          v-map pid iris next-pid next-sid))
@@ -154,7 +155,7 @@
                   (cond-> (conj acc* new-flake)
                           (nil? existing-sid) (conj
                                                 (flake/create ref-sid const/$iri
-                                                              id
+                                                              ref-id
                                                               const/$xsd:string
                                                               t true nil))))
                 (let [[value dt] (datatype/from-expanded v-map nil)
