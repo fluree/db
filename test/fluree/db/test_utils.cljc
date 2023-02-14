@@ -109,11 +109,12 @@
 
 (defn retry-promise-wrapped
   "Retries a fn that when deref'd might return a Throwable. Intended for
-  retrying promise-wrapped API fns."
-  [thrower max-attempts]
+  retrying promise-wrapped API fns. Do not deref the return value, this will do
+  it for you."
+  [pwrapped max-attempts]
   (loop [attempt 0]
     (let [final (try
-                  (let [res @(thrower)]
+                  (let [res @(pwrapped)]
                     (if (instance? Throwable res)
                       (throw res)
                       res))
