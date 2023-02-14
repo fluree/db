@@ -191,8 +191,7 @@
                 datatype-map     (get-in shacl-map [:datatype pid])
                 property-flakes* (if existing-pid
                                    property-flakes
-                                   (cond-> (conj property-flakes (flake/create pid const/$iri k const/$xsd:string t true nil))
-                                           ref? (conj (flake/create pid const/$rdf:type const/$iri const/$xsd:anyURI t true nil))))
+                                   (conj property-flakes (flake/create pid const/$iri k const/$xsd:string t true nil)))
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts?  (or (not new-subj?) existing-pid)
                 flakes*          (if retract?

@@ -34,7 +34,7 @@
                                            :type         :schema/Person
                                            :schema/fname "Me"}])]
          @(fluree/commit! ledger db)
-         (is @(fluree/exists? conn ledger-alias))
+         (is (test-utils/retry-exists? conn ledger-alias 10))
          (is (not @(fluree/exists? conn "notaledger"))))
 
        :cljs

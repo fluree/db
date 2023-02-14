@@ -107,20 +107,32 @@
   (->> @(fluree/stage (fluree/db ledger) data)
        (fluree/commit! ledger)))
 
-(defn retry-load
-  "Retry loading a ledger until max-attempts. Hopefully not needed once JSON-LD
-  code has an equivalent to :syncTo"
-  [conn ledger-alias max-attempts]
+(defn retry-promise-wrapped
+  "Retries a fn that when deref'd might return a Throwable. Intended for
+  retrying promise-wrapped API fns. Do not deref the return value, this will do
+  it for you."
+  [pwrapped max-attempts]
   (loop [attempt 0]
-    (let [ledger (try
-                   (let [res @(fluree/load conn ledger-alias)]
-                     (if (instance? Throwable res)
-                       (throw res)
-                       res))
-                   (catch Exception e
-                     (when (= (inc attempt) max-attempts)
-                       (throw e)
-                       (Thread/sleep 100))))]
-      (if ledger
-        ledger
+    (let [final (try
+                  (let [res @(pwrapped)]
+                    (if (instance? Throwable res)
+                      (throw res)
+                      res))
+                  (catch Throwable t
+                    (when (= (inc attempt) max-attempts)
+                      (throw t)
+                      (Thread/sleep 100))))]
+      (if final
+        final
         (recur (inc attempt))))))
+
+(defn retry-load
+  "Retry loading a ledger until it loads or max-attempts. Hopefully not needed
+  once JSON-LD code has an equivalent to :syncTo"
+  [conn ledger-alias max-attempts]
+  (retry-promise-wrapped #(fluree/load conn ledger-alias) max-attempts))
+
+(defn retry-exists?
+  "Retry calling exists? until it returns true or max-attempts."
+  [conn ledger-alias max-atttemts]
+  (retry-promise-wrapped #(fluree/exists? conn ledger-alias) max-atttemts))

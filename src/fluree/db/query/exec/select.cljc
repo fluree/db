@@ -131,6 +131,6 @@
     format-ch))
 
 (defn implicit-grouping?
-  "Returns true if the provide `selector` can only operate on grouped elements."
+  "Returns true if the provided `selector` can only operate on grouped elements."
   [selector]
   (instance? AggregateSelector selector))
