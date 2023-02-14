@@ -69,6 +69,20 @@ NOTE: use `make -j` to run tasks in parallel.
 * `make nodejs-test` - run node package in node
 * `make browser-test` - run browser package in headless Chrome
 
+#### Running specific tests
+
+> This applies to CLJ tests only, not CLJS.
+
+`clojure -X:cljtest :kaocha.filter/focus [focus-spec]`
+
+...where `focus-spec` can be a test namespace or a fully-qualified `deftest`
+var. Note that the square brackets around the `focus-spec` must be present in
+the command, they are NOT there to indicate "optional" or "placeholder" in the
+example.
+
+This feature comes from the test runner kaocha which has
+[additional features](https://cljdoc.org/d/lambdaisland/kaocha/1.77.1236/doc/6-focusing-and-skipping).
+
 ### CLJS REPL
 
 In order to get a Node or web browser CLJS REPL running, you need to do the
