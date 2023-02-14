@@ -159,7 +159,9 @@
 
      (testing "can load a file ledger with its own context"
        (with-tmp-dir storage-path #_{::twf/delete-dir false}
-         (let [conn-context   {:id "@id", :type "@type"}
+         #_(println "storage path:" storage-path)
+         (let [conn-context   {:id "@id", :type "@type"
+                               :xsd "http://www.w3.org/2001/XMLSchema#"}
                ledger-context {:ex     "http://example.com/"
                                :schema "http://schema.org/"}
                conn           @(fluree/connect
@@ -175,7 +177,11 @@
                                    :schema/name    "Wes"
                                    :schema/email   "wes@example.org"
                                    :schema/age     42
-                                   :schema/favNums [1 2 3]}])
+                                   :schema/favNums [1 2 3]
+                                   :ex/friend      {:id           :ex/jake
+                                                    :type         :ex/User
+                                                    :schema/name  "Jake"
+                                                    :schema/email "jake@example.org"}}])
                db             @(fluree/commit! ledger db)
                loaded         (test-utils/retry-load conn ledger-alias 100)
                loaded-db      (fluree/db loaded)
@@ -195,5 +201,34 @@
                     :schema/age     42
                     :schema/email   "wes@example.org"
                     :schema/favNums [1 2 3]
-                    :schema/name    "Wes"}]
-                  results)))))))
+                    :schema/name    "Wes"
+                    :ex/friend      {:id :ex/jake}}]
+                  results)))))
+
+     (testing "query returns the correct results from a loaded ledger"
+       (with-tmp-dir storage-path
+         (let [conn-context   {:id "@id", :type "@type"}
+               ledger-context {:ex     "http://example.com/"
+                               :schema "http://schema.org/"}
+               conn           @(fluree/connect
+                                 {:method   :file :storage-path storage-path
+                                  :defaults {:context conn-context}})
+               ledger-alias   "load-from-file-query"
+               ledger         @(fluree/create conn ledger-alias
+                                              {:context ledger-context})
+               db             @(fluree/stage
+                                 (fluree/db ledger)
+                                 [{:id          :ex/Andrew
+                                   :type        :schema/Person
+                                   :schema/name "Andrew"
+                                   :ex/friend   {:id          :ex/Jonathan
+                                                 :type        :schema/Person
+                                                 :schema/name "Jonathan"}}])
+               query          {:select '{?s [:*]}
+                               :where  '[[?s :id :ex/Andrew]]}
+               res1           @(fluree/query db query)
+               _              @(fluree/commit! ledger db)
+               loaded         (test-utils/retry-load conn ledger-alias 100)
+               loaded-db      (fluree/db loaded)
+               res2           @(fluree/query loaded-db query)]
+           (is (= res1 res2)))))))
