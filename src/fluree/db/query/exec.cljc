@@ -38,13 +38,12 @@
 
 (defn collect-results
   "Returns a channel that will eventually contain the stream of results from the
-  `result-ch` channel collected into a single vector. Handles the special case
-  of `:select-distinct` queries by removing any repeated results before
-  collecting. Handles the special case of `:select-one` queries by only
-  returning the first result from `result-ch` in the output channel. Note that
-  this behavior is different from queries with `:limit` set to 1 as those
-  queries will return a vector containing a single result to the output channel
-  instead of the single result alone."
+  `result-ch` channel collected into a single vector, but handles the special
+  case of `:select-one` queries by only returning the first result from
+  `result-ch` in the output channel. Note that this behavior is different from
+  queries with `:limit` set to 1 as those queries will return a vector
+  containing a single result to the output channel instead of the single result
+  alone."
   [q result-ch]
   (if (:select-one q)
     (async/take 1 result-ch)
