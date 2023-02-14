@@ -27,6 +27,8 @@
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \?))))
 
+(def value? (complement coll?))
+
 (defn sid?
   [x]
   (int? x))
@@ -76,6 +78,7 @@
                  [:list [:fn fn-list?]]]
      ::wildcard [:fn wildcard?]
      ::var [:fn variable?]
+     ::val [:fn value?]
      ::iri [:orn
             [:keyword keyword?]
             [:string string?]]
@@ -118,7 +121,6 @@
      ::group-by ::groupBy
      ::where-op [:enum :filter :optional :union :bind]
      ::where-map [:and
-                  #_[:map-of {:max 1} ::where-op :any]
                   [:map-of {:max 1} ::where-op :any]
                   [:multi {:dispatch where-op}
                    [:filter [:map [:filter [:ref ::filter]]]]
@@ -152,12 +154,22 @@
      ::where [:sequential [:orn
                            [:where-map ::where-map]
                            [:tuple ::where-tuple]]]
-     ::vars [:map-of ::var :any]
+     ::var-collection [:sequential ::var]
+     ::val-collection [:sequential ::val]
+     ::single-var-binding [:tuple ::var ::val-collection]
+     ::value-binding [:sequential ::val]
+     ::multiple-var-binding [:tuple
+                             ::var-collection
+                             [:sequential ::value-binding]]
+     ::values [:orn
+               [:single ::single-var-binding]
+               [:multiple ::multiple-var-binding]]
      ::t [:or :int :string]
-     ::delete ::triple     ::delete-op [:map
-                                        [:delete ::delete]
-                                        [:where ::where]
-                                        [:vars {:optional true} ::vars]]
+     ::delete ::triple
+     ::delete-op [:map
+                  [:delete ::delete]
+                  [:where ::where]
+                  [:values {:optional true} ::values]]
      ::context [:map-of :any :any]
      ::analytical-query [:map
                          [:where ::where]
@@ -173,7 +185,7 @@
                          [:group-by {:optional true} ::group-by]
                          [:filter {:optional true} ::filter]
                          [:having {:optional true} ::function]
-                         [:vars {:optional true} ::vars]
+                         [:values {:optional true} ::values]
                          [:limit {:optional true} ::limit]
                          [:offset {:optional true} ::offset]
                          [:maxFuel {:optional true} ::maxFuel]
