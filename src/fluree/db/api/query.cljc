@@ -68,8 +68,8 @@
 
             (if commit-details
               ;; annotate with commit details
-              (async/alt!
-                (history/add-commit-details db parsed-context error-ch history-results-chan)
+             (async/alt!
+                (async/into [] (history/add-commit-details db parsed-context error-ch history-results-chan))
                 ([result] result)
                 error-ch ([e] e))
 

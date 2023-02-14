@@ -302,45 +302,42 @@
                           t-flakes-ch)
     out-ch))
 
-(defn add-commit-details
-  "Annotate the results of a history query by associng the commit map for each `t` into the
-  history result for that t.
+(defn with-consecutive-ts
+  "Return a transducer that processes a stream of history results
+  and chunk together results with consecutive `t`s. "
+  [t-key]
+  (let [last-t (volatile! nil)
+       last-partition-val (volatile! true)]
+    (partition-by (fn [result]
+                    (let [result-t (get result t-key)
+                          chunk-last-t @last-t]
+                      (vreset! last-t result-t)
+                      (if (or (nil? chunk-last-t)
+                              (= chunk-last-t (dec result-t)))
+                        ;;partition-by will not create a new paritition
+                        ;;if returned value is the same as before
+                        @last-partition-val
+                        ;; partition-by will create a new partition
+                        (vswap! last-partition-val not)))))))
 
-  Chunks together results with consecutive `t`s to reduce number of `time-range` index traversals
-  needed for commit retrieval."
-  [db context error-ch history-results-chan]
-  (go-try
-    (when-let [first-result (<? history-results-chan)]
-     (let [t-key (json-ld/compact const/iri-t context)]
-       (loop [result first-result
-              consecutive-t-results []
-              first-t (get result t-key)
-              last-t nil
-              final []]
-         (if result
-           (let [result-t  (get result t-key)]
-             (if (or (nil? last-t)
-                     (= last-t (inc result-t)))
-               (recur (<? history-results-chan)
-                      (conj consecutive-t-results result)
-                      first-t
-                      result-t
-                      final)
-               (let [from-t  (- last-t)
-                     to-t  (- first-t)
-                     flake-slices-ch (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
-                     consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flake-slices-ch)
-                                                     (async/into [])
-                                                     (async/<!))]
-                 (recur (<? history-results-chan)
-                        [result]
-                        result-t
-                        result-t
-                        (into final (map into consecutive-t-results consecutive-commit-details))))))
-           (let [from-t  (- last-t)
-                 to-t  (- first-t)
-                 flake-slices-ch (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
-                 consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flake-slices-ch)
-                                                 (async/into [])
-                                                 (async/<!))]
-             (into final (map into consecutive-t-results consecutive-commit-details)))))))))
+(defn add-commit-details
+  "Adds commit-details to history results from the history-results-ch.
+  Chunks together history results with consecutive `t`s to reduce `time-range`
+  calls. "
+  [db context error-ch history-results-ch]
+  (let [t-key (json-ld/compact const/iri-t context)
+        out-ch (async/chan 2 cat)
+        chunked-ch (async/chan 2 (with-consecutive-ts t-key))]
+    (async/pipe history-results-ch chunked-ch)
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [chunk ch]
+                            (async/pipe (async/go
+                                          (let [to-t  (- (-> chunk peek (get t-key)))
+                                                from-t  (- (-> chunk (nth 0) (get t-key)))
+                                                flake-slices-ch (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
+                                                consecutive-commit-details (<? (async/into [] (commit-flakes->json-ld db context error-ch flake-slices-ch)))]
+                                            (map into chunk consecutive-commit-details)))
+                                        ch))
+                          chunked-ch)
+    out-ch))
