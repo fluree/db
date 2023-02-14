@@ -46,6 +46,23 @@
                                    :having   (>= (avg ?favNums) 2)}))
             "filters results according to the supplied having function code")))))
 
+(deftest ^:integration select-distinct-test
+  (testing "Distinct queries"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)
+          q      '{:context         {:ex "http://example.org/ns/"}
+                   :select-distinct [?name ?email]
+                   :where           [[?s :schema/name ?name]
+                                     [?s :schema/email ?email]
+                                     [?s :ex/favNums ?favNum]]
+                   :order-by        ?favNum}]
+      (is (= [["Cam" "cam@example.org"]
+              ["Brian" "brian@example.org"]
+              ["Alice" "alice@example.org"]]
+             @(fluree/query db q))
+          "return results without repeated entries"))))
+
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
