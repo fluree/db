@@ -339,10 +339,10 @@
                                            {:status 500 :error :db/invalid-commit})))
           assert         (db-assert db-data)
           retract        (db-retract db-data)
-          retract-flakes (retract-flakes db retract t-new iris)
+          retract-flakes (<? (retract-flakes db retract t-new iris))
           {:keys [flakes pid sid]} (<? (assert-flakes db assert t-new iris refs))
           all-flakes     (-> (empty (get-in db [:novelty :spot]))
-                             (into (<? retract-flakes))
+                             (into retract-flakes)
                              (into flakes))
           ecount*        (assoc ecount const/$_predicate pid
                                        const/$_default sid)]
