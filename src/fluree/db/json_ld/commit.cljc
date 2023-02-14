@@ -67,7 +67,7 @@
       (if p-flakes
         (let [fflake    (first p-flakes)
               p-iri     (<? (get-s-iri (flake/p fflake) db iri-map compact-fn))
-              ref?      (get-in schema [:pred (flake/p fflake) :ref?])
+              ref?      (= const/$iri (flake/dt fflake))
               list?     (:i (flake/m fflake))
               p-flakes* (if list?
                           (sort-by #(:i (flake/m %)) p-flakes)
