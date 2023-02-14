@@ -63,6 +63,58 @@
              @(fluree/query db q))
           "return results without repeated entries"))))
 
+(deftest ^:integration values-test
+  (testing "Queries with pre-specified values"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+      (testing "binding a single variable"
+        (testing "with a single value"
+          (let [q '{:context {:ex "http://example.org/ns/"}
+                    :select  [?name ?age]
+                    :where   [[?s :schema/email ?email]
+                              [?s :schema/name ?name]
+                              [?s :schema/age ?age]]
+                    :values [?email ["alice@example.org"]]}]
+            (is (= [["Alice" 50]]
+                   @(fluree/query db q))
+                "returns only the results related to the bound value")))
+        (testing "with multiple values"
+          (let [q '{:context {:ex "http://example.org/ns/"}
+                    :select  [?name ?age]
+                    :where   [[?s :schema/email ?email]
+                              [?s :schema/name ?name]
+                              [?s :schema/age ?age]]
+                    :values [?email ["alice@example.org" "cam@example.org"]]}]
+            (is (= [["Alice" 50] ["Cam" 34]]
+                   @(fluree/query db q))
+                "returns only the results related to the bound values"))))
+      (testing "binding multiple variables"
+        (testing "with multiple values"
+          (let [q '{:context {:ex "http://example.org/ns/"}
+                    :select  [?name ?age]
+                    :where   [[?s :schema/email ?email]
+                              [?s :ex/favNums ?favNum]
+                              [?s :schema/name ?name]
+                              [?s :schema/age ?age]]
+                    :values [[?email ?favNum] [["alice@example.org" 42]
+                                               ["cam@example.org" 10]]]}]
+            (is (= [["Alice" 50] ["Cam" 34]]
+                   @(fluree/query db q))
+                "returns only the results related to the bound values")))
+        (testing "with some values not present"
+          (let [q '{:context {:ex "http://example.org/ns/"}
+                    :select  [?name ?age]
+                    :where   [[?s :schema/email ?email]
+                              [?s :ex/favNums ?favNum]
+                              [?s :schema/name ?name]
+                              [?s :schema/age ?age]]
+                    :values [[?email ?favNum] [["alice@example.org" 42]
+                                               ["cam@example.org" 37]]]}]
+            (is (= [["Alice" 50]]
+                   @(fluree/query db q))
+                "returns only the results related to the existing bound values")))))))
+
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)

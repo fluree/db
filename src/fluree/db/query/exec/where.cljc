@@ -58,25 +58,40 @@
                     (>! error-ch e))))
     out-ch))
 
+(defn unmatched
+  ([] {})
+  ([var-sym]
+   {::var var-sym}))
+
+(defn match-value
+  ([m x dt]
+   (assoc m
+          ::val      x
+          ::datatype dt)))
+
+(defn anonymous-value
+  "Build a pattern that already matches an explicit value."
+  ([v]
+   (let [dt (datatype/infer v)]
+     (anonymous-value v dt)))
+  ([v dt]
+   (-> (unmatched)
+       (match-value v dt))))
+
+(defn matched?
+  [component]
+  (::val component))
+
+(def unmatched?
+  "Returns true if the triple pattern component `component` represents a variable
+  without an associated value."
+  (complement matched?))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
   #?(:clj (MapEntry/create typ data)
      :cljs (MapEntry. typ data nil)))
-
-(defn ->variable
-  "Build an unmatched variable pattern."
-  [nme]
-  {::var nme})
-
-(defn ->value
-  "Build a pattern that already matches an explicit value."
-  ([v]
-   (let [dt (datatype/infer v)]
-     (->value v dt)))
-  ([v dt]
-   {::val      v
-    ::datatype dt}))
 
 (defn ->ident
   "Build a pattern that already matches the two-tuple database identifier `x`"
@@ -88,13 +103,13 @@
   boolean function `f`."
   [var f]
   (-> var
-      ->variable
+      unmatched
       (assoc ::fn f)))
 
 (defn ->predicate
   "Build a pattern that already matches the explicit predicate value `value`."
   ([value]
-   (->value value))
+   (anonymous-value value))
   ([value recur-n]
    (-> value
        ->predicate
@@ -130,14 +145,6 @@
   (fn [db solution pattern filters error-ch]
     (pattern-type pattern)))
 
-(defn get-value
-  "Get the value matched to the supplied `variable` within the supplied pattern
-  match `solution`."
-  [solution variable]
-  (-> solution
-      (get variable)
-      ::val))
-
 (defn assign-matched-values
   "Assigns the value of any variables within the supplied `triple-pattern` that
   were previously matched in the supplied solution map `solution` to their
@@ -149,49 +156,38 @@
   [triple-pattern solution filters]
   (mapv (fn [component]
           (if-let [variable (::var component)]
-            (if-let [value (get-value solution variable)]
-              (assoc component ::val value)
-              (let [filter-fn (some->> (get filters variable)
-                                       (map ::fn)
-                                       (map (fn [f]
-                                              (partial f solution)))
-                                       (apply every-pred))]
-                (assoc component ::fn filter-fn)))
+            (let [match (get solution variable)]
+              (if-let [value (::val match)]
+                (let [dt (::datatype match)]
+                  (match-value component value dt))
+                (let [filter-fn (some->> (get filters variable)
+                                         (map ::fn)
+                                         (map (fn [f]
+                                                (partial f solution)))
+                                         (apply every-pred))]
+                  (assoc component ::fn filter-fn))))
             component))
         triple-pattern))
 
-(defn unmatched?
-  "Returns true if the triple pattern component `component` represents a variable
-  without an associated value."
-  [component]
-  (and (::var component)
-       (not (::val component))))
-
 (defn match-subject
   "Matches the subject of the supplied `flake` to the triple subject pattern
-  component `s-pattern`, and marks the matched pattern component as a URI data
+  component `s-match`, and marks the matched pattern component as a URI data
   type."
-  [s-pattern flake]
-  (assoc s-pattern
-         ::val      (flake/s flake)
-         ::datatype const/$xsd:anyURI))
+  [s-match flake]
+  (match-value s-match (flake/s flake) const/$xsd:anyURI))
 
 (defn match-predicate
   "Matches the predicate of the supplied `flake` to the triple predicate pattern
-  component `p-pattern`, and marks the matched pattern component as a URI data
+  component `p-match`, and marks the matched pattern component as a URI data
   type."
-  [p-pattern flake]
-  (assoc p-pattern
-         ::val      (flake/p flake)
-         ::datatype const/$xsd:anyURI))
+  [p-match flake]
+  (match-value p-match (flake/p flake) const/$xsd:anyURI))
 
 (defn match-object
   "Matches the object and data type of the supplied `flake` to the triple object
-  pattern component `o-pattern`."
-  [o-pattern flake]
-  (assoc o-pattern
-         ::val      (flake/o flake)
-         ::datatype (flake/dt flake)))
+  pattern component `o-match`."
+  [o-match flake]
+  (match-value o-match (flake/o flake) (flake/dt flake)))
 
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
@@ -344,7 +340,16 @@
 
 (defn search
   [db q error-ch]
-  (let [where-clause     (:where q)
-        initial-solution (or (:vars q)
-                             blank-solution)]
-    (match-clause db initial-solution where-clause error-ch)))
+  (let [where-clause      (:where q)
+        initial-solutions (-> q
+                              :values
+                              not-empty
+                              (or [blank-solution]))
+        out-ch            (async/chan)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [initial-solution ch]
+                            (-> (match-clause db initial-solution where-clause error-ch)
+                                (async/pipe ch)))
+                          (async/to-chan! initial-solutions))
+    out-ch))

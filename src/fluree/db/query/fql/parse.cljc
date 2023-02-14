@@ -3,6 +3,7 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
+            [fluree.db.datatype :as datatype]
             [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.string :as str]
@@ -10,7 +11,6 @@
             [clojure.walk :refer [postwalk]]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.query.analytical-filter :as filter]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
@@ -36,16 +36,33 @@
 
 (defn parse-variable
   [x]
-  (when-let [var-name (parse-var-name x)]
-    (where/->variable var-name)))
+  (some-> x parse-var-name where/unmatched))
 
-(defn parse-vars
-  [{:keys [vars] :as _q}]
-  (reduce-kv (fn [m var val]
-               (let [variable (-> (parse-variable var)
-                                  (assoc ::where/val val))]
-                 (assoc m var variable)))
-             {} vars))
+(defn parse-value-binding
+  [vars vals]
+  (let [var-matches (mapv parse-variable vars)
+        binding     (mapv (fn [var-match value]
+                            (let [dt (datatype/infer value)]
+                              (where/match-value var-match value dt)))
+                          var-matches vals)]
+    (zipmap vars binding)))
+
+(defn parse-values
+  [q]
+  (when-let [values (:values q)]
+    (let [[vars vals] values
+          vars*       (util/sequential vars)
+          vals*       (mapv util/sequential vals)
+          var-count   (count vars*)]
+      (if (every? (fn [bdg]
+                    (= (count bdg) var-count))
+                  vals*)
+        [vars* (mapv (partial parse-value-binding vars*)
+                     vals*)]
+        (throw (ex-info (str "Invalid value binding: "
+                             "number of variables and values don't match: "
+                             values)
+                        {:status 400 :error :db/invalid-query}))))))
 
 (def rdf-type-preds #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
                       "a"
@@ -155,12 +172,12 @@
   [x context]
   (-> x
       (json-ld/expand-iri context)
-      (where/->value const/$xsd:anyURI)))
+      (where/anonymous-value const/$xsd:anyURI)))
 
 (defn parse-sid
   [x]
   (when (syntax/sid? x)
-    (where/->value x)))
+    (where/anonymous-value x)))
 
 (defn parse-subject
   ([x]
@@ -185,7 +202,7 @@
 (defn parse-class-predicate
   [x]
   (when (rdf-type? x)
-    (where/->value const/$rdf:type)))
+    (where/anonymous-value const/$rdf:type)))
 
 (defn parse-iri-predicate
   [x]
@@ -223,7 +240,7 @@
   [x db context]
   (-> x
       (iri->pred-id-strict db context)
-      where/->value))
+      where/anonymous-value))
 
 (defn parse-predicate-pattern
   [p-pat db context]
@@ -237,7 +254,7 @@
 (defn parse-class
   [o-iri db context]
   (if-let [id (iri->pred-id o-iri db context)]
-    (where/->value id const/$xsd:anyURI)
+    (where/anonymous-value id const/$xsd:anyURI)
     (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o-iri context))
                     {:status 400 :error :db/invalid-query}))))
 
@@ -245,7 +262,7 @@
   [o-pat]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
-      (where/->value o-pat)))
+      (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
   (fn [pattern _vars _db _context]
@@ -295,7 +312,7 @@
       (if (= const/$iri (::where/val p))
         (let [o (-> o-pat
                     (json-ld/expand-iri context)
-                    where/->value)]
+                    where/anonymous-value)]
           (where/->pattern :iri [s p o]))
         (let [o (parse-object-pattern o-pat)]
           [s p o])))))
@@ -398,17 +415,17 @@
 
 (defn parse-analytical-query*
   [q db]
-  (let [context  (parse-context q db)
-        vars     (parse-vars q)
-        where    (parse-where q vars db context)
-        grouping (parse-grouping q)
-        ordering (parse-ordering q)]
+  (let [context       (parse-context q db)
+        [vars values] (parse-values q)
+        where         (parse-where q vars db context)
+        grouping      (parse-grouping q)
+        ordering      (parse-ordering q)]
     (-> q
         (assoc :context context
-               :vars    vars
                :where   where)
-        (cond-> grouping (assoc :group-by grouping)
-                ordering (assoc :order-by ordering))
+        (cond-> (seq values) (assoc :values values)
+                grouping     (assoc :group-by grouping)
+                ordering     (assoc :order-by ordering))
         parse-having
         (parse-select db context))))
 
@@ -426,11 +443,11 @@
 (defn parse-delete
   [q db]
   (when (:delete q)
-    (let [context (parse-context q db)
-          vars    (parse-vars q)
-          where   (parse-where q vars db context)]
+    (let [context       (parse-context q db)
+          [vars values] (parse-values q)
+          where         (parse-where q vars db context)]
       (-> q
           (assoc :context context
-                 :where   where
-                 :vars    vars)
+                 :where   where)
+          (cond-> (seq values) (assoc :values values))
           (update :delete parse-triple db context)))))
