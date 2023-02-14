@@ -10,6 +10,13 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn remove-duplicates
+  [q result-ch]
+  (if (:select-distinct q)
+    (async/pipe result-ch
+                (async/chan 1 (distinct)))
+    result-ch))
+
 (defn drop-offset
   "Returns a channel containing the stream of solutions from `solution-ch` after
   the `offset` specified by the supplied query. Returns the original
@@ -39,10 +46,9 @@
   queries will return a vector containing a single result to the output channel
   instead of the single result alone."
   [q result-ch]
-  (cond
-    (:select-one q)      (async/take 1 result-ch)
-    (:select-distinct q) (async/transduce (distinct) conj [] result-ch)
-    :else                (async/into [] result-ch)))
+  (if (:select-one q)
+    (async/take 1 result-ch)
+    (async/into [] result-ch)))
 
 (defn query
   "Execute the parsed query `q` against the database value `db`. Returns an async
@@ -56,6 +62,7 @@
                         (having/filter q error-ch)
                         (order/arrange q)
                         (select/format db q error-ch)
+                        (remove-duplicates q)
                         (drop-offset q)
                         (take-limit q)
                         (collect-results q))]
