@@ -57,23 +57,6 @@
       (vswap! cache assoc sid iri)
       iri)))
 
-
-(defn iri-only-ref
-  "Extracts result information from a ref predicate. If sub-select exists
-  and additional graph crawl is performed. If it doesn't exist, simply returns
-  {@id <iri>} for each object."
-  [db cache compact-fn p-flakes]
-  (go-try
-    (let [id-key (:as (wildcard-spec db cache compact-fn const/$iri))]
-      (loop [[next-flake & r] p-flakes
-             acc []]
-        (if next-flake
-          (let [iri (<? (dbproto/-iri db (flake/o next-flake) compact-fn))]
-            (recur r (conj acc {id-key iri})))
-          (if (= 1 (count acc))
-            (first acc)
-            acc))))))
-
 (defn crawl-ref-item
   [db compact-fn flake-sid sub-select cache fuel-vol max-fuel depth-i]
   (go-try
