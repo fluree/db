@@ -87,7 +87,7 @@
   [x]
   (cond
     (string? x) const/$xsd:string
-    (integer? x) const/$xsd:integer
+    (integer? x) const/$xsd:long ; infer to long to prevent overflow
     (number? x) const/$xsd:decimal
     (boolean? x) const/$xsd:boolean))
 
