@@ -54,11 +54,15 @@
 
             parsed-context (fql-parse/parse-context query-map db)
             error-ch       (async/chan)]
-
         (if history
           ;; filter flakes for history pattern
-          (let [[pattern idx] (<? (history/history-pattern db context history))
-                flakes        (<? (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t}))
+          (let [[pattern idx]  (<? (history/history-pattern db context history))
+                flake-slice-ch (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t})
+                flake-ch       (async/chan 1 cat)
+
+                _ (async/pipe flake-slice-ch flake-ch)
+
+                flakes (async/<! (async/into [] flake-ch))
 
                 history-results-chan (history/history-flakes->json-ld db parsed-context error-ch flakes)]
 
@@ -75,8 +79,8 @@
                 error-ch ([e] e))))
 
           ;; just commits over a range of time
-          (let [flakes            (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
-                commit-results-ch (history/commit-flakes->json-ld db parsed-context error-ch flakes)]
+          (let [flake-slice-ch    (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
+                commit-results-ch (history/commit-flakes->json-ld db parsed-context error-ch flake-slice-ch)]
             (async/alt!
               (async/into [] commit-results-ch) ([result] result)
               error-ch ([e] e))))))))

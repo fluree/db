@@ -165,7 +165,7 @@
                           (fn [t-flakes ch]
                             (-> (async/go
                                   (try*
-                                    (let [{assert-flakes  true
+                                    (let [{assert-flakes true
                                            retract-flakes false} (group-by flake/op t-flakes)
 
                                           t (- (flake/t (first t-flakes)))
@@ -177,8 +177,8 @@
                                           retracts (->> (t-flakes->json-ld db compact cache fuel error-ch retract-flakes)
                                                         (async/into [])
                                                         (async/<!))]
-                                      {t-key       t
-                                       assert-key  asserts
+                                      {t-key t
+                                       assert-key asserts
                                        retract-key retracts})
                                     (catch* e
                                             (log/error e "Error converting history flakes.")
@@ -291,17 +291,15 @@
 
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."
-  [db context error-ch flakes]
+  [db context error-ch flake-slice-ch]
   (let [fuel    (volatile! 0)
         cache   (volatile! {})
         compact (json-ld/compact-fn context)
 
-        out-ch     (async/chan)
+        t-flakes-ch (async/chan 1 (comp cat (partition-by flake/t)))
+        out-ch     (async/chan)]
 
-        t-flakes-ch (->> flakes
-                         (partition-by flake/t)
-                         (async/to-chan!))]
-
+    (async/pipe flake-slice-ch t-flakes-ch)
     (async/pipeline-async 2
                           out-ch
                           (fn [t-flakes ch]
@@ -336,8 +334,8 @@
                       final)
                (let [from-t  (- last-t)
                      to-t  (- first-t)
-                     flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
-                     consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flakes)
+                     flake-slices-ch (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
+                     consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flake-slices-ch)
                                                      (async/into [])
                                                      (async/<!))]
                  (recur (<? history-results-chan)
@@ -347,8 +345,8 @@
                         (into final (map into consecutive-t-results consecutive-commit-details))))))
            (let [from-t  (- last-t)
                  to-t  (- first-t)
-                 flakes (<? (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t}))
-                 consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flakes)
+                 flake-slices-ch (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
+                 consecutive-commit-details (->> (commit-flakes->json-ld db context error-ch flake-slices-ch)
                                                  (async/into [])
                                                  (async/<!))]
              (into final (map into consecutive-t-results consecutive-commit-details)))))))))

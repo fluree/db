@@ -388,6 +388,33 @@
       (testing "time range from"
         (is (= [{:f/commit
                  {:f/address
+                  "fluree:memory://67df776dd7cee2a21b9c2a513224ad044e2dc613e5be5d6de42478ed69ac7b21",
+                  :f/v 0,
+                  :f/previous
+                  {:id
+                   "fluree:commit:sha256:bzlpatyzpsmdyvr4eywvsa2bctleol5tbupsr35ejxntxnjn7l2q"},
+                  :f/time 720000,
+                  :id
+                  "fluree:commit:sha256:bbr54svhy4ergg3mmed4eugzljonsl7jlfmadsbcq6b7sr2cs7yyl",
+                  :f/branch "main",
+                  :f/data
+                  {:f/previous
+                   {:id
+                    "fluree:db:sha256:blxs4kpvkuwsc76cf2hfgs6housqeoxwvbehect4p47f6ow7fkbb"},
+                   :f/address
+                   "fluree:memory://85e076bdfe8e5c8d53551d290f9e4e716eab86ba8577238d731c51df4f6effba",
+                   :f/flakes 82,
+                   :f/size 7650,
+                   :f/t 4,
+                   :f/assert [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/cat}],
+                   :f/retract []},
+                  "https://www.w3.org/2018/credentials#issuer"
+                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
+                  :f/alias "committest",
+                  :f/context
+                  "fluree:memory:///contexts/b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
+                {:f/commit
+                 {:f/address
                   "fluree:memory://14efe5ef1163589f9ee6fcc5af8e2830c3300a80abbbae0aa82194083e93aebe",
                   :f/v 0,
                   :f/previous
@@ -414,7 +441,7 @@
                   :f/alias "committest",
                   :f/context
                   "fluree:memory:///contexts/b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}]
-               @(fluree/history ledger {:commit-details true :t {:from 5}}))))
+               @(fluree/history ledger {:commit-details true :t {:from 4}}))))
 
       (testing "time range to"
         (is (= [{:f/commit
