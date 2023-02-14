@@ -150,12 +150,6 @@
                          (group-by flake/t)
                          (vals)
                          (async/to-chan!))
-
-        ;; We're compacting this static iri for each t. Since the compact iri is
-        ;; constant through repeated invocations of this async function, we should
-        ;; compute it once outside of it. I think we should move this compacting and the
-        ;; compacting of the retract iri to the let binding starting at line 146.
-
         t-key       (json-ld/compact const/iri-t compact)
         assert-key  (json-ld/compact const/iri-assert compact)
         retract-key (json-ld/compact const/iri-retract compact)]
