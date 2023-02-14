@@ -361,17 +361,24 @@
   [q db context]
   (let [depth      (or (:depth q) 0)
         select-key (some (fn [k]
-                           (and (contains? q k) k))
-                         [:select :selectOne :select-one])
-        select     (-> q
-                       (get select-key)
-                       (parse-select-clause db context depth))]
+                           (when (contains? q k) k))
+                         [:select :selectOne :select-one
+                          :selectDistinct :select-distinct])
+        select (-> q
+                   (get select-key)
+                   (parse-select-clause db context depth))]
     (case select-key
-      :select     (assoc q :select select)
-      :select-one (assoc q :select-one select)
-      :selectOne  (-> q
-                      (dissoc :selectOne)
-                      (assoc :select-one select)))))
+      (:select
+       :select-one
+       :select-distinct) (assoc q select-key select)
+
+      :selectOne         (-> q
+                             (dissoc :selectOne)
+                             (assoc :select-one select))
+
+      :selectDistinct    (-> q
+                             (dissoc :selectDistinct)
+                             (assoc :select-distinct select)))))
 
 (defn ensure-vector
   [x]
