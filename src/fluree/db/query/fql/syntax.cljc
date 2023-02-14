@@ -100,6 +100,8 @@
                [:collection [:sequential ::selector]]]
      ::selectOne ::select
      ::select-one ::selectOne
+     ::select-distinct ::select
+     ::selectDistinct ::select-distinct
      ::direction [:orn
                   [:asc [:fn asc?]]
                   [:desc [:fn desc?]]]
@@ -166,6 +168,8 @@
                          [:select {:optional true} ::select]
                          [:selectOne {:optional true} ::selectOne]
                          [:select-one {:optional true} ::select-one]
+                         [:selectDistinct {:optional true} ::selectDistinct]
+                         [:select-distinct {:optional true} ::select-distinct]
                          [:delete {:optional true} ::delete]
                          [:orderBy {:optional true} ::orderBy]
                          [:order-by {:optional true} ::order-by]
