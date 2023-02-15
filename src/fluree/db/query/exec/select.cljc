@@ -121,7 +121,9 @@
                       (:select-one q)
                       (:select-distinct q))
         iri-cache (volatile! {})
-        format-ch (chan)]
+        format-ch (if (contains? q :select-distinct)
+                    (chan 1 (distinct))
+                    (chan))]
     (async/pipeline-async 1
                           format-ch
                           (fn [solution ch]

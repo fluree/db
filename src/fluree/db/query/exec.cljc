@@ -10,13 +10,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn remove-duplicates
-  [q result-ch]
-  (if (:select-distinct q)
-    (async/pipe result-ch
-                (async/chan 1 (distinct)))
-    result-ch))
-
 (defn drop-offset
   "Returns a channel containing the stream of solutions from `solution-ch` after
   the `offset` specified by the supplied query. Returns the original
@@ -61,7 +54,6 @@
                         (having/filter q error-ch)
                         (order/arrange q)
                         (select/format db q error-ch)
-                        (remove-duplicates q)
                         (drop-offset q)
                         (take-limit q)
                         (collect-results q))]
