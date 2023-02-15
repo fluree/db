@@ -14,6 +14,7 @@
 (def ^:const iri-DB "https://ns.flur.ee/ledger#DB")
 (def ^:const iri-data "https://ns.flur.ee/ledger#data")
 (def ^:const iri-t "https://ns.flur.ee/ledger#t")
+
 (def ^:const iri-address "https://ns.flur.ee/ledger#address")
 (def ^:const iri-v "https://ns.flur.ee/ledger#v")
 (def ^:const iri-flakes "https://ns.flur.ee/ledger#flakes")
@@ -33,6 +34,11 @@
 (def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
 (def ^:const iri-context "https://ns.flur.ee/ledger#context")
 
+(def ^:const iri-id "@id")
+(def ^:const iri-type "@type")
+(def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+(def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
+;; TODO, replace usage with iri-context
 (def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
 
 ;; system constants
@@ -61,15 +67,26 @@
 
 ;; predicate id constants
 
-(def ^:const $_block:hash 51)                                ;; JSON-LD: turning into data/db id
-(def ^:const $_block:prevHash 52)
-(def ^:const $_block:transactions 53)                        ;; JSON-LD: turning into commit id ref
-(def ^:const $_block:ledgers 54)                             ;; JSON-LD - reuse as commit message
+(def ^:const $_previous 52)
+(def ^:const $_v 58)
+(def ^:const $_address 59)
+
+(def ^:const $_commit:dbId 51)                                ;; JSON-LD: turning into data/db id
+
+(def ^:const $_commit:idRef 53)
+(def ^:const $_commit:message 54)
 (def ^:const $_commit:time 55)
-(def ^:const $_block:number 56)                              ;; JSON-LD: reuse as commit tag(s)
-(def ^:const $_block:sigs 57)                                ;; JSON-LD: turning into signer of commit
+(def ^:const $_commit:signer 57)
 
 
+(def ^:const $_ledger:alias 170)
+(def ^:const $_ledger:branch 171)
+(def ^:const $_ledger:context 172)
+
+(def ^:const $_commit:data 160)
+(def ^:const $_commitdata:flakes 182)
+(def ^:const $_commitdata:size 183)
+(def ^:const $_commitdata:t 184)
 
 (def ^:const $_predicate:name 10)
 (def ^:const $_predicate:doc 11)

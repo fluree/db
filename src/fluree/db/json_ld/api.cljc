@@ -274,8 +274,8 @@
       promise-wrap))
 
 (defn history
-  "Return the history of the specified subject in the given time range. Optionally return
-  history of multiple subjects according to flake pattern matching."
+  "Return the change history over a specified time range. Optionally include the commit
+  that produced the changes."
   [ledger query]
   (let [latest-db (ledger-proto/-db ledger)
         res-chan (query-api/history latest-db query)]
