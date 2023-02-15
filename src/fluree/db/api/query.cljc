@@ -11,7 +11,7 @@
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.async :as async-util :refer [<? go-try into?]]
+            [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.json-ld :as json-ld]
