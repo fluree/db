@@ -357,10 +357,7 @@
   [{:keys [conn] :as ledger} commit]
   (go-try
     (let [context (get commit (keyword const/iri-default-context))
-          stringify? (-> context keys first keyword?) ; (too?) simple check if we need to stringify the keys before storing
-          context-str (if stringify?
-                        (util/stringify-keys context)
-                        context)
+          context-str (util/stringify-keys context)
           {:keys [address]} (<? (conn-proto/-ctx-write conn ledger context-str))]
       (assoc commit (keyword const/iri-default-context) address))))
 
