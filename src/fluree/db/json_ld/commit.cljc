@@ -376,7 +376,7 @@
                                    new-commit*)
           [new-commit** jld-commit] (commit-data/commit-jsonld new-commit*)
           signed-commit (if did
-                          (cred/generate jld-commit private (:id did))
+                          (<? (cred/generate jld-commit private (:id did)))
                           jld-commit)
           commit-res    (<? (conn-proto/-c-write conn ledger signed-commit)) ;; write commit credential
           new-commit*** (commit-data/update-commit-address new-commit** (:address commit-res))
