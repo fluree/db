@@ -61,6 +61,8 @@
    :output-to       "out/browser-test/browser-tests.js"
    :closure-defines {fluree.db.platform/BROWSER true
                      cljs.core/*global*         "window"}
+   :compiler-options {:pretty-print true
+                      :pseudo-names true}
    :js-options      {:resolve {"fs"      false
                                "path"    false
                                "process" false
