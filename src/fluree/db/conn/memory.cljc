@@ -33,13 +33,11 @@
                     {:status 500 :error :db/invalid-db}))))
 
 (defn- write-data!
-  [data-atom data-type data]
+  [data-atom data]
   (go-try
     (let [json (json-ld/normalize-data data)
           hash (crypto/sha2-256-normalize json)
-          path (if (= data-type :context)
-                 (str "/contexts/" hash)
-                 hash)]
+          path hash]
       #?(:cljs (when platform/BROWSER
                  (.setItem js/localStorage hash json)))
       (swap! data-atom assoc hash data)
@@ -50,7 +48,7 @@
 
 (defn write-commit!
   [data-atom commit-data]
-  (write-data! data-atom :commit commit-data))
+  (write-data! data-atom commit-data))
 
 (defn- read-address
   [data-atom address]
@@ -60,11 +58,8 @@
                  (and platform/BROWSER (.getItem js/localStorage addr-path))))))
 
 (defn- read-data
-  [data-atom data-type address]
-  (let [addr (if (= data-type :context)
-               (str "/contexts/" address)
-               address)
-        data (read-address data-atom addr)]
+  [data-atom address]
+  (let [data (read-address data-atom address)]
     #?(:cljs (if (and platform/BROWSER (string? data))
                (js->clj (.parse js/JSON data))
                data)
@@ -72,21 +67,20 @@
 
 (defn read-commit
   [data-atom address]
-  (read-data data-atom :commit address))
+  (read-data data-atom address))
 
 (defn write-context!
   [data-atom context-data]
-  (write-data! data-atom :context context-data))
+  (write-data! data-atom context-data))
 
 (defn read-context
   [data-atom context-key]
-  (read-data data-atom :context context-key))
+  (read-data data-atom context-key))
 
 (defn push!
-  [data-atom publish-address ledger-data]
-  (let [commit-address (:address ledger-data)
-        commit-path    (address-path commit-address)
-        address-path   (address-path publish-address)]
+  [data-atom publish-address {commit-address :address :as ledger-data}]
+  (let [commit-path (address-path commit-address)
+        head-path   (address-path publish-address)]
     (swap! data-atom
            (fn [state]
              (let [commit (get state commit-path)]
@@ -94,9 +88,9 @@
                  (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                  {:status 500 :error :db/invalid-db})))
                (log/debug "pushing:" publish-address "referencing commit:" commit-address)
-               (assoc state address-path commit))))
-    #?(:cljs (and platform/BROWSER (.setItem js/localStorage address-path commit-path))))
-  ledger-data)
+               (assoc state head-path (assoc commit "address" commit-address)))))
+    #?(:cljs (and platform/BROWSER (.setItem js/localStorage address-path commit-path)))
+    ledger-data))
 
 
 (defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom
@@ -120,7 +114,7 @@
   (-lookup [this head-commit-address]
     (go #?(:clj
            (if-let [head-commit (read-address data-atom head-commit-address)]
-             (-> head-commit (get "credentialSubject") (get "data") (get "address"))
+             (-> head-commit (get "address"))
              (throw (ex-info (str "Unable to lookup ledger address from conn: "
                                   head-commit-address)
                              {:status 500 :error :db/missing-head})))
@@ -209,9 +203,9 @@
           data-atom       (atom {})
           state           (state-machine/blank-state)
 
-          cache-size     (conn-cache/memory->cache-size memory)
-          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache
-                                                    cache-size)))]
+          cache-size      (conn-cache/memory->cache-size memory)
+          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
+                                                     cache-size)))]
       (map->MemoryConnection {:id              conn-id
                               :ledger-defaults ledger-defaults
                               :data-atom       data-atom
