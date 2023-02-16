@@ -34,17 +34,16 @@
 
 (defn- write-data!
   [data-atom data]
-  (go-try
-    (let [json (json-ld/normalize-data data)
-          hash (crypto/sha2-256-normalize json)
-          path hash]
-      #?(:cljs (when platform/BROWSER
-                 (.setItem js/localStorage hash json)))
-      (swap! data-atom assoc hash data)
-      {:name    hash
-       :hash    hash
-       :size    (count json)
-       :address (memory-address path)})))
+  (let [json (json-ld/normalize-data data)
+        hash (crypto/sha2-256-normalize json)
+        path hash]
+    #?(:cljs (when platform/BROWSER
+               (.setItem js/localStorage hash json)))
+    (swap! data-atom assoc hash data)
+    {:name    hash
+     :hash    hash
+     :size    (count json)
+     :address (memory-address path)}))
 
 (defn write-commit!
   [data-atom commit-data]
@@ -88,7 +87,8 @@
                  (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
                                  {:status 500 :error :db/invalid-db})))
                (log/debug "pushing:" publish-address "referencing commit:" commit-address)
-               (assoc state head-path (assoc commit "address" commit-address)))))
+               (let [commit (assoc commit "address" commit-address)]
+                 (assoc state head-path commit)))))
     #?(:cljs (and platform/BROWSER (.setItem js/localStorage address-path commit-path)))
     ledger-data))
 
@@ -98,8 +98,8 @@
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (go (read-commit data-atom commit-key)))
-  (-c-write [_ _ledger commit-data] (write-commit! data-atom commit-data))
-  (-ctx-write [_ _ledger context-data] (write-context! data-atom context-data))
+  (-c-write [_ _ledger commit-data] (go (write-commit! data-atom commit-data)))
+  (-ctx-write [_ _ledger context-data] (go (write-context! data-atom context-data)))
   (-ctx-read [_ context-key] (go (read-context data-atom context-key)))
 
   conn-proto/iNameService
