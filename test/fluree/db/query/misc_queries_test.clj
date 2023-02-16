@@ -77,6 +77,83 @@
                @(fluree/query db {:select ['?s '?p '?o]
                                   :where  [['?s '?p '?o]]}))
             "Entire database should be pulled.")
+        (is (= [{:id :ex/jane,
+                 :rdf/type [:ex/User],
+                 :schema/name "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age 30}
+                {:id :ex/jane,
+                 :rdf/type [:ex/User],
+                 :schema/name "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age 30}
+                {:id :ex/jane,
+                 :rdf/type [:ex/User],
+                 :schema/name "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age 30}
+                {:id :ex/jane,
+                 :rdf/type [:ex/User],
+                 :schema/name "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age 30}
+                {:id :ex/jane,
+                 :rdf/type [:ex/User],
+                 :schema/name "Jane",
+                 :schema/email "jane@flur.ee",
+                 :schema/age 30}
+                {:id :ex/bob,
+                 :rdf/type [:ex/User],
+                 :schema/name "Bob",
+                 :schema/age 22}
+                {:id :ex/bob,
+                 :rdf/type [:ex/User],
+                 :schema/name "Bob",
+                 :schema/age 22}
+                {:id :ex/bob,
+                 :rdf/type [:ex/User],
+                 :schema/name "Bob",
+                 :schema/age 22}
+                {:id :ex/bob,
+                 :rdf/type [:ex/User],
+                 :schema/name "Bob",
+                 :schema/age 22}
+                {:id :ex/alice,
+                 :rdf/type [:ex/User],
+                 :schema/name "Alice",
+                 :schema/email "alice@flur.ee",
+                 :schema/age 42}
+                {:id :ex/alice,
+                 :rdf/type [:ex/User],
+                 :schema/name "Alice",
+                 :schema/email "alice@flur.ee",
+                 :schema/age 42}
+                {:id :ex/alice,
+                 :rdf/type [:ex/User],
+                 :schema/name "Alice",
+                 :schema/email "alice@flur.ee",
+                 :schema/age 42}
+                {:id :ex/alice,
+                 :rdf/type [:ex/User],
+                 :schema/name "Alice",
+                 :schema/email "alice@flur.ee",
+                 :schema/age 42}
+                {:id :ex/alice,
+                 :rdf/type [:ex/User],
+                 :schema/name "Alice",
+                 :schema/email "alice@flur.ee",
+                 :schema/age 42}
+                {:id :schema/age}
+                {:id :schema/email}
+                {:id :schema/name}
+                {:id :ex/User, :rdf/type [:rdfs/Class]}
+                {:id :ex/User, :rdf/type [:rdfs/Class]}
+                {:id :rdfs/Class}
+                {:id :rdf/type}
+                {:id :id}]
+               @(fluree/query db {:select {'?s ["*"]}
+                                  :where  [['?s '?p '?o]]}))
+            "Every triple should be returned.")
       (let [db* @(fluree/commit! ledger db)]
         (is (= [[:ex/jane :id "http://example.org/ns/jane"]
                 [:ex/jane :rdf/type :ex/User]
