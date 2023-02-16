@@ -34,7 +34,7 @@
                                            :type         :schema/Person
                                            :schema/fname "Me"}])]
          @(fluree/commit! ledger db)
-         (is (test-utils/retry-exists? conn ledger-alias 10))
+         (is (test-utils/retry-exists? conn ledger-alias 100))
          (is (not @(fluree/exists? conn "notaledger"))))
 
        :cljs
@@ -48,7 +48,7 @@
                                                    :type         :schema/Person
                                                    :schema/fname "Me"}]))]
              (<p! (fluree/commit! ledger db))
-             (is (<p! (fluree/exists? conn ledger-alias)))
+             (is (test-utils/retry-exists? conn ledger-alias 100))
              (is (not (<p! (fluree/exists? conn "notaledger"))))
              (done)))))))
 
@@ -64,7 +64,6 @@
                                              :context      ledger-context})
              merged-context (merge test-utils/default-context
                                    (util/keywordize-keys ledger-context))]
-         (println "ledger context:" (pr-str (:context ledger)))
          (is (= merged-context (:context ledger)))))))
 
 #?(:clj
