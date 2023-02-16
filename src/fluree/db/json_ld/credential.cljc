@@ -58,23 +58,26 @@
 
 (defn generate
   "Generate a VerifiableCredential given a subject and some issuer opts."
-  ([credential-subject private] (generate credential-subject private (did/private->did-map private)))
+  ([credential-subject private] (generate credential-subject private
+                                          (did/private->did-map private)))
   ([credential-subject private did]
    (go-try
-     {"@context"          "https://www.w3.org/2018/credentials/v1"
-      "id"                ""
-      "type"              ["VerifiableCredential" "CommitProof"]
-      "issuer"            (:id did)
-      "issuanceDate"      (util/current-time-iso)
-      "credentialSubject" credential-subject
-      "proof"             #?(:clj (create-proof (-> (jld-processor/canonize credential-subject)
-                                                    (crypto/sha2-256))
-                                                (did/encode-did-key (:public did))
-                                                private)
-                             :cljs (let [canonicalized (<p! (jld-processor/canonize credential-subject))]
-                                     (create-proof (crypto/sha2-256 canonicalized)
-                                                   (did/encode-did-key (:public did))
-                                                   private)))})))
+     (let [proof #?(:clj (create-proof (-> credential-subject
+                                           jld-processor/canonize
+                                           crypto/sha2-256)
+                                       (did/encode-did-key (:public did))
+                                       private)
+                    :cljs (let [canonicalized (<p! (jld-processor/canonize credential-subject))]
+                            (create-proof (crypto/sha2-256 canonicalized)
+                                          (did/encode-did-key (:public did))
+                                          private)))]
+       {"@context"          "https://www.w3.org/2018/credentials/v1"
+        "id"                ""
+        "type"              ["VerifiableCredential" "CommitProof"]
+        "issuer"            (:id did)
+        "issuanceDate"      (util/current-time-iso)
+        "credentialSubject" credential-subject
+        "proof" proof}))))
 
 (defn verify
   "Takes a credential and returns the credential subject and issuer id if it verifies. If
