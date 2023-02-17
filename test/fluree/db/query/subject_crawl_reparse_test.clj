@@ -59,7 +59,15 @@
                                                          db)
         s+p+o-parsed (parse/parse-analytical-query {:select {"?s" [:*]}
                                                     :where  [["?s" "?p" "?o"]]}
-                                                   db)]
+                                                   db)
+        s+p+o2-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
+                                                     :where [['?s :schema/age 50]
+                                                             ['?s '?p '?o]]}
+                                                    db)
+        s+p+o3-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
+                                                     :where [['?s '?p '?o]
+                                                             ['?s :schema/age 50]]}
+                                                    db)]
     (testing "simple-subject-crawl?"
       (is (= true
              (reparse/simple-subject-crawl? ssc-q1-parsed)))
@@ -68,7 +76,9 @@
       (is (not (reparse/simple-subject-crawl? vars-query-parsed)))
       (is (not (reparse/simple-subject-crawl? not-ssc-parsed)))
       (is (not (reparse/simple-subject-crawl? order-group-parsed)))
-      (is (not (reparse/simple-subject-crawl? s+p+o-parsed))))
+      (is (not (reparse/simple-subject-crawl? s+p+o-parsed)))
+      (is (not (reparse/simple-subject-crawl? s+p+o2-parsed)))
+      (is (not (reparse/simple-subject-crawl? s+p+o3-parsed))))
     (testing "reparse"
       (let [ssc-q1-reparsed (reparse/re-parse-as-simple-subj-crawl ssc-q1-parsed)
             {:keys [where context]} ssc-q1-reparsed
