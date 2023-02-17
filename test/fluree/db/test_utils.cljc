@@ -1,7 +1,8 @@
 (ns fluree.db.test-utils
   (:require [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
-            #?@(:cljs [[clojure.core.async :refer [go]]
+            [fluree.db.util.core :refer [try* catch*]]
+            #?@(:cljs [[clojure.core.async :refer [go go-loop]]
                        [clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
@@ -111,22 +112,27 @@
 
 (defn retry-promise-wrapped
   "Retries a fn that when deref'd might return a Throwable. Intended for
-  retrying promise-wrapped API fns. Do not deref the return value, this will do
-  it for you."
-  [pwrapped max-attempts]
-  (loop [attempt 0]
-    (let [final (try
-                  (let [res @(pwrapped)]
-                    (if (instance? Throwable res)
-                      (throw res)
-                      res))
-                  (catch Throwable t
-                    (when (= (inc attempt) max-attempts)
-                      (throw t)
-                      (Thread/sleep 100))))]
-      (if final
-        final
-        (recur (inc attempt))))))
+  retrying promise-wrapped API fns. Do not deref the return value, this will
+  do it for you. In CLJS it will not retry and will return a core.async chan."
+  [pwrapped max-attempts & [retry-on-false?]]
+  (#?(:clj loop :cljs go-loop) [attempt 0]
+    (let [error? #(instance? #?(:clj Throwable :cljs js/Error) %)
+          res' (try*
+                 (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
+                   (if (error? res)
+                     (throw res)
+                     res))
+                 (catch* e e))]
+      (if (= (inc attempt) max-attempts)
+        (if (error? res')
+          (throw res')
+          res')
+        (if (or (error? res')
+                (and retry-on-false? (false? res')))
+          (do
+            #?(:clj (Thread/sleep 100))
+            (recur (inc attempt)))
+          res')))))
 
 (defn retry-load
   "Retry loading a ledger until it loads or max-attempts. Hopefully not needed
@@ -137,4 +143,4 @@
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."
   [conn ledger-alias max-atttemts]
-  (retry-promise-wrapped #(fluree/exists? conn ledger-alias) max-atttemts))
+  (retry-promise-wrapped #(fluree/exists? conn ledger-alias) max-atttemts true))
