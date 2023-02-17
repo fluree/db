@@ -211,9 +211,9 @@
   "Keywordizes string contexts so they merge correctly with other keyword
   contexts."
   [context-type context]
-  (if (= :string context-type)
-    (keywordize-keys context)
-    context))
+  (if (= :keyword context-type)
+    context
+    (keywordize-keys context)))
 
 (defn str->epoch-ms
   "Takes time as a string and returns epoch millis."
