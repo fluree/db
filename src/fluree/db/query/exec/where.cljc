@@ -80,7 +80,7 @@
 
 (defn matched?
   [component]
-  (::val component))
+  (-> component ::val boolean))
 
 (def unmatched?
   "Returns true if the triple pattern component `component` represents a variable
