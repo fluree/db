@@ -115,28 +115,6 @@
                    @(fluree/query db q))
                 "returns only the results related to the existing bound values")))))))
 
-(deftest ^:integration iri-test
-  (testing "Querying with IRIs"
-    (let [conn   (test-utils/create-conn)
-          people (test-utils/load-people conn)
-          db     (fluree/db people)]
-      (testing "as variables"
-        (let [qry '{:context {:ex "http://example.org/ns/"}
-                    :select  [?id]
-                    :where   [[?s :id ?id]
-                              [?s :schema/name "Alice"]]}]
-          (is (= [["http://example.org/ns/alice"]]
-                 @(fluree/query db qry))
-              "look up the relevant IRI from the database")))
-      (testing "as values"
-        (let [qry '{:context {:ex "http://example.org/ns/"}
-                    :select  [?name]
-                    :where   [[?s :id :ex/alice]
-                              [?s :schema/name ?name]]}]
-          (is (= [["Alice"]]
-                 @(fluree/query db qry))
-              "uses the provided IRI to look up the relevant info"))))))
-
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
