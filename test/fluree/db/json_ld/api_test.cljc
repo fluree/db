@@ -159,7 +159,7 @@
      (testing "can load a file ledger with its own context"
        (with-tmp-dir storage-path #_{::twf/delete-dir false}
          #_(println "storage path:" storage-path)
-         (let [conn-context   {:id "@id", :type "@type"
+         (let [conn-context   {:id  "@id", :type "@type"
                                :xsd "http://www.w3.org/2001/XMLSchema#"}
                ledger-context {:ex     "http://example.com/"
                                :schema "http://schema.org/"}
