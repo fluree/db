@@ -167,7 +167,7 @@
               "_predicate" {:name "_predicate" :id 0 :sid nil}
               11           {:name "_default" :id 11 :sid nil}
               "_default"   {:name "_default" :id 11 :sid nil}}
-        pred (map-pred-id+iri [{:iri  "@id"
+        pred (map-pred-id+iri [{:iri const/iri-id
                                 :idx? true
                                 :id   const/$iri}
                                {:iri  "@type"

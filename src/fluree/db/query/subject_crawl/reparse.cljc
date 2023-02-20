@@ -28,7 +28,9 @@
   with other clauses to create a filter for the simple-subject-crawl
   strategy"
   [where-clause]
-  (#{:class :tuple} (where/pattern-type where-clause)))
+  (and (#{:class :tuple} (where/pattern-type where-clause))
+       ;;exclude full s+p+o queries
+       (some ::where/val where-clause)))
 
 (defn clause-subject-var
   [where-clause]
@@ -140,10 +142,11 @@
        (if-let [{select-var :var} select]
          (let [{::where/keys [patterns]} where]
            (every? (fn [pattern]
-                     (let [pred (second pattern)]
-                       (and (= select-var (clause-subject-var pattern))
-                            (not (::where/recur pred))
-                            (not (::where/fullText pred))))) patterns)))))
+                     (and (mergeable-where-clause? pattern)
+                          (let [pred (second pattern)]
+                            (and (= select-var (clause-subject-var pattern))
+                                 (not (::where/recur pred))
+                                 (not (::where/fullText pred)))))) patterns)))))
 
 (defn re-parse-as-simple-subj-crawl
   "Returns true if query contains a single subject crawl.
