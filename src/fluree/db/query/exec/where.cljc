@@ -12,13 +12,21 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn reference?
+  [mch]
+  (= (::datatype mch)
+     const/$xsd:anyURI))
+
 (defn idx-for
   [s p o]
   (cond
     s         :spot
     (and p o) :post
     p         :psot
-    o         :opst
+    o         (if (reference? o)
+                :opst
+                (throw (ex-info (str "Illegal reference object value" (::var o))
+                                {:status 400 :error :db/invalid-query})))
     :else     :spot))
 
 (defn resolve-flake-range

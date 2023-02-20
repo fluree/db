@@ -1,8 +1,8 @@
 (ns fluree.db.query.misc-queries-test
-  (:require
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]))
+  (:require [clojure.test :refer :all]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.util.core :as util]))
 
 (deftest ^:integration select-sid
   (testing "Select index's subject id in query using special keyword"
@@ -32,26 +32,25 @@
                                 :where  [['?s :type :ex/User]]}))))))
 
 (deftest ^:integration s+p+o-full-db-queries
-  (testing "Query that pulls entire database."
-    (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
-          db     @(fluree/stage
-                    (fluree/db ledger)
-                    {:graph [{:id           :ex/alice,
-                              :type         :ex/User,
-                              :schema/name  "Alice"
-                              :schema/email "alice@flur.ee"
-                              :schema/age   42}
-                             {:id          :ex/bob,
-                              :type        :ex/User,
-                              :schema/name "Bob"
-                              :schema/age  22}
-                             {:id           :ex/jane,
-                              :type         :ex/User,
-                              :schema/name  "Jane"
-                              :schema/email "jane@flur.ee"
-                              :schema/age   30}]})]
-
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
+        db     @(fluree/stage
+                 (fluree/db ledger)
+                 {:graph [{:id           :ex/alice,
+                           :type         :ex/User,
+                           :schema/name  "Alice"
+                           :schema/email "alice@flur.ee"
+                           :schema/age   42}
+                          {:id          :ex/bob,
+                           :type        :ex/User,
+                           :schema/name "Bob"
+                           :schema/age  22}
+                          {:id           :ex/jane,
+                           :type         :ex/User,
+                           :schema/name  "Jane"
+                           :schema/email "jane@flur.ee"
+                           :schema/age   30}]})]
+    (testing "Query that pulls entire database."
       (is (= [[:ex/jane :id "http://example.org/ns/jane"]
               [:ex/jane :rdf/type :ex/User]
               [:ex/jane :schema/name "Jane"]
@@ -76,4 +75,12 @@
               [:id :id "@id"]]
              @(fluree/query db {:select ['?s '?p '?o]
                                 :where  [['?s '?p '?o]]}))
-          "Entire database should be pulled."))))
+          "Entire database should be pulled."))
+    (testing "Illegal reference queries"
+      (let [test-subject @(fluree/query db {:select ['?s '?p]
+                                            :where [['?s '?p 22]]})]
+        (is (util/exception? test-subject)
+            "return errors")
+        (is (= :db/invalid-query
+               (-> test-subject ex-data :error))
+            "have 'invalid query' error codes")))))
