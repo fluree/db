@@ -302,6 +302,14 @@
                       (parse-filter-maps vars))]
     (where/->where-clause patterns filters)))
 
+(defn parse-iri-object
+  [o-iri context]
+  (if (syntax/variable? o-iri)
+    (parse-variable o-iri)
+    (-> o-iri
+        (json-ld/expand-iri context)
+        where/anonymous-value)))
+
 (defn parse-triple
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
@@ -310,9 +318,7 @@
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
       (if (= const/$iri (::where/val p))
-        (let [o (-> o-pat
-                    (json-ld/expand-iri context)
-                    where/anonymous-value)]
+        (let [o (parse-iri-object o-pat context)]
           (where/->pattern :iri [s p o]))
         (let [o (parse-object-pattern o-pat)]
           [s p o])))))
