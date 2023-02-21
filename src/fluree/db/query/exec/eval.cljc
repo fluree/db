@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [compile rand])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.util.log :as log]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]])
@@ -115,12 +116,16 @@
   [s substr]
   (str/ends-with? s substr))
 
-(def allowed-filters
-  '#{&& || ! > < >= <= = + - * / and bound coalesce if nil?
-     not not= now or re-find re-pattern strStarts strEnds})
+(defn subStr
+  [s start end]
+  (subs s start end))
+
+(def allowed-fns
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if nil?
+     not not= now or re-find re-pattern strStarts strEnds subStr})
 
 (def allowed-symbols
-  (set/union allowed-aggregates allowed-filters))
+  (set/union allowed-aggregates allowed-fns))
 
 (defn variable?
   [sym]
@@ -164,6 +169,7 @@
     stddev      fluree.db.query.exec.eval/stddev
     strStarts   fluree.db.query.exec.eval/strStarts
     strEnds     fluree.db.query.exec.eval/strEnds
+    subStr      fluree.db.query.exec.eval/subStr
     sum         fluree.db.query.exec.eval/sum
     variance    fluree.db.query.exec.eval/variance
     !           fluree.db.query.exec.eval/!
@@ -173,7 +179,9 @@
 (defn qualify
   [sym]
   (if (contains? allowed-symbols sym)
-    (get qualified-symbols sym sym)
+    (let [qsym (get qualified-symbols sym sym)]
+      (log/debug "qualified symbol" sym "as" qsym)
+      qsym)
     (throw (ex-info (str "Query function references illegal symbol: " sym)
                     {:status 400, :error :db/invalid-query}))))
 
@@ -205,10 +213,13 @@
   (let [qualified-code (coerce code)
         vars           (variables qualified-code)
         soln-sym       'solution
-        bdg            (bind-variables soln-sym vars)]
-    (eval `(fn [~soln-sym]
-             (let ~bdg
-               ~qualified-code)))))
+        bdg            (bind-variables soln-sym vars)
+        fn-code        `(fn [~soln-sym]
+                          (log/debug "fn solution:" ~soln-sym)
+                          (let ~bdg
+                            ~qualified-code))]
+    (log/debug "compiled fn:" fn-code)
+    (eval fn-code)))
 
 (defn compile-filter
   [code var]
