@@ -1,8 +1,12 @@
 (ns fluree.db.util.log
-  (:require #?@(:clj  [[clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
+  (:require #?@(:clj  [[clojure.core.async :as async]
+                       [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
                        [fluree.db.util.core :refer [if-cljs]]]
                 :cljs [[goog.log :as glog]
-                       [fluree.db.util.core :refer-macros [if-cljs]]]))
+                       [fluree.db.util.core :refer-macros [if-cljs]]
+                       [fluree.db.util.log :refer-macros
+                        [debug->val debug->>val debug-async->>vals
+                         debug-async->vals]]]))
   #?(:cljs (:import [goog.debug Console]
                     [goog.log Level])))
 
@@ -93,3 +97,40 @@
 
 #?(:cljs
    (log-to-console!))
+
+#?(:clj
+   (defmacro debug->>val
+     "Logs a ->> threaded value w/ msg (at debug level) and then returns the
+     value so it can continue being threaded."
+     [msg v]
+     `(log/debug ~msg ~v)
+     v))
+
+#?(:clj
+   (defmacro debug->val
+     "Logs a -> threaded value w/ msg (at debug level) and then returns the
+     value so it can continue being threaded."
+     [v msg]
+     `(log/debug ~msg ~v)
+     v))
+
+#?(:clj
+   (defmacro debug-async->vals
+     "Logs value(s) taken from chan c w/ msg (at debug level) and then returns a
+     new channel with the values on it so further async thread ops can consume
+     them."
+     [c msg]
+     `(let [out-ch# (async/chan 100)]
+        (async/pipeline-blocking 1 out-ch#
+                                 (map (fn [v#] (debug->val v# ~msg))) ~c)
+        out-ch#)))
+
+#?(:clj
+   (defmacro debug-async->>vals
+     "Logs value(s) taken from chan c w/ msg (at debug level) and then returns a
+     new channel with the values on it so further async thread ops can consume
+     them."
+     [msg c]
+     `(debug-async->vals ~c ~msg)))
+
+
