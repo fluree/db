@@ -331,8 +331,8 @@
          (if @solutions?
            (rf result)
            (do (vreset! solutions? true) ; mark that a solution was processed in
-               ; case the reducing fn is terminated
-               ; again as can happen with buffers.
+                                         ; case the reducing fn is terminated
+                                         ; again as can happen with buffers.
                (-> result
                    (rf default-solution)
                    rf))))))))
