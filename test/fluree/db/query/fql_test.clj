@@ -75,7 +75,7 @@
                     :where   [[?s :schema/email ?email]
                               [?s :schema/name ?name]
                               [?s :schema/age ?age]]
-                    :values [?email ["alice@example.org"]]}]
+                    :values  [?email ["alice@example.org"]]}]
             (is (= [["Alice" 50]]
                    @(fluree/query db q))
                 "returns only the results related to the bound value")))
@@ -85,7 +85,7 @@
                     :where   [[?s :schema/email ?email]
                               [?s :schema/name ?name]
                               [?s :schema/age ?age]]
-                    :values [?email ["alice@example.org" "cam@example.org"]]}]
+                    :values  [?email ["alice@example.org" "cam@example.org"]]}]
             (is (= [["Alice" 50] ["Cam" 34]]
                    @(fluree/query db q))
                 "returns only the results related to the bound values"))))
@@ -97,8 +97,8 @@
                               [?s :ex/favNums ?favNum]
                               [?s :schema/name ?name]
                               [?s :schema/age ?age]]
-                    :values [[?email ?favNum] [["alice@example.org" 42]
-                                               ["cam@example.org" 10]]]}]
+                    :values  [[?email ?favNum] [["alice@example.org" 42]
+                                                ["cam@example.org" 10]]]}]
             (is (= [["Alice" 50] ["Cam" 34]]
                    @(fluree/query db q))
                 "returns only the results related to the bound values")))
@@ -109,35 +109,53 @@
                               [?s :ex/favNums ?favNum]
                               [?s :schema/name ?name]
                               [?s :schema/age ?age]]
-                    :values [[?email ?favNum] [["alice@example.org" 42]
-                                               ["cam@example.org" 37]]]}]
+                    :values  [[?email ?favNum] [["alice@example.org" 42]
+                                                ["cam@example.org" 37]]]}]
             (is (= [["Alice" 50]]
                    @(fluree/query db q))
                 "returns only the results related to the existing bound values")))))))
+
+(deftest ^:integration bind-query-test
+  (let [conn   (test-utils/create-conn)
+        people (test-utils/load-people conn)
+        db     (fluree/db people)]
+    (testing "bind query w/ fn value"
+      (let [q '{:context {:ex "http://example.org/ns/"}
+                :select  [?firstLetterOfName ?name ?decadesOld]
+                :where   [[?s :schema/age ?age]
+                          {:bind {?decadesOld (quot ?age 10)}}
+                          [?s :schema/name ?name]
+                          {:bind {?firstLetterOfName (subStr ?name 0 1)}}]
+                :order-by ?firstLetterOfName}
+            res @(fluree/query db q)]
+        (is (= [["A" "Alice" 5]
+                ["B" "Brian" 5]
+                ["C" "Cam" 3]]
+               res))))))
 
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
         db     (fluree/db people)]
     (testing "multi queries"
-      (let [q '{"alice" {:select {?s [:*]}
-                         :where  [[?s :schema/email "alice@example.org"]]}
-                "brian" {:select {?s [:*]}
-                         :where  [[?s :schema/email "brian@example.org"]]}}
+      (let [q       '{"alice" {:select {?s [:*]}
+                               :where  [[?s :schema/email "alice@example.org"]]}
+                      "brian" {:select {?s [:*]}
+                               :where  [[?s :schema/email "brian@example.org"]]}}
             subject @(fluree/multi-query db q)]
         (is (= {"alice"
-                [{:id "http://example.org/ns/alice",
-                  :rdf/type ["http://example.org/ns/User"],
-                  :schema/name "Alice",
-                  :schema/email "alice@example.org",
-                  :schema/age 50,
+                [{:id                             "http://example.org/ns/alice",
+                  :rdf/type                       ["http://example.org/ns/User"],
+                  :schema/name                    "Alice",
+                  :schema/email                   "alice@example.org",
+                  :schema/age                     50,
                   "http://example.org/ns/favNums" [9 42 76]}],
                 "brian"
-                [{:id "http://example.org/ns/brian",
-                  :rdf/type ["http://example.org/ns/User"],
-                  :schema/name "Brian",
-                  :schema/email "brian@example.org",
-                  :schema/age 50,
+                [{:id                             "http://example.org/ns/brian",
+                  :rdf/type                       ["http://example.org/ns/User"],
+                  :schema/name                    "Brian",
+                  :schema/email                   "brian@example.org",
+                  :schema/age                     50,
                   "http://example.org/ns/favNums" 7}]}
                subject)
             "returns all results in a map keyed by alias.")))))
