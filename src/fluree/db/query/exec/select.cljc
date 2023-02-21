@@ -125,6 +125,7 @@
     (async/pipeline-async 1
                           format-ch
                           (fn [solution ch]
+                            (log/debug "select/format solution:" solution)
                             (-> (format-values selectors db iri-cache compact error-ch solution)
                                 (async/pipe ch)))
                           solution-ch)
