@@ -3,10 +3,10 @@
                        [clojure.tools.logging.readable :as log] ; readable variants use pr-str automatically
                        [fluree.db.util.core :refer [if-cljs]]]
                 :cljs [[goog.log :as glog]
-                       [fluree.db.util.core :refer-macros [if-cljs]]
-                       [fluree.db.util.log :refer-macros
-                        [debug->val debug->>val debug-async->>vals
-                         debug-async->vals]]]))
+                       [fluree.db.util.core :refer-macros [if-cljs]]]))
+  #?(:cljs (:require-macros [fluree.db.util.log :refer
+                             [debug->val debug->>val debug-async->vals
+                              debug-async->>vals]]))
   #?(:cljs (:import [goog.debug Console]
                     [goog.log Level])))
 
