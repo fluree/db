@@ -128,9 +128,8 @@
   ([patterns]
    {::patterns patterns})
   ([patterns filters]
-   (-> patterns
-       ->where-clause
-       (assoc ::filters filters))))
+   (cond-> (->where-clause patterns)
+           (seq filters) (assoc ::filters filters))))
 
 (defn pattern-type
   [pattern]
