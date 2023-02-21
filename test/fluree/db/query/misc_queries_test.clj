@@ -238,7 +238,6 @@
                    :f/context
                    "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]]
                  @(fluree/query db* {:select ['?s '?p '?o]
-
                                      :where  [['?s '?p '?o]]})))))
       (testing "Illegal reference queries"
         (let [test-subject @(fluree/query db {:select ['?s '?p]
