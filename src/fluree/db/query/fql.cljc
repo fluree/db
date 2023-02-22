@@ -1,6 +1,8 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec])
@@ -40,8 +42,12 @@
   [db query-map]
   (if (cache? query-map)
     (cache-query db query-map)
-    (let [q   (parse/parse query-map db)
+    (let [q   (try*
+                (parse/parse query-map db)
+                (catch* e e))
           db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
-      (if (= :simple-subject-crawl (:strategy q))
-        (simple-subject-crawl db* q)
-        (exec/query db* q)))))
+      (if (util/exception? q)
+        (async/to-chan! [q])
+        (if (= :simple-subject-crawl (:strategy q))
+          (simple-subject-crawl db* q)
+          (exec/query db* q))))))
