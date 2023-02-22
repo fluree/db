@@ -351,28 +351,19 @@
 
 (defmethod match-pattern :bind
   [_db solution pattern _ error-ch]
-  (let [bind     (val pattern)
-        out-ch   (async/chan 2)
-        binds-ch (async/to-chan! (vals bind))]
+  (let [bind (val pattern)]
     (log/debug "match-pattern :bind bind:" bind)
     (log/debug "match-pattern :bind solution:" solution)
-    (async/pipeline-async
-      2
-      out-ch
-      (fn [bind ch]
-        (log/debug "pipeline fn bind:" bind)
-        (let [f        (::fn bind)
-              var-name (::var bind)]
-          (go
-            (try*
-              (->> (f solution)
-                   (log/debug->>val "pipeline fn result:")
-                   (add-fn-result-to-solution solution var-name)
-                   (>! ch))
-              (catch* e (>! error-ch e))
-              (finally (async/close! ch))))))
-      binds-ch)
-    out-ch))
+    (go
+      (reduce (fn [solution* b]
+                (let [f        (::fn b)
+                      var-name (::var b)]
+                  (try*
+                    (->> (f solution)
+                         (log/debug->>val "bind fn result:")
+                         (add-fn-result-to-solution solution* var-name))
+                    (catch* e (>! error-ch e)))))
+              solution (vals bind)))))
 
 (def blank-solution {})
 
