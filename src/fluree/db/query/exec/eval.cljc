@@ -177,24 +177,29 @@
     ||          fluree.db.query.exec.eval/||})
 
 (defn qualify
-  [sym]
-  (if (contains? allowed-symbols sym)
-    (let [qsym (get qualified-symbols sym sym)]
-      (log/debug "qualified symbol" sym "as" qsym)
-      qsym)
-    (throw (ex-info (str "Query function references illegal symbol: " sym)
-                    {:status 400, :error :db/invalid-query}))))
+  [sym allow-aggregates?]
+  (let [allowed-fns (if allow-aggregates?
+                      allowed-symbols
+                      allowed-scalar-fns)]
+    (if (contains? allowed-fns sym)
+      (let [qsym (get qualified-symbols sym sym)]
+        (log/debug "qualified symbol" sym "as" qsym)
+        qsym)
+      (let [err-msg (if (and (not allow-aggregates?)
+                             (contains? allowed-aggregate-fns sym))
+                      (str "Aggregate function " sym " is only valid for grouped values")
+                      (str "Query function references illegal symbol: " sym))]
+        (throw (ex-info err-msg
+                        {:status 400, :error :db/invalid-query}))))))
 
 (defn coerce
-  [code]
+  [code allow-aggregates?]
   (postwalk (fn [x]
               (if (and (symbol? x)
                        (not (variable? x)))
-                (qualify x)
+                (qualify x allow-aggregates?)
                 x))
             code))
-
-
 
 (defn bind-variables
   [soln-sym var-syms]
@@ -209,17 +214,18 @@
        (into [])))
 
 (defn compile
-  [code]
-  (let [qualified-code (coerce code)
-        vars           (variables qualified-code)
-        soln-sym       'solution
-        bdg            (bind-variables soln-sym vars)
-        fn-code        `(fn [~soln-sym]
-                          (log/debug "fn solution:" ~soln-sym)
-                          (let ~bdg
-                            ~qualified-code))]
-    (log/debug "compiled fn:" fn-code)
-    (eval fn-code)))
+  ([code] (compile code true))
+  ([code allow-aggregates?]
+   (let [qualified-code (coerce code allow-aggregates?)
+         vars           (variables qualified-code)
+         soln-sym       'solution
+         bdg            (bind-variables soln-sym vars)
+         fn-code        `(fn [~soln-sym]
+                           (log/debug "fn solution:" ~soln-sym)
+                           (let ~bdg
+                             ~qualified-code))]
+     (log/debug "compiled fn:" fn-code)
+     (eval fn-code))))
 
 (defn compile-filter
   [code var]

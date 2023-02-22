@@ -150,7 +150,7 @@
   [var-name fn-code]
   (let [code (parse-code fn-code)
         _    (log/debug "parse-bind-function code:" code)
-        f    (eval/compile code)]
+        f    (eval/compile code false)]
     (log/debug "parse-bind-function f:" f)
     (where/->function var-name f)))
 
