@@ -8,7 +8,7 @@
     (let [conn   (test-utils/create-conn)
           people (test-utils/load-people conn)
           db     (fluree/db people)]
-      (testing "with multiple grouped fields"
+      (testing "with a single grouped-by field"
         (let [qry     '{:context  {:ex "http://example.org/ns/"}
                         :select   [?name ?email ?age ?favNums]
                         :where    [[?s :schema/name ?name]
@@ -23,28 +23,46 @@
                    [50 50 50]
                    [9 42 76]]
                   ["Brian" ["brian@example.org"] [50] [7]]
-                  ["Cam" ["cam@example.org" "cam@example.org"] [34 34] [5 10]]]
+                  ["Cam" ["cam@example.org" "cam@example.org"] [34 34] [5 10]]
+                  ["Liam" ["liam@example.org" "liam@example.org"] [13 13] [11 42]]]
                  subject)
               "returns grouped results")))
 
-      (testing "with having clauses"
-        (is (= [["Cam" [5 10]] ["Alice" [9 42 76]]]
-               @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
-                                   :select   [?name ?favNums]
-                                   :where    [[?s :schema/name ?name]
-                                              [?s :ex/favNums ?favNums]]
-                                   :group-by ?name
-                                   :having   (>= (count ?favNums) 2)}))
-            "filters results according to the supplied having function code")
+      (testing "with multiple grouped-by fields"
+        (let [qry     '{:context  {:ex "http://example.org/ns/"}
+                        :select   [?name ?email ?age ?favNums]
+                        :where    [[?s :schema/name ?name]
+                                   [?s :schema/email ?email]
+                                   [?s :schema/age ?age]
+                                   [?s :ex/favNums ?favNums]]
+                        :group-by [?name ?email ?age]
+                        :order-by ?name}
+              subject @(fluree/query db qry)]
+          (is (= [["Alice" "alice@example.org" 50 [9 42 76]]
+                  ["Brian" "brian@example.org" 50 [7]]
+                  ["Cam" "cam@example.org" 34 [5 10]]
+                  ["Liam" "liam@example.org" 13 [11 42]]]
+                 subject)
+              "returns grouped results"))
 
-        (is (= [["Cam" [5 10]] ["Alice" [9 42 76]] ["Brian" [7]]]
-               @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
-                                   :select   [?name ?favNums]
-                                   :where    [[?s :schema/name ?name]
-                                              [?s :ex/favNums ?favNums]]
-                                   :group-by ?name
-                                   :having   (>= (avg ?favNums) 2)}))
-            "filters results according to the supplied having function code")))))
+        (testing "with having clauses"
+          (is (= [["Liam" [11 42]] ["Cam" [5 10]] ["Alice" [9 42 76]]]
+                 @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
+                                     :select   [?name ?favNums]
+                                     :where    [[?s :schema/name ?name]
+                                                [?s :ex/favNums ?favNums]]
+                                     :group-by ?name
+                                     :having   (>= (count ?favNums) 2)}))
+              "filters results according to the supplied having function code")
+
+          (is (= [["Liam" [11 42]] ["Alice" [9 42 76]]]
+                 @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
+                                     :select   [?name ?favNums]
+                                     :where    [[?s :schema/name ?name]
+                                                [?s :ex/favNums ?favNums]]
+                                     :group-by ?name
+                                     :having   (>= (avg ?favNums) 10)}))
+              "filters results according to the supplied having function code"))))))
 
 (deftest ^:integration select-distinct-test
   (testing "Distinct queries"
@@ -59,7 +77,8 @@
                    :order-by        ?favNum}]
       (is (= [["Cam" "cam@example.org"]
               ["Brian" "brian@example.org"]
-              ["Alice" "alice@example.org"]]
+              ["Alice" "alice@example.org"]
+              ["Liam" "liam@example.org"]]
              @(fluree/query db q))
           "return results without repeated entries"))))
 
@@ -119,19 +138,48 @@
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
         db     (fluree/db people)]
-    (testing "bind query w/ fn value"
-      (let [q '{:context {:ex "http://example.org/ns/"}
-                :select  [?firstLetterOfName ?name ?decadesOld]
-                :where   [[?s :schema/age ?age]
-                          {:bind {?decadesOld (quot ?age 10)}}
-                          [?s :schema/name ?name]
-                          {:bind {?firstLetterOfName (subStr ?name 0 1)}}]
-                :order-by ?firstLetterOfName}
+    (testing "with 2 separate fn binds"
+      (let [q   '{:context  {:ex "http://example.org/ns/"}
+                  :select   [?firstLetterOfName ?name ?decadesOld]
+                  :where    [[?s :schema/age ?age]
+                             {:bind {?decadesOld (quot ?age 10)}}
+                             [?s :schema/name ?name]
+                             {:bind {?firstLetterOfName (subStr ?name 0 1)}}]
+                  :order-by ?firstLetterOfName}
             res @(fluree/query db q)]
         (is (= [["A" "Alice" 5]
                 ["B" "Brian" 5]
-                ["C" "Cam" 3]]
-               res))))))
+                ["C" "Cam" 3]
+                ["L" "Liam" 1]]
+               res))))
+
+    (testing "with 2 fn binds in one bind map"
+      (let [q   '{:context  {:ex "http://example.org/ns/"}
+                  :select   [?firstLetterOfName ?name ?canVote]
+                  :where    [[?s :schema/age ?age]
+                             [?s :schema/name ?name]
+                             {:bind {?firstLetterOfName (subStr ?name 0 1)
+                                     ?canVote           (>= ?age 18)}}]
+                  :order-by ?name}
+            res @(fluree/query db q)]
+        (is (= [["A" "Alice" true]
+                ["B" "Brian" true]
+                ["C" "Cam" true]
+                ["L" "Liam" false]]
+               res))))
+
+    (testing "with invalid aggregate fn"
+      (let [q '{:context  {:ex "http://example.org/ns/"}
+                :select   [?sumFavNums ?name ?canVote]
+                :where    [[?s :schema/age ?age]
+                           [?s :ex/favNums ?favNums]
+                           [?s :schema/name ?name]
+                           {:bind {?sumFavNums (sum ?favNums)
+                                   ?canVote    (>= ?age 18)}}]
+                :order-by ?name}]
+        (is (re-matches
+              #"Aggregate function sum is only valid for grouped values"
+              (ex-message @(fluree/query db q))))))))
 
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)
