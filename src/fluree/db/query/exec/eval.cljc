@@ -69,7 +69,7 @@
        (take n)
        vec))
 
-(def allowed-aggregates
+(def allowed-aggregate-fns
   '#{abs as avg ceil count count-distinct distinct floor groupconcat
      median max min rand sample stddev str sum variance})
 
@@ -120,12 +120,12 @@
   [s start end]
   (subs s start end))
 
-(def allowed-fns
+(def allowed-scalar-fns
   '#{&& || ! > < >= <= = + - * / quot and bound coalesce if nil?
      not not= now or re-find re-pattern strStarts strEnds subStr})
 
 (def allowed-symbols
-  (set/union allowed-aggregates allowed-fns))
+  (set/union allowed-aggregate-fns allowed-scalar-fns))
 
 (defn variable?
   [sym]
