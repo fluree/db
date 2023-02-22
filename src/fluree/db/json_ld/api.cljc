@@ -264,8 +264,7 @@
 
 (defn query
   [db query]
-  (let [res-chan (query-api/query db query)]
-    (promise-wrap res-chan)))
+  (promise-wrap (query-api/query db query)))
 
 (defn multi-query
   [db multi-query]

@@ -1,8 +1,10 @@
 (ns fluree.db.util.async
   (:require
-   [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-   [clojure.core.async :refer [go <!] :as async]
-   [clojure.core.async.impl.protocols :as async-protocols])
+    [fluree.db.util.core :as util]
+    [fluree.db.util.log :as log]
+    [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+    [clojure.core.async :refer [go <!] :as async]
+    [clojure.core.async.impl.protocols :as async-protocols])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -23,7 +25,8 @@
      (if (cljs-env? &env) then else)))
 
 (defn throw-err [e]
-  (when (instance? #?(:clj Throwable :cljs js/Error) e) (throw e))
+  (when (util/exception? e)
+    (throw e))
   e)
 
 #?(:clj
