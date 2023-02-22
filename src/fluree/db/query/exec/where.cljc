@@ -346,8 +346,8 @@
 
 (defn add-fn-result-to-solution
   [solution var-name result]
-  (-> solution
-      (assoc var-name {::var var-name ::val result})))
+  (let [dt (datatype/infer result)]
+    (assoc solution var-name {::var var-name ::val result ::datatype dt})))
 
 (defmethod match-pattern :bind
   [_db solution pattern _ error-ch]
