@@ -70,7 +70,7 @@
        vec))
 
 (def allowed-aggregate-fns
-  '#{abs as avg ceil count count-distinct distinct floor groupconcat
+  '#{as avg ceil count count-distinct distinct floor groupconcat
      median max min rand sample stddev str sum variance})
 
 (defmacro coalesce
@@ -121,7 +121,7 @@
   (subs s start end))
 
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if nil?
+  '#{abs && || ! > < >= <= = + - * / quot and bound coalesce if nil?
      not not= now or re-find re-pattern strStarts strEnds subStr})
 
 (def allowed-symbols
