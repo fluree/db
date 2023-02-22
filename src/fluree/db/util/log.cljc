@@ -103,16 +103,18 @@
      "Logs a ->> threaded value w/ msg (at debug level) and then returns the
      value so it can continue being threaded."
      [msg v]
-     `(log/debug ~msg ~v)
-     v))
+     `(do
+        (debug ~msg ~v)
+        ~v)))
 
 #?(:clj
    (defmacro debug->val
      "Logs a -> threaded value w/ msg (at debug level) and then returns the
      value so it can continue being threaded."
      [v msg]
-     `(log/debug ~msg ~v)
-     v))
+     `(do
+        (debug ~msg ~v)
+        ~v)))
 
 #?(:clj
    (defmacro debug-async->vals
