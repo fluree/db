@@ -137,8 +137,7 @@
                     [[{::where/var '?s}
                       {::where/val      1006
                        ::where/datatype 8}
-                      {::where/var '?favColor}]]
-                    ::where/filters {}}]]
+                      {::where/var '?favColor}]]}]]
                  patterns))))
       (testing "class, union"
         (let [union-q {:select ['?s '?email1 '?email2]
@@ -160,14 +159,12 @@
                      [[{::where/var '?s}
                        {::where/val      1007
                         ::where/datatype 8}
-                       {::where/var '?email1}]]
-                     ::where/filters {}}
+                       {::where/var '?email1}]]}
                     {::where/patterns
                      [[{::where/var '?s}
                        {::where/val      1003
                         ::where/datatype 8}
-                       {::where/var '?email2}]]
-                     ::where/filters {}}]]]
+                       {::where/var '?email2}]]}]]]
                  patterns))))
       (testing "class, filters"
         (let [filter-q {:select ['?name '?age]

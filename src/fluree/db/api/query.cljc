@@ -2,7 +2,7 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.string :as str]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [go <!]]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as fql-parse]
@@ -68,10 +68,10 @@
 
             (if commit-details
               ;; annotate with commit details
-             (async/alt!
-                (async/into [] (history/add-commit-details db parsed-context error-ch history-results-chan))
-                ([result] result)
-                error-ch ([e] e))
+              (async/alt!
+                 (async/into [] (history/add-commit-details db parsed-context error-ch history-results-chan))
+                 ([result] result)
+                 error-ch ([e] e))
 
               ;; we're already done
               (async/alt!
@@ -88,7 +88,7 @@
 (defn query
   "Execute a query against a database source, or optionally
   additional sources if the query spans multiple data sets.
-  Returns core async channel containing result."
+  Returns core async channel containing result or exception."
   [sources query]
   (go-try
     (let [{query :subject, issuer :issuer}

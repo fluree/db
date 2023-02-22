@@ -49,10 +49,12 @@
 
 #?(:clj
    (defmacro try*
-     "Like try but supports catch*. catch* is like catch but supports CLJ/CLJS with
-  less boilerplate. In CLJ it catches `Exception`. In CLJS it catches `:default`.
-  Use it like this: `(try* ... (catch* err (handle-err err)))`.
-  Also supports an optional finally clause."
+     "Like try but supports catch*. catch* is like catch but supports CLJ/CLJS
+     with less boilerplate. In CLJ it catches `Exception`. In CLJS it catches
+     `:default`.
+
+     Use it like this: `(try* ... (catch* err (handle-err err)))`.
+     Also supports an optional finally clause."
      [& body]
      `(if-cljs
         (cljs-exceptions/try* ~@body)
@@ -269,7 +271,7 @@
 
 
 (defn exception?
-  "x-platform, returns true if is an execption"
+  "x-platform, returns true if is an exception"
   [x]
   (instance? #?(:clj Throwable :cljs js/Error) x))
 
@@ -325,17 +327,17 @@
 #?(:clj
    (defmacro condps
      "Takes an expression and a set of clauses.
-  Each clause can take the form of either:
+     Each clause can take the form of either:
 
-  unary-predicate-fn? result-expr
-  (unary-predicate-fn?-1 ... unary-predicate-fn?-N) result-expr
+     unary-predicate-fn? result-expr
+     (unary-predicate-fn?-1 ... unary-predicate-fn?-N) result-expr
 
-  For each clause, (unary-predicate-fn? expr) is evalated (for each
-  unary-predicate-fn? in the clause when >1 is given). If it returns logical
-  true, the clause is a match.
+     For each clause, (unary-predicate-fn? expr) is evalated (for each
+     unary-predicate-fn? in the clause when >1 is given). If it returns logical
+     true, the clause is a match.
 
-  Similar to condp but takes unary predicates instead of binary and allows
-  multiple predicates to be supplied in a list similar to case."
+     Similar to condp but takes unary predicates instead of binary and allows
+     multiple predicates to be supplied in a list similar to case."
      [expr & clauses]
      (let [gexpr (gensym "expr__")
            emit  (fn emit [expr args]
