@@ -70,7 +70,7 @@
        vec))
 
 (def allowed-aggregate-fns
-  '#{as avg ceil count count-distinct distinct floor groupconcat
+  '#{avg ceil count count-distinct distinct floor groupconcat
      median max min rand sample stddev str sum variance})
 
 (defmacro coalesce
