@@ -63,14 +63,36 @@
                            " lower than actual count of " n ".")
                       {:status 400 :error :db/shacl-validation})))))
 
+(defn validate-pair-property
+  "Validates a PropertyShape against a set of flakes"
+  [{:keys [equals] :as _p-shape} pair-flake p-flakes]
+  (let [[pair-o pair-dt] [(flake/o pair-flake) (flake/dt pair-flake)]
+        pair-comparator (partial flake/cmp-obj pair-o pair-dt)]
+    (cond
+
+      equals (let [non-equal-objs (keep (fn [flake]
+                                          (let [flake-o (flake/o flake)
+                                                comp-result (pair-comparator flake-o (flake/dt flake))]
+                                            (when-not (contains? #{0 true} comp-result)
+                                              flake-o)))
+                                        p-flakes)]
+               (when-not (empty? non-equal-objs)
+                 (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. Values" (into [] non-equal-objs)
+                                      " not equal to " pair-o ".")
+                                 {:status 400 :error :db/shacl-validation})))))))
 (defn validate-shape
-  [{:keys [property closed-props] :as shape} flakes-p]
-  (loop [[p-flakes & r] flakes-p
+  [{:keys [property closed-props] :as shape} flakes-by-p]
+  (loop [[p-flakes & r] (vals flakes-by-p)
          required (:required shape)]
     (if p-flakes
-      (let [pid      (flake/p (first p-flakes))
-            p-shapes (get property pid)
-            error?   (some #(validate-property % p-flakes) p-shapes)]
+      (let [pid      (flake/p (first p-flakes)) ;;validate by predicate
+            p-shapes (get property pid) ;;look up pid in :property part of shape
+            error?   (some (fn [p-shape]
+                             (if-let [pair (:pair? p-shape)]
+                               (let [pair-flake (-> flakes-by-p (get pair) first)]
+                                 (validate-pair-property p-shape pair-flake p-flakes))
+                               (validate-property p-shape p-flakes)))
+                           p-shapes)]
         (when closed-props
           (when-not (closed-props pid)
             (throw (ex-info (str "SHACL shape is closed, property: " pid
@@ -86,10 +108,9 @@
   "Some new flakes don't need extra validation."
   [db {:keys [shapes datatype] :as shape-map} flakes]
   (go-try
-    (let [flakes-p (partition-by flake/p flakes)]
-      (doseq [shape shapes]
-        (validate-shape shape flakes-p)))))
-
+   (let [flakes-by-p (group-by flake/p flakes)]
+     (doseq [shape shapes]
+       (validate-shape shape flakes-by-p)))))
 
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
@@ -157,6 +178,9 @@
 
           const/$sh:maxInclusive
           (assoc acc :max-inclusive o)
+
+          const/$sh:equals
+          (assoc acc :equals o :pair? o)
 
           ;; else
           acc)))
@@ -294,10 +318,11 @@
                                    (let [p (flake/p flake)
                                          o (flake/o flake)]
                                      (if (= const/$sh:property p)
-                                       (let [property-shape (-> (<? (query-range/index-range db :spot = [o]))
-                                                                (build-property-shape))
+                                       (let [{:keys [equals path] :as property-shape} (-> (<? (query-range/index-range db :spot = [o]))
+                                                                  (build-property-shape))
                                              ;; we key the property shapes map with the property subj id (sh:path)
-                                             p-shapes*      (update p-shapes (:path property-shape) util/conjv property-shape)
+                                             p-shapes*      (cond-> (update p-shapes path util/conjv property-shape)
+                                                              equals (update equals util/conjv {:path equals :equals path :pair? path}))
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)

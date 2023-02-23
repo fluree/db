@@ -154,7 +154,7 @@
 (def ^:const $sh:maxInclusive 241)
 
 
-
+(def ^:const $sh:equals 242)
 
 ;; fluree-specific
 (def ^:const $fluree:context 250)

@@ -55,6 +55,7 @@
           "http://www.w3.org/ns/shacl#nodeKind"                 const/$sh:nodeKind
           "http://www.w3.org/ns/shacl#minLength"                const/$sh:minLength
           "http://www.w3.org/ns/shacl#maxLength"                const/$sh:maxLength
+          "http://www.w3.org/ns/shacl#equals"                   const/$sh:equals
           "http://www.w3.org/ns/shacl#pattern"                  const/$sh:pattern
           "http://www.w3.org/ns/shacl#languageIn"               const/$sh:languageIn
           "http://www.w3.org/ns/shacl#uniqueLang"               const/$sh:uniqueLang
@@ -119,7 +120,8 @@
                           (#{const/$rdfs:subClassOf
                              const/$sh:path const/$sh:ignoredProperties
                              const/$sh:targetClass
-                             const/$sh:targetSubjectsOf const/$sh:targetObjectsOf}
+                             const/$sh:targetSubjectsOf const/$sh:targetObjectsOf
+                             const/$sh:equals}
                            referring-pid))
                     (next-pid)
                     (next-sid)))]
@@ -175,5 +177,3 @@
      "commit"   commit
      "idx"      idx-map
      "from"     from}))
-
-

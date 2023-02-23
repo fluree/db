@@ -184,3 +184,50 @@
                :rdf/type    [:ex/User],
                :schema/name "John"}])
           "basic rdf:type query response not correct"))))
+
+(deftest ^:integration shacl-property-pairs
+  (testing "shacl property pairs"
+    (let [conn          (test-utils/create-conn)
+          ledger        @(fluree/create conn "shacl/pairs")
+          user-query    {:context {:ex "http://example.org/ns/"}
+                         :select  {'?s [:*]}
+                         :where   [['?s :rdf/type :ex/User]]}
+          db            @(fluree/stage
+                           (fluree/db ledger)
+                           {:context              {:ex "http://example.org/ns/"}
+                            :id                   :ex/EqualNames
+                            :type                 [:sh/NodeShape],
+                            :sh/targetClass       :ex/User
+                            :sh/property          [{:sh/path     :schema/name
+                                                    :sh/equals   :ex/firstName}]
+                        ;;    :sh/ignoredProperties [:rdf/type]
+                         ;;   :sh/closed            true
+                            })
+          db-ok         @(fluree/stage
+                           db
+                           {:context     {:ex "http://example.org/ns/"}
+                            :id          :ex/alice,
+                            :type        [:ex/User],
+                            :schema/name "Alice"
+                            :ex/firstName "Alice"})
+
+          db-not-equal (try
+                         @(fluree/stage
+                           db
+                           {:context      {:ex "http://example.org/ns/"}
+                            :id           :ex/john,
+                            :type         [:ex/User],
+                            :schema/name  "John"
+                            :ex/firstName "Jack"})
+                         (catch Exception e e))]
+      (is (util/exception? db-not-equal)
+          "Exception, because :schema/name does not equal :ex/firstName")
+      (is (str/starts-with? (ex-message db-not-equal)
+                            "SHACL PropertyShape exception - sh:equals"))
+
+      (is (= [{:id          :ex/alice,
+               :rdf/type    [:ex/User],
+               :schema/name "Alice"
+               :ex/firstName "Alice"}]
+             @(fluree/query db-ok user-query))
+          "basic rdf:type query response not correct"))))
