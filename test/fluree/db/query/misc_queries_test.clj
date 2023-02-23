@@ -31,6 +31,32 @@
              @(fluree/query db {:select {'?s [:_id :* {:ex/favArtist [:_id :schema/name]}]}
                                 :where  [['?s :type :ex/User]]}))))))
 
+(deftest ^:integration result-formatting
+  (let [conn (test-utils/create-conn)
+        ledger @(fluree/create conn "query-context" {:context {:ex "http://example.org/ns/"}})
+        db @(test-utils/transact ledger [{:id :ex/dan
+                                          :ex/x 1}])]
+    (is (= [{:id :foo/dan
+             :foo/x 1}]
+           @(fluree/query db {"@context" {:foo "http://example.org/ns/"}
+                              :where [['?s :id :foo/dan]]
+                              :select {'?s [:*]}}))
+        "default unwrapped objects")
+    (is (= [{:id :foo/dan
+             :foo/x [1]}]
+           @(fluree/query db {"@context" {:foo "http://example.org/ns/"
+                                          :foo/x {:container :set}}
+                              :where [['?s :id :foo/dan]]
+                              :select {'?s [:*]}}))
+        "override unwrapping with :set")
+    (is (= [{:id :ex/dan
+             "foo:x" [1]}]
+           @(fluree/query db {"@context" {"foo" "http://example.org/ns/"
+                                          "foo:x" {"@container" "@list"}}
+                              :where [['?s "@id" "foo:dan"]]
+                              :select {'?s ["*"]}}))
+        "override unwrapping with @list")))
+
 (deftest ^:integration s+p+o-full-db-queries
   (testing "Query that pulls entire database."
     (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
