@@ -22,22 +22,6 @@
         (vswap! cache assoc pid p-spec)
         p-spec)))
 
-(defn p-values
-  [flakes]
-  (let [ff (first flakes)]
-    (cond
-      (= 1 (count flakes))
-      (flake/o ff)                                          ;; TODO - if @container = @list in the query context, should always return a vector even if just one result
-
-      ;; flakes are an @list, return in sorted order
-      (:i (flake/m ff))
-      (->> flakes
-           (sort-by #(:i (flake/m %)))
-           (mapv flake/o))
-
-      :else
-      (mapv flake/o flakes))))
-
 (defn iri?
   [pid]
   (= const/$iri pid))

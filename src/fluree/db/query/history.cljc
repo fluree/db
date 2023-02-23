@@ -9,7 +9,6 @@
    [fluree.db.flake :as flake]
    [fluree.db.query.json-ld.response :as json-ld-resp]
    [fluree.db.query.fql.parse :as fql-parse]
-   [fluree.db.query.fql.resp :refer [flakes->res]]
    [fluree.db.util.async :refer [<? go-try]]
    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
    [fluree.db.util.log :as log]

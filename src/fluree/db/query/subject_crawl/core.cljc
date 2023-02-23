@@ -5,7 +5,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.subject :refer [subj-crawl]]
             [fluree.db.query.subject-crawl.common :refer [order-results]]
-            [fluree.db.query.fql.resp :as legacy-resp]
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.json-ld :as json-ld]))
 
