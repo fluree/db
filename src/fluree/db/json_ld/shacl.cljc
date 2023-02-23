@@ -85,10 +85,10 @@
   (loop [[p-flakes & r] (vals flakes-by-p)
          required (:required shape)]
     (if p-flakes
-      (let [pid      (flake/p (first p-flakes)) ;;validate by predicate
-            p-shapes (get property pid) ;;look up pid in :property part of shape
+      (let [pid      (flake/p (first p-flakes))
+            p-shapes (get property pid)
             error?   (some (fn [p-shape]
-                             (if-let [pair (:pair? p-shape)]
+                             (if-let [pair (:pair-property p-shape)]
                                (let [pair-flake (-> flakes-by-p (get pair) first)]
                                  (validate-pair-property p-shape pair-flake p-flakes))
                                (validate-property p-shape p-flakes)))
@@ -180,7 +180,7 @@
           (assoc acc :max-inclusive o)
 
           const/$sh:equals
-          (assoc acc :equals o :pair? o)
+          (assoc acc :equals o :pair-property o)
 
           ;; else
           acc)))
@@ -322,7 +322,7 @@
                                                                   (build-property-shape))
                                              ;; we key the property shapes map with the property subj id (sh:path)
                                              p-shapes*      (cond-> (update p-shapes path util/conjv property-shape)
-                                                              equals (update equals util/conjv {:path equals :equals path :pair? path}))
+                                                              equals (update equals util/conjv {:path equals :equals path :pair-property path}))
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)
