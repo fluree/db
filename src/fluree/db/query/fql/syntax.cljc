@@ -198,7 +198,7 @@
                              [:opts {:optional true} ::opts]
                              [:prettyPrint {:optional true} ::prettyPrint]
                              [:pretty-print {:optional true} ::pretty-print]]
-     ::multi-query          [:map-of :string ::analytical-query]
+     ::multi-query          [:map-of [:or :string :keyword] ::analytical-query]
      ::query                [:orn
                              [:single ::analytical-query]
                              [:multi ::multi-query]]}))
