@@ -1,25 +1,15 @@
 (ns fluree.db.api.query
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [clojure.string :as str]
-            [clojure.core.async :as async :refer [go <!]]
+  (:require [clojure.core.async :as async]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.query.json-ld.response :as json-ld-resp]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.db.json-ld :as jld-db]
-            [malli.core :as m]
-            [fluree.db.util.log :as log]
-            [fluree.db.constants :as const]
-            [fluree.db.datatype :as datatype]))
+            [fluree.db.json-ld.credential :as cred]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -33,7 +23,7 @@
                       {:status 400
                        :error  :db/invalid-query}))
 
-      (let [{:keys [context history t commit-details] :as parsed} (history/history-query-parser query-map)
+      (let [{:keys [context history t commit-details] :as _parsed} (history/history-query-parser query-map)
 
             ;; from and to are positive ints, need to convert to negative or fill in default values
             {:keys [from to at]} t
