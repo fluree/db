@@ -135,14 +135,9 @@
                                             {id-key c-iri}))
                                         (flake/o f))]
                               (recur r (conj acc res)))
-                            (cond
-                              (#{:list :set} (-> context (get p-iri) :container))
-                              acc
-
-                              (= 1 (count acc))
+                            (if (and (= 1 (count acc))
+                                     (not (#{:list :set} (-> context (get p-iri) :container))))
                               (first acc)
-
-                              :else
                               acc))))]
             (if v
               (recur r (assoc acc p-iri v))
