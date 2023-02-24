@@ -56,6 +56,7 @@
           "http://www.w3.org/ns/shacl#minLength"                const/$sh:minLength
           "http://www.w3.org/ns/shacl#maxLength"                const/$sh:maxLength
           "http://www.w3.org/ns/shacl#equals"                   const/$sh:equals
+          "http://www.w3.org/ns/shacl#disjoint"                 const/$sh:disjoint
           "http://www.w3.org/ns/shacl#pattern"                  const/$sh:pattern
           "http://www.w3.org/ns/shacl#languageIn"               const/$sh:languageIn
           "http://www.w3.org/ns/shacl#uniqueLang"               const/$sh:uniqueLang
@@ -121,7 +122,8 @@
                              const/$sh:path const/$sh:ignoredProperties
                              const/$sh:targetClass
                              const/$sh:targetSubjectsOf const/$sh:targetObjectsOf
-                             const/$sh:equals}
+                             const/$sh:equals
+                             const/$sh:disjoint}
                            referring-pid))
                     (next-pid)
                     (next-sid)))]

@@ -154,7 +154,9 @@
 (def ^:const $sh:maxInclusive 241)
 
 
+;;property pair constraints
 (def ^:const $sh:equals 242)
+(def ^:const $sh:disjoint 243)
 
 ;; fluree-specific
 (def ^:const $fluree:context 250)

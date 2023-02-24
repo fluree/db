@@ -227,8 +227,7 @@
                    :rdf/type    [:ex/User],
                    :schema/name "Alice"
                    :ex/firstName "Alice"}]
-                 @(fluree/query db-ok user-query))
-              "basic rdf:type query response not correct")))
+                 @(fluree/query db-ok user-query)))))
       (testing "multi-cardinality equals"
           (let [db            @(fluree/stage
                                 (fluree/db ledger)
@@ -294,5 +293,57 @@
                      :schema/name "Alice"
                      :ex/favNums   [11 17]
                      :ex/luckyNums [11 17]}]
-                   @(fluree/query db-ok user-query))
-                "basic rdf:type query response not correct"))))))
+                   @(fluree/query db-ok user-query)))))
+      (testing "disjoint"
+        (let [db            @(fluree/stage
+                              (fluree/db ledger)
+                              {:context              {:ex "http://example.org/ns/"}
+                               :id                   :ex/EqualNames
+                               :type                 [:sh/NodeShape],
+                               :sh/targetClass       :ex/User
+                               :sh/property          [{:sh/path     :ex/favNums
+                                                       :sh/disjoint   :ex/luckyNums}]})
+              db-ok         @(fluree/stage
+                              db
+                              {:context     {:ex "http://example.org/ns/"}
+                               :id          :ex/alice,
+                               :type        [:ex/User],
+                               :schema/name "Alice"
+                               :ex/favNums   [11 17]
+                               :ex/luckyNums 1})
+
+              db-not-disjoint1 (try
+                                 @(fluree/stage
+                                   db
+                                   {:context     {:ex "http://example.org/ns/"}
+                                    :id          :ex/brian
+                                    :type        [:ex/User],
+                                    :schema/name "Brian"
+                                    :ex/favNums   11
+                                    :ex/luckyNums 11})
+                                 (catch Exception e e))
+              db-not-disjoint2 (try
+                                 @(fluree/stage
+                                   db
+                                   {:context     {:ex "http://example.org/ns/"}
+                                    :id          :ex/brian
+                                    :type        [:ex/User],
+                                    :schema/name "Brian"
+                                    :ex/favNums   [11 17 31]
+                                    :ex/luckyNums 11})
+                                 (catch Exception e e))]
+          (is (util/exception? db-not-disjoint1)
+              "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
+          (is (str/starts-with? (ex-message db-not-disjoint1)
+                                "SHACL PropertyShape exception - sh:disjoint"))
+
+          (is (util/exception? db-not-disjoint2)
+              "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
+          (is (str/starts-with? (ex-message db-not-disjoint2)
+                                "SHACL PropertyShape exception - sh:disjoint"))
+          (is (= [{:id          :ex/alice,
+                   :rdf/type        [:ex/User],
+                   :schema/name "Alice"
+                   :ex/favNums   [11 17]
+                   :ex/luckyNums 1}]
+                 @(fluree/query db-ok user-query))))))))

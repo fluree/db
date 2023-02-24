@@ -63,16 +63,20 @@
       (throw (ex-info (str "SHACL PropertyShape exception - sh:maxCount of " max-count
                            " lower than actual count of " n ".")
                       {:status 400 :error :db/shacl-validation})))))
-(defn validate-equals
-  [lhs-flakes rhs-flakes]
+
+(defn cmp-flake-pairs
+  "Compares the `.-o` values of two sets of flakes.
+  - `throw-error?` is a fn that takes the result of a `cmp-obj` call
+  and returns `true` if the validation process should throw an error.
+  - `error-msg` is the message that will be used for any errors."
+  [lhs-flakes rhs-flakes throw-error? error-msg]
   (doall
    (map
     (fn [l-flake r-flake]
-      (let [comp-result (flake/cmp-obj (flake/o l-flake) (flake/dt l-flake)
+      (let [cmp-result (flake/cmp-obj (flake/o l-flake) (flake/dt l-flake)
                                        (flake/o r-flake) (flake/dt r-flake))]
-        (when-not (contains? #{0 true} comp-result)
-          (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
-                               " not equal to " (mapv flake/o rhs-flakes) ".")
+        (when (throw-error? cmp-result)
+          (throw (ex-info error-msg
                           {:status 400 :error :db/shacl-validation})))))
     lhs-flakes
     rhs-flakes)))
@@ -80,14 +84,23 @@
 (defn validate-pair-property
   "Validates a PropertyShape that compares values
   for a pair of predicates."
-  [{:keys [equals] :as _p-shape} lhs-flakes rhs-flakes]
-  (cond
+  [{:keys [pair-constraint] :as _p-shape} lhs-flakes rhs-flakes]
+  (case pair-constraint
 
-    equals (if-not (= (count lhs-flakes) (count rhs-flakes))
-             (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
-                                  " not equal to " (mapv flake/o rhs-flakes) ".")
-                             {:status 400 :error :db/shacl-validation}))
-             (validate-equals rhs-flakes lhs-flakes))))
+    :equals (let [error-msg (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
+                                 " not equal to " (mapv flake/o rhs-flakes) ".")]
+              (if-not (= (count lhs-flakes) (count rhs-flakes))
+                (throw (ex-info error-msg
+                                {:status 400 :error :db/shacl-validation}))
+                (cmp-flake-pairs lhs-flakes rhs-flakes (fn [cmp-result]
+                                                         (not (contains? #{0 true} cmp-result)))
+                                 error-msg)))
+
+    :disjoint (let [error-msg (str "SHACL PropertyShape exception - sh:disjoint. " (mapv flake/o lhs-flakes)
+                                   "not disjoint from " (mapv flake/o rhs-flakes) ".")]
+                (cmp-flake-pairs lhs-flakes rhs-flakes (fn [cmp-result]
+                                                         (= 0 cmp-result))
+                                 error-msg))))
 
 (defn validate-shape
   [{:keys [property closed-props] :as shape} p-flakes all-flakes]
@@ -97,9 +110,9 @@
       (let [pid      (flake/p (first p-flakes))
             p-shapes (get property pid)
             error?   (some (fn [p-shape]
-                             (if-let [pair-property (:pair-property p-shape)]
-                               (let [pair-flakes (filter #(= pair-property (flake/p %)) all-flakes)]
-                                 (validate-pair-property p-shape pair-flakes p-flakes))
+                             (if-let [pair-property (:rhs-property p-shape)]
+                               (let [rhs-flakes (filter #(= pair-property (flake/p %)) all-flakes)]
+                                 (validate-pair-property p-shape p-flakes rhs-flakes))
                                (validate-property p-shape p-flakes)))
                            p-shapes)]
         (when closed-props
@@ -189,7 +202,11 @@
           (assoc acc :max-inclusive o)
 
           const/$sh:equals
-          (assoc acc :equals o :pair-property o)
+          (assoc acc :pair-constraint :equals :rhs-property o)
+
+
+          const/$sh:disjoint
+          (assoc acc :pair-constraint :disjoint  :rhs-property o)
 
           ;; else
           acc)))
@@ -307,7 +324,6 @@
                          (into (keys property)))]
     (assoc shape :closed-props closed-props)))
 
-
 (defn build-class-shapes
   "Given a class SID, returns class shape"
   [db type-sid]
@@ -328,7 +344,7 @@
                                          o (flake/o flake)]
                                      (if (= const/$sh:property p)
                                        (let [{:keys [path] :as property-shape} (-> (<? (query-range/index-range db :spot = [o]))
-                                                                  (build-property-shape))
+                                                                                   (build-property-shape))
                                              ;; we key the property shapes map with the property subj id (sh:path)
                                              p-shapes*      (update p-shapes path util/conjv property-shape)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
