@@ -49,7 +49,8 @@
   )
 
 (defn validate-property
-  "Validates a PropertyShape against a set of flakes"
+  "Validates a PropertyShape for a single predicate
+  against a set of flakes"
   [{:keys [min-count max-count node-kind]} p-flakes]
   (let [n (count p-flakes)]
     (when (and min-count
@@ -62,35 +63,48 @@
       (throw (ex-info (str "SHACL PropertyShape exception - sh:maxCount of " max-count
                            " lower than actual count of " n ".")
                       {:status 400 :error :db/shacl-validation})))))
+(defn validate-equals
+  [lhs-flakes rhs-flakes]
+  (doall
+   (map
+    (fn [l-flake r-flake]
+      (cond
+        (let [comp-result (flake/cmp-obj (flake/o l-flake) (flake/dt l-flake)
+                                         (flake/o r-flake) (flake/dt r-flake))]
+          (when-not (contains? #{0 true} comp-result)
+            (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
+                                 " not equal to " (mapv flake/o rhs-flakes) ".")
+                            {:status 400 :error :db/shacl-validation}))))
+
+        (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
+                             " not equal to " (mapv flake/o rhs-flakes) ".")
+                        {:status 400 :error :db/shacl-validation}))))
+    lhs-flakes
+    rhs-flakes)))
 
 (defn validate-pair-property
-  "Validates a PropertyShape against a set of flakes"
-  [{:keys [equals] :as _p-shape} pair-flake p-flakes]
-  (let [[pair-o pair-dt] [(flake/o pair-flake) (flake/dt pair-flake)]
-        pair-comparator (partial flake/cmp-obj pair-o pair-dt)]
-    (cond
+  "Validates a PropertyShape that compares values
+  for a pair of predicates."
+  [{:keys [equals] :as _p-shape} lhs-flakes rhs-flakes]
+  (cond
 
-      equals (let [non-equal-objs (keep (fn [flake]
-                                          (let [flake-o (flake/o flake)
-                                                comp-result (pair-comparator flake-o (flake/dt flake))]
-                                            (when-not (contains? #{0 true} comp-result)
-                                              flake-o)))
-                                        p-flakes)]
-               (when-not (empty? non-equal-objs)
-                 (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. Values" (into [] non-equal-objs)
-                                      " not equal to " pair-o ".")
-                                 {:status 400 :error :db/shacl-validation})))))))
+    equals (if-not (= (count lhs-flakes) (count rhs-flakes))
+             (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
+                                  " not equal to " (mapv flake/o rhs-flakes) ".")
+                             {:status 400 :error :db/shacl-validation}))
+             (validate-equals rhs-flakes lhs-flakes))))
+
 (defn validate-shape
-  [{:keys [property closed-props] :as shape} flakes-by-p]
-  (loop [[p-flakes & r] (vals flakes-by-p)
+  [{:keys [property closed-props] :as shape} p-flakes all-flakes]
+  (loop [[p-flakes & r] p-flakes
          required (:required shape)]
     (if p-flakes
       (let [pid      (flake/p (first p-flakes))
             p-shapes (get property pid)
             error?   (some (fn [p-shape]
-                             (if-let [pair (:pair-property p-shape)]
-                               (let [pair-flake (-> flakes-by-p (get pair) first)]
-                                 (validate-pair-property p-shape pair-flake p-flakes))
+                             (if-let [pair-property (:pair-property p-shape)]
+                               (let [pair-flakes (filter #(= pair-property (flake/p %)) all-flakes)]
+                                 (validate-pair-property p-shape pair-flakes p-flakes))
                                (validate-property p-shape p-flakes)))
                            p-shapes)]
         (when closed-props
@@ -106,11 +120,11 @@
 
 (defn validate-target
   "Some new flakes don't need extra validation."
-  [db {:keys [shapes datatype] :as shape-map} flakes]
+  [db {:keys [shapes datatype] :as shape-map} all-flakes]
   (go-try
-   (let [flakes-by-p (group-by flake/p flakes)]
+   (let [p-flakes (partition-by flake/p all-flakes)]
      (doseq [shape shapes]
-       (validate-shape shape flakes-by-p)))))
+       (validate-shape shape p-flakes all-flakes)))))
 
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"

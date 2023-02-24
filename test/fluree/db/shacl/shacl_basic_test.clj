@@ -191,43 +191,108 @@
           ledger        @(fluree/create conn "shacl/pairs")
           user-query    {:context {:ex "http://example.org/ns/"}
                          :select  {'?s [:*]}
-                         :where   [['?s :rdf/type :ex/User]]}
-          db            @(fluree/stage
-                           (fluree/db ledger)
-                           {:context              {:ex "http://example.org/ns/"}
-                            :id                   :ex/EqualNames
-                            :type                 [:sh/NodeShape],
-                            :sh/targetClass       :ex/User
-                            :sh/property          [{:sh/path     :schema/name
-                                                    :sh/equals   :ex/firstName}]
-                        ;;    :sh/ignoredProperties [:rdf/type]
-                         ;;   :sh/closed            true
-                            })
-          db-ok         @(fluree/stage
-                           db
-                           {:context     {:ex "http://example.org/ns/"}
-                            :id          :ex/alice,
-                            :type        [:ex/User],
-                            :schema/name "Alice"
-                            :ex/firstName "Alice"})
+                         :where   [['?s :rdf/type :ex/User]]} ]
+      (testing "single-cardinality equals"
+        (let [db            @(fluree/stage
+                              (fluree/db ledger)
+                              {:context              {:ex "http://example.org/ns/"}
+                               :id                   :ex/EqualNames
+                               :type                 [:sh/NodeShape],
+                               :sh/targetClass       :ex/User
+                               :sh/property          [{:sh/path     :schema/name
+                                                       :sh/equals   :ex/firstName}]})
+              db-ok         @(fluree/stage
+                              db
+                              {:context     {:ex "http://example.org/ns/"}
+                               :id          :ex/alice,
+                               :type        [:ex/User],
+                               :schema/name "Alice"
+                               :ex/firstName "Alice"})
 
-          db-not-equal (try
-                         @(fluree/stage
-                           db
-                           {:context      {:ex "http://example.org/ns/"}
-                            :id           :ex/john,
-                            :type         [:ex/User],
-                            :schema/name  "John"
-                            :ex/firstName "Jack"})
-                         (catch Exception e e))]
-      (is (util/exception? db-not-equal)
-          "Exception, because :schema/name does not equal :ex/firstName")
-      (is (str/starts-with? (ex-message db-not-equal)
-                            "SHACL PropertyShape exception - sh:equals"))
+              db-not-equal (try
+                             @(fluree/stage
+                               db
+                               {:context      {:ex "http://example.org/ns/"}
+                                :id           :ex/john,
+                                :type         [:ex/User],
+                                :schema/name  "John"
+                                :ex/firstName "Jack"})
+                             (catch Exception e e))]
+          (is (util/exception? db-not-equal)
+              "Exception, because :schema/name does not equal :ex/firstName")
+          (is (str/starts-with? (ex-message db-not-equal)
+                                "SHACL PropertyShape exception - sh:equals"))
 
-      (is (= [{:id          :ex/alice,
-               :rdf/type    [:ex/User],
-               :schema/name "Alice"
-               :ex/firstName "Alice"}]
-             @(fluree/query db-ok user-query))
-          "basic rdf:type query response not correct"))))
+          (is (= [{:id          :ex/alice,
+                   :rdf/type    [:ex/User],
+                   :schema/name "Alice"
+                   :ex/firstName "Alice"}]
+                 @(fluree/query db-ok user-query))
+              "basic rdf:type query response not correct")))
+      (testing "multi-cardinality equals"
+          (let [db            @(fluree/stage
+                                (fluree/db ledger)
+                                {:context              {:ex "http://example.org/ns/"}
+                                 :id                   :ex/EqualNames
+                                 :type                 [:sh/NodeShape],
+                                 :sh/targetClass       :ex/User
+                                 :sh/property          [{:sh/path     :ex/favNums
+                                                         :sh/equals   :ex/luckyNums}]})
+                db-ok         @(fluree/stage
+                                db
+                                {:context     {:ex "http://example.org/ns/"}
+                                 :id          :ex/alice,
+                                 :type        [:ex/User],
+                                 :schema/name "Alice"
+                                 :ex/favNums   [11 17]
+                                 :ex/luckyNums [11 17]})
+
+                db-not-equal1 (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/brian
+                                   :type        [:ex/User],
+                                   :schema/name "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums [13 18]})
+                                (catch Exception e e))
+                db-not-equal2 (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/brian
+                                   :type        [:ex/User],
+                                   :schema/name "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums [11]})
+                                (catch Exception e e))
+                db-not-equal3 (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/brian
+                                   :type        [:ex/User],
+                                   :schema/name "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums [11 17 18]})
+                                (catch Exception e e))]
+            (is (util/exception? db-not-equal1)
+                "Exception, because :ex/favNums does not equal :ex/luckyNums")
+            (is (str/starts-with? (ex-message db-not-equal1)
+                                  "SHACL PropertyShape exception - sh:equals"))
+            (is (util/exception? db-not-equal2)
+                "Exception, because :ex/favNums does not equal :ex/luckyNums")
+            (is (str/starts-with? (ex-message db-not-equal2)
+                                  "SHACL PropertyShape exception - sh:equals"))
+            (is (util/exception? db-not-equal3)
+                "Exception, because :ex/favNums does not equal :ex/luckyNums")
+            (is (str/starts-with? (ex-message db-not-equal3)
+                                  "SHACL PropertyShape exception - sh:equals"))
+            (is (= [{:id          :ex/alice,
+                     :rdf/type        [:ex/User],
+                     :schema/name "Alice"
+                     :ex/favNums   [11 17]
+                     :ex/luckyNums [11 17]}]
+                   @(fluree/query db-ok user-query))
+                "basic rdf:type query response not correct"))))))
