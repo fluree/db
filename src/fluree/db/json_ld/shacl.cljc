@@ -68,17 +68,12 @@
   (doall
    (map
     (fn [l-flake r-flake]
-      (cond
-        (let [comp-result (flake/cmp-obj (flake/o l-flake) (flake/dt l-flake)
-                                         (flake/o r-flake) (flake/dt r-flake))]
-          (when-not (contains? #{0 true} comp-result)
-            (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
-                                 " not equal to " (mapv flake/o rhs-flakes) ".")
-                            {:status 400 :error :db/shacl-validation}))))
-
-        (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
-                             " not equal to " (mapv flake/o rhs-flakes) ".")
-                        {:status 400 :error :db/shacl-validation}))))
+      (let [comp-result (flake/cmp-obj (flake/o l-flake) (flake/dt l-flake)
+                                       (flake/o r-flake) (flake/dt r-flake))]
+        (when-not (contains? #{0 true} comp-result)
+          (throw (ex-info (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
+                               " not equal to " (mapv flake/o rhs-flakes) ".")
+                          {:status 400 :error :db/shacl-validation})))))
     lhs-flakes
     rhs-flakes)))
 
@@ -332,11 +327,10 @@
                                    (let [p (flake/p flake)
                                          o (flake/o flake)]
                                      (if (= const/$sh:property p)
-                                       (let [{:keys [equals path] :as property-shape} (-> (<? (query-range/index-range db :spot = [o]))
+                                       (let [{:keys [path] :as property-shape} (-> (<? (query-range/index-range db :spot = [o]))
                                                                   (build-property-shape))
                                              ;; we key the property shapes map with the property subj id (sh:path)
-                                             p-shapes*      (cond-> (update p-shapes path util/conjv property-shape)
-                                                              equals (update equals util/conjv {:path equals :equals path :pair-property path}))
+                                             p-shapes*      (update p-shapes path util/conjv property-shape)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)
