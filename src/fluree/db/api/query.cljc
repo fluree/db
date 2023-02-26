@@ -94,7 +94,9 @@
                                  db)
                                (assoc-in [:policy :cache] (atom {})))
           meta?         (:meta opts)
-          opts*         (assoc opts :issuer issuer)
+          opts*         (-> opts
+                            (assoc :issuer issuer)
+                            (dissoc :meta))
           start         #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
           result        (<? (fql/query db* (assoc query :opts opts*)))]
