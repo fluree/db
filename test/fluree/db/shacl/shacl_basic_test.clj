@@ -196,7 +196,7 @@
         (let [db            @(fluree/stage
                               (fluree/db ledger)
                               {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/EqualNames
+                               :id                   :ex/EqualNamesShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :schema/name
@@ -232,7 +232,7 @@
           (let [db            @(fluree/stage
                                 (fluree/db ledger)
                                 {:context              {:ex "http://example.org/ns/"}
-                                 :id                   :ex/EqualNames
+                                 :id                   :ex/EqualNamesShape
                                  :type                 [:sh/NodeShape],
                                  :sh/targetClass       :ex/User
                                  :sh/property          [{:sh/path     :ex/favNums
@@ -245,6 +245,15 @@
                                  :schema/name "Alice"
                                  :ex/favNums   [11 17]
                                  :ex/luckyNums [11 17]})
+
+                db-ok2         @(fluree/stage
+                                 db
+                                 {:context     {:ex "http://example.org/ns/"}
+                                  :id          :ex/alice,
+                                  :type        [:ex/User],
+                                  :schema/name "Alice"
+                                  :ex/favNums   [11 17]
+                                  :ex/luckyNums [17 11]})
 
                 db-not-equal1 (try
                                 @(fluree/stage
@@ -275,6 +284,16 @@
                                    :schema/name "Brian"
                                    :ex/favNums   [11 17]
                                    :ex/luckyNums [11 17 18]})
+                                (catch Exception e e))
+                db-not-equal4 (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/brian
+                                   :type        [:ex/User],
+                                   :schema/name "Brian"
+                                   :ex/favNums   [11 17]
+                                   :ex/luckyNums ["11" "17"]})
                                 (catch Exception e e))]
             (is (util/exception? db-not-equal1)
                 "Exception, because :ex/favNums does not equal :ex/luckyNums")
@@ -288,17 +307,27 @@
                 "Exception, because :ex/favNums does not equal :ex/luckyNums")
             (is (str/starts-with? (ex-message db-not-equal3)
                                   "SHACL PropertyShape exception - sh:equals"))
+            (is (util/exception? db-not-equal4)
+                "Exception, because :ex/favNums does not equal :ex/luckyNums")
+            (is (str/starts-with? (ex-message db-not-equal4)
+                                  "SHACL PropertyShape exception - sh:equals"))
             (is (= [{:id          :ex/alice,
                      :rdf/type        [:ex/User],
                      :schema/name "Alice"
                      :ex/favNums   [11 17]
                      :ex/luckyNums [11 17]}]
-                   @(fluree/query db-ok user-query)))))
+                   @(fluree/query db-ok user-query)))
+            (is (= [{:id          :ex/alice,
+                     :rdf/type        [:ex/User],
+                     :schema/name "Alice"
+                     :ex/favNums   [11 17]
+                     :ex/luckyNums [11 17]}]
+                   @(fluree/query db-ok2 user-query)))))
       (testing "disjoint"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
                               {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/DisjointNums
+                               :id                   :ex/DisjointShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :ex/favNums
@@ -331,6 +360,17 @@
                                     :schema/name "Brian"
                                     :ex/favNums   [11 17 31]
                                     :ex/luckyNums 11})
+                                 (catch Exception e e))
+
+              db-not-disjoint3 (try
+                                 @(fluree/stage
+                                   db
+                                   {:context     {:ex "http://example.org/ns/"}
+                                    :id          :ex/brian
+                                    :type        [:ex/User],
+                                    :schema/name "Brian"
+                                    :ex/favNums   [11 17 31]
+                                    :ex/luckyNums [13 18 11]})
                                  (catch Exception e e))]
           (is (util/exception? db-not-disjoint1)
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
@@ -341,6 +381,13 @@
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
           (is (str/starts-with? (ex-message db-not-disjoint2)
                                 "SHACL PropertyShape exception - sh:disjoint"))
+
+
+          (is (util/exception? db-not-disjoint3)
+              "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
+          (is (str/starts-with? (ex-message db-not-disjoint3)
+                                "SHACL PropertyShape exception - sh:disjoint"))
+
           (is (= [{:id          :ex/alice,
                    :rdf/type        [:ex/User],
                    :schema/name "Alice"
@@ -351,7 +398,7 @@
         (let [db            @(fluree/stage
                               (fluree/db ledger)
                               {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/LessThan
+                               :id                   :ex/LessThanShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :ex/p1
@@ -383,7 +430,7 @@
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
-                                   :ex/p2 10})
+                                   :ex/p2 17})
                                 (catch Exception e e))
 
               db-fail2        (try
@@ -396,6 +443,7 @@
                                    :ex/p1   [11 17]
                                    :ex/p2 ["18" "19"]})
                                 (catch Exception e e))
+
 
               db-fail3        (try
                                 @(fluree/stage
@@ -450,4 +498,108 @@
                    :schema/name "Alice"
                    :ex/p1   [11 17]
                    :ex/p2 18}]
+                 @(fluree/query db-ok2 user-query)))))
+      (testing "lessThanOrEquals"
+        (let [db            @(fluree/stage
+                              (fluree/db ledger)
+                              {:context              {:ex "http://example.org/ns/"}
+                               :id                   :ex/LessThanOrEqualsShape
+                               :type                 [:sh/NodeShape],
+                               :sh/targetClass       :ex/User
+                               :sh/property          [{:sh/path     :ex/p1
+                                                       :sh/lessThanOrEquals :ex/p2}]})
+              db-ok1         @(fluree/stage
+                               db
+                               {:context     {:ex "http://example.org/ns/"}
+                                :id          :ex/alice,
+                                :type        [:ex/User],
+                                :schema/name "Alice"
+                                :ex/p1   [11 17]
+                                :ex/p2 [17 19]})
+
+
+              db-ok2         @(fluree/stage
+                               db
+                               {:context     {:ex "http://example.org/ns/"}
+                                :id          :ex/alice,
+                                :type        [:ex/User],
+                                :schema/name "Alice"
+                                :ex/p1   [11 17]
+                                :ex/p2 17})
+
+              db-fail1        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [11 17]
+                                   :ex/p2 10})
+                                (catch Exception e e))
+
+              db-fail2        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [11 17]
+                                   :ex/p2 ["17" "19"]})
+                                (catch Exception e e))
+
+              db-fail3        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [12 17]
+                                   :ex/p2 [10 17]})
+                                (catch Exception e e))
+
+              db-fail4        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [11 17]
+                                   :ex/p2 [12 16]})
+                                (catch Exception e e))]
+
+          (is (util/exception? db-fail1)
+              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
+          (is (str/starts-with? (ex-message db-fail1)
+                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+
+
+          (is (util/exception? db-fail2)
+              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
+          (is (str/starts-with? (ex-message db-fail2)
+                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+
+          (is (util/exception? db-fail3)
+              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
+          (is (str/starts-with? (ex-message db-fail3)
+                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+
+          (is (util/exception? db-fail4)
+              "Exception, because :ex/p1 is not less than or equal to :ex/p2")
+          (is (str/starts-with? (ex-message db-fail4)
+                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+          (is (= [{:id          :ex/alice,
+                   :rdf/type        [:ex/User],
+                   :schema/name "Alice"
+                   :ex/p1   [11 17]
+                   :ex/p2 [17 19]}]
+                 @(fluree/query db-ok1 user-query)))
+          (is (= [{:id          :ex/alice,
+                   :rdf/type        [:ex/User],
+                   :schema/name "Alice"
+                   :ex/p1   [11 17]
+                   :ex/p2 17}]
                  @(fluree/query db-ok2 user-query))))))))

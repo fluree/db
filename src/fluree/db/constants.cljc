@@ -158,6 +158,7 @@
 (def ^:const $sh:equals 242)
 (def ^:const $sh:disjoint 243)
 (def ^:const $sh:lessThan 244)
+(def ^:const $sh:lessThanOrEquals 248)
 
 ;; fluree-specific
 (def ^:const $fluree:context 250)

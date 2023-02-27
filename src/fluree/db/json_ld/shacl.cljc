@@ -5,7 +5,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [clojure.set :as set]))
 
 (comment
   ;; a raw SHACL shape looks something like this:
@@ -64,54 +65,49 @@
                            " lower than actual count of " n ".")
                       {:status 400 :error :db/shacl-validation})))))
 
-(defn cmp-flake-pairs
-  "Compares the `.-o` values of two sets of flakes.
-  - `throw-error?` is a fn that takes the result of a `cmp-obj` call
-  and returns `true` if the validation process should throw an error.
-  - `error-msg` is the message that will be used for any errors."
-  [lhs-flakes rhs-flakes throw-error? error-msg]
-  (doall
-   (map
-    (fn [l-flake r-flake]
-      (let [cmp-result (flake/cmp-obj (flake/o l-flake) (flake/dt l-flake)
-                                       (flake/o r-flake) (flake/dt r-flake))]
-        (when (throw-error? cmp-result)
-          (throw (ex-info error-msg
-                          {:status 400 :error :db/shacl-validation})))))
-    lhs-flakes
-    rhs-flakes)))
-
 (defn validate-pair-property
   "Validates a PropertyShape that compares values
   for a pair of predicates."
   [{:keys [pair-constraint] :as _p-shape} lhs-flakes rhs-flakes]
-  (case pair-constraint
+  (let [flake-o-dt (fn [flake] [(flake/o flake) (flake/dt flake)])]
+    (case pair-constraint
 
-    :equals (let [error-msg (str "SHACL PropertyShape exception - sh:equals. " (mapv flake/o lhs-flakes)
-                                 " not equal to " (mapv flake/o rhs-flakes) ".")]
-              (if-not (= (count lhs-flakes) (count rhs-flakes))
-                (throw (ex-info error-msg
-                                {:status 400 :error :db/shacl-validation}))
-                (cmp-flake-pairs lhs-flakes rhs-flakes (fn [cmp-result]
-                                                         (not= 0 cmp-result))
-                                 error-msg)))
+     :equals (let [lhs-values (into #{} (map flake-o-dt) lhs-flakes)
+                    rhs-values (into #{} (map flake-o-dt) rhs-flakes)]
+                (if-not (= lhs-values rhs-values)
+                  (throw (ex-info (str "SHACL PropertyShape exception - sh:equals: " (mapv flake/o lhs-flakes)
+                                       " not equal to " (mapv flake/o rhs-flakes))
+                                  {:status 400 :error :db/shacl-validation}))))
 
-    :disjoint (let [error-msg (str "SHACL PropertyShape exception - sh:disjoint. " (mapv flake/o lhs-flakes)
-                                   "not disjoint from " (mapv flake/o rhs-flakes) ".")]
-                (cmp-flake-pairs lhs-flakes rhs-flakes (fn [cmp-result]
-                                                         (= 0 cmp-result))
-                                 error-msg))
+      :disjoint (let [lhs-values (into #{} (map flake-o-dt) lhs-flakes)
+                      rhs-values (into #{} (map flake-o-dt) rhs-flakes)]
+                  (if-not (empty? (set/intersection lhs-values rhs-values))
+                    (throw (ex-info (str "SHACL PropertyShape exception - sh:disjoint: " (mapv flake/o lhs-flakes)
+                                         " not disjoint from " (mapv flake/o lhs-flakes))
+                                    {:status 400 :error :db/shacl-validation}))))
 
-    :lessThan (doall (map (fn [l-flake r-flake]
-                            (let [[l-flake-o l-flake-dt] [(flake/o l-flake) (flake/dt l-flake)]
-                                  [r-flake-o r-flake-dt] [(flake/o r-flake) (flake/dt r-flake)]]
-                                  (when (or (not= l-flake-dt
-                                                  r-flake-dt)
-                                            (not= -1 (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt)))
-                                    (throw (ex-info (str "SHACL PropertyShape exception - sh:lessThan."
-                                                         l-flake-o " not less than " r-flake-o)
-                                                    {:status 400 :error :db/shacl-validation})))))
-                          lhs-flakes rhs-flakes))))
+
+      :lessThan (doseq [l-flake lhs-flakes
+                        r-flake rhs-flakes]
+                  (let [[l-flake-o l-flake-dt] (flake-o-dt l-flake)
+                        [r-flake-o r-flake-dt] (flake-o-dt r-flake)]
+                    (when (or (not= l-flake-dt
+                                    r-flake-dt)
+                              (not= -1 (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt)))
+                      (throw (ex-info (str "SHACL PropertyShape exception - sh:lessThan: "
+                                           l-flake-o " not less than " r-flake-o)
+                                      {:status 400 :error :db/shacl-validation})))))
+      :lessThanOrEquals (doseq [l-flake lhs-flakes
+                                r-flake rhs-flakes]
+                          (let [[l-flake-o l-flake-dt] (flake-o-dt l-flake)
+                                [r-flake-o r-flake-dt] (flake-o-dt r-flake)]
+                            (when (or (not= l-flake-dt
+                                            r-flake-dt)
+                                      (not (contains? #{0 -1}
+                                                      (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt))))
+                              (throw (ex-info (str "SHACL PropertyShape exception - sh:lessThanOrEquals: "
+                                                   l-flake-o " not less than or equal to " r-flake-o)
+                                              {:status 400 :error :db/shacl-validation}))))))))
 
 (defn validate-shape
   [{:keys [property closed-props] :as shape} p-flakes all-flakes]
@@ -222,6 +218,10 @@
 
           const/$sh:lessThan
           (assoc acc :pair-constraint :lessThan  :rhs-property o)
+
+
+          const/$sh:lessThanOrEquals
+          (assoc acc :pair-constraint :lessThanOrEquals  :rhs-property o)
           ;; else
           acc)))
     {}
