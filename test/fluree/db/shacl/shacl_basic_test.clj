@@ -88,7 +88,7 @@
           "basic rdf:type query response not correct"))))
 
 
-(deftest ^:integration shacl-datatype-constraings
+(deftest ^:integration shacl-datatype-constraints
   (testing "shacl datatype errors"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b")
@@ -298,7 +298,7 @@
         (let [db            @(fluree/stage
                               (fluree/db ledger)
                               {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/EqualNames
+                               :id                   :ex/DisjointNums
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :ex/favNums

@@ -93,7 +93,7 @@
                 (throw (ex-info error-msg
                                 {:status 400 :error :db/shacl-validation}))
                 (cmp-flake-pairs lhs-flakes rhs-flakes (fn [cmp-result]
-                                                         (not (contains? #{0 true} cmp-result)))
+                                                         (not= 0 cmp-result))
                                  error-msg)))
 
     :disjoint (let [error-msg (str "SHACL PropertyShape exception - sh:disjoint. " (mapv flake/o lhs-flakes)
