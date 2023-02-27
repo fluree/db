@@ -346,4 +346,108 @@
                    :schema/name "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums 1}]
-                 @(fluree/query db-ok user-query))))))))
+                 @(fluree/query db-ok user-query)))))
+      (testing "lessThan"
+        (let [db            @(fluree/stage
+                              (fluree/db ledger)
+                              {:context              {:ex "http://example.org/ns/"}
+                               :id                   :ex/LessThan
+                               :type                 [:sh/NodeShape],
+                               :sh/targetClass       :ex/User
+                               :sh/property          [{:sh/path     :ex/p1
+                                                       :sh/lessThan :ex/p2}]})
+              db-ok1         @(fluree/stage
+                               db
+                               {:context     {:ex "http://example.org/ns/"}
+                                :id          :ex/alice,
+                                :type        [:ex/User],
+                                :schema/name "Alice"
+                                :ex/p1   [11 17]
+                                :ex/p2 [18 19]})
+
+
+              db-ok2         @(fluree/stage
+                               db
+                               {:context     {:ex "http://example.org/ns/"}
+                                :id          :ex/alice,
+                                :type        [:ex/User],
+                                :schema/name "Alice"
+                                :ex/p1   [11 17]
+                                :ex/p2 [18]})
+
+              db-fail1        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [11 17]
+                                   :ex/p2 10})
+                                (catch Exception e e))
+
+              db-fail2        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [11 17]
+                                   :ex/p2 ["18" "19"]})
+                                (catch Exception e e))
+
+              db-fail3        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [12 17]
+                                   :ex/p2 [10 18]})
+                                (catch Exception e e))
+
+              db-fail4        (try
+                                @(fluree/stage
+                                  db
+                                  {:context     {:ex "http://example.org/ns/"}
+                                   :id          :ex/alice,
+                                   :type        [:ex/User],
+                                   :schema/name "Alice"
+                                   :ex/p1   [11 17]
+                                   :ex/p2 [12 16]})
+                                (catch Exception e e))]
+
+          (is (util/exception? db-fail1)
+              "Exception, because :ex/p1 is not less than :ex/p2")
+          (is (str/starts-with? (ex-message db-fail1)
+                                "SHACL PropertyShape exception - sh:lessThan"))
+
+
+          (is (util/exception? db-fail2)
+              "Exception, because :ex/p1 is not less than :ex/p2")
+          (is (str/starts-with? (ex-message db-fail2)
+                                "SHACL PropertyShape exception - sh:lessThan"))
+
+          (is (util/exception? db-fail3)
+              "Exception, because :ex/p1 is not less than :ex/p2")
+          (is (str/starts-with? (ex-message db-fail3)
+                                "SHACL PropertyShape exception - sh:lessThan"))
+
+          (is (util/exception? db-fail4)
+              "Exception, because :ex/p1 is not less than :ex/p2")
+          (is (str/starts-with? (ex-message db-fail4)
+                                "SHACL PropertyShape exception - sh:lessThan"))
+          (is (= [{:id          :ex/alice,
+                   :rdf/type        [:ex/User],
+                   :schema/name "Alice"
+                   :ex/p1   [11 17]
+                   :ex/p2 [18 19]}]
+                 @(fluree/query db-ok1 user-query)))
+          (is (= [{:id          :ex/alice,
+                   :rdf/type        [:ex/User],
+                   :schema/name "Alice"
+                   :ex/p1   [11 17]
+                   :ex/p2 18}]
+                 @(fluree/query db-ok2 user-query))))))))

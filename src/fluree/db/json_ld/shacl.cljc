@@ -100,7 +100,18 @@
                                    "not disjoint from " (mapv flake/o rhs-flakes) ".")]
                 (cmp-flake-pairs lhs-flakes rhs-flakes (fn [cmp-result]
                                                          (= 0 cmp-result))
-                                 error-msg))))
+                                 error-msg))
+
+    :lessThan (doall (map (fn [l-flake r-flake]
+                            (let [[l-flake-o l-flake-dt] [(flake/o l-flake) (flake/dt l-flake)]
+                                  [r-flake-o r-flake-dt] [(flake/o r-flake) (flake/dt r-flake)]]
+                                  (when (or (not= l-flake-dt
+                                                  r-flake-dt)
+                                            (not= -1 (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt)))
+                                    (throw (ex-info (str "SHACL PropertyShape exception - sh:lessThan."
+                                                         l-flake-o " not less than " r-flake-o)
+                                                    {:status 400 :error :db/shacl-validation})))))
+                          lhs-flakes rhs-flakes))))
 
 (defn validate-shape
   [{:keys [property closed-props] :as shape} p-flakes all-flakes]
@@ -208,6 +219,9 @@
           const/$sh:disjoint
           (assoc acc :pair-constraint :disjoint  :rhs-property o)
 
+
+          const/$sh:lessThan
+          (assoc acc :pair-constraint :lessThan  :rhs-property o)
           ;; else
           acc)))
     {}
