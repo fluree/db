@@ -406,15 +406,14 @@
   or nil if none exist."
   [{:keys [schema] :as db} type-sids]
   (go-try
-   (let [shapes-atom (:shapes schema)
-         cached-shapes @shapes-atom]
+    (let [shapes-cache (:shapes schema)]
       (loop [[type-sid & r] type-sids
              shape-maps nil]
         (if type-sid
-          (let [shape-map (if-let [cached (get-in cached-shapes [:class type-sid])]
-                            cached
+          (let [shape-map (if (contains? (:class @shapes-cache) type-sid)
+                            (get-in @shapes-cache [:class type-sid])
                             (let [shapes (<? (build-class-shapes db type-sid))]
-                              (swap! shapes-atom assoc-in [:class type-sid] shapes)
+                              (swap! shapes-cache assoc-in [:class type-sid] shapes)
                               shapes))]
             (recur r (if shape-map
                        (conj shape-maps shape-map)
