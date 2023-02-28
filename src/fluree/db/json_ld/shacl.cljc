@@ -101,15 +101,15 @@
                                                 r-flake-o))))))))
 
 (defn validate-shape
-  [{:keys [property closed-props] :as shape} p-flakes all-flakes]
-  (loop [[p-flakes & r] p-flakes
+  [{:keys [property closed-props] :as shape} flake-p-partitions all-flakes]
+  (loop [[p-flakes & r] flake-p-partitions
          required (:required shape)]
     (if p-flakes
       (let [pid      (flake/p (first p-flakes))
             p-shapes (get property pid)
             error?   (some (fn [p-shape]
-                             (if-let [pair-property (:rhs-property p-shape)]
-                               (let [rhs-flakes (filter #(= pair-property (flake/p %)) all-flakes)]
+                             (if-let [rhs-property (:rhs-property p-shape)]
+                               (let [rhs-flakes (filter #(= rhs-property (flake/p %)) all-flakes)]
                                  (validate-pair-property p-shape p-flakes rhs-flakes))
                                (validate-property p-shape p-flakes)))
                            p-shapes)]
@@ -128,9 +128,9 @@
   "Some new flakes don't need extra validation."
   [db {:keys [shapes datatype] :as shape-map} all-flakes]
   (go-try
-   (let [p-flakes (partition-by flake/p all-flakes)]
+   (let [flake-p-partitions (partition-by flake/p all-flakes)]
      (doseq [shape shapes]
-       (validate-shape shape p-flakes all-flakes)))))
+       (validate-shape shape flake-p-partitions all-flakes)))))
 
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
