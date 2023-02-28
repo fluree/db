@@ -7,7 +7,7 @@
             [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.core :as util]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.credential :as cred]))
 
