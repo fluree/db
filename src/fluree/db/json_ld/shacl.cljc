@@ -49,6 +49,11 @@
 
   )
 
+(defn throw-property-shape-exception!
+  [msg]
+  (throw (ex-info (str "SHACL PropertyShape exception - " msg ".")
+                      {:status 400 :error :db/shacl-validation})))
+
 (defn validate-property
   "Validates a PropertyShape for a single predicate
   against a set of flakes"
@@ -56,58 +61,44 @@
   (let [n (count p-flakes)]
     (when (and min-count
                (> min-count n))
-      (throw (ex-info (str "SHACL PropertyShape exception - sh:minCount of " min-count
-                           " higher than actual count of " n ".")
-                      {:status 400 :error :db/shacl-validation})))
+      (throw-property-shape-exception! (str "sh:minCount of " min-count " higher than actual count of " n)))
     (when (and max-count
                (> n max-count))
-      (throw (ex-info (str "SHACL PropertyShape exception - sh:maxCount of " max-count
-                           " lower than actual count of " n ".")
-                      {:status 400 :error :db/shacl-validation})))))
+      (throw-property-shape-exception! (str "sh:maxCount of " max-count " lower than actual count of " n)))))
 
 (defn validate-pair-property
   "Validates a PropertyShape that compares values
   for a pair of predicates."
   [{:keys [pair-constraint] :as _p-shape} lhs-flakes rhs-flakes]
-  (let [flake-o-dt (fn [flake] [(flake/o flake) (flake/dt flake)])]
+  (let [flake-value (fn [flake] [(flake/o flake) (flake/dt flake)])]
     (case pair-constraint
 
-     :equals (let [lhs-values (into #{} (map flake-o-dt) lhs-flakes)
-                    rhs-values (into #{} (map flake-o-dt) rhs-flakes)]
-                (if-not (= lhs-values rhs-values)
-                  (throw (ex-info (str "SHACL PropertyShape exception - sh:equals: " (mapv flake/o lhs-flakes)
-                                       " not equal to " (mapv flake/o rhs-flakes))
-                                  {:status 400 :error :db/shacl-validation}))))
+      (:equals :disjoint) (let [lhs-values (into #{} (map flake-value) lhs-flakes)
+                                rhs-values (into #{} (map flake-value) rhs-flakes)]
+                            (case pair-constraint
+                              :equals
+                              (when (not= lhs-values rhs-values)
+                                (throw-property-shape-exception!
+                                 (str "sh:equals: " (mapv flake/o lhs-flakes) " not equal to " (mapv flake/o rhs-flakes))))
+                              :disjoint
+                              (when (seq (set/intersection lhs-values rhs-values))
+                                (throw-property-shape-exception!
+                                 (str "sh:disjoint: " (mapv flake/o lhs-flakes) " not disjoint from " (mapv flake/o rhs-flakes))))))
 
-      :disjoint (let [lhs-values (into #{} (map flake-o-dt) lhs-flakes)
-                      rhs-values (into #{} (map flake-o-dt) rhs-flakes)]
-                  (if-not (empty? (set/intersection lhs-values rhs-values))
-                    (throw (ex-info (str "SHACL PropertyShape exception - sh:disjoint: " (mapv flake/o lhs-flakes)
-                                         " not disjoint from " (mapv flake/o lhs-flakes))
-                                    {:status 400 :error :db/shacl-validation}))))
-
-
-      :lessThan (doseq [l-flake lhs-flakes
-                        r-flake rhs-flakes]
-                  (let [[l-flake-o l-flake-dt] (flake-o-dt l-flake)
-                        [r-flake-o r-flake-dt] (flake-o-dt r-flake)]
-                    (when (or (not= l-flake-dt
-                                    r-flake-dt)
-                              (not= -1 (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt)))
-                      (throw (ex-info (str "SHACL PropertyShape exception - sh:lessThan: "
-                                           l-flake-o " not less than " r-flake-o)
-                                      {:status 400 :error :db/shacl-validation})))))
-      :lessThanOrEquals (doseq [l-flake lhs-flakes
-                                r-flake rhs-flakes]
-                          (let [[l-flake-o l-flake-dt] (flake-o-dt l-flake)
-                                [r-flake-o r-flake-dt] (flake-o-dt r-flake)]
-                            (when (or (not= l-flake-dt
-                                            r-flake-dt)
-                                      (not (contains? #{0 -1}
-                                                      (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt))))
-                              (throw (ex-info (str "SHACL PropertyShape exception - sh:lessThanOrEquals: "
-                                                   l-flake-o " not less than or equal to " r-flake-o)
-                                              {:status 400 :error :db/shacl-validation}))))))))
+      (:lessThan :lessThanOrEquals) (let [allowed-cmp-results (cond-> #{-1}
+                                                                (= pair-constraint :lessThanOrEquals) (conj 0))]
+                                      (doseq [l-flake lhs-flakes
+                                              r-flake rhs-flakes
+                                              :let [[l-flake-o l-flake-dt] (flake-value l-flake)
+                                                    [r-flake-o r-flake-dt] (flake-value r-flake)]]
+                                        (when (or (not= l-flake-dt
+                                                        r-flake-dt)
+                                                  (not (contains? allowed-cmp-results
+                                                                  (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt))))
+                                          (throw-property-shape-exception!
+                                           (str "sh" pair-constraint ": " l-flake-o " not less than "
+                                                (when (= pair-constraint :lessThanOrEquals) "or equal to ")
+                                                r-flake-o))))))))
 
 (defn validate-shape
   [{:keys [property closed-props] :as shape} p-flakes all-flakes]
