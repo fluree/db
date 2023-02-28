@@ -5,7 +5,6 @@
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.subject-crawl.subject :refer [subj-crawl]]
             [fluree.db.query.subject-crawl.common :refer [order-results]]
-            [fluree.db.query.fql.resp :as legacy-resp]
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.json-ld :as json-ld]))
 
@@ -71,8 +70,9 @@
         cache       (volatile! {})
         fuel-vol    (volatile! 0)
         select-spec (retrieve-select-spec db parsed-query)
-        compact-fn  (->> parsed-query :context json-ld/compact-fn)
-        result-fn   (partial json-ld-resp/flakes->res db cache compact-fn fuel-vol fuel select-spec 0)
+        context     (:context parsed-query)
+        compact-fn  (json-ld/compact-fn context)
+        result-fn   (partial json-ld-resp/flakes->res db cache context compact-fn fuel-vol fuel select-spec 0)
         finish-fn   (build-finishing-fn parsed-query)
         opts        {:rdf-type?     rdf-type?
                      :db            db

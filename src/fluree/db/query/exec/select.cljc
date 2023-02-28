@@ -41,12 +41,12 @@
 (defprotocol ValueSelector
   "Format a where search solution (map of pattern matches) by extracting and
   displaying relevant pattern matches."
-  (format-value [fmt db iri-cache compact error-ch solution]))
+  (format-value [fmt db iri-cache context compact error-ch solution]))
 
 (defrecord VariableSelector [var]
   ValueSelector
   (format-value
-    [_ db iri-cache compact error-ch solution]
+    [_ db iri-cache context compact error-ch solution]
     (-> solution
         (get var)
         (display db iri-cache compact error-ch))))
@@ -60,7 +60,7 @@
 (defrecord AggregateSelector [agg-fn]
   ValueSelector
   (format-value
-    [_ db iri-cache compact error-ch solution]
+    [_ db iri-cache context compact error-ch solution]
     (go (try* (agg-fn solution)
               (catch* e
                       (log/error e "Error applying aggregate selector")
@@ -77,7 +77,7 @@
 (defrecord SubgraphSelector [var selection depth spec]
   ValueSelector
   (format-value
-    [_ db iri-cache compact error-ch solution]
+    [_ db iri-cache context compact error-ch solution]
     (go
       (let [sid (-> solution
                     (get var)
@@ -85,7 +85,7 @@
         (try*
          (let [flakes (<? (query-range/index-range db :spot = [sid]))]
            ;; TODO: Replace these nils with fuel values when we turn fuel back on
-           (<? (json-ld-resp/flakes->res db iri-cache compact nil nil spec 0 flakes)))
+           (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))
          (catch* e
                  (log/error e "Error formatting subgraph for subject:" sid)
                  (>! error-ch e)))))))
@@ -101,22 +101,23 @@
 (defn format-values
   "Formats the values from the specified where search solution `solution`
   according to the selector or collection of selectors specified by `selectors`"
-  [selectors db iri-cache compact error-ch solution]
+  [selectors db iri-cache context compact error-ch solution]
   (if (sequential? selectors)
     (go-loop [selectors  selectors
               values     []]
       (if-let [selector (first selectors)]
-        (let [value (<! (format-value selector db iri-cache compact error-ch solution))]
+        (let [value (<! (format-value selector db iri-cache context compact error-ch solution))]
           (recur (rest selectors)
                  (conj values value)))
         values))
-    (format-value selectors db iri-cache compact error-ch solution)))
+    (format-value selectors db iri-cache context compact error-ch solution)))
 
 (defn format
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
   [db q error-ch solution-ch]
-  (let [compact   (->> q :context json-ld/compact-fn)
+  (let [context   (:context q)
+        compact   (json-ld/compact-fn context)
         selectors (or (:select q)
                       (:select-one q)
                       (:select-distinct q))
@@ -126,7 +127,7 @@
                           format-ch
                           (fn [solution ch]
                             (log/debug "select/format solution:" solution)
-                            (-> (format-values selectors db iri-cache compact error-ch solution)
+                            (-> (format-values selectors db iri-cache context compact error-ch solution)
                                 (async/pipe ch)))
                           solution-ch)
     format-ch))

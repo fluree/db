@@ -22,22 +22,6 @@
         (vswap! cache assoc pid p-spec)
         p-spec)))
 
-(defn p-values
-  [flakes]
-  (let [ff (first flakes)]
-    (cond
-      (= 1 (count flakes))
-      (flake/o ff)                                          ;; TODO - if @container = @list in the query context, should always return a vector even if just one result
-
-      ;; flakes are an @list, return in sorted order
-      (:i (flake/m ff))
-      (->> flakes
-           (sort-by #(:i (flake/m %)))
-           (mapv flake/o))
-
-      :else
-      (mapv flake/o flakes))))
-
 (defn iri?
   [pid]
   (= const/$iri pid))
@@ -58,15 +42,15 @@
       iri)))
 
 (defn crawl-ref-item
-  [db compact-fn flake-sid sub-select cache fuel-vol max-fuel depth-i]
+  [db context compact-fn flake-sid sub-select cache fuel-vol max-fuel depth-i]
   (go-try
     (let [sub-flakes (<? (query-range/index-range db :spot = [flake-sid]))]
-      (<? (flakes->res db cache compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes)))))
+      (<? (flakes->res db cache context compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes)))))
 
 
 (defn add-reverse-specs
   "When @reverse variables are present, crawl for the reverse specs."
-  [db cache compact-fn fuel-vol max-fuel {:keys [reverse] :as select-spec} depth-i flakes]
+  [db cache context compact-fn fuel-vol max-fuel {:keys [reverse] :as select-spec} depth-i flakes]
   (go-try
     (let [sid (flake/s (first flakes))]
       (loop [[reverse-item & r] (vals reverse)
@@ -79,7 +63,7 @@
                              (if ref-sid
                                (let [result (if spec
                                               ;; have a sub-selection
-                                              (<? (crawl-ref-item db compact-fn ref-sid spec cache fuel-vol max-fuel (inc depth-i)))
+                                              (<? (crawl-ref-item db context compact-fn ref-sid spec cache fuel-vol max-fuel (inc depth-i)))
                                               ;; no sub-selection, just return IRI
                                               (or (get @cache ref-sid)
                                                   (<? (cache-sid->iri db cache compact-fn ref-sid))))]
@@ -94,12 +78,12 @@
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
   the requested depth within the select-spec"
-  [db cache compact-fn fuel-vol max-fuel {:keys [wildcard? _id? depth reverse] :as select-spec} depth-i flakes]
+  [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? _id? depth reverse] :as select-spec} depth-i s-flakes]
   (go-try
-    (when (not-empty flakes)
-      (loop [[p-flakes & r] (partition-by flake/p flakes)
+    (when (not-empty s-flakes)
+      (loop [[p-flakes & r] (partition-by flake/p s-flakes)
              acc (if _id?
-                   {:_id (flake/s (first flakes))}
+                   {:_id (flake/s (first s-flakes))}
                    {})]
         (if p-flakes
           (let [ff    (first p-flakes)
@@ -108,6 +92,7 @@
                 spec  (or (get select-spec p)
                           (when wildcard?
                             (wildcard-spec db cache compact-fn p)))
+                p-iri (:as spec)
                 v     (cond
                         (nil? spec)
                         nil
@@ -136,11 +121,11 @@
                                         (cond
                                           ;; have a specified sub-selection (graph crawl)
                                           (:spec spec)
-                                          (<? (crawl-ref-item db compact-fn (flake/o f) (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
+                                          (<? (crawl-ref-item db context compact-fn (flake/o f) (:spec spec) cache fuel-vol max-fuel (inc depth-i)))
 
                                           ;; requested graph crawl depth has not yet been reached
                                           (< depth-i depth)
-                                          (<? (crawl-ref-item db compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
+                                          (<? (crawl-ref-item db context compact-fn (flake/o f) select-spec cache fuel-vol max-fuel (inc depth-i)))
 
                                           ;; no sub-selection, just return {@id <iri>} for each ref iri
                                           :else
@@ -150,12 +135,13 @@
                                             {id-key c-iri}))
                                         (flake/o f))]
                               (recur r (conj acc res)))
-                            (if (= 1 (count acc))
+                            (if (and (= 1 (count acc))
+                                     (not (#{:list :set} (-> context (get p-iri) :container))))
                               (first acc)
                               acc))))]
             (if v
-              (recur r (assoc acc (:as spec) v))
+              (recur r (assoc acc p-iri v))
               (recur r acc)))
           (if reverse
-            (merge acc (<? (add-reverse-specs db cache compact-fn fuel-vol max-fuel select-spec depth-i flakes)))
+            (merge acc (<? (add-reverse-specs db cache context compact-fn fuel-vol max-fuel select-spec depth-i s-flakes)))
             acc))))))
