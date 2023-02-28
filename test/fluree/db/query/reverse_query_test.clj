@@ -22,24 +22,26 @@
                       :schema/name  "Cam"
                       :ex/friend    [:ex/brian :ex/alice]}])]
 
-      (is (= @(fluree/query db '{:context {:friended {:reverse :ex/friend}}
+      (is (= {:schema/name "Brian"
+              :friended    :ex/cam}
+             @(fluree/query db '{:context {:friended {:reverse :ex/friend}}
                                  :selectOne {?s [:schema/name :friended]}
-                                 :where [[?s :id :ex/brian]]})
-             {:schema/name "Brian"
-              :friended    :ex/cam}))
+                                 :where [[?s :id :ex/brian]]})))
 
-      (is (= @(fluree/query db '{:context {:friended {:reverse :ex/friend}},
+
+      (is (= {:schema/name "Alice"
+              :friended    [:ex/cam :ex/brian]}
+             @(fluree/query db '{:context {:friended {:reverse :ex/friend}},
                                  :selectOne {?s [:schema/name :friended]},
-                                 :where [[?s :id :ex/alice]]})
-             {:schema/name "Alice"
-              :friended    [:ex/cam :ex/brian]}))
+                                 :where [[?s :id :ex/alice]]})))
 
 
-      (is (= @(fluree/query db '{:context {:friended {:reverse :ex/friend}},
-                                 :selectOne {?s [:schema/name {:friended [:*]}]},
-                                 :where [[?s :id :ex/brian]]})
-             {:schema/name "Brian",
+      (is (= {:schema/name "Brian",
               :friended    {:id           :ex/cam,
                             :rdf/type     [:ex/User],
                             :schema/name  "Cam",
-                            :ex/friend    [{:id :ex/brian} {:id :ex/alice}]}})))))
+                            :ex/friend    [{:id :ex/brian} {:id :ex/alice}]}}
+             @(fluree/query db '{:context {:friended {:reverse :ex/friend}},
+                                 :selectOne {?s [:schema/name {:friended [:*]}]},
+                                 :where [[?s :id :ex/brian]]}))))))
+
