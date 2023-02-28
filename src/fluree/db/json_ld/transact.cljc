@@ -20,10 +20,27 @@
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [fluree.db.util.validation :as v]
+            [malli.core :as m])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(def registry
+  (merge
+    (m/predicate-schemas)
+    (m/class-schemas)
+    (m/comparator-schemas)
+    (m/type-schemas)
+    (m/sequence-schemas)
+    (m/base-schemas)
+    {::val [:fn v/value?]
+     ::txn-map [:map-of v/iri-key [:orn [:iri v/iri]
+                                        [:val ::val]]]
+     ::txn     [:orn
+                [:single-map ::txn-map]
+                [:collection-of-maps [:sequential ::txn-map]]]}))
 
 (declare json-ld-node->flakes)
 

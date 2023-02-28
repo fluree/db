@@ -1,6 +1,9 @@
 (ns fluree.db.query.fql.syntax
-  (:require [malli.core :as m]
-            [fluree.db.util.core :refer [pred-ident?]]))
+  (:require [clojure.string :as str]
+            [fluree.db.util.log :as log]
+            [malli.core :as m]
+            [fluree.db.util.core :refer [pred-ident?]]
+            [fluree.db.util.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -26,8 +29,6 @@
   [x]
   (and (or (string? x) (symbol? x) (keyword? x))
        (-> x name first (= \?))))
-
-(def value? (complement coll?))
 
 (defn sid?
   [x]
@@ -77,25 +78,32 @@
                              [:string [:fn fn-string?]]
                              [:list [:fn fn-list?]]]
      ::wildcard             [:fn wildcard?]
-     ::var                  [:fn variable?]
-     ::val                  [:fn value?]
-     ::iri                  [:orn
-                             [:keyword keyword?]
-                             [:string string?]]
+     ::var                  [:fn {:decode/json
+                                  (fn [v]
+                                    (log/debug "decoding var:" v)
+                                    (if (string? v)
+                                      (symbol v)
+                                      v))}
+                             variable?]
+     ::val                  [:fn v/value?]
+     ::iri                  v/iri
+     ::iri-pred             v/iri-key
      ::subject              [:orn
                              [:sid [:fn sid?]]
                              [:iri ::iri]
                              [:ident [:fn pred-ident?]]]
-     ::subselect-map        [:map-of ::iri [:ref ::subselection]]
+     ::subselect-map        [:map-of
+                             [:orn [:var ::var] [:iri ::iri]]
+                             [:ref ::subselection]]
      ::subselection         [:sequential [:orn
                                           [:wildcard ::wildcard]
-                                          [:predicate ::iri]
+                                          [:predicate ::iri-pred]
                                           [:subselect-map [:ref ::subselect-map]]]]
      ::select-map           [:map-of {:max 1}
                              ::var ::subselection]
      ::selector             [:orn
                              [:var ::var]
-                             [:pred ::iri]
+                             [:pred ::iri-pred]
                              [:aggregate ::function]
                              [:select-map ::select-map]]
      ::select               [:orn
@@ -135,14 +143,14 @@
                                         [:val ::subject]]]
                              [:predicate [:orn
                                           [:var ::var]
-                                          [:iri ::iri]]]
+                                          [:iri ::iri-pred]]]
                              [:object [:orn
                                        [:var ::var]
+                                       [:iri ::iri]
                                        [:ident [:fn pred-ident?]]
                                        [:val :any]]]]
      ::where-tuple          [:orn
                              [:triple ::triple]
-                             [:binding [:sequential {:max 2} :any]]
                              [:remote [:sequential {:max 4} :any]]]
      ::where-pattern        [:orn
                              [:where-map ::where-map]
@@ -152,7 +160,7 @@
                              [:collection [:sequential ::where-pattern]]]
      ::filter               [:sequential ::function]
      ::union                [:sequential [:sequential ::where-pattern]]
-     ::bind                 [:map-of ::var :any]
+     ::bind                 [:map-of ::var ::function]
      ::where                [:sequential [:orn
                                           [:where-map ::where-map]
                                           [:tuple ::where-tuple]]]
@@ -201,7 +209,14 @@
      ::multi-query          [:map-of [:or :string :keyword] ::analytical-query]
      ::query                [:orn
                              [:single ::analytical-query]
-                             [:multi ::multi-query]]}))
+                             [:multi ::multi-query]]
+
+     ::query-results        [:sequential
+                             [:map-of ::iri-pred [:or ::iri ::val
+                                                  [:sequential
+                                                   [:or ::iri ::val]]]]]
+
+     ::multi-query-results  [:map-of [:or :string :keyword] ::query-results]}))
 
 (def query-validator
   (m/validator ::query {:registry registry}))
