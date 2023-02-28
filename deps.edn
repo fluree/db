@@ -16,7 +16,7 @@
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
          ch.qos.logback/logback-classic  {:mvn/version "1.4.5"}
-         org.slf4j/slf4j-api             {:mvn/version "2.0.5"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.6"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -44,8 +44,8 @@
 
  :aliases
  {:build
-  {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.5"
-                                               :git/sha "b73ff34"}
+  {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.3"
+                                               :git/sha "f37d64e"}
                 slipset/deps-deploy           {:mvn/version "0.2.0"}}
    :ns-default build}
 
@@ -54,12 +54,12 @@
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.20.12"}
+                 thheller/shadow-cljs              {:mvn/version "2.20.20"}
                  com.magnars/test-with-files {:mvn/version "2021-02-17"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources"]
-   :extra-deps  {lambdaisland/kaocha         {:mvn/version "1.71.1119"}
+   :extra-deps  {lambdaisland/kaocha         {:mvn/version "1.77.1236"}
                  org.clojure/test.check      {:mvn/version "1.1.1"}
                  io.github.cap10morgan/test-with-files {:git/tag "v1.0.0"
                                                         :git/sha "9181a2e"}}
@@ -107,5 +107,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.11.02"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.01.20"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
