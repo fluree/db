@@ -617,3 +617,137 @@
                    :ex/p1   [11 17]
                    :ex/p2 17}]
                  @(fluree/query db-ok2 user-query))))))))
+
+(deftest ^:integration shacl-value-range
+  (testing "shacl value range constraints"
+    (let [conn          (test-utils/create-conn)
+          ledger        @(fluree/create conn "shacl/value-range")
+          user-query    {:context {:ex "http://example.org/ns/"}
+                         :select  {'?s [:*]}
+                         :where   [['?s :rdf/type :ex/User]]}]
+      (testing "exclusive constraints"
+        (let [db            @(fluree/stage
+                              (fluree/db ledger)
+                              {:context              {:ex "http://example.org/ns/"}
+                               :id                   :ex/ExclusiveNumRangeShape
+                               :type                 [:sh/NodeShape],
+                               :sh/targetClass       :ex/User
+                               :sh/property          [{:sh/path     :schema/age
+                                                       :sh/minExclusive 1
+                                                       :sh/maxExclusive 100}]})
+              db-ok         @(fluree/stage
+                              db
+                              {:context     {:ex "http://example.org/ns/"}
+                               :id          :ex/john,
+                               :type        [:ex/User],
+                               :schema/age  2})
+              db-too-low         (try @(fluree/stage
+                                        db
+                                        {:context     {:ex "http://example.org/ns/"}
+                                         :id          :ex/john,
+                                         :type        [:ex/User],
+                                         :schema/age  1})
+                                      (catch Exception e e))
+              db-too-high         (try @(fluree/stage
+                                         db
+                                         {:context     {:ex "http://example.org/ns/"}
+                                          :id          :ex/john,
+                                          :type        [:ex/User],
+                                          :schema/age  100})
+                                       (catch Exception e e))]
+          (is (util/exception? db-too-low)
+              "Exception, because :schema/age is below the minimum")
+          (is (str/starts-with? (ex-message db-too-low)
+                                "SHACL PropertyShape exception - sh:minExclusive: value 1"))
+
+          (is (util/exception? db-too-high)
+              "Exception, because :schema/age is above the maximum")
+          (is (str/starts-with? (ex-message db-too-high)
+                                "SHACL PropertyShape exception - sh:maxExclusive: value 100"))
+
+          (is (= @(fluree/query db-ok user-query)
+                 [{:id          :ex/john,
+                   :rdf/type   [:ex/User],
+                   :schema/age 2}]))))
+      (testing "inclusive constraints"
+        (let [db            @(fluree/stage
+                              (fluree/db ledger)
+                              {:context              {:ex "http://example.org/ns/"}
+                               :id                   :ex/InclusiveNumRangeShape
+                               :type                 [:sh/NodeShape],
+                               :sh/targetClass       :ex/User
+                               :sh/property          [{:sh/path     :schema/age
+                                                       :sh/minInclusive 1
+                                                       :sh/maxInclusive 100}]})
+              db-ok         @(fluree/stage
+                              db
+                              {:context     {:ex "http://example.org/ns/"}
+                               :id          :ex/brian
+                               :type        [:ex/User],
+                               :schema/age  1})
+              db-ok2        @(fluree/stage
+                              db-ok
+                              {:context     {:ex "http://example.org/ns/"}
+                               :id          :ex/alice,
+                               :type        [:ex/User],
+                               :schema/age  100})
+              db-too-low      @(fluree/stage
+                                db
+                                {:context     {:ex "http://example.org/ns/"}
+                                 :id          :ex/alice,
+                                 :type        [:ex/User],
+                                 :schema/age  0})
+              db-too-high      @(fluree/stage
+                                 db
+                                 {:context     {:ex "http://example.org/ns/"}
+                                  :id          :ex/alice,
+                                  :type        [:ex/User],
+                                  :schema/age  101})]
+          (is (util/exception? db-too-low)
+              "Exception, because :schema/age is below the minimum")
+          (is (str/starts-with? (ex-message db-too-low)
+                                "SHACL PropertyShape exception - sh:minInclusive: value 0"))
+
+          (is (util/exception? db-too-high)
+              "Exception, because :schema/age is above the maximum")
+          (is (str/starts-with? (ex-message db-too-high)
+                                "SHACL PropertyShape exception - sh:maxInclusive: value 101"))
+          (is (= @(fluree/query db-ok2 user-query)
+                 [{:id :ex/alice
+                   :rdf/type [:ex/User]
+                   :schema/age 100}
+                  {:id :ex/brian
+                   :rdf/type [:ex/User]
+                   :schema/age 1}]))))
+      (testing "non-numeric values"
+        (let [db            @(fluree/stage
+                              (fluree/db ledger)
+                              {:context              {:ex "http://example.org/ns/"}
+                               :id                   :ex/NumRangeShape
+                               :type                 [:sh/NodeShape],
+                               :sh/targetClass       :ex/User
+                               :sh/property          [{:sh/path     :schema/age
+                                                       :sh/minExclusive 0}]})
+              db-subj-id          (try @(fluree/stage
+                                         db
+                                         {:context     {:ex "http://example.org/ns/"}
+                                          :id          :ex/alice,
+                                          :type        [:ex/User],
+                                          :schema/age  :ex/brian})
+                                       (catch Exception e e))
+              db-string      (try @(fluree/stage
+                                    db
+                                    {:context     {:ex "http://example.org/ns/"}
+                                     :id          :ex/alice,
+                                     :type        [:ex/User],
+                                     :schema/age  "10"})
+                                  (catch Exception e e))]
+          (is (util/exception? db-subj-id)
+              "Exception, because :schema/age is not a number")
+          (is (str/starts-with? (ex-message db-string)
+                                "SHACL PropertyShape exception - sh:minExclusive"))
+
+          (is (util/exception? db-string)
+              "Exception, because :schema/age is not a number")
+          (is (str/starts-with? (ex-message db-string)
+                                "SHACL PropertyShape exception - sh:minExclusive: value 10")))))))
