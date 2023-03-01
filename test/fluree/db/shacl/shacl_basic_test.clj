@@ -465,8 +465,16 @@
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
                                    :ex/p2 [12 16]})
-                                (catch Exception e e))]
-
+                                (catch Exception e e))
+              db-iris         (try @(fluree/stage
+                                     db
+                                     {:context     {:ex "http://example.org/ns/"}
+                                      :id          :ex/alice,
+                                      :type        [:ex/User],
+                                      :schema/name "Alice"
+                                      :ex/p1 :ex/brian
+                                      :ex/p2 :ex/john})
+                                   (catch Exception e e))]
           (is (util/exception? db-fail1)
               "Exception, because :ex/p1 is not less than :ex/p2")
           (is (str/starts-with? (ex-message db-fail1)
@@ -487,6 +495,12 @@
               "Exception, because :ex/p1 is not less than :ex/p2")
           (is (str/starts-with? (ex-message db-fail4)
                                 "SHACL PropertyShape exception - sh:lessThan"))
+
+          (is (util/exception? db-iris)
+              "Exception, because :ex/p1 and :ex/p2 are iris, and not valid for comparison")
+          (is (str/starts-with? (ex-message db-iris)
+                                "SHACL PropertyShape exception - sh:lessThan"))
+
           (is (= [{:id          :ex/alice,
                    :rdf/type        [:ex/User],
                    :schema/name "Alice"

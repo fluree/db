@@ -54,6 +54,33 @@
   (throw (ex-info (str "SHACL PropertyShape exception - " msg ".")
                       {:status 400 :error :db/shacl-validation})))
 
+(def numeric-types
+  #{const/$xsd:int
+    const/$xsd:short
+    const/$xsd:float
+    const/$xsd:unsignedLong
+    const/$xsd:unsignedInt
+    const/$xsd:unsignedShort
+    const/$xsd:positiveInteger
+    const/$xsd:nonPositiveInteger
+    const/$xsd:negativeInteger
+    const/$xsd:nonNegativeInteger
+    const/$xsd:decimal
+    const/$xsd:double
+    const/$xsd:integer
+    const/$xsd:long})
+
+(def time-types
+  #{const/$xsd:date
+    const/$xsd:dateTime
+    const/$xsd:duration
+    const/$xsd:gDay
+    const/$xsd:gMonth
+    const/$xsd:gMonthDay
+    const/$xsd:gYear
+    const/$xsd:gYearMonth
+    const/$xsd:time})
+
 (defn validate-property
   "Validates a PropertyShape for a single predicate
   against a set of flakes"
@@ -86,19 +113,21 @@
                                  (str "sh:disjoint: " (mapv flake/o lhs-flakes) " not disjoint from " (mapv flake/o rhs-flakes))))))
 
       (:lessThan :lessThanOrEquals) (let [allowed-cmp-results (cond-> #{-1}
-                                                                (= pair-constraint :lessThanOrEquals) (conj 0))]
+                                                                (= pair-constraint :lessThanOrEquals) (conj 0))
+                                          valid-cmp-types (into numeric-types time-types)]
                                       (doseq [l-flake lhs-flakes
                                               r-flake rhs-flakes
                                               :let [[l-flake-o l-flake-dt] (flake-value l-flake)
                                                     [r-flake-o r-flake-dt] (flake-value r-flake)]]
                                         (when (or (not= l-flake-dt
                                                         r-flake-dt)
+                                                  (not (contains? valid-cmp-types l-flake-dt))
                                                   (not (contains? allowed-cmp-results
                                                                   (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt))))
                                           (throw-property-shape-exception!
                                            (str "sh" pair-constraint ": " l-flake-o " not less than "
                                                 (when (= pair-constraint :lessThanOrEquals) "or equal to ")
-                                                r-flake-o))))))))
+                                                r-flake-o ", or values are not valid for comparison"))))))))
 
 (defn validate-shape
   [{:keys [property closed-props] :as shape} flake-p-partitions all-flakes]
