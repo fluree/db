@@ -24,8 +24,8 @@
                                    (:contextType opts)))
                   :context-str
                   :context)
-        db-ctx (get-in db [:schema ctx-key])
-        q-ctx  (or (:context q) (get q "@context"))]
+        db-ctx  (get-in db [:schema ctx-key])
+        q-ctx   (or (:context q) (get q "@context"))]
     (json-ld/parse-context db-ctx q-ctx)))
 
 (defn parse-var-name
@@ -51,9 +51,9 @@
   [q]
   (when-let [values (:values q)]
     (let [[vars vals] values
-          vars*       (util/sequential vars)
-          vals*       (mapv util/sequential vals)
-          var-count   (count vars*)]
+          vars*     (util/sequential vars)
+          vals*     (mapv util/sequential vals)
+          var-count (count vars*)]
       (if (every? (fn [bdg]
                     (= (count bdg) var-count))
                   vals*)
@@ -88,9 +88,9 @@
                         {:status 400 :error :db/invalid-query})))
       code)
     (catch* e
-            (log/warn e "Invalid query function attempted: " code-str)
-            (throw (ex-info (str "Invalid query function: " code-str)
-                            {:status 400 :error :db/invalid-query})))))
+      (log/warn e "Invalid query function attempted: " code-str)
+      (throw (ex-info (str "Invalid query function: " code-str)
+                      {:status 400 :error :db/invalid-query})))))
 
 (defn variables
   "Returns the set of items within the arbitrary data structure `data` that
@@ -129,12 +129,13 @@
 
 (defn parse-code
   [x]
+  (log/debug "parse-code:" x)
   (if (list? x)
     x
     (safe-read x)))
 
 (defn parse-filter-function
-  "Evals, and returns query function."
+  "Evals and returns filter function."
   [fltr vars]
   (let [code      (parse-code fltr)
         code-vars (or (not-empty (variables code))
@@ -142,6 +143,15 @@
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)
         f         (eval/compile-filter code var-name)]
+    (where/->function var-name f)))
+
+(defn parse-bind-function
+  "Evals and returns bind function."
+  [var-name fn-code]
+  (let [code (parse-code fn-code)
+        _    (log/debug "parse-bind-function code:" code)
+        f    (eval/compile code false)]
+    (log/debug "parse-bind-function f:" f)
     (where/->function var-name f)))
 
 (def ^:const default-recursion-depth 100)
@@ -266,14 +276,19 @@
 
 (defmulti parse-pattern
   (fn [pattern _vars _db _context]
-    (if (map? pattern)
-      (->> pattern keys first)
-      :triple)))
+    (log/debug "parse-pattern pattern:" pattern)
+    (cond
+      (map? pattern) (->> pattern keys first)
+      (map-entry? pattern) :binding
+      :else :triple)))
 
-(defn filter-pattern?
-  [x]
+(defn type-pattern?
+  [typ x]
   (and (map? x)
-       (-> x keys first (= :filter))))
+       (-> x keys first (= typ))))
+
+(def filter-pattern?
+  (partial type-pattern? :filter))
 
 (defn parse-filter-maps
   [vars filters]
@@ -291,15 +306,22 @@
                                               (conj fltr))))))
                  {}))))
 
+(defn parse-bind-map
+  [bind]
+  (reduce (fn [m k] (update m k #(parse-bind-function k %)))
+          bind (keys bind)))
+
 (defn parse-where-clause
   [clause vars db context]
   (let [patterns (->> clause
                       (remove filter-pattern?)
+                      (log/debug->>val "patterns to parse:")
                       (mapv (fn [pattern]
                               (parse-pattern pattern vars db context))))
         filters  (->> clause
                       (filter filter-pattern?)
                       (parse-filter-maps vars))]
+    (log/debug "parse-where-clause patterns:" patterns)
     (where/->where-clause patterns filters)))
 
 (defn parse-triple
@@ -319,6 +341,7 @@
 
 (defmethod parse-pattern :triple
   [triple _ db context]
+  (log/debug "parse-triple:" triple)
   (parse-triple triple db context))
 
 (defmethod parse-pattern :union
@@ -336,6 +359,19 @@
         parsed (parse-where-clause clause vars db context)]
     (where/->pattern :optional parsed)))
 
+(defmethod parse-pattern :bind
+  [{:keys [bind]} _vars _db _context]
+  (let [parsed (parse-bind-map bind)
+        _ (log/debug "parsed bind map:" parsed)
+        pattern (where/->pattern :bind parsed)]
+    (log/debug "parse-pattern :bind pattern:" pattern)
+    pattern))
+
+(defmethod parse-pattern :binding
+  [[v f] _vars _db _context]
+  (log/debug "parse-pattern binding v:" v "- f:" f)
+  (where/->pattern :binding [v f]))
+
 (defn parse-where
   [q vars db context]
   (when-let [where (:where q)]
@@ -346,9 +382,9 @@
   (cond
     (syntax/variable? s) (-> s parse-var-name select/variable-selector)
     (syntax/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
-    (select-map? s)      (let [{:keys [variable selection depth spec]}
-                               (parse-subselection db context s depth)]
-                           (select/subgraph-selector variable selection depth spec))))
+    (select-map? s) (let [{:keys [variable selection depth spec]}
+                          (parse-subselection db context s depth)]
+                      (select/subgraph-selector variable selection depth spec))))
 
 (defn parse-select-clause
   [clause db context depth]
@@ -364,21 +400,21 @@
                            (when (contains? q k) k))
                          [:select :selectOne :select-one
                           :selectDistinct :select-distinct])
-        select (-> q
-                   (get select-key)
-                   (parse-select-clause db context depth))]
+        select     (-> q
+                       (get select-key)
+                       (parse-select-clause db context depth))]
     (case select-key
       (:select
        :select-one
        :select-distinct) (assoc q select-key select)
 
-      :selectOne         (-> q
-                             (dissoc :selectOne)
-                             (assoc :select-one select))
+      :selectOne (-> q
+                     (dissoc :selectOne)
+                     (assoc :select-one select))
 
-      :selectDistinct    (-> q
-                             (dissoc :selectDistinct)
-                             (assoc :select-distinct select)))))
+      :selectDistinct (-> q
+                          (dissoc :selectDistinct)
+                          (assoc :select-distinct select)))))
 
 (defn ensure-vector
   [x]
@@ -402,7 +438,7 @@
                    (if-let [v (parse-var-name ord)]
                      [v :asc]
                      (let [[dir dim] ord
-                           v         (parse-var-name dim)]
+                           v (parse-var-name dim)]
                        (if (syntax/asc? dir)
                          [v :asc]
                          [v :desc])))))))
@@ -415,17 +451,18 @@
 
 (defn parse-analytical-query*
   [q db]
-  (let [context       (parse-context q db)
+  (let [context  (parse-context q db)
         [vars values] (parse-values q)
-        where         (parse-where q vars db context)
-        grouping      (parse-grouping q)
-        ordering      (parse-ordering q)]
+        _        (log/debug "parse-analytical-query*:" q)
+        where    (parse-where q vars db context)
+        grouping (parse-grouping q)
+        ordering (parse-ordering q)]
     (-> q
         (assoc :context context
-               :where   where)
+               :where where)
         (cond-> (seq values) (assoc :values values)
-                grouping     (assoc :group-by grouping)
-                ordering     (assoc :order-by ordering))
+                grouping (assoc :group-by grouping)
+                ordering (assoc :order-by ordering))
         parse-having
         (parse-select db context))))
 
@@ -443,11 +480,11 @@
 (defn parse-delete
   [q db]
   (when (:delete q)
-    (let [context       (parse-context q db)
+    (let [context (parse-context q db)
           [vars values] (parse-values q)
-          where         (parse-where q vars db context)]
+          where   (parse-where q vars db context)]
       (-> q
           (assoc :context context
-                 :where   where)
+                 :where where)
           (cond-> (seq values) (assoc :values values))
           (update :delete parse-triple db context)))))

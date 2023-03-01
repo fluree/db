@@ -1,7 +1,7 @@
 (ns fluree.db.test-utils
   (:require [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             #?@(:cljs [[clojure.core.async :refer [go go-loop]]
                        [clojure.core.async.interop :refer [<p!]]])))
 
@@ -74,7 +74,15 @@
     :schema/email "cam@example.org"
     :schema/age   34
     :ex/favNums   [5, 10]
-    :ex/friend    [:ex/brian :ex/alice]}])
+    :ex/friend    [:ex/brian :ex/alice]}
+   {:context      {:ex "http://example.org/ns/"}
+    :id           :ex/liam
+    :type         :ex/User
+    :schema/name  "Liam"
+    :schema/email "liam@example.org"
+    :schema/age   13
+    :ex/favNums   [42, 11]
+    :ex/friend    [:ex/brian :ex/alice :ex/cam]}])
 
 (defn create-conn
   ([]
@@ -116,18 +124,17 @@
   do it for you. In CLJS it will not retry and will return a core.async chan."
   [pwrapped max-attempts & [retry-on-false?]]
   (#?(:clj loop :cljs go-loop) [attempt 0]
-    (let [error? #(instance? #?(:clj Throwable :cljs js/Error) %)
-          res' (try*
+    (let [res' (try*
                  (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
-                   (if (error? res)
+                   (if (util/exception? res)
                      (throw res)
                      res))
                  (catch* e e))]
       (if (= (inc attempt) max-attempts)
-        (if (error? res')
+        (if (util/exception? res')
           (throw res')
           res')
-        (if (or (error? res')
+        (if (or (util/exception? res')
                 (and retry-on-false? (false? res')))
           (do
             #?(:clj (Thread/sleep 100))

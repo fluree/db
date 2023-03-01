@@ -20,7 +20,7 @@
 (defn idx-for
   [s p o]
   (cond
-    s         :spot
+    s :spot
     (and p o) :post
     p         :psot
     o         (if (reference? o)
@@ -31,12 +31,12 @@
 
 (defn resolve-flake-range
   [{:keys [conn t] :as db} error-ch components]
-  (let [out-ch               (async/chan)
-        [s-cmp p-cmp o-cmp]  components
+  (let [out-ch (async/chan)
+        [s-cmp p-cmp o-cmp] components
         {s ::val, s-fn ::fn} s-cmp
         {p ::val, p-fn ::fn} p-cmp
-        {o ::val, o-fn ::fn
-         o-dt ::datatype}    o-cmp]
+        {o    ::val, o-fn ::fn
+         o-dt ::datatype} o-cmp]
     (go
       (try* (let [s*          (if (and s (not (number? s)))
                                 (<? (dbproto/-subid db s true))
@@ -53,17 +53,17 @@
                                        :start-flake start-flake
                                        :end-test    <=
                                        :end-flake   end-flake}
-                                s-fn (assoc :subject-fn s-fn)
-                                p-fn (assoc :predicate-fn p-fn)
-                                o-fn (assoc :object-fn o-fn))]
+                                      s-fn (assoc :subject-fn s-fn)
+                                      p-fn (assoc :predicate-fn p-fn)
+                                      o-fn (assoc :object-fn o-fn))]
               (-> (query-range/resolve-flake-slices conn idx-root novelty
                                                     error-ch opts)
                   (->> (query-range/filter-authorized db start-flake end-flake
                                                       error-ch))
                   (async/pipe out-ch)))
             (catch* e
-                    (log/error e "Error resolving flake range")
-                    (>! error-ch e))))
+              (log/error e "Error resolving flake range")
+              (>! error-ch e))))
     out-ch))
 
 (defn unmatched
@@ -74,8 +74,8 @@
 (defn match-value
   ([m x dt]
    (assoc m
-          ::val      x
-          ::datatype dt)))
+     ::val x
+     ::datatype dt)))
 
 (defn anonymous-value
   "Build a pattern that already matches an explicit value."
@@ -98,7 +98,7 @@
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
-  #?(:clj (MapEntry/create typ data)
+  #?(:clj  (MapEntry/create typ data)
      :cljs (MapEntry. typ data nil)))
 
 (defn ->ident
@@ -107,8 +107,8 @@
   {::ident x})
 
 (defn ->function
-  "Build a filter function specification for the variable `var` out of the
-  boolean function `f`."
+  "Build a query function specification for the variable `var` out of the
+  parsed function `f`."
   [var f]
   (-> var
       unmatched
@@ -136,9 +136,8 @@
   ([patterns]
    {::patterns patterns})
   ([patterns filters]
-   (-> patterns
-       ->where-clause
-       (assoc ::filters filters))))
+   (cond-> (->where-clause patterns)
+           (seq filters) (assoc ::filters filters))))
 
 (defn pattern-type
   [pattern]
@@ -148,9 +147,9 @@
 
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
-  `db` that are compatible with the initial solution `solution` and matches the
-  additional where-clause pattern `pattern`."
-  (fn [db solution pattern filters error-ch]
+   `db` that are compatible with the initial solution `solution` and matches the
+   additional where-clause pattern `pattern`."
+  (fn [_db _solution pattern _filters _error-ch]
     (pattern-type pattern)))
 
 (defn assign-matched-values
@@ -162,9 +161,12 @@
   to the value associated with that variable from the `filter` specification
   map."
   [triple-pattern solution filters]
+  (log/debug "assign-matched-values triple-pattern:" triple-pattern)
+  (log/debug "assign-matched-values solution:" solution)
   (mapv (fn [component]
           (if-let [variable (::var component)]
             (let [match (get solution variable)]
+              (log/debug "assign-matched-values variable:" variable)
               (if-let [value (::val match)]
                 (let [dt (::datatype match)]
                   (match-value component value dt))
@@ -173,6 +175,7 @@
                                          (map (fn [f]
                                                 (partial f solution)))
                                          (apply every-pred))]
+                  (log/debug "assign-matched-values filter-fn:" filter-fn)
                   (assoc component ::fn filter-fn))))
             component))
         triple-pattern))
@@ -203,13 +206,14 @@
   [solution triple-pattern flake]
   (let [[s p o] triple-pattern]
     (cond-> solution
-      (unmatched? s) (assoc (::var s) (match-subject s flake))
-      (unmatched? p) (assoc (::var p) (match-predicate p flake))
-      (unmatched? o) (assoc (::var o) (match-object o flake)))))
+            (unmatched? s) (assoc (::var s) (match-subject s flake))
+            (unmatched? p) (assoc (::var p) (match-predicate p flake))
+            (unmatched? o) (assoc (::var o) (match-object o flake)))))
 
 (defmethod match-pattern :tuple
   [db solution pattern filters error-ch]
   (let [cur-vals (assign-matched-values pattern solution filters)
+        _        (log/debug "assign-matched-values returned:" cur-vals)
         flake-ch (resolve-flake-range db error-ch cur-vals)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
@@ -220,6 +224,7 @@
   [db solution pattern filters error-ch]
   (let [triple   (val pattern)
         cur-vals (assign-matched-values triple solution filters)
+        _        (log/debug "assign-matched-values returned:" cur-vals)
         flake-ch (resolve-flake-range db error-ch cur-vals)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
@@ -253,7 +258,8 @@
 (defmethod match-pattern :class
   [db solution pattern filters error-ch]
   (let [triple   (val pattern)
-        [s p o]  (assign-matched-values triple solution filters)
+        [s p o] (assign-matched-values triple solution filters)
+        _        (log/debug "assign-matched-values returned:" s p o)
         cls      (::val o)
         classes  (into [cls] (dbproto/-class-prop db :subclasses cls))
         class-ch (async/to-chan! classes)
@@ -265,6 +271,7 @@
                           match-ch
                           (fn [cls ch]
                             (-> (resolve-flake-range db error-ch [s p (assoc o ::val cls)])
+                                (log/debug->val "match-pattern :class pipeline fn flake range:")
                                 (async/pipe ch)))
                           class-ch)
     match-ch))
@@ -291,6 +298,7 @@
         filters    (::filters clause)
         patterns   (::patterns clause)]
     (reduce (fn [solution-ch pattern]
+              (log/debug "calling with-constraint w/ pattern:" pattern)
               (with-constraint db pattern filters error-ch solution-ch))
             initial-ch patterns)))
 
@@ -344,6 +352,27 @@
     (-> (match-clause db solution clause error-ch)
         (async/pipe opt-ch))))
 
+(defn add-fn-result-to-solution
+  [solution var-name result]
+  (let [dt (datatype/infer result)]
+    (assoc solution var-name {::var var-name ::val result ::datatype dt})))
+
+(defmethod match-pattern :bind
+  [_db solution pattern _ error-ch]
+  (let [bind (val pattern)]
+    (log/debug "match-pattern :bind bind:" bind)
+    (log/debug "match-pattern :bind solution:" solution)
+    (go
+      (reduce (fn [solution* b]
+                (let [f        (::fn b)
+                      var-name (::var b)]
+                  (try*
+                    (->> (f solution)
+                         (log/debug->>val "bind fn result:")
+                         (add-fn-result-to-solution solution* var-name))
+                    (catch* e (>! error-ch e)))))
+              solution (vals bind)))))
+
 (def blank-solution {})
 
 (defn search
@@ -357,7 +386,9 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [initial-solution ch]
+                            (log/debug "search calling match-clause w/ where-clause:" where-clause)
                             (-> (match-clause db initial-solution where-clause error-ch)
+                                #_(log/debug-async->vals "match-clause results:")
                                 (async/pipe ch)))
                           (async/to-chan! initial-solutions))
     out-ch))

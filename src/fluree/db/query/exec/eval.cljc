@@ -2,6 +2,7 @@
   (:refer-clojure :exclude [compile rand])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.util.log :as log]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]])
@@ -68,8 +69,8 @@
        (take n)
        vec))
 
-(def allowed-aggregates
-  '#{abs as avg ceil count count-distinct distinct floor groupconcat
+(def allowed-aggregate-fns
+  '#{avg ceil count count-distinct distinct floor groupconcat
      median max min rand sample stddev str sum variance})
 
 (defmacro coalesce
@@ -115,12 +116,16 @@
   [s substr]
   (str/ends-with? s substr))
 
-(def allowed-filters
-  '#{&& || ! > < >= <= = + - * / and bound coalesce if nil?
-     not not= now or re-find re-pattern strStarts strEnds})
+(defn subStr
+  [s start end]
+  (subs s start end))
+
+(def allowed-scalar-fns
+  '#{abs && || ! > < >= <= = + - * / quot and bound coalesce if nil?
+     not not= now or re-find re-pattern strStarts strEnds subStr})
 
 (def allowed-symbols
-  (set/union allowed-aggregates allowed-filters))
+  (set/union allowed-aggregate-fns allowed-scalar-fns))
 
 (defn variable?
   [sym]
@@ -164,6 +169,7 @@
     stddev      fluree.db.query.exec.eval/stddev
     strStarts   fluree.db.query.exec.eval/strStarts
     strEnds     fluree.db.query.exec.eval/strEnds
+    subStr      fluree.db.query.exec.eval/subStr
     sum         fluree.db.query.exec.eval/sum
     variance    fluree.db.query.exec.eval/variance
     !           fluree.db.query.exec.eval/!
@@ -171,22 +177,29 @@
     ||          fluree.db.query.exec.eval/||})
 
 (defn qualify
-  [sym]
-  (if (contains? allowed-symbols sym)
-    (get qualified-symbols sym sym)
-    (throw (ex-info (str "Query function references illegal symbol: " sym)
-                    {:status 400, :error :db/invalid-query}))))
+  [sym allow-aggregates?]
+  (let [allowed-fns (if allow-aggregates?
+                      allowed-symbols
+                      allowed-scalar-fns)]
+    (if (contains? allowed-fns sym)
+      (let [qsym (get qualified-symbols sym sym)]
+        (log/debug "qualified symbol" sym "as" qsym)
+        qsym)
+      (let [err-msg (if (and (not allow-aggregates?)
+                             (contains? allowed-aggregate-fns sym))
+                      (str "Aggregate function " sym " is only valid for grouped values")
+                      (str "Query function references illegal symbol: " sym))]
+        (throw (ex-info err-msg
+                        {:status 400, :error :db/invalid-query}))))))
 
 (defn coerce
-  [code]
+  [code allow-aggregates?]
   (postwalk (fn [x]
               (if (and (symbol? x)
                        (not (variable? x)))
-                (qualify x)
+                (qualify x allow-aggregates?)
                 x))
             code))
-
-
 
 (defn bind-variables
   [soln-sym var-syms]
@@ -201,14 +214,18 @@
        (into [])))
 
 (defn compile
-  [code]
-  (let [qualified-code (coerce code)
-        vars           (variables qualified-code)
-        soln-sym       'solution
-        bdg            (bind-variables soln-sym vars)]
-    (eval `(fn [~soln-sym]
-             (let ~bdg
-               ~qualified-code)))))
+  ([code] (compile code true))
+  ([code allow-aggregates?]
+   (let [qualified-code (coerce code allow-aggregates?)
+         vars           (variables qualified-code)
+         soln-sym       'solution
+         bdg            (bind-variables soln-sym vars)
+         fn-code        `(fn [~soln-sym]
+                           (log/debug "fn solution:" ~soln-sym)
+                           (let ~bdg
+                             ~qualified-code))]
+     (log/debug "compiled fn:" fn-code)
+     (eval fn-code))))
 
 (defn compile-filter
   [code var]
