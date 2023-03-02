@@ -1,8 +1,8 @@
 (ns fluree.db.query.misc-queries-test
-  (:require
-    [clojure.test :refer :all]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]))
+  (:require [clojure.test :refer :all]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.db.util.core :as util]))
 
 (deftest ^:integration select-sid
   (testing "Select index's subject id in query using special keyword"
@@ -58,26 +58,26 @@
         "override unwrapping with @list")))
 
 (deftest ^:integration s+p+o-full-db-queries
-  (testing "Query that pulls entire database."
-    (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
-      (let [conn   (test-utils/create-conn)
-            ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
-            db     @(fluree/stage
-                      (fluree/db ledger)
-                      {:graph [{:id           :ex/alice,
-                                :type         :ex/User,
-                                :schema/name  "Alice"
-                                :schema/email "alice@flur.ee"
-                                :schema/age   42}
-                               {:id          :ex/bob,
-                                :type        :ex/User,
-                                :schema/name "Bob"
-                                :schema/age  22}
-                               {:id           :ex/jane,
-                                :type         :ex/User,
-                                :schema/name  "Jane"
-                                :schema/email "jane@flur.ee"
-                                :schema/age   30}]})]
+  (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
+          db     @(fluree/stage
+                   (fluree/db ledger)
+                   {:graph [{:id           :ex/alice,
+                             :type         :ex/User,
+                             :schema/name  "Alice"
+                             :schema/email "alice@flur.ee"
+                             :schema/age   42}
+                            {:id          :ex/bob,
+                             :type        :ex/User,
+                             :schema/name "Bob"
+                             :schema/age  22}
+                            {:id           :ex/jane,
+                             :type         :ex/User,
+                             :schema/name  "Jane"
+                             :schema/email "jane@flur.ee"
+                             :schema/age   30}]})]
+      (testing "Query that pulls entire database."
         (is (= [[:ex/jane :id "http://example.org/ns/jane"]
                 [:ex/jane :rdf/type :ex/User]
                 [:ex/jane :schema/name "Jane"]
@@ -263,5 +263,27 @@
                   ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
                    :f/context
                    "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]]
-                @(fluree/query db* {:select ['?s '?p '?o]
-                                    :where  [['?s '?p '?o]]}))))))))
+                 @(fluree/query db* {:select ['?s '?p '?o]
+                                     :where  [['?s '?p '?o]]}))))))))
+
+(deftest ^:integration illegal-reference-test
+  (testing "Illegal reference queries"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+      (testing "with non-string objects"
+        (let [test-subject @(fluree/query db {:select ['?s '?p]
+                                              :where [['?s '?p 22]]})]
+          (is (util/exception? test-subject)
+              "return errors")
+          (is (= :db/invalid-query
+                 (-> test-subject ex-data :error))
+              "have 'invalid query' error codes")))
+      (testing "with string objects"
+        (let [test-subject @(fluree/query db {:select ['?s '?p]
+                                              :where [['?s '?p "Bob"]]})]
+          (is (util/exception? test-subject)
+              "return errors")
+          (is (= :db/invalid-query
+                 (-> test-subject ex-data :error))
+              "have 'invalid query' error codes"))))))

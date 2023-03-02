@@ -12,14 +12,22 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn reference?
+  [match]
+  (= (::datatype match)
+     const/$xsd:anyURI))
+
 (defn idx-for
   [s p o]
   (cond
     s :spot
     (and p o) :post
-    p :psot
-    o :opst
-    :else :spot))
+    p         :psot
+    o         (if (reference? o)
+                :opst
+                (throw (ex-info (str "Illegal reference object value" (::var o))
+                                {:status 400 :error :db/invalid-query})))
+    :else     :spot))
 
 (defn resolve-flake-range
   [{:keys [conn t] :as db} error-ch components]
@@ -80,7 +88,7 @@
 
 (defn matched?
   [component]
-  (::val component))
+  (-> component ::val boolean))
 
 (def unmatched?
   "Returns true if the triple pattern component `component` represents a variable
