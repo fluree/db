@@ -181,6 +181,17 @@
               #"Aggregate function sum is only valid for grouped values"
               (ex-message @(fluree/query db q))))))))
 
+(deftest ^:integration iri-test
+  (let [conn   (test-utils/create-conn)
+        movies (test-utils/load-movies conn)
+        db     (fluree/db movies)]
+    (testing "iri queries"
+      (let [test-subject @(fluree/query db '{:select [?s]
+                                             :where [[?s :id :wiki/Q836821]]})]
+        (is (= [[:wiki/Q836821]]
+               test-subject)
+            "Returns the subject with that iri")))))
+
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
