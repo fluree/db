@@ -264,10 +264,24 @@
                    :f/context
                    "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]]
                  @(fluree/query db* {:select ['?s '?p '?o]
-                                     :where  [['?s '?p '?o]]})))))
-      (testing "Illegal reference queries"
+                                     :where  [['?s '?p '?o]]}))))))))
+
+(deftest ^:integration illegal-reference-test
+  (testing "Illegal reference queries"
+    (let [conn   (test-utils/create-conn)
+          people (test-utils/load-people conn)
+          db     (fluree/db people)]
+      (testing "with non-string objects"
         (let [test-subject @(fluree/query db {:select ['?s '?p]
                                               :where [['?s '?p 22]]})]
+          (is (util/exception? test-subject)
+              "return errors")
+          (is (= :db/invalid-query
+                 (-> test-subject ex-data :error))
+              "have 'invalid query' error codes")))
+      (testing "with string objects"
+        (let [test-subject @(fluree/query db {:select ['?s '?p]
+                                              :where [['?s '?p "Bob"]]})]
           (is (util/exception? test-subject)
               "return errors")
           (is (= :db/invalid-query
