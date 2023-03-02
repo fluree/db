@@ -13,8 +13,8 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn reference?
-  [mch]
-  (= (::datatype mch)
+  [match]
+  (= (::datatype match)
      const/$xsd:anyURI))
 
 (defn idx-for
