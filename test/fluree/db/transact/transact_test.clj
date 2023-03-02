@@ -23,6 +23,16 @@
                                 {})
                               (catch Exception e e))
 
+
+          stage-empty-node   (try
+                               @(fluree/stage
+                                 (fluree/db ledger)
+                                 [{:context {:ex "http://example.org/ns/"}
+                                   :id :ex/alice
+                                   :schema/age 42}
+                                  {}])
+                               (catch Exception e e))
+
           db-ok           @(fluree/stage
                             (fluree/db ledger)
                             {:context {:ex "http://example.org/ns/"}
@@ -34,6 +44,10 @@
 
       (is (util/exception? stage-empty-txn))
       (is (str/starts-with? (ex-message stage-empty-txn)
+                            "Invalid transaction, transaction node contains no properties" ))
+
+      (is (util/exception? stage-empty-node))
+      (is (str/starts-with? (ex-message stage-empty-node)
                             "Invalid transaction, transaction node contains no properties" ))
 
       (is (= [[:ex/alice :id "http://example.org/ns/alice"]
