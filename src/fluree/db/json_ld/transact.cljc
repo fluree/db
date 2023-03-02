@@ -360,8 +360,14 @@
     (loop [[node & r] nodes
            flakes* flakeset]
       (if node
-        (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
-          (recur r (into flakes* node-flakes)))
+        (if (empty? (dissoc node :idx :id))
+          (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
+                               (some->> (:id node)
+                                        (str " for @id: ") )
+                               ".")
+                          {:status 400 :error :db/invalid-transaction}))
+          (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
+            (recur r (into flakes* node-flakes))))
         flakes*))))
 
 (defn validate-rules
