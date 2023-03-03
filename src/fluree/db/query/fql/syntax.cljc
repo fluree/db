@@ -64,6 +64,7 @@
      ::parse-json           ::parseJSON
      ::contextType          [:enum :string :keyword]
      ::context-type         ::contextType
+     ::issuer               [:maybe string?]
      ::opts                 [:map
                              [:maxFuel {:optional true} ::maxFuel]
                              [:max-fuel {:optional true} ::maxFuel]
@@ -72,7 +73,8 @@
                              [:prettyPrint {:optional true} ::prettyPrint]
                              [:pretty-print {:optional true} ::pretty-print]
                              [:contextType {:optional true} ::contextType]
-                             [:context-type {:optional true} ::contextType]]
+                             [:context-type {:optional true} ::contextType]
+                             [:issuer {:optional true} ::issuer]]
      ::function             [:orn
                              [:string [:fn fn-string?]]
                              [:list [:fn fn-list?]]]

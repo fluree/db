@@ -23,7 +23,7 @@
                       {:status 400
                        :error  :db/invalid-query}))
 
-      (let [{:keys [context history t commit-details] :as parsed} (history/history-query-parser query-map)
+      (let [{:keys [context history t commit-details] :as _parsed} (history/history-query-parser query-map)
 
             ;; from and to are positive ints, need to convert to negative or fill in default values
             {:keys [from to at]} t
@@ -93,12 +93,13 @@
                                  (<? (time-travel/as-of db t))
                                  db)
                                (assoc-in [:policy :cache] (atom {})))
-          meta?         (:meta opts)
-          opts*         (assoc opts :issuer issuer)
+          opts*         (-> opts
+                            (assoc :issuer issuer)
+                            (dissoc :meta))
           start         #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
           result        (<? (fql/query db* (assoc query :opts opts*)))]
-      (if meta?
+      (if (:meta opts)
         {:status 200
          :result result
          :time   (util/response-time-formatted start)}
@@ -121,19 +122,25 @@
            - errors - map of query alias to their respective error"
   [source flureeQL]
   (go-try
-   (let [global-meta?       (get-in flureeQL [:opts :meta]) ;; if true, need to collect meta for each query to total up
+   (let [global-opts         (:opts flureeQL)
+         global-context-type (:context-type global-opts)
+         global-meta         (:meta global-opts) ;; if true, need to collect meta for each query to total up
          ;; update individual queries for :meta if not otherwise specified
-         queries            (reduce-kv
-                             (fn [acc alias query]
-                               (let [query-meta?  (get-in query [:opts :meta])
-                                     meta?        (or global-meta? query-meta?)
-                                     remove-meta? (and meta? (not query-meta?)) ;; query didn't ask for meta, but multiquery did so must strip it
-
-                                     opts*        (assoc (:opts query) :meta meta?
-                                                         :-remove-meta? remove-meta?)
-                                     query*       (assoc query :opts opts*)]
-                                 (assoc acc alias query*)))
-                             {} (dissoc flureeQL :opts))
+         queries             (reduce-kv
+                              (fn [acc alias query]
+                                (let [query-opts   (:opts query)
+                                      query-meta   (:meta query-opts)
+                                      context-type (-> query-opts
+                                                       :context-type
+                                                       (or global-context-type))
+                                      meta?        (or global-meta query-meta)
+                                      remove-meta? (and meta? (not query-meta)) ;; query didn't ask for meta, but multiquery did so must strip it
+                                      opts*        (-> (:opts query)
+                                                       (assoc :meta meta? :-remove-meta? remove-meta?)
+                                                       (cond-> context-type (assoc :context-type context-type)))
+                                      query*       (assoc query :opts opts*)]
+                                  (assoc acc alias query*)))
+                              {} (dissoc flureeQL :opts))
          start-time #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
          ;; kick off all queries in parallel, each alias now mapped to core async channel
          pending-resp       (map (fn [[alias q]] [alias (query source q)]) queries)]
@@ -141,7 +148,7 @@
             status-global nil                            ;; overall status.
             response      {}]
        (if (nil? port)                                   ;; done?
-         (if global-meta?
+         (if global-meta
            {:result response
             :status status-global
             :time   (util/response-time-formatted start-time)}
