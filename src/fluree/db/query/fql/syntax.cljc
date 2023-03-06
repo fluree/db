@@ -133,10 +133,10 @@
      ::where-map            [:and
                              [:map-of {:max 1} ::where-op :any]
                              [:multi {:dispatch where-op}
-                              [:filter [:map [:filter [:ref ::filter]]]]
+                              [:filter [:map [:filter ::filter]]]
                               [:optional [:map [:optional [:ref ::optional]]]]
                               [:union [:map [:union [:ref ::union]]]]
-                              [:bind [:map [:bind [:ref ::bind]]]]]]
+                              [:bind [:map [:bind ::bind]]]]]
      ::triple               [:catn
                              [:subject [:orn
                                         [:var ::var]
