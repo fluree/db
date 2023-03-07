@@ -66,6 +66,57 @@
                                    (util/keywordize-keys ledger-context))]
          (is (= merged-context (:context ledger)))))))
 
+(deftest context-test
+  (testing "transact context"
+    (let [conn (test-utils/create-conn)
+          ledger @(fluree/create conn "context-test" {:context-type :string})
+          db0 (fluree/db ledger)
+          db1 @(fluree/stage db0 {"@context" {"ex" "http://example.com/"}
+                                   "@id" "ex:dan"
+                                   "ex:x" 1})
+          db2 @(fluree/stage db1 {"@context" {"foo" "http://example.com/"}
+                                  "@id" "foo:dan"
+                                  "foo:y" "y"})]
+      (testing "keyword context"
+        (is (= [{:id :foo/dan, :foo/x 1 :foo/y "y"}]
+               @(fluree/query db2 {:context {:foo "http://example.com/"}
+                                    :where [['?s :id :foo/dan]]
+                                    :select {'?s [:*]}}))))
+
+      (testing "string context"
+        (is (= [{:id "foo:dan", "foo:x" 1 "foo:y" "y"}]
+               @(fluree/query db2 {"@context" {"foo" "http://example.com/"}
+                                    :where [["?s" "@id" "foo:dan"]]
+                                    :select {"?s" ["*"]}}))))
+      (testing "string context, context-type string"
+        (is (= [{"id" "foo:dan", "foo:x" 1 "foo:y" "y"}]
+               @(fluree/query db2 {"@context" {"foo" "http://example.com/"}
+                                    :where [["?s" "@id" "foo:dan"]]
+                                    :select {"?s" ["*"]}
+                                    :opts {:context-type :string}}))))
+      (testing "nil context"
+        (is (= [{"@id" "http://example.com/dan"
+                 "http://example.com/x" 1
+                 "http://example.com/y" "y"}]
+               @(fluree/query db2 {"@context" nil
+                                    :where [["?s" "@id" "http://example.com/dan"]]
+                                    :select {"?s" ["*"]}
+                                    :opts {:context-type :string}}))
+            "should be fully expanded"))
+      (testing "vector context"
+        (is (= [{"@id" "foo:dan", "foo:x" 1, "foo:y" "y"}]
+               @(fluree/query db2 {"@context" [nil {"foo" "http://example.com/"}]
+                                    :where [["?s" "@id" "http://example.com/dan"]]
+                                    :select {"?s" ["*"]}
+                                    :opts {:context-type :string}})))
+        (is (= [{"@id" "http://example.com/dan"
+                 "http://example.com/x" 1
+                 "http://example.com/y" "y"}]
+               @(fluree/query db2 {"@context" [{"foo" "http://example.com/"} nil]
+                                    :where [["?s" "@id" "http://example.com/dan"]]
+                                    :select {"?s" ["*"]}
+                                    :opts {:context-type :string}})))))))
+
 #?(:clj
    (deftest load-from-file-test
      (testing "can load a file ledger with single cardinality predicates"
