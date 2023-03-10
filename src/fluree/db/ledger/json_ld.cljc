@@ -174,18 +174,12 @@
                                     :reindex-max-bytes reindex-max-bytes})))
           ledger-alias* (normalize-alias ledger-alias)
           address       (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
-          conn-context  (conn-proto/-context conn)
-          _             (log/debug "create conn-context:" conn-context)
-          context*      (->> context
-                             (util/normalize-context context-type)
-                             (merge conn-context))
-          _             (log/debug "create merged context*:" context*)
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
           branches      {branch (branch/new-branch-map nil ledger-alias* branch)}
           ledger        (map->JsonLDLedger
                           {:id      (random-uuid)
-                           :context context*
+                           :context context
                            :did     did*
                            :state   (atom {:closed?  false
                                            :branches branches
