@@ -40,10 +40,10 @@
   ([conn ledger-alias] (fluree/load conn ledger-alias)))
 
 (defn ^:export stage
-  ([db-or-ledger json-ld]
-   (fluree/stage db-or-ledger (js->clj json-ld) {:context-type :string}))
-  ([db-or-ledger json-ld opts]
-   (fluree/stage db-or-ledger (js->clj json-ld)
+  ([db json-ld]
+   (fluree/stage db (js->clj json-ld) {:context-type :string}))
+  ([db json-ld opts]
+   (fluree/stage db (js->clj json-ld)
                  (-> (js->clj opts :keywordize-keys true)
                      (assoc :context-type :string)))))
 
