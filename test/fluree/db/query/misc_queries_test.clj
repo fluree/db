@@ -287,3 +287,52 @@
           (is (= :db/invalid-query
                  (-> test-subject ex-data :error))
               "have 'invalid query' error codes"))))))
+
+(deftest ^:integration class-queries
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "query/class" {:context {:ex "http://example.org/ns/"}})
+        db     @(fluree/stage
+                  (fluree/db ledger)
+                  [{:id           :ex/alice,
+                    :type         :ex/User,
+                    :schema/name  "Alice"
+                    :schema/email "alice@flur.ee"
+                    :schema/age   42}
+                   {:id          :ex/bob,
+                    :type        :ex/User,
+                    :schema/name "Bob"
+                    :schema/age  22}
+                   {:id           :ex/jane,
+                    :type         :ex/User,
+                    :schema/name  "Jane"
+                    :schema/email "jane@flur.ee"
+                    :schema/age   30}
+                   {:id          :ex/dave
+                    :type        :ex/nonUser
+                    :schema/name "Dave"}])]
+    (testing "rdf/type"
+      (is (= [[:ex/User]]
+             @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
+                                 :select   [?class]
+                                 :where    [[:ex/jane :rdf/type ?class]]})))
+      (is (= [[:ex/dave :ex/nonUser]
+              [:ex/jane :ex/User]
+              [:ex/bob :ex/User]
+              [:ex/alice :ex/User]
+              [:ex/nonUser :rdfs/Class]
+              [:ex/User :rdfs/Class]]
+             @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
+                                 :select   [?s ?class]
+                                 :where    [[?s :rdf/type ?class]]}))))
+    (testing "shacl targetClass"
+      (let [shacl-db @(fluree/stage
+                        (fluree/db ledger)
+                        {:context        {:ex "http://example.org/ns/"}
+                         :id             :ex/UserShape,
+                         :type           [:sh/NodeShape],
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:sh/path     :schema/name
+                                           :sh/datatype :xsd/string}]})]
+        (is (= [[:ex/User]]
+               @(fluree/query shacl-db '{:select [?class]
+                                         :where  [[:ex/UserShape :sh/targetClass ?class]]})))))))

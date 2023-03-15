@@ -113,6 +113,20 @@
                   ::where/datatype 8}
                  {::where/var '?email}]]
                patterns)))
+      (testing "not a `:class` pattern if obj is a var"
+        (let [query {:context {:ex "http://example.org/ns/"}
+                     :select  ['?class]
+                     :where   [[:ex/cam :rdf/type '?class]]}
+              {:keys [select where] :as parsed} (parse/parse-analytical-query query db)
+              {::where/keys [patterns]} where]
+          (is (= [{:var '?class}]
+                 (de-recordify-select select)))
+          (is (= [[{::where/val "http://example.org/ns/cam",
+                    ::where/datatype 0}
+                   {::where/val 200,
+                    ::where/datatype 8}
+                   {::where/var '?class}]]
+                 patterns))))
       (testing "class, optional"
         (let [optional-q {:select ['?name '?favColor]
                           :where  [['?s :rdf/type :ex/User]

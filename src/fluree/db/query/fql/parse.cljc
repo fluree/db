@@ -328,7 +328,8 @@
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
-    (if (= const/$rdf:type (::where/val p))
+    (if (and (= const/$rdf:type (::where/val p))
+             (not (syntax/variable? o-pat)))
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
       (if (= const/$iri (::where/val p))
