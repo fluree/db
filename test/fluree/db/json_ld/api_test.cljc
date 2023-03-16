@@ -230,4 +230,48 @@
                loaded         (test-utils/retry-load conn ledger-alias 100)
                loaded-db      (fluree/db loaded)
                res2           @(fluree/query loaded-db query)]
-           (is (= res1 res2)))))))
+           (is (= res1 res2)))))
+
+     (testing "conn context is not merged into ledger's on load"
+       (with-tmp-dir storage-path #_{::twf/delete-dir false}
+         #_(println "storage path:" storage-path)
+         (let [conn1-context  {:id  "@id", :type "@type"
+                               :xsd "http://www.w3.org/2001/XMLSchema#"
+                               :foo "http://foo.com/"}
+               ledger-context {:ex     "http://example.com/"
+                               :schema "http://schema.org/"}
+               conn1          @(fluree/connect
+                                 {:method   :file, :storage-path storage-path
+                                  :defaults {:context conn1-context}})
+               ledger-alias   "load-from-file-with-context"
+               ledger         @(fluree/create conn1 ledger-alias
+                                              {:context ledger-context})
+               db             @(fluree/stage
+                                 (fluree/db ledger)
+                                 [{:id             :ex/wes
+                                   :type           :ex/User
+                                   :schema/name    "Wes"
+                                   :schema/email   "wes@example.org"
+                                   :schema/age     42
+                                   :schema/favNums [1 2 3]
+                                   :ex/friend      {:id           :ex/jake
+                                                    :type         :ex/User
+                                                    :schema/name  "Jake"
+                                                    :schema/email "jake@example.org"}}])
+               db             @(fluree/commit! ledger db)
+               conn2-context  {:id "@id", :type "@type"
+                               :xsd "http://www.w3.org/2001/XMLSchema#"
+                               :foo "http://foobar.com/"
+                               :baz "http://baz.org/"}
+               conn2          @(fluree/connect
+                                 {:method :file, :storage-path storage-path
+                                  :defaults {:context conn2-context}})
+               loaded         (test-utils/retry-load conn2 ledger-alias 100)
+               loaded-db      (fluree/db loaded)
+               merged-ctx     (merge conn1-context ledger-context)]
+           (is (= (:t db) (:t loaded-db)))
+           (is (= merged-ctx (:context loaded)))
+           (is (= (get-in db [:schema :context])
+                  (get-in loaded-db [:schema :context])))
+           (is (= (get-in db [:schema :context-str])
+                  (get-in loaded-db [:schema :context-str]))))))))
