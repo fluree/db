@@ -21,15 +21,9 @@
     (is (= nil (coerce "foo" const/$xsd:boolean))))
 
   (testing "date"
-    (is (= #?(:clj
-              (OffsetDateTime/of 1980 10 5 0 0 0 0 (ZoneOffset/of "Z"))
-              :cljs
-              #inst "1980-10-05T00:00:00.000-00:00")
+    (is (= nil
            (coerce "1980-10-5Z" const/$xsd:date)))
-    (is (= #?(:clj
-              (LocalDate/of 1980 10 5)
-              :cljs
-              (js/Date. "1980-10-05T00:00:00"))
+    (is (= nil
            (coerce "1980-10-5" const/$xsd:date)))
     (is (= #?(:clj
               (OffsetDateTime/of 2022 1 5 0 0 0 0 (ZoneOffset/of "Z"))
@@ -62,15 +56,9 @@
               :cljs
               #inst "1970-01-01T09:30:10.000-06:00")
           (coerce "09:30:10-06:00" const/$xsd:time)))
-    (is (= #?(:clj
-              (LocalTime/of 12 42 5)
-              :cljs
-              (js/Date. "1970-01-01T12:42:05"))
+    (is (= nil
            (coerce "12:42:5" const/$xsd:time)))
-    (is (= #?(:clj
-              (OffsetTime/of 12 42 5 0 (ZoneOffset/of "Z"))
-              :cljs
-              #inst "1970-01-01T12:42:05.000-00:00")
+    (is (= nil
            (coerce "12:42:5Z" const/$xsd:time)))
     (is (= #?(:clj
               (OffsetTime/of 11 14 32 833000000 (ZoneOffset/of "Z"))
@@ -80,18 +68,21 @@
     (is (= nil (coerce "foo" const/$xsd:time))))
 
   (testing "datetime"
+    (is (= nil
+           (coerce "1980-10-5T11:23:00Z" const/$xsd:dateTime))
+        "don't accept non-8601 timestamps")
+    (is (= #?(:clj
+              (OffsetDateTime/of 1980 10 5 11 23 0 0 (ZoneOffset/of "-06:00"))
+              :cljs
+              #inst "1980-10-05T17:23:00.000-00:00")
+           (coerce "1980-10-05T11:23:00-06:00" const/$xsd:dateTime))
+        "offset")
     (is (= #?(:clj
               (OffsetDateTime/of 1980 10 5 11 23 0 0 (ZoneOffset/of "Z"))
               :cljs
               #inst "1980-10-05T11:23:00.000-00:00")
-           (coerce "1980-10-5T11:23:00Z" const/$xsd:dateTime))
-        "utc")
-    (is (= #?(:clj
-              (OffsetDateTime/of 1980 10 5 11 23 0 0 (ZoneOffset/of "-06:00"))
-              :cljs
-              #inst "1980-10-05T11:23:00.000-00:00")
-           (coerce "1980-10-5T11:23:00-06:00" const/$xsd:dateTime))
-        "offset")
+           (coerce "1980-10-05T11:23:00Z" const/$xsd:dateTime))
+        "z")
     (is (= #?(:clj (OffsetDateTime/of 2021 9 24 11 14 32 833000000 (ZoneOffset/of "Z")))
            (coerce "2021-09-24T11:14:32.833Z" const/$xsd:dateTime))
         "with nanoseconds")

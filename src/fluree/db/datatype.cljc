@@ -47,14 +47,14 @@
    "http://www.w3.org/2001/XMLSchema#base64Binary"       const/$xsd:base64Binary})
 
 (def iso8601-offset-pattern
-  "(Z|(?:[+-][0-9]{1,2}:[0-9]{2}))?")
+  "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
 
 (def iso8601-date-component-pattern
   "This is slightly more forgiving than the xsd:date spec:
   http://books.xmlschemata.org/relaxng/ch19-77041.html
   Note there is no need to be extra strict with the numeric ranges in here as
   the java.time constructors will take care of that for us."
-  "((?:-)?[0-9]{4})-([0-9]{1,2})-([0-9]{1,2})")
+  "((?:-)?[0-9]{4})-([0-9]{2})-([0-9]{2})")
 
 (def iso8601-date-pattern
   "Defines the pattern for dates w/o times where an offset is still allowed on
@@ -69,7 +69,7 @@
   http://books.xmlschemata.org/relaxng/ch19-77311.html
   Note there is no need to be extra strict with the numeric ranges in here as
   the java.time constructors will take care of that for us."
-  (str "([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})(?:\\.([0-9]{1,9}))?" iso8601-offset-pattern))
+  (str "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,9}))?" iso8601-offset-pattern))
 
 (def iso8601-time-re
   (re-pattern iso8601-time-pattern))
