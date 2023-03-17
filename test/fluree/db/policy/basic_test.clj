@@ -62,10 +62,10 @@
                                                      :f/targetRole :ex/userRole
                                                      :f/action     [:f/view]
                                                      :f/equals     {:list [:f/$identity :ex/user]}}]}]}])
-          root-db   @(fluree/wrap-policy db+policy {:f/$identity root-did
-                                                    :f/role      :ex/rootRole})
-          alice-db  @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                    :f/role      :ex/userRole})]
+          root-identity {:f/$identity root-did
+                         :f/role      :ex/rootRole}
+          alice-identity {:f/$identity alice-did
+                          :f/role      :ex/userRole}]
 
       ;; root can see all user data
       (is (= [{:id               :ex/john,
@@ -83,8 +83,9 @@
                :ex/location      {:id         "_:f211106232532993",
                                   :ex/state   "NC",
                                   :ex/country "USA"}}]
-             @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
-                                     :where  [['?s :rdf/type :ex/User]]}))
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/User]]
+                                       :opts root-identity}))
           "Both user records + all attributes should show")
 
       ;; root can see all product data
@@ -93,14 +94,16 @@
                :schema/name          "Widget",
                :schema/price         99.99,
                :schema/priceCurrency "USD"}]
-             @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
-                                     :where  [['?s :rdf/type :ex/Product]]}))
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/Product]]
+                                       :opts root-identity}))
           "The product record should show with all attributes")
 
       ;; Alice cannot see product data as it was not explicitly allowed
       (is (= []
-             @(fluree/query alice-db {:select {'?s [:*]}
-                                      :where  [['?s :rdf/type :ex/Product]]})))
+             @(fluree/query db+policy {:select {'?s [:*]}
+                                       :where  [['?s :rdf/type :ex/Product]]
+                                       :opts alice-identity})))
 
       ;; Alice can see all users, but can only see SSN for herself, and can't see the nested location
       (is (= [{:id               :ex/john,
@@ -114,14 +117,15 @@
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
                :schema/ssn       "111-11-1111"}]
-             @(fluree/query alice-db {:select {'?s [:* {:ex/location [:*]}]}
-                                      :where  [['?s :rdf/type :ex/User]]}))
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/User]]
+                                       :opts alice-identity}))
           "Both users should show, but only SSN for Alice")
 
       ;; Alice can only see her allowed data in a non-graph-crawl query too
       (is (= [["John" nil] ["Alice" "111-11-1111"]]
-             @(fluree/query alice-db {:select '[?name ?ssn]
-                                      :where  '[[?p :schema/name ?name]
-                                                {:optional [?p :schema/ssn ?ssn]}]}))
+             @(fluree/query db+policy {:select '[?name ?ssn]
+                                       :where  '[[?p :schema/name ?name]
+                                                 {:optional [?p :schema/ssn ?ssn]}]
+                                       :opts alice-identity}))
           "Both user names should show, but only SSN for Alice"))))
-

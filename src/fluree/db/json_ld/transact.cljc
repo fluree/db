@@ -18,6 +18,7 @@
             [clojure.core.async :as async]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
+            [fluree.db.json-ld.policy :as perm] ;;TODO
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.util.log :as log])
@@ -472,7 +473,10 @@
   (go-try
     (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
                                            {:subject json-ld})
-          tx-state (->tx-state db (assoc opts :issuer issuer))
+          db* (if-let [policy-opts (perm/policy-opts opts)]
+                (<? (perm/wrap-policy db policy-opts))
+                db)
+          tx-state (->tx-state db* (assoc opts :issuer issuer))
           flakes   (if (and (contains? tx :delete)
                             (contains? tx :where))
                      (<? (delete db util/max-integer tx tx-state))

@@ -9,6 +9,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -89,16 +90,21 @@
           db               (if (async-util/channel? sources) ;; only support 1 source currently
                              (<? sources)
                              sources)
-          db*              (-> (if t
-                                 (<? (time-travel/as-of db t))
-                                 db)
+
+          db*             (if-let [policy-opts (perm/policy-opts opts)]
+                             (<? (perm/wrap-policy db policy-opts))
+                             db)
+
+          db**              (-> (if t
+                                 (<? (time-travel/as-of db* t))
+                                 db*)
                                (assoc-in [:policy :cache] (atom {})))
           opts*         (-> opts
                             (assoc :issuer issuer)
                             (dissoc :meta))
           start         #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
-          result        (<? (fql/query db* (assoc query :opts opts*)))]
+          result        (<? (fql/query db** (assoc query :opts opts*)))]
       (if (:meta opts)
         {:status 200
          :result result

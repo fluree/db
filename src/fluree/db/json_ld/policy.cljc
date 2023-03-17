@@ -464,10 +464,16 @@
                 (throw e))))))
 
 
+(defn policy-opts
+  [opts]
+  (-> (select-keys opts [:f/$identity :f/role :f/credential])
+      not-empty))
+
 (defn wrap-policy
-  "Given a db object, wraps specified policy permissions"
-  [db identity role credential]
+  "Given a db object and a map containing the identity,
+  wraps specified policy permissions"
+  [db {:f/keys [$identity role credential]}]
   ;; TODO - not yet paying attention to verifiable credentials that are present
   (go-try
     (assoc db :policy
-              (<? (policy-map db identity role credential)))))
+           (<? (policy-map db $identity role credential)))))

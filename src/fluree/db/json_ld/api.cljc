@@ -261,9 +261,9 @@
   allows the permission attributes to be modified.
 
   Returns promise"
-  [db {:keys [f/$identity f/role f/credential]}]
+  [db identity-map]
   (promise-wrap
-    (perm/wrap-policy db $identity role credential)))
+    (perm/wrap-policy db identity-map)))
 
 
 (defn query

@@ -39,7 +39,7 @@
                         ;; assign alice-did to :ex/userRole and also link the did to :ex/alice via :ex/user
                         {:id      alice-did
                          :ex/user :ex/alice
-                         :f/role  :ex/userRole}])
+                         :f/role  [:ex/userRole :ex/otherRole]}])
 
           db+policy @(fluree/stage
                        db
@@ -71,13 +71,16 @@
                                                      :f/action     [:f/view]}]}
                                          {:f/path  :schema/name
                                           :f/allow [{:f/targetRole :ex/userRole
-                                                     :f/action     [:f/view :f/modify]}]}]}])]
+                                                     :f/action     [:f/view :f/modify]}]}]}])
+          alice-user-identity {:f/$identity alice-did
+                               :f/role      :ex/userRole}
+          alice-other-identity {:f/$identity alice-did
+                                :f/role      :ex/otherRole}]
 
       (testing "Policy allowed modification"
-        (let [alice-db    @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                          :f/role      :ex/userRole})
-              update-name @(fluree/stage alice-db {:id          :ex/widget
-                                                   :schema/name "Widget2"})]
+        (let [update-name @(fluree/stage db+policy {:id          :ex/widget
+                                                    :schema/name "Widget2"}
+                                         alice-user-identity)]
 
           (is (= [{:rdf/type    [:ex/Product]
                    :schema/name "Widget2"}]
@@ -87,10 +90,19 @@
               "Updated :schema/name should have been allowed and have updated value.")))
 
       (testing "Policy doesn't allow a modification"
-        (let [alice-db     @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                           :f/role      :ex/userRole})
-              update-price @(fluree/stage alice-db {:id           :ex/widget
-                                                    :schema/price 42.99})]
+        (let [update-name-other-role @(fluree/stage db+policy {:id          :ex/widget
+                                                               :schema/name "Widget2"}
+                                                    alice-other-identity)]
+          ;;Cannot make update when using `ex:otherRole`
+          (is (util/exception? update-name-other-role)
+              "Attempted update should have thrown an exception")
+
+          (is (= :db/policy-exception
+                 (:error (ex-data update-name-other-role)))
+              "Exception should be of type :db/policy-exception"))
+        (let [update-price @(fluree/stage db+policy {:id           :ex/widget
+                                                     :schema/price 42.99}
+                                          alice-user-identity)]
           (is (util/exception? update-price)
               "Attempted update should have thrown an exception")
 
