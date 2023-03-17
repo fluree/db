@@ -129,7 +129,11 @@
   [source flureeQL]
   (go-try
    (let [global-opts         (:opts flureeQL)
+         db                  (if-let [policy-opts (perm/policy-opts global-opts)]
+                               (<? (perm/wrap-policy source policy-opts))
+                               source)
          global-context-type (:context-type global-opts)
+
          global-meta         (:meta global-opts) ;; if true, need to collect meta for each query to total up
          ;; update individual queries for :meta if not otherwise specified
          queries             (reduce-kv
@@ -149,7 +153,7 @@
                               {} (dissoc flureeQL :opts))
          start-time #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
          ;; kick off all queries in parallel, each alias now mapped to core async channel
-         pending-resp       (map (fn [[alias q]] [alias (query source q)]) queries)]
+         pending-resp       (map (fn [[alias q]] [alias (query db q)]) queries)]
      (loop [[[alias port] & r] pending-resp
             status-global nil                            ;; overall status.
             response      {}]

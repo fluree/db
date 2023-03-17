@@ -6,8 +6,8 @@
     [fluree.db.did :as did]))
 
 
-(deftest ^:integration policy-enforcement
-  (testing "Testing basic policy enforcement."
+(deftest ^:integration query-policy-enforcement
+  (testing "Testing basic policy enforcement on queries."
     (let [conn      (test-utils/create-conn)
           ledger    @(fluree/create conn "policy/a" {:context {:ex "http://example.org/ns/"}})
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
@@ -128,4 +128,18 @@
                                        :where  '[[?p :schema/name ?name]
                                                  {:optional [?p :schema/ssn ?ssn]}]
                                        :opts alice-identity}))
-          "Both user names should show, but only SSN for Alice"))))
+          "Both user names should show, but only SSN for Alice")
+
+      (testing "multi-query"
+        (is (= {"john" [["john@flur.ee" nil]]
+                "alice" [["alice@flur.ee" "111-11-1111"]]}
+               @(fluree/multi-query db+policy {"john" '{:select [?email ?ssn]
+                                                        :where  [[?p :schema/name "John"]
+                                                                 [?p :schema/email ?email]
+                                                                 {:optional [?p :schema/ssn ?ssn]}]}
+                                               "alice" '{:select [?email ?ssn]
+                                                         :where  [[?p :schema/name "Alice"]
+                                                                  [?p :schema/email ?email]
+                                                                  {:optional [?p :schema/ssn ?ssn]}]}
+                                               :opts alice-identity}))
+            "Both emails should show, but only SSN for Alice")))))
