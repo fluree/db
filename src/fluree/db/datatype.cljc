@@ -65,21 +65,16 @@
   (re-pattern iso8601-date-pattern))
 
 (def iso8601-time-pattern
-  "This is slightly more forgiving than the xsd:time spec:
-  http://books.xmlschemata.org/relaxng/ch19-77311.html
-  Note there is no need to be extra strict with the numeric ranges in here as
-  the java.time constructors will take care of that for us."
-  (str "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,9}))?" iso8601-offset-pattern))
+  (str #?(:clj  "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,9}))?"
+          :cljs "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,3}))?")
+       iso8601-offset-pattern))
 
 (def iso8601-time-re
   (re-pattern iso8601-time-pattern))
 
 (def iso8601-datetime-pattern
-  "This is slightly more forgiving than the xsd:dateTime spec:
-  http://books.xmlschemata.org/relaxng/ch19-77049.html
-
-  Note there is no need to be extra strict with the numeric ranges in here as
-  the java.time constructors will take care of that for us."
+  "JS: https://tc39.es/ecma262/#sec-date-time-string-format simplified ISO8601 HH:mm:ss.sssZ
+   JVM: ISO8601 that supports nanosecond resolution."
   (str iso8601-date-component-pattern "T" iso8601-time-pattern))
 
 (def iso8601-datetime-re
