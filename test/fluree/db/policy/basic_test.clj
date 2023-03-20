@@ -142,4 +142,24 @@
                                                                   [?p :schema/email ?email]
                                                                   {:optional [?p :schema/ssn ?ssn]}]}
                                                :opts alice-identity}))
-            "Both emails should show, but only SSN for Alice")))))
+            "Both emails should show, but only SSN for Alice"))
+
+      (testing "history query"
+        (let [_ @(fluree/commit! ledger db+policy)]
+          (is (= []
+                 @(fluree/history ledger {:history [:ex/john :schema/ssn] :t {:from 1}
+                                          :commit-details true
+                                          :opts alice-identity}))
+              "Alice should not be able to see any history for John's ssn")
+          (is (= [{:f/t       1,
+                   :f/assert [{:schema/ssn "111-11-1111", :id :ex/alice}],
+                   :f/retract []}]
+                 @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
+                                          :opts    alice-identity}))
+              "Alice should be able to see history for her own ssn")
+          (is (= [{:f/t 1,
+                   :f/assert [{:schema/birthDate "2021-08-17", :id :ex/john}],
+                   :f/retract []}]
+                 @(fluree/history ledger {:history [:ex/john :schema/birthDate] :t {:from 1}
+                                          :opts alice-identity}))
+              "Alice should be able to see John's birthdate"))))))
