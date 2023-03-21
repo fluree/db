@@ -25,7 +25,12 @@
                   :context-str
                   :context)
         db-ctx  (get-in db [:schema ctx-key])
-        q-ctx   (or (:context q) (get q "@context"))]
+        ;; if context is explicitly set to nil, preserve it
+        q-ctx (if (or (contains? q :context)
+                      (contains? q "@context"))
+                (or (:context q) (get q "@context"))
+                ;; otherwise, fall back to db-ctx
+                {})]
     (json-ld/parse-context db-ctx q-ctx)))
 
 (defn parse-var-name

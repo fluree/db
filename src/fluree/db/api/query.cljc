@@ -25,6 +25,12 @@
 
       (let [{:keys [context history t commit-details] :as _parsed} (history/history-query-parser query-map)
 
+            ;; if context is explicitly nil, preserve it, otherwise fall back to default
+            context (if (or (contains? query-map :context)
+                            (contains? query-map "@context"))
+                      context
+                      {})
+
             ;; from and to are positive ints, need to convert to negative or fill in default values
             {:keys [from to at]} t
             [from-t to-t]        (if at
