@@ -3,7 +3,9 @@
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
-    [fluree.db.did :as did]))
+    [fluree.db.did :as did]
+    [fluree.db.util.core :as util]
+    [clojure.string :as str]))
 
 
 (deftest ^:integration query-policy-enforcement
@@ -66,6 +68,14 @@
                          :f/role      :ex/rootRole}
           alice-identity {:f/$identity alice-did
                           :f/role      :ex/userRole}]
+      (let [root-wrapped-db            @(fluree/wrap-policy db+policy root-identity)
+            double-policy-query-result @(fluree/query root-wrapped-db {:select {'?s [:* {:ex/location [:*]}]}
+                                                                       :where  [['?s :rdf/type :ex/User]]
+                                                                       :opts   root-identity})]
+        (is  (util/exception? double-policy-query-result)
+             "Should be an error to try to apply policy twice on one db.")
+        (is (str/includes? (ex-message double-policy-query-result)
+                           "Policy already in place")))
 
       ;; root can see all user data
       (is (= [{:id               :ex/john,
