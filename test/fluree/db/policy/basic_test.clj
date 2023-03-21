@@ -151,15 +151,50 @@
                                           :commit-details true
                                           :opts alice-identity}))
               "Alice should not be able to see any history for John's ssn")
-          (is (= [{:f/t       1,
+          (is (= [{:f/t 1,
                    :f/assert [{:schema/ssn "111-11-1111", :id :ex/alice}],
                    :f/retract []}]
                  @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
                                           :opts    alice-identity}))
-              "Alice should be able to see history for her own ssn")
-          (is (= [{:f/t 1,
-                   :f/assert [{:schema/birthDate "2021-08-17", :id :ex/john}],
-                   :f/retract []}]
-                 @(fluree/history ledger {:history [:ex/john :schema/birthDate] :t {:from 1}
-                                          :opts alice-identity}))
-              "Alice should be able to see John's birthdate"))))))
+              "Alice should be able to see history for her own ssn.")
+          (let [[history-result]  @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
+                                                           :commit-details true
+                                                           :opts    alice-identity})
+                commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
+            (is (= [{:rdf/type [:ex/User],
+                     :schema/name "John",
+                     :schema/email "john@flur.ee",
+                     :schema/birthDate "2021-08-17",
+                     :id :ex/john}
+                    {:rdf/type [:ex/User],
+                     :schema/name "Alice",
+                     :schema/email "alice@flur.ee",
+                     :schema/birthDate "2022-08-17",
+                     :schema/ssn "111-11-1111",
+                     :ex/location {:id nil},
+                     :id :ex/alice}]
+                   commit-details-asserts)
+                "Alice should be able to see her own ssn in commit asserts, but not John's."))
+          (let [[history-result] @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
+                                                          :commit-details true
+                                                          :opts    root-identity})
+                commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
+            (is (contains? (into #{} commit-details-asserts)
+                           {:rdf/type [:ex/User],
+                            :schema/name "John",
+                            :schema/email "john@flur.ee",
+                            :schema/birthDate "2021-08-17",
+                            :schema/ssn "888-88-8888",
+                            :id :ex/john})
+                "Root can see John's ssn in commit details."))
+          (let [_ @(test-utils/transact ledger {:id :ex/john
+                                                :schema/name "Jack"})]
+            (is (= [{:f/t 1,
+                     :f/assert [{:schema/name "John", :id :ex/john}],
+                     :f/retract []}
+                    {:f/t 2,
+                     :f/assert [{:schema/name "Jack", :id :ex/john}],
+                     :f/retract [{:schema/name "John", :id :ex/john}]}]
+                   @(fluree/history ledger {:history [:ex/john :schema/name] :t {:from 1}
+                                            :opts alice-identity}))
+                "Alice should be able to see all history for John's name")))))))
