@@ -152,7 +152,19 @@
                                                                   [?p :schema/email ?email]
                                                                   {:optional [?p :schema/ssn ?ssn]}]}
                                                :opts alice-identity}))
-            "Both emails should show, but only SSN for Alice"))
+            "Both emails should show, but only SSN for Alice")
+
+        (let [illegal-opts-multi-result @(fluree/multi-query db+policy {"john" {:select '[?ssn]
+                                                                                 :where  '[[?p :schema/name "John"]
+                                                                                          {:optional [?p :schema/ssn ?ssn]}]
+                                                                                ;;supplying an identity here is not supported
+                                                                                 :opts root-identity}
+                                                                        "alice" '{:select [?ssn]
+                                                                                  :where  [[?p :schema/name "Alice"]
+                                                                                           {:optional [?p :schema/ssn ?ssn]}]}})]
+          (is (util/exception? illegal-opts-multi-result))
+          (is (str/includes? (ex-message illegal-opts-multi-result)
+                             "Applying policy via `:opts` on individual queries"))))
 
       (testing "history query"
         (let [_ @(fluree/commit! ledger db+policy)]
