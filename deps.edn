@@ -9,7 +9,7 @@
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
-         metosin/malli                   {:mvn/version "0.10.2"}
+         metosin/malli                   {:mvn/version "0.10.4"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
                                           :sha     "a909330e33196504ef8a5411aaa0409ab72aaa35"}
 
@@ -55,12 +55,12 @@
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
                  thheller/shadow-cljs              {:mvn/version "2.22.0"}
-                 com.magnars/test-with-files {:mvn/version "2021-02-17"}}}
+                 com.magnars/test-with-files       {:mvn/version "2021-02-17"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources"]
-   :extra-deps  {lambdaisland/kaocha         {:mvn/version "1.80.1274"}
-                 org.clojure/test.check      {:mvn/version "1.1.1"}
+   :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.80.1274"}
+                 org.clojure/test.check                {:mvn/version "1.1.1"}
                  io.github.cap10morgan/test-with-files {:git/tag "v1.0.0"
                                                         :git/sha "9181a2e"}}
    :exec-fn     kaocha.runner/exec-fn
@@ -92,15 +92,15 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps  {jonase/eastwood {:mvn/version "1.3.0"}}
-   :main-opts   ["-m" "eastwood.lint"
-                 {:source-paths ["src" "src-docs"]
-                  :test-paths   ["test"]
-                  ;; TODO: Un-exclude this when it stops triggering false
-                  ;;       positives on "UnsupportedOperationException empty is
-                  ;;       not supported on Flake" when using the #Flake data
-                  ;;       reader - WSM 2023-02-01
-                  :exclude-linters [:implicit-dependencies]}]}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.3.0"}}
+   :main-opts  ["-m" "eastwood.lint"
+                {:source-paths    ["src" "src-docs"]
+                 :test-paths      ["test"]
+                 ;; TODO: Un-exclude this when it stops triggering false
+                 ;;       positives on "UnsupportedOperationException empty is
+                 ;;       not supported on Flake" when using the #Flake data
+                 ;;       reader - WSM 2023-02-01
+                 :exclude-linters [:implicit-dependencies]}]}
 
   :ancient
   {:extra-deps {com.github.liquidz/antq {:mvn/version "RELEASE"}}
