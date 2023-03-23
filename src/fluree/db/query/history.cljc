@@ -1,6 +1,7 @@
 (ns fluree.db.query.history
   (:require
    [clojure.core.async :as async]
+   [clojure.string :as str]
    [malli.core :as m]
    [fluree.json-ld :as json-ld]
    [fluree.db.constants :as const]
@@ -15,7 +16,23 @@
    [fluree.db.query.range :as query-range]
    [fluree.db.db.json-ld :as jld-db]))
 
-(def commit-re (re-pattern "^.+[/:#]commit$"))
+(def commit-key-re (re-pattern "^.+[/:#]commit$"))
+
+(defn commit-key
+  [commit]
+  (re-matches commit-key-re (-> commit keys first)))
+
+(defn commit?
+  [v]
+  ;; TODO: Move this into malli schema directly when it supports one-to-one
+  ;;       key schema -> value schema mapping in maps.
+  ;;       https://github.com/metosin/malli/issues/881
+  (when (map? v)
+    (when-let [ck (commit-key v)]
+      (every? (fn [k] (some #(str/ends-with? k %)
+                            #{"id" "address" "alias" "branch" "context" "data"
+                              "time" "v" "issuer"}))
+              (-> v (get ck) keys)))))
 
 (def registry
   (merge
@@ -68,7 +85,7 @@
                               [:fn {:error/message "Must supply either a \"history\" or \"commit-details\" key."}
                                (fn [{:strs [history commit-details]}]
                                  (or history commit-details))]]
-     ::commit                [:re commit-re]
+     ::commit                [:fn commit?]
      ::history-query-results [:sequential ::commit]}))
 
 (def history-query-validator
