@@ -71,8 +71,8 @@
           alice-flakes    @(fluree/range db+policy :spot = [(fluree/expand-iri db+policy :ex/alice)])
           widget-flakes   @(fluree/range db+policy :spot = [(fluree/expand-iri db+policy :ex/widget)])
 
-          alice-db        @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                          :f/role      :ex/userRole})
+          alice-db        @(fluree/wrap-policy db+policy {:did alice-did
+                                                          :role      :ex/userRole})
 
           ;; john's flakes filtered using alice's policy-enforced db
           alice-db-john   (->> john-flakes

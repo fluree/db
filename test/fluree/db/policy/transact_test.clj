@@ -82,8 +82,8 @@
         (testing "using role + id"
           (let [update-name @(fluree/stage db+policy {:id          :ex/alice
                                                       :schema/email "alice@foo.bar"}
-                                           {:f/$identity alice-did
-                                            :f/role      :ex/userRole})]
+                                           {:did alice-did
+                                            :role      :ex/userRole})]
 
             (is (= [{:id :ex/alice,
                      :rdf/type [:ex/User],
@@ -99,7 +99,7 @@
         (testing "using role only"
           (let [update-price @(fluree/stage db+policy {:id          :ex/widget
                                                        :schema/price 105.99}
-                                            {:f/role :ex/rootRole})]
+                                            {:role :ex/rootRole})]
 
             (is (= [{:id :ex/widget,
                      :rdf/type [:ex/Product],
@@ -112,7 +112,7 @@
                 "Updated :schema/price should have been allowed, and entire product is visible in query."))
           (let [update-name @(fluree/stage db+policy {:id          :ex/widget
                                                       :schema/name "Widget2"}
-                                           {:f/role :ex/userRole})]
+                                           {:role :ex/userRole})]
 
             (is (= [{:rdf/type    [:ex/Product]
                      :schema/name "Widget2"}]
@@ -124,8 +124,8 @@
       (testing "Policy doesn't allow a modification"
         (let [update-price @(fluree/stage db+policy {:id           :ex/widget
                                                      :schema/price 42.99}
-                                          {:f/$identity root-did
-                                           :f/role      :ex/userRole})]
+                                          {:did root-did
+                                           :role      :ex/userRole})]
           (is (util/exception? update-price)
               "Attempted update should have thrown an exception, `:ex/userRole` cannot modify product prices regardless of identity")
 
@@ -134,7 +134,7 @@
               "Exception should be of type :db/policy-exception"))
         (let [update-email @(fluree/stage db+policy {:id          :ex/john
                                                      :schema/email "john@foo.bar"}
-                                          {:f/role :ex/user})]
+                                          {:role :ex/user})]
 
           (is (util/exception? update-email)
               "attempted update should have thrown an exception, no identity was provided")
@@ -144,8 +144,8 @@
               "exception should be of type :db/policy-exception"))
         (let [update-name-other-role @(fluree/stage db+policy {:id          :ex/widget
                                                                :schema/name "Widget2"}
-                                                    {:f/$identity alice-did
-                                                     :f/role      :ex/otherRole})]
+                                                    {:did alice-did
+                                                     :role      :ex/otherRole})]
           (is (util/exception? update-name-other-role)
               "Attempted update should have thrown an exception, this role cannot modify product names")
 
