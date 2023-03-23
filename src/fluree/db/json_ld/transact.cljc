@@ -1,5 +1,7 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.json-ld :as json-ld]
+  (:require [clojure.string :as str]
+            [fluree.db.util.validation :as v]
+            [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.vocab :as vocab]
@@ -20,10 +22,41 @@
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.util.log :as log])
+            [fluree.db.util.log :as log]
+            [malli.core :as m])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(def retract-key-re (re-pattern "^.+[/:#]retract$"))
+
+(def registry
+  (merge
+    (m/base-schemas)
+    (m/type-schemas)
+    v/registry
+    {::iri          ::v/iri
+     ::val          ::v/val
+     ::context      ::v/context
+     ::txn-val      [:orn
+                     [:multiple [:sequential
+                                 [:or [:ref ::txn-map] [:ref ::txn-val]]]]
+                     [:node [:ref ::txn-map]]
+                     [:iri ::iri]
+                     [:val ::val]]
+     ::txn-leaf-map [:map
+                     ["@context" {:optional true} ::context]
+                     [::m/default [:map-of ::iri ::txn-val]]]
+     ::retract-key  [:and ::iri [:re retract-key-re]]
+     ::txn-map      [:orn
+                     [:assert ::txn-leaf-map]
+                     [:retract
+                      [:map
+                       ["@context" {:optional true} ::context]
+                       [::m/default [:map-of ::retract-key ::txn-leaf-map]]]]]
+     ::txn          [:orn
+                     [:single-amp ::txn-map]
+                     [:sequence-of-maps [:sequential ::txn-map]]]}))
 
 (declare json-ld-node->flakes)
 
