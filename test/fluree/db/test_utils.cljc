@@ -6,16 +6,16 @@
                        [clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
-  {:id     "@id"
-   :type   "@type"
-   :xsd    "http://www.w3.org/2001/XMLSchema#"
-   :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-   :rdfs   "http://www.w3.org/2000/01/rdf-schema#"
-   :sh     "http://www.w3.org/ns/shacl#"
-   :schema "http://schema.org/"
-   :skos   "http://www.w3.org/2008/05/skos#"
-   :wiki   "https://www.wikidata.org/wiki/"
-   :f      "https://ns.flur.ee/ledger#"})
+  {"id"     "@id"
+   "type"   "@type"
+   "xsd"    "http://www.w3.org/2001/XMLSchema#"
+   "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"
+   "sh"     "http://www.w3.org/ns/shacl#"
+   "schema" "http://schema.org/"
+   "skos"   "http://www.w3.org/2008/05/skos#"
+   "wiki"   "https://www.wikidata.org/wiki/"
+   "f"      "https://ns.flur.ee/ledger#"})
 
 (def default-private-key
   "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")
@@ -87,11 +87,11 @@
 (defn create-conn
   ([]
    (create-conn {}))
-  ([{:keys [context did]
+  ([{:strs [context did]
      :or   {context default-context
-            did     (did/private->did-map default-private-key)}}]
-   (let [conn-p (fluree/connect-memory {:defaults {:context context
-                                                   :did     did}})]
+            did     (did/private->did-map default-private-key false)}}]
+   (let [conn-p (fluree/connect-memory {"defaults" {"@context" context
+                                                    "did"      did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies

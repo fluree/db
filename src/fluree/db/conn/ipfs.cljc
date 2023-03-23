@@ -158,7 +158,7 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [ipfs-endpoint {:keys [ipns context-type context did indexer] :as defaults}]
+  [ipfs-endpoint {:keys [ipns context did indexer] :as _defaults}]
   (go-try
     (let [ipns-default-key     (or (:key ipns) "self")
           ipns-default-address (<? (ipfs-keys/address ipfs-endpoint ipns-default-key))
@@ -180,7 +180,7 @@
                         {:status 400 :error :db/ipfs-keys})))
       {:ipns    {:key     ipns-default-key
                  :address ipns-default-address}
-       :context (util/normalize-context context-type context)
+       :context context
        :did     did
        :indexer new-indexer-fn})))
 

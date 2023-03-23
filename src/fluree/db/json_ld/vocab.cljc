@@ -223,8 +223,8 @@
   "Updates the schema map of a db."
   [db]
   (go-try
-    (let [{{:keys [context context-str]} :schema} db
+    (let [{{:keys [context]} :schema} db
           _       (log/debug "refresh-schema existing context:" context)
           schema  (<? (vocab-map db))
-          schema* (assoc schema :context context :context-str context-str)]
+          schema* (assoc schema :context context)]
       (assoc db :schema schema*))))

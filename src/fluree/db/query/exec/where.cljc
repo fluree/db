@@ -377,7 +377,7 @@
 
 (defn search
   [db q error-ch]
-  (let [where-clause      (:where q)
+  (let [where-clause      (get q "where")
         initial-solutions (-> q
                               :values
                               not-empty

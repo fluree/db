@@ -64,7 +64,7 @@
 (defn combine
   "Returns a channel of solutions from `solution-ch` collected into groups defined
   by the `:group-by` clause specified in the supplied query."
-  [{:keys [group-by select]} solution-ch]
+  [{:strs [group-by select]} solution-ch]
   (if-let [grouping (or group-by
                         (implicit-grouping select))]
     (-> (async/transduce (map (partial split-solution-by grouping))

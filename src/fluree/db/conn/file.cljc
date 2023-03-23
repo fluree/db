@@ -146,6 +146,7 @@
   (let [alias      (ledger-proto/-alias ledger)
         branch     (name (:name (ledger-proto/-branch ledger)))
         json       (json-ld/normalize-data data)
+        _          (log/debug "normalized JSON:" json)
         bytes      (->bytes json)
         hash       (crypto/sha2-256 bytes :hex)
         type-dir   (-> data-type name (str "s"))
@@ -193,7 +194,7 @@
 
 (defn read-context
   [conn context-key]
-  (json/parse (read-address conn context-key) true))
+  (json/parse (read-address conn context-key) false))
 
 (defrecord FileConnection [id memory state ledger-defaults parallelism msg-in-ch
                            msg-out-ch lru-cache-atom]
@@ -280,8 +281,8 @@
     s))
 
 (defn ledger-defaults
-  [{:keys [context-type context did indexer]}]
-  {:context (util/normalize-context context-type context)
+  [{:keys [did indexer context] :as _opts}]
+  {:context context
    :did     did
    :indexer (cond
               (fn? indexer)
@@ -305,11 +306,13 @@
           state        (state-machine/blank-state)
 
           cache-size     (conn-cache/memory->cache-size memory)
-          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
+          ld             (ledger-defaults defaults)]
+      (log/debug "connect ledger-defaults:" ld)
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
                             :storage-path    storage-path
-                            :ledger-defaults (ledger-defaults defaults)
+                            :ledger-defaults ld
                             :serializer      #?(:clj  (avro-serde/avro-serde)
                                                 :cljs (json-serde/json-serde))
                             :parallelism     parallelism

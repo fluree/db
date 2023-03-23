@@ -1,6 +1,5 @@
 (ns fluree.sdk.node
   (:require [cljs.nodejs :as node-js]
-            [clojure.string :as str]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.log :as log]))
 
@@ -8,13 +7,13 @@
 
 (defn ^:export connect
   [opts]
-  (fluree/connect (js->clj opts :keywordize-keys true)))
+  (fluree/connect (js->clj opts :keywordize-keys false)))
 
 (defn ^:export create
   ([conn] (fluree/create conn))
   ([conn ledger-alias] (fluree/create conn ledger-alias))
   ([conn ledger-alias opts] (fluree/create conn ledger-alias
-                                           (js->clj opts :keywordize-keys true))))
+                                           (js->clj opts :keywordize-keys false))))
 
 (defn ^:export exists
   [conn alias-or-address]
@@ -30,17 +29,15 @@
 
 (defn ^:export stage
   ([db-or-ledger json-ld]
-   (fluree/stage db-or-ledger (js->clj json-ld) {:context-type :string}))
+   (fluree/stage db-or-ledger (js->clj json-ld)))
   ([db-or-ledger json-ld opts]
    (fluree/stage db-or-ledger (js->clj json-ld)
-                 (-> opts
-                     (js->clj :keywordize-keys true)
-                     (assoc :context-type :string)))))
+                 (js->clj opts :keywordize-keys false))))
 
 (defn ^:export commit
   ([ledger db] (fluree/commit! ledger db))
   ([ledger db opts] (fluree/commit! ledger db
-                                    (js->clj opts :keywordize-keys true))))
+                                    (js->clj opts :keywordize-keys false))))
 
 (defn ^:export status
   ([ledger] (clj->js (fluree/status ledger)))
@@ -48,17 +45,12 @@
 
 (defn ^:export db
   ([ledger] (fluree/db ledger))
-  ([ledger opts] (fluree/db ledger (js->clj opts :keywordize-keys true))))
+  ([ledger opts] (fluree/db ledger (js->clj opts :keywordize-keys false))))
 
 (defn ^:export query
   [db query]
-  (let [query* (->> (js->clj query :keywordize-keys false)
-                    (reduce-kv (fn [acc k v]
-                                 (assoc acc (if (str/starts-with? k "@")
-                                              k
-                                              (keyword k)) v))
-                               {}))]
-    (.then (fluree/query db (assoc-in query* [:opts :context-type] :string))
+  (let [query* (js->clj query :keywordize-keys false)]
+    (.then (fluree/query db query*)
            (fn [result] (clj->js result)))))
 
 (log/set-level! :warning)

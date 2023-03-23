@@ -46,26 +46,40 @@
 
   Multiple connections to same endpoint will share underlying network connection.
 
-  Options include:
-    - did - (optional) DiD information to use, if storing blocks as verifiable credentials,
-            or issuing queries against a permissioned database.
-    - context - (optional) Default @context map to use for ledgers formed with this connection.
-    - write - (optional) Function to use for all writes, if empty will store in memory until a commit is performed
-    - read - (optional) Function to use for reads of persisted blocks/data
-    - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
-    - push - (optional) Function(s) in a vector that will attempt to push the commit to naming service(s)
-    "
-  [{:keys [method parallelism] :as opts}]
+  Options include (keys are strings):
+    - defaults:
+      - did - (optional) DiD information to use, if storing blocks as verifiable credentials,
+              or issuing queries against a permissioned database.
+      - context - (optional) Default @context map to use for ledgers formed with this connection."
+  [{:strs [method parallelism] :as opts}]
   ;; TODO - do some validation
   (promise-wrap
-    (let [opts*   (assoc opts :parallelism (or parallelism 4))
-          method* (keyword method)]
+    (let [parallelism* (or parallelism 4)
+          opts*        (assoc opts "parallelism" parallelism*)
+          shared-opts  (-> opts*
+                           (util/update-in-if-contains ["defaults" "did"]
+                                                       util/assoc-from-str-opts
+                                                       #{"id" "public" "private"})
+                           (util/update-in-if-contains ["defaults"]
+                                                       util/assoc-from-str-opts
+                                                       #{"did"
+                                                         {"@context" :context}})
+                           (util/assoc-from-str-opts
+                             #{"defaults" "lru-cache-atom" "memory" "parallelism"}))
+          method*      (keyword method)]
+      (log/debug "connect shared opts:" shared-opts)
       (case method*
-        :ipfs (ipfs-conn/connect opts*)
+        :ipfs (ipfs-conn/connect (->> shared-opts
+                                      (util/assoc-from-str-opts
+                                        opts
+                                        #{"server" "memory" "serializer"})))
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
-                (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)))))
+                (file-conn/connect (->> shared-opts
+                                        (util/assoc-from-str-opts
+                                          opts
+                                          #{"storage-path"}))))
+        :memory (memory-conn/connect shared-opts)))))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
@@ -74,14 +88,14 @@
   - did - (optional) DiD information to use, if storing blocks as verifiable credentials
   - context - (optional) Default @context map to use for ledgers formed with this connection."
   [opts]
-  (connect (assoc opts :method :ipfs)))
+  (connect (assoc opts "method" :ipfs)))
 
 (defn connect-memory
   "Forms an in-memory connection using default settings.
   - did - (optional) DiD information to use, if storing blocks as verifiable credentials
   - context - (optional) Default @context map to use for ledgers formed with this connection."
   [opts]
-  (connect (assoc opts :method :memory)))
+  (connect (assoc opts "method" :memory)))
 
 (defn address?
   "Returns true if the argument is a full ledger address, false if it is just an
@@ -90,8 +104,7 @@
   (str/starts-with? ledger-alias-or-address "fluree:"))
 
 (defn create
-  "Creates a new json-ld ledger. A connection (conn)
-  must always be supplied.
+  "Creates a new json-ld ledger. A connection (conn) must always be supplied.
 
   Ledger-name (optional) is a friendly name that is used for:
   - When publishing to a naming service that allows multiple pointers for the
@@ -105,14 +118,19 @@
   - When combining multiple ledgers, each ledger becomes an individual named
     graph which can be referenced by name.
 
-  Options map (opts) can include:
+  Options map (opts) can include (keys are strings):
   - did - DiD information to use, if storing blocks as verifiable credentials
-  - context - Default @context map to use for ledgers formed with this connection
-    "
+  - @context - Default @context map to use for ledgers formed with this connection"
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
-   (let [res-ch (jld-ledger/create conn ledger-alias opts)]
+   (let [opts*  (util/assoc-from-str-opts
+                  opts
+                  #{{"@context" :context} "did" "branch" "pub-fn" "ipns"
+                    "indexer" "include" "reindex-min-bytes" "reindex-max-bytes"
+                    "initial-tx"})
+         _      (log/debug "create opts*:" opts*)
+         res-ch (jld-ledger/create conn ledger-alias opts*)]
      (promise-wrap res-ch))))
 
 (defn load-from-address
@@ -188,6 +206,8 @@
   "Performs a transaction and queues change if valid (does not commit)"
   ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
+   (log/debug "stage JSON-LD:" json-ld)
+   (log/debug "staging in db:" db "w/ opts:" opts "\n" json-ld)
    (let [result-ch (db-proto/-stage db json-ld opts)]
      (promise-wrap result-ch))))
 
@@ -203,8 +223,20 @@
    (promise-wrap
      (ledger-proto/-commit! ledger db)))
   ([ledger db opts]
-   (promise-wrap
-     (ledger-proto/-commit! ledger db opts))))
+   (log/debug "commit! incoming opts:" opts)
+   (let [opts* (if (map? opts)
+                 (-> opts
+                     (util/update-in-if-contains ["did"]
+                                                 util/assoc-from-str-opts
+                                                 #{"id" "public" "private"})
+                     (util/assoc-from-str-opts opts
+                                               #{"message" "branch" "tag"
+                                                 {"@context" :context}
+                                                 "did" "private" "push?"}))
+                 opts)]
+     (log/debug "commit! decoded opts:" opts*)
+     (promise-wrap
+       (ledger-proto/-commit! ledger db opts*)))))
 
 
 (defn status
@@ -247,6 +279,7 @@
    (if opts
      (throw (ex-info "DB opts not yet implemented"
                      {:status 500 :error :db/unexpected-error}))
+     ;; TOOD: When db opts are allowed, convert from string keys to keyword keys
      (ledger-proto/-db ledger opts))))
 
 
@@ -277,7 +310,7 @@
   that produced the changes."
   [ledger query]
   (let [latest-db (ledger-proto/-db ledger)
-        res-chan (query-api/history latest-db query)]
+        res-chan  (query-api/history latest-db query)]
     (promise-wrap res-chan)))
 
 (defn range

@@ -209,13 +209,32 @@
         (assoc acc k v)))
     {} m))
 
-(defn normalize-context
-  "Keywordizes string contexts so they merge correctly with other keyword
-  contexts."
-  [context-type context]
-  (if (= :keyword context-type)
-    context
-    (keywordize-keys context)))
+(defn assoc-from-str-opts
+  "For each string in str-keys, if the supplied str key exists in the supplied
+  from opts map, it is assoc'ed into the to map w/ a keyword key.
+
+  Alternatively you can supply single-element maps in str-keys whose key is the
+  string key to lookup in from and the value is the keyword key to assoc it into
+  to with. This is useful for when the to key is not just (keyword str-key)."
+  ([from str-keys] (assoc-from-str-opts from str-keys {}))
+  ([from str-keys to]
+   (reduce (fn [t k]
+             (let [[from-k to-k] (if (map? k)
+                                   (first k)
+                                   [k (keyword k)])]
+               (if (contains? from from-k)
+                 (assoc t to-k (get from from-k))
+                 t)))
+           to str-keys)))
+
+(defn update-in-if-contains
+  "Updates the key-path kp in map m iff m contains the key-path kp. The update
+  is done with the clojure.core/update-in fn with m kp f args. Returns m
+  unmodified if it doesn't contain kp."
+  [m kp f & args]
+  (if (= ::not-found (get-in m kp ::not-found))
+    m
+    (apply update-in m kp f args)))
 
 (defn str->epoch-ms
   "Takes time as a string and returns epoch millis."

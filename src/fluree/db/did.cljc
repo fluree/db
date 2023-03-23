@@ -2,7 +2,8 @@
   (:require [fluree.crypto :as crypto]
             [alphabase.core :as alphabase]
             [alphabase.base58 :as base58]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.util.core :as util]))
 
 ;; did operations
 
@@ -27,11 +28,15 @@
 
 (defn private->did-map
   "Returns a complete did map from a private key."
-  [private-key]
-  (let [public  (crypto/pub-key-from-private private-key)
-        auth-id (crypto/account-id-from-public public)
-        did-id  (auth-id->did auth-id)]
-    (did-map did-id public private-key)))
+  ([private-key] (private->did-map private-key true))
+  ([private-key keyword-keys?]
+   (let [public   (crypto/pub-key-from-private private-key)
+         auth-id  (crypto/account-id-from-public public)
+         did-id   (auth-id->did auth-id)
+         kw-map (did-map did-id public private-key)]
+     (if keyword-keys?
+       kw-map
+       (util/stringify-keys kw-map)))))
 
 ;; https://github.com/multiformats/multicodec/blob/master/table.csv
 (def secp256k1-pub
@@ -54,17 +59,17 @@
   encoded secp256k1 public key."
   [did]
   (let [[_ _ multibase-value] (str/split did #":")
-        prefix                (str (first multibase-value))
-        base-key              (subs multibase-value 1)
-        _                     (when (not= prefix base58btc)
-                                (throw (ex-info (str "The prefix " (pr-str prefix) " does not map to a supported multibase encoding.")
-                                                {:value multibase-value
-                                                 :prefix prefix})))
-        multicodec            (alphabase/bytes->hex (base58/decode base-key))
-        pubkey-header         (subs multicodec 0 2)
-        pubkey                (subs multicodec 2)]
+        prefix        (str (first multibase-value))
+        base-key      (subs multibase-value 1)
+        _             (when (not= prefix base58btc)
+                        (throw (ex-info (str "The prefix " (pr-str prefix) " does not map to a supported multibase encoding.")
+                                        {:value  multibase-value
+                                         :prefix prefix})))
+        multicodec    (alphabase/bytes->hex (base58/decode base-key))
+        pubkey-header (subs multicodec 0 2)
+        pubkey        (subs multicodec 2)]
     (when (not= pubkey-header secp256k1-pub)
       (throw (ex-info (str "The multicodec header " (pr-str pubkey-header) " does not map to a supported multicodec encoding.")
-                      {:value multicodec
+                      {:value  multicodec
                        :header pubkey-header})))
     pubkey))

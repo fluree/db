@@ -21,15 +21,13 @@
   "Retrieves branch metadata from ledger state"
   [{:keys [state context] :as _ledger} requested-branch]
   (let [{:keys [branch branches]} @state
-        branch      (if requested-branch
-                      (get branches requested-branch)
-                      ;; default branch
-                      (get branches branch))
-        context-kw  (json-ld/parse-context context)
-        context-str (-> context util/stringify-keys json-ld/parse-context)]
-    (-> branch
-        (assoc-in [:latest-db :schema :context] context-kw)
-        (assoc-in [:latest-db :schema :context-str] context-str))))
+        branch  (if requested-branch
+                  (get branches requested-branch)
+                  ;; default branch
+                  (get branches branch))
+        context (json-ld/parse-context context)]
+    (log/debug "setting branch context to:" context)
+    (assoc-in branch [:latest-db :schema :context] context)))
 
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn db
@@ -150,7 +148,7 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [context-type context did branch pub-fn ipns indexer include
+    (let [{:keys [context did branch pub-fn ipns indexer include
                   reindex-min-bytes reindex-max-bytes initial-tx]
            :or   {branch :main}} opts
           did*          (if did
@@ -176,9 +174,7 @@
           address       (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
           conn-context  (conn-proto/-context conn)
           _             (log/debug "create conn-context:" conn-context)
-          context*      (->> context
-                             (util/normalize-context context-type)
-                             (merge conn-context))
+          context*      (merge conn-context context)
           _             (log/debug "create merged context*:" context*)
           method-type   (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
@@ -239,6 +235,7 @@
                            :value
                            (->> (jld-reify/load-default-context conn))
                            <?)
+          _            (log/debug "loaded default context from commit:" default-ctx)
           ledger       (<? (create conn alias {:branch  branch
                                                :id      last-commit
                                                :context default-ctx}))

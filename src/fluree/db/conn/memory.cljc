@@ -189,9 +189,9 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context-type context did] :as _defaults}]
+  [{:keys [did context]}]
   (async/go
-    {:context (util/normalize-context context-type context)
+    {:context context
      :did     did}))
 
 (defn connect
