@@ -92,7 +92,7 @@
                             (assoc-in [:policy :cache] (atom {})))
           opts*         (-> opts
                             (assoc :issuer issuer)
-                            (dissoc :meta))
+                            (dissoc "meta"))
           start #?(:clj (System/nanoTime)
                    :cljs (util/current-time-millis))
           result        (<? (fql/query db* (assoc query :opts opts*)))]
@@ -112,8 +112,8 @@
         default-meta       (get global-opts "meta")
         meta?              (or default-meta query-meta)
         remove-meta?       (and meta? (not query-meta)) ;; query didn't ask for meta, but multiquery did so must strip it
-        opts*              {:meta meta? ::remove-meta? remove-meta?}
-        query*             (assoc query :opts opts*)]
+        opts*              {"meta" meta? ::remove-meta? remove-meta?}
+        query*             (assoc query "opts" opts*)]
     (assoc m alias query*)))
 
 (defn multi-query
@@ -135,7 +135,7 @@
   (go-try
     (let [global-opts        (get flureeQL "opts")
           queries            (reduce-kv (partial multi-query-map global-opts)
-                                        {} (dissoc flureeQL :opts))
+                                        {} (dissoc flureeQL "opts"))
           start-time #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
           ;; kick off all queries in parallel, each alias now mapped to core async channel
           pending-resp       (map (fn [[alias q]] [alias (query source q)]) queries)]
@@ -148,7 +148,7 @@
              "status" status-global
              "time"   (util/response-time-formatted start-time)}
             response)
-          (let [{:keys [meta] remove-meta? ::remove-meta?} (get-in queries [alias :opts])
+          (let [{:strs [meta] remove-meta? ::remove-meta?} (get-in queries [alias "opts"])
 
                 res            (async/<! port)
                 error?         (:error res) ;; if error key is present in response, it is an error

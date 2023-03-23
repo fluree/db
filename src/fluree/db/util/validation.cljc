@@ -10,9 +10,7 @@
     (m/comparator-schemas)
     {::iri                    :string
      ::val                    [:fn value?]
-     ::at-context             [:= "@context"]
      ::context-key            :string
      ::context                [:or
                                :string
-                               [:map-of ::context-key [:or :string :map]]]
-     ::context-containing-map [:map-of ::at-context ::context]}))
+                               [:map-of ::context-key [:or :string :map]]]}))
