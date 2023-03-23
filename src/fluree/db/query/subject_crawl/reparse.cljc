@@ -66,12 +66,12 @@
       (if where-smt
         (when (and (= :tuple type)
                    (= first-s (clause-subject-var where-smt)))
-          (let [{::where/keys [val var]} o 
+          (let [{::where/keys [val var]} o
                 f (cond
                     val
                     (fn [flake _] (= val (flake/o flake)))
 
-                    ;;TODO: filters are not yet supported 
+                    ;;TODO: filters are not yet supported
                     #_#_filter
                     (let [{:keys [params variable function]} filter]
                       (if (= 1 (count params))
@@ -101,7 +101,7 @@
         [s p o] (if (= :tuple type)
                   pattern
                   (let [[_type-kw tuple] pattern]
-                    tuple)) 
+                    tuple))
         reparse-component (fn [component]
                             (let [{::where/keys [var val]} component]
                               (cond
@@ -116,7 +116,7 @@
   "Revises where clause for simple-subject-crawl query to optimize processing.
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
-  [{:keys [where vars] :as parsed-query}]
+  [{:strs [where vars] :as parsed-query}]
   (let [{::where/keys [patterns]} where
         [first-pattern & rest-patterns] patterns
         reparsed-first-clause (re-parse-pattern first-pattern)]
@@ -129,11 +129,12 @@
         (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
           (assoc parsed-query :where [reparsed-first-clause
                                       {:s-filter subj-filter-map}]
-                              :strategy :simple-subject-crawl))))))
+                 :strategy :simple-subject-crawl))))))
+
 (defn simple-subject-crawl?
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
-  [{:keys [where select vars] :as _parsed-query}]
+  [{:strs [where select vars] :as _parsed-query}]
   (and (instance? SubgraphSelector select)
        ;;TODO, filtering not supported yet
        (empty? (::where/filters where))
@@ -153,7 +154,7 @@
   e.g.
   {\"select\" {?subjects ['*']}
    \"where\" [...]}"
-  [{:keys [order-by group-by] :as parsed-query}]
+  [{:strs [order-by group-by] :as parsed-query}]
   (when (and (not group-by)
              (not order-by)
              (simple-subject-crawl? parsed-query))
