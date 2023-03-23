@@ -435,7 +435,9 @@
   [db identity role credential]
   (async/go
     (try*
-      (let [ident-sid         (<? (dbproto/-subid db identity))
+      (let [ident-sid         (some->> identity
+                                       (dbproto/-subid db)
+                                       (<?))
             role-sids         (if (sequential? role)
                                 (->> (<? (subids db role))
                                      (into #{}))
@@ -472,10 +474,10 @@
 (defn wrap-policy
   "Given a db object and a map containing the identity,
   wraps specified policy permissions"
-  [db {:f/keys [$identity role credential]}]
+  [{:keys [policy] :as db} {:f/keys [$identity role credential]}]
   ;; TODO - not yet paying attention to verifiable credentials that are present
   (go-try
-    (if (get-in db [:policy :ident])
+    (if (or (:ident policy) (:roles policy))
       (throw (ex-info (str "Policy already in place for this db. "
                            "Applying policy more than once, via multiple uses of `wrap-policy` and/or supplying an identity via `:opts`, is not supported.")
                       {:status 400
