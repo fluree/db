@@ -238,7 +238,7 @@
                      :ex/location {:id nil},
                      :id :ex/alice}]
                    commit-details-asserts)
-                "Alice should be able to see her own ssn in commit asserts, but not John's."))
+                "Alice should be able to see her own ssn in commit details, but not John's."))
           (let [[history-result] @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
                                                           :commit-details true
                                                           :opts     {:did root-did
