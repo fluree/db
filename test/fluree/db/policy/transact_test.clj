@@ -39,7 +39,7 @@
                         ;; assign alice-did to :ex/userRole and also link the did to :ex/alice via :ex/user
                         {:id      alice-did
                          :ex/user :ex/alice
-                         :f/role  :ex/userRole}])
+                         :f/role  [:ex/userRole :ex/otherRole]}])
 
           db+policy @(fluree/stage
                        db
@@ -61,6 +61,11 @@
                                           :f/allow [{:id           :ex/ssnViewRule
                                                      :f/targetRole :ex/userRole
                                                      :f/action     [:f/view]
+                                                     :f/equals     {:list [:f/$identity :ex/user]}}]}
+                                         {:f/path  :schema/email
+                                          :f/allow [{:id           :ex/emailChangeRule
+                                                     :f/targetRole :ex/userRole
+                                                     :f/action     [:f/view :f/modify]
                                                      :f/equals     {:list [:f/$identity :ex/user]}}]}]}
                         ;; add a :ex/Product policy allows view & modify for only :schema/name
                         {:id            :ex/ProductPolicy,
@@ -74,26 +79,76 @@
                                                      :f/action     [:f/view :f/modify]}]}]}])]
 
       (testing "Policy allowed modification"
-        (let [alice-db    @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                          :f/role      :ex/userRole})
-              update-name @(fluree/stage alice-db {:id          :ex/widget
-                                                   :schema/name "Widget2"})]
+        (testing "using role + id"
+          (let [update-name @(fluree/stage db+policy {:id          :ex/alice
+                                                      :schema/email "alice@foo.bar"}
+                                           {:did alice-did
+                                            :role      :ex/userRole})]
 
-          (is (= [{:rdf/type    [:ex/Product]
-                   :schema/name "Widget2"}]
-                 @(fluree/query update-name
-                                {:select {'?s [:*]}
-                                 :where  [['?s :rdf/type :ex/Product]]}))
-              "Updated :schema/name should have been allowed and have updated value.")))
+            (is (= [{:id :ex/alice,
+                     :rdf/type [:ex/User],
+                     :schema/name "Alice",
+                     :schema/email "alice@foo.bar",
+                     :schema/birthDate "2022-08-17",
+                     :schema/ssn "111-11-1111",
+                     :ex/location {:id nil}}]
+                   @(fluree/query update-name
+                                  {:select {'?s [:*]}
+                                   :where  [['?s :schema/name "Alice"]]}))
+                "Alice should be allowed to update her own name.")))
+        (testing "using role only"
+          (let [update-price @(fluree/stage db+policy {:id          :ex/widget
+                                                       :schema/price 105.99}
+                                            {:role :ex/rootRole})]
+
+            (is (= [{:id :ex/widget,
+                     :rdf/type [:ex/Product],
+                     :schema/name "Widget",
+                     :schema/price 105.99,
+                     :schema/priceCurrency "USD"}]
+                   @(fluree/query update-price
+                                  {:select {'?s [:*]}
+                                   :where  [['?s :rdf/type :ex/Product]]}))
+                "Updated :schema/price should have been allowed, and entire product is visible in query."))
+          (let [update-name @(fluree/stage db+policy {:id          :ex/widget
+                                                      :schema/name "Widget2"}
+                                           {:role :ex/userRole})]
+
+            (is (= [{:rdf/type    [:ex/Product]
+                     :schema/name "Widget2"}]
+                   @(fluree/query update-name
+                                  {:select {'?s [:*]}
+                                   :where  [['?s :rdf/type :ex/Product]]}))
+                "Updated :schema/name should have been allowed, and only name is visible in query."))))
 
       (testing "Policy doesn't allow a modification"
-        (let [alice-db     @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                           :f/role      :ex/userRole})
-              update-price @(fluree/stage alice-db {:id           :ex/widget
-                                                    :schema/price 42.99})]
+        (let [update-price @(fluree/stage db+policy {:id           :ex/widget
+                                                     :schema/price 42.99}
+                                          {:did root-did
+                                           :role      :ex/userRole})]
           (is (util/exception? update-price)
-              "Attempted update should have thrown an exception")
+              "Attempted update should have thrown an exception, `:ex/userRole` cannot modify product prices regardless of identity")
 
           (is (= :db/policy-exception
                  (:error (ex-data update-price)))
+              "Exception should be of type :db/policy-exception"))
+        (let [update-email @(fluree/stage db+policy {:id          :ex/john
+                                                     :schema/email "john@foo.bar"}
+                                          {:role :ex/user})]
+
+          (is (util/exception? update-email)
+              "attempted update should have thrown an exception, no identity was provided")
+
+          (is (= :db/policy-exception
+                 (:error (ex-data update-email)))
+              "exception should be of type :db/policy-exception"))
+        (let [update-name-other-role @(fluree/stage db+policy {:id          :ex/widget
+                                                               :schema/name "Widget2"}
+                                                    {:did alice-did
+                                                     :role      :ex/otherRole})]
+          (is (util/exception? update-name-other-role)
+              "Attempted update should have thrown an exception, this role cannot modify product names")
+
+          (is (= :db/policy-exception
+                 (:error (ex-data update-name-other-role)))
               "Exception should be of type :db/policy-exception"))))))
