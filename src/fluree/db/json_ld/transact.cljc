@@ -18,7 +18,7 @@
             [clojure.core.async :as async]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.json-ld.policy :as perm] ;;TODO
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.util.log :as log])
