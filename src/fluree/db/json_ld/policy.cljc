@@ -477,10 +477,13 @@
   [{:keys [policy] :as db} {:keys [did role credential]}]
   ;; TODO - not yet paying attention to verifiable credentials that are present
   (go-try
-    (if (or (:ident policy) (:roles policy))
-      (throw (ex-info (str "Policy already in place for this db. "
-                           "Applying policy more than once, via multiple uses of `wrap-policy` and/or supplying an identity via `:opts`, is not supported.")
-                      {:status 400
-                       :error :db/policy-exception}))
-      (assoc db :policy
-             (<? (policy-map db did role credential))))))
+    (cond
+      (or (:ident policy) (:roles policy)) (throw (ex-info (str "Policy already in place for this db. "
+                                                                "Applying policy more than once, via multiple uses of `wrap-policy` and/or supplying an identity via `:opts`, is not supported.")
+                                                           {:status 400
+                                                            :error  :db/policy-exception}))
+      (not role)                           (throw (ex-info "Applying policy without a role is not yet supported."
+                                                           {:status 400
+                                                            :error  :db/policy-exception}) )
+      :else                                (assoc db :policy
+                                                  (<? (policy-map db did role credential))))))
