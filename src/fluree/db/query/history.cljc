@@ -22,17 +22,29 @@
   [commit]
   (re-matches commit-key-re (-> commit keys first)))
 
-(defn commit?
+(defn history-query-result?
   [v]
   ;; TODO: Move this into malli schema directly when it supports one-to-one
   ;;       key schema -> value schema mapping in maps.
   ;;       https://github.com/metosin/malli/issues/881
   (when (map? v)
-    (when-let [ck (commit-key v)]
-      (every? (fn [k] (some #(str/ends-with? k %)
-                            #{"id" "address" "alias" "branch" "context" "data"
-                              "time" "v" "issuer"}))
-              (-> v (get ck) keys)))))
+    (and
+      (if-let [ck (commit-key v)]
+        (every? (fn [k] (some #(re-matches % k)
+                              (map re-pattern
+                                   ["^.+[/:#]id$" "^.+[/:#]address$"
+                                    "^.+[/:#]alias$" "^.+[/:#]branch$"
+                                    "^.+[/:#]context$"
+                                    "^.+[/:#]data$" "^.+[/:#]time$" ".+[/:#]v$"
+                                    "^.+[/:#]issuer$"])))
+                (-> v (get ck) keys))
+        true)
+      (every? (fn [k] (some #(re-matches % k)
+                            (map re-pattern
+                                 [".+[/:#]t$" ".+[/:#]assert$"
+                                  "^.+[/:#]retract$"
+                                  ".+[/:#]commit$"])))
+              (keys v)))))
 
 (def registry
   (merge
@@ -85,8 +97,8 @@
                               [:fn {:error/message "Must supply either a \"history\" or \"commit-details\" key."}
                                (fn [{:strs [history commit-details]}]
                                  (or history commit-details))]]
-     ::commit                [:fn commit?]
-     ::history-query-results [:sequential ::commit]}))
+     ::history-query-result  [:fn history-query-result?]
+     ::history-query-results [:sequential ::history-query-result]}))
 
 (def history-query-validator
   (m/validator ::history-query {:registry registry}))
