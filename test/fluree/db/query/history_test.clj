@@ -293,7 +293,7 @@
           (is (= [commit-4 commit-5]
                  @(fluree/history ledger {:commit-details true :t {:from 4 :to 5}})))
           (is (= [commit-5]
-                 @(fluree/history ledger {:commit-details true :t {:at :latest}})))))
+                 @(fluree/history ledger {:commit-details true :t {:at "latest"}})))))
 
       (testing "time range"
         (let [[c2 c3 c4 :as response] @(fluree/history

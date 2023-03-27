@@ -39,15 +39,15 @@
      [:and
       [:map
        [:from {:optional true} [:or
-                                [:enum :latest]
+                                [:enum "latest"]
                                 pos-int?
                                 datatype/iso8601-datetime-re]]
        [:to {:optional true} [:or
-                              [:enum :latest]
+                              [:enum "latest"]
                               pos-int?
                               datatype/iso8601-datetime-re]]
        [:at {:optional true} [:or
-                              [:enum :latest]
+                              [:enum "latest"]
                               pos-int?
                               datatype/iso8601-datetime-re]]]
       [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
