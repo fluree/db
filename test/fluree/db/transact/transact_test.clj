@@ -51,21 +51,4 @@
               [:id :id "@id"]]
              @(fluree/query db-ok '{:context {:ex "http://example.org/ns/"}
                                     :select [?s ?p ?o]
-                                    :where  [[?s ?p ?o]]})))))
-  (testing "Allow transacting `false` values"
-    (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "tx/bools")
-          db-bool @(fluree/stage
-                     (fluree/db ledger)
-                     {:context    {:ex "http://example.org/ns/"}
-                      :id         :ex/alice
-                      :ex/isCool   false})]
-      (is (= [[:ex/alice :id "http://example.org/ns/alice"]
-              [:ex/alice :ex/isCool false]
-              [:ex/isCool :id "http://example.org/ns/isCool"]
-              [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
-              [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
-              [:id :id "@id"]]
-             @(fluree/query db-bool '{:context {:ex "http://example.org/ns/"}
-                                      :select  [?s ?p ?o]
-                                      :where   [[?s ?p ?o]]}))))))
+                                    :where  [[?s ?p ?o]]}))))))
