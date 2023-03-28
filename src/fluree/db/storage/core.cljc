@@ -253,9 +253,11 @@
          (catch* e
                  (log/error e "Error resolving index node")
                  (when error-fn
-                   (error-fn
-                     (async/put! return-ch e)
-                     (async/close! return-ch))))))
+                   (try*
+                     (error-fn)
+                     (catch* e (log/error e "Error executing error-fn in resolve-index-node!"))))
+                 (async/put! return-ch e)
+                 (async/close! return-ch))))
      return-ch)))
 
 (defn resolve-empty-leaf
