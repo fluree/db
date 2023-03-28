@@ -471,7 +471,6 @@
               (async/alt!
                 error-ch
                 ([e]
-                 ()
                  (throw e))
 
                 refresh-ch
