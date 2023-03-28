@@ -27,9 +27,5 @@
   (-serialize-garbage [_ garbage]
     garbage)
   (-deserialize-garbage [_ garbage]
-    garbage)
-  (-serialize-db-pointer [_ pointer]
-    pointer)
-  (-deserialize-db-pointer [_ pointer]
-    pointer))
+    garbage))
 

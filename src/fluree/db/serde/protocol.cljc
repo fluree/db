@@ -13,6 +13,4 @@
   (-serialize-leaf [this leaf] "Serializes a leaf.")
   (-deserialize-leaf [this leaf] "Deserializes a leaf.")
   (-serialize-garbage [this garbage] "Serializes database garbage for later cleanup.")
-  (-deserialize-garbage [this garbage] "Deserializes database garbage.")
-  (-serialize-db-pointer [this pointer] "Serializes a database pointer")
-  (-deserialize-db-pointer [this pointer] "Deserializes a database pointer"))
+  (-deserialize-garbage [this garbage] "Deserializes database garbage."))

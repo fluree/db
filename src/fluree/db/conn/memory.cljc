@@ -42,6 +42,7 @@
     (swap! data-atom assoc hash data)
     {:name    hash
      :hash    hash
+     :json    json
      :size    (count json)
      :address (memory-address path)}))
 
@@ -155,24 +156,6 @@
                       :TODO))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
-
-  storage/Store
-  (read [_ k]
-    #?(:clj (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
-                            {:status 500 :error :db/unexpected-error}))
-       :cljs (if platform/BROWSER
-
-               (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
-                               {:status 500 :error :db/unexpected-error})))))
-  (write [_ k data]
-    (throw (ex-info (str "Memory connection does not support storage writes. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
-  (exists? [_ k]
-    (throw (ex-info (str "Memory connection does not support storage exists?. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
-  (rename [_ old-key new-key]
-    (throw (ex-info (str "Memory connection does not support storage rename. Old/new key: " old-key new-key)
-                    {:status 500 :error :db/unexpected-error})))
 
   index/Resolver
   (resolve
