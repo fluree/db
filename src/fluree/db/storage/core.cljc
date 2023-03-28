@@ -5,12 +5,12 @@
             [clojure.string :as str]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
-            [fluree.db.dbproto :as dbproto]
             [clojure.core.async :refer [go <!] :as async]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.conn.proto :as conn-proto]
             #?(:clj [clojure.java.io :as io])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -23,95 +23,23 @@
   (rename [s old-key new-key] "Remove `old-key` and associate its data to `new-key`")
   (delete [s k] "Delete data associated with key `k`"))
 
-#?(:clj
-   (defn block-storage-path
-     "For a ledger server, will return the relative storage path it is using for blocks for a given ledger."
-     [network ledger-id]
-     (io/file network ledger-id "block")))
-
 (defn serde
   "Returns serializer from connection."
   [conn]
   (:serializer conn))
 
 (defn ledger-root-key
-  [network ledger-id block]
-  (str network "_" ledger-id "_root_" (util/zero-pad block 15)))
+  [network ledger-id t]
+  (str network "_" ledger-id "_root_" (util/zero-pad t 15)))
 
 (defn ledger-garbage-prefix
   [network ldgr-id]
   (str/join "_" [network ldgr-id "garbage"]))
 
 (defn ledger-garbage-key
-  [network ldgr-id block]
+  [network ldgr-id t]
   (let [pre (ledger-garbage-prefix network ldgr-id)]
-    (str/join "_" [pre block])))
-
-(defn ledger-node-key
-  [network ledger-id idx-type base-id node-type]
-  (str network "_" ledger-id "_" (name idx-type) "_" base-id "-" node-type))
-
-(defn ledger-block-key
-  [network ledger-id block]
-  (str network "_" ledger-id "_block_" (util/zero-pad block 15)))
-
-(defn ledger-block-file-path
-  [network ledger-id block]
-  (str network "/" ledger-id "/block/" (util/zero-pad block 15)))
-
-(defn read-block
-  "Returns a core async channel with the requested block."
-  [conn network ledger-id block]
-  (go-try
-    (let [key  (ledger-block-key network ledger-id block)
-          data (<? (read conn key))]
-      (when data
-        (serdeproto/-deserialize-block (serde conn) data)))))
-
-(defn read-block-version
-  "Returns a core async channel with the requested block."
-  [conn network ledger-id block version]
-  (go-try
-    (let [key  (str (ledger-block-key network ledger-id block) "--v" version)
-          data (<? (read conn key))]
-      (when data
-        (serdeproto/-deserialize-block (serde conn) data)))))
-
-(defn write-block-version
-  "Block data should look like:
-
-  {:block  block (long)
-   :flakes flakes
-   :hash   hash
-   :sigs   sigs
-   :txns   {tid (tx-id, string) {:cmd command (JSON string)
-                                 :sig signature (string}]}
-  "
-  [conn network ledger-id block-data version]
-  (go-try
-    (let [persisted-data (select-keys block-data [:block :t :flakes])
-          key            (str (ledger-block-key network ledger-id
-                                                (:block persisted-data))
-                              "--v" version)
-          ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
-      (<? (write conn key ser)))))
-
-(defn write-block
-  "Block data should look like:
-
-  {:block  block (long)
-   :flakes flakes
-   :hash   hash
-   :sigs   sigs
-   :txns   {tid (tx-id, string) {:cmd command (JSON string)
-                                 :sig signature (string}]}
-  "
-  [conn network ledger-id block-data]
-  (go-try
-    (let [persisted-data (select-keys block-data [:block :t :flakes])
-          key            (ledger-block-key network ledger-id (:block persisted-data))
-          ser            (serdeproto/-serialize-block (serde conn) persisted-data)]
-      (<? (write conn key ser)))))
+    (str/join "_" [pre t])))
 
 (defn child-data
   "Given a child, unresolved node, extracts just the data that will go into
@@ -119,80 +47,63 @@
   [child]
   (select-keys child [:id :leaf :first :rhs :size]))
 
-(defn random-leaf-id
-  [network ledger-id idx]
-  (ledger-node-key network ledger-id idx (random-uuid) "l"))
-
 (defn write-leaf
   "Writes `leaf` to storage under the provided `leaf-id`, computing a new id if
   one isn't provided. Returns the leaf map with the id used attached uner the
   `:id` key"
-  ([conn network ledger-id idx-type leaf]
-   (let [leaf-id (random-leaf-id network ledger-id idx-type)]
-     (write-leaf conn network ledger-id idx-type leaf-id leaf)))
-
-  ([conn network ledger-id idx-type leaf-id {:keys [flakes] :as leaf}]
-   (go-try
-     (let [data {:flakes flakes}
-           ser  (serdeproto/-serialize-leaf (serde conn) data)
-           res  (<? (write conn leaf-id ser))]
-       (assoc leaf :id (or (:address res) leaf-id))))))
+  [{:keys [conn ledger] :as db} idx-type leaf]
+  (go-try
+    (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)
+          res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
+      (log/warn "WRITE-LEAF COMPLETE WITH: " res)
+      res)))
 
 (defn write-branch-data
-  "Serializes final data for branch and writes it to provided key"
-  [conn key data]
+  "Serializes final data for branch and writes it to provided key.
+  Returns two-tuple of response output and raw bytes written."
+  [{:keys [conn ledger] :as db} idx-type data]
   (go-try
-    (let [ser (serdeproto/-serialize-branch (serde conn) data)]
-      (<? (write conn key ser)))))
-
-(defn random-branch-id
-  [network ledger-id idx]
-  (ledger-node-key network ledger-id idx (random-uuid) "b"))
+    (let [ser (serdeproto/-serialize-branch (serde conn) data)
+          res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
+      (log/warn "WRITE-BRANCH COMPLETE WITH: " res)
+      res)))
 
 (defn write-branch
   "Writes `branch` to storage under the provided `branch-id`, computing a new id
   if one isn't provided. Returns the branch map with the id used attached uner
   the `:id` key"
-  ([conn network ledger-id idx-type branch]
-   (let [branch-id (random-branch-id network ledger-id idx-type)]
-     (write-branch conn network ledger-id idx-type branch-id branch)))
-
-  ([conn network ledger-id idx-type branch-id {:keys [children] :as branch}]
-   (go-try
-     (let [child-vals  (->> children
-                            (map val)
-                            (mapv child-data))
-           first-flake (->> child-vals first :first)
-           rhs         (->> child-vals rseq first :rhs)
-           data        {:children child-vals}
-           res         (<? (write-branch-data conn branch-id data))]
-       (assoc branch :id (or (:address res) branch-id))))))
+  [db idx-type  {:keys [children] :as branch}]
+  (go-try
+    (let [child-vals  (->> children
+                           (map val)
+                           (mapv child-data))
+          data        {:children child-vals}
+          res         (<? (write-branch-data db idx-type data))]
+      (assoc branch :id (:address res)))))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
   [db garbage]
   (go-try
-    (let [{:keys [conn network ledger-id block]} db
-          garbage-key (ledger-garbage-key network ledger-id block)
+    (let [{:keys [conn ledger ledger-id t]} db
+          t'          (- t) ;; use positive t integer
           data        {:ledger-id ledger-id
-                       :block     block
+                       :block     t'
                        :garbage   garbage}
           ser         (serdeproto/-serialize-garbage (serde conn) data)]
-      (<? (write conn garbage-key ser)))))
+      (<? (conn-proto/-index-file-write conn ledger :garbage ser)))))
 
 (defn write-db-root
   ([db]
    (write-db-root db nil))
   ([db custom-ecount]
    (go-try
-     (let [{:keys [conn network commit block t ecount stats spot psot post opst
-                   tspo fork fork-block]}
-           db
-           ledger-id (:id commit)
-           db-root-key (ledger-root-key network ledger-id block)
+     (let [{:keys [conn ledger commit t ecount stats spot psot post opst
+                   tspo fork fork-block]} db
+           t'          (- t)
+           ledger-id   (:id commit)
            data        {:ledger-id ledger-id
-                        :block     block
-                        :t         t
+                        :t         t'
                         :ecount    (or custom-ecount ecount)
                         :stats     (select-keys stats [:flakes :size])
                         :spot      (child-data spot)
@@ -205,23 +116,23 @@
                         :fork      fork
                         :forkBlock fork-block}
            ser         (serdeproto/-serialize-db-root (serde conn) data)]
-       (<? (write conn db-root-key ser))))))
+       (<? (conn-proto/-index-file-write conn ledger :root ser))))))
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (read conn key))]
+    (when-let [data (<? (conn-proto/-index-file-read conn key))]
       (serdeproto/-deserialize-branch serializer data))))
 
 (defn read-leaf
   [{:keys [serializer] :as conn} key]
   (go-try
-    (when-let [data (<? (read conn key))]
+    (when-let [data (<? (conn-proto/-index-file-read conn key))]
       (serdeproto/-deserialize-leaf serializer data))))
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
-  [_conn {:keys [network ledger-id comparators block t]} index index-data]
+  [_conn {:keys [network ledger-id comparators t]} index index-data]
   (let [cmp (or (get comparators index)
                 (throw (ex-info (str "Internal error reifying db index root: "
                                      (pr-str index))
@@ -233,7 +144,6 @@
             true (assoc :comparator cmp
                         :network network
                         :ledger-id ledger-id
-                        :block block
                         :t t
                         :leftmost? true))))
 
@@ -241,11 +151,10 @@
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
-  (let [{:keys [block t ecount stats]} root-data
-        db* (assoc blank-db :block block
-                            :t t
+  (let [{:keys [t ecount stats]} root-data
+        db* (assoc blank-db :t (- t)
                             :ecount ecount
-                            :stats (assoc stats :indexed (- t)))]
+                            :stats (assoc stats :indexed t))]
     (reduce
       (fn [db idx]
         (let [idx-root (reify-index-root conn db idx (get root-data idx))]
@@ -254,26 +163,26 @@
 
 
 (defn read-garbage
-  "Returns a all data for a db index root of a given block."
-  [conn network ledger-id block]
+  "Returns garbage file data for a given index t."
+  [conn network ledger-id t]
   (go-try
-    (let [key  (ledger-garbage-key network ledger-id block)
-          data (read conn key)]
+    (let [key  (ledger-garbage-key network ledger-id t)
+          data (<? (conn-proto/-index-file-read conn key))]
       (when data
-        (serdeproto/-deserialize-garbage (serde conn) (<? data))))))
+        (serdeproto/-deserialize-garbage (serde conn) data)))))
 
 
 (defn read-db-root
   "Returns all data for a db index root of a given block."
   ([conn idx-address]
    (go-try
-     (let [data (<? (read conn idx-address))]
+     (let [data (<? (conn-proto/-index-file-read conn idx-address))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data)))))
   ([conn network ledger-id block]
    (go-try
      (let [key  (ledger-root-key network ledger-id block)
-           data (<? (read conn key))]
+           data (<? (conn-proto/-index-file-read conn key))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data))))))
 
@@ -352,11 +261,11 @@
            (async/put! return-ch
                        (assoc node k data)))
          (catch* e
-           (log/error e "Error resolving index node")
-           (when error-fn
-             (error-fn
-               (async/put! return-ch e)
-               (async/close! return-ch))))))
+                 (log/error e "Error resolving index node")
+                 (when error-fn
+                   (error-fn
+                     (async/put! return-ch e)
+                     (async/close! return-ch))))))
      return-ch)))
 
 (defn resolve-empty-leaf

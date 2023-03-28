@@ -8,6 +8,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.json-ld.commit-data :as commit-data]))
 
 ;; default indexer
@@ -162,7 +163,7 @@
        boolean))
 
 (defn update-branch
-  [{:keys [network ledger-id comparator], branch-t :t, :as branch} idx t child-nodes]
+  [{:keys [comparator], branch-t :t, :as branch} idx t child-nodes]
   (if (some-update-after? branch-t child-nodes)
     (let [children    (apply index/child-map comparator child-nodes)
           size        (->> child-nodes
@@ -170,7 +171,7 @@
                            (reduce +))
           first-flake (->> children first key)
           rhs         (->> children flake/last val :rhs)
-          new-id      (storage/random-branch-id network ledger-id idx)]
+          new-id      (random-uuid)]
       (assoc branch
         :id new-id
         :t t
@@ -241,7 +242,7 @@
     [leaf]))
 
 (defn update-leaf
-  [{:keys [network ledger-id] :as leaf} idx t novelty remove-preds]
+  [leaf idx t novelty remove-preds]
   (let [new-flakes (index/novelty-subrange leaf t novelty)
         to-remove  (filter-predicates remove-preds (:flakes leaf) new-flakes)]
     (if (or (seq new-flakes) (seq to-remove))
@@ -252,7 +253,7 @@
                            rebalance-leaf)]
         (map (fn [l]
                (assoc l
-                 :id (storage/random-leaf-id network ledger-id idx)
+                 :id (random-uuid)
                  :t t))
              new-leaves))
       [leaf])))
@@ -343,18 +344,18 @@
 
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
-  [conn idx {:keys [id network ledger-id] :as node} error-ch updated-ids]
+  [db idx node error-ch updated-ids]
   (let [node         (dissoc node ::old-id)
-        display-node (select-keys node [:id :network :ledger-id])]
+        display-node (select-keys node [:id :ledger-id])]
     (async/go
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (<? (storage/write-leaf conn network ledger-id idx id node)))
+              (<? (storage/write-leaf db idx node)))
           (do (log/debug "Writing index branch:" display-node)
               (->> node
                    (update-branch-ids updated-ids)
-                   (storage/write-branch conn network ledger-id idx id)
+                   (storage/write-branch db idx)
                    <?)))
         (catch* e
                 (log/error e
@@ -362,17 +363,32 @@
                 (async/>! error-ch e))))))
 
 
+(defn send-changes-to-chan
+  [changes-chan {:keys [address t] :as written-node}]
+  (let [file-type (cond
+                    (contains? written-node :garbage) :garbage
+                    :else :data-node)]
+    (async/>! changes-chan {:event     :new-index-file
+                            :file-type file-type
+                            :data      written-node
+                            :address   (or address (:id written-node))
+                            :t         t})))
+
 (defn write-resolved-nodes
-  [conn idx error-ch index-ch]
+  [db idx changes-ch error-ch index-ch]
   (async/go-loop [stats {:idx idx, :novel 0, :unchanged 0, :garbage #{} :updated-ids {}}
                   last-node nil]
     (if-let [{::keys [old-id] :as node} (async/<! index-ch)]
       (if (index/resolved? node)
-        (let [written-node (async/<! (write-node conn idx node error-ch (:updated-ids stats)))
+        (let [written-node (async/<! (write-node db idx node error-ch (:updated-ids stats)))
               stats*       (cond-> stats
                                    (not= old-id :empty) (update :garbage conj old-id)
                                    true (update :novel inc)
-                                   true (assoc-in [:updated-ids (:id node)] (:id written-node)))]
+                                   true (assoc-in [:updated-ids (:id node)] (:address written-node)))]
+          (when changes-ch
+            ;; when a stream of changes is requested (for consensus synchronization), send new file
+            ;; note: this intentionally blocks in case channel is backed up and full it will push back on indexing process
+            (send-changes-to-chan changes-ch written-node))
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
@@ -381,14 +397,14 @@
 
 
 (defn refresh-index
-  [conn error-ch {::keys [idx t novelty remove-preds root]}]
+  [{:keys [conn] :as db} changes-ch error-ch {::keys [idx t novelty remove-preds root]}]
   (let [refresh-xf (comp (map preserve-id)
                          (integrate-novelty idx t novelty remove-preds))
         novel?     (fn [node]
                      (or (seq remove-preds)
                          (seq (index/novelty-subrange node t novelty))))]
     (->> (index/tree-chan conn root novel? (constantly true) 1 refresh-xf error-ch)
-         (write-resolved-nodes conn idx error-ch))))
+         (write-resolved-nodes db idx changes-ch error-ch))))
 
 (defn extract-root
   [{:keys [novelty t] :as db} remove-preds idx]
@@ -411,11 +427,11 @@
 
 (defn refresh-all
   ([db error-ch]
-   (refresh-all db #{} error-ch))
-  ([{:keys [conn] :as db} remove-preds error-ch]
+   (refresh-all db #{} error-ch nil))
+  ([db remove-preds error-ch changes-ch]
    (->> index/types
         (map (partial extract-root db remove-preds))
-        (map (partial refresh-index conn error-ch))
+        (map (partial refresh-index db changes-ch error-ch))
         async/merge
         (async/reduce tally {:db db, :indexes [], :garbage #{}}))))
 
@@ -437,7 +453,7 @@
 (defn refresh
   [indexer
    {:keys [ecount novelty block t network ledger-id] :as db}
-   {:keys [remove-preds]}]
+   {:keys [remove-preds changes-ch]}]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
@@ -451,10 +467,11 @@
               (seq remove-preds))
         (do (log/info "Refreshing Index:" init-stats)
             (let [error-ch   (async/chan)
-                  refresh-ch (refresh-all db remove-preds error-ch)]
+                  refresh-ch (refresh-all db remove-preds error-ch changes-ch)]
               (async/alt!
                 error-ch
                 ([e]
+                 ()
                  (throw e))
 
                 refresh-ch
@@ -465,11 +482,13 @@
                        ;;        as a tx, currently requires waiting for both
                        ;;        through raft sync
                        garbage-res   (when (seq garbage)
-                                       (<? (storage/write-garbage indexed-db garbage)))
+                                       (let [garbage-meta (<? (storage/write-garbage indexed-db garbage))]
+                                         (when changes-ch
+                                           (send-changes-to-chan changes-ch garbage-meta))
+                                         garbage-meta))
                        ;; TODO - WRITE GARBAGE INTO INDEX ROOT!!!
                        db-root-res   (<? (storage/write-db-root indexed-db ecount))
                        index-address (:address db-root-res)
-                       ;; TODO - generate our own internal hash for the index id.
                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
                        commit-index  (commit-data/new-index (-> indexed-db :commit :data)
                                                             index-id
@@ -483,7 +502,6 @@
                                        :address (:address db-root-res)
                                        :garbage (:address garbage-res))]
                    (log/info "Index refresh complete:" end-stats)
-                   ;; TODO the :commit :index metadata below can get removed once no longer looked for, replaced with (:index-meta db)
                    indexed-db*)))))
         db))))
 
@@ -495,11 +513,10 @@
 
 (defn do-index
   "Performs an index operation and returns a promise-channel of the latest db once complete"
-  [indexer {:keys [t branch] :as db} {:keys [update-commit] :as opts}]
+  [indexer {:keys [t branch] :as db} {:keys [update-commit changes-ch] :as opts}]
   (let [[lock? index-state] (lock-indexer (:state-atom indexer) branch t update-commit)
-        {:keys [tempid port]} index-state
-        index-t (- t)]
-    (when lock?
+        {:keys [tempid port]} index-state]
+    (if lock?
       ;; when we have a lock, reindex and put updated db onto pc.
       (async/go
         (try*
@@ -509,14 +526,20 @@
                 {:keys [update-commit-fn port]} index-state*]
             ;; in case event listener wanted final indexed db, put on established port
             (when (fn? update-commit-fn)
-              (update-commit-fn indexed-db))
+              (let [result (async/<!
+                             (update-commit-fn indexed-db))]
+                (when (util/exception? result)
+                  (log/error result "Exception updating commit with new index: " (ex-message result))
+                  (throw result))))
             (async/put! port indexed-db)
             ;; push out event, retain :port for downstream to retrieve indexed db if needed, but
             ;; remove update-commit-fn as we don't want downstream processes being able to do this
             (push-index-event indexer :index-end (dissoc index-state* :update-commit-fn)))
           (catch* e
                   (log/error e "Error encountered creating index for db: " db ". "
-                             "Indexing stopped.")))))
+                             "Indexing stopped."))))
+      (when changes-ch ;; if we don't have a lock, nothing to index so close changes-ch if it exists
+        (async/close! changes-ch)))
     port))
 
 

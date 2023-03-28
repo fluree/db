@@ -25,7 +25,8 @@
             (str "IPFS publish error, unable to retrieve IPFS name. Response object: "
                  res)
             {:status 500 :error :db/push-ipfs})))
-      (assoc res :address (str "fluree:ipfs://" name)))))
+      (assoc res :address (str "fluree:ipfs://" name)
+                 :json json))))
 
 (defn read
   "Reads either IPFS or IPNS docs. Reads JSON only, returning clojure map with

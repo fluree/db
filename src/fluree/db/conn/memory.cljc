@@ -42,6 +42,7 @@
     (swap! data-atom assoc hash data)
     {:name    hash
      :hash    hash
+     :json    json
      :size    (count json)
      :address (memory-address path)}))
 
