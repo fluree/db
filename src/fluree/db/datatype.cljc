@@ -46,37 +46,35 @@
    "http://www.w3.org/2001/XMLSchema#hexBinary"          const/$xsd:hexBinary
    "http://www.w3.org/2001/XMLSchema#base64Binary"       const/$xsd:base64Binary})
 
+(def iso8601-offset-pattern
+  "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
+
 (def iso8601-date-component-pattern
   "This is slightly more forgiving than the xsd:date spec:
   http://books.xmlschemata.org/relaxng/ch19-77041.html
   Note there is no need to be extra strict with the numeric ranges in here as
   the java.time constructors will take care of that for us."
-  "((?:-)?[0-9]{4})-([0-9]{1,2})-([0-9]{1,2})")
+  "((?:-)?[0-9]{4})-([0-9]{2})-([0-9]{2})")
 
 (def iso8601-date-pattern
   "Defines the pattern for dates w/o times where an offset is still allowed on
   the end."
-  (str iso8601-date-component-pattern "(Z|(?:[+-][0-9]{1,2}:[0-9]{2}))?"))
+  (str iso8601-date-component-pattern iso8601-offset-pattern))
 
 (def iso8601-date-re
   (re-pattern iso8601-date-pattern))
 
 (def iso8601-time-pattern
-  "This is slightly more forgiving than the xsd:time spec:
-  http://books.xmlschemata.org/relaxng/ch19-77311.html
-  Note there is no need to be extra strict with the numeric ranges in here as
-  the java.time constructors will take care of that for us."
-  "([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})(Z|(?:[+-][0-9]{1,2}:[0-9]{2}))?")
+  (str #?(:clj  "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,9}))?"
+          :cljs "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,3}))?")
+       iso8601-offset-pattern))
 
 (def iso8601-time-re
   (re-pattern iso8601-time-pattern))
 
 (def iso8601-datetime-pattern
-  "This is slightly more forgiving than the xsd:dateTime spec:
-  http://books.xmlschemata.org/relaxng/ch19-77049.html
-
-  Note there is no need to be extra strict with the numeric ranges in here as
-  the java.time constructors will take care of that for us."
+  "JS: https://tc39.es/ecma262/#sec-date-time-string-format simplified ISO8601 HH:mm:ss.sssZ
+   JVM: ISO8601 that supports nanosecond resolution."
   (str iso8601-date-component-pattern "T" iso8601-time-pattern))
 
 (def iso8601-datetime-re
@@ -86,11 +84,10 @@
   "Infers a default data type if not otherwise provided."
   [x]
   (cond
-    (string? x) const/$xsd:string
+    (string? x)  const/$xsd:string
     (integer? x) const/$xsd:long ; infer to long to prevent overflow
-    (number? x) const/$xsd:decimal
+    (number? x)  const/$xsd:decimal
     (boolean? x) const/$xsd:boolean))
-
 
 #?(:cljs
    (defn- left-pad
@@ -132,15 +129,19 @@
         local timezone according to your device."
   [s]
   (when-let [matches (re-matches iso8601-time-re s)]
-    (let [time   (->> matches rest butlast)
-          offset (last matches)
-          [hour min sec] (map #?(:clj  #(Integer/parseInt %)
-                                 :cljs #(left-pad % "0" 2))
-                              time)]
-      #?(:clj  (if offset
-                 (OffsetTime/of hour min sec 0 (ZoneOffset/of ^String offset))
-                 (LocalTime/of hour min sec))
-         :cljs (js/Date. (str "1970-01-01T" hour ":" min ":" sec offset))))))
+    #?(:clj (let [time-parts (->> matches rest butlast)
+                  offset     (last matches)
+
+                  [hours minutes seconds second-fraction]
+                  (->> time-parts
+                       (map #(or % "0"))
+                       (map #(Integer/parseInt %)))
+
+                  nanos (* second-fraction 1000000)]
+              (if offset
+                (OffsetTime/of hours minutes seconds nanos (ZoneOffset/of ^String offset))
+                (LocalTime/of hours minutes seconds nanos)))
+       :cljs (js/Date. (str "1970-01-01T" s)))))
 
 (defn- parse-iso8601-datetime
   "Parses string s into one of the following:
@@ -150,18 +151,23 @@
         assume it's in your current, local timezone according to your device."
   [s]
   (when-let [matches (re-matches iso8601-datetime-re s)]
-    (let [datetime (->> matches rest (take 6))
-          offset   (last matches)
-          [year month day hour min sec] (map #?(:clj  #(Integer/parseInt %)
-                                                :cljs #(left-pad % "0" 2))
-                                             datetime)]
-      #?(:clj  (if offset
-                 (OffsetDateTime/of year month day hour min sec 0
-                                    (ZoneOffset/of ^String offset))
-                 (LocalDateTime/of ^int year ^int month ^int day ^int hour
-                                   ^int min ^int sec))
-         :cljs (js/Date. (str year "-" month "-" day "T" hour ":" min ":" sec
-                              offset))))))
+    #?(:clj
+       (let [datetime-parts (->> matches rest (take 7))
+             offset   (last matches)
+             [years months days hours minutes seconds second-fraction]
+             (->> datetime-parts
+                  (map #(or % "0"))
+                  (map #(Integer/parseInt %)))
+
+             nanos (* second-fraction 1000000)]
+         (if offset
+           (OffsetDateTime/of years months days hours minutes seconds nanos
+                              (ZoneOffset/of ^String offset))
+           (LocalDateTime/of ^int years ^int months ^int days ^int hours
+                             ^int minutes ^int seconds ^int nanos)))
+
+       :cljs
+       (js/Date. s))))
 
 (defn- coerce-boolean
   [value]
