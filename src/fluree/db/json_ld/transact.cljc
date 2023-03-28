@@ -76,7 +76,7 @@
                           (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
                         ;; a literal value
-                        (and value (not= shacl-dt const/$xsd:anyURI))
+                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
                         (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
                           (if validate-fn
                             (or (validate-fn value*)
