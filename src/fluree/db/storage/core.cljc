@@ -1,5 +1,4 @@
 (ns fluree.db.storage.core
-  (:refer-clojure :exclude [read exists? list])
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
             [clojure.string :as str]
@@ -10,18 +9,9 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.schema :as schema]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.conn.proto :as conn-proto]
-            #?(:clj [clojure.java.io :as io])))
+            [fluree.db.conn.proto :as conn-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defprotocol Store
-  (exists? [s k] "Returns true when `k` exists in `s`")
-  (list [s d] "Returns a collection containing the keys stored under the subdirectory/prefix `d` of `s`")
-  (read [s k] "Reads raw bytes from `s` associated with `k`")
-  (write [s k data] "Writes `data` as raw bytes to `s` and associates it with `k`")
-  (rename [s old-key new-key] "Remove `old-key` and associate its data to `new-key`")
-  (delete [s k] "Delete data associated with key `k`"))
 
 (defn serde
   "Returns serializer from connection."

@@ -254,25 +254,6 @@
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
-  storage/Store
-  (exists? [s k]
-    (let [path (store-key->local-path s k)]
-      #?(:clj  (-> path io/file .exists)
-         :cljs (fs/existsSync path))))
-  (list [s d]
-    (log/error "TODO: file Store/list" d))
-  (read [s k]
-    (log/error "TODO: file Store/read" k))
-  (write [s k data]
-    ;; expects data as byte array
-    (go-try
-      (let [path (store-key->local-path s k)]
-        (write-file path data))))
-  (rename [s old-key new-key]
-    (log/error "TODO: file Store/rename" old-key new-key))
-  (delete [s k]
-    (log/error "TODO: file Store/delete" k))
-
   index/Resolver
   (resolve
     [conn {:keys [id leaf tempid] :as node}]

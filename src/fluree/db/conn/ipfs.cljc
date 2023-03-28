@@ -125,17 +125,6 @@
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
-  storage/Store
-  (read [_ k]
-    (ipfs/read ipfs-endpoint k true))
-  (write [_ k data]
-    (ipfs/write ipfs-endpoint data))
-  (exists? [conn k]
-    (storage/read conn k))
-  (rename [_ old-key new-key]
-    (throw (ex-info (str "IPFS does not support renaming of files: " old-key new-key)
-                    {:status 500 :error :db/unexpected-error})))
-
   index/Resolver
   (resolve
     [conn {:keys [id leaf tempid] :as node}]
