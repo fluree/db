@@ -2,8 +2,7 @@
   (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take last])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util]
-            #?(:clj [abracad.avro :as avro]))
+            [fluree.db.util.core :as util])
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -76,12 +75,7 @@
 
 
 (deftype Flake [s p o dt t op m]
-  #?@(:clj  [avro/AvroSerializable
-             (schema-name [_] "fluree.Flake")
-             (field-get [f field] (get f field))
-             (field-list [_] #{:s :p :o :dt :t :op :m})
-
-             clojure.lang.Seqable
+  #?@(:clj  [clojure.lang.Seqable
              (seq [f] (list (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)))
 
              clojure.lang.Indexed
