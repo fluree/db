@@ -1,6 +1,6 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
          org.clojure/clojurescript       {:mvn/version "1.11.60"}
-         org.clojure/core.async          {:mvn/version "1.5.648"}
+         org.clojure/core.async          {:mvn/version "1.6.673"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
@@ -12,8 +12,8 @@
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
-         ch.qos.logback/logback-classic  {:mvn/version "1.4.4"}
-         org.slf4j/slf4j-api             {:mvn/version "2.0.4"}
+         ch.qos.logback/logback-classic  {:mvn/version "1.4.6"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.7"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -28,7 +28,7 @@
          ;; serialization / compression
          com.fluree/abracad              {:mvn/version "0.4.19"}
          com.taoensso/nippy              {:mvn/version "3.2.0"}
-         org.xerial.snappy/snappy-java   {:mvn/version "1.1.8.4"}
+         org.xerial.snappy/snappy-java   {:mvn/version "1.1.9.1"}
          com.fluree/alphabase            {:mvn/version "3.3.0"}
 
          ;; cryptography
@@ -42,14 +42,14 @@
 
  :aliases
  {:build
-  {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.5"
-                                               :git/sha "b73ff34"}
-                slipset/deps-deploy {:mvn/version "0.2.0"}}
+  {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.4"
+                                               :git/sha "b0ee58b"}
+                slipset/deps-deploy {:mvn/version "0.2.1"}}
    :ns-default build}
 
   :dev
   {:extra-paths ["dev" "test" "src-cljs" "src-nodejs" "src-docs"]
-   :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
+   :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.4.4"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}}}
 
   :cljs-browser-test
@@ -68,7 +68,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.71.1119"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.80.1274"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -97,7 +97,7 @@
                 :output-path "docs"}}
 
   :deploy
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.0"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.1"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "deploy"
                   "target/fluree-db.jar"]}
 
@@ -120,5 +120,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2022.11.02"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.03.17"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
