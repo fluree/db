@@ -3,7 +3,7 @@
             [deps-deploy.deps-deploy :as dd]))
 
 (def lib 'com.fluree/db)
-(def version "2.0.0-beta2")
+(def version "2.0.0")
 
 (def class-dir "target/classes")
 (def basis (b/create-basis {:project "deps.edn"}))
