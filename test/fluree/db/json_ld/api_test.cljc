@@ -292,7 +292,8 @@
                                  :type       :ex/User,
                                  :ex/friends {:list [:ex/john :ex/cam]}}
                                 {:id   :ex/cam,
-                                 :type :ex/User}
+                                 :type :ex/User
+                                 :ex/numList {:list [7 8 9 10]}}
                                 {:id   :ex/john,
                                  :type :ex/User}])
                db           @(fluree/commit! ledger db)
@@ -300,7 +301,9 @@
                loaded-db    (fluree/db loaded)]
            (is (= (:t db) (:t loaded-db)))
            (testing "query returns expected `list` values"
-             (is (= [{:id :ex/cam, :rdf/type [:ex/User]}
+             (is (= [{:id :ex/cam,
+                      :rdf/type [:ex/User],
+                      :ex/numList [7 8 9 10]}
                      {:id :ex/john, :rdf/type [:ex/User]}
                      {:id :ex/alice,
                       :rdf/type [:ex/User],
