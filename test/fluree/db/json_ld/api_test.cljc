@@ -274,4 +274,36 @@
            (is (= (get-in db [:schema :context])
                   (get-in loaded-db [:schema :context])))
            (is (= (get-in db [:schema :context-str])
-                  (get-in loaded-db [:schema :context-str]))))))))
+                  (get-in loaded-db [:schema :context-str]))))))
+
+     (testing "can load a ledger with `list` values"
+       (with-tmp-dir storage-path
+         (let [conn         @(fluree/connect
+                               {:method       :file
+                                :storage-path storage-path
+                                :defaults
+                                {:context (merge test-utils/default-context
+                                                 {:ex "http://example.org/ns/"})}})
+               ledger-alias "load-lists-test"
+               ledger       @(fluree/create conn ledger-alias)
+               db           @(fluree/stage
+                               (fluree/db ledger)
+                               [{:id         :ex/alice,
+                                 :type       :ex/User,
+                                 :ex/friends {:list [:ex/john :ex/cam]}}
+                                {:id   :ex/cam,
+                                 :type :ex/User}
+                                {:id   :ex/john,
+                                 :type :ex/User}])
+               db           @(fluree/commit! ledger db)
+               loaded       (test-utils/retry-load conn ledger-alias 100)
+               loaded-db    (fluree/db loaded)]
+           (is (= (:t db) (:t loaded-db)))
+           (testing "query returns expected `list` values"
+             (is (= [{:id :ex/cam, :rdf/type [:ex/User]}
+                     {:id :ex/john, :rdf/type [:ex/User]}
+                     {:id :ex/alice,
+                      :rdf/type [:ex/User],
+                      :ex/friends [{:id :ex/john} {:id :ex/cam}]}]
+                    @(fluree/query loaded-db '{:select {?s [:*]}
+                                               :where  [[?s :rdf/type :ex/User]]})))))))))
