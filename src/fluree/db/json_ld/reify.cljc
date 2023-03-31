@@ -182,7 +182,6 @@
       (log/debug "assert-v-maps v-map:" v-map)
       (log/debug "assert-v-maps id:" id)
       (let [ref-id (:id v-map)
-            list? (list-value? v-map)
             acc**
             (cond->
                 (cond
