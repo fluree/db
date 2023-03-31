@@ -138,50 +138,15 @@
           (recur r (into acc flakes)))
         acc))))
 
-(defn- assert-list-flakes
-  [{:keys [db iris pid existing-pid next-pid sid next-sid #__id k t acc]} v-map]
-  (go-try
-    (let [list-vals (:list v-map)]
-      (loop [[list-val & r-list-vals] list-vals
-             acc* acc]
-        (let [ref-id (:id list-val)
-              acc**
-              (cond->
-                  (if (and (node? list-val) ref-id)
-                    (let [existing-sid (<? (get-iri-sid ref-id db iris))
-                          ref-sid      (or existing-sid
-                                           (jld-ledger/generate-new-sid
-                                             list-val pid iris next-pid next-sid))
-                          new-flake    (flake/create sid pid ref-sid
-                                                     const/$xsd:anyURI t true {:i (-> list-val :idx last)})]
-                      (log/debug "creating ref flake in @list:" new-flake)
-                      (cond-> (conj acc* new-flake)
-                        (nil? existing-sid) (conj
-                                              (flake/create ref-sid const/$iri
-                                                            ref-id
-                                                            const/$xsd:string
-                                                            t true nil))))
-
-                    (let [[value dt] (datatype/from-expanded list-val nil)
-                          new-flake  (flake/create sid pid value dt t true nil)]
-                      (log/debug "creating value flake in @list:" new-flake)
-                      (conj acc* new-flake)))
-
-                (nil? existing-pid) (conj (flake/create pid const/$iri k
-                                                        const/$xsd:string t true
-                                                        nil)))]
-          (if (seq r-list-vals)
-            (recur r-list-vals acc**)
-            acc**))))))
-
 (defn- assert-v-maps
-  [{:keys [db iris pid existing-pid next-pid sid next-sid id k t acc] :as args} v-maps]
+  [{:keys [db iris pid existing-pid next-pid sid next-sid id k t acc list-members?] :as args} v-maps]
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
       (log/debug "assert-v-maps v-map:" v-map)
       (log/debug "assert-v-maps id:" id)
       (let [ref-id (:id v-map)
+            meta (when list-members? {:i (-> v-map :idx last)})
             acc**
             (cond->
                 (cond
@@ -191,7 +156,7 @@
                                          (jld-ledger/generate-new-sid
                                            v-map pid iris next-pid next-sid))
                         new-flake    (flake/create sid pid ref-sid
-                                                   const/$xsd:anyURI t true nil)]
+                                                   const/$xsd:anyURI t true meta)]
                     (log/debug "creating ref flake:" new-flake)
                     (cond-> (conj acc* new-flake)
                       (nil? existing-sid) (conj
@@ -199,14 +164,14 @@
                                                           ref-id
                                                           const/$xsd:string
                                                           t true nil))))
-
                   (list-value? v-map)
-                  (<? (assert-list-flakes args v-map))
+                  (let [list-vals (:list v-map)]
+                    (<? (assert-v-maps (assoc args :list-members? true) list-vals)))
 
-                  :else  (let [[value dt] (datatype/from-expanded v-map nil)
-                               new-flake  (flake/create sid pid value dt t true nil)]
-                           (log/debug "creating value flake:" new-flake)
-                           (conj acc* new-flake)))
+                  :else (let [[value dt] (datatype/from-expanded v-map nil)
+                              new-flake  (flake/create sid pid value dt t true meta)]
+                          (log/debug "creating value flake:" new-flake)
+                          (conj acc* new-flake)))
 
               (nil? existing-pid) (conj (flake/create pid const/$iri k
                                                       const/$xsd:string t true

@@ -335,7 +335,6 @@
                                   {:id      "did:fluree:123"
                                    :ex/user :ex/alice
                                    :f/role  :ex/userRole}])
-
                  db+policy    @(fluree/stage
                                  db
                                  [{:id            :ex/UserPolicy,
