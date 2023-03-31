@@ -172,7 +172,7 @@
 (defn- enrich-commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
   [{:keys [ledger branch schema t commit stats] :as _db}
-   {:keys [context did private push? message tag file-data?] :as _opts}]
+   {:keys [context did private push? message tag file-data? index-files-ch] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
                             (:context schema))
@@ -210,6 +210,7 @@
      :branch-name    (util/keyword->str branch)
      :id-key         (json-ld/compact "@id" compact-fn)
      :type-key       (json-ld/compact "@type" compact-fn)
+     :index-files-ch index-files-ch ;; optional async chan passed in which will stream out all new index files created (for consensus)
      :stats          stats}))
 
 
@@ -402,10 +403,15 @@
                              util/stringify-keys
                              (conn-proto/-ctx-write conn ledger)
                              <?))]
-      {:context-res context-res
-       :commit      (if context-res
-                      (assoc commit (keyword const/iri-default-context) (:address context-res))
-                      commit)})))
+      [(if context-res
+         (assoc commit (keyword const/iri-default-context) (:address context-res))
+         commit)
+       context-res])))
+
+(defn new-commit-context?
+  "Returns true if there is a new commit map context."
+  [new-commit]
+  (map? (get new-commit (keyword const/iri-default-context))))
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
@@ -417,7 +423,9 @@
                             (> (commit-data/t commit) (commit-data/t ledger-commit)))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
-          {new-commit* :commit context-res :context-res} (<? (link-context-to-commit ledger new-commit))
+          [new-commit* context-res] (if (new-commit-context? new-commit)
+                                      (<? (link-context-to-commit ledger new-commit))
+                                      [new-commit nil])
           _             (log/debug "do-commit+push new-commit w/ linked context:"
                                    new-commit*)
           [new-commit** jld-commit] (commit-data/commit-jsonld new-commit*)
@@ -475,7 +483,7 @@
   returns a db with an updated :commit."
   [{:keys [conn indexer context] :as ledger} {:keys [t stats commit] :as db} opts]
   (go-try
-    (let [{:keys [id-key did message tag file-data?] :as opts*} (enrich-commit-opts db opts)]
+    (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*} (enrich-commit-opts db opts)]
       (let [ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
             dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
             ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
@@ -495,9 +503,9 @@
              commit-file-meta  :commit-res
              context-file-meta :context-res} (<? (do-commit+push db* opts*))
             ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
-            indexing-ch       (when (idx-proto/-index? indexer db**)
-                                (let [idx-ch (when file-data? (async/chan))]
-                                  (run-index db** opts* idx-ch)))]
+            indexing-ch       (if (idx-proto/-index? indexer db**)
+                                (run-index db** opts* index-files-ch)
+                                (when index-files-ch (async/close! index-files-ch)))]
         (if file-data?
           {:data-file-meta    ledger-update-res
            :commit-file-meta  commit-file-meta

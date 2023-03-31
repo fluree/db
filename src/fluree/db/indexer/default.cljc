@@ -344,18 +344,18 @@
 
 (defn write-node
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
-  [db idx node error-ch updated-ids]
+  [db idx node error-ch changes-ch updated-ids]
   (let [node         (dissoc node ::old-id)
         display-node (select-keys node [:id :ledger-id])]
     (async/go
       (try*
         (if (index/leaf? node)
           (do (log/debug "Writing index leaf:" display-node)
-              (<? (storage/write-leaf db idx node)))
+              (<? (storage/write-leaf db idx changes-ch node)))
           (do (log/debug "Writing index branch:" display-node)
               (->> node
                    (update-branch-ids updated-ids)
-                   (storage/write-branch db idx)
+                   (storage/write-branch db idx changes-ch)
                    <?)))
         (catch* e
                 (log/error e
@@ -363,32 +363,17 @@
                 (async/>! error-ch e))))))
 
 
-(defn send-changes-to-chan
-  [changes-chan {:keys [address t] :as written-node}]
-  (let [file-type (cond
-                    (contains? written-node :garbage) :garbage
-                    :else :data-node)]
-    (async/>! changes-chan {:event     :new-index-file
-                            :file-type file-type
-                            :data      written-node
-                            :address   (or address (:id written-node))
-                            :t         t})))
-
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
   (async/go-loop [stats {:idx idx, :novel 0, :unchanged 0, :garbage #{} :updated-ids {}}
                   last-node nil]
     (if-let [{::keys [old-id] :as node} (async/<! index-ch)]
       (if (index/resolved? node)
-        (let [written-node (async/<! (write-node db idx node error-ch (:updated-ids stats)))
+        (let [written-node (async/<! (write-node db idx node error-ch changes-ch (:updated-ids stats)))
               stats*       (cond-> stats
                                    (not= old-id :empty) (update :garbage conj old-id)
                                    true (update :novel inc)
-                                   true (assoc-in [:updated-ids (:id node)] (:address written-node)))]
-          (when changes-ch
-            ;; when a stream of changes is requested (for consensus synchronization), send new file
-            ;; note: this intentionally blocks in case channel is backed up and full it will push back on indexing process
-            (send-changes-to-chan changes-ch written-node))
+                                   true (assoc-in [:updated-ids (:id node)] (:id written-node)))]
           (recur stats*
                  written-node))
         (recur (update stats :unchanged inc)
@@ -481,12 +466,9 @@
                        ;;        as a tx, currently requires waiting for both
                        ;;        through raft sync
                        garbage-res   (when (seq garbage)
-                                       (let [garbage-meta (<? (storage/write-garbage indexed-db garbage))]
-                                         (when changes-ch
-                                           (send-changes-to-chan changes-ch garbage-meta))
-                                         garbage-meta))
+                                       (<? (storage/write-garbage indexed-db changes-ch garbage)))
                        ;; TODO - WRITE GARBAGE INTO INDEX ROOT!!!
-                       db-root-res   (<? (storage/write-db-root indexed-db ecount))
+                       db-root-res   (<? (storage/write-db-root indexed-db changes-ch ecount))
                        index-address (:address db-root-res)
                        index-id      (str "fluree:index:sha256:" (:hash db-root-res))
                        commit-index  (commit-data/new-index (-> indexed-db :commit :data)
@@ -529,7 +511,10 @@
                              (update-commit-fn indexed-db))]
                 (when (util/exception? result)
                   (log/error result "Exception updating commit with new index: " (ex-message result))
-                  (throw result))))
+                  (throw result))
+                (when changes-ch
+                  (async/put! changes-ch {:event :new-commit
+                                          :data  result}))))
             (async/put! port indexed-db)
             ;; push out event, retain :port for downstream to retrieve indexed db if needed, but
             ;; remove update-commit-fn as we don't want downstream processes being able to do this
