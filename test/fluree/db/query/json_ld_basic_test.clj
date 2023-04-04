@@ -115,25 +115,27 @@
           movies (test-utils/load-movies conn)]
       (testing "define @list container in context"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {:context {:ex      "http://example.org/ns#"
+                                       {:context {:id      "@id"
+                                                  :ex      "http://example.org/ns#"
                                                   :ex/list {"@container" "@list"}}
                                         :id      "list-test"
                                         :ex/list [42 2 88 1]})
-              query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
+              query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}]
                                             :selectOne {?s [:*]},
-                                            :where [[?s :id "list-test"]]})]
+                                            :where     [[?s :id "list-test"]]})]
           (is (= query-res
                  {:id      "list-test"
                   :ex/list [42 2 88 1]})
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {:context {:ex "http://example.org/ns#"}
+                                       {:context {:id      "@id"
+                                                  :ex      "http://example.org/ns#"}
                                         :id      "list-test2"
                                         :ex/list {"@list" [42 2 88 1]}})
-              query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
+              query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}],
                                             :selectOne {?s [:*]},
-                                            :where [[?s :id "list-test2"]]})]
+                                            :where     [[?s :id "list-test2"]]})]
           (is (= query-res
                  {:id      "list-test2"
                   :ex/list [42 2 88 1]})
@@ -141,7 +143,7 @@
 
 (deftest ^:integration simple-subject-crawl-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/simple-subject-crawl" {:context {:ex "http://example.org/ns/"}})
+        ledger @(fluree/create conn "query/simple-subject-crawl" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/brian,

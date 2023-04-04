@@ -9,7 +9,7 @@
           ledger         @(fluree/create conn "tx/retract")
           db             @(fluree/stage
                             (fluree/db ledger)
-                            {:context {:ex "http://example.org/ns/"}
+                            {:context ["" {:ex "http://example.org/ns/"}]
                              :graph   [{:id          :ex/alice,
                                         :type        :ex/User,
                                         :schema/name "Alice"
@@ -25,11 +25,11 @@
           ;; retract Alice's age attribute by using nil
           db-age-retract @(fluree/stage
                             db
-                            {:context    {:ex "http://example.org/ns/"}
+                            {:context    ["" {:ex "http://example.org/ns/"}]
                              :id         :ex/alice,
                              :schema/age nil})]
       (is (= @(fluree/query db-age-retract
-                            '{:context {:ex "http://example.org/ns/"},
+                            '{:context ["" {:ex "http://example.org/ns/"}],
                               :select {?s [:*]},
                               :where [[?s :id :ex/alice]]})
              [{:id           :ex/alice,

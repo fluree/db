@@ -2,6 +2,7 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             #?(:clj [fluree.db.full-text :as full-text])
@@ -143,7 +144,7 @@
   (-method [_] :memory)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-context [_] (:context ledger-defaults))
+  (-default-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
@@ -172,10 +173,11 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [{:keys [context-type context did] :as _defaults}]
+  [{:keys [context did context-type] :as _defaults}]
   (async/go
-    {:context (util/normalize-context context-type context)
-     :did     did}))
+    {:context      (ctx-util/stringify-context context)
+     :context-type context-type
+     :did          did}))
 
 (defn connect
   "Creates a new memory connection."

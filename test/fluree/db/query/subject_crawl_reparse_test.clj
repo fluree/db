@@ -8,7 +8,7 @@
 
 (deftest test-reparse-as-ssc
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/parse" {:context {:ex "http://example.org/ns/"}})
+        ledger @(fluree/create conn "query/parse" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                  (fluree/db ledger)
                  [{:id           :ex/brian,
@@ -39,8 +39,7 @@
                                                       :where  [["?s" :schema/age 50]
                                                                ["?s" :ex/favColor "Blue"]]}
                                                      db)
-        not-ssc-parsed (parse/parse-analytical-query* {:context {:ex "http://example.org/ns/"}
-                                                       :select  ['?name '?age '?email]
+        not-ssc-parsed (parse/parse-analytical-query* {:select  ['?name '?age '?email]
                                                        :where   [['?s :schema/name "Cam"]
                                                                  ['?s :ex/friend '?f]
                                                                  ['?f :schema/name '?name]

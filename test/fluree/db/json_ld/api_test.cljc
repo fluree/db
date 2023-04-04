@@ -3,8 +3,10 @@
                :cljs [cljs.test :refer-macros [deftest is testing async]])
             #?@(:cljs [[clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
                       :as twf]
@@ -60,11 +62,11 @@
              ledger-context {"ex"  "http://example.com/"
                              "foo" "http://foobar.com/"}
              ledger         @(fluree/create conn ledger-alias
-                                            {:context-type :string
-                                             :context      ledger-context})
-             merged-context (merge test-utils/default-context
-                                   (util/keywordize-keys ledger-context))]
-         (is (= merged-context (:context ledger)))))))
+                                            {:context-type    :string
+                                             :defaultContext ["" ledger-context]})
+             merged-context (merge (util/stringify-keys test-utils/default-context)
+                                   ledger-context)]
+         (is (= merged-context (dbproto/-default-context (fluree/db ledger))))))))
 
 #?(:clj
    (deftest load-from-file-test
@@ -73,21 +75,20 @@
          (let [conn         @(fluree/connect
                                {:method :file :storage-path storage-path
                                 :defaults
-                                {:context test-utils/default-context}})
+                                {:context test-utils/default-context
+                                 :context-type :keyword}})
                ledger-alias "load-from-file-test-single-card"
-               ledger       @(fluree/create conn ledger-alias)
+               ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
                db           @(fluree/stage
                                (fluree/db ledger)
-                               [{:context      {:ex "http://example.org/ns/"}
-                                 :id           :ex/brian
+                               [{:id           :ex/brian
                                  :type         :ex/User
                                  :schema/name  "Brian"
                                  :schema/email "brian@example.org"
                                  :schema/age   50
                                  :ex/favNums   7}
 
-                                {:context      {:ex "http://example.org/ns/"}
-                                 :id           :ex/cam
+                                {:id           :ex/cam
                                  :type         :ex/User
                                  :schema/name  "Cam"
                                  :schema/email "cam@example.org"
@@ -97,10 +98,8 @@
                db           @(fluree/commit! ledger db)
                db           @(fluree/stage
                                db
-                               ;; test a retraction
-                               {:context   {:ex "http://example.org/ns/"}
-                                :f/retract {:id         :ex/brian
-                                            :ex/favNums 7}})
+                               {:id         :ex/brian
+                                :ex/favNums 7})
                _            @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded       (test-utils/retry-load conn ledger-alias 100)
@@ -113,29 +112,27 @@
          (let [conn         @(fluree/connect
                                {:method :file :storage-path storage-path
                                 :defaults
-                                {:context test-utils/default-context}})
+                                {:context test-utils/default-context
+                                 :context-type :keyword}})
                ledger-alias "load-from-file-test-multi-card"
-               ledger       @(fluree/create conn ledger-alias)
+               ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
                db           @(fluree/stage
                                (fluree/db ledger)
-                               [{:context      {:ex "http://example.org/ns/"}
-                                 :id           :ex/brian
+                               [{:id           :ex/brian
                                  :type         :ex/User
                                  :schema/name  "Brian"
                                  :schema/email "brian@example.org"
                                  :schema/age   50
                                  :ex/favNums   7}
 
-                                {:context      {:ex "http://example.org/ns/"}
-                                 :id           :ex/alice
+                                {:id           :ex/alice
                                  :type         :ex/User
                                  :schema/name  "Alice"
                                  :schema/email "alice@example.org"
                                  :schema/age   50
                                  :ex/favNums   [42 76 9]}
 
-                                {:context      {:ex "http://example.org/ns/"}
-                                 :id           :ex/cam
+                                {:id           :ex/cam
                                  :type         :ex/User
                                  :schema/name  "Cam"
                                  :schema/email "cam@example.org"
@@ -146,15 +143,14 @@
                db           @(fluree/stage
                                db
                                ;; test a multi-cardinality retraction
-                               [{:context   {:ex "http://example.org/ns/"}
-                                 :f/retract {:id         :ex/alice
-                                             :ex/favNums [42 76 9]}}])
+                               [{:id         :ex/alice
+                                 :ex/favNums [42 76 9]}])
                _            @(fluree/commit! ledger db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
                loaded       (test-utils/retry-load conn ledger-alias 100)
                loaded-db    (fluree/db loaded)]
            (is (= (:t db) (:t loaded-db)))
-           (is (= (:context ledger) (:context loaded))))))
+           (is (= (dbproto/-default-context db) (dbproto/-default-context loaded-db))))))
 
      (testing "can load a file ledger with its own context"
        (with-tmp-dir storage-path #_{::twf/delete-dir false}
@@ -165,10 +161,11 @@
                                :schema "http://schema.org/"}
                conn           @(fluree/connect
                                  {:method   :file :storage-path storage-path
-                                  :defaults {:context conn-context}})
+                                  :defaults {:context conn-context
+                                             :context-type :keyword}})
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn ledger-alias
-                                              {:context ledger-context})
+                                              {:defaultContext ["" ledger-context]})
                db             @(fluree/stage
                                  (fluree/db ledger)
                                  [{:id             :ex/wes
@@ -184,17 +181,13 @@
                db             @(fluree/commit! ledger db)
                loaded         (test-utils/retry-load conn ledger-alias 100)
                loaded-db      (fluree/db loaded)
-               merged-ctx     (merge conn-context ledger-context)
+               merged-ctx     (merge (ctx-util/stringify-context conn-context) (ctx-util/stringify-context ledger-context))
                query          {:where  '[[?p :schema/email "wes@example.org"]]
                                :select '{?p [:*]}}
                results        @(fluree/query loaded-db query)
                full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
            (is (= (:t db) (:t loaded-db)))
-           (is (= merged-ctx (:context loaded)))
-           (is (= (get-in db [:schema :context])
-                  (get-in loaded-db [:schema :context])))
-           (is (= (get-in db [:schema :context-str])
-                  (get-in loaded-db [:schema :context-str])))
+           (is (= merged-ctx (dbproto/-default-context loaded-db)))
            (is (= [{full-type-url   [:ex/User]
                     :id             :ex/wes
                     :schema/age     42
@@ -211,10 +204,11 @@
                                :schema "http://schema.org/"}
                conn           @(fluree/connect
                                  {:method   :file :storage-path storage-path
-                                  :defaults {:context conn-context}})
+                                  :defaults {:context conn-context
+                                             :context-type :keyword}})
                ledger-alias   "load-from-file-query"
                ledger         @(fluree/create conn ledger-alias
-                                              {:context ledger-context})
+                                              {:defaultContext ["" ledger-context]})
                db             @(fluree/stage
                                  (fluree/db ledger)
                                  [{:id          :ex/Andrew
@@ -242,10 +236,11 @@
                                :schema "http://schema.org/"}
                conn1          @(fluree/connect
                                  {:method   :file, :storage-path storage-path
-                                  :defaults {:context conn1-context}})
+                                  :defaults {:context conn1-context
+                                             :context-type :keyword}})
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn1 ledger-alias
-                                              {:context ledger-context})
+                                              {:defaultContext ["" ledger-context]})
                db             @(fluree/stage
                                  (fluree/db ledger)
                                  [{:id             :ex/wes
@@ -265,16 +260,13 @@
                                :baz "http://baz.org/"}
                conn2          @(fluree/connect
                                  {:method :file, :storage-path storage-path
-                                  :defaults {:context conn2-context}})
+                                  :defaults {:context conn2-context
+                                             :context-type :keyword}})
                loaded         (test-utils/retry-load conn2 ledger-alias 100)
                loaded-db      (fluree/db loaded)
-               merged-ctx     (merge conn1-context ledger-context)]
+               merged-ctx     (merge (ctx-util/stringify-context conn1-context) (ctx-util/stringify-context ledger-context))]
            (is (= (:t db) (:t loaded-db)))
-           (is (= merged-ctx (:context loaded)))
-           (is (= (get-in db [:schema :context])
-                  (get-in loaded-db [:schema :context])))
-           (is (= (get-in db [:schema :context-str])
-                  (get-in loaded-db [:schema :context-str]))))))
+           (is (= merged-ctx (dbproto/-default-context loaded-db))))))
 
      (testing "can load a ledger with `list` values"
        (with-tmp-dir storage-path
@@ -283,7 +275,8 @@
                                 :storage-path storage-path
                                 :defaults
                                 {:context (merge test-utils/default-context
-                                                 {:ex "http://example.org/ns/"})}})
+                                                 {:ex "http://example.org/ns/"})
+                                 :context-type :keyword}})
                ledger-alias "load-lists-test"
                ledger       @(fluree/create conn ledger-alias)
                db           @(fluree/stage
@@ -318,7 +311,8 @@
                                   :storage-path storage-path
                                   :defaults
                                   {:context (merge test-utils/default-context
-                                                   {:ex "http://example.org/ns/"})}})
+                                                   {:ex "http://example.org/ns/"})
+                                   :context-type :keyword}})
                  ledger-alias "load-policy-test"
                  ledger       @(fluree/create conn ledger-alias)
                  db           @(fluree/stage

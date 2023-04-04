@@ -1,6 +1,7 @@
 (ns fluree.db.conn.ipfs
   (:require [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util :refer [exception?]]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log :include-macros true]
@@ -109,8 +110,8 @@
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-context [_] (:context ledger-defaults))
-  (-new-indexer [_ opts]                                    ;; default new ledger indexer
+  (-default-context [_] (:context ledger-defaults))
+  (-new-indexer [_ opts] ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
   (-did [_] (:did ledger-defaults))
@@ -147,7 +148,7 @@
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
-  [ipfs-endpoint {:keys [ipns context-type context did indexer] :as defaults}]
+  [ipfs-endpoint {:keys [ipns context context-type did indexer] :as _defaults}]
   (go-try
     (let [ipns-default-key     (or (:key ipns) "self")
           ipns-default-address (<? (ipfs-keys/address ipfs-endpoint ipns-default-key))
@@ -167,11 +168,12 @@
         (throw (ex-info (str "IPNS publishing appears to have an issue. No corresponding ipns address found for key: "
                              ipns-default-key)
                         {:status 400 :error :db/ipfs-keys})))
-      {:ipns    {:key     ipns-default-key
-                 :address ipns-default-address}
-       :context (util/normalize-context context-type context)
-       :did     did
-       :indexer new-indexer-fn})))
+      {:ipns         {:key     ipns-default-key
+                      :address ipns-default-address}
+       :context      (ctx-util/stringify-context context)
+       :context-type context-type
+       :did          did
+       :indexer      new-indexer-fn})))
 
 
 (defn connect
@@ -186,8 +188,8 @@
           conn-id         (str (random-uuid))
           state           (state-machine/blank-state)
 
-          cache-size     (conn-cache/memory->cache-size memory)
-          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+          cache-size      (conn-cache/memory->cache-size memory)
+          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
                             :ipfs-endpoint   ipfs-endpoint

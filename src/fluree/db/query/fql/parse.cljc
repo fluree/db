@@ -20,13 +20,9 @@
 
 (defn parse-context
   [{:keys [opts] :as q} db]
-  (let [ctx-key (if (= :string (or (:context-type opts)
-                                   (:contextType opts)))
-                  :context-str
-                  :context)
-        db-ctx  (get-in db [:schema ctx-key])
-        q-ctx   (or (:context q) (get q "@context"))]
-    (json-ld/parse-context db-ctx q-ctx)))
+  (dbproto/-context db
+                    (or (:context q) (get q "@context"))
+                    (:context-type opts)))
 
 (defn parse-var-name
   "Returns a `x` as a symbol if `x` is a valid '?variable'."
