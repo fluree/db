@@ -178,7 +178,7 @@
      ::analytical-query     [:map
                              [:where ::where]
                              [:t {:optional true} ::t]
-                             [:context {:optional true} ::context]
+                             [:context {:optional true} :any]
                              [:select {:optional true} ::select]
                              [:selectOne {:optional true} ::selectOne]
                              [:select-one {:optional true} ::select-one]

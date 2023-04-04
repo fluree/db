@@ -18,6 +18,7 @@
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.log :as log]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.commit-data :as commit-data])
   #?(:clj (:import (java.io Writer))))
 
@@ -242,11 +243,12 @@
 
 (defn expand-iri
   "Expands an IRI from the db's context."
-  ([{:keys [schema] :as _db} iri]
-   (json-ld/expand-iri iri (:context schema)))
-  ([{:keys [schema] :as _db} iri provided-context]
-   (->> (json-ld/parse-context (:context schema) provided-context)
-        (json-ld/expand-iri iri))))
+  ([db iri]
+   (expand-iri db iri nil))
+  ([db iri provided-context]
+   (if (keyword? iri)
+     (json-ld/expand-iri iri (dbproto/-context db provided-context :keyword))
+     (json-ld/expand-iri iri (dbproto/-context db provided-context :string)))))
 
 (defn iri->sid
   "Returns subject id or nil if no match.
@@ -418,13 +420,36 @@
           (assoc-in [:stats :indexed] index-t))
       db)))
 
+(defn retrieve-context
+  "Returns the parsed context. Caches."
+  [default-context context-cache supplied-context context-type]
+  (log/debug "retrieve-context - default: " default-context "supplied:" supplied-context "context-type: " context-type)
+  (or (get-in @context-cache [context-type supplied-context])
+      (let [context    (if supplied-context
+                         (if (sequential? supplied-context)
+                           (mapv #(if (= "" %)
+                                    ;; we need to substitute in the default context, keywordize if of type :keyword
+                                    (if (= :keyword context-type)
+                                      (ctx-util/keywordize-context default-context)
+                                      default-context)
+                                    %)
+                                 supplied-context)
+                           supplied-context)
+                         (if (= :keyword context-type)
+                           (ctx-util/keywordize-context default-context)
+                           default-context))
+            parsed-ctx (json-ld/parse-context context)]
+        (vswap! context-cache assoc-in [supplied-context context-type] parsed-ctx)
+        parsed-ctx)))
+
+
 ;; ================ end GraphDB record support fns ============================
 
 ;; TODO - conn is included here because current index-range query looks for conn on the db
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
 (defrecord JsonLdDb [ledger conn method alias branch commit block t tt-id stats
-                     spot psot post opst tspo schema comparators novelty
-                     policy ecount]
+                     spot psot post opst tspo schema comparators novelty policy ecount
+                     default-context context-type context-cache new-context?]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
@@ -457,7 +482,11 @@
   (-db-type [_] :json-ld)
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
-  (-index-update [db commit-index] (index-update db commit-index)))
+  (-index-update [db commit-index] (index-update db commit-index))
+  (-context [_] (retrieve-context default-context context-cache nil context-type))
+  (-context [_ context] (retrieve-context default-context context-cache context context-type))
+  (-context [_ context type] (retrieve-context default-context context-cache context (or type context-type)))
+  (-default-context [_] default-context))
 
 #?(:cljs
    (extend-type JsonLdDb
@@ -498,39 +527,46 @@
 
 
 (defn create
-  [{:keys [method alias conn] :as ledger}]
-  (let [novelty     (new-novelty-map index/default-comparators)
+  [{:keys [method alias conn] :as ledger} default-context context-type new-context?]
+  (let [novelty       (new-novelty-map index/default-comparators)
         {spot-cmp :spot
          psot-cmp :psot
          post-cmp :post
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot        (index/empty-branch method alias spot-cmp)
-        psot        (index/empty-branch method alias psot-cmp)
-        post        (index/empty-branch method alias post-cmp)
-        opst        (index/empty-branch method alias opst-cmp)
-        tspo        (index/empty-branch method alias tspo-cmp)
-        stats       {:flakes 0, :size 0, :indexed 0}
-        schema      (vocab/base-schema)
-        branch      (branch/branch-meta ledger)]
-    (map->JsonLdDb {:ledger      ledger
-                    :conn        conn
-                    :method      method
-                    :alias       alias
-                    :branch      (:name branch)
-                    :commit      (:commit branch)
-                    :block       0
-                    :t           0
-                    :tt-id       nil
-                    :stats       stats
-                    :spot        spot
-                    :psot        psot
-                    :post        post
-                    :opst        opst
-                    :tspo        tspo
-                    :schema      schema
-                    :comparators index/default-comparators
-                    :novelty     novelty
-                    :policy      root-policy-map
-                    :ecount      genesis-ecount})))
+        spot          (index/empty-branch method alias spot-cmp)
+        psot          (index/empty-branch method alias psot-cmp)
+        post          (index/empty-branch method alias post-cmp)
+        opst          (index/empty-branch method alias opst-cmp)
+        tspo          (index/empty-branch method alias tspo-cmp)
+        stats         {:flakes 0, :size 0, :indexed 0}
+        schema        (vocab/base-schema)
+        branch        (branch/branch-meta ledger)
+        context-type* (if (not= :keyword context-type)
+                        :string
+                        context-type)]
+    (map->JsonLdDb {:ledger          ledger
+                    :conn            conn
+                    :method          method
+                    :alias           alias
+                    :branch          (:name branch)
+                    :commit          (:commit branch)
+                    :block           0
+                    :t               0
+                    :tt-id           nil
+                    :stats           stats
+                    :spot            spot
+                    :psot            psot
+                    :post            post
+                    :opst            opst
+                    :tspo            tspo
+                    :schema          schema
+                    :comparators     index/default-comparators
+                    :novelty         novelty
+                    :policy          root-policy-map
+                    :default-context default-context
+                    :context-type    context-type*
+                    :context-cache   (volatile! nil)
+                    :new-context?    new-context?
+                    :ecount          genesis-ecount})))

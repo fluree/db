@@ -22,8 +22,8 @@
     (let [;conn         (test-utils/create-conn) ; doesn't work see comment below
           conn                   @(fluree/connect {:method :memory
                                                    :defaults
-                                                   {:context
-                                                    test-utils/default-context}})
+                                                   {:context      test-utils/default-context
+                                                    :context-type :keyword}})
           ;; if the :did default below is present on the conn
           ;; (as it is w/ test-utils/create-conn)
           ;; then the tests below fail at the last check

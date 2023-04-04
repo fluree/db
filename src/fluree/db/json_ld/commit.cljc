@@ -392,24 +392,18 @@
 
 (defn link-context-to-commit
   "Takes a commit with an embedded :context and pulls it out, saves it to
-  storage separately (content-addressed), and puts the address of that data
-  back into the commit under the :context key."
-  [{:keys [conn] :as ledger} commit]
+  storage separately (content-addressed).
+
+  Returns a two-tuple of [updated-commit context-file-write-response]"
+  [{:keys [conn ledger default-context] :as db} commit]
   (go-try
-    (let [context     (get commit (keyword const/iri-default-context))
-          context-res (when (map? context)
-                        (->> context
-                             util/stringify-keys
-                             (conn-proto/-ctx-write conn ledger)
-                             <?))]
-      {:context-res context-res
-       :commit      (if context-res
-                      (assoc commit (keyword const/iri-default-context) (:address context-res))
-                      commit)})))
+    (let [context-res (<? (conn-proto/-ctx-write conn ledger default-context))
+          commit*     (assoc commit (keyword const/iri-default-context) (:address context-res))]
+      [commit* context-res])))
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [ledger commit] :as db} {:keys [branch push? did private] :as _opts}]
+  [{:keys [ledger commit new-context?] :as db} {:keys [branch push? did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
           ledger-commit (:commit (ledger-proto/-status ledger branch))
@@ -417,7 +411,9 @@
                             (> (commit-data/t commit) (commit-data/t ledger-commit)))
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
-          {new-commit* :commit context-res :context-res} (<? (link-context-to-commit ledger new-commit))
+          [new-commit* context-res] (if new-context?
+                                      (<? (link-context-to-commit db new-commit))
+                                      [new-commit nil])
           _             (log/debug "do-commit+push new-commit w/ linked context:"
                                    new-commit*)
           [new-commit** jld-commit] (commit-data/commit-jsonld new-commit*)
@@ -426,7 +422,8 @@
                           jld-commit)
           commit-res    (<? (conn-proto/-c-write conn ledger signed-commit)) ;; write commit credential
           new-commit*** (commit-data/update-commit-address new-commit** (:address commit-res))
-          db*           (assoc db :commit new-commit***) ;; branch published to
+          db*           (assoc db :commit new-commit***
+                                  :new-context? false)
           db**         (if new-t?
                          (<? (add-commit-flakes (:prev-commit db) db*))
                          db*)

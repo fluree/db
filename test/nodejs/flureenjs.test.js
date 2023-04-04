@@ -77,7 +77,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
    // test providing context works and remaps keys
    const contextResults = await flureenjs.query(
      db1,
-     { "@context": {"flhubee": "http://schema.org/name"},
+     { "@context": ["", {"flhubee": "http://schema.org/name"}],
        select: { "?s": ["*"] },
        where: [["?s", "rdf:type", "ex:User"]]
      }

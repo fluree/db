@@ -53,30 +53,26 @@
     "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}])
 
 (def people
-  [{:context      {:ex "http://example.org/ns/"}
-    :id           :ex/brian,
+  [{:id           :ex/brian,
     :type         :ex/User,
     :schema/name  "Brian"
     :schema/email "brian@example.org"
     :schema/age   50
     :ex/favNums   7}
-   {:context      {:ex "http://example.org/ns/"}
-    :id           :ex/alice,
+   {:id           :ex/alice,
     :type         :ex/User,
     :schema/name  "Alice"
     :schema/email "alice@example.org"
     :schema/age   50
     :ex/favNums   [42, 76, 9]}
-   {:context      {:ex "http://example.org/ns/"}
-    :id           :ex/cam,
+   {:id           :ex/cam,
     :type         :ex/User,
     :schema/name  "Cam"
     :schema/email "cam@example.org"
     :schema/age   34
     :ex/favNums   [5, 10]
     :ex/friend    [:ex/brian :ex/alice]}
-   {:context      {:ex "http://example.org/ns/"}
-    :id           :ex/liam
+   {:id           :ex/liam
     :type         :ex/User
     :schema/name  "Liam"
     :schema/email "liam@example.org"
@@ -90,8 +86,9 @@
   ([{:keys [context did]
      :or   {context default-context
             did     (did/private->did-map default-private-key)}}]
-   (let [conn-p (fluree/connect-memory {:defaults {:context context
-                                                   :did     did}})]
+   (let [conn-p (fluree/connect-memory {:defaults {:context      context
+                                                   :context-type :keyword
+                                                   :did          did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies
@@ -101,12 +98,12 @@
       (let [staged @(fluree/stage (fluree/db ledger) movie)]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
-                          :push? true})))
+                          :push?   true})))
     ledger))
 
 (defn load-people
   [conn]
-  (let [ledger @(fluree/create conn "test/people")
+  (let [ledger @(fluree/create conn "test/people" {:default-context ["" {:ex "http://example.org/ns/"}]})
         staged @(fluree/stage (fluree/db ledger) people)]
     @(fluree/commit! ledger staged {:message "Adding people", :push? true})
     ledger))

@@ -3,6 +3,7 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
+            [fluree.db.util.context :as ctx-util]
             [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
             [fluree.db.conn.proto :as conn-proto]
@@ -243,7 +244,7 @@
   (-method [_] :file)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-context [_] (:context ledger-defaults))
+  (-default-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
@@ -280,12 +281,13 @@
     s))
 
 (defn ledger-defaults
-  [{:keys [context-type context did indexer]}]
-  {:context (util/normalize-context context-type context)
-   :did     did
-   :indexer (cond
-              (fn? indexer)
-              indexer
+  [{:keys [context context-type did indexer]}]
+  {:context      (ctx-util/stringify-context context)
+   :context-type context-type
+   :did          did
+   :indexer      (cond
+                   (fn? indexer)
+                   indexer
 
               (or (map? indexer) (nil? indexer))
               (fn [opts]

@@ -7,25 +7,22 @@
 (deftest ^:integration simple-compound-queries
   (testing "Simple compound queries."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/compounda")
+          ledger @(fluree/create conn "query/compounda" {:default-context ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                    (fluree/db ledger)
-                   [{:context      {:ex "http://example.org/ns/"}
-                     :id           :ex/brian,
+                   [{:id           :ex/brian,
                      :type         :ex/User,
                      :schema/name  "Brian"
                      :schema/email "brian@example.org"
                      :schema/age   50
                      :ex/favNums   7}
-                    {:context      {:ex "http://example.org/ns/"}
-                     :id           :ex/alice,
+                    {:id           :ex/alice,
                      :type         :ex/User,
                      :schema/name  "Alice"
                      :schema/email "alice@example.org"
                      :schema/age   50
                      :ex/favNums   [42, 76, 9]}
-                    {:context      {:ex "http://example.org/ns/"}
-                     :id           :ex/cam,
+                    {:id           :ex/cam,
                      :type         :ex/User,
                      :schema/name  "Cam"
                      :schema/email "cam@example.org"
@@ -34,15 +31,13 @@
                      :ex/friend    [:ex/brian :ex/alice]}])
 
           two-tuple-select-with-crawl
-          @(fluree/query db '{:context {:ex "http://example.org/ns/"}
-                              :select  [?age {?f [:*]}]
+          @(fluree/query db '{:select  [?age {?f [:*]}]
                               :where   [[?s :schema/name "Cam"]
                                         [?s :ex/friend ?f]
                                         [?f :schema/age ?age]]})
 
           two-tuple-select-with-crawl+var
-          @(fluree/query db '{:context {:ex "http://example.org/ns/"}
-                              :select  [?age {?f [:*]}]
+          @(fluree/query db '{:select  [?age {?f [:*]}]
                               :where   [[?s :schema/name ?name]
                                         [?s :ex/friend ?f]
                                         [?f :schema/age ?age]]
@@ -65,7 +60,8 @@
 
       ;; here we have pass-through variables (?name and ?age) which must get "passed through"
       ;; the last where statements into the select statement
-      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context {:schema "http://schema.org/"
+                                          :ex "http://example.org/ns/"}
                                 :select  ['?name '?age '?email]
                                 :where   [['?s :schema/name "Cam"]
                                           ['?s :ex/friend '?f]
@@ -77,7 +73,8 @@
           "Prior where statement variables may not be passing through to select results")
 
       ;; same as prior query, but using selectOne
-      (is (= @(fluree/query db {:context   {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context   {:schema "http://schema.org/"
+                                            :ex "http://example.org/ns/"}
                                 :selectOne ['?name '?age '?email]
                                 :where     [['?s :schema/name "Cam"]
                                             ['?s :ex/friend '?f]
@@ -90,7 +87,8 @@
       ;; if mixing multi-cardinality results along with single cardinality, there
       ;; should be a result output for every multi-cardinality value and the single
       ;; cardinality values should duplicate
-      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context {:schema "http://schema.org/"
+                                          :ex "http://example.org/ns/"}
                                 :select  ['?name '?favNums]
                                 :where   [['?s :schema/name '?name]
                                           ['?s :ex/favNums '?favNums]]})
@@ -100,7 +98,8 @@
           "Multi-cardinality values should duplicate non-multicardinality values ")
 
       ;; ordering by a single variable
-      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context {:schema "http://schema.org/"
+                                          :ex "http://example.org/ns/"}
                                 :select  ['?name '?favNums]
                                 :where   [['?s :schema/name '?name]
                                           ['?s :ex/favNums '?favNums]]
@@ -109,7 +108,8 @@
           "Ordering of favNums not in ascending order.")
 
       ;; ordering by a single variable descending
-      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context {:schema "http://schema.org/"
+                                          :ex "http://example.org/ns/"}
                                 :select  ['?name '?favNums]
                                 :where   [['?s :schema/name '?name]
                                           ['?s :ex/favNums '?favNums]]
@@ -118,7 +118,8 @@
           "Ordering of favNums not in descending order.")
 
       ;; ordering by multiple variables
-      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context {:schema "http://schema.org/"
+                                          :ex "http://example.org/ns/"}
                                 :select  ['?name '?favNums]
                                 :where   [['?s :schema/name '?name]
                                           ['?s :ex/favNums '?favNums]]
@@ -127,7 +128,8 @@
           "Ordering of multiple variables not working.")
 
       ;; ordering by multiple variables where some are equal, and not all carried to 'select'
-      (is (= @(fluree/query db {:context {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context {:schema "http://schema.org/"
+                                          :ex "http://example.org/ns/"}
                                 :select  ['?name '?favNums]
                                 :where   [['?s :schema/name '?name]
                                           ['?s :schema/age '?age]
@@ -137,7 +139,8 @@
           "Ordering of multiple variables where some are equal working.")
 
       ;; group-by with a multicardinality value, but not using any aggregate function
-      (is (= @(fluree/query db {:context  {:ex "http://example.org/ns/"}
+      (is (= @(fluree/query db {:context  {:schema "http://schema.org/"
+                                           :ex "http://example.org/ns/"}
                                 :select   ['?name '?favNums]
                                 :where    [['?s :schema/name '?name]
                                            ['?s :ex/favNums '?favNums]]
@@ -150,8 +153,7 @@
 
       ;; checking s, p, o values all pulled correctly and all IRIs are resolved from sid integer & compacted
       (is (= @(fluree/query db
-                            {:context  {:ex "http://example.org/ns/"}
-                             :select  ['?s '?p '?o]
+                            {:select  ['?s '?p '?o]
                              :where   [['?s :schema/age 34]
                                        ['?s '?p '?o]]})
              [[:ex/cam :id "http://example.org/ns/cam"]
@@ -167,8 +169,7 @@
 
       ;; checking object-subject joins
       (is (= @(fluree/query db
-                            '{:context {:ex "http://example.org/ns/"}
-                              :select  {?s ["*" {:ex/friend ["*"]}]}
+                            '{:select  {?s ["*" {:ex/friend ["*"]}]}
                               :where   [[?s :ex/friend ?o]
                                         [?o :schema/name "Alice"]]})
              [{:id :ex/cam,

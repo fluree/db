@@ -111,13 +111,9 @@
     "
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
-  ([conn ledger-alias {:keys [context context-type] :as opts}]
-   (let [conn-context (conn-proto/-context conn)
-         ledger-context (->> context
-                             (util/normalize-context context-type)
-                             (clojure.core/merge conn-context))
-         res-ch       (jld-ledger/create conn ledger-alias (assoc opts :context ledger-context))]
-     (promise-wrap res-ch))))
+  ([conn ledger-alias opts]
+   (promise-wrap
+     (jld-ledger/create conn ledger-alias opts))))
 
 (defn load-from-address
   "Loads a ledger defined with a Fluree address, e.g.:

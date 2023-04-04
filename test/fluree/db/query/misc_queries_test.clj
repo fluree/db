@@ -7,7 +7,7 @@
 (deftest ^:integration select-sid
   (testing "Select index's subject id in query using special keyword"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/subid" {:context {:ex "http://example.org/ns/"}})
+          ledger @(fluree/create conn "query/subid" {:default-context ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                     (fluree/db ledger)
                     {:graph [{:id          :ex/alice,
@@ -32,35 +32,35 @@
                                 :where  [['?s :type :ex/User]]}))))))
 
 (deftest ^:integration result-formatting
-  (let [conn (test-utils/create-conn)
-        ledger @(fluree/create conn "query-context" {:context {:ex "http://example.org/ns/"}})
-        db @(test-utils/transact ledger [{:id :ex/dan
-                                          :ex/x 1}])]
-    (is (= [{:id :foo/dan
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "query-context" {:default-context ["" {:ex "http://example.org/ns/"}]})
+        db     @(test-utils/transact ledger [{:id   :ex/dan
+                                              :ex/x 1}])]
+    (is (= [{:id    :foo/dan
              :foo/x 1}]
-           @(fluree/query db {"@context" {:foo "http://example.org/ns/"}
-                              :where [['?s :id :foo/dan]]
-                              :select {'?s [:*]}}))
+           @(fluree/query db {"@context" ["" {:foo "http://example.org/ns/"}]
+                              :where     [['?s :id :foo/dan]]
+                              :select    {'?s [:*]}}))
         "default unwrapped objects")
-    (is (= [{:id :foo/dan
+    (is (= [{:id    :foo/dan
              :foo/x [1]}]
-           @(fluree/query db {"@context" {:foo "http://example.org/ns/"
-                                          :foo/x {:container :set}}
-                              :where [['?s :id :foo/dan]]
-                              :select {'?s [:*]}}))
+           @(fluree/query db {"@context" ["" {:foo   "http://example.org/ns/"
+                                              :foo/x {:container :set}}]
+                              :where     [['?s :id :foo/dan]]
+                              :select    {'?s [:*]}}))
         "override unwrapping with :set")
-    (is (= [{:id :ex/dan
+    (is (= [{:id     :ex/dan
              "foo:x" [1]}]
-           @(fluree/query db {"@context" {"foo" "http://example.org/ns/"
-                                          "foo:x" {"@container" "@list"}}
-                              :where [['?s "@id" "foo:dan"]]
-                              :select {'?s ["*"]}}))
+           @(fluree/query db {"@context" ["" {"foo"   "http://example.org/ns/"
+                                              "foo:x" {"@container" "@list"}}]
+                              :where     [['?s "@id" "foo:dan"]]
+                              :select    {'?s ["*"]}}))
         "override unwrapping with @list")))
 
 (deftest ^:integration s+p+o-full-db-queries
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/everything" {:context {:ex "http://example.org/ns/"}})
+          ledger @(fluree/create conn "query/everything" {:default-context ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                    (fluree/db ledger)
                    {:graph [{:id           :ex/alice,
@@ -195,24 +195,12 @@
                   [:ex/alice :schema/name "Alice"]
                   [:ex/alice :schema/email "alice@flur.ee"]
                   [:ex/alice :schema/age 42]
-                  ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"
-                   :id
-                   "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:db:sha256:bbvrvnmzcotbulq3zo7cdakl3vacysgap6il37m4widvdp7vr353a"
-                   :id
-                   "fluree:db:sha256:bbvrvnmzcotbulq3zo7cdakl3vacysgap6il37m4widvdp7vr353a"]
-                  ["fluree:db:sha256:bbvrvnmzcotbulq3zo7cdakl3vacysgap6il37m4widvdp7vr353a"
-                   :f/address
-                   "fluree:memory://6fc2d43d2625d61ac668360707681aed4607da79a25dc0fef36acbebf24cb28a"]
-                  ["fluree:db:sha256:bbvrvnmzcotbulq3zo7cdakl3vacysgap6il37m4widvdp7vr353a"
-                   :f/flakes
-                   25]
-                  ["fluree:db:sha256:bbvrvnmzcotbulq3zo7cdakl3vacysgap6il37m4widvdp7vr353a"
-                   :f/size
-                   1888]
-                  ["fluree:db:sha256:bbvrvnmzcotbulq3zo7cdakl3vacysgap6il37m4widvdp7vr353a"
-                   :f/t
-                   1]
+                  ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :id "fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank"]
+                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/address "fluree:memory://2921503e8e62f47b598d4504f990a25bc7f7b841c11367599d87884d4bf5f0f8"]
+                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/flakes 25]
+                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/size 1888]
+                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/t 1]
                   [:schema/age :id "http://schema.org/age"]
                   [:schema/email :id "http://schema.org/email"]
                   [:schema/name :id "http://schema.org/name"]
@@ -229,40 +217,20 @@
                   [:f/data :id "https://ns.flur.ee/ledger#data"]
                   [:f/address :id "https://ns.flur.ee/ledger#address"]
                   [:f/v :id "https://ns.flur.ee/ledger#v"]
-                  ["https://www.w3.org/2018/credentials#issuer"
-                   :id
-                   "https://www.w3.org/2018/credentials#issuer"]
+                  ["https://www.w3.org/2018/credentials#issuer" :id "https://www.w3.org/2018/credentials#issuer"]
                   [:f/time :id "https://ns.flur.ee/ledger#time"]
                   [:f/message :id "https://ns.flur.ee/ledger#message"]
                   [:f/previous :id "https://ns.flur.ee/ledger#previous"]
                   [:id :id "@id"]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :id
-                   "fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :f/time
-                   720000]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   "https://www.w3.org/2018/credentials#issuer"
-                   "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :f/v
-                   0]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :f/address
-                   "fluree:memory://8a031273bf6fdbecf13c229abb6c23d346a0f8af3344e8bb9f0a1fce1db723bc"]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :f/data
-                   "fluree:db:sha256:bbvrvnmzcotbulq3zo7cdakl3vacysgap6il37m4widvdp7vr353a"]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :f/alias
-                   "query/everything"]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :f/branch
-                   "main"]
-                  ["fluree:commit:sha256:bbstbkfuob2d73ubsc3xvqckbmn7z35esq5k7i3rolj7hed7li2ox"
-                   :f/context
-                   "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :id "fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3"]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :f/time 720000]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" "https://www.w3.org/2018/credentials#issuer" "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :f/v 0]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :f/address "fluree:memory://1b766e9d594d0afb754aeb7b9bc62158ff319273552a0b7fda9bb77b001e8acb"]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :f/data "fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank"]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :f/alias "query/everything"]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :f/branch "main"]
+                  ["fluree:commit:sha256:bbjjp52yfifntgso6dtpbzynb3qdyjxb3kwiykksiwei45izv2up3" :f/context "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]]
                  @(fluree/query db* {:select ['?s '?p '?o]
                                      :where  [['?s '?p '?o]]}))))))))
 
@@ -290,7 +258,7 @@
 
 (deftest ^:integration class-queries
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/class" {:context {:ex "http://example.org/ns/"}})
+        ledger @(fluree/create conn "query/class" {:default-context ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/alice,
@@ -312,18 +280,16 @@
                     :schema/name "Dave"}])]
     (testing "rdf/type"
       (is (= [[:ex/User]]
-             @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
-                                 :select   [?class]
-                                 :where    [[:ex/jane :rdf/type ?class]]})))
+             @(fluree/query db '{:select [?class]
+                                 :where  [[:ex/jane :rdf/type ?class]]})))
       (is (= [[:ex/dave :ex/nonUser]
               [:ex/jane :ex/User]
               [:ex/bob :ex/User]
               [:ex/alice :ex/User]
               [:ex/nonUser :rdfs/Class]
               [:ex/User :rdfs/Class]]
-             @(fluree/query db '{:context  {:ex "http://example.org/ns/"}
-                                 :select   [?s ?class]
-                                 :where    [[?s :rdf/type ?class]]}))))
+             @(fluree/query db '{:select [?s ?class]
+                                 :where  [[?s :rdf/type ?class]]}))))
     (testing "shacl targetClass"
       (let [shacl-db @(fluree/stage
                         (fluree/db ledger)

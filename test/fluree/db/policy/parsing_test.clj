@@ -46,7 +46,7 @@
 (deftest ^:integration policy-enforcement
   (testing "Testing query policy returns correctly."
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "policy-parse/a" {:context {:ex "http://example.org/ns/"}})
+          ledger       @(fluree/create conn "policy-parse/a" {:default-context ["" {:ex "http://example.org/ns/"}]})
           root-did     (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did    (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           customer-did (:id (did/private->did-map "854358f6cb3a78ff81febe0786010d6e22839ea6bd52e03365a728d7b693b5a0"))

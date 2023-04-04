@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.json-ld :as json-ld]
+  (:require [fluree.db.dbproto :as db-proto]
+            [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.vocab :as vocab]
@@ -215,13 +216,13 @@
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t        (-> commit-t inc -)] ;; commit-t is always positive, need to make negative for internal indexing
-    {:issuer        issuer
-     :db-before     (dbproto/-rootdb db)
-     :policy        policy
-     :bootstrap?    bootstrap?
-     :default-ctx   (if (= :string context-type)
-                      (:context-str schema)
-                      (:context schema))
+    {:issuer      issuer
+     :db-before   (dbproto/-rootdb db)
+     :policy      policy
+     :bootstrap?  bootstrap?
+     :default-ctx (if context-type
+                    (dbproto/-context db nil context-type)
+                    (dbproto/-context db))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t

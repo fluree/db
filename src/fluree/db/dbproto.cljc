@@ -22,7 +22,9 @@
   (-add-predicate-to-idx [db pred-id] "Adds predicate to idx, return updated db.")
   (-db-type [db] "Returns db type, e.g. :json-ld, :json")
   (-stage [db tx] [db tx opts] "Stages a database transaction.")
-  (-index-update [db commit-index] "Updates db to reflect a new index point described by commit-index metadata"))
+  (-index-update [db commit-index] "Updates db to reflect a new index point described by commit-index metadata")
+  (-context [db] [db context] [db context context-type] "Returns parsed context given supplied context. If no context is supplied, returns default context.")
+  (-default-context [db] "Returns the default context the db is configured to use."))
 
 (defn db?
   [db]
