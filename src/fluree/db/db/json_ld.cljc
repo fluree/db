@@ -439,7 +439,7 @@
                            (ctx-util/keywordize-context default-context)
                            default-context))
             parsed-ctx (json-ld/parse-context context)]
-        (vswap! context-cache assoc-in [supplied-context context-type] parsed-ctx)
+        (vswap! context-cache assoc-in [context-type supplied-context] parsed-ctx)
         parsed-ctx)))
 
 
