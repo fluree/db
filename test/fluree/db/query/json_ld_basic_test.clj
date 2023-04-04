@@ -143,7 +143,7 @@
 
 (deftest ^:integration simple-subject-crawl-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/simple-subject-crawl" {:default-context ["" {:ex "http://example.org/ns/"}]})
+        ledger @(fluree/create conn "query/simple-subject-crawl" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/brian,

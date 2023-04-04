@@ -63,7 +63,7 @@
                              "foo" "http://foobar.com/"}
              ledger         @(fluree/create conn ledger-alias
                                             {:context-type    :string
-                                             :default-context ["" ledger-context]})
+                                             :defaultContext ["" ledger-context]})
              merged-context (merge (util/stringify-keys test-utils/default-context)
                                    ledger-context)]
          (is (= merged-context (dbproto/-default-context (fluree/db ledger))))))))
@@ -78,7 +78,7 @@
                                 {:context test-utils/default-context
                                  :context-type :keyword}})
                ledger-alias "load-from-file-test-single-card"
-               ledger       @(fluree/create conn ledger-alias {:default-context ["" {:ex "http://example.org/ns/"}]})
+               ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
                db           @(fluree/stage
                                (fluree/db ledger)
                                [{:id           :ex/brian
@@ -115,7 +115,7 @@
                                 {:context test-utils/default-context
                                  :context-type :keyword}})
                ledger-alias "load-from-file-test-multi-card"
-               ledger       @(fluree/create conn ledger-alias {:default-context ["" {:ex "http://example.org/ns/"}]})
+               ledger       @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
                db           @(fluree/stage
                                (fluree/db ledger)
                                [{:id           :ex/brian
@@ -165,7 +165,7 @@
                                              :context-type :keyword}})
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn ledger-alias
-                                              {:default-context ["" ledger-context]})
+                                              {:defaultContext ["" ledger-context]})
                db             @(fluree/stage
                                  (fluree/db ledger)
                                  [{:id             :ex/wes
@@ -208,7 +208,7 @@
                                              :context-type :keyword}})
                ledger-alias   "load-from-file-query"
                ledger         @(fluree/create conn ledger-alias
-                                              {:default-context ["" ledger-context]})
+                                              {:defaultContext ["" ledger-context]})
                db             @(fluree/stage
                                  (fluree/db ledger)
                                  [{:id          :ex/Andrew
@@ -240,7 +240,7 @@
                                              :context-type :keyword}})
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn1 ledger-alias
-                                              {:default-context ["" ledger-context]})
+                                              {:defaultContext ["" ledger-context]})
                db             @(fluree/stage
                                  (fluree/db ledger)
                                  [{:id             :ex/wes

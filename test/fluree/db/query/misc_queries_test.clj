@@ -7,7 +7,7 @@
 (deftest ^:integration select-sid
   (testing "Select index's subject id in query using special keyword"
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/subid" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger @(fluree/create conn "query/subid" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                     (fluree/db ledger)
                     {:graph [{:id          :ex/alice,
@@ -33,7 +33,7 @@
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query-context" {:default-context ["" {:ex "http://example.org/ns/"}]})
+        ledger @(fluree/create conn "query-context" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(test-utils/transact ledger [{:id   :ex/dan
                                               :ex/x 1}])]
     (is (= [{:id    :foo/dan
@@ -60,7 +60,7 @@
 (deftest ^:integration s+p+o-full-db-queries
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/everything" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger @(fluree/create conn "query/everything" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                    (fluree/db ledger)
                    {:graph [{:id           :ex/alice,
@@ -258,7 +258,7 @@
 
 (deftest ^:integration class-queries
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/class" {:default-context ["" {:ex "http://example.org/ns/"}]})
+        ledger @(fluree/create conn "query/class" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/alice,

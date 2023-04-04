@@ -103,7 +103,7 @@
 
 (defn load-people
   [conn]
-  (let [ledger @(fluree/create conn "test/people" {:default-context ["" {:ex "http://example.org/ns/"}]})
+  (let [ledger @(fluree/create conn "test/people" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         staged @(fluree/stage (fluree/db ledger) people)]
     @(fluree/commit! ledger staged {:message "Adding people", :push? true})
     ledger))

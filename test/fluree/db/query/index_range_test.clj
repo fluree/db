@@ -11,7 +11,7 @@
   (testing "Various index range scans using the API."
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/index-range"
-                                  {:default-context ["" {:ex "http://example.org/ns/"}]})
+                                  {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db      @(fluree/stage
                      (fluree/db ledger)
                      [{:id           :ex/brian,

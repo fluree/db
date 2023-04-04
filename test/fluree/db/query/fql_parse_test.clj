@@ -17,7 +17,7 @@
 (deftest test-parse-query
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/parse"
-                               {:default-context ["" {:ex "http://example.org/ns/"}]})
+                               {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/brian,

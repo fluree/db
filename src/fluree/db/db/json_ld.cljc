@@ -423,7 +423,7 @@
 (defn retrieve-context
   "Returns the parsed context. Caches."
   [default-context context-cache supplied-context context-type]
-  (log/debug "retrieve-context - default: " default-context "supplied:" supplied-context "context-type: " context-type)
+  (log/trace "retrieve-context - default: " default-context "supplied:" supplied-context "context-type: " context-type)
   (or (get-in @context-cache [context-type supplied-context])
       (let [context    (if supplied-context
                          (if (sequential? supplied-context)

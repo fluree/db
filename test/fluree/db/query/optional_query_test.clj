@@ -9,7 +9,7 @@
 (deftest ^:integration optional-queries
   (testing "Testing various 'optional' query clauses."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/optional" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger @(fluree/create conn "query/optional" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                     (fluree/db ledger)
                     [{:id          :ex/brian,

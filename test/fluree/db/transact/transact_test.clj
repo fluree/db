@@ -8,7 +8,7 @@
 (deftest ^:integration staging-data
   (testing "Disallow staging invalid transactions"
     (let [conn           (test-utils/create-conn )
-          ledger         @(fluree/create conn "tx/disallow" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger         @(fluree/create conn "tx/disallow" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
           stage-id-only     (try
                               @(fluree/stage
@@ -50,7 +50,7 @@
                                     :where  [[?s ?p ?o]]})))))
   (testing "Allow transacting `false` values"
     (let [conn    (test-utils/create-conn)
-          ledger  @(fluree/create conn "tx/bools" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger  @(fluree/create conn "tx/bools" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db-bool @(fluree/stage
                      (fluree/db ledger)
                      {:id         :ex/alice

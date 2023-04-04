@@ -9,7 +9,7 @@
   (let [ts-primeval (util/current-time-iso)
 
         conn        (test-utils/create-conn)
-        ledger      @(fluree/create conn "historytest" {:default-context ["" {:ex "http://example.org/ns/"}]})
+        ledger      @(fluree/create conn "historytest" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
         db1         @(test-utils/transact ledger [{:id   :ex/dan
                                                    :ex/x "foo-1"
@@ -178,7 +178,7 @@
 
     (testing "small cache"
       (let [conn   (test-utils/create-conn)
-            ledger @(fluree/create conn "historycachetest" {:default-context ["" {:ex "http://example.org/ns/"}]})
+            ledger @(fluree/create conn "historycachetest" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
             db1    @(test-utils/transact ledger [{:id   :ex/dan
                                                   :ex/x "foo-1"
@@ -195,7 +195,7 @@
 (deftest ^:integration commit-details
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "committest" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger @(fluree/create conn "committest" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
           db1    @(test-utils/transact ledger {:id   :ex/alice
                                                :ex/x "foo-1"

@@ -9,7 +9,7 @@
 (deftest ^:integration using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "class/testing" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger    @(fluree/create conn "class/testing" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db1       @(fluree/stage
                        (fluree/db ledger)
                        {:id                 :ex/MyClass,
@@ -30,7 +30,7 @@
 (deftest ^:integration shacl-cardinality-constraints
   (testing "shacl minimum and maximum cardinality"
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "shacl/a" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger       @(fluree/create conn "shacl/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select  {'?s [:*]}
                         :where   [['?s :rdf/type :ex/User]]}
           db           @(fluree/stage
@@ -83,7 +83,7 @@
 (deftest ^:integration shacl-datatype-constraints
   (testing "shacl datatype errors"
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "shacl/b" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select  {'?s [:*]}
                         :where   [['?s :rdf/type :ex/User]]}
           db           @(fluree/stage
@@ -131,7 +131,7 @@
 (deftest ^:integration shacl-closed-shape
   (testing "shacl closed shape"
     (let [conn          (test-utils/create-conn)
-          ledger        @(fluree/create conn "shacl/c" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger        @(fluree/create conn "shacl/c" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query    {:select  {'?s [:*]}
                          :where   [['?s :rdf/type :ex/User]]}
           db            @(fluree/stage
@@ -171,7 +171,7 @@
 (deftest ^:integration shacl-property-pairs
   (testing "shacl property pairs"
     (let [conn          (test-utils/create-conn)
-          ledger        @(fluree/create conn "shacl/pairs" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger        @(fluree/create conn "shacl/pairs" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query    {:select  {'?s [:*]}
                          :where   [['?s :rdf/type :ex/User]]} ]
       (testing "single-cardinality equals"
@@ -573,7 +573,7 @@
 (deftest ^:integration shacl-value-range
   (testing "shacl value range constraints"
     (let [conn          (test-utils/create-conn)
-          ledger        @(fluree/create conn "shacl/value-range" {:default-context ["" {:ex "http://example.org/ns/"}]})
+          ledger        @(fluree/create conn "shacl/value-range" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query    {:select  {'?s [:*]}
                          :where   [['?s :rdf/type :ex/User]]}]
       (testing "exclusive constraints"
