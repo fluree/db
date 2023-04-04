@@ -188,10 +188,6 @@
                full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
            (is (= (:t db) (:t loaded-db)))
            (is (= merged-ctx (dbproto/-default-context loaded-db)))
-           (is (= (get-in db [:schema :context])
-                  (get-in loaded-db [:schema :context])))
-           (is (= (get-in db [:schema :context-str])
-                  (get-in loaded-db [:schema :context-str])))
            (is (= [{full-type-url   [:ex/User]
                     :id             :ex/wes
                     :schema/age     42
@@ -270,11 +266,7 @@
                loaded-db      (fluree/db loaded)
                merged-ctx     (merge (ctx-util/stringify-context conn1-context) (ctx-util/stringify-context ledger-context))]
            (is (= (:t db) (:t loaded-db)))
-           (is (= merged-ctx (dbproto/-default-context loaded-db)))
-           (is (= (get-in db [:schema :context])
-                  (get-in loaded-db [:schema :context])))
-           (is (= (get-in db [:schema :context-str])
-                  (get-in loaded-db [:schema :context-str]))))))
+           (is (= merged-ctx (dbproto/-default-context loaded-db))))))
 
      (testing "can load a ledger with `list` values"
        (with-tmp-dir storage-path

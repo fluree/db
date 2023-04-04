@@ -186,8 +186,6 @@
      :refs        #{}
      :coll        coll
      :pred        pred
-     :context     nil
-     :context-str nil
      :shapes      (atom {:class {} ; TODO: Does this need to be an atom?
                          :pred  {}})
      :prefix      {}
@@ -223,8 +221,5 @@
   "Updates the schema map of a db."
   [db]
   (go-try
-    (let [{{:keys [context context-str]} :schema} db
-          _       (log/debug "refresh-schema existing context:" context)
-          schema  (<? (vocab-map db))
-          schema* (assoc schema :context context :context-str context-str)]
-      (assoc db :schema schema*))))
+    (let [schema  (<? (vocab-map db))]
+      (assoc db :schema schema))))
