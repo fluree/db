@@ -166,12 +166,12 @@
   (dbproto/-default-context db))
 
 (defn update-default-context
-  "Updates the default context on a specified ledger.
+  "Updates the default context on a given database.
   Currently, the updated default context will only be
   written with a new commit, which requires staging
   changed data.
 
-  Returns new db updated with new provided default context."
+  Returns an updated db."
   [db default-context]
   (dbproto/-default-context-update db default-context))
 
