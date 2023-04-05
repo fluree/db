@@ -37,7 +37,9 @@
                                  {:rdf/type [:_id]}
                                  {:f/allow [:* {:f/targetRole [:_id]}]}
                                  {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                   :where  [['?s :rdf/type :f/Policy]]}))))
+                   :where  [['?s :rdf/type :f/Policy]]
+                   :opts {:context-type :keyword}}))))
+
 
 
 (defn policies-for-roles*

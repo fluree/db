@@ -111,8 +111,31 @@
                   :roles    #{sid-userRole}}
                  policy-alice)
               "Policies for only :ex/userRole should return")))
-
-
+      (testing "Root policy contains {:root? true} for each applicable :f/action"
+        (let [policy-root  (-> @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))
+                               replace-policy-fns)
+              sid-root-did @(fluree/internal-id db root-did)
+              sid-rootRole @(fluree/internal-id db :ex/rootRole)]
+          (is (= {:f/modify {:root? true}
+                  :f/view   {:root? true}
+                  :ident    sid-root-did
+                  :roles    #{sid-rootRole}}
+                 policy-root))))))
+  (testing "Testing query policy with strings"
+    (let [conn         (test-utils/create-conn)
+          ledger       @(fluree/create conn "policy-parse/a" {:defaultContext ["" {"ex" "http://example.org/ns/"}]
+                                                              :context-type :string})
+          root-did     (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
+          db           @(fluree/stage
+                          (fluree/db ledger)
+                          [{"id"     root-did
+                            "f:role" {"id" "ex:rootRole"}}
+                           {"id"           "ex:rootPolicy",
+                            "type"         ["f:Policy"],
+                            "f:targetNode" {"id" "f:allNodes"}
+                            "f:allow"      [{"id"           "ex:rootAccessAllow"
+                                             "f:targetRole" {"id" "ex:rootRole"}
+                                             "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}])]
       (testing "Root policy contains {:root? true} for each applicable :f/action"
         (let [policy-root  (-> @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))
                                replace-policy-fns)
