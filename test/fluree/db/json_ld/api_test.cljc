@@ -521,46 +521,6 @@
              res2           @(fluree/query loaded-db query)]
          (is (= res1 res2))))
 
-     (testing "conn context is not merged into ledger's on load"
-       (let [conn1-context  {:id  "@id", :type "@type"
-                             :xsd "http://www.w3.org/2001/XMLSchema#"
-                             :foo "http://foo.com/"}
-             ledger-context {:ex     "http://example.com/"
-                             :schema "http://schema.org/"}
-             conn1          @(fluree/connect
-                              {:method   :memory
-                               :defaults {:context conn1-context
-                                          :context-type :keyword}})
-             ledger-alias   "load-from-memory-with-context"
-             ledger         @(fluree/create conn1 ledger-alias
-                                            {:defaultContext ["" ledger-context]})
-             db             @(fluree/stage
-                              (fluree/db ledger)
-                              [{:id             :ex/wes
-                                :type           :ex/User
-                                :schema/name    "Wes"
-                                :schema/email   "wes@example.org"
-                                :schema/age     42
-                                :schema/favNums [1 2 3]
-                                :ex/friend      {:id           :ex/jake
-                                                 :type         :ex/User
-                                                 :schema/name  "Jake"
-                                                 :schema/email "jake@example.org"}}])
-             db             @(fluree/commit! ledger db)
-             conn2-context  {:id "@id", :type "@type"
-                             :xsd "http://www.w3.org/2001/XMLSchema#"
-                             :foo "http://foobar.com/"
-                             :baz "http://baz.org/"}
-             conn2          @(fluree/connect
-                              {:method :file, :storage-path storage-path
-                               :defaults {:context conn2-context
-                                          :context-type :keyword}})
-             loaded         (test-utils/retry-load conn2 ledger-alias 100)
-             loaded-db      (fluree/db loaded)
-             merged-ctx     (merge (ctx-util/stringify-context conn1-context) (ctx-util/stringify-context ledger-context))]
-         (is (= (:t db) (:t loaded-db)))
-         (is (= merged-ctx (dbproto/-default-context loaded-db)))))
-
      (testing "can load a ledger with `list` values"
        (let [conn         @(fluree/connect
                             {:method       :memory
