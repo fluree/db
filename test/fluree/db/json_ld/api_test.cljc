@@ -368,6 +368,7 @@
                                                               {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
                                                  :where  [[?s :rdf/type :f/Policy]]})))))))))
 
+#?(:clj
    (deftest load-from-memory-test
      (testing "can load a memory ledger with single cardinality predicates"
        (let [conn         @(fluree/connect
