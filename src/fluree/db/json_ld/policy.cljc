@@ -484,6 +484,6 @@
                                                             :error  :db/policy-exception}))
       (not role)                           (throw (ex-info "Applying policy without a role is not yet supported."
                                                            {:status 400
-                                                            :error  :db/policy-exception}) )
+                                                            :error  :db/policy-exception}))
       :else                                (assoc db :policy
                                                   (<? (policy-map db did role credential))))))

@@ -365,7 +365,7 @@
         (if (empty? (dissoc node :idx :id))
           (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
                                (some->> (:id node)
-                                        (str " for @id: ") )
+                                        (str " for @id: "))
                                ".")
                           {:status 400 :error :db/invalid-transaction}))
           (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
