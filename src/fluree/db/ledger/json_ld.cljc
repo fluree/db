@@ -212,36 +212,36 @@
       ledger)))
 
 (defn load
-  [conn commit-address]
+  [conn db-alias]
   (go-try
-    (let [base-context {:base commit-address}
-          last-commit  (<? (conn-proto/-lookup conn commit-address))
-          _            (when-not last-commit
-                         (throw (ex-info (str "Unable to load. No commit exists for: " commit-address)
+    (let [base-context {:base db-alias}
+          commit-addr  (<? (conn-proto/-lookup conn db-alias))
+          _            (when-not commit-addr
+                         (throw (ex-info (str "Unable to load. No commit exists for: " db-alias)
                                          {:status 400 :error :db/invalid-commit-address})))
-          commit-data  (<? (conn-proto/-c-read conn last-commit))
+          commit-data  (<? (conn-proto/-c-read conn commit-addr))
           _            (when-not commit-data
-                         (throw (ex-info (str "Unable to load. No commit exists for: " last-commit)
+                         (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))
           commit-data* (json-ld/expand commit-data base-context)
           [commit proof] (jld-reify/parse-commit commit-data*)
           _            (when proof
                          (jld-reify/validate-commit db commit proof))
           _            (log/debug "load commit:" commit)
-          alias        (or (get-in commit [const/iri-alias :value])
-                           (conn-proto/-alias conn commit-address))
+          ledger-alias (or (get-in commit [const/iri-alias :value])
+                           (conn-proto/-alias conn db-alias))
           branch       (keyword (get-in commit [const/iri-branch :value]))
           default-ctx  (-> commit
                            (get const/iri-default-context)
                            :value
                            (->> (jld-reify/load-default-context conn))
                            <?)
-          ledger       (<? (create conn alias {:branch         branch
-                                               :id             last-commit
-                                               :defaultContext default-ctx
-                                               :new-context?   false}))
+          ledger       (<? (create conn ledger-alias {:branch         branch
+                                                      :id             commit-addr
+                                                      :defaultContext default-ctx
+                                                      :new-context?   false}))
           db           (ledger-proto/-db ledger)
-          db*          (<? (jld-reify/load-db-idx db commit last-commit false))]
+          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
       (ledger-proto/-commit-update ledger branch db*)
       ledger)))
 
