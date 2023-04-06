@@ -96,6 +96,8 @@
            (coerce "3.14" const/$xsd:decimal)))
     (is (= #?(:clj (BigDecimal. "42.0") :cljs 42)
            (coerce 42 const/$xsd:decimal)))
+    (is (= #?(:clj (bigdec 99.99) :cljs 99.99)
+           (coerce #?(:clj (bigdec 99.99) :cljs 99.99) const/$xsd:decimal)))
     (is (= nil
            (coerce "foo" const/$xsd:decimal))))
 
