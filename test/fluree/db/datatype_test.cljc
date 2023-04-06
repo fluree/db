@@ -90,11 +90,11 @@
     (is (= nil (coerce "foo" const/$xsd:dateTime))))
 
   (testing "decimal"
-    (is (= #?(:clj (BigDecimal. "3.14") :cljs 3.14)
+    (is (= #?(:clj (bigdec "3.14") :cljs 3.14)
            (coerce 3.14 const/$xsd:decimal)))
-    (is (= #?(:clj (BigDecimal. "3.14") :cljs 3.14)
+    (is (= #?(:clj (bigdec "3.14") :cljs 3.14)
            (coerce "3.14" const/$xsd:decimal)))
-    (is (= #?(:clj (BigDecimal. "42.0") :cljs 42)
+    (is (= #?(:clj (bigdec "42.0") :cljs 42)
            (coerce 42 const/$xsd:decimal)))
     (is (= #?(:clj (bigdec 99.99) :cljs 99.99)
            (coerce #?(:clj (bigdec 99.99) :cljs 99.99) const/$xsd:decimal)))
