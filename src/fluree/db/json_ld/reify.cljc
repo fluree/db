@@ -427,7 +427,7 @@
   [{:keys [ledger] :as db} latest-commit commit-address merged-db?]
   (go-try
     (let [{:keys [conn]} ledger
-          idx-meta   (get latest-commit const/iri-index)
+          idx-meta   (get latest-commit const/iri-index) ;; get persistent index meta if ledger has indexes
           db-base    (if-let [idx-address (get-in idx-meta [const/iri-address :value])]
                        (<? (storage/reify-db conn db idx-address))
                        db)

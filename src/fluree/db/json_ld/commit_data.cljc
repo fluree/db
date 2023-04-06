@@ -179,11 +179,13 @@
          issuer      const/iri-issuer
          time        const/iri-time,
          tag         const/iri-tag,
+         ctx-default const/iri-default-context
          message     const/iri-message
          prev-commit const/iri-previous,
          data        const/iri-data,
          ns          const/iri-ns,
          index       const/iri-index} commit-json-ld
+        ctx-key   (keyword const/iri-default-context)
         db-object (fn [{id      :id,
                         t       const/iri-t,
                         address const/iri-address,
@@ -224,7 +226,8 @@
                   :psot    psot
                   :post    post
                   :opst    opst
-                  :tspo    tspo})}))
+                  :tspo    tspo})
+     ctx-key   (:value ctx-default)}))
 
 
 (defn update-commit-id
@@ -359,12 +362,10 @@
   Assumes commit is not yet created (but db is persisted), so
   commit-id and commit-address are added after finalizing and persisting commit."
   [{:keys [old-commit issuer message tag dbid t db-address flakes size]
-    :as commit}]
+    :as   _commit}]
   (let [prev-data   (select-keys (data old-commit) [:id :address])
         data-commit (new-db-commit dbid t db-address prev-data flakes size)
         prev-commit (not-empty (select-keys old-commit [:id :address]))
-        context-key (keyword const/iri-default-context)
-        context     (get commit context-key)
         commit      (-> old-commit
                         (dissoc :id :address :data :issuer :time :message :tag :prev-commit)
                         (assoc :address ""
@@ -374,8 +375,7 @@
             issuer (assoc :issuer {:id issuer})
             prev-commit (assoc :previous prev-commit)
             message (assoc :message message)
-            tag (assoc :tag tag)
-            context (assoc context-key context))))
+            tag (assoc :tag tag))))
 
 (defn update-db
   "Updates the :data portion of the commit map to represent a saved new db update."
