@@ -37,7 +37,9 @@
                                  {:rdf/type [:_id]}
                                  {:f/allow [:* {:f/targetRole [:_id]}]}
                                  {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                   :where  [['?s :rdf/type :f/Policy]]}))))
+                   :where  [['?s :rdf/type :f/Policy]]
+                   :opts {:context-type :keyword}}))))
+
 
 
 (defn policies-for-roles*
@@ -334,7 +336,9 @@
            async/merge
            (async/reduce
              (fn [acc result]
-               (into acc result)) [])
+               (if (instance? Throwable result)
+                 (reduced result)
+                 (into acc result))) [])
            <?))))
 
 ;; TODO - exceptions in here won't be caught!
@@ -349,7 +353,9 @@
          async/merge
          (async/reduce
            (fn [acc result]
-             (into acc result)) [])
+             (if (instance? Throwable result)
+               (reduced result)
+               (into acc result))) [])
          <?)))
 
 
@@ -427,8 +433,9 @@
        (map #(compile-policy db %))
        async/merge
        (async/reduce (fn [acc compiled-policy]
-                       (into acc compiled-policy)) [])))
-
+                       (if (instance? Throwable compiled-policy)
+                         (reduced compiled-policy)
+                         (into acc compiled-policy))) [])))
 
 (defn policy-map
   "perm-action is a set of the action(s) being filtered for."
@@ -441,7 +448,7 @@
             role-sids         (if (sequential? role)
                                 (->> (<? (subids db role))
                                      (into #{}))
-                                #{(<? (dbproto/-subid db role))})
+                                #{(<? (dbproto/-subid db role ))})
             policies          {:ident ident-sid
                                :roles role-sids
                                :cache (atom {})}
