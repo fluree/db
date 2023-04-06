@@ -55,7 +55,13 @@
                                               "foo:x" {"@container" "@list"}}]
                               :where     [['?s "@id" "foo:dan"]]
                               :select    {'?s ["*"]}}))
-        "override unwrapping with @list")))
+        "override unwrapping with @list")
+    (is (= [{"@id"     "http://example.org/ns/dan"
+             "http://example.org/ns/x" 1}]
+           @(fluree/query db {"@context" ["" nil]
+                              :where     [['?s "@id" "http://example.org/ns/dan"]]
+                              :select    {'?s ["*"]}}))
+        "force iri expansion")))
 
 (deftest ^:integration s+p+o-full-db-queries
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]

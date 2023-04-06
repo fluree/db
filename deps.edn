@@ -13,6 +13,7 @@
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
                                           :sha     "4c559826e281c7c373bea29b1fc11462740e5398"}
 
+
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
          ch.qos.logback/logback-classic  {:mvn/version "1.4.5"}
