@@ -46,6 +46,7 @@
   ([db-or-ledger json-ld opts]
    (fluree/stage db-or-ledger (js->clj json-ld)
                  (js->clj opts :keywordize-keys false))))
+
 (defn ^:export commit
   ([ledger db] (.then (fluree/commit! ledger db)
                       (fn [result] (clj->js result))))

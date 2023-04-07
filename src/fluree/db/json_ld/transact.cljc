@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.transact
-  (:require [clojure.string :as str]
-            [fluree.db.util.validation :as v]
+  (:require [fluree.db.util.validation :as v]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -20,6 +19,7 @@
             [clojure.core.async :as async]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.util.log :as log]
@@ -108,7 +108,7 @@
                           (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
                         ;; a literal value
-                        (and value (not= shacl-dt const/$xsd:anyURI))
+                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
                         (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
                           (if validate-fn
                             (or (validate-fn value*)
@@ -251,7 +251,7 @@
      :db-before     (dbproto/-rootdb db)
      :policy        policy
      :bootstrap?    bootstrap?
-     :default-ctx   (:context schema)
+     :default-ctx   (dbproto/-context db)
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
@@ -503,7 +503,10 @@
   (go-try
     (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
                                            {:subject json-ld})
-          tx-state (->tx-state db (assoc opts :issuer issuer))
+          db* (if-let [policy-opts (perm/policy-opts opts)]
+                (<? (perm/wrap-policy db policy-opts))
+                db)
+          tx-state (->tx-state db* (assoc opts :issuer issuer))
           flakes   (if (and (contains? tx :delete)
                             (contains? tx :where))
                      (<? (delete db util/max-integer tx tx-state))

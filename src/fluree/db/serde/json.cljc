@@ -113,11 +113,7 @@
   (-serialize-garbage [_ garbage]
     (util/stringify-keys garbage))
   (-deserialize-garbage [_ garbage]
-    (deserialize-garbage garbage))
-  (-serialize-db-pointer [_ pointer]
-    (util/stringify-keys pointer))
-  (-deserialize-db-pointer [_ pointer]
-    (json/parse pointer)))
+    (deserialize-garbage garbage)))
 
 
 (defn json-serde

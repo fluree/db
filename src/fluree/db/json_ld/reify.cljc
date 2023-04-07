@@ -19,6 +19,12 @@
 
 (def ^:const max-vocab-sid (flake/max-subject-id const/$_collection))
 
+(defn list-value?
+  "returns true if json-ld value is a list object."
+  [v]
+  (and (map? v)
+       (= :list (-> v first key))))
+
 (defn node?
   "Returns true if a nested value is itself another node in the graph.
   Only need to test maps that have :id - and if they have other properties they
@@ -28,9 +34,7 @@
     (contains? mapx :value)
     false
 
-    (and
-      (contains? mapx :list)
-      (= #{:list :idx} (set (keys mapx))))
+    (list-value? mapx)
     false
 
     (and
@@ -135,33 +139,40 @@
         acc))))
 
 (defn- assert-v-maps
-  [{:keys [db iris pid existing-pid next-pid sid next-sid id k t acc]} v-maps]
+  [{:keys [db iris pid existing-pid next-pid sid next-sid id k t acc list-members?] :as args} v-maps]
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
       (log/debug "assert-v-maps v-map:" v-map)
       (log/debug "assert-v-maps id:" id)
       (let [ref-id (:id v-map)
+            meta (when list-members? {:i (-> v-map :idx last)})
             acc**
             (cond->
-              (if (and ref-id (node? v-map)) ;; is a ref to another IRI
-                (let [existing-sid (<? (get-iri-sid ref-id db iris))
-                      ref-sid      (or existing-sid
-                                       (jld-ledger/generate-new-sid
-                                         v-map pid iris next-pid next-sid))
-                      new-flake    (flake/create sid pid ref-sid
-                                                 const/$xsd:anyURI t true nil)]
-                  (log/debug "creating ref flake:" new-flake)
-                  (cond-> (conj acc* new-flake)
-                          (nil? existing-sid) (conj
-                                                (flake/create ref-sid const/$iri
-                                                              ref-id
-                                                              const/$xsd:string
-                                                              t true nil))))
-                (let [[value dt] (datatype/from-expanded v-map nil)
-                      new-flake  (flake/create sid pid value dt t true nil)]
-                  (log/debug "creating value flake:" new-flake)
-                  (conj acc* new-flake)))
+                (cond
+                  (and ref-id (node? v-map))
+                  (let [existing-sid (<? (get-iri-sid ref-id db iris))
+                        ref-sid      (or existing-sid
+                                         (jld-ledger/generate-new-sid
+                                           v-map pid iris next-pid next-sid))
+                        new-flake    (flake/create sid pid ref-sid
+                                                   const/$xsd:anyURI t true meta)]
+                    (log/debug "creating ref flake:" new-flake)
+                    (cond-> (conj acc* new-flake)
+                      (nil? existing-sid) (conj
+                                            (flake/create ref-sid const/$iri
+                                                          ref-id
+                                                          const/$xsd:string
+                                                          t true nil))))
+                  (list-value? v-map)
+                  (let [list-vals (:list v-map)]
+                    (<? (assert-v-maps (assoc args :list-members? true) list-vals)))
+
+                  :else (let [[value dt] (datatype/from-expanded v-map nil)
+                              new-flake  (flake/create sid pid value dt t true meta)]
+                          (log/debug "creating value flake:" new-flake)
+                          (conj acc* new-flake)))
+
               (nil? existing-pid) (conj (flake/create pid const/$iri k
                                                       const/$xsd:string t true
                                                       nil)))]
@@ -416,7 +427,7 @@
   [{:keys [ledger] :as db} latest-commit commit-address merged-db?]
   (go-try
     (let [{:keys [conn]} ledger
-          idx-meta   (get latest-commit const/iri-index)
+          idx-meta   (get latest-commit const/iri-index) ;; get persistent index meta if ledger has indexes
           db-base    (if-let [idx-address (get-in idx-meta [const/iri-address :value])]
                        (<? (storage/reify-db conn db idx-address))
                        db)

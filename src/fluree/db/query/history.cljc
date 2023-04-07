@@ -1,7 +1,6 @@
 (ns fluree.db.query.history
   (:require
    [clojure.core.async :as async]
-   [clojure.string :as str]
    [malli.core :as m]
    [fluree.json-ld :as json-ld]
    [fluree.db.constants :as const]

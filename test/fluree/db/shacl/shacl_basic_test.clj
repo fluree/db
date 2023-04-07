@@ -9,20 +9,17 @@
 (deftest ^:integration using-pre-defined-types-as-classes
   (testing "Class not used as class initially can still be used as one."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "class/testing")
+          ledger    @(fluree/create conn "class/testing" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db1       @(fluree/stage
                        (fluree/db ledger)
-                       {:context            {:ex "http://example.org/ns/"}
-                        :id                 :ex/MyClass,
+                       {:id                 :ex/MyClass,
                         :schema/description "Just a basic object not used as a class"})
           db2       @(fluree/stage
                        db1
-                       {:context            {:ex "http://example.org/ns/"}
-                        :id                 :ex/myClassInstance,
+                       {:id                 :ex/myClassInstance,
                         :type               [:ex/MyClass]
                         :schema/description "Now a new subject uses MyClass as a Class"})
-          query-res @(fluree/query db2 '{:context {:ex "http://example.org/ns/"},
-                                         :select {?s [:*]},
+          query-res @(fluree/query db2 '{:select {?s [:*]},
                                          :where [[?s :id :ex/myClassInstance]]})]
       (is (= query-res
              [{:id                 :ex/myClassInstance,
@@ -33,14 +30,12 @@
 (deftest ^:integration shacl-cardinality-constraints
   (testing "shacl minimum and maximum cardinality"
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "shacl/a")
-          user-query   {:context {:ex "http://example.org/ns/"}
-                        :select  {'?s [:*]}
+          ledger       @(fluree/create conn "shacl/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query   {:select  {'?s [:*]}
                         :where   [['?s :rdf/type :ex/User]]}
           db           @(fluree/stage
                           (fluree/db ledger)
-                          {:context        {:ex "http://example.org/ns/"}
-                           :id             :ex/UserShape,
+                          {:id             :ex/UserShape,
                            :type           [:sh/NodeShape],
                            :sh/targetClass :ex/User
                            :sh/property    [{:sh/path     :schema/name
@@ -49,8 +44,7 @@
                                              :sh/datatype :xsd/string}]})
           db-ok        @(fluree/stage
                           db
-                          {:context         {:ex "http://example.org/ns/"}
-                           :id              :ex/john,
+                          {:id              :ex/john,
                            :type            [:ex/User],
                            :schema/name     "John"
                            :schema/callSign "j-rock"})
@@ -58,16 +52,14 @@
           db-no-names  (try
                          @(fluree/stage
                             db
-                            {:context         {:ex "http://example.org/ns/"}
-                             :id              :ex/john,
+                            {:id              :ex/john,
                              :type            [:ex/User],
                              :schema/callSign "j-rock"})
                          (catch Exception e e))
           db-two-names (try
                          @(fluree/stage
                             db
-                            {:context         {:ex "http://example.org/ns/"}
-                             :id              :ex/john,
+                            {:id              :ex/john,
                              :type            [:ex/User],
                              :schema/name     ["John", "Johnny"]
                              :schema/callSign "j-rock"})
@@ -91,38 +83,33 @@
 (deftest ^:integration shacl-datatype-constraints
   (testing "shacl datatype errors"
     (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "shacl/b")
-          user-query   {:context {:ex "http://example.org/ns/"}
-                        :select  {'?s [:*]}
+          ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query   {:select  {'?s [:*]}
                         :where   [['?s :rdf/type :ex/User]]}
           db           @(fluree/stage
                           (fluree/db ledger)
-                          {:context        {:ex "http://example.org/ns/"}
-                           :id             :ex/UserShape,
+                          {:id             :ex/UserShape,
                            :type           [:sh/NodeShape],
                            :sh/targetClass :ex/User
                            :sh/property    [{:sh/path     :schema/name
                                              :sh/datatype :xsd/string}]})
           db-ok        @(fluree/stage
                           db
-                          {:context     {:ex "http://example.org/ns/"}
-                           :id          :ex/john,
+                          {:id          :ex/john,
                            :type        [:ex/User],
                            :schema/name "John"})
           ; no :schema/name
           db-int-name  (try
                          @(fluree/stage
                             db
-                            {:context     {:ex "http://example.org/ns/"}
-                             :id          :ex/john,
+                            {:id          :ex/john,
                              :type        [:ex/User],
                              :schema/name 42})
                          (catch Exception e e))
           db-bool-name (try
                          @(fluree/stage
                             db
-                            {:context     {:ex "http://example.org/ns/"}
-                             :id          :ex/john,
+                            {:id          :ex/john,
                              :type        [:ex/User],
                              :schema/name true})
                          (catch Exception e e))]
@@ -144,14 +131,12 @@
 (deftest ^:integration shacl-closed-shape
   (testing "shacl closed shape"
     (let [conn          (test-utils/create-conn)
-          ledger        @(fluree/create conn "shacl/c")
-          user-query    {:context {:ex "http://example.org/ns/"}
-                         :select  {'?s [:*]}
+          ledger        @(fluree/create conn "shacl/c" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query    {:select  {'?s [:*]}
                          :where   [['?s :rdf/type :ex/User]]}
           db            @(fluree/stage
                            (fluree/db ledger)
-                           {:context              {:ex "http://example.org/ns/"}
-                            :id                   :ex/UserShape,
+                           {:id                   :ex/UserShape,
                             :type                 [:sh/NodeShape],
                             :sh/targetClass       :ex/User
                             :sh/property          [{:sh/path     :schema/name
@@ -160,16 +145,14 @@
                             :sh/closed            true})
           db-ok         @(fluree/stage
                            db
-                           {:context     {:ex "http://example.org/ns/"}
-                            :id          :ex/john,
+                           {:id          :ex/john,
                             :type        [:ex/User],
                             :schema/name "John"})
           ; no :schema/name
           db-extra-prop (try
                           @(fluree/stage
                              db
-                             {:context      {:ex "http://example.org/ns/"}
-                              :id           :ex/john,
+                             {:id           :ex/john,
                               :type         [:ex/User],
                               :schema/name  "John"
                               :schema/email "john@flur.ee"})
@@ -188,23 +171,20 @@
 (deftest ^:integration shacl-property-pairs
   (testing "shacl property pairs"
     (let [conn          (test-utils/create-conn)
-          ledger        @(fluree/create conn "shacl/pairs")
-          user-query    {:context {:ex "http://example.org/ns/"}
-                         :select  {'?s [:*]}
+          ledger        @(fluree/create conn "shacl/pairs" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query    {:select  {'?s [:*]}
                          :where   [['?s :rdf/type :ex/User]]} ]
       (testing "single-cardinality equals"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
-                              {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/EqualNamesShape
+                              {:id                   :ex/EqualNamesShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :schema/name
                                                        :sh/equals   :ex/firstName}]})
               db-ok         @(fluree/stage
                               db
-                              {:context     {:ex "http://example.org/ns/"}
-                               :id          :ex/alice,
+                              {:id          :ex/alice,
                                :type        [:ex/User],
                                :schema/name "Alice"
                                :ex/firstName "Alice"})
@@ -212,8 +192,7 @@
               db-not-equal (try
                              @(fluree/stage
                                db
-                               {:context      {:ex "http://example.org/ns/"}
-                                :id           :ex/john,
+                               {:id           :ex/john,
                                 :type         [:ex/User],
                                 :schema/name  "John"
                                 :ex/firstName "Jack"})
@@ -231,16 +210,14 @@
       (testing "multi-cardinality equals"
           (let [db            @(fluree/stage
                                 (fluree/db ledger)
-                                {:context              {:ex "http://example.org/ns/"}
-                                 :id                   :ex/EqualNamesShape
+                                {:id                   :ex/EqualNamesShape
                                  :type                 [:sh/NodeShape],
                                  :sh/targetClass       :ex/User
                                  :sh/property          [{:sh/path     :ex/favNums
                                                          :sh/equals   :ex/luckyNums}]})
                 db-ok         @(fluree/stage
                                 db
-                                {:context     {:ex "http://example.org/ns/"}
-                                 :id          :ex/alice,
+                                {:id          :ex/alice,
                                  :type        [:ex/User],
                                  :schema/name "Alice"
                                  :ex/favNums   [11 17]
@@ -248,8 +225,7 @@
 
                 db-ok2         @(fluree/stage
                                  db
-                                 {:context     {:ex "http://example.org/ns/"}
-                                  :id          :ex/alice,
+                                 {:id          :ex/alice,
                                   :type        [:ex/User],
                                   :schema/name "Alice"
                                   :ex/favNums   [11 17]
@@ -258,8 +234,7 @@
                 db-not-equal1 (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/brian
+                                  {:id          :ex/brian
                                    :type        [:ex/User],
                                    :schema/name "Brian"
                                    :ex/favNums   [11 17]
@@ -268,8 +243,7 @@
                 db-not-equal2 (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/brian
+                                  {:id          :ex/brian
                                    :type        [:ex/User],
                                    :schema/name "Brian"
                                    :ex/favNums   [11 17]
@@ -278,8 +252,7 @@
                 db-not-equal3 (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/brian
+                                  {:id          :ex/brian
                                    :type        [:ex/User],
                                    :schema/name "Brian"
                                    :ex/favNums   [11 17]
@@ -288,8 +261,7 @@
                 db-not-equal4 (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/brian
+                                  {:id          :ex/brian
                                    :type        [:ex/User],
                                    :schema/name "Brian"
                                    :ex/favNums   [11 17]
@@ -326,16 +298,14 @@
       (testing "disjoint"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
-                              {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/DisjointShape
+                              {:id                   :ex/DisjointShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :ex/favNums
                                                        :sh/disjoint   :ex/luckyNums}]})
               db-ok         @(fluree/stage
                               db
-                              {:context     {:ex "http://example.org/ns/"}
-                               :id          :ex/alice,
+                              {:id          :ex/alice,
                                :type        [:ex/User],
                                :schema/name "Alice"
                                :ex/favNums   [11 17]
@@ -344,8 +314,7 @@
               db-not-disjoint1 (try
                                  @(fluree/stage
                                    db
-                                   {:context     {:ex "http://example.org/ns/"}
-                                    :id          :ex/brian
+                                   {:id          :ex/brian
                                     :type        [:ex/User],
                                     :schema/name "Brian"
                                     :ex/favNums   11
@@ -354,8 +323,7 @@
               db-not-disjoint2 (try
                                  @(fluree/stage
                                    db
-                                   {:context     {:ex "http://example.org/ns/"}
-                                    :id          :ex/brian
+                                   {:id          :ex/brian
                                     :type        [:ex/User],
                                     :schema/name "Brian"
                                     :ex/favNums   [11 17 31]
@@ -365,8 +333,7 @@
               db-not-disjoint3 (try
                                  @(fluree/stage
                                    db
-                                   {:context     {:ex "http://example.org/ns/"}
-                                    :id          :ex/brian
+                                   {:id          :ex/brian
                                     :type        [:ex/User],
                                     :schema/name "Brian"
                                     :ex/favNums   [11 17 31]
@@ -397,16 +364,14 @@
       (testing "lessThan"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
-                              {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/LessThanShape
+                              {:id                   :ex/LessThanShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :ex/p1
                                                        :sh/lessThan :ex/p2}]})
               db-ok1         @(fluree/stage
                                db
-                               {:context     {:ex "http://example.org/ns/"}
-                                :id          :ex/alice,
+                               {:id          :ex/alice,
                                 :type        [:ex/User],
                                 :schema/name "Alice"
                                 :ex/p1   [11 17]
@@ -415,8 +380,7 @@
 
               db-ok2         @(fluree/stage
                                db
-                               {:context     {:ex "http://example.org/ns/"}
-                                :id          :ex/alice,
+                               {:id          :ex/alice,
                                 :type        [:ex/User],
                                 :schema/name "Alice"
                                 :ex/p1   [11 17]
@@ -425,8 +389,7 @@
               db-fail1        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
@@ -436,8 +399,7 @@
               db-fail2        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
@@ -448,8 +410,7 @@
               db-fail3        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [12 17]
@@ -459,8 +420,7 @@
               db-fail4        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
@@ -468,8 +428,7 @@
                                 (catch Exception e e))
               db-iris         (try @(fluree/stage
                                      db
-                                     {:context     {:ex "http://example.org/ns/"}
-                                      :id          :ex/alice,
+                                     {:id          :ex/alice,
                                       :type        [:ex/User],
                                       :schema/name "Alice"
                                       :ex/p1 :ex/brian
@@ -516,16 +475,14 @@
       (testing "lessThanOrEquals"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
-                              {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/LessThanOrEqualsShape
+                              {:id                   :ex/LessThanOrEqualsShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :ex/p1
                                                        :sh/lessThanOrEquals :ex/p2}]})
               db-ok1         @(fluree/stage
                                db
-                               {:context     {:ex "http://example.org/ns/"}
-                                :id          :ex/alice,
+                               {:id          :ex/alice,
                                 :type        [:ex/User],
                                 :schema/name "Alice"
                                 :ex/p1   [11 17]
@@ -534,8 +491,7 @@
 
               db-ok2         @(fluree/stage
                                db
-                               {:context     {:ex "http://example.org/ns/"}
-                                :id          :ex/alice,
+                               {:id          :ex/alice,
                                 :type        [:ex/User],
                                 :schema/name "Alice"
                                 :ex/p1   [11 17]
@@ -544,8 +500,7 @@
               db-fail1        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
@@ -555,8 +510,7 @@
               db-fail2        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
@@ -566,8 +520,7 @@
               db-fail3        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [12 17]
@@ -577,8 +530,7 @@
               db-fail4        (try
                                 @(fluree/stage
                                   db
-                                  {:context     {:ex "http://example.org/ns/"}
-                                   :id          :ex/alice,
+                                  {:id          :ex/alice,
                                    :type        [:ex/User],
                                    :schema/name "Alice"
                                    :ex/p1   [11 17]
@@ -621,15 +573,13 @@
 (deftest ^:integration shacl-value-range
   (testing "shacl value range constraints"
     (let [conn          (test-utils/create-conn)
-          ledger        @(fluree/create conn "shacl/value-range")
-          user-query    {:context {:ex "http://example.org/ns/"}
-                         :select  {'?s [:*]}
+          ledger        @(fluree/create conn "shacl/value-range" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query    {:select  {'?s [:*]}
                          :where   [['?s :rdf/type :ex/User]]}]
       (testing "exclusive constraints"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
-                              {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/ExclusiveNumRangeShape
+                              {:id                   :ex/ExclusiveNumRangeShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :schema/age
@@ -637,21 +587,18 @@
                                                        :sh/maxExclusive 100}]})
               db-ok         @(fluree/stage
                               db
-                              {:context     {:ex "http://example.org/ns/"}
-                               :id          :ex/john,
+                              {:id          :ex/john,
                                :type        [:ex/User],
                                :schema/age  2})
               db-too-low         (try @(fluree/stage
                                         db
-                                        {:context     {:ex "http://example.org/ns/"}
-                                         :id          :ex/john,
+                                        {:id          :ex/john,
                                          :type        [:ex/User],
                                          :schema/age  1})
                                       (catch Exception e e))
               db-too-high         (try @(fluree/stage
                                          db
-                                         {:context     {:ex "http://example.org/ns/"}
-                                          :id          :ex/john,
+                                         {:id          :ex/john,
                                           :type        [:ex/User],
                                           :schema/age  100})
                                        (catch Exception e e))]
@@ -672,8 +619,7 @@
       (testing "inclusive constraints"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
-                              {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/InclusiveNumRangeShape
+                              {:id                   :ex/InclusiveNumRangeShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :schema/age
@@ -681,26 +627,22 @@
                                                        :sh/maxInclusive 100}]})
               db-ok         @(fluree/stage
                               db
-                              {:context     {:ex "http://example.org/ns/"}
-                               :id          :ex/brian
+                              {:id          :ex/brian
                                :type        [:ex/User],
                                :schema/age  1})
               db-ok2        @(fluree/stage
                               db-ok
-                              {:context     {:ex "http://example.org/ns/"}
-                               :id          :ex/alice,
+                              {:id          :ex/alice,
                                :type        [:ex/User],
                                :schema/age  100})
               db-too-low      @(fluree/stage
                                 db
-                                {:context     {:ex "http://example.org/ns/"}
-                                 :id          :ex/alice,
+                                {:id          :ex/alice,
                                  :type        [:ex/User],
                                  :schema/age  0})
               db-too-high      @(fluree/stage
                                  db
-                                 {:context     {:ex "http://example.org/ns/"}
-                                  :id          :ex/alice,
+                                 {:id          :ex/alice,
                                   :type        [:ex/User],
                                   :schema/age  101})]
           (is (util/exception? db-too-low)
@@ -722,23 +664,20 @@
       (testing "non-numeric values"
         (let [db            @(fluree/stage
                               (fluree/db ledger)
-                              {:context              {:ex "http://example.org/ns/"}
-                               :id                   :ex/NumRangeShape
+                              {:id                   :ex/NumRangeShape
                                :type                 [:sh/NodeShape],
                                :sh/targetClass       :ex/User
                                :sh/property          [{:sh/path     :schema/age
                                                        :sh/minExclusive 0}]})
               db-subj-id          (try @(fluree/stage
                                          db
-                                         {:context     {:ex "http://example.org/ns/"}
-                                          :id          :ex/alice,
+                                         {:id          :ex/alice,
                                           :type        [:ex/User],
                                           :schema/age  :ex/brian})
                                        (catch Exception e e))
               db-string      (try @(fluree/stage
                                     db
-                                    {:context     {:ex "http://example.org/ns/"}
-                                     :id          :ex/alice,
+                                    {:id          :ex/alice,
                                      :type        [:ex/User],
                                      :schema/age  "10"})
                                   (catch Exception e e))]

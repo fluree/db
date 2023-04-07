@@ -3,10 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld]
             [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -186,8 +183,6 @@
      :refs        #{}
      :coll        coll
      :pred        pred
-     :context     nil
-     :context-str nil
      :shapes      (atom {:class {} ; TODO: Does this need to be an atom?
                          :pred  {}})
      :prefix      {}
@@ -223,8 +218,5 @@
   "Updates the schema map of a db."
   [db]
   (go-try
-    (let [{{:keys [context]} :schema} db
-          _       (log/debug "refresh-schema existing context:" context)
-          schema  (<? (vocab-map db))
-          schema* (assoc schema :context context)]
-      (assoc db :schema schema*))))
+    (let [schema  (<? (vocab-map db))]
+      (assoc db :schema schema))))

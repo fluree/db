@@ -1,258 +1,277 @@
 (ns fluree.db.datatype-test
-  (:require #?(:clj  [clojure.test :refer [deftest are]]
-               :cljs [cljs.test :refer-macros [deftest are]])
+  (:require [clojure.test :refer [deftest testing are is]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :refer [coerce]])
   #?(:clj (:import (java.time LocalDate LocalTime OffsetDateTime OffsetTime
                               ZoneOffset))))
 
 (deftest coerce-test
-  (are [coerced-value value datatype]
-    (= coerced-value (coerce value datatype))
+  (testing "strings"
+    (is (= "foo" (coerce "foo" const/$xsd:string)))
+    (is (= nil (coerce 42 const/$xsd:string))))
 
-    ;; test format:
-    ;; expected input const/$xsd:type
+  (testing "anyURI"
+    (is (= "foo" (coerce "foo" const/$xsd:anyURI)))
+    (is (= nil (coerce 42 const/$xsd:anyURI))))
+  (testing "boolean"
+    (is (= true (coerce "true" const/$xsd:boolean)))
+    (is (= false (coerce "false" const/$xsd:boolean)))
+    (is (= true (coerce true const/$xsd:boolean)))
+    (is (= false (coerce false const/$xsd:boolean)))
+    (is (= nil (coerce "foo" const/$xsd:boolean))))
 
-    ;; string
-    "foo" "foo" const/$xsd:string
-    nil 42 const/$xsd:string
+  (testing "date"
+    (is (= nil
+           (coerce "1980-10-5Z" const/$xsd:date)))
+    (is (= nil
+           (coerce "1980-10-5" const/$xsd:date)))
+    (is (= #?(:clj
+              (OffsetDateTime/of 2022 1 5 0 0 0 0 (ZoneOffset/of "Z"))
+              :cljs
+              #inst "2022-01-05T00:00:00.000-00:00")
+           (coerce "2022-01-05Z" const/$xsd:date)))
 
-    ;; anyURI
-    "foo" "foo" const/$xsd:anyURI
-    nil 42 const/$xsd:anyURI
+    (is (= #?(:clj
+              (LocalDate/of 2022 1 5)
+              :cljs
+              (js/Date. "2022-01-05T00:00:00"))
+           (coerce "2022-01-05" const/$xsd:date)))
 
-    ;; boolean
-    true "true" const/$xsd:boolean
-    false "false" const/$xsd:boolean
-    true true const/$xsd:boolean
-    false false const/$xsd:boolean
-    nil "foo" const/$xsd:boolean
+    (is (= nil
+           (coerce "foo" const/$xsd:date))))
 
-    ;; date
-    #?(:clj
-       (OffsetDateTime/of 1980 10 5 0 0 0 0
-                          (ZoneOffset/of "Z"))
-       :cljs
-       #inst "1980-10-05T00:00:00.000-00:00") "1980-10-5Z" const/$xsd:date
-    #?(:clj
-       (LocalDate/of 1980 10 5)
-       :cljs
-       (js/Date. "1980-10-05T00:00:00")) "1980-10-5" const/$xsd:date
-    #?(:clj
-       (OffsetDateTime/of 2022 1 5 0 0 0 0
-                          (ZoneOffset/of "Z"))
-       :cljs
-       #inst "2022-01-05T00:00:00.000-00:00") "2022-01-05Z" const/$xsd:date
-    #?(:clj
-       (LocalDate/of 2022 1 5)
-       :cljs
-       (js/Date. "2022-01-05T00:00:00")) "2022-01-05" const/$xsd:date
+  (testing "time"
+    (is (= #?(:clj
+              (LocalTime/of 12 42 0)
+              :cljs
+              (js/Date. "1970-01-01T12:42:00"))
+           (coerce "12:42:00" const/$xsd:time)))
+    (is (= #?(:clj
+              (OffsetTime/of 12 42 0 0 (ZoneOffset/of "Z"))
+              :cljs
+              #inst "1970-01-01T12:42:00.000-00:00")
+           (coerce "12:42:00Z" const/$xsd:time)))
+    (is (= #?(:clj
+              (OffsetTime/of 9 30 10 0 (ZoneOffset/of "-06:00"))
+              :cljs
+              #inst "1970-01-01T09:30:10.000-06:00")
+          (coerce "09:30:10-06:00" const/$xsd:time)))
+    (is (= nil
+           (coerce "12:42:5" const/$xsd:time)))
+    (is (= nil
+           (coerce "12:42:5Z" const/$xsd:time)))
+    (is (= #?(:clj
+              (OffsetTime/of 11 14 32 833000000 (ZoneOffset/of "Z"))
+              :cljs
+              #inst "1970-01-01T11:14:32.833-00:00")
+           (coerce "11:14:32.833Z" const/$xsd:time)))
+    (is (= nil (coerce "foo" const/$xsd:time))))
 
-    nil "foo" const/$xsd:date
+  (testing "datetime"
+    (is (= nil
+           (coerce "1980-10-5T11:23:00Z" const/$xsd:dateTime))
+        "don't accept non-8601 timestamps")
+    (is (= #?(:clj
+              (OffsetDateTime/of 1980 10 5 11 23 0 0 (ZoneOffset/of "-06:00"))
+              :cljs
+              #inst "1980-10-05T17:23:00.000-00:00")
+           (coerce "1980-10-05T11:23:00-06:00" const/$xsd:dateTime))
+        "offset")
+    (is (= #?(:clj
+              (OffsetDateTime/of 1980 10 5 11 23 0 0 (ZoneOffset/of "Z"))
+              :cljs
+              #inst "1980-10-05T11:23:00.000-00:00")
+           (coerce "1980-10-05T11:23:00Z" const/$xsd:dateTime))
+        "z")
+    (is (= #?(:clj (OffsetDateTime/of 2021 9 24 11 14 32 833000000 (ZoneOffset/of "Z")))
+           (coerce "2021-09-24T11:14:32.833Z" const/$xsd:dateTime))
+        "with nanoseconds")
 
-    ;; time
-    #?(:clj
-       (LocalTime/of 12 42 0)
-       :cljs
-       (js/Date. "1970-01-01T12:42:00")) "12:42:00" const/$xsd:time
+    (is (= nil (coerce "foo" const/$xsd:dateTime))))
 
-    #?(:clj
-       (OffsetTime/of 12 42 0 0
-                      (ZoneOffset/of "Z"))
-       :cljs
-       #inst "1970-01-01T12:42:00.000-00:00") "12:42:00Z" const/$xsd:time
+  (testing "decimal"
+    (is (= #?(:clj (BigDecimal. "3.14") :cljs 3.14)
+           (coerce 3.14 const/$xsd:decimal)))
+    (is (= #?(:clj (BigDecimal. "3.14") :cljs 3.14)
+           (coerce "3.14" const/$xsd:decimal)))
+    (is (= #?(:clj (BigDecimal. "42.0") :cljs 42)
+           (coerce 42 const/$xsd:decimal)))
+    (is (= nil
+           (coerce "foo" const/$xsd:decimal))))
 
-    #?(:clj
-       (LocalTime/of 12 42 5)
-       :cljs
-       (js/Date. "1970-01-01T12:42:05")) "12:42:5" const/$xsd:time
+  (testing "double"
+    (is (= #?(:clj Double/POSITIVE_INFINITY
+              :cljs js/Number.POSITIVE_INFINITY)
+           (coerce "INF" const/$xsd:double)))
+    (is (= #?(:clj Double/NEGATIVE_INFINITY
+              :cljs js/Number.NEGATIVE_INFINITY)
+           (coerce "-INF" const/$xsd:double)))
+    (is (= 3.14
+           (coerce 3.14 const/$xsd:double)))
+    (is (= 3.0
+           (coerce 3 const/$xsd:double)))
+    (is (= nil
+           (coerce "foo" const/$xsd:double))))
 
-    #?(:clj
-       (OffsetTime/of 12 42 5 0
-                      (ZoneOffset/of "Z"))
-       :cljs
-       #inst "1970-01-01T12:42:05.000-00:00") "12:42:5Z" const/$xsd:time
+  (testing "float"
+    (is (= #?(:clj Float/POSITIVE_INFINITY
+              :cljs js/Number.POSITIVE_INFINITY)
+           (coerce "INF" const/$xsd:float)))
+    (is (= #?(:clj Float/NEGATIVE_INFINITY
+              :cljs js/Number.NEGATIVE_INFINITY)
+           (coerce "-INF" const/$xsd:float)))
+    (is (= 3.14
+           (coerce 3.14 const/$xsd:float)))
+    (is (= 3.0
+           (coerce 3 const/$xsd:float)))
+    (is (= nil
+           (coerce "foo" const/$xsd:float))))
 
-    nil "foo" const/$xsd:time
+  (testing "integer"
+    (is (= 42 (coerce 42 const/$xsd:integer)))
+    (is (= 42 (coerce "42" const/$xsd:integer)))
+    (is (= -42 (coerce -42 const/$xsd:integer)))
+    (is (= 0 (coerce 0 const/$xsd:integer)))
+    (is (= nil (coerce 3.14 const/$xsd:integer)))
+    (is (= nil (coerce "3.14" const/$xsd:integer))))
 
-    ;; datetime
-    #?(:clj
-       (OffsetDateTime/of 1980 10 5 11 23 0 0
-                          (ZoneOffset/of "Z"))
-       :cljs
-       #inst "1980-10-05T11:23:00.000-00:00") "1980-10-5T11:23:00Z" const/$xsd:dateTime
+  (testing "int"
+    (is (= 42 (coerce 42 const/$xsd:int)))
+    (is (= 42 (coerce "42" const/$xsd:int)))
+    (is (= -42 (coerce -42 const/$xsd:int)))
+    (is (= 0 (coerce 0 const/$xsd:int)))
+    (is (= nil (coerce 3.14 const/$xsd:int)))
+    (is (= nil (coerce "3.14" const/$xsd:int)))
+    (is (= #?(:clj nil :cljs 2147483648) (coerce 2147483648 const/$xsd:int)))
+    (is (= #?(:clj nil :cljs 2147483648) (coerce "2147483648" const/$xsd:int)))
+    (is (= #?(:clj nil :cljs -2147483649) (coerce -2147483649 const/$xsd:int)))
+    (is (= #?(:clj nil :cljs -2147483649) (coerce "-2147483649" const/$xsd:int))))
 
-    nil "foo" const/$xsd:dateTime
+  (testing "unsignedInt"
+    (is (= 42 (coerce 42 const/$xsd:unsignedInt)))
+    (is (= 0 (coerce 0 const/$xsd:unsignedInt)))
+    (is (= 42 (coerce "42" const/$xsd:unsignedInt)))
+    (is (= nil (coerce -42 const/$xsd:unsignedInt)))
+    (is (= nil (coerce "-42" const/$xsd:unsignedInt)))
+    (is (= nil (coerce 3.14 const/$xsd:unsignedInt)))
+    (is (= nil (coerce "3.14" const/$xsd:unsignedInt))))
 
-    ;; decimal
-    #?(:clj (BigDecimal. "3.14") :cljs 3.14) 3.14 const/$xsd:decimal
-    #?(:clj (BigDecimal. "3.14") :cljs 3.14) "3.14" const/$xsd:decimal
-    #?(:clj (BigDecimal. "42.0") :cljs 42) 42 const/$xsd:decimal
-    nil "foo" const/$xsd:decimal
+  (testing "natural integer"
+    (is (= 42 (coerce 42 const/$xsd:nonNegativeInteger)))
+    (is (= 0 (coerce 0 const/$xsd:nonNegativeInteger)))
+    (is (= 42 (coerce "42" const/$xsd:nonNegativeInteger)))
+    (is (= 0 (coerce "0" const/$xsd:nonNegativeInteger)))
+    (is (= nil (coerce -42 const/$xsd:nonNegativeInteger)))
+    (is (= nil (coerce "-42" const/$xsd:nonNegativeInteger)))
+    (is (= nil (coerce 3.14 const/$xsd:nonNegativeInteger)))
+    (is (= nil (coerce "3.14" const/$xsd:nonNegativeInteger))))
 
-    ;; double
-    #?(:clj Double/POSITIVE_INFINITY
-       :cljs js/Number.POSITIVE_INFINITY) "INF" const/$xsd:double
-    #?(:clj Double/NEGATIVE_INFINITY
-       :cljs js/Number.NEGATIVE_INFINITY) "-INF" const/$xsd:double
-    3.14 3.14 const/$xsd:double
-    3.0 3 const/$xsd:double
-    nil "foo" const/$xsd:double
+  (testing "positive integer"
+    (is (= 42 (coerce 42 const/$xsd:positiveInteger)))
+    (is (= 42 (coerce "42" const/$xsd:positiveInteger)))
+    (is (= nil (coerce 0 const/$xsd:positiveInteger)))
+    (is (= nil (coerce "0" const/$xsd:positiveInteger)))
+    (is (= nil (coerce -42 const/$xsd:positiveInteger)))
+    (is (= nil (coerce "-42" const/$xsd:positiveInteger)))
+    (is (= nil (coerce 3.14 const/$xsd:positiveInteger)))
+    (is (= nil (coerce "3.14" const/$xsd:positiveInteger))))
 
-    ;; float
-    #?(:clj Float/POSITIVE_INFINITY
-       :cljs js/Number.POSITIVE_INFINITY) "INF" const/$xsd:float
-    #?(:clj Float/NEGATIVE_INFINITY
-       :cljs js/Number.NEGATIVE_INFINITY) "-INF" const/$xsd:float
-    3.14 3.14 const/$xsd:float
-    3.0 3 const/$xsd:float
-    nil "foo" const/$xsd:float
+  (testing "negative integer"
+    (is (= nil (coerce 42 const/$xsd:negativeInteger)))
+    (is (= nil (coerce "42" const/$xsd:negativeInteger)))
+    (is (= nil (coerce 0 const/$xsd:negativeInteger)))
+    (is (= nil (coerce "0" const/$xsd:negativeInteger)))
+    (is (= -42 (coerce -42 const/$xsd:negativeInteger)))
+    (is (= -42 (coerce "-42" const/$xsd:negativeInteger)))
+    (is (= nil (coerce -3.14 const/$xsd:negativeInteger)))
+    (is (= nil (coerce "-3.14" const/$xsd:negativeInteger))))
 
-    ;; integer / int / unsignedInt / etc.
-    42 42 const/$xsd:integer
-    42 "42" const/$xsd:integer
-    -42 -42 const/$xsd:integer
-    0 0 const/$xsd:integer
-    nil 3.14 const/$xsd:integer
-    nil "3.14" const/$xsd:integer
+  (testing "non-positive integer"
+    (is (= nil (coerce 42 const/$xsd:nonPositiveInteger)))
+    (is (= nil (coerce "42" const/$xsd:nonPositiveInteger)))
+    (is (= 0 (coerce 0 const/$xsd:nonPositiveInteger)))
+    (is (= 0 (coerce "0" const/$xsd:nonPositiveInteger)))
+    (is (= -42 (coerce -42 const/$xsd:nonPositiveInteger)))
+    (is (= -42 (coerce "-42" const/$xsd:nonPositiveInteger)))
+    (is (= nil (coerce -3.14 const/$xsd:nonPositiveInteger)))
+    (is (= nil (coerce "-3.14" const/$xsd:nonPositiveInteger))))
 
-    42 42 const/$xsd:int
-    42 "42" const/$xsd:int
-    -42 -42 const/$xsd:int
-    0 0 const/$xsd:int
-    nil 3.14 const/$xsd:int
-    nil "3.14" const/$xsd:int
-    #?(:clj nil :cljs 2147483648) 2147483648 const/$xsd:int
-    #?(:clj nil :cljs 2147483648) "2147483648" const/$xsd:int
-    #?(:clj nil :cljs -2147483649) -2147483649 const/$xsd:int
-    #?(:clj nil :cljs -2147483649) "-2147483649" const/$xsd:int
+  (testing "long"
+    (is (= 42 (coerce 42 const/$xsd:long)))
+    (is (= 42 (coerce "42" const/$xsd:long)))
+    (is (= -42 (coerce -42 const/$xsd:long)))
+    (is (= -42 (coerce "-42" const/$xsd:long)))
+    (is (= nil (coerce 3.14 const/$xsd:long)))
+    (is (= nil (coerce "3.14" const/$xsd:long))))
 
-    42 42 const/$xsd:unsignedInt
-    0 0 const/$xsd:unsignedInt
-    42 "42" const/$xsd:unsignedInt
-    nil -42 const/$xsd:unsignedInt
-    nil "-42" const/$xsd:unsignedInt
-    nil 3.14 const/$xsd:unsignedInt
-    nil "3.14" const/$xsd:unsignedInt
+  (testing "unsigned long"
+    (is (= 42 (coerce 42 const/$xsd:unsignedLong)))
+    (is (= 42 (coerce "42" const/$xsd:unsignedLong)))
+    (is (= nil (coerce -42 const/$xsd:unsignedLong)))
+    (is (= nil (coerce "-42" const/$xsd:unsignedLong)))
+    (is (= nil (coerce 3.14 const/$xsd:unsignedLong)))
+    (is (= nil (coerce "3.14" const/$xsd:unsignedLong))))
 
-    42 42 const/$xsd:nonNegativeInteger
-    0 0 const/$xsd:nonNegativeInteger
-    42 "42" const/$xsd:nonNegativeInteger
-    0 "0" const/$xsd:nonNegativeInteger
-    nil -42 const/$xsd:nonNegativeInteger
-    nil "-42" const/$xsd:nonNegativeInteger
-    nil 3.14 const/$xsd:nonNegativeInteger
-    nil "3.14" const/$xsd:nonNegativeInteger
+  (testing "short"
+    (is (= 42 (coerce 42 const/$xsd:short)))
+    (is (= 42 (coerce "42" const/$xsd:short)))
+    (is (= -42 (coerce -42 const/$xsd:short)))
+    (is (= -42 (coerce "-42" const/$xsd:short)))
+    (is (= nil (coerce 3.14 const/$xsd:short)))
+    (is (= nil (coerce "3.14" const/$xsd:short)))
+    (is (= #?(:clj nil :cljs 32768) (coerce "32768" const/$xsd:short)))
+    (is (= #?(:clj nil :cljs 32768) (coerce 32768 const/$xsd:short)))
+    (is (= #?(:clj nil :cljs -32769) (coerce "-32769" const/$xsd:short)))
+    (is (= #?(:clj nil :cljs -32769) (coerce -32769 const/$xsd:short))))
 
-    42 42 const/$xsd:positiveInteger
-    42 "42" const/$xsd:positiveInteger
-    nil 0 const/$xsd:positiveInteger
-    nil "0" const/$xsd:positiveInteger
-    nil -42 const/$xsd:positiveInteger
-    nil "-42" const/$xsd:positiveInteger
-    nil 3.14 const/$xsd:positiveInteger
-    nil "3.14" const/$xsd:positiveInteger
+  (testing "unsigned short"
+    (is (= 42 (coerce 42 const/$xsd:unsignedShort)))
+    (is (= 42 (coerce "42" const/$xsd:unsignedShort)))
+    (is (= nil (coerce -42 const/$xsd:unsignedShort)))
+    (is (= nil (coerce "-42" const/$xsd:unsignedShort)))
+    (is (= nil (coerce 3.14 const/$xsd:unsignedShort)))
+    (is (= nil (coerce "3.14" const/$xsd:unsignedShort)))
+    (is (= #?(:clj nil :cljs 32768) (coerce 32768 const/$xsd:unsignedShort)))
+    (is (= #?(:clj nil :cljs 32768) (coerce "32768" const/$xsd:unsignedShort))))
 
-    nil 42 const/$xsd:negativeInteger
-    nil "42" const/$xsd:negativeInteger
-    nil 0 const/$xsd:negativeInteger
-    nil "0" const/$xsd:negativeInteger
-    -42 -42 const/$xsd:negativeInteger
-    -42 "-42" const/$xsd:negativeInteger
-    nil -3.14 const/$xsd:negativeInteger
-    nil "-3.14" const/$xsd:negativeInteger
+  (testing "byte"
+    (is (= 42 (coerce 42 const/$xsd:byte)))
+    (is (= 42 (coerce "42" const/$xsd:byte)))
+    (is (= -42 (coerce -42 const/$xsd:byte)))
+    (is (= -42 (coerce "-42" const/$xsd:byte)))
+    (is (= nil (coerce 3.14 const/$xsd:byte)))
+    (is (= nil (coerce "3.14" const/$xsd:byte)))
+    (is (= #?(:clj nil :cljs 128) (coerce 128 const/$xsd:byte)))
+    (is (= #?(:clj nil :cljs 128) (coerce "128" const/$xsd:byte)))
+    (is (= #?(:clj nil :cljs -129) (coerce -129 const/$xsd:byte)))
+    (is (= #?(:clj nil :cljs -129) (coerce "-129" const/$xsd:byte))))
 
-    nil 42 const/$xsd:nonPositiveInteger
-    nil "42" const/$xsd:nonPositiveInteger
-    0 0 const/$xsd:nonPositiveInteger
-    0 "0" const/$xsd:nonPositiveInteger
-    -42 -42 const/$xsd:nonPositiveInteger
-    -42 "-42" const/$xsd:nonPositiveInteger
-    nil -3.14 const/$xsd:nonPositiveInteger
-    nil "-3.14" const/$xsd:nonPositiveInteger
+  (testing "unsigned byte"
+    (is (= 42 (coerce 42 const/$xsd:unsignedByte)))
+    (is (= 42 (coerce "42" const/$xsd:unsignedByte)))
+    (is (= nil (coerce -42 const/$xsd:unsignedByte)))
+    (is (= nil (coerce "-42" const/$xsd:unsignedByte)))
+    (is (= nil (coerce 3.14 const/$xsd:unsignedByte)))
+    (is (= nil (coerce "3.14" const/$xsd:unsignedByte)))
+    (is (= #?(:clj nil :cljs 32768) (coerce 32768 const/$xsd:unsignedByte)))
+    (is (= #?(:clj nil :cljs 32768) (coerce "32768" const/$xsd:unsignedByte))))
 
-    nil -42 const/$xsd:nonNegativeInteger
-    nil "-42" const/$xsd:nonNegativeInteger
-    0 0 const/$xsd:nonNegativeInteger
-    0 "0" const/$xsd:nonNegativeInteger
-    42 42 const/$xsd:nonNegativeInteger
-    42 "42" const/$xsd:nonNegativeInteger
-    nil 3.14 const/$xsd:nonNegativeInteger
-    nil "3.14" const/$xsd:nonNegativeInteger
+  (testing "normalized string"
+    (is (= "foo  bar  baz" (coerce "foo  bar \tbaz" const/$xsd:normalizedString)))
+    (is (= "foo     bar     baz" (coerce "foo
+    bar     baz" const/$xsd:normalizedString)))
+    (is (= " foo   bar  baz " (coerce " foo   bar  baz " const/$xsd:normalizedString))))
 
-    ;; long & unsignedLong
-    42 42 const/$xsd:long
-    42 "42" const/$xsd:long
-    -42 -42 const/$xsd:long
-    -42 "-42" const/$xsd:long
-    nil 3.14 const/$xsd:long
-    nil "3.14" const/$xsd:long
+  (testing "token"
+    (is (= "foo bar baz" (coerce "  foo    bar \t\t\t baz    " const/$xsd:token)))
+    (is (= "foo bar baz" (coerce "foo
+    bar          baz" const/$xsd:token))))
 
-    42 42 const/$xsd:unsignedLong
-    42 "42" const/$xsd:unsignedLong
-    nil -42 const/$xsd:unsignedLong
-    nil "-42" const/$xsd:unsignedLong
-    nil 3.14 const/$xsd:unsignedLong
-    nil "3.14" const/$xsd:unsignedLong
+  (testing "language"
+    (is (= "en" (coerce "en " const/$xsd:language)))
+    (is (= "en-US" (coerce " en-US" const/$xsd:language)))
+    (is (= "es-MX" (coerce "\tes-MX" const/$xsd:language))))
 
-    ;; short & unsignedShort
-    42 42 const/$xsd:short
-    42 "42" const/$xsd:short
-    -42 -42 const/$xsd:short
-    -42 "-42" const/$xsd:short
-    nil 3.14 const/$xsd:short
-    nil "3.14" const/$xsd:short
-    #?(:clj nil :cljs 32768) "32768" const/$xsd:short
-    #?(:clj nil :cljs 32768) 32768 const/$xsd:short
-    #?(:clj nil :cljs -32769) "-32769" const/$xsd:short
-    #?(:clj nil :cljs -32769) -32769 const/$xsd:short
-
-    42 42 const/$xsd:unsignedShort
-    42 "42" const/$xsd:unsignedShort
-    nil -42 const/$xsd:unsignedShort
-    nil "-42" const/$xsd:unsignedShort
-    nil 3.14 const/$xsd:unsignedShort
-    nil "3.14" const/$xsd:unsignedShort
-    #?(:clj nil :cljs 32768) 32768 const/$xsd:unsignedShort
-    #?(:clj nil :cljs 32768) "32768" const/$xsd:unsignedShort
-
-    ;; byte & unsignedByte
-    42 42 const/$xsd:byte
-    42 "42" const/$xsd:byte
-    -42 -42 const/$xsd:byte
-    -42 "-42" const/$xsd:byte
-    nil 3.14 const/$xsd:byte
-    nil "3.14" const/$xsd:byte
-    #?(:clj nil :cljs 128) 128 const/$xsd:byte
-    #?(:clj nil :cljs 128) "128" const/$xsd:byte
-    #?(:clj nil :cljs -129) -129 const/$xsd:byte
-    #?(:clj nil :cljs -129) "-129" const/$xsd:byte
-
-    42 42 const/$xsd:unsignedByte
-    42 "42" const/$xsd:unsignedByte
-    nil -42 const/$xsd:unsignedByte
-    nil "-42" const/$xsd:unsignedByte
-    nil 3.14 const/$xsd:unsignedByte
-    nil "3.14" const/$xsd:unsignedByte
-    #?(:clj nil :cljs 32768) 32768 const/$xsd:unsignedByte
-    #?(:clj nil :cljs 32768) "32768" const/$xsd:unsignedByte
-
-    ;; normalizedString
-    "foo  bar  baz" "foo  bar \tbaz" const/$xsd:normalizedString
-    "foo     bar     baz" "foo
-    bar     baz" const/$xsd:normalizedString
-    " foo   bar  baz " " foo   bar  baz " const/$xsd:normalizedString
-
-    ;; token
-    "foo bar baz" "  foo    bar \t\t\t baz    " const/$xsd:token
-    "foo bar baz" "foo
-    bar          baz" const/$xsd:token
-
-    ;; language
-    "en" "en " const/$xsd:language
-    "en-US" " en-US" const/$xsd:language
-    "es-MX" "\tes-MX" const/$xsd:language
-
-    ;; non-coerced datatypes
-    "whatever" "whatever" const/$xsd:hexBinary
-    "thingy" "thingy" const/$xsd:duration))
+  (testing "non-coerced datatypes"
+    (is (= "whatever" (coerce "whatever" const/$xsd:hexBinary)))
+    (is (= "thingy" (coerce "thingy" const/$xsd:duration)))))

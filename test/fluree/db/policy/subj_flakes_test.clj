@@ -13,7 +13,7 @@
 (deftest ^:integration subject-flakes-policy
   (testing "Policy enforcement for groups of flakes by subject."
     (let [conn            (test-utils/create-conn)
-          ledger          @(fluree/create conn "policy/a" {:context {:ex "http://example.org/ns/"}})
+          ledger          @(fluree/create conn "policy/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           root-did        (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did       (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db              @(fluree/stage
@@ -71,8 +71,8 @@
           alice-flakes    @(fluree/range db+policy :spot = [(fluree/expand-iri db+policy :ex/alice)])
           widget-flakes   @(fluree/range db+policy :spot = [(fluree/expand-iri db+policy :ex/widget)])
 
-          alice-db        @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                          :f/role      :ex/userRole})
+          alice-db        @(fluree/wrap-policy db+policy {:did alice-did
+                                                          :role      :ex/userRole})
 
           ;; john's flakes filtered using alice's policy-enforced db
           alice-db-john   (->> john-flakes

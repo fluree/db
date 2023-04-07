@@ -120,18 +120,17 @@
 
   Options map (opts) can include (keys are strings):
   - did - DiD information to use, if storing blocks as verifiable credentials
-  - @context - Default @context map to use for ledgers formed with this connection"
+  - default-context - Default default-context map to use for ledgers formed with this connection"
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (let [opts*  (util/assoc-from-str-opts
                   opts
-                  #{{"@context" :context} "did" "branch" "pub-fn" "ipns"
+                  #{"default-context" "did" "branch" "pub-fn" "ipns"
                     "indexer" "include" "reindex-min-bytes" "reindex-max-bytes"
-                    "initial-tx"})
-         _      (log/debug "create opts*:" opts*)
-         res-ch (jld-ledger/create conn ledger-alias opts*)]
-     (promise-wrap res-ch))))
+                    "initial-tx"})]
+     (log/debug "create opts*:" opts*)
+     (promise-wrap (jld-ledger/create conn ledger-alias opts*)))))
 
 (defn load-from-address
   "Loads a ledger defined with a Fluree address, e.g.:
@@ -290,9 +289,9 @@
   allows the permission attributes to be modified.
 
   Returns promise"
-  [db {:keys [f/$identity f/role f/credential]}]
+  [db identity-map]
   (promise-wrap
-    (perm/wrap-policy db $identity role credential)))
+    (perm/wrap-policy db identity-map)))
 
 
 (defn query

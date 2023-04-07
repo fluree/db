@@ -18,6 +18,7 @@
             [fluree.db.json-ld.transact :as jld-transact]
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.log :as log]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.commit-data :as commit-data])
   #?(:clj (:import (java.io Writer))))
 
@@ -60,20 +61,20 @@
   to grow beyond novelty-max."
   [db pred-id {:keys [reindex?] :as opts}]
   (go-try
-    (let [flakes-to-idx (<? (query-range/index-range db :psot = [pred-id]))
-          {:keys [post size]} (:novelty db)
-          with-size     (flake/size-bytes flakes-to-idx)
-          total-size    (+ size with-size)
-          {:keys [novelty-min novelty-max]} (get-in db [:conn :meta])
-          _             (if (and (> total-size novelty-max) (not reindex?))
-                          (throw (ex-info (str "You cannot add " pred-id " to the index at this point. There are too many affected flakes.")
-                                          {:error  :db/max-novelty-size
-                                           :status 400})))
-          post          (into post flakes-to-idx)]
-      (swap! (:schema-cache db) empty)
-      (-> db
-          (assoc-in [:novelty :post] post)
-          (assoc-in [:novelty :size] total-size)))))
+   (let [flakes-to-idx (<? (query-range/index-range db :psot = [pred-id]))
+         {:keys [post size]} (:novelty db)
+         with-size     (flake/size-bytes flakes-to-idx)
+         total-size    (+ size with-size)
+         {:keys [novelty-min novelty-max]} (get-in db [:conn :meta])
+         _             (if (and (> total-size novelty-max) (not reindex?))
+                         (throw (ex-info (str "You cannot add " pred-id " to the index at this point. There are too many affected flakes.")
+                                         {:error  :db/max-novelty-size
+                                          :status 400})))
+         post          (into post flakes-to-idx)]
+     (swap! (:schema-cache db) empty)
+     (-> db
+         (assoc-in [:novelty :post] post)
+         (assoc-in [:novelty :size] total-size)))))
 
 
 (defn- with-db-size
@@ -94,11 +95,11 @@
                              (sort-by flake/p)
                              (partition-by flake/p)
                              (reduce
-                               (fn [opst* p-flakes]
-                                 (if (get-in pred-map [(-> p-flakes first flake/p) :ref?])
-                                   (into opst* p-flakes)
-                                   opst*))
-                               opst))
+                              (fn [opst* p-flakes]
+                                (if (get-in pred-map [(-> p-flakes first flake/p) :ref?])
+                                  (into opst* p-flakes)
+                                  opst*))
+                              opst))
                   :size (+ size #?(:clj @flakes-bytes :cljs flakes-bytes))}]
     res))
 
@@ -108,7 +109,7 @@
   occurred."
   [{:keys [ecount schema] :as db} flakes]
   (loop [[flakes-s & r] (partition-by flake/s flakes)
-         schema-change?  (boolean (nil? schema))            ;; if no schema for any reason, make sure one is generated
+         schema-change?  (boolean (nil? schema)) ;; if no schema for any reason, make sure one is generated
          setting-change? false
          ecount          ecount]
     (if flakes-s
@@ -135,42 +136,42 @@
   it allows novelty to be run in parallel and this function is never triggered."
   [proposed-db flakes flake-bytes]
   (go-try
-    (let [schema  (<? (vocab/vocab-map proposed-db))
-          novelty (with-t-novelty (assoc proposed-db :schema schema) flakes flake-bytes)]
-      (assoc proposed-db :schema schema
-                         :novelty novelty))))
+   (let [schema  (<? (vocab/vocab-map proposed-db))
+         novelty (with-t-novelty (assoc proposed-db :schema schema) flakes flake-bytes)]
+     (assoc proposed-db :schema schema
+                        :novelty novelty))))
 
 
 (defn- with-t-updated-settings
   "If settings changed, return new settings map."
   [proposed-db]
   (go-try
-    (assoc proposed-db :settings (<? (schema/setting-map proposed-db)))))
+   (assoc proposed-db :settings (<? (schema/setting-map proposed-db)))))
 
 
 (defn with-t
   ([db flakes] (with-t db flakes nil))
   ([{:keys [stats t] :as db} flakes opts]
    (go-try
-     (let [new-t           (-> flakes first flake/t)
-           _               (when (not= new-t (dec t))
-                             (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " t " is not beyond supplied transaction t: " new-t ".")
-                                             {:status 500
-                                              :error  :db/unexpected-error})))
-           bytes #?(:clj   (future (flake/size-bytes flakes)) ;; calculate in separate thread for CLJ
-                    :cljs (flake/size-bytes flakes))
-           novelty #?(:clj (future (with-t-novelty db flakes bytes)) ;; calculate in separate thread for CLJ
-                      :cljs (with-t-novelty db flakes bytes))
-           {:keys [schema-change? setting-change? ecount]} (with-t-ecount db flakes)
-           stats*          (-> stats
-                               (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
-                               (update :flakes + (count flakes)))]
-       (cond-> (assoc db :t new-t
-                         :novelty #?(:clj @novelty :cljs novelty)
-                         :ecount ecount
-                         :stats stats*)
-               schema-change? (-> (with-t-updated-schema flakes bytes) <?)
-               setting-change? (-> with-t-updated-settings <?))))))
+    (let [new-t           (-> flakes first flake/t)
+          _               (when (not= new-t (dec t))
+                            (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " t " is not beyond supplied transaction t: " new-t ".")
+                                            {:status 500
+                                             :error  :db/unexpected-error})))
+          bytes #?(:clj   (future (flake/size-bytes flakes)) ;; calculate in separate thread for CLJ
+                   :cljs (flake/size-bytes flakes))
+          novelty #?(:clj (future (with-t-novelty db flakes bytes)) ;; calculate in separate thread for CLJ
+                     :cljs (with-t-novelty db flakes bytes))
+          {:keys [schema-change? setting-change? ecount]} (with-t-ecount db flakes)
+          stats*          (-> stats
+                              (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
+                              (update :flakes + (count flakes)))]
+      (cond-> (assoc db :t new-t
+                        :novelty #?(:clj @novelty :cljs novelty)
+                        :ecount ecount
+                        :stats stats*)
+              schema-change? (-> (with-t-updated-schema flakes bytes) <?)
+                             setting-change? (-> with-t-updated-settings <?))))))
 
 
 (defn with
@@ -181,19 +182,19 @@
    (let [resp-ch (async/promise-chan)]
      (async/go
        (try*
-         (if (empty? flakes)
-           (async/put! resp-ch db)
-           (let [flakes-by-t (->> flakes
-                                  (sort flake/cmp-flakes-block)
-                                  (partition-by :t))]
-             (loop [[t-flakes & r] flakes-by-t
-                    db db]
-               (if t-flakes
-                 (let [db' (<? (with-t db t-flakes opts))]
-                   (recur r db'))
-                 (async/put! resp-ch db)))))
-         (catch* e
-                 (async/put! resp-ch e))))
+        (if (empty? flakes)
+          (async/put! resp-ch db)
+          (let [flakes-by-t (->> flakes
+                                 (sort flake/cmp-flakes-block)
+                                 (partition-by :t))]
+            (loop [[t-flakes & r] flakes-by-t
+                   db db]
+              (if t-flakes
+                (let [db' (<? (with-t db t-flakes opts))]
+                  (recur r db'))
+                (async/put! resp-ch db)))))
+        (catch* e
+          (async/put! resp-ch e))))
      resp-ch)))
 
 (defn forward-time-travel-db?
@@ -221,45 +222,42 @@
   the flakes that end up requiring the schema change."
   [db tt-id flakes]
   (go-try
-    (let [tt-id'      (if (nil? tt-id) (random-uuid) tt-id)
-          ;; update each root index with the provided tt-id
-          ;; As the root indexes are resolved, the tt-id will carry through the b-tree and ensure
-          ;; query caching is specific to this tt-id
-          db'         (reduce (fn [db* idx]
-                                (assoc db* idx (-> (get db* idx)
-                                                   (assoc :tt-id tt-id'))))
-                              (assoc db :tt-id tt-id')
-                              [:spot :psot :post :opst])
-          flakes-by-t (->> flakes
-                           (sort-by :t)
-                           reverse
-                           (partition-by :t))]
-      (loop [db db'
-             [flakes & rest] flakes-by-t]
-        (if flakes
-          (recur (<? (with-t db flakes)) rest)
-          db)))))
+   (let [tt-id'      (if (nil? tt-id) (random-uuid) tt-id)
+         ;; update each root index with the provided tt-id
+         ;; As the root indexes are resolved, the tt-id will carry through the b-tree and ensure
+         ;; query caching is specific to this tt-id
+         db'         (reduce (fn [db* idx]
+                               (assoc db* idx (-> (get db* idx)
+                                                  (assoc :tt-id tt-id'))))
+                             (assoc db :tt-id tt-id')
+                             [:spot :psot :post :opst])
+         flakes-by-t (->> flakes
+                          (sort-by :t)
+                          reverse
+                          (partition-by :t))]
+     (loop [db db'
+            [flakes & rest] flakes-by-t]
+       (if flakes
+         (recur (<? (with-t db flakes)) rest)
+         db)))))
 
 (defn expand-iri
   "Expands an IRI from the db's context."
-  ([{:keys [schema] :as _db} iri]
-   (json-ld/expand-iri iri (:context schema)))
-  ([{:keys [schema] :as _db} iri provided-context]
-   (->> (json-ld/parse-context (:context schema) provided-context)
-        (json-ld/expand-iri iri))))
+  ([db iri]
+   (expand-iri db iri nil))
+  ([db iri provided-context]
+   (json-ld/expand-iri iri (dbproto/-context db provided-context))))
 
 (defn iri->sid
   "Returns subject id or nil if no match.
 
-  iri can be compact iri in string or keyword form."
+  iri can be a compact iri."
   [db iri]
   (go-try
-    (let [iri* (expand-iri db iri)]
-      ;; string? necessary because expand-iri will return original iri if not matched, and could be a keyword
-      (when (string? iri*)
-        (some-> (<? (query-range/index-range db :post = [const/$iri iri*]))
-                first
-                flake/s)))))
+   (let [iri* (expand-iri db iri)]
+     (some-> (<? (query-range/index-range db :post = [const/$iri iri*]))
+             first
+             flake/s))))
 
 (defn subid
   "Returns subject ID of ident as async promise channel.
@@ -268,73 +266,69 @@
   (let [return-chan (async/promise-chan)]
     (go
       (try*
-        (let [res (cond (number? ident)
-                        (when (not-empty (<? (query-range/index-range db :spot = [ident])))
-                          ident)
+       (let [res (cond (number? ident)
+                       (when (not-empty (<? (query-range/index-range db :spot = [ident])))
+                         ident)
 
-                        ;; assume iri
-                        (string? ident)
-                        (<? (iri->sid db ident))
+                       ;; assume iri
+                       (string? ident)
+                       (<? (iri->sid db ident))
 
-                        ;; assume iri that needs to be expanded (should we allow this, or should it be expanded before getting this far?)
-                        (keyword? ident)
-                        (<? (iri->sid db ident))
+                       ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
+                       (util/pred-ident? ident)
+                       (if-let [pid (dbproto/-p-prop db :id (first ident))]
+                         (some-> (<? (query-range/index-range db :post = [pid (second ident)]))
+                                 first
+                                 flake/s)
+                         (throw (ex-info (str "Subject ID lookup failed. The predicate " (pr-str (first ident)) " does not exist.")
+                                         {:status 400
+                                          :error  :db/invalid-ident})))
 
-                        ;; TODO - should we validate this is an ident predicate? This will return first result of any indexed value
-                        (util/pred-ident? ident)
-                        (if-let [pid (dbproto/-p-prop db :id (first ident))]
-                          (some-> (<? (query-range/index-range db :post = [pid (second ident)]))
-                                  first
-                                  flake/s)
-                          (throw (ex-info (str "Subject ID lookup failed. The predicate " (pr-str (first ident)) " does not exist.")
-                                          {:status 400
-                                           :error  :db/invalid-ident})))
+                       :else
+                       (throw (ex-info (str "Entid lookup must be a number or valid two-tuple identity: " (pr-str ident))
+                                       {:status 400
+                                        :error  :db/invalid-ident})))]
+         (cond
+           res
+           (async/put! return-chan res)
 
-                        :else
-                        (throw (ex-info (str "Entid lookup must be a number or valid two-tuple identity: " (pr-str ident))
-                                        {:status 400
-                                         :error  :db/invalid-ident})))]
-          (cond
-            res
-            (async/put! return-chan res)
+           (and (nil? res) strict?)
+           (async/put! return-chan
+                       (ex-info (str "Subject identity does not exist: " ident)
+                                {:status 400 :error :db/invalid-subject}))
 
-            (and (nil? res) strict?)
-            (async/put! return-chan
-                        (ex-info (str "Subject identity does not exist: " ident)
-                                 {:status 400 :error :db/invalid-subject}))
+           :else
+           (async/close! return-chan)))
 
-            :else
-            (async/close! return-chan)))
-
-        (catch* e
-                (async/put! return-chan
-                            (ex-info (str "Error looking up subject id: " ident)
-                                     {:status 400 :error :db/invalid-subject}
-                                     e)))))
+       (catch* e
+         (async/put! return-chan
+                     (ex-info (str "Error looking up subject id: " ident)
+                              {:status 400 :error :db/invalid-subject}
+                              e)))))
     return-chan))
 
 (defn class-ids
   "Returns list of class-ids for given subject-id"
   [db subject-id]
   (go-try
-    (map flake/o
-         (-> (dbproto/-rootdb db)
-             (query-range/index-range :spot = [subject-id const/$rdf:type])
-             <?))))
+   (map flake/o
+        (-> (dbproto/-rootdb db)
+            (query-range/index-range :spot = [subject-id const/$rdf:type])
+            <?))))
 
 (defn iri
   "Returns the iri for a given subject ID"
   [db subject-id compact-fn]
   (go-try
-    (when-let [flake (first (<? (query-range/index-range db :spot = [subject-id 0])))]
-      (-> flake flake/o compact-fn))))
+   (when-let [flake (first (<? (query-range/index-range db :spot = [subject-id 0])))]
+     (-> flake flake/o compact-fn))))
 
 ;; ================ GraphDB record support fns ================================
 
 (defn- graphdb-latest-db [{:keys [current-db-fn policy]}]
   (go-try
-    (let [current-db (<? (current-db-fn))]
-      (assoc current-db :policy policy))))
+   (let [current-db (<? (current-db-fn))]
+     (assoc current-db :policy policy))))
 
 (defn- graphdb-root-db [this]
   (assoc this :policy root-policy-map))
@@ -369,34 +363,34 @@
   return value if it starts with the given predicate name"
   ([this tag-id]
    (go-try
-     (let [tag-pred-id 30]
-       (some-> (<? (query-range/index-range (dbproto/-rootdb this)
-                                            :spot = [tag-id tag-pred-id]))
-               first
-               flake/o))))
+    (let [tag-pred-id 30]
+      (some-> (<? (query-range/index-range (dbproto/-rootdb this)
+                                           :spot = [tag-id tag-pred-id]))
+              first
+              flake/o))))
   ([this tag-id pred]
    (go-try
-     (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
-           tag       (<? (dbproto/-tag this tag-id))]
-       (when (and pred-name tag)
-         (if (str/includes? tag ":")
-           (-> (str/split tag #":") second)
-           tag))))))
+    (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))
+          tag       (<? (dbproto/-tag this tag-id))]
+      (when (and pred-name tag)
+        (if (str/includes? tag ":")
+          (-> (str/split tag #":") second)
+          tag))))))
 
 (defn- graphdb-tag-id
   ([this tag-name]
    (go-try
-     (let [tag-pred-id const/$_tag:id]
-       (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
-               first
-               flake/s))))
+    (let [tag-pred-id const/$_tag:id]
+      (some-> (<? (query-range/index-range (dbproto/-rootdb this) :post = [tag-pred-id tag-name]))
+              first
+              flake/s))))
   ([this tag-name pred]
    (go-try
-     (if (str/includes? tag-name "/")
-       (<? (dbproto/-tag-id this tag-name))
-       (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
-         (when pred-name
-           (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
+    (if (str/includes? tag-name "/")
+      (<? (dbproto/-tag-id this tag-name))
+      (let [pred-name (if (string? pred) pred (dbproto/-p-prop this :name pred))]
+        (when pred-name
+          (<? (dbproto/-tag-id this (str pred-name ":" tag-name)))))))))
 
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
@@ -418,13 +412,32 @@
           (assoc-in [:stats :indexed] index-t))
       db)))
 
+(defn retrieve-context
+  "Returns the parsed context. Caches."
+  [default-context context-cache supplied-context]
+  (log/debug "retrieve-context - default: " default-context "supplied:" supplied-context)
+  (or (get @context-cache supplied-context)
+      (let [context    (if supplied-context
+                         (if (sequential? supplied-context)
+                           (mapv #(if (= "" %)
+                                    ;; we need to substitute in the default context
+                                    default-context
+                                    %)
+                                 supplied-context)
+                           supplied-context)
+                         default-context)
+            parsed-ctx (json-ld/parse-context context)]
+        (vswap! context-cache assoc supplied-context parsed-ctx)
+        parsed-ctx)))
+
+
 ;; ================ end GraphDB record support fns ============================
 
 ;; TODO - conn is included here because current index-range query looks for conn on the db
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
 (defrecord JsonLdDb [ledger conn method alias branch commit block t tt-id stats
-                     spot psot post opst tspo schema comparators novelty
-                     policy ecount]
+                     spot psot post opst tspo schema comparators novelty policy
+                     ecount default-context context-cache new-context?]
   dbproto/IFlureeDb
   (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
@@ -457,16 +470,19 @@
   (-db-type [_] :json-ld)
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
-  (-index-update [db commit-index] (index-update db commit-index)))
+  (-index-update [db commit-index] (index-update db commit-index))
+  (-context [_] (retrieve-context default-context context-cache nil))
+  (-context [_ context] (retrieve-context default-context context-cache context))
+  (-default-context [_] default-context))
 
 #?(:cljs
    (extend-type JsonLdDb
      IPrintWithWriter
      (-pr-writer [db w opts]
        (-write w "#FlureeJsonLdDb ")
-       (-write w (pr {:method      (:method db) :alias (:alias db) :block (:block db)
-                      :t           (:t db) :stats (:stats db)
-                      :policy      (:policy db)})))))
+       (-write w (pr {:method (:method db) :alias (:alias db) :block (:block db)
+                      :t      (:t db) :stats (:stats db)
+                      :policy (:policy db)})))))
 
 #?(:clj
    (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
@@ -478,11 +494,11 @@
 (defn new-novelty-map
   [comparators]
   (reduce
-    (fn [m idx]
-      (assoc m idx (-> comparators
-                       (get idx)
-                       flake/sorted-set-by)))
-    {:size 0} index/types))
+   (fn [m idx]
+     (assoc m idx (-> comparators
+                      (get idx)
+                      flake/sorted-set-by)))
+   {:size 0} index/types))
 
 (def genesis-ecount {const/$_predicate  (flake/->sid const/$_predicate 1000)
                      const/$_collection (flake/->sid const/$_collection 19)
@@ -498,39 +514,42 @@
 
 
 (defn create
-  [{:keys [method alias conn] :as ledger}]
-  (let [novelty     (new-novelty-map index/default-comparators)
+  [{:keys [method alias conn] :as ledger} default-context new-context?]
+  (let [novelty (new-novelty-map index/default-comparators)
         {spot-cmp :spot
          psot-cmp :psot
          post-cmp :post
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot        (index/empty-branch method alias spot-cmp)
-        psot        (index/empty-branch method alias psot-cmp)
-        post        (index/empty-branch method alias post-cmp)
-        opst        (index/empty-branch method alias opst-cmp)
-        tspo        (index/empty-branch method alias tspo-cmp)
-        stats       {:flakes 0, :size 0, :indexed 0}
-        schema      (vocab/base-schema)
-        branch      (branch/branch-meta ledger)]
-    (map->JsonLdDb {:ledger      ledger
-                    :conn        conn
-                    :method      method
-                    :alias       alias
-                    :branch      (:name branch)
-                    :commit      (:commit branch)
-                    :block       0
-                    :t           0
-                    :tt-id       nil
-                    :stats       stats
-                    :spot        spot
-                    :psot        psot
-                    :post        post
-                    :opst        opst
-                    :tspo        tspo
-                    :schema      schema
-                    :comparators index/default-comparators
-                    :novelty     novelty
-                    :policy      root-policy-map
-                    :ecount      genesis-ecount})))
+        spot    (index/empty-branch method alias spot-cmp)
+        psot    (index/empty-branch method alias psot-cmp)
+        post    (index/empty-branch method alias post-cmp)
+        opst    (index/empty-branch method alias opst-cmp)
+        tspo    (index/empty-branch method alias tspo-cmp)
+        stats   {:flakes 0, :size 0, :indexed 0}
+        schema  (vocab/base-schema)
+        branch  (branch/branch-meta ledger)]
+    (map->JsonLdDb {:ledger          ledger
+                    :conn            conn
+                    :method          method
+                    :alias           alias
+                    :branch          (:name branch)
+                    :commit          (:commit branch)
+                    :block           0
+                    :t               0
+                    :tt-id           nil
+                    :stats           stats
+                    :spot            spot
+                    :psot            psot
+                    :post            post
+                    :opst            opst
+                    :tspo            tspo
+                    :schema          schema
+                    :comparators     index/default-comparators
+                    :novelty         novelty
+                    :policy          root-policy-map
+                    :default-context default-context
+                    :context-cache   (volatile! nil)
+                    :new-context?    new-context?
+                    :ecount          genesis-ecount})))

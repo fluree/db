@@ -7,7 +7,7 @@
 (deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
     (let [conn             (test-utils/create-conn)
-          ledger           @(fluree/create conn "tx/delete" {:context {:ex "http://example.org/ns/"}})
+          ledger           @(fluree/create conn "tx/delete" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db               @(fluree/stage
                              (fluree/db ledger)
                              {:graph [{:id           :ex/alice,

@@ -2,7 +2,6 @@
   (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
-            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
@@ -42,6 +41,7 @@
     (swap! data-atom assoc hash data)
     {:name    hash
      :hash    hash
+     :json    json
      :size    (count json)
      :address (memory-address path)}))
 
@@ -142,7 +142,7 @@
   (-method [_] :memory)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-context [_] (:context ledger-defaults))
+  (-default-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
@@ -155,24 +155,6 @@
                       :TODO))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
-
-  storage/Store
-  (read [_ k]
-    #?(:clj (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
-                            {:status 500 :error :db/unexpected-error}))
-       :cljs (if platform/BROWSER
-
-               (throw (ex-info (str "Memory connection does not support storage reads. Requested key: " k)
-                               {:status 500 :error :db/unexpected-error})))))
-  (write [_ k data]
-    (throw (ex-info (str "Memory connection does not support storage writes. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
-  (exists? [_ k]
-    (throw (ex-info (str "Memory connection does not support storage exists?. Requested key: " k)
-                    {:status 500 :error :db/unexpected-error})))
-  (rename [_ old-key new-key]
-    (throw (ex-info (str "Memory connection does not support storage rename. Old/new key: " old-key new-key)
-                    {:status 500 :error :db/unexpected-error})))
 
   index/Resolver
   (resolve
@@ -193,6 +175,7 @@
   (async/go
     {:context context
      :did     did}))
+
 
 (defn connect
   "Creates a new memory connection."

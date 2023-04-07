@@ -1,7 +1,6 @@
 (ns fluree.db.conn.ipfs
   (:require [fluree.db.storage.core :as storage]
             [fluree.db.index :as index]
-            [fluree.db.util.core :as util :refer [exception?]]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
@@ -9,7 +8,6 @@
             [fluree.db.util.async :refer [<? go-try channel?]]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.conn.state-machine :as state-machine]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.method.ipfs.directory :as ipfs-dir]
@@ -109,8 +107,8 @@
   (-method [_] :ipfs)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-context [_] (:context ledger-defaults))
-  (-new-indexer [_ opts]                                    ;; default new ledger indexer
+  (-default-context [_] (:context ledger-defaults))
+  (-new-indexer [_ opts] ;; default new ledger indexer
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
   (-did [_] (:did ledger-defaults))
@@ -124,17 +122,6 @@
   ;;                     :TODO))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
-
-  storage/Store
-  (read [_ k]
-    (ipfs/read ipfs-endpoint k true))
-  (write [_ k data]
-    (ipfs/write ipfs-endpoint data))
-  (exists? [conn k]
-    (storage/read conn k))
-  (rename [_ old-key new-key]
-    (throw (ex-info (str "IPFS does not support renaming of files: " old-key new-key)
-                    {:status 500 :error :db/unexpected-error})))
 
   index/Resolver
   (resolve
@@ -197,8 +184,8 @@
           conn-id         (str (random-uuid))
           state           (state-machine/blank-state)
 
-          cache-size     (conn-cache/memory->cache-size memory)
-          lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
+          cache-size      (conn-cache/memory->cache-size memory)
+          lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
       (map->IPFSConnection {:id              conn-id
                             :ipfs-endpoint   ipfs-endpoint

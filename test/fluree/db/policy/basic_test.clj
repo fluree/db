@@ -3,13 +3,15 @@
     [clojure.test :refer :all]
     [fluree.db.test-utils :as test-utils]
     [fluree.db.json-ld.api :as fluree]
-    [fluree.db.did :as did]))
+    [fluree.db.did :as did]
+    [fluree.db.util.core :as util]
+    [clojure.string :as str]))
 
 
-(deftest ^:integration policy-enforcement
-  (testing "Testing basic policy enforcement."
+(deftest ^:integration query-policy-enforcement
+  (testing "Testing basic policy enforcement on queries."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/a" {:context {:ex "http://example.org/ns/"}})
+          ledger    @(fluree/create conn "policy/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/stage
@@ -61,11 +63,17 @@
                                           :f/allow [{:id           :ex/ssnViewRule
                                                      :f/targetRole :ex/userRole
                                                      :f/action     [:f/view]
-                                                     :f/equals     {:list [:f/$identity :ex/user]}}]}]}])
-          root-db   @(fluree/wrap-policy db+policy {:f/$identity root-did
-                                                    :f/role      :ex/rootRole})
-          alice-db  @(fluree/wrap-policy db+policy {:f/$identity alice-did
-                                                    :f/role      :ex/userRole})]
+                                                     :f/equals     {:list [:f/$identity :ex/user]}}]}]}])]
+      (let [root-wrapped-db            @(fluree/wrap-policy db+policy {:did root-did
+                                                                       :role      :ex/rootRole})
+            double-policy-query-result @(fluree/query root-wrapped-db {:select {'?s [:* {:ex/location [:*]}]}
+                                                                       :where  [['?s :rdf/type :ex/User]]
+                                                                       :opts {:did root-did
+                                                                              :role      :ex/rootRole}})]
+        (is  (util/exception? double-policy-query-result)
+             "Should be an error to try to apply policy twice on one db.")
+        (is (str/includes? (ex-message double-policy-query-result)
+                           "Policy already in place")))
 
       ;; root can see all user data
       (is (= [{:id               :ex/john,
@@ -83,24 +91,64 @@
                :ex/location      {:id         "_:f211106232532993",
                                   :ex/state   "NC",
                                   :ex/country "USA"}}]
-             @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
-                                     :where  [['?s :rdf/type :ex/User]]}))
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/User]]
+                                       :opts {:did root-did
+                                              :role      :ex/rootRole}}))
           "Both user records + all attributes should show")
 
-      ;; root can see all product data
+      (is (= [{:id               :ex/john,
+               :rdf/type         [:ex/User],
+               :schema/name      "John",
+               :schema/email     "john@flur.ee",
+               :schema/birthDate "2021-08-17",
+               :schema/ssn       "888-88-8888"}
+              {:id               :ex/alice,
+               :rdf/type         [:ex/User],
+               :schema/name      "Alice",
+               :schema/email     "alice@flur.ee",
+               :schema/birthDate "2022-08-17",
+               :schema/ssn       "111-11-1111",
+               :ex/location      {:id         "_:f211106232532993",
+                                  :ex/state   "NC",
+                                  :ex/country "USA"}}]
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/User]]
+                                       :opts {:did root-did
+                                              :role      :ex/rootRole}}))
+          "Both user records + all attributes should show")
+
+      ;; root role can see all product data, without identity
       (is (= [{:id                   :ex/widget,
                :rdf/type             [:ex/Product],
                :schema/name          "Widget",
                :schema/price         99.99,
                :schema/priceCurrency "USD"}]
-             @(fluree/query root-db {:select {'?s [:* {:ex/location [:*]}]}
-                                     :where  [['?s :rdf/type :ex/Product]]}))
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/Product]]
+                                       :opts {:role :ex/rootRole}}))
           "The product record should show with all attributes")
+      (is (= [{:id               :ex/john,
+               :rdf/type         [:ex/User],
+               :schema/name      "John",
+               :schema/email     "john@flur.ee",
+               :schema/birthDate "2021-08-17"}
+              {:id               :ex/alice,
+               :rdf/type         [:ex/User],
+               :schema/name      "Alice",
+               :schema/email     "alice@flur.ee",
+               :schema/birthDate "2022-08-17"}]
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/User]]
+                                       :opts {:role :ex/userRole}}))
+          "Both users should show, but no SSNs because no identity was provided")
 
       ;; Alice cannot see product data as it was not explicitly allowed
       (is (= []
-             @(fluree/query alice-db {:select {'?s [:*]}
-                                      :where  [['?s :rdf/type :ex/Product]]})))
+             @(fluree/query db+policy {:select {'?s [:*]}
+                                       :where  [['?s :rdf/type :ex/Product]]
+                                       :opts {:did alice-did
+                                              :role :ex/userRole}})))
 
       ;; Alice can see all users, but can only see SSN for herself, and can't see the nested location
       (is (= [{:id               :ex/john,
@@ -114,14 +162,105 @@
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
                :schema/ssn       "111-11-1111"}]
-             @(fluree/query alice-db {:select {'?s [:* {:ex/location [:*]}]}
-                                      :where  [['?s :rdf/type :ex/User]]}))
+             @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
+                                       :where  [['?s :rdf/type :ex/User]]
+                                       :opts {:did alice-did
+                                              :role :ex/userRole}}))
           "Both users should show, but only SSN for Alice")
 
       ;; Alice can only see her allowed data in a non-graph-crawl query too
       (is (= [["John" nil] ["Alice" "111-11-1111"]]
-             @(fluree/query alice-db {:select '[?name ?ssn]
-                                      :where  '[[?p :schema/name ?name]
-                                                {:optional [?p :schema/ssn ?ssn]}]}))
-          "Both user names should show, but only SSN for Alice"))))
+             @(fluree/query db+policy {:select '[?name ?ssn]
+                                       :where  '[[?p :schema/name ?name]
+                                                 {:optional [?p :schema/ssn ?ssn]}]
+                                       :opts {:did alice-did
+                                              :role :ex/userRole}}))
+          "Both user names should show, but only SSN for Alice")
 
+      (testing "multi-query"
+        (is (= {"john" [["john@flur.ee" nil]]
+                "alice" [["alice@flur.ee" "111-11-1111"]]}
+               @(fluree/multi-query db+policy {"john" '{:select [?email ?ssn]
+                                                        :where  [[?p :schema/name "John"]
+                                                                 [?p :schema/email ?email]
+                                                                 {:optional [?p :schema/ssn ?ssn]}]}
+                                               "alice" '{:select [?email ?ssn]
+                                                         :where  [[?p :schema/name "Alice"]
+                                                                  [?p :schema/email ?email]
+                                                                  {:optional [?p :schema/ssn ?ssn]}]}
+                                               :opts {:did alice-did
+                                                      :role :ex/userRole}}))
+            "Both emails should show, but only SSN for Alice")
+
+        (let [illegal-opts-multi-result @(fluree/multi-query db+policy {"john" {:select '[?ssn]
+                                                                                :where  '[[?p :schema/name "John"]
+                                                                                          {:optional [?p :schema/ssn ?ssn]}]
+                                                                                ;;supplying an identity here is not supported
+                                                                                :opts {:did root-did
+                                                                                       :role      :ex/rootRole}}
+                                                                        "alice" '{:select [?ssn]
+                                                                                  :where  [[?p :schema/name "Alice"]
+                                                                                           {:optional [?p :schema/ssn ?ssn]}]}})]
+          (is (util/exception? illegal-opts-multi-result))
+          (is (str/includes? (ex-message illegal-opts-multi-result)
+                             "Applying policy via `:opts` on individual queries"))))
+
+      (testing "history query"
+        (let [_ @(fluree/commit! ledger db+policy)]
+          (is (= []
+                 @(fluree/history ledger {:history [:ex/john :schema/ssn] :t {:from 1}
+                                          :commit-details true
+                                          :opts {:did alice-did
+                                                 :role :ex/userRole}}))
+              "Alice should not be able to see any history for John's ssn")
+          (is (= [{:f/t 1,
+                   :f/assert [{:schema/ssn "111-11-1111", :id :ex/alice}],
+                   :f/retract []}]
+                 @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
+                                          :opts    {:did alice-did
+                                                    :role :ex/userRole}}))
+              "Alice should be able to see history for her own ssn.")
+          (let [[history-result]  @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
+                                                           :commit-details true
+                                                           :opts    {:did alice-did
+                                                                     :role :ex/userRole}})
+                commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
+            (is (= [{:rdf/type [:ex/User],
+                     :schema/name "John",
+                     :schema/email "john@flur.ee",
+                     :schema/birthDate "2021-08-17",
+                     :id :ex/john}
+                    {:rdf/type [:ex/User],
+                     :schema/name "Alice",
+                     :schema/email "alice@flur.ee",
+                     :schema/birthDate "2022-08-17",
+                     :schema/ssn "111-11-1111",
+                     :ex/location {:id nil},
+                     :id :ex/alice}]
+                   commit-details-asserts)
+                "Alice should be able to see her own ssn in commit details, but not John's."))
+          (let [[history-result] @(fluree/history ledger {:history [:ex/alice :schema/ssn] :t {:from 1}
+                                                          :commit-details true
+                                                          :opts     {:did root-did
+                                                                     :role      :ex/rootRole}})
+                commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
+            (is (contains? (into #{} commit-details-asserts)
+                           {:rdf/type [:ex/User],
+                            :schema/name "John",
+                            :schema/email "john@flur.ee",
+                            :schema/birthDate "2021-08-17",
+                            :schema/ssn "888-88-8888",
+                            :id :ex/john})
+                "Root can see John's ssn in commit details."))
+          (let [_ @(test-utils/transact ledger {:id :ex/john
+                                                :schema/name "Jack"})]
+            (is (= [{:f/t 1,
+                     :f/assert [{:schema/name "John", :id :ex/john}],
+                     :f/retract []}
+                    {:f/t 2,
+                     :f/assert [{:schema/name "Jack", :id :ex/john}],
+                     :f/retract [{:schema/name "John", :id :ex/john}]}]
+                   @(fluree/history ledger {:history [:ex/john :schema/name] :t {:from 1}
+                                            :opts {:did alice-did
+                                                   :role :ex/userRole}}))
+                "Alice should be able to see all history for John's name")))))))

@@ -9,7 +9,7 @@
   (let [ts-primeval (util/current-time-iso)
 
         conn        (test-utils/create-conn)
-        ledger      @(fluree/create conn "historytest" {:context {:ex "http://example.org/ns/"}})
+        ledger      @(fluree/create conn "historytest" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
         db1         @(test-utils/transact ledger [{:id   :ex/dan
                                                    :ex/x "foo-1"
@@ -178,7 +178,7 @@
 
     (testing "small cache"
       (let [conn   (test-utils/create-conn)
-            ledger @(fluree/create conn "historycachetest" {:context {:ex "http://example.org/ns/"}})
+            ledger @(fluree/create conn "historycachetest" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
             db1    @(test-utils/transact ledger [{:id   :ex/dan
                                                   :ex/x "foo-1"
@@ -195,7 +195,7 @@
 (deftest ^:integration commit-details
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "committest" {:context {:ex "http://example.org/ns/"}})
+          ledger @(fluree/create conn "committest" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
 
           db1    @(test-utils/transact ledger {:id   :ex/alice
                                                :ex/x "foo-1"
@@ -214,86 +214,69 @@
                                                :ex/y "bar-cat"}
                                        {:message "meow"})]
       (testing "at time t"
-        (is (= [{:f/commit
-                 {:f/address
-                  "fluree:memory://3f7ff6df48e007cab36098274fd822ac11c9da4bf8b29762d1de3fdbdd6b6013",
-                  :f/v      0,
-                  :f/time   720000,
-                  :id
-                  "fluree:commit:sha256:bsso2btsgd4gsukmqrlmm4gap4gbmk5fkemiht6hlpjkaxzdgmmk",
-                  :f/branch "main",
-                  :f/data
-                  {:f/address "fluree:memory://5d3ce686baa6fd5cc547b5e03e6aca3d92cbce0328c2320a49c514b01e58b4c2",
-                   :f/flakes  11,
-                   :f/size    996,
-                   :f/t       1,
-                   :f/assert  [{:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}],
-                   :f/retract []},
-                  "https://www.w3.org/2018/credentials#issuer"
-                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                  :f/alias  "committest",
-                  :f/context
-                  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}]
+        (is (= [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                            {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                            :f/address "fluree:memory://c2e0047d4d75cad2700d5c8d0db0ad3d7dd2bbbbbdf55ba7c28dd4252a557664"
+                            :f/alias   "committest"
+                            :f/branch  "main"
+                            :f/context "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                            :f/data    #:f{:address "fluree:memory://bcb581e731a7c0ceadcfbf432b4ee8cf046de377cc33f047bd05b6c47f9da94d"
+                                           :assert  [{:ex/x "foo-1"
+                                                      :ex/y "bar-1"
+                                                      :id   :ex/alice}]
+                                           :flakes  11
+                                           :retract []
+                                           :size    996
+                                           :t       1}
+                            :f/time    720000
+                            :f/v       0
+                            :id        "fluree:commit:sha256:bn6sykdmktzuxcavgrsa5ejwdzfae6njj4q3lonb5cexlfhauvpc"}}]
                @(fluree/history ledger {:commit-details true :t {:from 1 :to 1}})))
-        (let [commit-5 {:f/commit
-                        {:f/address
-                         "fluree:memory://16d376f6cac29e8125ec3beca7aea6f75fb7a4328d73cbe0d629c6132510621c",
-                         :f/v       0,
-                         :f/previous
-                         {:id
-                          "fluree:commit:sha256:busykqnrg3i2zdhi7wvlbhretnv32e5cyxcqwvgjtazftkjnpup7"},
-                         :f/time    720000,
-                         :id
-                         "fluree:commit:sha256:bbgkybvkkdwelzlmj6vei7kitm5hvxecotx6imytpta272jwbiaw7",
-                         :f/branch  "main",
-                         :f/message "meow",
-                         :f/data
-                         {:f/previous
-                          {:id
-                           "fluree:db:sha256:bbiioffkgezekkxzojudoqrtk3zmjcxeotecprh2ordafskng7hhc"},
-                          :f/address
-                          "fluree:memory://783086c375a712eba5d5a74b18882a98a1f77eccf51bddd9b99e2c625e67a088",
-                          :f/flakes  102,
-                          :f/size    9328,
-                          :f/t       5,
-                          :f/assert  [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
-                          :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]},
-                         "https://www.w3.org/2018/credentials#issuer"
-                         {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                         :f/alias   "committest",
-                         :f/context
-                         "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
-              commit-4 {:f/commit
-                        {:f/address
-                         "fluree:memory://f0207c4d1d5b3e9abd71622f72149ec36518abda929aa63812c44d21a0b77b5a",
-                         :f/v      0,
-                         :f/previous
-                         {:id
-                          "fluree:commit:sha256:bdsvqh2dyqm7d4y3ou7jteevehp7t6wrfprdhjbuanx43bafyjgd"},
-                         :f/time   720000,
-                         :id
-                         "fluree:commit:sha256:busykqnrg3i2zdhi7wvlbhretnv32e5cyxcqwvgjtazftkjnpup7",
-                         :f/branch "main",
-                         :f/data
-                         {:f/previous
-                          {:id
-                           "fluree:db:sha256:bbc26gz36q2kxbrwmdo4ryfq4shvbw5b7aloxqsaje3tzd32issul"},
-                          :f/address
-                          "fluree:memory://c3a54a71c8c554c9d583df9e72a57bf572976e7a20c088f0cf536032cfd6d212",
-                          :f/flakes  82,
-                          :f/size    7590,
-                          :f/t       4,
-                          :f/assert  [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/cat}],
-                          :f/retract []},
-                         "https://www.w3.org/2018/credentials#issuer"
-                         {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                         :f/alias  "committest",
-                         :f/context
-                         "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}]
+        (let [commit-5 {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                                   {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                                   :f/address  "fluree:memory://2716b3eaef91b763b32daebab8ba3733a8537de37a864f726c5021464b90277f"
+                                   :f/alias    "committest"
+                                   :f/branch   "main"
+                                   :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                                   :f/data     #:f{:address  "fluree:memory://2b8125a4c996f8612ae62f16cc62b167b762c517b0c5aa7b16fa21dfe47e7b2a"
+                                                   :assert   [{:ex/x "foo-cat"
+                                                               :ex/y "bar-cat"
+                                                               :id   :ex/alice}]
+                                                   :flakes   102
+                                                   :previous {:id "fluree:db:sha256:bbtdwia2mle22abe2z7mmdrs4vufs77yubzxip3chhkmffvfk4npk"}
+                                                   :retract  [{:ex/x "foo-3"
+                                                               :ex/y "bar-3"
+                                                               :id   :ex/alice}]
+                                                   :size     9326
+                                                   :t        5}
+                                   :f/message  "meow"
+                                   :f/previous {:id "fluree:commit:sha256:bhcunj52uwxshi6jws2ypsjiziyncfa5gal4xptfldj5utb54cpf"}
+                                   :f/time     720000
+                                   :f/v        0
+                                   :id         "fluree:commit:sha256:bq4r74wu4sru43z5f4byipe5zzkgyi2kksqxlmwuttdcwcgwpsrn"}}
+              commit-4 {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                                   {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                                   :f/address  "fluree:memory://ffe008a623d3c6920f1d7d7607783893042c8093629f64ffefc8eb8472f542af"
+                                   :f/alias    "committest"
+                                   :f/branch   "main"
+                                   :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                                   :f/data     #:f{:address  "fluree:memory://2cac0ce4036dd82a0c23eb3deca0e7775386ed220411edb271803144b001326c"
+                                                   :assert   [{:ex/x "foo-cat"
+                                                               :ex/y "bar-cat"
+                                                               :id   :ex/cat}]
+                                                   :flakes   82
+                                                   :previous {:id "fluree:db:sha256:bcl3anjpvmxaciox7inzx4za6teagj7ipacuadzlnwg45y6z77ts"}
+                                                   :retract  []
+                                                   :size     7588
+                                                   :t        4}
+                                   :f/previous {:id "fluree:commit:sha256:b5jlses24wzjhcmqywvcdwgxxzmjlmxruh2duqsgxbxy7522utlg"}
+                                   :f/time     720000
+                                   :f/v        0
+                                   :id         "fluree:commit:sha256:bhcunj52uwxshi6jws2ypsjiziyncfa5gal4xptfldj5utb54cpf"}}]
           (is (= [commit-4 commit-5]
                  @(fluree/history ledger {:commit-details true :t {:from 4 :to 5}})))
           (is (= [commit-5]
-                 @(fluree/history ledger {:commit-details true :t {:at :latest}})))))
+                 @(fluree/history ledger {:commit-details true :t {:at "latest"}})))))
 
       (testing "time range"
         (let [[c2 c3 c4 :as response] @(fluree/history
@@ -302,235 +285,193 @@
                                           :t              {:from 2 :to 4}})]
           (testing "all commits in time range are returned"
             (is (= 3 (count response)))
-            (is (= {:f/commit
-                    {:f/address
-                     "fluree:memory://f0207c4d1d5b3e9abd71622f72149ec36518abda929aa63812c44d21a0b77b5a",
-                     :f/v      0,
-                     :f/previous
-                     {:id
-                      "fluree:commit:sha256:bdsvqh2dyqm7d4y3ou7jteevehp7t6wrfprdhjbuanx43bafyjgd"},
-                     :f/time   720000,
-                     :id
-                     "fluree:commit:sha256:busykqnrg3i2zdhi7wvlbhretnv32e5cyxcqwvgjtazftkjnpup7",
-                     :f/branch "main",
-                     :f/data
-                     {:f/previous
-                      {:id
-                       "fluree:db:sha256:bbc26gz36q2kxbrwmdo4ryfq4shvbw5b7aloxqsaje3tzd32issul"},
-                      :f/address
-                      "fluree:memory://c3a54a71c8c554c9d583df9e72a57bf572976e7a20c088f0cf536032cfd6d212",
-                      :f/flakes  82,
-                      :f/size    7590,
-                      :f/t       4,
-                      :f/assert  [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/cat}],
-                      :f/retract []},
-                     "https://www.w3.org/2018/credentials#issuer"
-                     {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                     :f/alias  "committest",
-                     :f/context
-                     "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
+            (is (= {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                               {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                               :f/address  "fluree:memory://ffe008a623d3c6920f1d7d7607783893042c8093629f64ffefc8eb8472f542af"
+                               :f/alias    "committest"
+                               :f/branch   "main"
+                               :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                               :f/data     #:f{:address  "fluree:memory://2cac0ce4036dd82a0c23eb3deca0e7775386ed220411edb271803144b001326c"
+                                               :assert   [{:ex/x "foo-cat"
+                                                           :ex/y "bar-cat"
+                                                           :id   :ex/cat}]
+                                               :flakes   82
+                                               :previous {:id "fluree:db:sha256:bcl3anjpvmxaciox7inzx4za6teagj7ipacuadzlnwg45y6z77ts"}
+                                               :retract  []
+                                               :size     7588
+                                               :t        4}
+                               :f/previous {:id "fluree:commit:sha256:b5jlses24wzjhcmqywvcdwgxxzmjlmxruh2duqsgxbxy7522utlg"}
+                               :f/time     720000
+                               :f/v        0
+                               :id         "fluree:commit:sha256:bhcunj52uwxshi6jws2ypsjiziyncfa5gal4xptfldj5utb54cpf"}}
                    c4)))
-          (is (= {:f/commit
-                  {:f/address
-                   "fluree:memory://3529d447998ec5b2c42ed1336009fdab9388bbd987fade075f1208aa8b7ec44b",
-                   :f/v      0,
-                   :f/previous
-                   {:id
-                    "fluree:commit:sha256:bb42ijix6d6tidq4zzc75uymowpx7hazczwhxkuz2u45c2gcwtwvw"},
-                   :f/time   720000,
-                   :id
-                   "fluree:commit:sha256:bdsvqh2dyqm7d4y3ou7jteevehp7t6wrfprdhjbuanx43bafyjgd",
-                   :f/branch "main",
-                   :f/data
-                   {:f/previous
-                    {:id
-                     "fluree:db:sha256:bba364nb2cbanjsgwk7t7l34m5f667efop4yiu5l5lvxscoggqdgg"},
-                    :f/address
-                    "fluree:memory://dc0c296d3047963ff807d0f17807c21a582d89ae72faa3d1d3c13d7af3929d22",
-                    :f/flakes  63,
-                    :f/size    5864,
-                    :f/t       3,
-                    :f/assert  [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}],
-                    :f/retract [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/alice}]},
-                   "https://www.w3.org/2018/credentials#issuer"
-                   {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                   :f/alias  "committest",
-                   :f/context
-                   "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
+          (is (= {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                             {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                             :f/address  "fluree:memory://f29bfb686c834d667dc62f8c46af1802f02c62567b400d50c0202428e489d1fe"
+                             :f/alias    "committest"
+                             :f/branch   "main"
+                             :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                             :f/data     #:f{:address  "fluree:memory://cb16fc43954b9ed029be2c96c6f73fa5e34e5ca1607111c5e8f8d6e337b648f6"
+                                             :assert   [{:ex/x "foo-3"
+                                                         :ex/y "bar-3"
+                                                         :id   :ex/alice}]
+                                             :flakes   63
+                                             :previous {:id "fluree:db:sha256:bjufs3dmyea7wzbkrjrh2pzua2mtqgijnl3cqpkktk7wzvy5wlnq"}
+                                             :retract  [{:ex/x "foo-2"
+                                                         :ex/y "bar-2"
+                                                         :id   :ex/alice}]
+                                             :size     5864
+                                             :t        3}
+                             :f/previous {:id "fluree:commit:sha256:bbvotmnlqkm4xkc27au55rctw5klntegd36j4dbh665qfilem42eq"}
+                             :f/time     720000
+                             :f/v        0
+                             :id         "fluree:commit:sha256:b5jlses24wzjhcmqywvcdwgxxzmjlmxruh2duqsgxbxy7522utlg"}}
                  c3))
-          (is (= {:f/commit
-                  {:f/address
-                   "fluree:memory://08ef0ead00f983ec19d1cabbaa991fe2beba70a8666bda2df6685654a646b332",
-                   :f/v      0,
-                   :f/previous
-                   {:id
-                    "fluree:commit:sha256:bsso2btsgd4gsukmqrlmm4gap4gbmk5fkemiht6hlpjkaxzdgmmk"},
-                   :f/time   720000,
-                   :id
-                   "fluree:commit:sha256:bb42ijix6d6tidq4zzc75uymowpx7hazczwhxkuz2u45c2gcwtwvw",
-                   :f/branch "main",
-                   :f/data
-                   {:f/previous
-                    {:id
-                     "fluree:db:sha256:bwogmajjh3rwlkijfihbcdy4h52qjv4kumctu4mhy27pj3zsxtes"},
-                    :f/address
-                    "fluree:memory://cffe310ce5b609c281342f812771e204e8789d5b9c6f15dcd19a7e74427d0413",
-                    :f/flakes  43,
-                    :f/size    4132,
-                    :f/t       2,
-                    :f/assert  [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/alice}],
-                    :f/retract [{:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}]},
-                   "https://www.w3.org/2018/credentials#issuer"
-                   {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                   :f/alias  "committest",
-                   :f/context
-                   "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
+          (is (= {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                             {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                             :f/address  "fluree:memory://a3f34c963d5724782dc33aae1c9e0d8dc8b1f35092a659cb2431d7204b95288c"
+                             :f/alias    "committest"
+                             :f/branch   "main"
+                             :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                             :f/data     #:f{:address  "fluree:memory://2fb8ce1aa6771837c7986b1d81dcdb42ca8be8927679fe3814b2fb044b903b9d"
+                                             :assert   [{:ex/x "foo-2"
+                                                         :ex/y "bar-2"
+                                                         :id   :ex/alice}]
+                                             :flakes   43
+                                             :previous {:id "fluree:db:sha256:bbbi2zkypmbphdnt7ntmtqxtuvayt5izcbfkjaqfrlq2ixxrj5dcu"}
+                                             :retract  [{:ex/x "foo-1"
+                                                         :ex/y "bar-1"
+                                                         :id   :ex/alice}]
+                                             :size     4134
+                                             :t        2}
+                             :f/previous {:id "fluree:commit:sha256:bn6sykdmktzuxcavgrsa5ejwdzfae6njj4q3lonb5cexlfhauvpc"}
+                             :f/time     720000
+                             :f/v        0
+                             :id         "fluree:commit:sha256:bbvotmnlqkm4xkc27au55rctw5klntegd36j4dbh665qfilem42eq"}}
                  c2))))
 
       (testing "time range from"
-        (is (= [{:f/commit
-                 {:f/address
-                  "fluree:memory://f0207c4d1d5b3e9abd71622f72149ec36518abda929aa63812c44d21a0b77b5a",
-                  :f/v      0,
-                  :f/previous
-                  {:id
-                   "fluree:commit:sha256:bdsvqh2dyqm7d4y3ou7jteevehp7t6wrfprdhjbuanx43bafyjgd"},
-                  :f/time   720000,
-                  :id
-                  "fluree:commit:sha256:busykqnrg3i2zdhi7wvlbhretnv32e5cyxcqwvgjtazftkjnpup7",
-                  :f/branch "main",
-                  :f/data
-                  {:f/previous
-                   {:id
-                    "fluree:db:sha256:bbc26gz36q2kxbrwmdo4ryfq4shvbw5b7aloxqsaje3tzd32issul"},
-                   :f/address
-                   "fluree:memory://c3a54a71c8c554c9d583df9e72a57bf572976e7a20c088f0cf536032cfd6d212",
-                   :f/flakes  82,
-                   :f/size    7590,
-                   :f/t       4,
-                   :f/assert  [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/cat}],
-                   :f/retract []},
-                  "https://www.w3.org/2018/credentials#issuer"
-                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                  :f/alias  "committest",
-                  :f/context
-                  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
-                {:f/commit
-                 {:f/address
-                  "fluree:memory://16d376f6cac29e8125ec3beca7aea6f75fb7a4328d73cbe0d629c6132510621c",
-                  :f/v       0,
-                  :f/previous
-                  {:id
-                   "fluree:commit:sha256:busykqnrg3i2zdhi7wvlbhretnv32e5cyxcqwvgjtazftkjnpup7"},
-                  :f/time    720000,
-                  :id
-                  "fluree:commit:sha256:bbgkybvkkdwelzlmj6vei7kitm5hvxecotx6imytpta272jwbiaw7",
-                  :f/branch  "main",
-                  :f/message "meow",
-                  :f/data
-                  {:f/previous
-                   {:id
-                    "fluree:db:sha256:bbiioffkgezekkxzojudoqrtk3zmjcxeotecprh2ordafskng7hhc"},
-                   :f/address
-                   "fluree:memory://783086c375a712eba5d5a74b18882a98a1f77eccf51bddd9b99e2c625e67a088",
-                   :f/flakes  102,
-                   :f/size    9328,
-                   :f/t       5,
-                   :f/assert  [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
-                   :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]},
-                  "https://www.w3.org/2018/credentials#issuer"
-                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                  :f/alias   "committest",
-                  :f/context
-                  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}]
+        (is (= [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                            {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                            :f/address  "fluree:memory://ffe008a623d3c6920f1d7d7607783893042c8093629f64ffefc8eb8472f542af"
+                            :f/alias    "committest"
+                            :f/branch   "main"
+                            :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                            :f/data     #:f{:address  "fluree:memory://2cac0ce4036dd82a0c23eb3deca0e7775386ed220411edb271803144b001326c"
+                                            :assert   [{:ex/x "foo-cat"
+                                                        :ex/y "bar-cat"
+                                                        :id   :ex/cat}]
+                                            :flakes   82
+                                            :previous {:id "fluree:db:sha256:bcl3anjpvmxaciox7inzx4za6teagj7ipacuadzlnwg45y6z77ts"}
+                                            :retract  []
+                                            :size     7588
+                                            :t        4}
+                            :f/previous {:id "fluree:commit:sha256:b5jlses24wzjhcmqywvcdwgxxzmjlmxruh2duqsgxbxy7522utlg"}
+                            :f/time     720000
+                            :f/v        0
+                            :id         "fluree:commit:sha256:bhcunj52uwxshi6jws2ypsjiziyncfa5gal4xptfldj5utb54cpf"}}
+                {:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                            {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                            :f/address  "fluree:memory://2716b3eaef91b763b32daebab8ba3733a8537de37a864f726c5021464b90277f"
+                            :f/alias    "committest"
+                            :f/branch   "main"
+                            :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                            :f/data     #:f{:address  "fluree:memory://2b8125a4c996f8612ae62f16cc62b167b762c517b0c5aa7b16fa21dfe47e7b2a"
+                                            :assert   [{:ex/x "foo-cat"
+                                                        :ex/y "bar-cat"
+                                                        :id   :ex/alice}]
+                                            :flakes   102
+                                            :previous {:id "fluree:db:sha256:bbtdwia2mle22abe2z7mmdrs4vufs77yubzxip3chhkmffvfk4npk"}
+                                            :retract  [{:ex/x "foo-3"
+                                                        :ex/y "bar-3"
+                                                        :id   :ex/alice}]
+                                            :size     9326
+                                            :t        5}
+                            :f/message  "meow"
+                            :f/previous {:id "fluree:commit:sha256:bhcunj52uwxshi6jws2ypsjiziyncfa5gal4xptfldj5utb54cpf"}
+                            :f/time     720000
+                            :f/v        0
+                            :id         "fluree:commit:sha256:bq4r74wu4sru43z5f4byipe5zzkgyi2kksqxlmwuttdcwcgwpsrn"}}]
                @(fluree/history ledger {:commit-details true :t {:from 4}}))))
 
       (testing "time range to"
-        (is (= [{:f/commit
-                 {:f/address
-                  "fluree:memory://3f7ff6df48e007cab36098274fd822ac11c9da4bf8b29762d1de3fdbdd6b6013",
-                  :f/v      0,
-                  :f/time   720000,
-                  :id
-                  "fluree:commit:sha256:bsso2btsgd4gsukmqrlmm4gap4gbmk5fkemiht6hlpjkaxzdgmmk",
-                  :f/branch "main",
-                  :f/data
-                  {:f/address
-                   "fluree:memory://5d3ce686baa6fd5cc547b5e03e6aca3d92cbce0328c2320a49c514b01e58b4c2",
-                   :f/flakes  11,
-                   :f/size    996,
-                   :f/t       1,
-                   :f/assert  [{:ex/x "foo-1", :ex/y "bar-1", :id :ex/alice}],
-                   :f/retract []},
-                  "https://www.w3.org/2018/credentials#issuer"
-                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                  :f/alias  "committest",
-                  :f/context
-                  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}]
+        (is (= [{:f/commit {"https://www.w3.org/2018/credentials#issuer"
+                            {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                            :f/address "fluree:memory://c2e0047d4d75cad2700d5c8d0db0ad3d7dd2bbbbbdf55ba7c28dd4252a557664"
+                            :f/alias   "committest"
+                            :f/branch  "main"
+                            :f/context "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                            :f/data    #:f{:address "fluree:memory://bcb581e731a7c0ceadcfbf432b4ee8cf046de377cc33f047bd05b6c47f9da94d"
+                                           :assert  [{:ex/x "foo-1"
+                                                      :ex/y "bar-1"
+                                                      :id   :ex/alice}]
+                                           :flakes  11
+                                           :retract []
+                                           :size    996
+                                           :t       1}
+                            :f/time    720000
+                            :f/v       0
+                            :id        "fluree:commit:sha256:bn6sykdmktzuxcavgrsa5ejwdzfae6njj4q3lonb5cexlfhauvpc"}}]
                @(fluree/history ledger {:commit-details true :t {:to 1}}))))
 
       (testing "history commit details"
-        (is (= [{:f/t       3,
-                 :f/assert  [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}],
-                 :f/retract [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/alice}],
-                 :f/commit
-                 {:f/address
-                  "fluree:memory://3529d447998ec5b2c42ed1336009fdab9388bbd987fade075f1208aa8b7ec44b",
-                  :f/v      0,
-                  :f/previous
-                  {:id
-                   "fluree:commit:sha256:bb42ijix6d6tidq4zzc75uymowpx7hazczwhxkuz2u45c2gcwtwvw"},
-                  :f/time   720000,
-                  :id
-                  "fluree:commit:sha256:bdsvqh2dyqm7d4y3ou7jteevehp7t6wrfprdhjbuanx43bafyjgd",
-                  :f/branch "main",
-                  :f/data
-                  {:f/previous
-                   {:id
-                    "fluree:db:sha256:bba364nb2cbanjsgwk7t7l34m5f667efop4yiu5l5lvxscoggqdgg"},
-                   :f/address
-                   "fluree:memory://dc0c296d3047963ff807d0f17807c21a582d89ae72faa3d1d3c13d7af3929d22",
-                   :f/flakes  63,
-                   :f/size    5864,
-                   :f/t       3,
-                   :f/assert  [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}],
-                   :f/retract [{:ex/x "foo-2", :ex/y "bar-2", :id :ex/alice}]},
-                  "https://www.w3.org/2018/credentials#issuer"
-                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                  :f/alias  "committest",
-                  :f/context
-                  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"}}
-                {:f/t       5,
-                 :f/assert  [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
-                 :f/commit
-                 {:f/address
-                  "fluree:memory://16d376f6cac29e8125ec3beca7aea6f75fb7a4328d73cbe0d629c6132510621c",
-                  :f/v       0,
-                  :f/previous
-                  {:id
-                   "fluree:commit:sha256:busykqnrg3i2zdhi7wvlbhretnv32e5cyxcqwvgjtazftkjnpup7"},
-                  :f/time    720000,
-                  :id
-                  "fluree:commit:sha256:bbgkybvkkdwelzlmj6vei7kitm5hvxecotx6imytpta272jwbiaw7",
-                  :f/branch  "main",
-                  :f/message "meow",
-                  :f/data
-                  {:f/previous
-                   {:id
-                    "fluree:db:sha256:bbiioffkgezekkxzojudoqrtk3zmjcxeotecprh2ordafskng7hhc"},
-                   :f/address
-                   "fluree:memory://783086c375a712eba5d5a74b18882a98a1f77eccf51bddd9b99e2c625e67a088",
-                   :f/flakes  102,
-                   :f/size    9328,
-                   :f/t       5,
-                   :f/assert  [{:ex/x "foo-cat", :ex/y "bar-cat", :id :ex/alice}],
-                   :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]},
-                  "https://www.w3.org/2018/credentials#issuer"
-                  {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"},
-                  :f/alias   "committest",
-                  :f/context
-                  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"},
-                 :f/retract [{:ex/x "foo-3", :ex/y "bar-3", :id :ex/alice}]}]
+        (is (= [#:f{:assert  [{:ex/x "foo-3"
+                               :ex/y "bar-3"
+                               :id   :ex/alice}]
+                    :commit  {"https://www.w3.org/2018/credentials#issuer"
+                              {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                              :f/address  "fluree:memory://f29bfb686c834d667dc62f8c46af1802f02c62567b400d50c0202428e489d1fe"
+                              :f/alias    "committest"
+                              :f/branch   "main"
+                              :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                              :f/data     #:f{:address  "fluree:memory://cb16fc43954b9ed029be2c96c6f73fa5e34e5ca1607111c5e8f8d6e337b648f6"
+                                              :assert   [{:ex/x "foo-3"
+                                                          :ex/y "bar-3"
+                                                          :id   :ex/alice}]
+                                              :flakes   63
+                                              :previous {:id "fluree:db:sha256:bjufs3dmyea7wzbkrjrh2pzua2mtqgijnl3cqpkktk7wzvy5wlnq"}
+                                              :retract  [{:ex/x "foo-2"
+                                                          :ex/y "bar-2"
+                                                          :id   :ex/alice}]
+                                              :size     5864
+                                              :t        3}
+                              :f/previous {:id "fluree:commit:sha256:bbvotmnlqkm4xkc27au55rctw5klntegd36j4dbh665qfilem42eq"}
+                              :f/time     720000
+                              :f/v        0
+                              :id         "fluree:commit:sha256:b5jlses24wzjhcmqywvcdwgxxzmjlmxruh2duqsgxbxy7522utlg"}
+                    :retract [{:ex/x "foo-2"
+                               :ex/y "bar-2"
+                               :id   :ex/alice}]
+                    :t       3}
+                #:f{:assert  [{:ex/x "foo-cat"
+                               :ex/y "bar-cat"
+                               :id   :ex/alice}]
+                    :commit  {"https://www.w3.org/2018/credentials#issuer"
+                              {:id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                              :f/address  "fluree:memory://2716b3eaef91b763b32daebab8ba3733a8537de37a864f726c5021464b90277f"
+                              :f/alias    "committest"
+                              :f/branch   "main"
+                              :f/context  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                              :f/data     #:f{:address  "fluree:memory://2b8125a4c996f8612ae62f16cc62b167b762c517b0c5aa7b16fa21dfe47e7b2a"
+                                              :assert   [{:ex/x "foo-cat"
+                                                          :ex/y "bar-cat"
+                                                          :id   :ex/alice}]
+                                              :flakes   102
+                                              :previous {:id "fluree:db:sha256:bbtdwia2mle22abe2z7mmdrs4vufs77yubzxip3chhkmffvfk4npk"}
+                                              :retract  [{:ex/x "foo-3"
+                                                          :ex/y "bar-3"
+                                                          :id   :ex/alice}]
+                                              :size     9326
+                                              :t        5}
+                              :f/message  "meow"
+                              :f/previous {:id "fluree:commit:sha256:bhcunj52uwxshi6jws2ypsjiziyncfa5gal4xptfldj5utb54cpf"}
+                              :f/time     720000
+                              :f/v        0
+                              :id         "fluree:commit:sha256:bq4r74wu4sru43z5f4byipe5zzkgyi2kksqxlmwuttdcwcgwpsrn"}
+                    :retract [{:ex/x "foo-3"
+                               :ex/y "bar-3"
+                               :id   :ex/alice}]
+                    :t       5}]
                @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 3}})))
         (testing "multiple history results"
           (let [history-with-commits @(fluree/history ledger {:history :ex/alice :commit-details true :t {:from 1 :to 5}})]

@@ -8,9 +8,9 @@
     (m/base-schemas)
     (m/type-schemas)
     (m/comparator-schemas)
-    {::iri                    :string
-     ::val                    [:fn value?]
-     ::context-key            :string
-     ::context                [:or
-                               :string
-                               [:map-of ::context-key [:or :string :map]]]}))
+    {::iri     :string
+     ::val     [:fn value?]
+     ::context [:orn
+                [:sequence [:orn [:string :string]
+                                 [:map map?]]]
+                [:map map?]]}))

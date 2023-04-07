@@ -9,6 +9,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
+            [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -22,45 +23,49 @@
                            (pr-str query-map))
                       {:status 400
                        :error  :db/invalid-query}))
-
-      (let [{:strs [context history t commit-details]}
-            (history/history-query-parser query-map)
+      (let [{:keys [opts]}                                         query-map
+            db*                                                    (if-let [policy-opts (perm/policy-opts opts)]
+                                                                     (<? (perm/wrap-policy db policy-opts))
+                                                                     db)
+            {:keys [context history t commit-details] :as _parsed} (history/history-query-parser query-map)
 
             ;; from and to are positive ints, need to convert to negative or fill in default values
             {:strs [from to at]} t
-            [from-t to-t] (if at
-                            (let [t (cond (= "latest" at) (:t db)
-                                          (string? at) (<? (time-travel/datetime->t db at))
-                                          (number? at) (- at))]
-                              [t t])
-                            [(cond (= "latest" from) (:t db)
-                                   (string? from) (<? (time-travel/datetime->t db from))
-                                   (number? from) (- from)
-                                   (nil? from) -1)
-                             (cond (= "latest" to) (:t db)
-                                   (string? to) (<? (time-travel/datetime->t db to))
-                                   (number? to) (- to)
-                                   (nil? to) (:t db))])
-            parsed-context (fql-parse/parse-context query-map db)
+            [from-t to-t]        (if at
+                                   (let [t (cond (= "latest" at) (:t db*)
+                                                 (string? at)   (<? (time-travel/datetime->t db* at))
+                                                 (number? at)   (- at))]
+                                     [t t])
+                                   ;; either (:from or :to)
+                                   [(cond (= "latest" from) (:t db*)
+                                          (string? from)   (<? (time-travel/datetime->t db* from))
+                                          (number? from)   (- from)
+                                          (nil? from)      -1)
+                                    (cond (= "latest" to) (:t db*)
+                                          (string? to)   (<? (time-travel/datetime->t db* to))
+                                          (number? to)   (- to)
+                                          (nil? to)      (:t db*))])
+
+            parsed-context (fql-parse/parse-context query-map db*)
             error-ch       (async/chan)]
         (if history
           ;; filter flakes for history pattern
-          (let [[pattern idx] (<? (history/history-pattern db context history))
-                flake-slice-ch       (query-range/time-range db idx = pattern {:from-t from-t :to-t to-t})
-                flake-ch             (async/chan 1 cat)
+          (let [[pattern idx]  (<? (history/history-pattern db* context history))
+                flake-slice-ch (query-range/time-range db* idx = pattern {:from-t from-t :to-t to-t})
+                flake-ch       (async/chan 1 cat)
 
                 _                    (async/pipe flake-slice-ch flake-ch)
 
                 flakes               (async/<! (async/into [] flake-ch))
 
-                history-results-chan (history/history-flakes->json-ld db parsed-context error-ch flakes)]
+                history-results-chan (history/history-flakes->json-ld db* parsed-context error-ch flakes)]
 
             (if commit-details
               ;; annotate with commit details
               (async/alt!
-                (async/into [] (history/add-commit-details db parsed-context error-ch history-results-chan))
-                ([result] result)
-                error-ch ([e] e))
+               (async/into [] (history/add-commit-details db* parsed-context error-ch history-results-chan))
+               ([result] result)
+               error-ch ([e] e))
 
               ;; we're already done
               (async/alt!
@@ -68,8 +73,8 @@
                 error-ch ([e] e))))
 
           ;; just commits over a range of time
-          (let [flake-slice-ch    (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
-                commit-results-ch (history/commit-flakes->json-ld db parsed-context error-ch flake-slice-ch)]
+          (let [flake-slice-ch    (query-range/time-range db* :tspo = [] {:from-t from-t :to-t to-t})
+                commit-results-ch (history/commit-flakes->json-ld db* parsed-context error-ch flake-slice-ch)]
             (async/alt!
               (async/into [] commit-results-ch) ([result] result)
               error-ch ([e] e))))))))
@@ -83,19 +88,25 @@
     (let [{query :subject, issuer :issuer}
           (or (<? (cred/verify query))
               {:subject query})
-          db            (if (async-util/channel? sources) ;; only support 1 source currently
-                          (<? sources)
-                          sources)
-          db*           (-> (if t
-                              (<? (time-travel/as-of db t))
-                              db)
-                            (assoc-in [:policy :cache] (atom {})))
+
+          db               (if (async-util/channel? sources) ;; only support 1 source currently
+                             (<? sources)
+                             sources)
+
+          db*             (if-let [policy-opts (perm/policy-opts opts)]
+                             (<? (perm/wrap-policy db policy-opts))
+                             db)
+
+          db**              (-> (if t
+                                 (<? (time-travel/as-of db* t))
+                                 db*)
+                               (assoc-in [:policy :cache] (atom {})))
           opts*         (-> opts
                             (assoc :issuer issuer)
                             (dissoc "meta"))
-          start #?(:clj (System/nanoTime)
-                   :cljs (util/current-time-millis))
-          result        (<? (fql/query db* (assoc query :opts opts*)))]
+          start         #?(:clj (System/nanoTime)
+                           :cljs (util/current-time-millis))
+          result        (<? (fql/query db** (assoc query :opts opts*)))]
       (if (get opts "meta")
         {"status" 200
          "result" result
@@ -108,6 +119,10 @@
    the whole multi-query."
   [global-opts m alias query]
   (let [query-opts         (get query "opts")
+        _                  (when (perm/policy-opts query-opts)
+                             (throw (ex-info "Applying policy via `:opts` on individual queries in a multi-query is not supported."
+                                             {:status 400
+                                              :error  :db/invalid-query})))
         query-meta         (get query-opts "meta")
         default-meta       (get global-opts "meta")
         meta?              (or default-meta query-meta)
@@ -149,7 +164,6 @@
              "time"   (util/response-time-formatted start-time)}
             response)
           (let [{:strs [meta] remove-meta? ::remove-meta?} (get-in queries [alias "opts"])
-
                 res            (async/<! port)
                 error?         (:error res) ;; if error key is present in response, it is an error
                 status-global* (when meta

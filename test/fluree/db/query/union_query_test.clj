@@ -7,7 +7,7 @@
 (deftest ^:integration union-queries
   (testing "Testing various 'union' query clauses."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/union" {:context {:ex "http://example.org/ns/"}})
+          ledger @(fluree/create conn "query/union" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                     (fluree/db ledger)
                     [{:id           :ex/brian,

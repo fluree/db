@@ -8,13 +8,10 @@
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.state-machine :as state-machine]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try channel?]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.storage.core :as storage]
             [fluree.db.indexer.default :as idx-default]
-            #?(:clj [fluree.db.serde.avro :as avro-serde])
-            #?(:cljs [fluree.db.serde.json :as json-serde])
+            [fluree.db.serde.json :refer [json-serde]]
             #?@(:cljs [["fs" :as fs]
                        ["path" :as path]])
             #?(:clj [fluree.db.full-text :as full-text])
@@ -145,11 +142,12 @@
   [conn ledger data-type data]
   (let [alias      (ledger-proto/-alias ledger)
         branch     (name (:name (ledger-proto/-branch ledger)))
-        json       (json-ld/normalize-data data)
-        _          (log/debug "normalized JSON:" json)
+        json       (if (string? data)
+                     data
+                     (json-ld/normalize-data data))
         bytes      (->bytes json)
         hash       (crypto/sha2-256 bytes :hex)
-        type-dir   (-> data-type name (str "s"))
+        type-dir   (name data-type)
         path       (str alias
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
@@ -159,6 +157,7 @@
     (write-file write-path bytes)
     {:name    hash
      :hash    hash
+     :json    json
      :size    (count json)
      :address (file-address path)}))
 
@@ -169,6 +168,10 @@
 (defn write-context
   [conn ledger context-data]
   (write-data conn ledger :context context-data))
+
+(defn write-index-item
+  [conn ledger index-type index-data]
+  (write-data conn ledger (str "index/" (name index-type)) index-data))
 
 (defn push
   "Just write to a different directory?"
@@ -206,6 +209,12 @@
   (-ctx-read [conn context-key] (go (read-context conn context-key)))
   (-ctx-write [conn ledger context-data] (go (write-context conn ledger
                                                             context-data)))
+  (-index-file-write [conn ledger index-type index-data]
+    #?(:clj (async/thread (write-index-item conn ledger index-type index-data))
+       :cljs (async/go (write-index-item conn ledger index-type index-data))))
+  (-index-file-read [conn index-address]
+    #?(:clj (async/thread (json/parse (read-address conn index-address) true))
+       :cljs (async/go (json/parse (read-address conn index-address) true))))
 
   conn-proto/iNameService
   (-pull [conn ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
@@ -232,7 +241,7 @@
   (-method [_] :file)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-context [_] (:context ledger-defaults))
+  (-default-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
@@ -243,30 +252,18 @@
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
-  storage/Store
-  (exists? [s k]
-    (let [path (store-key->local-path s k)]
-      #?(:clj  (-> path io/file .exists)
-         :cljs (fs/existsSync path))))
-  (list [s d]
-    (log/error "TODO: file Store/list" d))
-  (read [s k]
-    (log/error "TODO: file Store/read" k))
-  (write [s k data]
-    ;; expects data as byte array
-    (go-try
-      (let [path (store-key->local-path s k)]
-        (write-file path data))))
-  (rename [s old-key new-key]
-    (log/error "TODO: file Store/rename" old-key new-key))
-  (delete [s k]
-    (log/error "TODO: file Store/delete" k))
-
   index/Resolver
   (resolve
-    [conn node]
-    ;; all root index nodes will be empty
-    (storage/resolve-empty-leaf node))
+    [conn {:keys [id leaf tempid] :as node}]
+    (let [cache-key [::resolve id tempid]]
+      (if (= :empty id)
+        (storage/resolve-empty-leaf node)
+        (conn-cache/lru-lookup
+          lru-cache-atom
+          cache-key
+          (fn [_]
+            (storage/resolve-index-node conn node
+                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
 
   #?@(:clj
       [full-text/IndexConnection
@@ -299,11 +296,12 @@
 
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path lru-cache-atom memory] :as _opts}]
+  [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer]
+    :or   {serializer (json-serde)} :as _opts}]
   (go
-    (let [storage-path (trim-last-slash storage-path)
-          conn-id      (str (random-uuid))
-          state        (state-machine/blank-state)
+    (let [storage-path   (trim-last-slash storage-path)
+          conn-id        (str (random-uuid))
+          state          (state-machine/blank-state)
 
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))
@@ -312,9 +310,8 @@
       ;; TODO - need to set up monitor loops for async chans
       (map->FileConnection {:id              conn-id
                             :storage-path    storage-path
-                            :ledger-defaults ld
-                            :serializer      #?(:clj  (avro-serde/avro-serde)
-                                                :cljs (json-serde/json-serde))
+                            :ledger-defaults (ledger-defaults defaults)
+                            :serializer      serializer
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)
