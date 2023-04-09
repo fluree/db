@@ -3,10 +3,6 @@
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld]
             [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -16,17 +12,6 @@
 (def property-sids #{const/$rdf:Property
                      const/$owl:DatatypeProperty
                      const/$owl:ObjectProperty})
-
-(defn is-property?
-  "Takes a list of flakes for a specific subject and returns
-  truthy if any of them are of rdf:type rdf:Property, or the
-  owl-specific versions of properties as defined by property-sids."
-  [s-flakes]
-  (some (fn [f]
-          (and (= const/$rdf:type (flake/p f))
-               (property-sids (flake/o f))))
-        s-flakes))
-
 
 (defn schema-details
   [sid s-flakes]
