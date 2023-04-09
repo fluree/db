@@ -1,5 +1,5 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.db.dbproto :as db-proto]
+  (:require [fluree.db.dbproto :as dbproto]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -20,8 +20,6 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.credential :as cred]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [vswap!]))
 
@@ -79,7 +77,7 @@
                         ;; a literal value
                         (and (some? value) (not= shacl-dt const/$xsd:anyURI))
                         (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                          (if validate-fn
+                          (when validate-fn
                             (or (validate-fn value*)
                                 (throw (ex-info (str "Value did not pass SHACL validation: " value)
                                                 {:status 400 :error :db/shacl-validation}))))
@@ -260,22 +258,6 @@
                                          :children children*))))
           db indexes)
         (assoc :tt-id tt-id))))
-
-(defn remove-tt-id
-  "Removes a tt-id placed on indexes (opposite of add-tt-id)."
-  [db]
-  (let [indexes [:spot :psot :post :opst :tspo]]
-    (reduce
-      (fn [db* idx]
-        (let [{:keys [children] :as node} (get db* idx)
-              children* (reduce-kv
-                          (fn [children* k v]
-                            (assoc children* k (dissoc v :tt-id)))
-                          {} children)]
-          (assoc db* idx (-> node
-                             (dissoc :tt-id)
-                             (assoc :children children*)))))
-      (dissoc db :tt-id) indexes)))
 
 (defn update-novelty-idx
   [novelty-idx add remove]
