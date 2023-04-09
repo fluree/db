@@ -152,7 +152,7 @@
   (if-let [cached (get @iris iri)]
     cached
     ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest add:true
-    (when-let [sid (some-> (flake/match-post (get-in db [:novelty :post]) const/$iri iri const/$xsd:string)
+    (when-let [sid (some-> (flake/match-post (get-in db [:novelty :post]) const/$xsd:anyURI iri const/$xsd:string)
                            first
                            :s)]
       (vswap! iris assoc iri sid)

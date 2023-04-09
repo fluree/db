@@ -45,7 +45,7 @@
     (if f
       (let [pid      (flake/p f)
             details* (cond
-                       (= const/$iri pid)
+                       (= const/$xsd:anyURI pid)
                        (assoc details :iri (flake/o f))
 
                        (= const/$rdf:type pid)
@@ -54,7 +54,7 @@
                            (assoc details :class false
                                           :ref? true)
                            (assoc details :class false))
-                         (if (= const/$iri (flake/o f))
+                         (if (= const/$xsd:anyURI (flake/o f))
                            (assoc details :class false
                                           :ref? true)
                            ;; it is a class, but we already did :class true as a default
@@ -169,7 +169,7 @@
               "_default"   {:name "_default" :id 11 :sid nil}}
         pred (map-pred-id+iri [{:iri const/iri-id
                                 :idx? true
-                                :id   const/$iri}
+                                :id   const/$xsd:anyURI}
                                {:iri  "@type"
                                 :ref? true
                                 :idx? true

@@ -259,7 +259,7 @@
     (let [iri* (expand-iri db iri)]
       ;; string? necessary because expand-iri will return original iri if not matched, and could be a keyword
       (when (string? iri*)
-        (some-> (<? (query-range/index-range db :post = [const/$iri iri*]))
+        (some-> (<? (query-range/index-range db :post = [const/$xsd:anyURI iri*]))
                 first
                 flake/s)))))
 

@@ -160,7 +160,7 @@
                     (log/debug "creating ref flake:" new-flake)
                     (cond-> (conj acc* new-flake)
                       (nil? existing-sid) (conj
-                                            (flake/create ref-sid const/$iri
+                                            (flake/create ref-sid const/$xsd:anyURI
                                                           ref-id
                                                           const/$xsd:string
                                                           t true nil))))
@@ -173,7 +173,7 @@
                           (log/debug "creating value flake:" new-flake)
                           (conj acc* new-flake)))
 
-              (nil? existing-pid) (conj (flake/create pid const/$iri k
+              (nil? existing-pid) (conj (flake/create pid const/$xsd:anyURI k
                                                       const/$xsd:string t true
                                                       nil)))]
         (if (seq r-v-maps)
@@ -214,7 +214,7 @@
                                 (jld-ledger/generate-new-pid type-item iris
                                                              next-pid nil nil))
                 type-flakes (when-not existing-id
-                              [(flake/create type-id const/$iri type-item
+                              [(flake/create type-id const/$xsd:anyURI type-item
                                              const/$xsd:string t true nil)
                                (flake/create type-id const/$rdf:type
                                              const/$rdfs:Class const/$xsd:anyURI
@@ -244,7 +244,7 @@
           base-flakes     (if existing-sid
                             type-assertions
                             (conj type-assertions
-                                  (flake/create sid const/$iri id
+                                  (flake/create sid const/$xsd:anyURI id
                                                 const/$xsd:string t true nil)))
           context*        (assoc context :base-flakes base-flakes)]
       (<? (assert-node* context* node)))))

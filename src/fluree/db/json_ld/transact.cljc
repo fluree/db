@@ -48,7 +48,7 @@
             (recur r
                    (conj class-sids type-sid)
                    (conj class-flakes
-                         (flake/create type-sid const/$iri class-iri const/$xsd:string t true nil)
+                         (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)
                          (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
         [class-sids class-flakes]))))
 
@@ -165,7 +165,7 @@
                          (str "_:f" sid) ;; create a blank node id
                          id)
           base-flakes  (cond-> []
-                               new-subj? (conj (flake/create sid const/$iri id* const/$xsd:string t true nil))
+                               new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
                                new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
       ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
       (register-node subj-mods node sid {:iri-only? (iri-only? node)
@@ -193,7 +193,7 @@
                 datatype-map     (get-in shacl-map [:datatype pid])
                 property-flakes* (if existing-pid
                                    property-flakes
-                                   (conj property-flakes (flake/create pid const/$iri k const/$xsd:string t true nil)))
+                                   (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts?  (or (not new-subj?) existing-pid)
                 flakes*          (if retract?
@@ -285,9 +285,9 @@
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
-  [(flake/create const/$rdf:type const/$iri const/iri-rdf-type const/$xsd:string t true nil)
-   (flake/create const/$rdfs:Class const/$iri const/iri-class const/$xsd:string t true nil)
-   (flake/create const/$iri const/$iri "@id" const/$xsd:string t true nil)])
+  [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-rdf-type const/$xsd:string t true nil)
+   (flake/create const/$rdfs:Class const/$xsd:anyURI const/iri-class const/$xsd:string t true nil)
+   (flake/create const/$xsd:anyURI const/$xsd:anyURI "@id" const/$xsd:string t true nil)])
 
 (defn ref-flakes
   "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."

@@ -68,7 +68,7 @@
       (if p-flakes
         (let [fflake    (first p-flakes)
               p-iri     (<? (get-s-iri (flake/p fflake) db iri-map compact-fn))
-              ref?      (= const/$iri (flake/dt fflake))
+              ref?      (= const/$xsd:anyURI (flake/dt fflake))
               list?     (:i (flake/m fflake))
               p-flakes* (if list?
                           (sort-by #(:i (flake/m %)) p-flakes)
@@ -109,7 +109,7 @@
         (if s-flakes
           (let [sid            (flake/s (first s-flakes))
                 s-iri          (<? (get-s-iri sid db id->iri compact-fn))
-                non-iri-flakes (remove #(= const/$iri (flake/p %)) s-flakes)
+                non-iri-flakes (remove #(= const/$xsd:anyURI (flake/p %)) s-flakes)
                 [assert* retract*]
                 (cond
                   ;; just an IRI declaration, used internally - nothing to output
@@ -294,22 +294,22 @@
 
 (defn add-commit-schema-flakes
   [{:keys [schema] :as db} t]
-  (let [schema-flakes [(flake/create const/$_previous const/$iri const/iri-previous const/$xsd:string t true nil)
-                       (flake/create const/$_address const/$iri const/iri-address const/$xsd:string t true nil)
-                       (flake/create const/$_v const/$iri const/iri-v const/$xsd:string t true nil)
+  (let [schema-flakes [(flake/create const/$_previous const/$xsd:anyURI const/iri-previous const/$xsd:string t true nil)
+                       (flake/create const/$_address const/$xsd:anyURI const/iri-address const/$xsd:string t true nil)
+                       (flake/create const/$_v const/$xsd:anyURI const/iri-v const/$xsd:string t true nil)
 
-                       (flake/create const/$_ledger:alias const/$iri const/iri-alias const/$xsd:string t true nil)
-                       (flake/create const/$_ledger:branch const/$iri const/iri-branch const/$xsd:string t true nil)
-                       (flake/create const/$_ledger:context const/$iri const/iri-context const/$xsd:string t true nil)
+                       (flake/create const/$_ledger:alias const/$xsd:anyURI const/iri-alias const/$xsd:string t true nil)
+                       (flake/create const/$_ledger:branch const/$xsd:anyURI const/iri-branch const/$xsd:string t true nil)
+                       (flake/create const/$_ledger:context const/$xsd:anyURI const/iri-context const/$xsd:string t true nil)
 
-                       (flake/create const/$_commit:signer const/$iri const/iri-issuer const/$xsd:string t true nil)
-                       (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:string t true nil)
-                       (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:string t true nil)
-                       (flake/create const/$_commit:data const/$iri const/iri-data const/$xsd:string t true nil)
+                       (flake/create const/$_commit:signer const/$xsd:anyURI const/iri-issuer const/$xsd:string t true nil)
+                       (flake/create const/$_commit:message const/$xsd:anyURI const/iri-message const/$xsd:string t true nil)
+                       (flake/create const/$_commit:time const/$xsd:anyURI const/iri-time const/$xsd:string t true nil)
+                       (flake/create const/$_commit:data const/$xsd:anyURI const/iri-data const/$xsd:string t true nil)
 
-                       (flake/create const/$_commitdata:flakes const/$iri const/iri-flakes const/$xsd:string t true nil)
-                       (flake/create const/$_commitdata:size const/$iri const/iri-size const/$xsd:string t true nil)
-                       (flake/create const/$_commitdata:t const/$iri const/iri-t const/$xsd:string t true nil)]
+                       (flake/create const/$_commitdata:flakes const/$xsd:anyURI const/iri-flakes const/$xsd:string t true nil)
+                       (flake/create const/$_commitdata:size const/$xsd:anyURI const/iri-size const/$xsd:string t true nil)
+                       (flake/create const/$_commitdata:t const/$xsd:anyURI const/iri-t const/$xsd:string t true nil)]
         db*           (add-commit-flakes-to-db db schema-flakes)]
     (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
 
@@ -333,7 +333,7 @@
           db-sid (next-sid)
 
           base-flakes [ ;; link db to associated commit meta: @id
-                       (flake/create t const/$iri id const/$xsd:string t true nil)
+                       (flake/create t const/$xsd:anyURI id const/$xsd:string t true nil)
 
                        ;; commit flakes
                        ;; address
@@ -354,7 +354,7 @@
 
                        ;; db flakes
                        ;; @id
-                       (flake/create db-sid const/$iri db-id const/$xsd:string t true nil)
+                       (flake/create db-sid const/$xsd:anyURI db-id const/$xsd:string t true nil)
                        ;; t
                        (flake/create db-sid const/$_commitdata:t db-t const/$xsd:int t true nil)
                        ;; address
@@ -379,7 +379,7 @@
                              ;; create new issuer flake and a reference to it
                              (let [new-issuer-sid (next-sid)]
                                [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t true nil)
-                                (flake/create new-issuer-sid const/$iri issuer-iri const/$xsd:string t true nil)])))
+                                (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri const/$xsd:string t true nil)])))
           message-flakes (when message
                            [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
           flakes         (cond-> base-flakes
