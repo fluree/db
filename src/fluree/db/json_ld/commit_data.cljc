@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.commit-data
-  (:require [fluree.db.index :as index]
-            [fluree.crypto :as crypto]
+  (:require [fluree.crypto :as crypto]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.log :as log]
@@ -154,20 +153,6 @@
                                  (merge-template json-ld-index-template)))]
     (merge-template commit-map* json-ld-base-template)))
 
-(defn- un-jsonify
-  "Turns json commit IRIs into keywords"
-  [m]
-  (reduce-kv
-    (fn [acc k v]
-      (if (string? k)
-        (let [kw (-> (str/split k #"#") second keyword)
-              v* (or (:value v) (:id v))]
-          (if v*
-            (assoc acc kw v*)
-            acc))
-        acc))
-    {} m))
-
 (defn json-ld->map
   "Turns json-ld commit meta into the clojure map structure."
   [commit-json-ld {:keys [commit-address spot psot post opst tspo]}]
@@ -279,22 +264,6 @@
           :data    data-map}
          index-root-maps))
 
-(defn update-index
-  "Updates an existing commit with recently completed index data.
-  This differs from new-index, as that is always created from the current
-  db's commit map that generates the index. This will update the most recent
-  commit map with the results of an asynchronous indexing process that just completed.
-
-  Verifies commit-index is at least as current as the index in the commit map, else
-  just returns original commit map."
-  [commit-map new-commit-index]
-  (let [{existing-index-db :data} (:index commit-map)
-        {new-index-db :data} new-commit-index]
-    (if (and existing-index-db
-             (> (:t existing-index-db) (:t new-index-db)))
-      commit-map
-      (assoc commit-map :index new-commit-index))))
-
 (defn t
   "Given a commit map, returns the t value of the commit."
   [commit-map]
@@ -304,12 +273,6 @@
   "Given a commit map, returns the t value of the index (if exists)."
   [commit-map]
   (-> commit-map :index :data :t))
-
-
-(defn older-t?
-  "Returns true if first 't' value is older than second 't' value."
-  [t t']
-  (< t t'))
 
 (defn use-latest-index
   "Checks if old-commit has a more current index than new-commit and
@@ -376,9 +339,3 @@
             prev-commit (assoc :previous prev-commit)
             message (assoc :message message)
             tag (assoc :tag tag))))
-
-(defn update-db
-  "Updates the :data portion of the commit map to represent a saved new db update."
-  [commit-map dbid t db-address flakes size]
-  (let [prev-data (select-keys (:data commit-map) [:id :address])]
-    (assoc commit-map :data (new-db-commit dbid t db-address prev-data flakes size))))
