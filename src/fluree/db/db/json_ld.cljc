@@ -1,8 +1,6 @@
 (ns fluree.db.db.json-ld
   (:require [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.query.schema :as schema]
-            [fluree.db.util.schema :as schema-util]
             [fluree.db.query.fql :as fql]
             [fluree.db.index :as index]
             [fluree.db.query.range :as query-range]
@@ -29,60 +27,6 @@
   {:f/view   {:root? true}
    :f/modify {:root? true}})
 
-
-(defn validate-ledger-name
-  "Returns when ledger name is valid.
-  Otherwise throws."
-  [ledger-id type]
-  (when-not (re-matches #"^[a-z0-9-]{1,100}" ledger-id)
-    (throw (ex-info (str "Invalid " type " id: " ledger-id ". Must match a-z0-9- and be no more than 100 characters long.")
-                    {:status 400 :error :db/invalid-db}))))
-
-;; TODO - we should make the names more restrictive
-(defn validate-ledger-ident
-  "Returns two-tuple of [network name-or-dbid] if db-ident is valid.
-
-  Will ignore a direct db name reference (prefixed with '_')
-  Otherwise throws."
-  [ledger]
-  (let [[_ network maybe-alias] (re-find #"^([^/]+)/(?:_)?([^/]+)$" (util/keyword->str ledger))]
-    (if (and network maybe-alias)
-      [network maybe-alias]
-      (throw (ex-info (str "Invalid ledger identity: " ledger)
-                      {:status 400 :error :db/invalid-ledger-name})))))
-
-;; exclude these predicates from the database
-(def ^:const exclude-predicates #{const/$_tx:tx const/$_tx:sig const/$_tx:tempids})
-
-(defn add-predicate-to-idx
-  "Adds a predicate to post index when :index true is turned on.
-  Ensures adding the predicate into novelty won't blow past novelty-max.
-  When reindex? is true, we are doing a full reindex and allow the novelty
-  to grow beyond novelty-max."
-  [db pred-id {:keys [reindex?] :as opts}]
-  (go-try
-    (let [flakes-to-idx (<? (query-range/index-range db :psot = [pred-id]))
-          {:keys [post size]} (:novelty db)
-          with-size     (flake/size-bytes flakes-to-idx)
-          total-size    (+ size with-size)
-          {:keys [novelty-min novelty-max]} (get-in db [:conn :meta])
-          _             (if (and (> total-size novelty-max) (not reindex?))
-                          (throw (ex-info (str "You cannot add " pred-id " to the index at this point. There are too many affected flakes.")
-                                          {:error  :db/max-novelty-size
-                                           :status 400})))
-          post          (into post flakes-to-idx)]
-      (swap! (:schema-cache db) empty)
-      (-> db
-          (assoc-in [:novelty :post] post)
-          (assoc-in [:novelty :size] total-size)))))
-
-
-(defn- with-db-size
-  "Calculates db size. On JVM, would typically be used in a separate thread for concurrency"
-  [current-size flakes]
-  (+ current-size (flake/size-bytes flakes)))
-
-
 (defn- with-t-novelty
   [db flakes flakes-bytes]
   (let [{:keys [novelty schema]} db
@@ -102,144 +46,6 @@
                                opst))
                   :size (+ size #?(:clj @flakes-bytes :cljs flakes-bytes))}]
     res))
-
-
-(defn- with-t-ecount
-  "Calculates updated ecount based on flakes for with-t. Also records if a schema or settings change
-  occurred."
-  [{:keys [ecount schema] :as db} flakes]
-  (loop [[flakes-s & r] (partition-by flake/s flakes)
-         schema-change?  (boolean (nil? schema))            ;; if no schema for any reason, make sure one is generated
-         setting-change? false
-         ecount          ecount]
-    (if flakes-s
-      (let [sid (-> flakes-s first flake/s)
-            cid (flake/sid->cid sid)]
-        (recur r
-               (if (true? schema-change?)
-                 schema-change?
-                 (boolean (schema-util/is-schema-sid? sid)))
-               (if (true? setting-change?)
-                 setting-change?
-                 (schema-util/is-setting-sid? sid))
-               (update ecount cid #(if % (max % sid) sid))))
-      {:schema-change?  schema-change?
-       :setting-change? setting-change?
-       :ecount          ecount})))
-
-
-(defn- with-t-updated-schema
-  "If the schema changed, there may be also be new flakes with the transaction that rely on those
-  schema changes. Re-run novelty with the updated schema so things make it into the proper indexes.
-
-  This is not common, so while this duplicates the novelty work, in most circumstances
-  it allows novelty to be run in parallel and this function is never triggered."
-  [proposed-db flakes flake-bytes]
-  (go-try
-    (let [schema  (<? (vocab/vocab-map proposed-db))
-          novelty (with-t-novelty (assoc proposed-db :schema schema) flakes flake-bytes)]
-      (assoc proposed-db :schema schema
-                         :novelty novelty))))
-
-
-(defn- with-t-updated-settings
-  "If settings changed, return new settings map."
-  [proposed-db]
-  (go-try
-    (assoc proposed-db :settings (<? (schema/setting-map proposed-db)))))
-
-
-(defn with-t
-  ([db flakes] (with-t db flakes nil))
-  ([{:keys [stats t] :as db} flakes opts]
-   (go-try
-     (let [new-t           (-> flakes first flake/t)
-           _               (when (not= new-t (dec t))
-                             (throw (ex-info (str "Invalid with called for db " (:dbid db) " because current 't', " t " is not beyond supplied transaction t: " new-t ".")
-                                             {:status 500
-                                              :error  :db/unexpected-error})))
-           bytes #?(:clj   (future (flake/size-bytes flakes)) ;; calculate in separate thread for CLJ
-                    :cljs (flake/size-bytes flakes))
-           novelty #?(:clj (future (with-t-novelty db flakes bytes)) ;; calculate in separate thread for CLJ
-                      :cljs (with-t-novelty db flakes bytes))
-           {:keys [schema-change? setting-change? ecount]} (with-t-ecount db flakes)
-           stats*          (-> stats
-                               (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
-                               (update :flakes + (count flakes)))]
-       (cond-> (assoc db :t new-t
-                         :novelty #?(:clj @novelty :cljs novelty)
-                         :ecount ecount
-                         :stats stats*)
-               schema-change? (-> (with-t-updated-schema flakes bytes) <?)
-               setting-change? (-> with-t-updated-settings <?))))))
-
-
-(defn with
-  "Returns db 'with' flakes added as a core async promise channel.
-  Note this always does a re-sort."
-  ([db block flakes] (with db block flakes nil))
-  ([db block flakes opts]
-   (let [resp-ch (async/promise-chan)]
-     (async/go
-       (try*
-         (if (empty? flakes)
-           (async/put! resp-ch db)
-           (let [flakes-by-t (->> flakes
-                                  (sort flake/cmp-flakes-block)
-                                  (partition-by :t))]
-             (loop [[t-flakes & r] flakes-by-t
-                    db db]
-               (if t-flakes
-                 (let [db' (<? (with-t db t-flakes opts))]
-                   (recur r db'))
-                 (async/put! resp-ch db)))))
-         (catch* e
-                 (async/put! resp-ch e))))
-     resp-ch)))
-
-(defn forward-time-travel-db?
-  "Returns true if db is a forward time travel db."
-  [db]
-  (not (nil? (:tt-id db))))
-
-(defn forward-time-travel
-  "Returns a core async chan with a new db based on the provided db, including the provided flakes.
-  Flakes can contain one or more 't's, but should be sequential and start after the current
-  't' of the provided db. (i.e. if db-t is -14, flakes 't' should be -15, -16, etc.).
-  Remember 't' is negative and thus should be in descending order.
-
-  A tt-id (time-travel-id), if provided, can be any unique identifier of any type and is required.
-  It must be unique (to the computer/process) to avoid any query caching issues.
-
-  A forward-time-travel dbf can be further forward-time-traveled. If a tt-id is provided, ensure
-  it is unique for each successive call.
-
-  A forward-time travel DB is held in memory, and is not shared across servers. Ensure you
-  have adequate memory to hold the flakes you generate and add. If access is provided via
-  an external API, do any desired size restrictions or controls within your API endpoint.
-
-  Remember schema operations done via forward-time-travel should be done in a 't' prior to
-  the flakes that end up requiring the schema change."
-  [db tt-id flakes]
-  (go-try
-    (let [tt-id'      (if (nil? tt-id) (random-uuid) tt-id)
-          ;; update each root index with the provided tt-id
-          ;; As the root indexes are resolved, the tt-id will carry through the b-tree and ensure
-          ;; query caching is specific to this tt-id
-          db'         (reduce (fn [db* idx]
-                                (assoc db* idx (-> (get db* idx)
-                                                   (assoc :tt-id tt-id'))))
-                              (assoc db :tt-id tt-id')
-                              [:spot :psot :post :opst])
-          flakes-by-t (->> flakes
-                           (sort-by :t)
-                           reverse
-                           (partition-by :t))]
-      (loop [db db'
-             [flakes & rest] flakes-by-t]
-        (if flakes
-          (recur (<? (with-t db flakes)) rest)
-          db)))))
 
 (defn expand-iri
   "Expands an IRI from the db's context."
@@ -333,11 +139,6 @@
 
 ;; ================ GraphDB record support fns ================================
 
-(defn- graphdb-latest-db [{:keys [current-db-fn policy]}]
-  (go-try
-    (let [current-db (<? (current-db-fn))]
-      (assoc current-db :policy policy))))
-
 (defn- graphdb-root-db [this]
   (assoc this :policy root-policy-map))
 
@@ -356,15 +157,6 @@
           (str "Invalid predicate property: " (pr-str property)))
   (cond->> (get-in schema [:pred predicate property])
            (= :restrictCollection property) (dbproto/-c-prop this :partition)))
-
-(defn- graphdb-pred-name
-  "Lookup the predicate name if needed; return ::no-pred if pred arg is nil so
-  we can differentiate between that and (dbproto/-p-prop ...) returning nil"
-  [this pred]
-  (cond
-    (nil? pred) ::no-pred
-    (string? pred) pred
-    :else (dbproto/-p-prop this :name pred)))
 
 (defn- graphdb-tag
   "resolves a tags's value given a tag subject id; optionally shortening the
@@ -447,14 +239,11 @@
 
 ;; TODO - conn is included here because current index-range query looks for conn on the db
 ;; TODO - this can likely be excluded once index-range is changed to get 'conn' from (:conn ledger) where it also exists
-(defrecord JsonLdDb [ledger conn method alias branch commit block t tt-id stats
+(defrecord JsonLdDb [ledger conn method alias branch commit t tt-id stats
                      spot psot post opst tspo schema comparators novelty policy ecount
                      default-context context-type context-cache new-context?]
   dbproto/IFlureeDb
-  (-latest-db [this] (graphdb-latest-db this))
   (-rootdb [this] (graphdb-root-db this))
-  (-forward-time-travel [db flakes] (forward-time-travel db nil flakes))
-  (-forward-time-travel [db tt-id flakes] (forward-time-travel db tt-id flakes))
   (-c-prop [this property collection] (graphdb-c-prop this property collection))
   (-class-prop [this property class]
     (if (= :subclasses property)
@@ -474,12 +263,6 @@
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-search [this fparts] (query-range/search this fparts))
   (-query [this query-map] (fql/query this query-map))
-  (-with [this block flakes] (with this block flakes nil))
-  (-with [this block flakes opts] (with this block flakes opts))
-  (-with-t [this flakes] (with-t this flakes nil))
-  (-with-t [this flakes opts] (with-t this flakes opts))
-  (-add-predicate-to-idx [this pred-id] (add-predicate-to-idx this pred-id nil))
-  (-db-type [_] :json-ld)
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
@@ -493,7 +276,7 @@
      IPrintWithWriter
      (-pr-writer [db w opts]
        (-write w "#FlureeJsonLdDb ")
-       (-write w (pr {:method      (:method db) :alias (:alias db) :block (:block db)
+       (-write w (pr {:method      (:method db) :alias (:alias db)
                       :t           (:t db) :stats (:stats db)
                       :policy      (:policy db)})))))
 
@@ -501,7 +284,7 @@
    (defmethod print-method JsonLdDb [^JsonLdDb db, ^Writer w]
      (.write w (str "#FlureeJsonLdDb "))
      (binding [*out* w]
-       (pr {:method (:method db) :alias (:alias db) :block (:block db)
+       (pr {:method (:method db) :alias (:alias db)
             :t      (:t db) :stats (:stats db) :policy (:policy db)}))))
 
 (defn new-novelty-map
@@ -552,7 +335,6 @@
                     :alias           alias
                     :branch          (:name branch)
                     :commit          (:commit branch)
-                    :block           0
                     :t               0
                     :tt-id           nil
                     :stats           stats
