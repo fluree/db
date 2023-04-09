@@ -149,13 +149,5 @@
   "When not bootstrapping with a transaction, bootstraps initial base set of flakes required for a db."
   [blank-db]
   (let [t           -1
-        base-flakes (jld-transact/base-flakes t)
-        size (flake/size-bytes base-flakes)]
-    (-> blank-db
-        (update-in [:novelty :spot] into base-flakes)
-        (update-in [:novelty :psot] into base-flakes)
-        (update-in [:novelty :post] into base-flakes)
-        (update-in [:novelty :tspo] into base-flakes)
-        (update-in [:novelty :size] + size)
-        (update-in [:stats :size] + size)
-        (update-in [:stats :flakes] + (count base-flakes)))))
+        base-flakes (jld-transact/base-flakes t)]
+    (commit-data/update-novelty blank-db base-flakes)))

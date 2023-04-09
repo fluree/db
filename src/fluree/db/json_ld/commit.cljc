@@ -9,7 +9,7 @@
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.util.async :refer [<? go-try channel?]]
+            [fluree.db.util.async :refer [<? go-try]]
             #?(:clj  [clojure.core.async :refer [go <!] :as async]
                :cljs [cljs.core.async :refer [go <! put!] :as async])
             [fluree.db.indexer.proto :as idx-proto]
@@ -39,16 +39,6 @@
         (vswap! iri-map assoc sid iri)
         iri))))
 
-
-(defn- update-subj-prop
-  "Helper fn to subject-block"
-  [map property val]
-  (update map property #(if %
-                          (if (sequential? %)
-                            (conj % val)
-                            [% val])
-                          val)))
-
 (defn get-ref-iris
   "Returns a list of object IRIs from a set of flakes.
   Only to be used for ref? predicates"
@@ -61,7 +51,7 @@
         acc))))
 
 (defn- subject-block
-  [s-flakes {:keys [schema] :as db} iri-map ^clojure.lang.Volatile ctx compact-fn]
+  [s-flakes db iri-map ^clojure.lang.Volatile ctx compact-fn]
   (go-try
     (loop [[p-flakes & r] (partition-by flake/p s-flakes)
            acc nil]
@@ -277,20 +267,9 @@
 (defn add-commit-flakes-to-db
   "ecount and sid must be updated prior to calling this."
   [db flakes]
-  (let [{:keys [novelty]} db
-        {:keys [spot psot post opst tspo]} novelty
-        size (flake/size-bytes flakes)]
-    (-> db
-        (assoc :novelty {:spot (into spot flakes)
-                         :psot (into psot flakes)
-                         :post (into post flakes)
-                         :opst opst
-                         :tspo (into tspo flakes)
-                         :size (+ (:size novelty) size)}
-               :stats (-> (:stats db)
-                          (update :size + size)
-                          (update :flakes + (count flakes))))
-        (jld-transact/add-tt-id))))
+  (-> db
+      (commit-data/update-novelty flakes)
+      jld-transact/add-tt-id))
 
 (defn add-commit-schema-flakes
   [{:keys [schema] :as db} t]

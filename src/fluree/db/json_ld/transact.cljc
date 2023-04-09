@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.db.dbproto :as dbproto]
+  (:require [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.dbproto :as dbproto]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -259,22 +260,12 @@
           db indexes)
         (assoc :tt-id tt-id))))
 
-(defn update-novelty-idx
-  [novelty-idx add remove]
-  (-> (reduce disj novelty-idx remove)
-      (into add)))
-
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
   [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-rdf-type const/$xsd:string t true nil)
    (flake/create const/$rdfs:Class const/$xsd:anyURI const/iri-class const/$xsd:string t true nil)
    (flake/create const/$xsd:anyURI const/$xsd:anyURI "@id" const/$xsd:string t true nil)])
-
-(defn ref-flakes
-  "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
-  [flakes]
-  (filter #(= (flake/dt %) const/$xsd:anyURI) flakes))
 
 ;; TODO - can use transient! below
 (defn stage-update-novelty
@@ -295,22 +286,12 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn db-after
-  [{:keys [add remove ref-add ref-remove size count] :as staged} {:keys [db-before policy bootstrap? t block] :as tx-state}]
-  (let [{:keys [novelty]} db-before
-        {:keys [spot psot post opst tspo]} novelty
-        new-db (assoc db-before :ecount (final-ecount tx-state)
-                                :policy policy ;; re-apply policy to db-after
-                                :t t
-                                :block block
-                                :novelty {:spot (update-novelty-idx spot add remove)
-                                          :psot (update-novelty-idx psot add remove)
-                                          :post (update-novelty-idx post add remove)
-                                          :opst (update-novelty-idx opst ref-add ref-remove)
-                                          :tspo (update-novelty-idx tspo add remove)
-                                          :size (+ (:size novelty) size)}
-                                :stats (-> (:stats db-before)
-                                           (update :size + size)
-                                           (update :flakes + count)))]
+  [{:keys [add remove] :as _staged} {:keys [db-before policy bootstrap? t] :as tx-state}]
+  (let [new-db (-> db-before
+                   (assoc :ecount (final-ecount tx-state)
+                          :policy policy ;; re-apply policy to db-after
+                          :t t)
+                   (commit-data/update-novelty add remove))]
     (if bootstrap?
       new-db
       ;; TODO - we used to add tt-id to break the cache, so multiple 'staged' dbs with same t value don't get cached as the same
@@ -319,21 +300,15 @@
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an updated db."
-  [new-flakes {:keys [t stage-update? db-before refs class-mods] :as _tx-state}]
+  [new-flakes {:keys [t stage-update? db-before] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
           staged-map   {:add        add
-                        :remove     remove
-                        :ref-add    (ref-flakes add)
-                        :ref-remove (ref-flakes remove)
-                        :count      (cond-> (if add (count add) 0)
-                                            remove (- (count remove)))
-                        :size       (cond-> (flake/size-bytes add)
-                                            remove (- (flake/size-bytes remove)))}
-          db-after     (cond-> (db-after staged-map _tx-state)
+                        :remove     remove}
+          db-after     (cond-> (db-after staged-map tx-state)
                                vocab-flakes vocab/refresh-schema
                                vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))

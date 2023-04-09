@@ -135,14 +135,12 @@
 (defn update-with
   "When creating a new db from a transaction, merge new schema changes
   into existing schema of previous db."
-  [{:keys [schema] :as _db-before} db-t new-refs vocab-flakes]
+  [schema db-t new-refs vocab-flakes]
   (if (empty? vocab-flakes)
     schema
-    (let [{:keys [refs]} schema
-          refs* (into refs new-refs)]
-      (-> (assoc schema :refs refs*)
-          (update-with* db-t vocab-flakes)
-          (assoc :refs refs*)))))
+    (-> schema
+        (update :refs into new-refs)
+        (update-with* db-t vocab-flakes))))
 
 (defn base-schema
   []

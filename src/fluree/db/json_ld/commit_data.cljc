@@ -1,9 +1,13 @@
 (ns fluree.db.json-ld.commit-data
   (:require [fluree.crypto :as crypto]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
-            [clojure.string :as str]
             [fluree.db.constants :as const]))
 
 (comment
@@ -339,3 +343,42 @@
             prev-commit (assoc :previous prev-commit)
             message (assoc :message message)
             tag (assoc :tag tag))))
+
+(defn ref?
+  [f]
+  (-> f
+      flake/dt
+      (= const/$xsd:anyURI)))
+
+(defn ref-flakes
+  "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
+  [flakes]
+  (filter ref? flakes))
+
+(defn update-novelty-idx
+  [novelty-idx add remove]
+  (-> (reduce disj novelty-idx remove)
+      (into add)))
+
+(defn update-novelty
+  ([db add]
+   (update-novelty db add []))
+
+  ([db add rem]
+   (let [ref-add     (ref-flakes add)
+         ref-rem     (ref-flakes rem)
+         flake-count (cond-> 0
+                       add (+ (count add))
+                       rem (- (count rem)))
+         flake-size  (cond-> 0
+                       add (+ (flake/size-bytes add))
+                       rem (- (flake/size-bytes rem)))]
+     (-> db
+         (update-in [:novelty :spot] update-novelty-idx add rem)
+         (update-in [:novelty :psot] update-novelty-idx add rem)
+         (update-in [:novelty :post] update-novelty-idx add rem)
+         (update-in [:novelty :opst] update-novelty-idx ref-add ref-rem)
+         (update-in [:novelty :tspo] update-novelty-idx add rem)
+         (update-in [:novelty :size] + flake-size)
+         (update-in [:stats :size] + flake-size)
+         (update-in [:stats :flakes] + flake-count)))))

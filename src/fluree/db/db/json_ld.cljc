@@ -27,25 +27,6 @@
   {:f/view   {:root? true}
    :f/modify {:root? true}})
 
-(defn- with-t-novelty
-  [db flakes flakes-bytes]
-  (let [{:keys [novelty schema]} db
-        pred-map (:pred schema)
-        {:keys [spot psot post opst size]} novelty
-        res      {:spot (into spot flakes)
-                  :psot (into psot flakes)
-                  :post (into post flakes)
-                  :opst (->> flakes
-                             (sort-by flake/p)
-                             (partition-by flake/p)
-                             (reduce
-                               (fn [opst* p-flakes]
-                                 (if (get-in pred-map [(-> p-flakes first flake/p) :ref?])
-                                   (into opst* p-flakes)
-                                   opst*))
-                               opst))
-                  :size (+ size #?(:clj @flakes-bytes :cljs flakes-bytes))}]
-    res))
 
 (defn expand-iri
   "Expands an IRI from the db's context."
