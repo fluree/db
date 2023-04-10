@@ -80,10 +80,11 @@
   the requested depth within the select-spec"
   [db cache context compact-fn fuel-vol max-fuel {:keys [wildcard? _id? depth reverse] :as select-spec} depth-i s-flakes]
   (go-try
+    (log/debug "flakes->res select-spec:" select-spec)
     (when (not-empty s-flakes)
       (loop [[p-flakes & r] (partition-by flake/p s-flakes)
              acc (if _id?
-                   {:_id (flake/s (first s-flakes))}
+                   {"_id" (flake/s (first s-flakes))}
                    {})]
         (if p-flakes
           (let [ff    (first p-flakes)
@@ -92,6 +93,7 @@
                 spec  (or (get select-spec p)
                           (when wildcard?
                             (wildcard-spec db cache compact-fn p)))
+                _     (log/debug "flakes->res spec:" spec)
                 p-iri (:as spec)
                 v     (cond
                         (nil? spec)
@@ -132,11 +134,12 @@
                                           ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
                                           (let [id-key (:as (wildcard-spec db cache compact-fn const/$iri))
                                                 c-iri  (<? (dbproto/-iri db (flake/o f) compact-fn))]
+                                            (log/debug "id-key:" id-key "c-iri:" c-iri)
                                             {id-key c-iri}))
                                         (flake/o f))]
                               (recur r (conj acc res)))
                             (if (and (= 1 (count acc))
-                                     (not (#{:list :set} (-> context (get p-iri) :container))))
+                                     (not (#{"list" "set"} (-> context (get p-iri) (get "@container")))))
                               (first acc)
                               acc))))]
             (if v
