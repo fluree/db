@@ -240,26 +240,6 @@
     (assoc ecount const/$_predicate @last-pid
                   const/$_default @last-sid)))
 
-(defn add-tt-id
-  "Associates a unique tt-id for any in-memory staged db in their index roots.
-  tt-id is used as part of the caching key, by having this in place it means
-  that even though the 't' value hasn't changed it will cache each stage db
-  data as its own entity."
-  [db]
-  (let [tt-id   (random-uuid)
-        indexes [:spot :psot :post :opst :tspo]]
-    (-> (reduce
-          (fn [db* idx]
-            (let [{:keys [children] :as node} (get db* idx)
-                  children* (reduce-kv
-                              (fn [children* k v]
-                                (assoc children* k (assoc v :tt-id tt-id)))
-                              {} children)]
-              (assoc db* idx (assoc node :tt-id tt-id
-                                         :children children*))))
-          db indexes)
-        (assoc :tt-id tt-id))))
-
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
@@ -296,7 +276,7 @@
       new-db
       ;; TODO - we used to add tt-id to break the cache, so multiple 'staged' dbs with same t value don't get cached as the same
       ;; TODO - now that each db should have its own unique hash, we can use the db's hash id instead of 't' or 'tt-id' for caching
-      (add-tt-id new-db))))
+      (commit-data/add-tt-id new-db))))
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an updated db."
