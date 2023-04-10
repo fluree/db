@@ -35,8 +35,8 @@
                 (vswap! iri-cache assoc v iri)
                 iri)
               (catch* e
-                      (log/error e "Error displaying iri:" v)
-                      (>! error-ch e)))))))
+                (log/error e "Error displaying iri:" v)
+                (>! error-ch e)))))))
 
 (defprotocol ValueSelector
   "Format a where search solution (map of pattern matches) by extracting and
@@ -63,8 +63,8 @@
     [_ db iri-cache context compact error-ch solution]
     (go (try* (agg-fn solution)
               (catch* e
-                      (log/error e "Error applying aggregate selector")
-                      (>! error-ch e))))))
+                (log/error e "Error applying aggregate selector")
+                (>! error-ch e))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -87,8 +87,8 @@
            ;; TODO: Replace these nils with fuel values when we turn fuel back on
            (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))
          (catch* e
-                 (log/error e "Error formatting subgraph for subject:" sid)
-                 (>! error-ch e)))))))
+           (log/error e "Error formatting subgraph for subject:" sid)
+           (>! error-ch e)))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
@@ -103,8 +103,8 @@
   according to the selector or collection of selectors specified by `selectors`"
   [selectors db iri-cache context compact error-ch solution]
   (if (sequential? selectors)
-    (go-loop [selectors  selectors
-              values     []]
+    (go-loop [selectors selectors
+              values []]
       (if-let [selector (first selectors)]
         (let [value (<! (format-value selector db iri-cache context compact error-ch solution))]
           (recur (rest selectors)

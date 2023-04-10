@@ -379,7 +379,7 @@
   [db q error-ch]
   (let [where-clause      (get q "where")
         initial-solutions (-> q
-                              :values
+                              (get "values")
                               not-empty
                               (or [blank-solution]))
         out-ch            (async/chan)]

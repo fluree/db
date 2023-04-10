@@ -39,7 +39,7 @@
   ordering specified by the `:order-by` clause of the supplied parsed query.
   Note that all solutions from `solution-ch` are first loaded into memory before
   they are sorted in place and placed individually on the output channel."
-  [{:keys [order-by]} solution-ch]
+  [{:strs [order-by]} solution-ch]
   (if order-by
     (let [comparator (partial compare-solutions order-by)
           coll-ch    (async/into [] solution-ch)

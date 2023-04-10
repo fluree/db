@@ -76,15 +76,15 @@
 (defn safe-read
   [code-str]
   (try*
-    (let [code (read-string code-str)]
-      (when-not (list? code)
-        (throw (ex-info (code-str "Invalid function: " code-str)
-                        {:status 400 :error :db/invalid-query})))
-      code)
-    (catch* e
-      (log/warn e "Invalid query function attempted: " code-str)
-      (throw (ex-info (str "Invalid query function: " code-str)
-                      {:status 400 :error :db/invalid-query})))))
+   (let [code (read-string code-str)]
+     (when-not (list? code)
+       (throw (ex-info (code-str "Invalid function: " code-str)
+                       {:status 400 :error :db/invalid-query})))
+     code)
+   (catch* e
+     (log/warn e "Invalid query function attempted: " code-str)
+     (throw (ex-info (str "Invalid query function: " code-str)
+                     {:status 400 :error :db/invalid-query})))))
 
 (defn variables
   "Returns the set of items within the arbitrary data structure `data` that
@@ -320,6 +320,7 @@
 
 (defn parse-triple
   [[s-pat p-pat o-pat] db context]
+  (log/debug "parse-triple:" s-pat p-pat o-pat)
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
     (if (and (= const/$rdf:type (::where/val p))
@@ -356,8 +357,8 @@
 
 (defmethod parse-pattern :bind
   [{:strs [bind]} _vars _db _context]
-  (let [parsed (parse-bind-map bind)
-        _ (log/debug "parsed bind map:" parsed)
+  (let [parsed  (parse-bind-map bind)
+        _       (log/debug "parsed bind map:" parsed)
         pattern (where/->pattern :bind parsed)]
     (log/debug "parse-pattern :bind pattern:" pattern)
     pattern))
@@ -446,9 +447,9 @@
 
 (defn parse-analytical-query*
   [q db]
+  (log/debug "parse-analytical-query*:" q)
   (let [context  (parse-context q db)
         [vars values] (parse-values q)
-        _        (log/debug "parse-analytical-query*:" q)
         where    (parse-where q vars db context)
         grouping (parse-grouping q)
         ordering (parse-ordering q)]
@@ -463,9 +464,11 @@
 
 (defn parse-analytical-query
   [q db]
-  (let [parsed (parse-analytical-query* q db)]
-    (or (re-parse-as-simple-subj-crawl parsed)
-        parsed)))
+  (let [parsed    (parse-analytical-query* q db)
+        re-parsed (or (re-parse-as-simple-subj-crawl parsed)
+                      parsed)]
+    (log/debug "parse-analytical-query re-parsed:" re-parsed)
+    re-parsed))
 
 (defn parse
   [q db]
