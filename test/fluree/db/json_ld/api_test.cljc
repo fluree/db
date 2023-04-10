@@ -39,18 +39,18 @@
 
        :cljs
        (async done
-              (go
-               (let [conn         (<! (test-utils/create-conn))
-                     ledger-alias "testledger"
-                     ledger       (<p! (fluree/create conn ledger-alias))
-                     db           (<p! (fluree/stage (fluree/db ledger)
-                                                     [{"id"           "f:me"
-                                                       "type"         "schema:Person"
-                                                       "schema:fname" "Me"}]))]
-                 (<p! (fluree/commit! ledger db))
-                 (is (test-utils/retry-exists? conn ledger-alias 100))
-                 (is (not (<p! (fluree/exists? conn "notaledger"))))
-                 (done)))))))
+         (go
+          (let [conn         (<! (test-utils/create-conn))
+                ledger-alias "testledger"
+                ledger       (<p! (fluree/create conn ledger-alias))
+                db           (<p! (fluree/stage (fluree/db ledger)
+                                                [{"id"           "f:me"
+                                                  "type"         "schema:Person"
+                                                  "schema:fname" "Me"}]))]
+            (<p! (fluree/commit! ledger db))
+            (is (test-utils/retry-exists? conn ledger-alias 100))
+            (is (not (<p! (fluree/exists? conn "notaledger"))))
+            (done)))))))
 
 (deftest create-test
   (testing "ledger context gets correctly merged with conn context when requested"
@@ -184,9 +184,8 @@
                loaded-db      (fluree/db loaded)
                merged-ctx     (merge conn-context ledger-context)
                query          {"where"  '[[?p "schema:email" "wes@example.org"]]
-                               "select" '{?p [:*]}}
-               #_#_results        @(fluree/query loaded-db query)
-               results        @(fluree/query db query)
+                               "select" '{?p ["*"]}}
+               results        @(fluree/query loaded-db query)
                full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
            (is (= (:t db) (:t loaded-db)))
            (is (= merged-ctx (dbproto/-default-context loaded-db)))
@@ -205,7 +204,7 @@
                ledger-context {"ex"     "http://example.com/"
                                "schema" "http://schema.org/"}
                conn           @(fluree/connect
-                                {"method" "file", "storage-path" storage-path
+                                {"method"   "file", "storage-path" storage-path
                                  "defaults" {"@context" conn-context}})
                ledger-alias   "load-from-file-query"
                ledger         @(fluree/create conn ledger-alias
@@ -219,7 +218,7 @@
                                   "ex:friend"   {"id"          "ex:Jonathan"
                                                  "type"        "schema:Person"
                                                  "schema:name" "Jonathan"}}])
-               query          {"select" '{?s [:*]}
+               query          {"select" '{?s ["*"]}
                                "where"  '[[?s "id" "ex:Andrew"]]}
                res1           @(fluree/query db query)
                _              @(fluree/commit! ledger db)
@@ -242,7 +241,8 @@
                               (fluree/db ledger)
                               [{"id"         "ex:alice",
                                 "type"       "ex:User",
-                                "ex:friends" {"list" ["ex:john" "ex:cam"]}}
+                                "ex:friends" {"list" [{"id" "ex:john"}
+                                                      {"id" "ex:cam"}]}}
                                {"id"         "ex:cam",
                                 "type"       "ex:User"
                                 "ex:numList" {"list" [7 8 9 10]}}
@@ -253,15 +253,20 @@
                loaded-db    (fluree/db loaded)]
            (is (= (:t db) (:t loaded-db)))
            (testing "query returns expected `list` values"
-             (is (= [{"id"         "ex:cam",
-                      "rdf:type"   ["ex:User"],
-                      "ex:numList" [7 8 9 10]}
-                     {"id" "ex:john", "rdf:type" ["ex:User"]}
-                     {"id"         "ex:alice",
-                      "rdf:type"   ["ex:User"],
-                      "ex:friends" [{"id" "ex:john"} {"id" "ex:cam"}]}]
-                    @(fluree/query loaded-db '{"select" {?s ["*"]}
-                                               "where"  [[?s "rdf:type" "ex:User"]]}))))))
+             (is (= #{{"id"         "ex:cam",
+                       "rdf:type"   ["ex:User"],
+                       "ex:numList" [7 8 9 10]}
+                      {"id" "ex:john", "rdf:type" ["ex:User"]}
+                      {"id"         "ex:alice",
+                       "rdf:type"   ["ex:User"],
+                       "ex:friends" [{"id" "ex:john"} {"id" "ex:cam"}]}}
+                     (set
+                      @(fluree/query loaded-db '{"select" {?s ["*"]}
+                                                 "where"  [[?s "rdf:type" "ex:User"]]}))
+                    ;; TODO: Delete me and uncomment above
+                    #_(set
+                       @(fluree/query db '{"select" {?s ["*"]}
+                                           "where"  [[?s "rdf:type" "ex:User"]]})))))))
 
        (testing "can load with policies"
          (with-tmp-dir storage-path
@@ -279,27 +284,30 @@
                                   "type"        "ex:User",
                                   "schema:name" "Alice"
                                   "schema:ssn"  "111-11-1111"
-                                  "ex:friend"   "ex:john"}
+                                  "ex:friend"   {"id" "ex:john"}}
                                  {"id"          "ex:john",
                                   "schema:name" "John"
                                   "type"        "ex:User",
                                   "schema:ssn"  "888-88-8888"}
                                  {"id"      "did:fluree:123"
-                                  "ex:user" "ex:alice"
-                                  "f:role"  "ex:userRole"}])
+                                  "ex:user" {"id" "ex:alice"}
+                                  "f:role"  {"id" "ex:userRole"}}])
                  db+policy    @(fluree/stage
                                 db
-                                [{"id"            "ex:UserPolicy",
-                                  "type"          ["f:Policy"],
-                                  "f:targetClass" "ex:User"
+                                [{"id"            "ex:UserPolicy"
+                                  "type"          ["f:Policy"]
+                                  "f:targetClass" {"id" "ex:User"}
                                   "f:allow"       [{"id"           "ex:globalViewAllow"
-                                                    "f:targetRole" "ex:userRole"
-                                                    "f:action"     ["f:view"]}]
-                                  "f:property"    [{"f:path"  "schema:ssn"
-                                                    "f:allow" [{"id"           "ex:ssnViewRule"
-                                                                "f:targetRole" "ex:userRole"
-                                                                "f:action"     ["f:view"]
-                                                                "f:equals"     {"list" ["f:$identity" "ex:user"]}}]}]}])
+                                                    "f:targetRole" {"id" "ex:userRole"}
+                                                    "f:action"     [{"id" "f:view"}]}]
+                                  "f:property"
+                                  [{"f:path" {"id" "schema:ssn"}
+                                    "f:allow"
+                                    [{"id"           "ex:ssnViewRule"
+                                      "f:targetRole" {"id" "ex:userRole"}
+                                      "f:action"     [{"id" "f:view"}]
+                                      "f:equals"     {"list" [{"id" "f:$identity"}
+                                                              {"id" "ex:user"}]}}]}]}])
                  db+policy    @(fluree/commit! ledger db+policy)
                  loaded       (test-utils/retry-load conn ledger-alias 100)
                  loaded-db    (fluree/db loaded)]
@@ -494,7 +502,8 @@
                             (fluree/db ledger)
                             [{"id"         "ex:alice",
                               "type"       "ex:User",
-                              "ex:friends" {"list" ["ex:john" "ex:cam"]}}
+                              "ex:friends" {"list" [{"id" "ex:john"}
+                                                    {"id" "ex:cam"}]}}
                              {"id"         "ex:cam",
                               "type"       "ex:User"
                               "ex:numList" {"list" [7 8 9 10]}}
@@ -505,12 +514,12 @@
              loaded-db    (fluree/db loaded)]
          (is (= (:t db) (:t loaded-db)))
          (testing "query returns expected `list` values"
-           (is (= [{"id"         "ex:cam",
-                    "rdf:type"   ["ex:User"],
+           (is (= [{"id"         "ex:cam"
+                    "rdf:type"   ["ex:User"]
                     "ex:numList" [7 8 9 10]}
                    {"id" "ex:john", "rdf:type" ["ex:User"]}
-                   {"id"         "ex:alice",
-                    "rdf:type"   ["ex:User"],
+                   {"id"         "ex:alice"
+                    "rdf:type"   ["ex:User"]
                     "ex:friends" [{"id" "ex:john"} {"id" "ex:cam"}]}]
                   @(fluree/query loaded-db '{"select" {?s ["*"]}
                                              "where"  [[?s "rdf:type" "ex:User"]]})))))
@@ -529,27 +538,29 @@
                                 "type"        "ex:User",
                                 "schema:name" "Alice"
                                 "schema:ssn"  "111-11-1111"
-                                "ex:friend"   "ex:john"}
+                                "ex:friend"   {"id" "ex:john"}}
                                {"id"          "ex:john",
                                 "schema:name" "John"
                                 "type"        "ex:User",
                                 "schema:ssn"  "888-88-8888"}
                                {"id"      "did:fluree:123"
-                                "ex:user" "ex:alice"
-                                "f:role"  "ex:userRole"}])
+                                "ex:user" {"id" "ex:alice"}
+                                "f:role"  {"id" "ex:userRole"}}])
                db+policy    @(fluree/stage
                               db
                               [{"id"            "ex:UserPolicy",
                                 "type"          ["f:Policy"],
-                                "f:targetClass" "ex:User"
+                                "f:targetClass" {"id" "ex:User"}
                                 "f:allow"       [{"id"           "ex:globalViewAllow"
-                                                  "f:targetRole" "ex:userRole"
-                                                  "f:action"     ["f:view"]}]
-                                "f:property"    [{"f:path"  "schema:ssn"
-                                                  "f:allow" [{"id"           "ex:ssnViewRule"
-                                                              "f:targetRole" "ex:userRole"
-                                                              "f:action"     ["f:view"]
-                                                              "f:equals"     {"list" ["f:$identity" "ex:user"]}}]}]}])
+                                                  "f:targetRole" {"id" "ex:userRole"}
+                                                  "f:action"     [{"id" "f:view"}]}]
+                                "f:property"
+                                [{"f:path"  {"id" "schema:ssn"}
+                                  "f:allow" [{"id"           "ex:ssnViewRule"
+                                              "f:targetRole" {"id" "ex:userRole"}
+                                              "f:action"     [{"id" "f:view"}]
+                                              "f:equals"     {"list" [{"id" "f:$identity"}
+                                                                      {"id" "ex:user"}]}}]}]}])
                db+policy    @(fluree/commit! ledger db+policy)
                loaded       (test-utils/retry-load conn ledger-alias 100)
                loaded-db    (fluree/db loaded)]

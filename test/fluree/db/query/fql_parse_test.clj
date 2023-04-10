@@ -17,7 +17,8 @@
 (deftest test-parse-query
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/parse"
-                               {"default-context" {"ex" "http://example.org/ns/"}})
+                               {"default-context"
+                                ["" {"ex" "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{"id"           "ex:brian",
@@ -113,13 +114,11 @@
                  {::where/var '?email}]]
                patterns)))
       (testing "not a `:class` pattern if obj is a var"
-        (let [query {:context {:ex "http://example.org/ns/"}
-                     :select  ['?class]
-                     :where   [[:ex/cam :rdf/type '?class]]}
-              {:keys [where]} (parse/parse-analytical-query query db)
+        (let [query {"select"   ['?class]
+                     "where"    [["ex:cam" "rdf:type" '?class]]}
+              {:strs [where]} (parse/parse-analytical-query query db)
               {::where/keys [patterns]} where]
-          (is (= :tuple
-                (where/pattern-type (first patterns))))))
+          (is (= :tuple (where/pattern-type (first patterns))))))
       (testing "class, optional"
         (let [optional-q {"select" ['?name '?favColor]
                           "where"  [['?s "rdf:type" "ex:User"]
