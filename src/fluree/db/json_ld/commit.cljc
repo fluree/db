@@ -294,6 +294,7 @@
 
 (defn add-commit-schema-flakes
   [{:keys [schema] :as db} t]
+  (log/debug "add-commit-schema-flakes schema:" schema)
   (let [schema-flakes [(flake/create const/$_previous const/$iri const/iri-previous const/$xsd:string t true nil)
                        (flake/create const/$_address const/$iri const/iri-address const/$xsd:string t true nil)
                        (flake/create const/$_v const/$iri const/iri-v const/$xsd:string t true nil)
@@ -473,33 +474,34 @@
   returns a db with an updated :commit."
   [{:keys [conn indexer context] :as ledger} {:keys [t stats commit] :as db} opts]
   (go-try
-    (let [{:keys [id-key did message tag file-data?] :as opts*} (enrich-commit-opts db opts)
-          ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
-          dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
-          ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
-          db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
-          context-key       (keyword const/iri-default-context)
-          base-commit-map   {:old-commit commit, :issuer did
-                             :message    message, :tag tag, :dbid dbid, :t t
-                             :db-address db-address
-                             :flakes     (:flakes stats)
-                             :size       (:size stats)
-                             context-key context}
-          new-commit        (commit-data/new-db-commit-map base-commit-map)
-          db*               (assoc db
-                              :commit new-commit
-                              :prev-commit commit)
-          {db**              :db
-           commit-file-meta  :commit-res
-           context-file-meta :context-res} (<? (do-commit+push db* opts*))
-          ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
-          indexing-ch       (when (idx-proto/-index? indexer db**)
-                              (let [idx-ch (when file-data? (async/chan))]
-                                (run-index db** opts* idx-ch)))]
-      (if file-data?
-        {:data-file-meta    ledger-update-res
-         :commit-file-meta  commit-file-meta
-         :context-file-meta context-file-meta
-         :indexing-ch       indexing-ch
-         :db                db**}
-        db**))))
+   (log/debug "commit db:" db "- opts:" opts)
+   (let [{:keys [id-key did message tag file-data?] :as opts*} (enrich-commit-opts db opts)
+         ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
+         dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
+         ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
+         db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
+         context-key       (keyword const/iri-default-context)
+         base-commit-map   {:old-commit commit, :issuer did
+                            :message    message, :tag tag, :dbid dbid, :t t
+                            :db-address db-address
+                            :flakes     (:flakes stats)
+                            :size       (:size stats)
+                            context-key context}
+         new-commit        (commit-data/new-db-commit-map base-commit-map)
+         db*               (assoc db
+                             :commit new-commit
+                             :prev-commit commit)
+         {db**              :db
+          commit-file-meta  :commit-res
+          context-file-meta :context-res} (<? (do-commit+push db* opts*))
+         ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
+         indexing-ch       (when (idx-proto/-index? indexer db**)
+                             (let [idx-ch (when file-data? (async/chan))]
+                               (run-index db** opts* idx-ch)))]
+     (if file-data?
+       {:data-file-meta    ledger-update-res
+        :commit-file-meta  commit-file-meta
+        :context-file-meta context-file-meta
+        :indexing-ch       indexing-ch
+        :db                db**}
+       db**))))

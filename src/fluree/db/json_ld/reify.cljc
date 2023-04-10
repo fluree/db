@@ -23,7 +23,7 @@
   "returns true if json-ld value is a list object."
   [v]
   (and (map? v)
-       (= :list (-> v first key))))
+       (contains? v :list)))
 
 (defn node?
   "Returns true if a nested value is itself another node in the graph.

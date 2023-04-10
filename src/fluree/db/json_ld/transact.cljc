@@ -125,7 +125,7 @@
   "returns true if json-ld value is a list object."
   [v]
   (and (map? v)
-       (= :list (-> v first key))))
+       (contains? v "list")))
 
 (defn get-subject-types
   "Returns a set of all :rdf/type Class subject ids for the provided subject.
@@ -210,7 +210,7 @@
           (let [list?            (list-value? v)
                 retract?         (nil? v)
                 v*               (if list?
-                                   (let [list-vals (:list v)]
+                                   (let [list-vals (get v "list")]
                                      (when-not (sequential? list-vals)
                                        (throw (ex-info (str "List values have to be vectors, provided: " v)
                                                        {:status 400 :error :db/invalid-transaction})))
