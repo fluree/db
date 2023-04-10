@@ -46,7 +46,7 @@
       "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")
 
 
-    (def did (did/private->did-map default-private-key ))
+    (def did (did/private->did-map default-private-key))
 
     (def default-context
       {:id     "@id"
@@ -71,37 +71,37 @@
   (def ledger @(fluree/create file-conn "user/test"))
 
   (def db1 @(fluree/stage
-            (fluree/db ledger)
-            [{:context      {:ex "http://example.org/ns/"}
-              :id           :ex/brian,
-              :type         :ex/User,
-              :schema/name  "Brian"
-              :schema/email "brian@example.org"
-              :schema/age   50
-              :ex/favNums   7
-              }
-             {:context      {:ex "http://example.org/ns/"}
-              :id           :ex/alice,
-              :type         :ex/User,
-              :schema/name  "Alice"
-              :schema/email "alice@example.org"
-              :schema/age   50
-              :ex/favNums   [42, 76, 9]
-              }
-             {:context      {:ex "http://example.org/ns/"}
-              :id           :ex/cam,
-              :type         :ex/User,
-              :schema/name  "Cam"
-              :schema/email "cam@example.org"
-              :schema/age   34
-              :ex/favNums   [5, 10]
-              :ex/friend    [:ex/brian :ex/alice]}]))
+             (fluree/db ledger)
+             [{:context      {:ex "http://example.org/ns/"}
+               :id           :ex/brian,
+               :type         :ex/User,
+               :schema/name  "Brian"
+               :schema/email "brian@example.org"
+               :schema/age   50
+               :ex/favNums   7}
+
+              {:context      {:ex "http://example.org/ns/"}
+               :id           :ex/alice,
+               :type         :ex/User,
+               :schema/name  "Alice"
+               :schema/email "alice@example.org"
+               :schema/age   50
+               :ex/favNums   [42, 76, 9]}
+
+              {:context      {:ex "http://example.org/ns/"}
+               :id           :ex/cam,
+               :type         :ex/User,
+               :schema/name  "Cam"
+               :schema/email "cam@example.org"
+               :schema/age   34
+               :ex/favNums   [5, 10]
+               :ex/friend    [:ex/brian :ex/alice]}]))
 
   (def db2 @(fluree/commit! ledger db1 {:message "hi"}))
 
-  @(fluree/load file-conn (-> ledger :alias))
+  @(fluree/load file-conn (-> ledger :alias)))
 
-  )
+
 
 ;; TODO - general
 ;; if an subject is a component, do we allow it to be explicitly assigned as a ref to another component?
