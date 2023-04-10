@@ -97,6 +97,7 @@
   "Re-parses a pattern into the format recognized
   by downstream simple-subject-crawl code"
   [pattern]
+  (log/debug "re-parse-pattern pattern:" pattern)
   (let [type (where/pattern-type pattern)
         [s p o] (if (= :tuple type)
                   pattern
@@ -117,18 +118,20 @@
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
   [{:strs [where vars] :as parsed-query}]
+  (log/debug "simple-subject-merge-where parsed-query:" parsed-query)
   (let [{::where/keys [patterns]} where
         [first-pattern & rest-patterns] patterns
         reparsed-first-clause (re-parse-pattern first-pattern)]
     (when-let [first-s (and (mergeable-where-clause? first-pattern)
                             (clause-subject-var first-pattern))]
+      (log/debug "simple-subject-merge-where first-s:" first-s)
       (if (empty? rest-patterns)
         (assoc parsed-query
-               :where [reparsed-first-clause]
-               :strategy :simple-subject-crawl)
+          "where" [reparsed-first-clause]
+          :strategy :simple-subject-crawl)
         (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
-          (assoc parsed-query :where [reparsed-first-clause
-                                      {:s-filter subj-filter-map}]
+          (assoc parsed-query "where" [reparsed-first-clause
+                                       {:s-filter subj-filter-map}]
                  :strategy :simple-subject-crawl))))))
 
 (defn simple-subject-crawl?
@@ -140,9 +143,11 @@
        (empty? (::where/filters where))
        ;;TODO: vars support not complete
        (empty? vars)
-       (if-let [{select-var :var} select]
+       (when-let [{select-var :var} select]
+         (log/debug "select-var:" select-var)
          (let [{::where/keys [patterns]} where]
            (every? (fn [pattern]
+                     (log/debug "where pattern:" pattern)
                      (and (mergeable-where-clause? pattern)
                           (let [pred (second pattern)]
                             (and (= select-var (clause-subject-var pattern))
@@ -155,8 +160,11 @@
   {\"select\" {?subjects ['*']}
    \"where\" [...]}"
   [{:strs [order-by group-by] :as parsed-query}]
+  (log/debug "re-parse-as-simple-subj-crawl parsed-query:" parsed-query)
   (when (and (not group-by)
              (not order-by)
              (simple-subject-crawl? parsed-query))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
-    (simple-subject-merge-where parsed-query)))
+    (when-let [ssmw (simple-subject-merge-where parsed-query)]
+      (util/assoc-from-str-opts ssmw #{"select" "where" {"@context" :context}}
+                                (dissoc ssmw "select" "where" "@context")))))

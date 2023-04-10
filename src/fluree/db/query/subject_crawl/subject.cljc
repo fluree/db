@@ -143,7 +143,7 @@
   [{:keys [db error-ch f-where limit offset parallelism vars ident-vars
            finish-fn] :as opts}]
   (go-try
-    (log/trace "subj-crawl opts:" opts)
+    (log/debug "subj-crawl opts:" opts)
     (let [{:keys [o p-ref?]} f-where
           vars*     (if ident-vars
                       (<? (resolve-ident-vars db vars ident-vars))
