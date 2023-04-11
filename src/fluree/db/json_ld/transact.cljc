@@ -56,7 +56,8 @@
                        [::m/default [:map-of ::retract-key ::txn-leaf-map]]]]]
      ::txn          [:orn
                      [:single-amp ::txn-map]
-                     [:sequence-of-maps [:sequential ::txn-map]]]}))
+                     [:sequence-of-maps [:sequential ::txn-map]]]
+     ::opts         [map?]}))
 
 (declare json-ld-node->flakes)
 
