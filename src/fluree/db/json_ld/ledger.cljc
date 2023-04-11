@@ -3,8 +3,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
-            [clojure.string :as str]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [clojure.set :as set]))
 
 ;; methods to link/trace back a ledger and return flakes
 #?(:clj (set! *warn-on-reflection* true))
@@ -73,14 +73,9 @@
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context
           const/iri-default-context                             const/$fluree:default-context}))
 
-
-(defn flip-key-vals
-  [map]
-  (reduce #(assoc %1 (val %2) (key %2)) {} map))
-
 (def predefined-sids
   (-> predefined-properties
-      flip-key-vals
+      set/map-invert
       ;; use @type json-ld shorthand instead of rdf:type full URL
       (assoc const/$rdf:type "@type")))
 
@@ -145,41 +140,3 @@
     (when ref?
       (vswap! refs-v conj new-pid))
     new-pid))
-
-(defn get-iri-sid
-  "Gets the IRI for any existing subject ID."
-  [iri db iris]
-  (if-let [cached (get @iris iri)]
-    cached
-    ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest add:true
-    (when-let [sid (some-> (flake/match-post (get-in db [:novelty :post]) const/$iri iri const/$xsd:string)
-                           first
-                           :s)]
-      (vswap! iris assoc iri sid)
-      sid)))
-
-
-
-(defn ledger-root
-  "Returns a full ledger-root JSON-LD document for persistent storage."
-  [{:keys [conn context state name reindex-min reindex-max] :as ledger}]
-  (let [{:keys [branches branch]} @state
-        {:keys [t dbs commit idx latest-db from]} (get branches branch)
-        idx-map   {"reindexMin" reindex-min
-                   "reindexMax" reindex-max
-                   "t"          t
-                   "idx"        idx
-                   "schema"     nil
-                   "context"    nil}
-
-        branches* (not-empty
-                    (->> (dissoc branches branch)
-                         (map #(select-keys % [t commit idx]))))]
-    {"@context" "https://ns.flur.ee/ledger/v1"
-     "name"     name
-     "branch"   branch
-     "branches" branches*
-     "t"        t
-     "commit"   commit
-     "idx"      idx-map
-     "from"     from}))

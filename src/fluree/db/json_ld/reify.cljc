@@ -5,7 +5,6 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage.core :as storage]
             [fluree.db.dbproto :as dbproto]
@@ -160,7 +159,7 @@
                     (log/debug "creating ref flake:" new-flake)
                     (cond-> (conj acc* new-flake)
                       (nil? existing-sid) (conj
-                                            (flake/create ref-sid const/$iri
+                                            (flake/create ref-sid const/$xsd:anyURI
                                                           ref-id
                                                           const/$xsd:string
                                                           t true nil))))
@@ -173,7 +172,7 @@
                           (log/debug "creating value flake:" new-flake)
                           (conj acc* new-flake)))
 
-              (nil? existing-pid) (conj (flake/create pid const/$iri k
+              (nil? existing-pid) (conj (flake/create pid const/$xsd:anyURI k
                                                       const/$xsd:string t true
                                                       nil)))]
         (if (seq r-v-maps)
@@ -214,7 +213,7 @@
                                 (jld-ledger/generate-new-pid type-item iris
                                                              next-pid nil nil))
                 type-flakes (when-not existing-id
-                              [(flake/create type-id const/$iri type-item
+                              [(flake/create type-id const/$xsd:anyURI type-item
                                              const/$xsd:string t true nil)
                                (flake/create type-id const/$rdf:type
                                              const/$rdfs:Class const/$xsd:anyURI
@@ -244,7 +243,7 @@
           base-flakes     (if existing-sid
                             type-assertions
                             (conj type-assertions
-                                  (flake/create sid const/$iri id
+                                  (flake/create sid const/$xsd:anyURI id
                                                 const/$xsd:string t true nil)))
           context*        (assoc context :base-flakes base-flakes)]
       (<? (assert-node* context* node)))))
@@ -269,34 +268,12 @@
 
 
 (defn merge-flakes
-  [{:keys [novelty stats ecount] :as db} t refs flakes]
-  (let [bytes #?(:clj (future (flake/size-bytes flakes)) ;; calculate in separate thread for CLJ
-                 :cljs (flake/size-bytes flakes))
-        {:keys [spot psot post opst tspo size]} novelty
-        vocab-flakes  (get-vocab-flakes flakes)
-        schema        (vocab/update-with db t refs vocab-flakes)
-        db*           (assoc db :t t
-                                :novelty {:spot (into spot flakes)
-                                          :psot (into psot flakes)
-                                          :post (into post flakes)
-                                          :opst (->> flakes
-                                                     (sort-by flake/p)
-                                                     (partition-by flake/p)
-                                                     (reduce
-                                                       (fn [opst* p-flakes]
-                                                         (let [pid (flake/p (first p-flakes))]
-                                                           (if (or (refs pid) ;; refs is a set of ref pids processed in this commit
-                                                                   (get-in schema [:pred pid :ref?]))
-                                                             (into opst* p-flakes)
-                                                             opst*)))
-                                                       opst))
-                                          :tspo (into tspo flakes)
-                                          :size (+ size #?(:clj @bytes :cljs bytes))}
-                                :stats (-> stats
-                                           (update :size + #?(:clj @bytes :cljs bytes)) ;; total db ~size
-                                           (update :flakes + (count flakes)))
-                                :schema schema)]
-    db*))
+  [db t refs flakes]
+  (let [vocab-flakes  (get-vocab-flakes flakes)]
+    (-> db
+        (assoc :t t)
+        (commit-data/update-novelty flakes)
+        (update :schema vocab/update-with t refs vocab-flakes))))
 
 (defn commit-error
   [message commit-data]

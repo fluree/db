@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.db.dbproto :as db-proto]
+  (:require [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.dbproto :as dbproto]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
@@ -20,8 +21,6 @@
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.json-ld.credential :as cred]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [vswap!]))
 
@@ -48,7 +47,7 @@
             (recur r
                    (conj class-sids type-sid)
                    (conj class-flakes
-                         (flake/create type-sid const/$iri class-iri const/$xsd:string t true nil)
+                         (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)
                          (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
         [class-sids class-flakes]))))
 
@@ -79,7 +78,7 @@
                         ;; a literal value
                         (and (some? value) (not= shacl-dt const/$xsd:anyURI))
                         (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                          (if validate-fn
+                          (when validate-fn
                             (or (validate-fn value*)
                                 (throw (ex-info (str "Value did not pass SHACL validation: " value)
                                                 {:status 400 :error :db/shacl-validation}))))
@@ -165,7 +164,7 @@
                          (str "_:f" sid) ;; create a blank node id
                          id)
           base-flakes  (cond-> []
-                               new-subj? (conj (flake/create sid const/$iri id* const/$xsd:string t true nil))
+                               new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
                                new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
       ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
       (register-node subj-mods node sid {:iri-only? (iri-only? node)
@@ -193,7 +192,7 @@
                 datatype-map     (get-in shacl-map [:datatype pid])
                 property-flakes* (if existing-pid
                                    property-flakes
-                                   (conj property-flakes (flake/create pid const/$iri k const/$xsd:string t true nil)))
+                                   (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts?  (or (not new-subj?) existing-pid)
                 flakes*          (if retract?
@@ -241,58 +240,12 @@
     (assoc ecount const/$_predicate @last-pid
                   const/$_default @last-sid)))
 
-(defn add-tt-id
-  "Associates a unique tt-id for any in-memory staged db in their index roots.
-  tt-id is used as part of the caching key, by having this in place it means
-  that even though the 't' value hasn't changed it will cache each stage db
-  data as its own entity."
-  [db]
-  (let [tt-id   (random-uuid)
-        indexes [:spot :psot :post :opst :tspo]]
-    (-> (reduce
-          (fn [db* idx]
-            (let [{:keys [children] :as node} (get db* idx)
-                  children* (reduce-kv
-                              (fn [children* k v]
-                                (assoc children* k (assoc v :tt-id tt-id)))
-                              {} children)]
-              (assoc db* idx (assoc node :tt-id tt-id
-                                         :children children*))))
-          db indexes)
-        (assoc :tt-id tt-id))))
-
-(defn remove-tt-id
-  "Removes a tt-id placed on indexes (opposite of add-tt-id)."
-  [db]
-  (let [indexes [:spot :psot :post :opst :tspo]]
-    (reduce
-      (fn [db* idx]
-        (let [{:keys [children] :as node} (get db* idx)
-              children* (reduce-kv
-                          (fn [children* k v]
-                            (assoc children* k (dissoc v :tt-id)))
-                          {} children)]
-          (assoc db* idx (-> node
-                             (dissoc :tt-id)
-                             (assoc :children children*)))))
-      (dissoc db :tt-id) indexes)))
-
-(defn update-novelty-idx
-  [novelty-idx add remove]
-  (-> (reduce disj novelty-idx remove)
-      (into add)))
-
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
-  [(flake/create const/$rdf:type const/$iri const/iri-rdf-type const/$xsd:string t true nil)
-   (flake/create const/$rdfs:Class const/$iri const/iri-class const/$xsd:string t true nil)
-   (flake/create const/$iri const/$iri "@id" const/$xsd:string t true nil)])
-
-(defn ref-flakes
-  "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
-  [flakes]
-  (filter #(= (flake/dt %) const/$xsd:anyURI) flakes))
+  [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-rdf-type const/$xsd:string t true nil)
+   (flake/create const/$rdfs:Class const/$xsd:anyURI const/iri-class const/$xsd:string t true nil)
+   (flake/create const/$xsd:anyURI const/$xsd:anyURI "@id" const/$xsd:string t true nil)])
 
 ;; TODO - can use transient! below
 (defn stage-update-novelty
@@ -313,45 +266,29 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn db-after
-  [{:keys [add remove ref-add ref-remove size count] :as staged} {:keys [db-before policy bootstrap? t block] :as tx-state}]
-  (let [{:keys [novelty]} db-before
-        {:keys [spot psot post opst tspo]} novelty
-        new-db (assoc db-before :ecount (final-ecount tx-state)
-                                :policy policy ;; re-apply policy to db-after
-                                :t t
-                                :block block
-                                :novelty {:spot (update-novelty-idx spot add remove)
-                                          :psot (update-novelty-idx psot add remove)
-                                          :post (update-novelty-idx post add remove)
-                                          :opst (update-novelty-idx opst ref-add ref-remove)
-                                          :tspo (update-novelty-idx tspo add remove)
-                                          :size (+ (:size novelty) size)}
-                                :stats (-> (:stats db-before)
-                                           (update :size + size)
-                                           (update :flakes + count)))]
+  [{:keys [add remove] :as _staged} {:keys [db-before policy bootstrap? t] :as tx-state}]
+  (let [new-db (-> db-before
+                   (assoc :ecount (final-ecount tx-state)
+                          :policy policy ;; re-apply policy to db-after
+                          :t t)
+                   (commit-data/update-novelty add remove))]
     (if bootstrap?
       new-db
       ;; TODO - we used to add tt-id to break the cache, so multiple 'staged' dbs with same t value don't get cached as the same
       ;; TODO - now that each db should have its own unique hash, we can use the db's hash id instead of 't' or 'tt-id' for caching
-      (add-tt-id new-db))))
+      (commit-data/add-tt-id new-db))))
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an updated db."
-  [new-flakes {:keys [t stage-update? db-before refs class-mods] :as _tx-state}]
+  [new-flakes {:keys [t stage-update? db-before] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
           staged-map   {:add        add
-                        :remove     remove
-                        :ref-add    (ref-flakes add)
-                        :ref-remove (ref-flakes remove)
-                        :count      (cond-> (if add (count add) 0)
-                                            remove (- (count remove)))
-                        :size       (cond-> (flake/size-bytes add)
-                                            remove (- (flake/size-bytes remove)))}
-          db-after     (cond-> (db-after staged-map _tx-state)
+                        :remove     remove}
+          db-after     (cond-> (db-after staged-map tx-state)
                                vocab-flakes vocab/refresh-schema
                                vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))

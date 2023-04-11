@@ -3,10 +3,6 @@
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld]
             [fluree.db.util.schema :as schema-util]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -16,17 +12,6 @@
 (def property-sids #{const/$rdf:Property
                      const/$owl:DatatypeProperty
                      const/$owl:ObjectProperty})
-
-(defn is-property?
-  "Takes a list of flakes for a specific subject and returns
-  truthy if any of them are of rdf:type rdf:Property, or the
-  owl-specific versions of properties as defined by property-sids."
-  [s-flakes]
-  (some (fn [f]
-          (and (= const/$rdf:type (flake/p f))
-               (property-sids (flake/o f))))
-        s-flakes))
-
 
 (defn schema-details
   [sid s-flakes]
@@ -45,7 +30,7 @@
     (if f
       (let [pid      (flake/p f)
             details* (cond
-                       (= const/$iri pid)
+                       (= const/$xsd:anyURI pid)
                        (assoc details :iri (flake/o f))
 
                        (= const/$rdf:type pid)
@@ -54,7 +39,7 @@
                            (assoc details :class false
                                           :ref? true)
                            (assoc details :class false))
-                         (if (= const/$iri (flake/o f))
+                         (if (= const/$xsd:anyURI (flake/o f))
                            (assoc details :class false
                                           :ref? true)
                            ;; it is a class, but we already did :class true as a default
@@ -150,14 +135,12 @@
 (defn update-with
   "When creating a new db from a transaction, merge new schema changes
   into existing schema of previous db."
-  [{:keys [schema] :as _db-before} db-t new-refs vocab-flakes]
+  [schema db-t new-refs vocab-flakes]
   (if (empty? vocab-flakes)
     schema
-    (let [{:keys [refs]} schema
-          refs* (into refs new-refs)]
-      (-> (assoc schema :refs refs*)
-          (update-with* db-t vocab-flakes)
-          (assoc :refs refs*)))))
+    (-> schema
+        (update :refs into new-refs)
+        (update-with* db-t vocab-flakes))))
 
 (defn base-schema
   []
@@ -169,7 +152,7 @@
               "_default"   {:name "_default" :id 11 :sid nil}}
         pred (map-pred-id+iri [{:iri const/iri-id
                                 :idx? true
-                                :id   const/$iri}
+                                :id   const/$xsd:anyURI}
                                {:iri  "@type"
                                 :ref? true
                                 :idx? true

@@ -1,10 +1,13 @@
 (ns fluree.db.json-ld.commit-data
-  (:require [fluree.db.index :as index]
-            [fluree.crypto :as crypto]
+  (:require [fluree.crypto :as crypto]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
-            [clojure.string :as str]
             [fluree.db.constants :as const]))
 
 (comment
@@ -154,20 +157,6 @@
                                  (merge-template json-ld-index-template)))]
     (merge-template commit-map* json-ld-base-template)))
 
-(defn- un-jsonify
-  "Turns json commit IRIs into keywords"
-  [m]
-  (reduce-kv
-    (fn [acc k v]
-      (if (string? k)
-        (let [kw (-> (str/split k #"#") second keyword)
-              v* (or (:value v) (:id v))]
-          (if v*
-            (assoc acc kw v*)
-            acc))
-        acc))
-    {} m))
-
 (defn json-ld->map
   "Turns json-ld commit meta into the clojure map structure."
   [commit-json-ld {:keys [commit-address spot psot post opst tspo]}]
@@ -279,22 +268,6 @@
           :data    data-map}
          index-root-maps))
 
-(defn update-index
-  "Updates an existing commit with recently completed index data.
-  This differs from new-index, as that is always created from the current
-  db's commit map that generates the index. This will update the most recent
-  commit map with the results of an asynchronous indexing process that just completed.
-
-  Verifies commit-index is at least as current as the index in the commit map, else
-  just returns original commit map."
-  [commit-map new-commit-index]
-  (let [{existing-index-db :data} (:index commit-map)
-        {new-index-db :data} new-commit-index]
-    (if (and existing-index-db
-             (> (:t existing-index-db) (:t new-index-db)))
-      commit-map
-      (assoc commit-map :index new-commit-index))))
-
 (defn t
   "Given a commit map, returns the t value of the commit."
   [commit-map]
@@ -304,12 +277,6 @@
   "Given a commit map, returns the t value of the index (if exists)."
   [commit-map]
   (-> commit-map :index :data :t))
-
-
-(defn older-t?
-  "Returns true if first 't' value is older than second 't' value."
-  [t t']
-  (< t t'))
 
 (defn use-latest-index
   "Checks if old-commit has a more current index than new-commit and
@@ -377,8 +344,163 @@
             message (assoc :message message)
             tag (assoc :tag tag))))
 
-(defn update-db
-  "Updates the :data portion of the commit map to represent a saved new db update."
-  [commit-map dbid t db-address flakes size]
-  (let [prev-data (select-keys (:data commit-map) [:id :address])]
-    (assoc commit-map :data (new-db-commit dbid t db-address prev-data flakes size))))
+(defn ref?
+  [f]
+  (-> f
+      flake/dt
+      (= const/$xsd:anyURI)))
+
+(defn ref-flakes
+  "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
+  [flakes]
+  (filter ref? flakes))
+
+(defn update-novelty-idx
+  [novelty-idx add remove]
+  (-> (reduce disj novelty-idx remove)
+      (into add)))
+
+(defn update-novelty
+  ([db add]
+   (update-novelty db add []))
+
+  ([db add rem]
+   (let [ref-add     (ref-flakes add)
+         ref-rem     (ref-flakes rem)
+         flake-count (cond-> 0
+                       add (+ (count add))
+                       rem (- (count rem)))
+         flake-size  (cond-> 0
+                       add (+ (flake/size-bytes add))
+                       rem (- (flake/size-bytes rem)))]
+     (-> db
+         (update-in [:novelty :spot] update-novelty-idx add rem)
+         (update-in [:novelty :psot] update-novelty-idx add rem)
+         (update-in [:novelty :post] update-novelty-idx add rem)
+         (update-in [:novelty :opst] update-novelty-idx ref-add ref-rem)
+         (update-in [:novelty :tspo] update-novelty-idx add rem)
+         (update-in [:novelty :size] + flake-size)
+         (update-in [:stats :size] + flake-size)
+         (update-in [:stats :flakes] + flake-count)))))
+
+(def commit-schema-flakes
+  #{(flake/create const/$_previous const/$xsd:anyURI const/iri-previous const/$xsd:string -1 true nil)
+    (flake/create const/$_address const/$xsd:anyURI const/iri-address const/$xsd:string -1 true nil)
+    (flake/create const/$_v const/$xsd:anyURI const/iri-v const/$xsd:string -1 true nil)
+
+    (flake/create const/$_ledger:alias const/$xsd:anyURI const/iri-alias const/$xsd:string -1 true nil)
+    (flake/create const/$_ledger:branch const/$xsd:anyURI const/iri-branch const/$xsd:string -1 true nil)
+    (flake/create const/$_ledger:context const/$xsd:anyURI const/iri-context const/$xsd:string -1 true nil)
+
+    (flake/create const/$_commit:signer const/$xsd:anyURI const/iri-issuer const/$xsd:string -1 true nil)
+    (flake/create const/$_commit:message const/$xsd:anyURI const/iri-message const/$xsd:string -1 true nil)
+    (flake/create const/$_commit:time const/$xsd:anyURI const/iri-time const/$xsd:string -1 true nil)
+    (flake/create const/$_commit:data const/$xsd:anyURI const/iri-data const/$xsd:string -1 true nil)
+
+    (flake/create const/$_commitdata:flakes const/$xsd:anyURI const/iri-flakes const/$xsd:string -1 true nil)
+    (flake/create const/$_commitdata:size const/$xsd:anyURI const/iri-size const/$xsd:string -1 true nil)
+    (flake/create const/$_commitdata:t const/$xsd:anyURI const/iri-t const/$xsd:string -1 true nil)})
+
+(defn add-tt-id
+  "Associates a unique tt-id for any in-memory staged db in their index roots.
+  tt-id is used as part of the caching key, by having this in place it means
+  that even though the 't' value hasn't changed it will cache each stage db
+  data as its own entity."
+  [db]
+  (let [tt-id   (random-uuid)
+        indexes [:spot :psot :post :opst :tspo]]
+    (-> (reduce
+          (fn [db* idx]
+            (let [{:keys [children] :as node} (get db* idx)
+                  children* (reduce-kv
+                              (fn [children* k v]
+                                (assoc children* k (assoc v :tt-id tt-id)))
+                              {} children)]
+              (assoc db* idx (assoc node :tt-id tt-id
+                                         :children children*))))
+          db indexes)
+        (assoc :tt-id tt-id))))
+
+(defn add-commit-schema-flakes
+  [db]
+  (-> db
+      (update-novelty commit-schema-flakes)
+      add-tt-id
+      (update :schema vocab/update-with* -1 commit-schema-flakes)))
+
+(defn add-commit-flakes
+  "Translate commit metadata into flakes and merge them into novelty."
+  [prev-commit {:keys [commit] :as db}]
+  (go-try
+    (let [last-sid (volatile! (jld-ledger/last-commit-sid db))
+          next-sid (fn [] (vswap! last-sid inc))
+
+          {:keys [address alias branch data fluree-default-context id issuer message time v]} commit
+          {db-id :id db-t :t db-address :address :keys [flakes size]}                         data
+
+          {previous-id :id prev-data :data} prev-commit
+          prev-data-id                      (:id prev-data)
+
+          t      (- db-t)
+          db-sid (next-sid)
+
+          base-flakes [ ;; link db to associated commit meta: @id
+                       (flake/create t const/$xsd:anyURI id const/$xsd:string t true nil)
+
+                       ;; commit flakes
+                       ;; address
+                       (flake/create t const/$_address address const/$xsd:string t true nil)
+                       ;; alias
+                       (flake/create t const/$_ledger:alias alias const/$xsd:string t true nil)
+                       ;; branch
+                       (flake/create t const/$_ledger:branch branch const/$xsd:string t true nil)
+                       ;; fluree-default-context
+                       (flake/create t const/$_ledger:context fluree-default-context const/$xsd:string t true nil)
+                       ;; v
+                       (flake/create t const/$_v v const/$xsd:int t true nil)
+                       ;; time
+                       (flake/create t const/$_commit:time (util/str->epoch-ms time) const/$xsd:dateTime t true nil) ;; data
+                       (flake/create t const/$_commit:data db-sid const/$xsd:anyURI t true nil)
+
+
+
+                       ;; db flakes
+                       ;; @id
+                       (flake/create db-sid const/$xsd:anyURI db-id const/$xsd:string t true nil)
+                       ;; t
+                       (flake/create db-sid const/$_commitdata:t db-t const/$xsd:int t true nil)
+                       ;; address
+                       (flake/create db-sid const/$_address db-address const/$xsd:string t true nil)
+                       ;; size
+                       (flake/create db-sid const/$_commitdata:size size const/$xsd:int t true nil)
+                       ;; flakes
+                       (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true nil)]
+
+          prev-commit-flakes (when previous-id
+                               (let [prev-sid (<? (dbproto/-subid db previous-id))]
+                                 [(flake/create t const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
+
+          prev-db-flakes (when prev-data-id
+                           (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
+                             [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
+
+          issuer-flakes  (when-let [issuer-iri (:id issuer)]
+                           (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
+                             ;; create reference to existing issuer
+                             [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true nil)]
+                             ;; create new issuer flake and a reference to it
+                             (let [new-issuer-sid (next-sid)]
+                               [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t true nil)
+                                (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri const/$xsd:string t true nil)])))
+          message-flakes (when message
+                           [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
+          commit-flakes  (cond-> base-flakes
+                           prev-commit-flakes (into prev-commit-flakes)
+                           prev-db-flakes     (into prev-db-flakes)
+                           issuer-flakes      (into issuer-flakes)
+                           message-flakes     (into message-flakes))]
+      (-> db
+          (assoc-in [:ecount const/$_shard] @last-sid)
+          (cond-> (= 1 db-t) add-commit-schema-flakes)
+          (update-novelty commit-flakes)
+          add-tt-id))))
