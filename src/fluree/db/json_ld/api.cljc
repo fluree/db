@@ -120,15 +120,19 @@
 
   Options map (opts) can include (keys are strings):
   - did - DiD information to use, if storing blocks as verifiable credentials
-  - default-context - Default default-context map to use for ledgers formed with this connection"
+  - defaults
+    - @context - default @context map to use for ledgers formed with this connection"
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
-   (let [opts*  (util/assoc-from-str-opts
-                  opts
-                  #{"default-context" "did" "branch" "pub-fn" "ipns"
-                    "indexer" "include" "reindex-min-bytes" "reindex-max-bytes"
-                    "initial-tx"})]
+   (let [opts* (-> opts
+                   (util/update-in-if-contains ["defaults"]
+                                               util/assoc-from-str-opts
+                                               #{{"@context" :context}})
+                   (util/assoc-from-str-opts
+                    #{"defaults" "did" "branch" "pub-fn" "ipns"
+                      "indexer" "include" "reindex-min-bytes" "reindex-max-bytes"
+                      "initial-tx"}))]
      (log/debug "create opts*:" opts*)
      (promise-wrap (jld-ledger/create conn ledger-alias opts*)))))
 

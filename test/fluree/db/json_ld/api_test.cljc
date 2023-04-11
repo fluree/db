@@ -60,7 +60,8 @@
              ledger-context {"ex"  "http://example.com/"
                              "foo" "http://foobar.com/"}
              ledger         @(fluree/create conn ledger-alias
-                                            {"default-context" ["" ledger-context]})
+                                            {"defaults"
+                                             {"@context" ["" ledger-context]}})
              merged-context (merge test-utils/default-context ledger-context)]
          (is (= merged-context (dbproto/-default-context (fluree/db ledger))))))))
 
@@ -74,8 +75,9 @@
                                {"@context" test-utils/default-context}})
                ledger-alias "load-from-file-test-single-card"
                ledger       @(fluree/create conn ledger-alias
-                                            {"default-context"
-                                             ["" {"ex" "http://example.org/ns/"}]})
+                                            {"defaults"
+                                             {"@context"
+                                              ["" {"ex" "http://example.org/ns/"}]}})
                db           @(fluree/stage
                               (fluree/db ledger)
                               [{"id"           "ex:brian"
@@ -114,8 +116,9 @@
                                {"@context" test-utils/default-context}})
                ledger-alias "load-from-file-test-multi-card"
                ledger       @(fluree/create conn ledger-alias
-                                            {"default-context"
-                                             ["" {"ex" "http://example.org/ns/"}]})
+                                            {"defaults"
+                                             {"@context"
+                                              ["" {"ex" "http://example.org/ns/"}]}})
                db           @(fluree/stage
                               (fluree/db ledger)
                               [{"id"           "ex:brian"
@@ -165,8 +168,9 @@
                                  "defaults"     {"@context" conn-context}})
                ledger-alias   "load-from-file-with-context"
                ledger         @(fluree/create conn ledger-alias
-                                              {"default-context"
-                                               ["" ledger-context]})
+                                              {"defaults"
+                                               {"@context"
+                                                ["" ledger-context]}})
                db             @(fluree/stage
                                 (fluree/db ledger)
                                 [{"id"             "ex:wes"
@@ -208,8 +212,9 @@
                                  "defaults" {"@context" conn-context}})
                ledger-alias   "load-from-file-query"
                ledger         @(fluree/create conn ledger-alias
-                                              {"default-context"
-                                               ["" ledger-context]})
+                                              {"defaults"
+                                               {"@context"
+                                                ["" ledger-context]}})
                db             @(fluree/stage
                                 (fluree/db ledger)
                                 [{"id"          "ex:Andrew"
@@ -344,8 +349,9 @@
                              {"@context" test-utils/default-context}})
              ledger-alias "load-from-memory-test-single-card"
              ledger       @(fluree/create conn ledger-alias
-                                          {"default-context"
-                                           ["" {"ex" "http://example.org/ns/"}]})
+                                          {"defaults"
+                                           {"@context"
+                                            ["" {"ex" "http://example.org/ns/"}]}})
              db           @(fluree/stage
                             (fluree/db ledger)
                             [{"id"           "ex:brian"
@@ -381,8 +387,9 @@
                              {"@context" test-utils/default-context}})
              ledger-alias "load-from-memory-test-multi-card"
              ledger       @(fluree/create conn ledger-alias
-                                          {"default-context"
-                                           ["" {"ex" "http://example.org/ns/"}]})
+                                          {"defaults"
+                                           {"@context"
+                                            ["" {"ex" "http://example.org/ns/"}]}})
              db           @(fluree/stage
                             (fluree/db ledger)
                             [{"id"           "ex:brian"
@@ -429,8 +436,9 @@
                                "defaults" {"@context" conn-context}})
              ledger-alias   "load-from-memory-with-context"
              ledger         @(fluree/create conn ledger-alias
-                                            {"default-context"
-                                             ["" ledger-context]})
+                                            {"defaults"
+                                             {"@context"
+                                              ["" ledger-context]}})
              db             @(fluree/stage
                               (fluree/db ledger)
                               [{"id"             "ex:wes"
@@ -471,8 +479,9 @@
                                "defaults" {"@context" conn-context}})
              ledger-alias   "load-from-memory-query"
              ledger         @(fluree/create conn ledger-alias
-                                            {"default-context"
-                                             ["" ledger-context]})
+                                            {"defaults"
+                                             {"@context"
+                                              ["" ledger-context]}})
              db             @(fluree/stage
                               (fluree/db ledger)
                               [{"id"          "ex:Andrew"

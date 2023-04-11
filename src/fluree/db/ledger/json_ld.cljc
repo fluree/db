@@ -146,9 +146,10 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-   (let [{:keys [default-context new-context? did branch pub-fn ipns indexer
+   (let [{:keys [defaults new-context? did branch pub-fn ipns indexer
                  include reindex-min-bytes reindex-max-bytes initial-tx]
           :or   {branch :main, new-context? true}} opts
+         default-context  (:context defaults)
          default-context* (if default-context
                             (ctx-util/mapify-context default-context
                                                      (conn-proto/-default-context conn))
@@ -232,10 +233,11 @@
                           :value
                           (->> (jld-reify/load-default-context conn))
                           <?)
-         ledger       (<? (create conn ledger-alias {:branch          branch
-                                                     :id              commit-addr
-                                                     :default-context default-ctx
-                                                     :new-context?    false}))
+         ledger       (<? (create conn ledger-alias
+                                  {:branch       branch
+                                   :id           commit-addr
+                                   :defaults     {:context default-ctx}
+                                   :new-context? false}))
          db           (ledger-proto/-db ledger)
          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
      (ledger-proto/-commit-update ledger branch db*)
