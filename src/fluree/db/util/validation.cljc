@@ -8,9 +8,11 @@
     (m/base-schemas)
     (m/type-schemas)
     (m/comparator-schemas)
+    (m/predicate-schemas)
     {::iri     :string
      ::val     [:fn value?]
      ::context [:orn
-                [:sequence [:orn [:string :string]
-                                 [:map map?]]]
+                [:sequence [:sequential [:orn
+                                         [:string :string]
+                                         [:map map?]]]]
                 [:map map?]]}))
