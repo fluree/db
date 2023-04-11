@@ -208,6 +208,7 @@
      ::analytical-query-results [:orn
                                  [:select-one ::result-map]
                                  [:select [:or
+                                           ::result-vec
                                            [:sequential ::result-map]
                                            [:sequential ::result-vec]]]]
      ::multi-query-results      [:map-of :string ::analytical-query-results]}))
