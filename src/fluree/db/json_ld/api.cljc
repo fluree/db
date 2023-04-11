@@ -232,8 +232,7 @@
                      (util/update-in-if-contains ["did"]
                                                  util/assoc-from-str-opts
                                                  #{"id" "public" "private"})
-                     (util/assoc-from-str-opts opts
-                                               #{"message" "branch" "tag"
+                     (util/assoc-from-str-opts #{"message" "branch" "tag"
                                                  {"@context" :context}
                                                  "did" "private" "push?"}))
                  opts)]
