@@ -130,7 +130,7 @@
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.
 
-  {:id :ex/foo :ex/x 1 :ex/y 2}"
+  {\"id\" \"ex:foo\" \"ex:x\" 1 \"ex:y\" 2}"
   [db cache context compact fuel error-ch s-flakes]
   (async/go
     (try*
@@ -139,7 +139,8 @@
                                                 0 s-flakes)]
         (-> (<? json-chan)
             ;; add the id in case the iri flake isn't present in s-flakes
-            (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
+            (assoc "id" (-> s-flakes first flake/s (->> (dbproto/-iri db)) <?
+                            (json-ld/compact compact)))))
       (catch* e
               (log/error e "Error transforming s-flakes.")
               (async/>! error-ch e)))))
@@ -147,7 +148,7 @@
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
 
-  [{:id :ex/foo :ex/x 1 :ex/y 2}...]
+  [{\"id\" \"ex:foo\" \"ex:x\" 1 \"ex:y\" 2}...]
   "
   [db context compact cache fuel error-ch t-flakes]
   (let [s-flakes-ch (->> t-flakes
@@ -168,7 +169,7 @@
   "Build a collection of maps for each t that contains the t along with the asserted and
   retracted subject maps.
 
-  [{:id :ex/foo :f/assert [{},,,} :f/retract [{},,,]]}]
+  [{\"id\" \"ex:foo\" \"f:assert\" [{},,,} \"f:retract\" [{},,,]]}]
   "
   [db context error-ch flakes]
   (let [fuel  (volatile! 0)

@@ -9,6 +9,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.core :as util]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
+            [fluree.db.util.log :as log]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]))
 
@@ -23,11 +24,12 @@
                            (pr-str query-map))
                       {:status 400
                        :error  :db/invalid-query}))
-      (let [{:keys [opts]}                                         query-map
+      (let [{:strs [opts]}                                         query-map
             db*                                                    (if-let [policy-opts (perm/policy-opts opts)]
                                                                      (<? (perm/wrap-policy db policy-opts))
                                                                      db)
-            {:keys [context history t commit-details] :as _parsed} (history/history-query-parser query-map)
+            {:strs [context history t commit-details] :as parsed} (history/history-query-parser query-map)
+            _ (log/debug "parsed history query:" parsed)
 
             ;; from and to are positive ints, need to convert to negative or fill in default values
             {:strs [from to at]} t
