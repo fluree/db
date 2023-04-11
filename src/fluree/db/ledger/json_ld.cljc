@@ -242,10 +242,3 @@
          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
      (ledger-proto/-commit-update ledger branch db*)
      ledger)))
-
-
-(defn is-ledger?
-  "Returns true if map is a ledger object.
-  Used to differentiate in cases where ledger or DB could be used."
-  [x]
-  (satisfies? ledger-proto/iLedger x))

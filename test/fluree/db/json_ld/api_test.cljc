@@ -85,7 +85,8 @@
                                 "schema:name"  "Brian"
                                 "schema:email" "brian@example.org"
                                 "schema:age"   50
-                                "ex:favNums"   7}
+                                "ex:favNums"   7
+                                "ex:height"    6.2}
 
                                {"id"           "ex:cam"
                                 "type"         "ex:User"

@@ -266,7 +266,7 @@
 
 (defn extra-data-flake?
   [f]
-  (or (= const/$iri (flake/p f))
+  (or (= const/$xsd:anyURI (flake/p f))
       (= const/$rdfs:Class (flake/o f))))
 
 (defn commit-t-flakes->json-ld

@@ -9,20 +9,16 @@
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.json-ld.branch :as branch]
-            [fluree.db.util.async :refer [<? go-try channel?]]
-            #?(:clj  [clojure.core.async :refer [go <!] :as async]
-               :cljs [cljs.core.async :refer [go <! put!] :as async])
+            [fluree.db.util.async :refer [<? go-try]]
+            #?(:clj  [clojure.core.async  :as async]
+               :cljs [cljs.core.async  :as async])
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.transact :as jld-transact])
+            [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [vswap!]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(def ledger-context "https://ns.flur.ee/ledger/v1")
 
 (defn get-s-iri
   "Returns an IRI from a subject id (sid).
@@ -39,16 +35,6 @@
        (vswap! iri-map assoc sid iri)
        iri))))
 
-
-(defn- update-subj-prop
-  "Helper fn to subject-block"
-  [map property val]
-  (update map property #(if %
-                          (if (sequential? %)
-                            (conj % val)
-                            [% val])
-                          val)))
-
 (defn get-ref-iris
   "Returns a list of object IRIs from a set of flakes.
   Only to be used for ref? predicates"
@@ -61,34 +47,29 @@
        acc))))
 
 (defn- subject-block
-  [s-flakes {:keys [schema] :as db} iri-map ^clojure.lang.Volatile ctx compact-fn]
+  [s-flakes db iri-map ^clojure.lang.Volatile ctx compact-fn]
   (go-try
-   (loop [[p-flakes & r] (partition-by flake/p s-flakes)
-          acc nil]
-     (if p-flakes
-       (let [fflake    (first p-flakes)
-             p-iri     (<? (get-s-iri (flake/p fflake) db iri-map compact-fn))
-             ref?      (= const/$iri (flake/dt fflake))
-             list?     (:i (flake/m fflake))
-             p-flakes* (if list?
-                         (sort-by #(:i (flake/m %)) p-flakes)
-                         p-flakes)
-             objs      (if ref?
-                         (do
-                           (vswap! ctx assoc-in [p-iri "@type"] "@id")
-                           (<? (get-ref-iris db iri-map compact-fn p-flakes*)))
-                         (mapv flake/o p-flakes*))
-             objs*     (cond
-                         list?
-                         {"@list" objs}
-
-                         (= 1 (count objs))
-                         (first objs)
-
-                         :else
-                         objs)]
-         (recur r (assoc acc p-iri objs*)))
-       acc))))
+    (loop [[p-flakes & r] (partition-by flake/p s-flakes)
+           acc nil]
+      (if p-flakes
+        (let [fflake    (first p-flakes)
+              p-iri     (<? (get-s-iri (flake/p fflake) db iri-map compact-fn))
+              ref?      (= const/$xsd:anyURI (flake/dt fflake))
+              list?     (:i (flake/m fflake))
+              p-flakes* (if list?
+                          (sort-by #(:i (flake/m %)) p-flakes)
+                          p-flakes)
+              objs      (if ref?
+                          (do
+                            (vswap! ctx assoc-in [p-iri "@type"] "@id")
+                            (<? (get-ref-iris db iri-map compact-fn p-flakes*)))
+                          (mapv flake/o p-flakes*))
+              objs*     (cond
+                          list? {"@list" objs}
+                          (= 1 (count objs)) (first objs)
+                          :else objs)]
+          (recur r (assoc acc p-iri objs*)))
+        acc))))
 
 (defn generate-commit
   "Generates assertion and retraction flakes for a given set of flakes
@@ -109,7 +90,7 @@
        (if s-flakes
          (let [sid            (flake/s (first s-flakes))
                s-iri          (<? (get-s-iri sid db id->iri compact-fn))
-               non-iri-flakes (remove #(= const/$iri (flake/p %)) s-flakes)
+               non-iri-flakes (remove #(= const/$xsd:anyURI (flake/p %)) s-flakes)
                [assert* retract*]
                (cond
                  ;; just an IRI declaration, used internally - nothing to output
@@ -273,124 +254,6 @@
                          (assoc "@context" (merge-with merge @ctx-used-atom refs-ctx*)))]
      (with-meta db-json* {:dbid dbid}))))
 
-
-(defn add-commit-flakes-to-db
-  "ecount and sid must be updated prior to calling this."
-  [db flakes]
-  (let [{:keys [novelty]} db
-        {:keys [spot psot post opst tspo]} novelty
-        size (flake/size-bytes flakes)]
-    (-> db
-        (assoc :novelty {:spot (into spot flakes)
-                         :psot (into psot flakes)
-                         :post (into post flakes)
-                         :opst opst
-                         :tspo (into tspo flakes)
-                         :size (+ (:size novelty) size)}
-               :stats (-> (:stats db)
-                          (update :size + size)
-                          (update :flakes + (count flakes))))
-        (jld-transact/add-tt-id))))
-
-(defn add-commit-schema-flakes
-  [{:keys [schema] :as db} t]
-  (log/debug "add-commit-schema-flakes schema:" schema)
-  (let [schema-flakes [(flake/create const/$_previous const/$iri const/iri-previous const/$xsd:string t true nil)
-                       (flake/create const/$_address const/$iri const/iri-address const/$xsd:string t true nil)
-                       (flake/create const/$_v const/$iri const/iri-v const/$xsd:string t true nil)
-
-                       (flake/create const/$_ledger:alias const/$iri const/iri-alias const/$xsd:string t true nil)
-                       (flake/create const/$_ledger:branch const/$iri const/iri-branch const/$xsd:string t true nil)
-                       (flake/create const/$_ledger:context const/$iri const/iri-context const/$xsd:string t true nil)
-
-                       (flake/create const/$_commit:signer const/$iri const/iri-issuer const/$xsd:string t true nil)
-                       (flake/create const/$_commit:message const/$iri const/iri-message const/$xsd:string t true nil)
-                       (flake/create const/$_commit:time const/$iri const/iri-time const/$xsd:string t true nil)
-                       (flake/create const/$_commit:data const/$iri const/iri-data const/$xsd:string t true nil)
-
-                       (flake/create const/$_commitdata:flakes const/$iri const/iri-flakes const/$xsd:string t true nil)
-                       (flake/create const/$_commitdata:size const/$iri const/iri-size const/$xsd:string t true nil)
-                       (flake/create const/$_commitdata:t const/$iri const/iri-t const/$xsd:string t true nil)]
-        db*           (add-commit-flakes-to-db db schema-flakes)]
-    (assoc db* :schema (vocab/update-with* schema t schema-flakes))))
-
-(defn add-commit-flakes
-  "Translate commit metadata into flakes and merge them into novelty."
-  [prev-commit {:keys [commit] :as db}]
-  (go-try
-   (let [last-sid           (volatile! (jld-ledger/last-commit-sid db))
-         next-sid           (fn [] (vswap! last-sid inc))
-
-         {:keys [address alias branch data fluree-default-context id issuer message time v]} commit
-         {db-id :id db-t :t db-address :address :keys [flakes size]} data
-
-         {previous-id :id prev-data :data} prev-commit
-         prev-data-id       (:id prev-data)
-
-         t                  (- db-t)
-         db*                (if (= 1 db-t)
-                              (add-commit-schema-flakes db t)
-                              db)
-         db-sid             (next-sid)
-
-         base-flakes        [;; link db to associated commit meta: @id
-                             (flake/create t const/$iri id const/$xsd:string t true nil)
-
-                             ;; commit flakes
-                             ;; address
-                             (flake/create t const/$_address address const/$xsd:string t true nil)
-                             ;; alias
-                             (flake/create t const/$_ledger:alias alias const/$xsd:string t true nil)
-                             ;; branch
-                             (flake/create t const/$_ledger:branch branch const/$xsd:string t true nil)
-                             ;; fluree-default-context
-                             (flake/create t const/$_ledger:context fluree-default-context const/$xsd:string t true nil)
-                             ;; v
-                             (flake/create t const/$_v v const/$xsd:int t true nil)
-                             ;; time
-                             (flake/create t const/$_commit:time (util/str->epoch-ms time) const/$xsd:dateTime t true nil) ;; data
-                             (flake/create t const/$_commit:data db-sid const/$xsd:anyURI t true nil)
-
-
-
-                             ;; db flakes
-                             ;; @id
-                             (flake/create db-sid const/$iri db-id const/$xsd:string t true nil)
-                             ;; t
-                             (flake/create db-sid const/$_commitdata:t db-t const/$xsd:int t true nil)
-                             ;; address
-                             (flake/create db-sid const/$_address db-address const/$xsd:string t true nil)
-                             ;; size
-                             (flake/create db-sid const/$_commitdata:size size const/$xsd:int t true nil)
-                             ;; flakes
-                             (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true nil)]
-
-         prev-commit-flakes (when previous-id
-                              (let [prev-sid (<? (dbproto/-subid db previous-id))]
-                                [(flake/create t const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
-
-         prev-db-flakes     (when prev-data-id
-                              (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
-                                [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
-
-         issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                              (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
-                                ;; create reference to existing issuer
-                                [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true nil)]
-                                ;; create new issuer flake and a reference to it
-                                (let [new-issuer-sid (next-sid)]
-                                  [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t true nil)
-                                   (flake/create new-issuer-sid const/$iri issuer-iri const/$xsd:string t true nil)])))
-         message-flakes     (when message
-                              [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
-         flakes             (cond-> base-flakes
-                                    prev-commit-flakes (into prev-commit-flakes)
-                                                       prev-db-flakes (into prev-db-flakes)
-                                                       issuer-flakes (into issuer-flakes)
-                                                       message-flakes (into message-flakes))
-         db**               (assoc-in db* [:ecount const/$_shard] @last-sid)]
-     (add-commit-flakes-to-db db** flakes))))
-
 (defn link-context-to-commit
   "Takes a commit with an embedded :context and pulls it out, saves it to
   storage separately (content-addressed).
@@ -427,7 +290,7 @@
          db*           (assoc db :commit new-commit***
                                  :new-context? false)
          db**          (if new-t?
-                         (<? (add-commit-flakes (:prev-commit db) db*))
+                         (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
                          db*)
          db***         (ledger-proto/-commit-update ledger branch db**)]
      ;; push is asynchronous!
@@ -474,7 +337,6 @@
   returns a db with an updated :commit."
   [{:keys [conn indexer context] :as ledger} {:keys [t stats commit] :as db} opts]
   (go-try
-   (log/debug "commit db:" db "- opts:" opts)
    (let [{:keys [id-key did message tag file-data?] :as opts*} (enrich-commit-opts db opts)
          ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
          dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger

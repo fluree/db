@@ -6,8 +6,7 @@
                :cljs [fluree.db.util.cljs-const :as uc]))
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
-                   (java.time.format DateTimeFormatter)
-                   (java.math BigDecimal))))
+                   (java.time.format DateTimeFormatter))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -190,16 +189,20 @@
   [value]
   (cond
     (string? value)
-    #?(:clj  (try (BigDecimal. ^String value) (catch Exception _ nil))
+    #?(:clj  (try (bigdec value) (catch Exception _ nil))
        :cljs (let [n (js/parseFloat value)] (if (js/Number.isNaN n) nil n)))
 
     (integer? value)
-    #?(:clj  (BigDecimal. ^int value)
+    #?(:clj  (bigdec value)
        :cljs value)
 
     (float? value)
     ;; convert to string first to keep float precision explosion at bay
-    #?(:clj  (BigDecimal. ^String (Float/toString value))
+    #?(:clj  (bigdec (Float/toString value))
+       :cljs value)
+
+    (number? value)
+    #?(:clj  (bigdec value)
        :cljs value)
 
     :else nil))

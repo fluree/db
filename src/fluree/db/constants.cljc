@@ -41,11 +41,6 @@
 ;; TODO, replace usage with iri-context
 (def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
 
-;; system constants
-
-;; @id (unique subject identifier) in the form of IRI
-(def ^:const $iri 0)
-
 ;; system collection ids
 (def ^:const $_tx -1) ; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
 (def ^:const $_predicate 0)

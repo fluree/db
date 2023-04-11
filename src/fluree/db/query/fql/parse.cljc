@@ -211,7 +211,7 @@
 (defn parse-iri-predicate
   [x]
   (when (= "@id" x)
-    (where/->predicate const/$iri)))
+    (where/->predicate const/$xsd:anyURI)))
 
 (defn iri->pred-id
   [iri db context]
@@ -327,7 +327,7 @@
              (not (syntax/variable? o-pat)))
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
-      (if (= const/$iri (::where/val p))
+      (if (= const/$xsd:anyURI (::where/val p))
         (let [o (-> o-pat
                     (json-ld/expand-iri context)
                     where/anonymous-value)]

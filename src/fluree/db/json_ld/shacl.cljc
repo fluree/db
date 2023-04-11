@@ -420,7 +420,7 @@
 
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p
-                                                      const/$iri
+                                                      const/$xsd:anyURI
                                                       (assoc shape :id o)
 
                                                       const/$sh:targetClass
