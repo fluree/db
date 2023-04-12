@@ -41,6 +41,10 @@
   [x]
   (boolean (#{'desc "desc" :desc} x)))
 
+(defn iri-key?
+  [x]
+  (= "@id" x))
+
 (defn where-op [x]
   (when (map? x)
     (-> x first key)))
@@ -131,6 +135,7 @@
                               [:optional [:map [:optional [:ref ::optional]]]]
                               [:union [:map [:union [:ref ::union]]]]
                               [:bind [:map [:bind [:ref ::bind]]]]]]
+     ::iri-key              [:fn iri-key?]
      ::triple               [:catn
                              [:subject [:orn
                                         [:var ::var]

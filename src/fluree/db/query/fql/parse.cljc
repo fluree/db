@@ -212,7 +212,7 @@
 
 (defn parse-iri-predicate
   [x]
-  (when (= "@id" x)
+  (when (syntax/iri-key? x)
     (where/->predicate const/$xsd:anyURI)))
 
 (defn iri->pred-id
