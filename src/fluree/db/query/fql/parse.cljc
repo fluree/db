@@ -174,7 +174,7 @@
   (when (util/pred-ident? x)
     (where/->ident x)))
 
-(defn parse-iri
+(defn parse-subject-iri
   [x context]
   (-> x
       (json-ld/expand-iri context)
@@ -193,7 +193,7 @@
    (if-let [parsed (parse-subject x)]
      parsed
      (when context
-       (parse-iri x context)))))
+       (parse-subject-iri x context)))))
 
 (defn parse-subject-pattern
   [s-pat context]
@@ -264,6 +264,12 @@
     (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o-iri context))
                     {:status 400 :error :db/invalid-query}))))
 
+(defn parse-object-iri
+  [x context]
+  (-> x
+      (json-ld/expand-iri context)
+      where/anonymous-value))
+
 (defn parse-object-pattern
   [o-pat]
   (or (parse-variable o-pat)
@@ -329,9 +335,7 @@
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
       (if (= const/$xsd:anyURI (::where/val p))
-        (let [o (-> o-pat
-                    (json-ld/expand-iri context)
-                    where/anonymous-value)]
+        (let [o (parse-object-iri o-pat context)]
           [s p o])
         (let [o (parse-object-pattern o-pat)]
           [s p o])))))
