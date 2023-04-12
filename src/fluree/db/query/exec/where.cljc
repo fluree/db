@@ -220,17 +220,6 @@
                                             (match-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
 
-(defmethod match-pattern :iri
-  [db solution pattern filters error-ch]
-  (let [triple   (val pattern)
-        cur-vals (assign-matched-values triple solution filters)
-        _        (log/debug "assign-matched-values returned:" cur-vals)
-        flake-ch (resolve-flake-range db error-ch cur-vals)
-        match-ch (async/chan 2 (comp cat
-                                     (map (fn [flake]
-                                            (match-flake solution triple flake)))))]
-    (async/pipe flake-ch match-ch)))
-
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
   subject ids repeated from previously processed flakes."

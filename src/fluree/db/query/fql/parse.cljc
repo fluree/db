@@ -332,7 +332,7 @@
         (let [o (-> o-pat
                     (json-ld/expand-iri context)
                     where/anonymous-value)]
-          (where/->pattern :iri [s p o]))
+          [s p o])
         (let [o (parse-object-pattern o-pat)]
           [s p o])))))
 
