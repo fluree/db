@@ -206,11 +206,11 @@
      ::result-map               [:map-of :string ::result-val]
      ::result-vec               [:sequential ::result-val]
      ::analytical-query-results [:orn
-                                 [:select-one ::result-map]
                                  [:select [:or
                                            ::result-vec
                                            [:sequential ::result-map]
-                                           [:sequential ::result-vec]]]]
+                                           [:sequential ::result-vec]]]
+                                 [:select-one ::result-map]]
      ::multi-query-results      [:map-of :string ::analytical-query-results]}))
 
 (def valid-query?
