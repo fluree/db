@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.syntax
-  (:require [malli.core :as m]
-            [fluree.db.util.core :refer [pred-ident?]]))
+  (:require [fluree.db.constants :as const]
+            [fluree.db.util.core :refer [pred-ident?]]
+            [malli.core :as m]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -43,7 +44,7 @@
 
 (defn iri-key?
   [x]
-  (= "@id" x))
+  (= const/iri-id x))
 
 (defn where-op [x]
   (when (map? x)
