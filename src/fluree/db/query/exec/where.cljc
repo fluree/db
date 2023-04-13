@@ -225,7 +225,7 @@
   (let [match-ch  (async/chan)
         [s p iri] (val pattern)]
     (go (try*
-          (log/info "looking up iri:" iri)
+          (log/trace "looking up iri:" iri)
           (let [sid   (<? (dbproto/-subid db iri true))
                 triple [s p sid]]
             (-> db
