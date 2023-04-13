@@ -136,6 +136,8 @@
                               [:union [:map [:union [:ref ::union]]]]
                               [:bind [:map [:bind [:ref ::bind]]]]]]
      ::iri-key              [:fn iri-key?]
+     ::iri-map              [:map-of {:max 1}
+                             ::iri-key ::iri]
      ::triple               [:catn
                              [:subject [:orn
                                         [:var ::var]
@@ -146,6 +148,7 @@
                              [:object [:orn
                                        [:var ::var]
                                        [:ident [:fn pred-ident?]]
+                                       [:iri-map ::iri-map]
                                        [:val :any]]]]
      ::where-tuple          [:orn
                              [:triple ::triple]

@@ -326,6 +326,20 @@
     (log/debug "parse-where-clause patterns:" patterns)
     (where/->where-clause patterns filters)))
 
+(defn iri-map?
+  [x]
+  (and (map? x)
+       (= (count x) 1)
+       (-> x keys first syntax/iri-key?)))
+
+(defn parse-iri-map
+  [x context]
+  (when (iri-map? x)
+    (-> x
+        vals
+        first
+        (parse-object-iri context))))
+
 (defn parse-triple
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
@@ -337,8 +351,11 @@
       (if (= const/$xsd:anyURI (::where/val p))
         (let [o (parse-object-iri o-pat context)]
           [s p o])
-        (let [o (parse-object-pattern o-pat)]
-          [s p o])))))
+        (if (iri-map? o-pat)
+          (let [o (parse-iri-map o-pat context)]
+            (where/->pattern :iri-ref [s p o]))
+          (let [o (parse-object-pattern o-pat)]
+            [s p o]))))))
 
 (defmethod parse-pattern :triple
   [triple _ db context]

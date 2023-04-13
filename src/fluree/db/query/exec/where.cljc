@@ -220,6 +220,22 @@
                                             (match-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
 
+(defmethod match-pattern :iri-ref
+  [db solution pattern filters error-ch]
+  (let [match-ch  (async/chan)
+        [s p iri] (val pattern)]
+    (go (try*
+          (log/info "looking up iri:" iri)
+          (let [sid   (<? (dbproto/-subid db iri true))
+                triple [s p sid]]
+            (-> db
+                (match-pattern solution triple filters error-ch)
+                (async/pipe match-ch)))
+          (catch* e
+                  (log/error e "Error looking up sid from iri")
+                  (>! error-ch e))))
+    match-ch))
+
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
   subject ids repeated from previously processed flakes."
