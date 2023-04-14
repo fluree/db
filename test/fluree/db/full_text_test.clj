@@ -3,9 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.dbproto :refer [IFlureeDb]]
             [fluree.db.flake :as flake]
-            [fluree.db.full-text :as full-text])
-  (:import (java.io Closeable)
-           (org.apache.lucene.index IndexWriter)))
+            [fluree.db.full-text :as full-text]))
 
 (def user-coll-id (inc const/$numSystemCollections))
 (def user-coll-name "user")

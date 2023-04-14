@@ -24,8 +24,8 @@
 
 (def root-policy-map
   "Base policy (permissions) map that will give access to all flakes."
-  {:f/view   {:root? true}
-   :f/modify {:root? true}})
+  {"f:view"  {:root? true}
+   "f:modify" {:root? true}})
 
 (defn expand-iri
   "Expands an IRI from the db's context."
@@ -40,10 +40,15 @@
   iri can be a compact iri."
   [db iri]
   (go-try
-   (let [iri* (expand-iri db iri)]
-     (some-> (<? (query-range/index-range db :post = [const/$xsd:anyURI iri*]))
-             first
-             flake/s))))
+   (log/debug "iri->sid iri:" iri)
+   (let [iri* (expand-iri db iri)
+         sid (some-> (<? (query-range/index-range db :post = [const/$xsd:anyURI iri*]))
+                     first
+                     flake/s)]
+     (log/debug "iri->sid expanded iri:" iri*)
+     (log/debug "iri->sid sid:" sid)
+     sid)))
+
 
 (defn subid
   "Returns subject ID of ident as async promise channel.

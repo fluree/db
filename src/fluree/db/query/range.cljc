@@ -165,10 +165,10 @@
             flake
             ::unauthorized)
           (catch* e
-                  (log/error e
-                             "Error authorizing flake in ledger"
-                             (select-keys db [:network :ledger-id :t]))
-                  (>! error-ch e)))))
+            (log/error e
+                       "Error authorizing flake in ledger"
+                       (select-keys db [:network :ledger-id :t]))
+            (>! error-ch e)))))
 
 (defn authorize-flakes
   "Authorize each flake in the supplied `flakes` collection asynchronously,
@@ -190,7 +190,7 @@
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (true? (get-in policy [:f/view :root?]))
+     (if (true? (get-in policy ["f:view" :root?]))
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)
@@ -340,7 +340,9 @@
        (let [s1*         (if (or (number? s1) (nil? s1))
                            s1
                            (<? (resolve-subid db s1)))
+             _           (log/debug "index-range s1*:" s1*)
              start-flake (resolve-match-flake start-test s1* p1 o1 t1 op1 m1)
+             _           (log/debug "index-range start-flake:" start-flake)
              s2*         (cond
                            (or (number? s2) (nil? s2))
                            s2
@@ -350,7 +352,9 @@
 
                            :else
                            (<? (resolve-subid db s2)))
+             _           (log/debug "index-range s2*:" s2*)
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
+             _           (log/debug "index-range end-flake:" end-flake)
              error-ch    (chan)
              range-ch    (index-range* db
                                        error-ch

@@ -86,7 +86,7 @@
                      :filter-map    filter-map
                      :limit         (if order-by util/max-long limit) ;; if ordering, limit performed by finish-fn after sort
                      :offset        (if order-by 0 offset)
-                     :permissioned? (not (get-in db [:policy :f/view :root?]))
+                     :permissioned? (not (get-in db [:policy "f:view" :root?]))
                      :parallelism   3
                      :f-where       f-where
                      :parse-json?   (:parse-json? opts)

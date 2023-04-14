@@ -1,14 +1,15 @@
 (ns fluree.db.policy.enforce-tx
   (:require [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.permissions-validate :as validate]))
+            [fluree.db.permissions-validate :as validate]
+            [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn root?
   "Returns true if policy has root modify permissions."
   [policy]
-  (= {:root? true} (get policy :f/modify)))
+  (= {:root? true} (get policy "f:modify")))
 
 
 (defn- check-property-policies
@@ -17,30 +18,33 @@
   default-allow?, where it will continue if true, else reject entire transaction if false."
   [db property-policies default-allow? flakes]
   (go-try
-    (let [policies-by-pid (validate/group-property-policies property-policies)]
-      (loop [[flake & r] flakes]
-        (if flake
-          (if-let [p-policies (->> flake flake/p (get policies-by-pid))]
-            (let [allow? (loop [[[async? f] & r] p-policies]
-                           ;; return first truthy response, else false
-                           (if f
-                             (let [res (if async?
-                                         (<? (f db flake))
-                                         (f db flake))]
-                               (or res
-                                   (recur r)))
-                             ;; always default to false! (deny)
-                             false))]
-              (if allow?
-                (recur r)
-                (throw (ex-info "Policy enforcement prevents modification."
-                                {:status 400 :error :db/policy-exception}))))
-            (if default-allow?
-              (recur r)
-              (throw (ex-info "Policy enforcement prevents modification."
-                              {:status 400 :error :db/policy-exception}))))
-          ;; passed all property policies, allow everything!
-          true)))))
+   (log/debug "check-property-policies property-policies:" property-policies)
+   (log/debug "check-property-policies flakes:" flakes)
+   (let [policies-by-pid (validate/group-property-policies property-policies)]
+     (log/debug "policies-by-pid:" policies-by-pid)
+     (loop [[flake & r] flakes]
+       (if flake
+         (if-let [p-policies (->> flake flake/p (get policies-by-pid))]
+           (let [allow? (loop [[[async? f] & r] p-policies]
+                          ;; return first truthy response, else false
+                          (if f
+                            (let [res (if async?
+                                        (<? (f db flake))
+                                        (f db flake))]
+                              (or res
+                                  (recur r)))
+                            ;; always default to false! (deny)
+                            false))]
+             (if allow?
+               (recur r)
+               (throw (ex-info "Policy enforcement prevents modification."
+                               {:status 400 :error :db/policy-exception}))))
+           (if default-allow?
+             (recur r)
+             (throw (ex-info "Policy enforcement prevents modification."
+                             {:status 400 :error :db/policy-exception}))))
+         ;; passed all property policies, allow everything!
+         true)))))
 
 
 (defn allowed?
@@ -50,21 +54,26 @@
   (let [{:keys [policy]} db-after
         subj-mods' @subj-mods]
     (go-try
-      (if (root? policy)
-        db-after
-        (loop [[s-flakes & r] (partition-by flake/s add)]
-          (if s-flakes
-            (let [fflake         (first s-flakes)
-                  sid            (flake/s fflake)
-                  {:keys [classes]} (get subj-mods' sid)
-                  {defaults :default props :property} (validate/group-policies-by-default policy :f/modify classes)
-                  default-allow? (<? (validate/default-allow? db-after fflake defaults))
-                  allow?         (if props
-                                   (<? (check-property-policies db-after props default-allow? s-flakes))
-                                   default-allow?)]
-              (if allow?
-                (recur r)
-                (throw (ex-info "Policy enforcement prevents modification."
-                                {:status 400 :error :db/policy-exception}))))
-            ;; all flakes processed and passed! return final db
-            db-after))))))
+     (log/debug "allowed? policy:" policy)
+     (log/debug "allowed? subj-mods:" subj-mods')
+     (if (root? policy)
+       db-after
+       (loop [[s-flakes & r] (partition-by flake/s add)]
+         (if s-flakes
+           (let [fflake         (first s-flakes)
+                 sid            (flake/s fflake)
+                 {:keys [classes]} (get subj-mods' sid)
+                 {defaults :default props :property :as gpbd} (validate/group-policies-by-default policy "f:modify" classes)
+                 _              (log/debug "allowed? gpbd:" gpbd)
+                 default-allow? (<? (validate/default-allow? db-after fflake defaults))
+                 _              (log/debug "allowed? default-allow?:" default-allow?)
+                 _              (log/debug "allowed? props:" props)
+                 allow?         (if props
+                                  (<? (check-property-policies db-after props default-allow? s-flakes))
+                                  default-allow?)]
+             (if allow?
+               (recur r)
+               (throw (ex-info "Policy enforcement prevents modification."
+                               {:status 400 :error :db/policy-exception}))))
+           ;; all flakes processed and passed! return final db
+           db-after))))))

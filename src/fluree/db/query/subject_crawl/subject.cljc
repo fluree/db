@@ -78,18 +78,20 @@
   (fn [sid port]
     (async/go
       (try*
+       (log/debug "flakes-xf sid:" sid)
         ;; TODO: Right now we enforce permissions after the index-range call, but
         ;; TODO: in some circumstances we can know user can see no subject flakes
         ;; TODO: and if detected, could avoid index-range call entirely.
-        (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
-                              filter-map (filter-subject vars filter-map)
-                              permissioned? (filter-subject-flakes db)
-                              permissioned? <?)]
-          (when (seq flakes)
-            (async/put! port flakes))
+       (let [flakes (cond->> (<? (query-range/index-range db :spot = [sid]))
+                             true (log/debug->>val "flakes-xf flakes:")
+                             filter-map (filter-subject vars filter-map)
+                             permissioned? (filter-subject-flakes db)
+                             permissioned? <?)]
+         (when (seq flakes)
+           (async/put! port flakes))
 
-          (async/close! port))
-        (catch* e (async/put! error-ch e) (async/close! port) nil)))))
+         (async/close! port))
+       (catch* e (async/put! error-ch e) (async/close! port) nil)))))
 
 
 (defn subjects-id-chan

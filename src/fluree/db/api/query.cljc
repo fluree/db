@@ -108,7 +108,7 @@
                             (dissoc "meta"))
           start         #?(:clj (System/nanoTime)
                            :cljs (util/current-time-millis))
-          result        (<? (fql/query db** (assoc query :opts opts*)))]
+          result        (<? (fql/query db** (assoc query "opts" opts*)))]
       (if (get opts "meta")
         {"status" 200
          "result" result
@@ -151,11 +151,15 @@
   [source flureeQL]
   (go-try
     (let [global-opts        (get flureeQL "opts")
+          db                 (if-let [policy-opts (perm/policy-opts global-opts)]
+                               (<? (perm/wrap-policy source policy-opts))
+                               source)
           queries            (reduce-kv (partial multi-query-map global-opts)
                                         {} (dissoc flureeQL "opts"))
+          _                  (log/debug "multi-query queries:" queries)
           start-time #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
           ;; kick off all queries in parallel, each alias now mapped to core async channel
-          pending-resp       (map (fn [[alias q]] [alias (query source q)]) queries)]
+          pending-resp       (map (fn [[alias q]] [alias (query db q)]) queries)]
       (loop [[[alias port] & r] pending-resp
              status-global nil ;; overall status.
              response      {}]

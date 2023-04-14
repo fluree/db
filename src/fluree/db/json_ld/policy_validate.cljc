@@ -34,25 +34,30 @@
   used with data that is not compliant (prefer f:contains)."
   [{:keys [policy] :as db} path-pids equals-rule]
   (go-try
-    (let [{:keys [cache ident]} policy
-          db-root (dbproto/-rootdb db)]
-      (loop [[next-pid & r] path-pids
-             last-result ident]
-        (if next-pid
-          (let [next-res (<? (query-range/index-range db-root :spot = [last-result next-pid]))
-                ;; in case of mixed data types, take the first IRI result - unless we
-                ;; are at the end of the path in which case take the first value regardless
-                next-val (some #(if (= const/$xsd:anyURI (flake/dt %))
-                                  (flake/o %)) next-res)]
-            (when (> (count next-res) 1)
-              (log/warn (str "f:equals used for identity " ident " and path: " equals-rule
-                             " however the query produces more than one result, the first one "
-                             " is being used which can product unpredictable results. "
-                             "Prefer f:contains when comparing with multiple results.")))
-            (recur r next-val))
-          (do
-            (swap! cache assoc equals-rule last-result)
-            last-result))))))
+   (log/debug "resolve-equals-rule policy:" policy)
+   (log/debug "resolve-equals-rule path-pids:" path-pids)
+   (let [{:keys [cache ident]} policy
+         db-root (dbproto/-rootdb db)]
+     (loop [[next-pid & r] path-pids
+            last-result ident]
+       (if next-pid
+         (let [next-res (<? (query-range/index-range db-root :spot = [last-result next-pid]))
+               _        (log/debug "resolve-equals-rule next-res:" next-res)
+               ;; in case of mixed data types, take the first IRI result - unless we
+               ;; are at the end of the path in which case take the first value regardless
+               next-val (some #(when (= const/$xsd:anyURI (flake/dt %))
+                                 (flake/o %))
+                              next-res)]
+           (log/debug "resolve-equals-fn next-val:" next-val)
+           (when (> (count next-res) 1)
+             (log/warn (str "f:equals used for identity " ident " and path: " equals-rule
+                            " however the query produces more than one result, the first one "
+                            " is being used which can product unpredictable results. "
+                            "Prefer f:contains when comparing with multiple results.")))
+           (recur r next-val))
+         (do
+           (swap! cache assoc equals-rule last-result)
+           last-result))))))
 
 (defn cache-store-value
   "Caches path lookup result into the policy map cache. Returns original value."
@@ -68,7 +73,7 @@
   (get @(get-in db [:policy :cache]) cache-key))
 
 (defn generate-equals-fn
-  "Returns validating function for :f/equals rule.
+  "Returns validating function for f:equals rule.
 
   Validating functions take two arguments, the db and the flake to be validated.
 
@@ -78,21 +83,30 @@
   All policy functions are evaluated for a truthy or falsey result which determines if the provided flake
   can be operated on/viewed."
   [rule property-path]
-  (if (= :f/$identity (first property-path))
-    ;; make certain first element of path is :f/$identity which following fn only considers. Will support other path constructs in the future
-    (let [path-no-identity (rest property-path)             ;; remove :f/$identity - following logic will "substitute" the user's actual identity in its place
+  (log/debug "generate-equals-fn property-path:" property-path)
+  (if (= "f:$identity" (first property-path))
+    ;; make certain first element of path is f:$identity which following fn only considers. Will support other path constructs in the future
+    (let [path-no-identity (rest property-path) ; remove f:$identity - following logic will "substitute" the user's actual identity in its place
           f                (fn [db flake]
                              (go-try
+                              (log/debug "equals-fn flake:" flake)
+                              (log/debug "equals-fn path-no-identity:" path-no-identity)
                                ;; because same 'path' is likely used in many flake evaluations, keep a local cache of results so expensive lookup only happens once per query/transaction.
-                               (let [path-val (or (cache-get-value db property-path)
-                                                  (->> (async/<! (resolve-equals-rule db path-no-identity rule))
-                                                       (cache-store-value db property-path)))]
-                                 (if (util/exception? path-val)
-                                   (do
-                                     (log/warn "Exception while processing path in policy rule, not allowing flake for subject " (flake/s flake)
-                                               " through policy enforcement for rule: " rule)
-                                     false)
-                                   (= (flake/s flake) path-val)))))]
+                              (let [path-val (or (cache-get-value db property-path)
+                                                 (->> (async/<! (resolve-equals-rule db path-no-identity rule))
+                                                      (cache-store-value db property-path)))]
+                                (if (util/exception? path-val)
+                                  (do
+                                    (log/warn "Exception while processing path in policy rule, not allowing flake for subject " (flake/s flake)
+                                              " through policy enforcement for rule: " rule)
+                                    false)
+                                  (let [subj (flake/s flake)
+                                        res (= subj path-val)]
+                                    (log/debug "equals-fn subj:" subj)
+                                    (log/debug "equals-fn path-val:" path-val)
+                                    (log/debug "equals-fn res:" res)
+                                    res)))))]
+
       [true f])
     (do
       (log/warn (str "Policy f:equals only supports equals paths that start with f:$identity currently. "

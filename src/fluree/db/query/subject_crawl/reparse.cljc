@@ -166,5 +166,5 @@
              (simple-subject-crawl? parsed-query))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (when-let [ssmw (simple-subject-merge-where parsed-query)]
-      (util/assoc-from-str-opts ssmw #{"select" "where" {"@context" :context}}
-                                (dissoc ssmw "select" "where" "@context")))))
+      (util/assoc-from-str-opts ssmw #{"select" "where" {"@context" :context} "opts"}
+                                (dissoc ssmw "select" "where" "@context" "opts")))))
