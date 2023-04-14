@@ -12,7 +12,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
 (defn reference?
   [dt]
   (= dt const/$xsd:anyURI))
