@@ -270,10 +270,30 @@
       (json-ld/expand-iri context)
       where/anonymous-value))
 
+(defn iri-map?
+  [x context]
+  (and (map? x)
+       (= (count x) 1)
+       (-> x
+           keys
+           first
+           (json-ld/expand-iri context)
+           syntax/iri-key?)))
+
+(defn parse-iri-map
+  [x context]
+  (when (iri-map? x context)
+    (let [o-iri (-> x
+                    vals
+                    first
+                    (json-ld/expand-iri context))]
+      (where/->iri-ref o-iri))))
+
 (defn parse-object-pattern
-  [o-pat]
+  [o-pat context]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
+      (parse-iri-map o-pat context)
       (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
@@ -326,24 +346,6 @@
     (log/debug "parse-where-clause patterns:" patterns)
     (where/->where-clause patterns filters)))
 
-(defn iri-map?
-  [x context]
-  (and (map? x)
-       (= (count x) 1)
-       (-> x
-           keys
-           first
-           (json-ld/expand-iri context)
-           syntax/iri-key?)))
-
-(defn parse-iri-map
-  [x context]
-  (when (iri-map? x context)
-    (-> x
-        vals
-        first
-        (parse-object-iri context))))
-
 (defn parse-triple
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
@@ -355,10 +357,8 @@
       (if (= const/$xsd:anyURI (::where/val p))
         (let [o (parse-object-iri o-pat context)]
           [s p o])
-        (if-let [o (parse-iri-map o-pat context)]
-          (where/->pattern :iri-ref [s p o])
-          (let [o (parse-object-pattern o-pat)]
-            [s p o]))))))
+        (let [o (parse-object-pattern o-pat context)]
+          [s p o])))))
 
 (defmethod parse-pattern :triple
   [triple _ db context]

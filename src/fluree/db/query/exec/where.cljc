@@ -12,61 +12,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn reference?
-  [match]
-  (= (::datatype match)
-     const/$xsd:anyURI))
-
-(defn idx-for
-  [s p o]
-  (cond
-    s :spot
-    (and p o) :post
-    p         :psot
-    o         (if (reference? o)
-                :opst
-                (throw (ex-info (str "Illegal reference object value" (::var o))
-                                {:status 400 :error :db/invalid-query})))
-    :else     :spot))
-
-(defn resolve-flake-range
-  [{:keys [conn t] :as db} error-ch components]
-  (let [out-ch (async/chan)
-        [s-cmp p-cmp o-cmp] components
-        {s ::val, s-fn ::fn} s-cmp
-        {p ::val, p-fn ::fn} p-cmp
-        {o    ::val
-         o-fn ::fn
-         o-dt ::datatype} o-cmp]
-    (go
-      (try* (let [s*          (if (and s (not (number? s)))
-                                (<? (dbproto/-subid db s true))
-                                s)
-                  idx         (idx-for s* p o)
-                  idx-root    (get db idx)
-                  novelty     (get-in db [:novelty idx])
-                  start-flake (flake/create s* p o o-dt nil nil util/min-integer)
-                  end-flake   (flake/create s* p o o-dt nil nil util/max-integer)
-                  opts        (cond-> {:idx         idx
-                                       :from-t      t
-                                       :to-t        t
-                                       :start-test  >=
-                                       :start-flake start-flake
-                                       :end-test    <=
-                                       :end-flake   end-flake}
-                                      s-fn (assoc :subject-fn s-fn)
-                                      p-fn (assoc :predicate-fn p-fn)
-                                      o-fn (assoc :object-fn o-fn))]
-              (-> (query-range/resolve-flake-slices conn idx-root novelty
-                                                    error-ch opts)
-                  (->> (query-range/filter-authorized db start-flake end-flake
-                                                      error-ch))
-                  (async/pipe out-ch)))
-            (catch* e
-              (log/error e "Error resolving flake range")
-              (>! error-ch e))))
-    out-ch))
-
 (defn unmatched
   ([] {})
   ([var-sym]
@@ -106,6 +51,10 @@
   "Build a pattern that already matches the two-tuple database identifier `x`"
   [x]
   {::ident x})
+
+(defn ->iri-ref
+  [x]
+  {::iri x})
 
 (defn ->function
   "Build a query function specification for the variable `var` out of the
@@ -211,6 +160,64 @@
             (unmatched? p) (assoc (::var p) (match-predicate p flake))
             (unmatched? o) (assoc (::var o) (match-object o flake)))))
 
+(defn reference?
+  [match]
+  (= (::datatype match)
+     const/$xsd:anyURI))
+
+(defn idx-for
+  [s p o]
+  (cond
+    s :spot
+    (and p o) :post
+    p         :psot
+    o         (if (reference? o)
+                :opst
+                (throw (ex-info (str "Illegal reference object value" (::var o))
+                                {:status 400 :error :db/invalid-query})))
+    :else     :spot))
+
+(defn resolve-flake-range
+  [{:keys [conn t] :as db} error-ch components]
+  (let [out-ch (async/chan)
+        [s-cmp p-cmp o-cmp] components
+        {s ::val, s-fn ::fn} s-cmp
+        {p ::val, p-fn ::fn} p-cmp
+        {o    ::val
+         o-fn ::fn
+         o-dt ::datatype} o-cmp]
+    (go
+      (try* (let [s*          (if (and s (not (number? s)))
+                                (<? (dbproto/-subid db s true))
+                                s)
+                  [o* o-dt*]  (if-let [o-iri (::iri o)]
+                                [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
+                                [o o-dt])
+                  idx         (idx-for s* p o)
+                  idx-root    (get db idx)
+                  novelty     (get-in db [:novelty idx])
+                  start-flake (flake/create s* p o* o-dt* nil nil util/min-integer)
+                  end-flake   (flake/create s* p o* o-dt* nil nil util/max-integer)
+                  opts        (cond-> {:idx         idx
+                                       :from-t      t
+                                       :to-t        t
+                                       :start-test  >=
+                                       :start-flake start-flake
+                                       :end-test    <=
+                                       :end-flake   end-flake}
+                                      s-fn (assoc :subject-fn s-fn)
+                                      p-fn (assoc :predicate-fn p-fn)
+                                      o-fn (assoc :object-fn o-fn))]
+              (-> (query-range/resolve-flake-slices conn idx-root novelty
+                                                    error-ch opts)
+                  (->> (query-range/filter-authorized db start-flake end-flake
+                                                      error-ch))
+                  (async/pipe out-ch)))
+            (catch* e
+              (log/error e "Error resolving flake range")
+              (>! error-ch e))))
+    out-ch))
+
 (defmethod match-pattern :tuple
   [db solution pattern filters error-ch]
   (let [cur-vals (assign-matched-values pattern solution filters)
@@ -220,23 +227,6 @@
                                      (map (fn [flake]
                                             (match-flake solution pattern flake)))))]
     (async/pipe flake-ch match-ch)))
-
-(defmethod match-pattern :iri-ref
-  [db solution pattern filters error-ch]
-  (let [match-ch        (async/chan)
-        [s p iri-match] (val pattern)
-        iri             (::val iri-match)]
-    (go (try*
-          (let [sid    (<? (dbproto/-subid db iri true))
-                o      (anonymous-value sid const/$xsd:anyURI)
-                triple [s p o]]
-            (-> db
-                (match-pattern solution triple filters error-ch)
-                (async/pipe match-ch)))
-          (catch* e
-                  (log/error e "Error looking up sid from iri")
-                  (>! error-ch e))))
-    match-ch))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
