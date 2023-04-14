@@ -12,6 +12,64 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+
+(defn reference?
+  [dt]
+  (= dt const/$xsd:anyURI))
+
+(defn idx-for
+  [s p o o-dt]
+  (cond
+    s         :spot
+    (and p o) :post
+    p         :psot
+    o         (if (reference? o-dt)
+                :opst
+                (throw (ex-info (str "Illegal reference object value" (::var o))
+                                {:status 400 :error :db/invalid-query})))
+    :else     :spot))
+
+(defn resolve-flake-range
+  [{:keys [conn t] :as db} error-ch components]
+  (let [out-ch (async/chan)
+        [s-cmp p-cmp o-cmp] components
+        {s ::val, s-fn ::fn} s-cmp
+        {p ::val, p-fn ::fn} p-cmp
+        {o    ::val
+         o-fn ::fn
+         o-dt ::datatype} o-cmp]
+    (go
+      (try* (let [s*          (if (and s (not (number? s)))
+                                (<? (dbproto/-subid db s true))
+                                s)
+                  [o* o-dt*]  (if-let [o-iri (::iri o)]
+                                [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
+                                [o o-dt])
+                  idx         (idx-for s* p o* o-dt*)
+                  idx-root    (get db idx)
+                  novelty     (get-in db [:novelty idx])
+                  start-flake (flake/create s* p o* o-dt* nil nil util/min-integer)
+                  end-flake   (flake/create s* p o* o-dt* nil nil util/max-integer)
+                  opts        (cond-> {:idx         idx
+                                       :from-t      t
+                                       :to-t        t
+                                       :start-test  >=
+                                       :start-flake start-flake
+                                       :end-test    <=
+                                       :end-flake   end-flake}
+                                      s-fn (assoc :subject-fn s-fn)
+                                      p-fn (assoc :predicate-fn p-fn)
+                                      o-fn (assoc :object-fn o-fn))]
+              (-> (query-range/resolve-flake-slices conn idx-root novelty
+                                                    error-ch opts)
+                  (->> (query-range/filter-authorized db start-flake end-flake
+                                                      error-ch))
+                  (async/pipe out-ch)))
+            (catch* e
+              (log/error e "Error resolving flake range")
+              (>! error-ch e))))
+    out-ch))
+
 (defn unmatched
   ([] {})
   ([var-sym]
@@ -159,64 +217,6 @@
             (unmatched? s) (assoc (::var s) (match-subject s flake))
             (unmatched? p) (assoc (::var p) (match-predicate p flake))
             (unmatched? o) (assoc (::var o) (match-object o flake)))))
-
-(defn reference?
-  [match]
-  (= (::datatype match)
-     const/$xsd:anyURI))
-
-(defn idx-for
-  [s p o]
-  (cond
-    s :spot
-    (and p o) :post
-    p         :psot
-    o         (if (reference? o)
-                :opst
-                (throw (ex-info (str "Illegal reference object value" (::var o))
-                                {:status 400 :error :db/invalid-query})))
-    :else     :spot))
-
-(defn resolve-flake-range
-  [{:keys [conn t] :as db} error-ch components]
-  (let [out-ch (async/chan)
-        [s-cmp p-cmp o-cmp] components
-        {s ::val, s-fn ::fn} s-cmp
-        {p ::val, p-fn ::fn} p-cmp
-        {o    ::val
-         o-fn ::fn
-         o-dt ::datatype} o-cmp]
-    (go
-      (try* (let [s*          (if (and s (not (number? s)))
-                                (<? (dbproto/-subid db s true))
-                                s)
-                  [o* o-dt*]  (if-let [o-iri (::iri o)]
-                                [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
-                                [o o-dt])
-                  idx         (idx-for s* p o)
-                  idx-root    (get db idx)
-                  novelty     (get-in db [:novelty idx])
-                  start-flake (flake/create s* p o* o-dt* nil nil util/min-integer)
-                  end-flake   (flake/create s* p o* o-dt* nil nil util/max-integer)
-                  opts        (cond-> {:idx         idx
-                                       :from-t      t
-                                       :to-t        t
-                                       :start-test  >=
-                                       :start-flake start-flake
-                                       :end-test    <=
-                                       :end-flake   end-flake}
-                                      s-fn (assoc :subject-fn s-fn)
-                                      p-fn (assoc :predicate-fn p-fn)
-                                      o-fn (assoc :object-fn o-fn))]
-              (-> (query-range/resolve-flake-slices conn idx-root novelty
-                                                    error-ch opts)
-                  (->> (query-range/filter-authorized db start-flake end-flake
-                                                      error-ch))
-                  (async/pipe out-ch)))
-            (catch* e
-              (log/error e "Error resolving flake range")
-              (>! error-ch e))))
-    out-ch))
 
 (defmethod match-pattern :tuple
   [db solution pattern filters error-ch]
