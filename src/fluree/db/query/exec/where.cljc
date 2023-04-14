@@ -35,7 +35,8 @@
         [s-cmp p-cmp o-cmp] components
         {s ::val, s-fn ::fn} s-cmp
         {p ::val, p-fn ::fn} p-cmp
-        {o    ::val, o-fn ::fn
+        {o    ::val
+         o-fn ::fn
          o-dt ::datatype} o-cmp]
     (go
       (try* (let [s*          (if (and s (not (number? s)))
@@ -222,12 +223,13 @@
 
 (defmethod match-pattern :iri-ref
   [db solution pattern filters error-ch]
-  (let [match-ch  (async/chan)
-        [s p iri] (val pattern)]
+  (let [match-ch        (async/chan)
+        [s p iri-match] (val pattern)
+        iri             (::val iri-match)]
     (go (try*
-          (log/trace "looking up iri:" iri)
-          (let [sid   (<? (dbproto/-subid db iri true))
-                triple [s p sid]]
+          (let [sid    (<? (dbproto/-subid db iri true))
+                o      (anonymous-value sid const/$xsd:anyURI)
+                triple [s p o]]
             (-> db
                 (match-pattern solution triple filters error-ch)
                 (async/pipe match-ch)))

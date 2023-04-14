@@ -327,14 +327,18 @@
     (where/->where-clause patterns filters)))
 
 (defn iri-map?
-  [x]
+  [x context]
   (and (map? x)
        (= (count x) 1)
-       (-> x keys first syntax/iri-key?)))
+       (-> x
+           keys
+           first
+           (json-ld/expand-iri context)
+           syntax/iri-key?)))
 
 (defn parse-iri-map
   [x context]
-  (when (iri-map? x)
+  (when (iri-map? x context)
     (-> x
         vals
         first
@@ -351,9 +355,8 @@
       (if (= const/$xsd:anyURI (::where/val p))
         (let [o (parse-object-iri o-pat context)]
           [s p o])
-        (if (iri-map? o-pat)
-          (let [o (parse-iri-map o-pat context)]
-            (where/->pattern :iri-ref [s p o]))
+        (if-let [o (parse-iri-map o-pat context)]
+          (where/->pattern :iri-ref [s p o])
           (let [o (parse-object-pattern o-pat)]
             [s p o]))))))
 
