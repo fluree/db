@@ -57,8 +57,7 @@
 (defn calc-subclass
   "Calculates subclass map for use with queries for rdf:type."
   [property-maps]
-  (let [classes      (filter #(true? (:class %)) property-maps)
-        subclass-map (recur-sub-classes (vals property-maps))]
+  (let [subclass-map (recur-sub-classes (vals property-maps))]
     ;; map subclasses for both subject-id and iri
     (reduce-kv
       (fn [acc class-id subclasses]
@@ -103,6 +102,26 @@
         with-equivalent-property (fnil add-equivalent-property initial-map)]
     (update prop-map sid with-equivalent-property prop)))
 
+(defn update-all-equivalent-properties
+  [prop-map sid o-props]
+  (reduce (fn [p-map o-prop]
+            (-> p-map
+                (update-equivalent-property sid o-prop)
+                (update-equivalent-property o-prop sid)))
+          prop-map o-props))
+
+(defn update-equivalent-properties
+  [pred-map sid obj]
+  (let [s-props (-> pred-map
+                    (get-in [sid :equivalentProperty])
+                    (conj sid))
+        o-props (-> pred-map
+                    (get-in [obj :equivalentProperty])
+                    (conj obj))]
+    (reduce (fn [p-map s-prop]
+              (update-all-equivalent-properties p-map s-prop o-props))
+            pred-map s-props)))
+
 (defn update-pred-map
   [pred-map vocab-flake]
   (let [[sid pid obj]   ((juxt flake/s flake/p flake/o) vocab-flake)
@@ -127,9 +146,7 @@
       (update pred-map sid with-subclass obj)
 
       (= const/$_predicate:equivalentProperty pid)
-      (-> pred-map
-          (update-equivalent-property sid obj)
-          (update-equivalent-property obj sid))
+      (update-equivalent-properties pred-map sid obj)
 
       :else pred-map)))
 
