@@ -289,13 +289,13 @@
 
 (defn db-assert
   [db-data]
-  (let [commit-assert (get-in db-data [const/iri-assert])]
+  (let [commit-assert (get db-data const/iri-assert)]
     ;; TODO - any basic validation required
     commit-assert))
 
 (defn db-retract
   [db-data]
-  (let [commit-retract (get-in db-data [const/iri-retract])]
+  (let [commit-retract (get db-data const/iri-retract)]
     ;; TODO - any basic validation required
     commit-retract))
 

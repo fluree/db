@@ -383,13 +383,13 @@
   "Executes a delete statement"
   [db max-fuel json-ld {:keys [t] :as _tx-state}]
   (go-try
-    (let [{:keys [delete] :as parsed-query}
+    (let [{:strs [delete] :as parsed-query}
           (-> json-ld
               syntax/validate-query
               (q-parse/parse-delete db))
 
           [s p o] delete
-          parsed-query (assoc parsed-query :delete [s p o])
+          parsed-query (assoc parsed-query "delete" [s p o])
           error-ch     (async/chan)
           flake-ch     (async/chan)
           where-ch     (where/search db parsed-query error-ch)]
@@ -446,8 +446,8 @@
                 (<? (perm/wrap-policy db policy-opts))
                 db)
           tx-state (->tx-state db* (assoc opts :issuer issuer))
-          flakes   (if (and (contains? tx :delete)
-                            (contains? tx :where))
+          flakes   (if (and (contains? tx "delete")
+                            (contains? tx "where"))
                      (<? (delete db util/max-integer tx tx-state))
                      (<? (insert db tx tx-state)))]
       (<? (flakes->final-db tx-state flakes)))))
