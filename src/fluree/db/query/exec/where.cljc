@@ -13,17 +13,16 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn reference?
-  [match]
-  (= (::datatype match)
-     const/$xsd:anyURI))
+  [dt]
+  (= dt const/$xsd:anyURI))
 
 (defn idx-for
-  [s p o]
+  [s p o o-dt]
   (cond
-    s :spot
+    s         :spot
     (and p o) :post
     p         :psot
-    o         (if (reference? o)
+    o         (if (reference? o-dt)
                 :opst
                 (throw (ex-info (str "Illegal reference object value" (::var o))
                                 {:status 400 :error :db/invalid-query})))
@@ -35,17 +34,21 @@
         [s-cmp p-cmp o-cmp] components
         {s ::val, s-fn ::fn} s-cmp
         {p ::val, p-fn ::fn} p-cmp
-        {o    ::val, o-fn ::fn
+        {o    ::val
+         o-fn ::fn
          o-dt ::datatype} o-cmp]
     (go
       (try* (let [s*          (if (and s (not (number? s)))
                                 (<? (dbproto/-subid db s true))
                                 s)
-                  idx         (idx-for s* p o)
+                  [o* o-dt*]  (if-let [o-iri (::iri o)]
+                                [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
+                                [o o-dt])
+                  idx         (idx-for s* p o* o-dt*)
                   idx-root    (get db idx)
                   novelty     (get-in db [:novelty idx])
-                  start-flake (flake/create s* p o o-dt nil nil util/min-integer)
-                  end-flake   (flake/create s* p o o-dt nil nil util/max-integer)
+                  start-flake (flake/create s* p o* o-dt* nil nil util/min-integer)
+                  end-flake   (flake/create s* p o* o-dt* nil nil util/max-integer)
                   opts        (cond-> {:idx         idx
                                        :from-t      t
                                        :to-t        t
@@ -105,6 +108,10 @@
   "Build a pattern that already matches the two-tuple database identifier `x`"
   [x]
   {::ident x})
+
+(defn ->iri-ref
+  [x]
+  {::iri x})
 
 (defn ->function
   "Build a query function specification for the variable `var` out of the
@@ -240,17 +247,6 @@
           (async/pipe match-ch)))
 
     match-ch))
-
-(defmethod match-pattern :iri
-  [db solution pattern filters error-ch]
-  (let [triple   (val pattern)
-        cur-vals (assign-matched-values triple solution filters)
-        _        (log/debug "assign-matched-values returned:" cur-vals)
-        flake-ch (resolve-flake-range db error-ch cur-vals)
-        match-ch (async/chan 2 (comp cat
-                                     (map (fn [flake]
-                                            (match-flake solution triple flake)))))]
-    (async/pipe flake-ch match-ch)))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with

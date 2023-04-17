@@ -174,7 +174,7 @@
   (when (util/pred-ident? x)
     (where/->ident x)))
 
-(defn parse-iri
+(defn parse-subject-iri
   [x context]
   (-> x
       (json-ld/expand-iri context)
@@ -193,7 +193,7 @@
    (if-let [parsed (parse-subject x)]
      parsed
      (when context
-       (parse-iri x context)))))
+       (parse-subject-iri x context)))))
 
 (defn parse-subject-pattern
   [s-pat context]
@@ -212,7 +212,7 @@
 
 (defn parse-iri-predicate
   [x]
-  (when (= "@id" x)
+  (when (syntax/iri-key? x)
     (where/->predicate const/$xsd:anyURI)))
 
 (defn iri->pred-id
@@ -264,10 +264,36 @@
     (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o-iri context))
                     {:status 400 :error :db/invalid-query}))))
 
+(defn parse-object-iri
+  [x context]
+  (-> x
+      (json-ld/expand-iri context)
+      where/anonymous-value))
+
+(defn iri-map?
+  [x context]
+  (and (map? x)
+       (= (count x) 1)
+       (-> x
+           keys
+           first
+           (json-ld/expand-iri context)
+           syntax/iri-key?)))
+
+(defn parse-iri-map
+  [x context]
+  (when (iri-map? x context)
+    (let [o-iri (-> x
+                    vals
+                    first
+                    (json-ld/expand-iri context))]
+      (where/->iri-ref o-iri))))
+
 (defn parse-object-pattern
-  [o-pat]
+  [o-pat context]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
+      (parse-iri-map o-pat context)
       (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
@@ -329,11 +355,9 @@
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
       (if (= const/$xsd:anyURI (::where/val p))
-        (let [o (-> o-pat
-                    (json-ld/expand-iri context)
-                    where/anonymous-value)]
-          (where/->pattern :iri [s p o]))
-        (let [o (parse-object-pattern o-pat)]
+        (let [o (parse-object-iri o-pat context)]
+          [s p o])
+        (let [o (parse-object-pattern o-pat context)]
           [s p o])))))
 
 (defmethod parse-pattern :triple

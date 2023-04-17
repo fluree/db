@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.syntax
-  (:require [malli.core :as m]
-            [fluree.db.util.core :refer [pred-ident?]]))
+  (:require [fluree.db.constants :as const]
+            [fluree.db.util.core :refer [pred-ident?]]
+            [malli.core :as m]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -40,6 +41,10 @@
 (defn desc?
   [x]
   (boolean (#{'desc "desc" :desc} x)))
+
+(defn iri-key?
+  [x]
+  (= const/iri-id x))
 
 (defn where-op [x]
   (when (map? x)
@@ -131,6 +136,9 @@
                               [:optional [:map [:optional [:ref ::optional]]]]
                               [:union [:map [:union [:ref ::union]]]]
                               [:bind [:map [:bind [:ref ::bind]]]]]]
+     ::iri-key              [:fn iri-key?]
+     ::iri-map              [:map-of {:max 1}
+                             ::iri-key ::iri]
      ::triple               [:catn
                              [:subject [:orn
                                         [:var ::var]
@@ -141,6 +149,7 @@
                              [:object [:orn
                                        [:var ::var]
                                        [:ident [:fn pred-ident?]]
+                                       [:iri-map ::iri-map]
                                        [:val :any]]]]
      ::where-tuple          [:orn
                              [:triple ::triple]
