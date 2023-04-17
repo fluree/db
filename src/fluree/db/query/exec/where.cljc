@@ -210,15 +210,36 @@
             (unmatched? p) (assoc (::var p) (match-predicate p flake))
             (unmatched? o) (assoc (::var o) (match-object o flake)))))
 
+(defn get-equivalent-properties
+  [db prop]
+  (-> db
+      (get-in [:schema :pred prop :equivalentProperty])
+      not-empty))
+
 (defmethod match-pattern :tuple
   [db solution pattern filters error-ch]
-  (let [cur-vals (assign-matched-values pattern solution filters)
-        _        (log/debug "assign-matched-values returned:" cur-vals)
-        flake-ch (resolve-flake-range db error-ch cur-vals)
+  (let [[s p o]  (assign-matched-values pattern solution filters)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
-                                            (match-flake solution pattern flake)))))]
-    (async/pipe flake-ch match-ch)))
+                                            (match-flake solution pattern flake)))))
+        p-val    (::val p)]
+
+    (if-let [props (and p-val (get-equivalent-properties db p-val))]
+      (let [prop-ch (async/to-chan! (conj props p-val))]
+        (async/pipeline-async 2
+                              match-ch
+                              (fn [prop ch]
+                                (let [p* (assoc p ::val prop)]
+                                  (-> db
+                                      (resolve-flake-range error-ch [s p* o])
+                                      (async/pipe ch))))
+                              prop-ch))
+
+      (-> db
+          (resolve-flake-range error-ch [s p o])
+          (async/pipe match-ch)))
+
+    match-ch))
 
 (defmethod match-pattern :iri
   [db solution pattern filters error-ch]
