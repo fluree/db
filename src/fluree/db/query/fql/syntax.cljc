@@ -2,8 +2,7 @@
   (:require [fluree.db.util.core :as util :refer [pred-ident?]]
             [fluree.db.constants :as const]
             [malli.core :as m]
-            [fluree.db.util.validation :as v])
-  (:import (clojure.lang ExceptionInfo)))
+            [fluree.db.util.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
