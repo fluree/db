@@ -139,7 +139,7 @@
                                        (flake/o f))]
                              (recur r (conj acc res)))
                            (if (and (= 1 (count acc))
-                                    (not (#{"list" "set"} (-> context (get p-iri) (get "@container")))))
+                                    (not (#{"list" "set" :list :set} (-> context (get p-iri) (get :container)))))
                              (first acc)
                              acc))))]
            (if v

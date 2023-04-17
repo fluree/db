@@ -36,29 +36,24 @@
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query-context"
-                               {"defaults"
-                                {"@context" ["" {"ex" "http://example.org/ns/"}]}})
+        ledger @(fluree/create conn "query-context" {"defaults" {"@context" ["" {"ex" "http://example.org/ns/"}]}})
         db     @(test-utils/transact ledger [{"id"   "ex:dan"
                                               "ex:x" 1}])]
-    (is (= [{"id"    "foo:dan"
-             "foo:x" 1}]
-           @(fluree/query db {"@context" ["" {"foo" "http://example.org/ns/"}]
-                              "where"    [['?s "id" "foo:dan"]]
+    (is (= [{"id"    "ex:dan"
+             "ex:x" 1}]
+           @(fluree/query db {"where"    [['?s "id" "ex:dan"]]
                               "select"   {'?s ["*"]}}))
         "default unwrapped objects")
-    (is (= [{"id"    "foo:dan"
-             "foo:x" [1]}]
-           @(fluree/query db {"@context" ["" {"foo"   "http://example.org/ns/"
-                                              "foo:x" {"@container" "set"}}]
-                              "where"    [['?s "id" "foo:dan"]]
+    (is (= [{"id"    "ex:dan"
+             "ex:x" [1]}]
+           @(fluree/query db {"@context" ["" {"ex:x" {"@container" "set"}}]
+                              "where"    [['?s "id" "ex:dan"]]
                               "select"   {'?s ["*"]}}))
         "override unwrapping with :set")
     (is (= [{"id"    "ex:dan"
-             "foo:x" [1]}]
-           @(fluree/query db {"@context" ["" {"foo"   "http://example.org/ns/"
-                                              "foo:x" {"@container" "@list"}}]
-                              "where"    [['?s "@id" "foo:dan"]]
+             "ex:x" [1]}]
+           @(fluree/query db {"@context" ["" {"ex:x" {"@container" "@list"}}]
+                              "where"    [['?s "@id" "ex:dan"]]
                               "select"   {'?s ["*"]}}))
         "override unwrapping with @list")))
 
