@@ -33,4 +33,11 @@
                                                "vocab2" "http://vocab1.example.org/"}
                                    :select    [?name]
                                    :where     [[?s "vocab2:firstName" ?name]]}))
+            "returns all values"))
+      (testing "querying for the symmetric property"
+        (is (= [["Brian"] ["Ben"]]
+               @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
+                                               "vocab2" "http://vocab1.example.org/"}
+                                   :select    [?name]
+                                   :where     [[?s "vocab1:givenName" ?name]]}))
             "returns all values")))))
