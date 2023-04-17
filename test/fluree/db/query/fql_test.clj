@@ -178,7 +178,13 @@
                                              "where" [[?s "id" "wiki:Q836821"]]})]
         (is (= [["wiki:Q836821"]]
                test-subject)
-            "Returns the subject with that iri")))))
+            "Returns the subject with that iri")))
+    (testing "iri references"
+      (let [test-subject @(fluree/query db '{"select" [?name]
+                                             "where"  [[?s "schema:name" ?name]
+                                                       [?s "schema:isBasedOn" {"id" "wiki:Q3107329"}]]})]
+        (is (= [["The Hitchhiker's Guide to the Galaxy"]]
+               test-subject))))))
 
 (deftest ^:integration multi-query-test
   (let [conn   (test-utils/create-conn)

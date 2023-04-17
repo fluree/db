@@ -207,6 +207,14 @@
         (vswap! context-cache assoc supplied-context parsed-ctx)
         parsed-ctx)))
 
+(defn default-context-update
+  "Updates default context, so on next commit it will get written in the commit file."
+  [db default-context]
+  (let [default-context* (ctx-util/mapify-context default-context
+                                                  (dbproto/-default-context db))] ;; allows 'extending' existing default context using empty string ""
+    (assoc db :default-context default-context*
+              :context-cache (volatile! {})
+              :new-context? true)))
 
 ;; ================ end GraphDB record support fns ============================
 
@@ -241,7 +249,8 @@
   (-index-update [db commit-index] (index-update db commit-index))
   (-context [_] (retrieve-context default-context context-cache nil))
   (-context [_ context] (retrieve-context default-context context-cache context))
-  (-default-context [_] default-context))
+  (-default-context [_] default-context)
+  (-default-context-update [db default-context] (default-context-update db default-context)))
 
 #?(:cljs
    (extend-type JsonLdDb

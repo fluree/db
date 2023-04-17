@@ -17,7 +17,7 @@
 
 
 (defn class-or-property?
-  [{:keys [type] :as node}]
+  [{:keys [type] :as _node}]
   (some class+property-iris (util/sequential type)))
 
 (def ^:const predefined-properties
@@ -32,6 +32,7 @@
           "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
           "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
           "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
+          "http://www.w3.org/2002/07/owl#equivalentProperty"    const/$_predicate:equivalentProperty
           ;; shacl
           "http://www.w3.org/ns/shacl#NodeShape"                const/$sh:NodeShape
           "http://www.w3.org/ns/shacl#PropertyShape"            const/$sh:PropertyShape

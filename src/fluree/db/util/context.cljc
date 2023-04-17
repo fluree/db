@@ -9,14 +9,12 @@
   [context default-context]
   (when context
     (cond
-
       (map? context)
       context
 
       (sequential? context)
       (reduce (fn [acc context-item]
                 (cond
-
                   (map? context-item)
                   (merge acc context-item)
 

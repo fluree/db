@@ -4,6 +4,7 @@
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.query :as query-api]
@@ -179,6 +180,22 @@
                       (<! (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
         (<! (conn-proto/-exists? conn address))))))
+
+(defn default-context
+  "Returns the current default context set on the db."
+  [db]
+  (dbproto/-default-context db))
+
+(defn update-default-context
+  "Updates the default context on a given database.
+  Currently, the updated default context will only be
+  written with a new commit, which requires staging
+  changed data.
+
+  Returns an updated db."
+  [db default-context]
+  (dbproto/-default-context-update db default-context))
+
 
 (defn index
   "Performs indexing operation on the specified ledger"
