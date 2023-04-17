@@ -65,8 +65,8 @@
                                           "f:allow" [{"id"           "ex:ssnViewRule"
                                                       "f:targetRole" {"id" "ex:userRole"}
                                                       "f:action"     [{"id" "f:view"}]
-                                                      "f:equals"     {"list" [{"id" "f:$identity"}
-                                                                              {"id" "ex:user"}]}}]}]}])]
+                                                      "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                                               {"id" "ex:user"}]}}]}]}])]
       (let [root-wrapped-db            @(fluree/wrap-policy
                                          db+policy
                                          {"did"  root-did

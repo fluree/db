@@ -247,11 +247,11 @@
                               (fluree/db ledger)
                               [{"id"         "ex:alice",
                                 "type"       "ex:User",
-                                "ex:friends" {"list" [{"id" "ex:john"}
-                                                      {"id" "ex:cam"}]}}
+                                "ex:friends" {"@list" [{"id" "ex:john"}
+                                                       {"id" "ex:cam"}]}}
                                {"id"         "ex:cam",
                                 "type"       "ex:User"
-                                "ex:numList" {"list" [7 8 9 10]}}
+                                "ex:numList" {"@list" [7 8 9 10]}}
                                {"id"   "ex:john",
                                 "type" "ex:User"}])
                db           @(fluree/commit! ledger db)
@@ -312,8 +312,8 @@
                                     [{"id"           "ex:ssnViewRule"
                                       "f:targetRole" {"id" "ex:userRole"}
                                       "f:action"     [{"id" "f:view"}]
-                                      "f:equals"     {"list" [{"id" "f:$identity"}
-                                                              {"id" "ex:user"}]}}]}]}])
+                                      "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                               {"id" "ex:user"}]}}]}]}])
                  db+policy    @(fluree/commit! ledger db+policy)
                  loaded       (test-utils/retry-load conn ledger-alias 100)
                  loaded-db    (fluree/db loaded)]
@@ -334,12 +334,13 @@
                           "f:equals"     [{"id" "f:$identity"} {"id" "ex:user"}]},
                          "f:path" {"id" "schema:ssn"}},
                         "f:targetClass" {"id" "ex:User"}}]
-                      @(fluree/query loaded-db
-                                     '{"select" {?s ["*"
-                                                     {"rdf:type" ["_id"]}
-                                                     {"f:allow" ["*" {"f:targetRole" ["_id"]}]}
-                                                     {"f:property" ["*" {"f:allow" ["*" {"f:targetRole" ["_id"]}]}]}]}
-                                       "where"  [[?s "rdf:type" "f:Policy"]]}))))))))))
+                      @(fluree/query
+                        loaded-db
+                        '{"select" {?s ["*"
+                                        {"rdf:type" ["_id"]}
+                                        {"f:allow" ["*" {"f:targetRole" ["_id"]}]}
+                                        {"f:property" ["*" {"f:allow" ["*" {"f:targetRole" ["_id"]}]}]}]}
+                          "where"  [[?s "rdf:type" "f:Policy"]]}))))))))))
 
 #?(:clj
    (deftest load-from-memory-test
@@ -512,11 +513,11 @@
                             (fluree/db ledger)
                             [{"id"         "ex:alice",
                               "type"       "ex:User",
-                              "ex:friends" {"list" [{"id" "ex:john"}
-                                                    {"id" "ex:cam"}]}}
+                              "ex:friends" {"@list" [{"id" "ex:john"}
+                                                     {"id" "ex:cam"}]}}
                              {"id"         "ex:cam",
                               "type"       "ex:User"
-                              "ex:numList" {"list" [7 8 9 10]}}
+                              "ex:numList" {"@list" [7 8 9 10]}}
                              {"id"   "ex:john",
                               "type" "ex:User"}])
              db           @(fluree/commit! ledger db)
@@ -569,8 +570,8 @@
                                   "f:allow" [{"id"           "ex:ssnViewRule"
                                               "f:targetRole" {"id" "ex:userRole"}
                                               "f:action"     [{"id" "f:view"}]
-                                              "f:equals"     {"list" [{"id" "f:$identity"}
-                                                                      {"id" "ex:user"}]}}]}]}])
+                                              "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                                       {"id" "ex:user"}]}}]}]}])
                db+policy    @(fluree/commit! ledger db+policy)
                loaded       (test-utils/retry-load conn ledger-alias 100)
                loaded-db    (fluree/db loaded)]

@@ -63,14 +63,14 @@
                                           "f:allow" [{"id"           "ex:ssnViewRule"
                                                       "f:targetRole" {"id" "ex:userRole"}
                                                       "f:action"     [{"id" "f:view"}]
-                                                      "f:equals"     {"list" [{"id" "f:$identity"}
-                                                                              {"id" "ex:user"}]}}]}
+                                                      "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                                               {"id" "ex:user"}]}}]}
                                          {"f:path"  {"id" "schema:email"}
                                           "f:allow" [{"id"           "ex:emailChangeRule"
                                                       "f:targetRole" {"id" "ex:userRole"}
                                                       "f:action"     [{"id" "f:view"} {"id" "f:modify"}]
-                                                      "f:equals"     {"list" [{"id" "f:$identity"}
-                                                                              {"id" "ex:user"}]}}]}]}
+                                                      "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                                               {"id" "ex:user"}]}}]}]}
                        ;; add a "ex:Product" policy allows view & modify for only "schema:name"
                        {"id"            "ex:ProductPolicy",
                         "type"          ["f:Policy"],

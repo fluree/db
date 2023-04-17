@@ -80,14 +80,14 @@
                                              {"f:targetRole" {"id" "ex:userRole"}
                                               "f:action"     [{"id" "f:modify"}]
                                               ;; by default, user can modify their own user profile (following relationship from identity/DID -> "ex:user" to User object
-                                              "f:equals"     {"list" [{"id" "f:$identity"}
-                                                                      {"id" "ex:user"}]}}]
+                                              "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                                       {"id" "ex:user"}]}}]
                             "f:property"    [{"f:path"  {"id" "schema:ssn"}
                                               "f:allow" [{"id"           "ex:ssnViewRule"
                                                           "f:targetRole" {"id" "ex:userRole"}
                                                           "f:action"     [{"id" "f:view"}]
-                                                          "f:equals"     {"list" [{"id" "f:$identity"}
-                                                                                  {"id" "ex:user"}]}}]}]}])]
+                                                          "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                                                   {"id" "ex:user"}]}}]}]}])]
 
       (testing "Policy map for classes and props within classes is properly formed"
         (let [policy-alice  (-> @(fluree/promise-wrap (policy/policy-map db alice-did "ex:userRole" nil))

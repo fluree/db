@@ -67,8 +67,8 @@
                                                  "f:allow" [{"id"           "ex:ssnViewRule"
                                                              "f:targetRole" {"id" "ex:userRole"}
                                                              "f:action"     [{"id" "f:view"}]
-                                                             "f:equals"     {"list" [{"id" "f:$identity"}
-                                                                                     {"id" "ex:user"}]}}]}]}])
+                                                             "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                                                      {"id" "ex:user"}]}}]}]}])
           ;; get a group of flakes that we know will have different permissions for different users.
           john-flakes     @(fluree/range db+policy :spot = ["ex:john"])
           alice-flakes    @(fluree/range db+policy :spot = [(fluree/expand-iri db+policy "ex:alice")])
