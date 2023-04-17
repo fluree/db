@@ -9,8 +9,9 @@
 (deftest test-reparse-as-ssc
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/parse"
-                               {"default-context"
-                                ["" {"ex" "http://example.org/ns/"}]})
+                               {"defaults"
+                                {"@context"
+                                 ["" {"ex" "http://example.org/ns/"}]}})
         db     @(fluree/stage
                  (fluree/db ledger)
                  [{"id" "ex:brian",
@@ -33,13 +34,13 @@
                    "schema:email" "cam@example.org"
                    "schema:age" 34
                    "ex:favNums" [5, 10]
-                   "ex:friend" ["ex:brian" "ex:alice"]}])
+                   "ex:friend" [{"id" "ex:brian"} {"id" "ex:alice"}]}])
 
-        ssc-q1-parsed      (parse/parse-analytical-query*
-                            {"select" {"?s" ["*"]}
-                             "where"  [["?s" "schema:name" "Alice"]]}
-                            db)
-        ssc-q2-parsed      (parse/parse-analytical-query*
+        ssc-q1-parsed (parse/parse-analytical-query*
+                       {"select" {"?s" ["*"]}
+                        "where"  [["?s" "schema:name" "Alice"]]}
+                       db)
+        ssc-q2-parsed (parse/parse-analytical-query*
                             {"select" {"?s" ["*"]}
                              "where"  [["?s" "schema:age" 50]
                                        ["?s" "ex:favColor" "Blue"]]}
@@ -91,7 +92,7 @@
       (is (not (reparse/simple-subject-crawl? s+p+o3-parsed))))
     (testing "reparse"
       (let [ssc-q1-reparsed                    (reparse/re-parse-as-simple-subj-crawl ssc-q1-parsed)
-            {:keys [where] context "@context"} ssc-q1-reparsed
+            {:keys [where context]}            ssc-q1-reparsed
             [pattern]                          where
             {:keys [s p o]}                    pattern]
         (is (not (nil? context)))
@@ -104,7 +105,7 @@
           (is datatype)))
 
       (let [ssc-q2-reparsed                    (reparse/re-parse-as-simple-subj-crawl ssc-q2-parsed)
-            {:keys [where] context "@context"} ssc-q2-reparsed
+            {:keys [where context]}            ssc-q2-reparsed
             [pattern _s-filter]                where
             {:keys [s p o]}                    pattern]
         (is (not (nil? context)))

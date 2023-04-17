@@ -480,16 +480,80 @@
                                "ex:y" "bar-3"
                                "id"   "ex:alice"}]
                  "f:t"       5}]
-               @(fluree/history ledger {"history" "ex:alice" "commit-details" true "t" {"from" 3}})))
+               @(fluree/history ledger {"history" "ex:alice" "commit-details" true "t" {"from" 3}}))))
 
-        (testing "multiple history results"
-          (let [history-with-commits @(fluree/history ledger {"history" "ex:alice" "commit-details" true "t" {"from" 1 "to" 5}})]
-            (testing "all `t`s with changes to subject are returned"
-              (is (= [1 2 3 5]
-                     (mapv #(get % "f:t") history-with-commits))))
-            (testing "all expected commits are present and associated with the correct results"
-              (is (= [[1 1] [2 2] [3 3] [5 5]]
-                     (map (fn [history-map]
-                            (let [commit-t (get-in history-map ["f:commit" "f:data" "f:t"])]
-                              (vector (get history-map "f:t") commit-t)))
-                          history-with-commits))))))))))
+      ;; TODO: Fix this https://github.com/fluree/db/issues/451
+      #_(testing "history commit details on a loaded ledger"
+          (is (= [{"f:assert"  [{"ex:x" "foo-3"
+                                 "ex:y" "bar-3"
+                                 "id"   "ex:alice"}]
+                   "f:commit"  {"https://www.w3.org/2018/credentials#issuer"
+                                {"id" "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                                "f:address"  "fluree:memory://f29bfb686c834d667dc62f8c46af1802f02c62567b400d50c0202428e489d1fe"
+                                "f:alias"    "committest"
+                                "f:branch"   "main"
+                                "f:context"  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                                "f:data"     {"f:address"  "fluree:memory://cb16fc43954b9ed029be2c96c6f73fa5e34e5ca1607111c5e8f8d6e337b648f6"
+                                              "f:assert"   [{"ex:x" "foo-3"
+                                                             "ex:y" "bar-3"
+                                                             "id"   "ex:alice"}]
+                                              "f:flakes"   63
+                                              "f:previous" {"id" "fluree:db:sha256:bjufs3dmyea7wzbkrjrh2pzua2mtqgijnl3cqpkktk7wzvy5wlnq"}
+                                              "f:retract"  [{"ex:x" "foo-2"
+                                                             "ex:y" "bar-2"
+                                                             "id"   "ex:alice"}]
+                                              "f:size"     5864
+                                              "f:t"        3}
+                                "f:previous" {"id" "fluree:commit:sha256:bbvotmnlqkm4xkc27au55rctw5klntegd36j4dbh665qfilem42eq"}
+                                "f:time"     720000
+                                "f:v"        0
+                                "id"         "fluree:commit:sha256:b5jlses24wzjhcmqywvcdwgxxzmjlmxruh2duqsgxbxy7522utlg"}
+                   "f:retract" [{"ex:x" "foo-2"
+                                 "ex:y" "bar-2"
+                                 "id"   "ex:alice"}]
+                   "f:t"       3}
+                  {"f:assert"  [{"ex:x" "foo-cat"
+                                 "ex:y" "bar-cat"
+                                 "id"   "ex:alice"}]
+                   "f:commit"  {"https://www.w3.org/2018/credentials#issuer"
+                                {"id" "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"}
+                                "f:address"  "fluree:memory://2716b3eaef91b763b32daebab8ba3733a8537de37a864f726c5021464b90277f"
+                                "f:alias"    "committest"
+                                "f:branch"   "main"
+                                "f:context"  "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"
+                                "f:data"     {"f:address"  "fluree:memory://2b8125a4c996f8612ae62f16cc62b167b762c517b0c5aa7b16fa21dfe47e7b2a"
+                                              "f:assert"   [{"ex:x" "foo-cat"
+                                                             "ex:y" "bar-cat"
+                                                             "id"   "ex:alice"}]
+                                              "f:flakes"   102
+                                              "f:previous" {"id" "fluree:db:sha256:bbtdwia2mle22abe2z7mmdrs4vufs77yubzxip3chhkmffvfk4npk"}
+                                              "f:retract"  [{"ex:x" "foo-3"
+                                                             "ex:y" "bar-3"
+                                                             "id"   "ex:alice"}]
+                                              "f:size"     9326
+                                              "f:t"        5}
+                                "f:message"  "meow"
+                                "f:previous" {"id" "fluree:commit:sha256:bhcunj52uwxshi6jws2ypsjiziyncfa5gal4xptfldj5utb54cpf"}
+                                "f:time"     720000
+                                "f:v"        0
+                                "id"         "fluree:commit:sha256:bq4r74wu4sru43z5f4byipe5zzkgyi2kksqxlmwuttdcwcgwpsrn"}
+                   "f:retract" [{"ex:x" "foo-3"
+                                 "ex:y" "bar-3"
+                                 "id"   "ex:alice"}]
+                   "f:t"       5}]
+                 (let [loaded-ledger @(fluree/load conn "committest")]
+                   @(fluree/history loaded-ledger {"history" "ex:alice"
+                                                   "commit-details" true
+                                                   "t" {"from" 3}})))))
+
+      (testing "multiple history results"
+        (let [history-with-commits @(fluree/history ledger {"history" "ex:alice" "commit-details" true "t" {"from" 1 "to" 5}})]
+          (testing "all `t`s with changes to subject are returned"
+            (is (= [1 2 3 5]
+                   (mapv #(get % "f:t") history-with-commits))))
+          (testing "all expected commits are present and associated with the correct results"
+            (is (= [[1 1] [2 2] [3 3] [5 5]]
+                   (map (fn [history-map]
+                          (let [commit-t (get-in history-map ["f:commit" "f:data" "f:t"])]
+                            (vector (get history-map "f:t") commit-t)))
+                        history-with-commits)))))))))

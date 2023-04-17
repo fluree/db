@@ -10,17 +10,17 @@
           people (test-utils/load-people conn)
           db     (fluree/db people)]
       (testing "with explicit grouping"
-        (let [qry    '{:select  [?name (count ?favNums)]
-                       :where   [[?s :schema/name ?name]
-                                 [?s :ex/favNums ?favNums]]
-                       :group-by ?name}
+        (let [qry     '{"select"   [?name (count ?favNums)]
+                        "where"    [[?s "schema:name" ?name]
+                                    [?s "ex:favNums" ?favNums]]
+                        "group-by" ?name}
               subject @(fluree/query db qry)]
           (is (= [["Liam" 2] ["Cam" 2] ["Alice" 3] ["Brian" 1]]
                  subject)
               "aggregates bindings within each group")))
       (testing "with implicit grouping"
-        (let [qry '{:select  [(count ?name)]
-                    :where   [[?s :schema/name ?name]]}
+        (let [qry     '{"select" [(count ?name)]
+                        "where"  [[?s "schema:name" ?name]]}
               subject @(fluree/query db qry)]
           (is (= [[4]] subject)
               "aggregates bindings for all results"))))))

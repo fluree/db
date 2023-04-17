@@ -9,21 +9,20 @@
     (let [conn   (test-utils/create-conn)
           ledger (test-utils/load-movies conn)
           db     (fluree/db ledger)
-          movies @(fluree/query db {:select '{?s [:*]}
-                                    :where  '[[?s :rdf/type :schema/Movie]]
-                                    :t      2})]
+          movies @(fluree/query db {"select" '{?s ["*"]}
+                                    "where"  '[[?s "rdf:type" "schema:Movie"]]
+                                    "t"      2})]
       (is (= 3 (count movies)))
       (is (every? #{"The Hitchhiker's Guide to the Galaxy"
                     "Back to the Future" "Back to the Future Part II"}
-                  (map :schema/name movies))))))
+                  (map #(get % "schema:name") movies))))))
 
 (deftest query-with-iso8601-string-t-value-test
   (testing "only gets results from before that time"
     (let [;conn         (test-utils/create-conn) ; doesn't work see comment below
-          conn                   @(fluree/connect {:method :memory
-                                                   :defaults
-                                                   {:context      test-utils/default-context
-                                                    :context-type :keyword}})
+          conn                   @(fluree/connect {"method" "memory"
+                                                   "defaults"
+                                                   {"@context" test-utils/default-context}})
           ;; if the :did default below is present on the conn
           ;; (as it is w/ test-utils/create-conn)
           ;; then the tests below fail at the last check
@@ -51,8 +50,8 @@
                                                   (fn [] start-iso)}
                                    (fn []
                                      (let [db1 @(fluree/stage
-                                                  (fluree/db ledger)
-                                                  (first test-utils/movies))]
+                                                 (fluree/db ledger)
+                                                 (first test-utils/movies))]
                                        @(fluree/commit! ledger db1))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] three-loaded-millis)
@@ -60,8 +59,8 @@
                                                   (fn [] three-loaded-iso)}
                                    (fn []
                                      (let [db2 @(fluree/stage
-                                                  (fluree/db ledger)
-                                                  (second test-utils/movies))]
+                                                 (fluree/db ledger)
+                                                 (second test-utils/movies))]
                                        @(fluree/commit! ledger db2))))
           _                      (with-redefs-fn {#'util/current-time-millis
                                                   (fn [] all-loaded-millis)
@@ -69,20 +68,20 @@
                                                   (fn [] all-loaded-iso)}
                                    (fn []
                                      (let [db3 @(fluree/stage
-                                                  (fluree/db ledger)
-                                                  (nth test-utils/movies 2))]
+                                                 (fluree/db ledger)
+                                                 (nth test-utils/movies 2))]
                                        @(fluree/commit! ledger db3))))
           db                     (fluree/db ledger)
-          base-query             {:select '{?s [:*]}
-                                  :where  '[[?s :rdf/type :schema/Movie]]}
+          base-query             {"select" '{?s ["*"]}
+                                  "where"  '[[?s "rdf:type" "schema:Movie"]]}
           one-movie              @(fluree/query db (assoc base-query
-                                                     :t after-one-loaded-iso))
+                                                     "t" after-one-loaded-iso))
           three-movies           @(fluree/query db (assoc base-query
-                                                     :t after-three-loaded-iso))
+                                                     "t" after-three-loaded-iso))
           all-movies             @(fluree/query db (assoc base-query
-                                                     :t after-all-loaded-iso))
+                                                     "t" after-all-loaded-iso))
           too-early              @(fluree/query db (assoc base-query
-                                                     :t too-early-iso))]
+                                                     "t" too-early-iso))]
       (is (= 1 (count one-movie)))
       (is (= 3 (count three-movies)))
       (is (= 4 (count all-movies)))
