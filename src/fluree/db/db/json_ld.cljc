@@ -111,7 +111,10 @@
   "Returns the iri for a given subject ID"
   [db subject-id compact-fn]
   (go-try
-   (when-let [flake (first (<? (query-range/index-range db :spot = [subject-id 0])))]
+   (when-let [flake (-> db
+                        (query-range/index-range :spot =
+                                                 [subject-id const/$xsd:anyURI])
+                        <? first)]
      (-> flake flake/o compact-fn))))
 
 ;; ================ GraphDB record support fns ================================
@@ -140,7 +143,7 @@
   return value if it starts with the given predicate name"
   ([this tag-id]
    (go-try
-    (let [tag-pred-id 30]
+    (let [tag-pred-id const/$_tag:id]
       (some-> (<? (query-range/index-range (dbproto/-rootdb this)
                                            :spot = [tag-id tag-pred-id]))
               first
