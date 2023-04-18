@@ -9,14 +9,14 @@
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.11.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
-         metosin/malli                   {:mvn/version "0.10.4"}
+         metosin/malli                   {:mvn/version "0.11.0"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :sha     "a909330e33196504ef8a5411aaa0409ab72aaa35"}
+                                          :sha     "a570e8f5898a59d28c775cf3ce72938da95d1541"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
-         ch.qos.logback/logback-classic  {:mvn/version "1.4.5"}
-         org.slf4j/slf4j-api             {:mvn/version "2.0.6"}
+         ch.qos.logback/logback-classic  {:mvn/version "1.4.6"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.7"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
@@ -45,20 +45,20 @@
  {:build
   {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.4"
                                                :git/sha "b0ee58b"}
-                slipset/deps-deploy           {:mvn/version "0.2.0"}}
+                slipset/deps-deploy           {:mvn/version "0.2.1"}}
    :ns-default build}
 
   :dev
   {:extra-paths ["dev" "test" "dev-resources" "src-cljs" "src-nodejs" "src-docs"]
-   :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.4.2"}
+   :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.4.4"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.22.0"}
+                 thheller/shadow-cljs              {:mvn/version "2.22.10"}
                  com.magnars/test-with-files       {:mvn/version "2021-02-17"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources"]
-   :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.80.1274"}
+   :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.82.1306"}
                  org.clojure/test.check                {:mvn/version "1.1.1"}
                  io.github.cap10morgan/test-with-files {:git/tag "v1.0.0"
                                                         :git/sha "9181a2e"}}
@@ -78,7 +78,7 @@
                 :output-path "docs"}}
 
   :deploy
-  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.0"}}
+  {:replace-deps {slipset/deps-deploy {:mvn/version "0.2.1"}}
    :main-opts    ["-m" "deps-deploy.deps-deploy" "deploy"
                   "target/fluree-db.jar"]}
 
@@ -91,7 +91,7 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.3.0"}}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.4.0"}}
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths    ["src" "src-docs"]
                  :test-paths      ["test"]
@@ -106,5 +106,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.02.17"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.04.14"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
