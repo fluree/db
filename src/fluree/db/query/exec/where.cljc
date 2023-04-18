@@ -154,8 +154,8 @@
 
 (defmulti match-pattern
   "Return a channel that will contain all pattern match solutions from flakes in
-   `db` that are compatible with the initial solution `solution` and matches the
-   additional where-clause pattern `pattern`."
+  `db` that are compatible with the initial solution `solution` and matches the
+  additional where-clause pattern `pattern`."
   (fn [_db _solution pattern _filters _error-ch]
     (pattern-type pattern)))
 

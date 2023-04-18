@@ -295,12 +295,12 @@
       (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
-          (fn [pattern _vars _db _context]
-            (log/debug "parse-pattern pattern:" pattern)
-            (cond
-              (map? pattern) (->> pattern keys first keyword)
-              (map-entry? pattern) :binding
-              :else :triple)))
+  (fn [pattern _vars _db _context]
+    (log/debug "parse-pattern pattern:" pattern)
+    (cond
+      (map? pattern) (->> pattern keys first keyword)
+      (map-entry? pattern) :binding
+      :else :triple)))
 
 (defn type-pattern?
   [typ x]
