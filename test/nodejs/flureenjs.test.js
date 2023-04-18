@@ -23,7 +23,7 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
   const conn = await flureenjs.connect({
     method: "memory",
     defaults: {
-      context: {
+      "@context": {
         id: "@id",
         type: "@type",
         schema: "http://schema.org/",
