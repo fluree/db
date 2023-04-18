@@ -54,7 +54,6 @@
              @(fluree/query db-subj-delete
                             '{"select" ?name
                               "where"  [[?s "schema:name" ?name]]}))
-
           "Only Jane and Bob should be left in the db.")
 
       (is (= {"id"          "ex:bob",
@@ -63,7 +62,6 @@
              @(fluree/query db-subj-pred-del
                             '{"selectOne" {?s ["*"]}
                               "where" [[?s "id" "ex:bob"]]}))
-
           "Bob should no longer have an age property.")
 
       (is (= ["Bob"]

@@ -14,7 +14,7 @@
   "Returns a channel containing the stream of solutions from `solution-ch` after
   the `offset` specified by the supplied query. Returns the original
   `solution-ch` if no offset is specified."
-  [{:strs [offset]} solution-ch]
+  [{:keys [offset]} solution-ch]
   (if offset
     (async/pipe solution-ch
                 (async/chan 2 (drop offset)))
@@ -24,7 +24,7 @@
   "Returns a channel that contains at most the specified `:limit` of the supplied
   query solutions from `solution-ch`, if the supplied query has a limit. Returns
   the original `solution-ch` if the supplied query has no specified limit."
-  [{:strs [limit]} solution-ch]
+  [{:keys [limit]} solution-ch]
   (if limit
     (async/take limit solution-ch)
     solution-ch))
@@ -38,7 +38,7 @@
   containing a single result to the output channel instead of the single result
   alone."
   [q result-ch]
-  (if (get q "select-one")
+  (if (:select-one q)
     (async/take 1 result-ch)
     (async/into [] result-ch)))
 

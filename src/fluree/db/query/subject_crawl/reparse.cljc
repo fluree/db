@@ -117,7 +117,7 @@
   "Revises where clause for simple-subject-crawl query to optimize processing.
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
-  [{:strs [where vars] :as parsed-query}]
+  [{:keys [where vars] :as parsed-query}]
   (log/debug "simple-subject-merge-where parsed-query:" parsed-query)
   (let [{::where/keys [patterns]} where
         [first-pattern & rest-patterns] patterns
@@ -127,17 +127,17 @@
       (log/debug "simple-subject-merge-where first-s:" first-s)
       (if (empty? rest-patterns)
         (assoc parsed-query
-          "where" [reparsed-first-clause]
+          :where [reparsed-first-clause]
           :strategy :simple-subject-crawl)
         (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
-          (assoc parsed-query "where" [reparsed-first-clause
-                                       {:s-filter subj-filter-map}]
+          (assoc parsed-query :where [reparsed-first-clause
+                                      {:s-filter subj-filter-map}]
                  :strategy :simple-subject-crawl))))))
 
 (defn simple-subject-crawl?
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
-  [{:strs [where select vars] :as _parsed-query}]
+  [{:keys [where select vars] :as _parsed-query}]
   (and (instance? SubgraphSelector select)
        ;;TODO, filtering not supported yet
        (empty? (::where/filters where))
@@ -157,14 +157,12 @@
 (defn re-parse-as-simple-subj-crawl
   "Returns true if query contains a single subject crawl.
   e.g.
-  {\"select\" {?subjects ['*']}
-   \"where\" [...]}"
-  [{:strs [order-by group-by] :as parsed-query}]
+  {:select {?subjects ['*']}
+   :where  [...]}"
+  [{:keys [order-by group-by] :as parsed-query}]
   (log/debug "re-parse-as-simple-subj-crawl parsed-query:" parsed-query)
   (when (and (not group-by)
              (not order-by)
              (simple-subject-crawl? parsed-query))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
-    (when-let [ssmw (simple-subject-merge-where parsed-query)]
-      (util/assoc-from-str-opts ssmw #{"select" "where" {"@context" :context} "opts"}
-                                (dissoc ssmw "select" "where" "@context" "opts")))))
+    (simple-subject-merge-where parsed-query)))

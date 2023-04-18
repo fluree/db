@@ -1,10 +1,11 @@
 (ns fluree.db.query.fql-parse-test
   (:require
-    [clojure.test :refer :all]
-    [fluree.db.query.exec.where :as where]
-    [fluree.db.test-utils :as test-utils]
-    [fluree.db.json-ld.api :as fluree]
-    [fluree.db.query.fql.parse :as parse]))
+   [clojure.test :refer :all]
+   [fluree.db.query.exec.where :as where]
+   [fluree.db.query.fql.syntax :as syntax]
+   [fluree.db.test-utils :as test-utils]
+   [fluree.db.json-ld.api :as fluree]
+   [fluree.db.query.fql.parse :as parse]))
 
 (defn de-recordify-select
   "Select statements are parsed into records.
@@ -20,31 +21,32 @@
                                {"default-context"
                                 ["" {"ex" "http://example.org/ns/"}]})
         db     @(fluree/stage
-                  (fluree/db ledger)
-                  [{"id"           "ex:brian",
-                    "type"         "ex:User",
-                    "schema:name"  "Brian"
-                    "schema:email" "brian@example.org"
-                    "schema:age"   50
-                    "ex:favNums"   7}
-                   {"id"           "ex:alice",
-                    "type"         "ex:User",
-                    "ex:favColor"  "Green"
-                    "schema:name"  "Alice"
-                    "schema:email" "alice@example.org"
-                    "schema:age"   50
-                    "ex:favNums"   [42, 76, 9]}
-                   {"id"          "ex:cam",
-                    "type"        "ex:User",
-                    "schema:name" "Cam"
-                    "ex:email"    "cam@example.org"
-                    "schema:age"  34
-                    "ex:favNums"  [5, 10]
-                    "ex:friend"   ["ex:brian" "ex:alice"]}])]
+                 (fluree/db ledger)
+                 [{"id"           "ex:brian",
+                   "type"         "ex:User",
+                   "schema:name"  "Brian"
+                   "schema:email" "brian@example.org"
+                   "schema:age"   50
+                   "ex:favNums"   7}
+                  {"id"           "ex:alice",
+                   "type"         "ex:User",
+                   "ex:favColor"  "Green"
+                   "schema:name"  "Alice"
+                   "schema:email" "alice@example.org"
+                   "schema:age"   50
+                   "ex:favNums"   [42, 76, 9]}
+                  {"id"          "ex:cam",
+                   "type"        "ex:User",
+                   "schema:name" "Cam"
+                   "ex:email"    "cam@example.org"
+                   "schema:age"  34
+                   "ex:favNums"  [5, 10]
+                   "ex:friend"   ["ex:brian" "ex:alice"]}])]
     (testing "parse-analytical-query"
-      (let [ssc {"select" {"?s" ["*"]}
-                 "where"  [["?s" "schema:name" "Alice"]]}
-            {:strs [select where]} (parse/parse-analytical-query* ssc db)
+      (let [ssc (syntax/encode-internal-query
+                 {"select" {"?s" ["*"]}
+                  "where"  [["?s" "schema:name" "Alice"]]})
+            {:keys [select where]} (parse/parse-analytical-query* ssc db)
             {::where/keys [patterns]} where]
         (is (= {:var       '?s
                 :selection ["*"]
@@ -56,17 +58,18 @@
                  {::where/val "Alice" ::where/datatype 1}]]
                patterns)))
 
-      (let [values-query '{"select" {"?s" ["*"]}
-                           "where"  [["?s" "schema:name" ?name]]
-                           "values" [?name ["Alice"]]}
+      (let [values-query (syntax/encode-internal-query
+                          '{"select" {"?s" ["*"]}
+                            "where"  [["?s" "schema:name" ?name]]
+                            "values" [?name ["Alice"]]})
 
-            {:strs [select where values]}
+            {:keys [select where values]}
             (parse/parse-analytical-query* values-query db)
 
             {::where/keys [patterns]} where]
         (is (= '[{?name
-                  {::where/var ?name
-                   ::where/val "Alice"
+                  {::where/var      ?name
+                   ::where/val      "Alice"
                    ::where/datatype 1}}]
                values))
         (is (= {:var       '?s
@@ -79,13 +82,14 @@
                   ::where/datatype 8}
                  {::where/var '?name}]]
                patterns)))
-      (let [query {"select"   ['?name '?age '?email]
-                   "where"    [['?s "schema:name" "Cam"]
-                               ['?s "ex:friend" '?f]
-                               ['?f "schema:name" '?name]
-                               ['?f "schema:age" '?age]
-                               ['?f "ex:email" '?email]]}
-            {:strs [select where]} (parse/parse-analytical-query query db)
+      (let [query (syntax/encode-internal-query
+                   {"select" ['?name '?age '?email]
+                    "where"  [['?s "schema:name" "Cam"]
+                              ['?s "ex:friend" '?f]
+                              ['?f "schema:name" '?name]
+                              ['?f "schema:age" '?age]
+                              ['?f "ex:email" '?email]]})
+            {:keys [select where]} (parse/parse-analytical-query query db)
             {::where/keys [patterns]} where]
         (is (= [{:var '?name}
                 {:var '?age}
@@ -114,17 +118,19 @@
                  {::where/var '?email}]]
                patterns)))
       (testing "not a `:class` pattern if obj is a var"
-        (let [query {"select"   ['?class]
-                     "where"    [["ex:cam" "rdf:type" '?class]]}
-              {:strs [where]} (parse/parse-analytical-query query db)
+        (let [query (syntax/encode-internal-query
+                     {"select" ['?class]
+                      "where"  [["ex:cam" "rdf:type" '?class]]})
+              {:keys [where]} (parse/parse-analytical-query query db)
               {::where/keys [patterns]} where]
           (is (= :tuple (where/pattern-type (first patterns))))))
       (testing "class, optional"
-        (let [optional-q {"select" ['?name '?favColor]
-                          "where"  [['?s "rdf:type" "ex:User"]
-                                    ['?s "schema:name" '?name]
-                                    {"optional" ['?s "ex:favColor" '?favColor]}]}
-              {:strs [select where]} (parse/parse-analytical-query optional-q db)
+        (let [optional-q (syntax/encode-internal-query
+                          {"select" ['?name '?favColor]
+                           "where"  [['?s "rdf:type" "ex:User"]
+                                     ['?s "schema:name" '?name]
+                                     {"optional" ['?s "ex:favColor" '?favColor]}]})
+              {:keys [select where]} (parse/parse-analytical-query optional-q db)
               {::where/keys [patterns]} where]
           (is (= [{:var '?name} {:var '?favColor}]
                  (mapv #(into {} %) select)))
@@ -146,11 +152,12 @@
                       {::where/var '?favColor}]]}]]
                  patterns))))
       (testing "class, union"
-        (let [union-q {"select" ['?s '?email1 '?email2]
-                       "where"  [['?s "rdf:type" "ex:User"]
-                                 {"union" [[['?s "ex:email" '?email1]]
-                                           [['?s "schema:email" '?email2]]]}]}
-              {:strs [select where]} (parse/parse-analytical-query union-q db)
+        (let [union-q (syntax/encode-internal-query
+                       {"select" ['?s '?email1 '?email2]
+                        "where"  [['?s "rdf:type" "ex:User"]
+                                  {"union" [[['?s "ex:email" '?email1]]
+                                            [['?s "schema:email" '?email2]]]}]})
+              {:keys [select where]} (parse/parse-analytical-query union-q db)
               {::where/keys [patterns]} where]
           (is (= [{:var '?s} {:var '?email1} {:var '?email2}]
                  (de-recordify-select select)))
@@ -173,12 +180,13 @@
                        {::where/var '?email2}]]}]]]
                  patterns))))
       (testing "class, filters"
-        (let [filter-q {"select" ['?name '?age]
-                        "where"  [['?s "rdf:type" "ex:User"]
-                                  ['?s "schema:age" '?age]
-                                  ['?s "schema:name" '?name]
-                                  {"filter" ["(> ?age 45)", "(< ?age 50)"]}]}
-              {:strs [select where]} (parse/parse-analytical-query filter-q db)
+        (let [filter-q (syntax/encode-internal-query
+                        {"select" ['?name '?age]
+                         "where"  [['?s "rdf:type" "ex:User"]
+                                   ['?s "schema:age" '?age]
+                                   ['?s "schema:name" '?name]
+                                   {"filter" ["(> ?age 45)", "(< ?age 50)"]}]})
+              {:keys [select where]} (parse/parse-analytical-query filter-q db)
               {::where/keys [patterns]} where]
           (is (= [{:var '?name} {:var '?age}]
                  (de-recordify-select select)))
@@ -198,12 +206,13 @@
                    {::where/var '?name}]]
                  patterns))))
       (testing "group-by, order-by"
-        (let [query {"select"   ['?name '?favNums]
-                     "where"    [['?s "schema:name" '?name]
-                                 ['?s "ex:favNums" '?favNums]]
-                     "group-by" '?name
-                     "order-by" '?name}
-              {:strs [group-by order-by]} (parse/parse-analytical-query query db)]
+        (let [query (syntax/encode-internal-query
+                     {"select"   ['?name '?favNums]
+                      "where"    [['?s "schema:name" '?name]
+                                  ['?s "ex:favNums" '?favNums]]
+                      "group-by" '?name
+                      "order-by" '?name})
+              {:keys [group-by order-by]} (parse/parse-analytical-query query db)]
           (is (= ['?name]
                  group-by))
           (is (= [['?name :asc]]

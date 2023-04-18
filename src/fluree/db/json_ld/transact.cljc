@@ -386,13 +386,14 @@
   "Executes a delete statement"
   [db max-fuel json-ld {:keys [t] :as _tx-state}]
   (go-try
-    (let [{:strs [delete] :as parsed-query}
+    (let [{:keys [delete] :as parsed-query}
           (-> json-ld
               syntax/validate-query
+              syntax/encode-internal-query
               (q-parse/parse-delete db))
 
           [s p o] delete
-          parsed-query (assoc parsed-query "delete" [s p o])
+          parsed-query (assoc parsed-query :delete [s p o])
           error-ch     (async/chan)
           flake-ch     (async/chan)
           where-ch     (where/search db parsed-query error-ch)]

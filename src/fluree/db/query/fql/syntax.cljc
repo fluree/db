@@ -1,8 +1,11 @@
 (ns fluree.db.query.fql.syntax
-  (:require [fluree.db.util.core :as util :refer [pred-ident?]]
+  (:require [clojure.string :as str]
+            [fluree.db.util.core :as util :refer [pred-ident?]]
+            [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
             [malli.core :as m]
-            [fluree.db.util.validation :as v]))
+            [fluree.db.util.validation :as v]
+            [malli.transform :as mt]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -48,6 +51,25 @@
 (defn where-op [x]
   (when (map? x)
     (-> x first key)))
+
+(defn ->kebab-case
+  [s]
+  (str/replace s #"([a-z])?([A-Z])"
+               (fn [[_ m1 m2]]
+                 (if m1
+                   (str m1 "-" (str/lower-case m2))
+                   (str/lower-case m2)))))
+
+(defn encode-query-key
+  [k]
+  (if (string? k)
+    (do
+      (log/debug "encoding query key:" k)
+      (let [kebab-k (->kebab-case k)]
+        (if (str/starts-with? kebab-k "@")
+          (-> kebab-k (subs 1) keyword)
+          (keyword kebab-k))))
+    k))
 
 (def registry
   (merge
@@ -111,6 +133,7 @@
                                 [:desc [:fn desc?]]]
     ::ordering                 [:orn
                                 [:scalar ::var]
+                                [:fn [:fn fn-list?]]
                                 [:vector [:catn
                                           [:direction ::direction]
                                           [:dimension ::var]]]]
@@ -124,7 +147,8 @@
     ::group-by                 ::groupBy
     ::where-op                 [:enum "filter" "optional" "union" "bind"]
     ::where-map                [:and
-                                [:map-of {:max 1} ::where-op :any]
+                                [:map-of {:max 1}
+                                 ::where-op :any]
                                 [:multi {:dispatch where-op}
                                  ["filter" [:map ["filter" [:ref ::filter]]]]
                                  ["optional" [:map ["optional" [:ref ::optional]]]]
@@ -218,6 +242,10 @@
                                           [:sequential ::result-vec]]]
                                 [:select-one ::result-map]]
     ::multi-query-results      [:map-of :string ::analytical-query-results]}))
+
+(def encode-internal-query
+  (m/encoder ::query {:registry registry}
+             (mt/key-transformer {:encode encode-query-key})))
 
 (def valid-query?
   (m/validator ::query {:registry registry}))

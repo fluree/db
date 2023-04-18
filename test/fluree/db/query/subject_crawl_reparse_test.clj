@@ -1,6 +1,7 @@
 (ns fluree.db.query.subject-crawl-reparse-test
   (:require
    [clojure.test :refer :all]
+   [fluree.db.query.fql.syntax :as syntax]
    [fluree.db.test-utils :as test-utils]
    [fluree.db.json-ld.api :as fluree]
    [fluree.db.query.fql.parse :as parse]
@@ -37,47 +38,55 @@
                    "ex:friend" [{"id" "ex:brian"} {"id" "ex:alice"}]}])
 
         ssc-q1-parsed (parse/parse-analytical-query*
-                       {"select" {"?s" ["*"]}
-                        "where"  [["?s" "schema:name" "Alice"]]}
+                       (syntax/encode-internal-query
+                        {"select" {"?s" ["*"]}
+                         "where"  [["?s" "schema:name" "Alice"]]})
                        db)
         ssc-q2-parsed (parse/parse-analytical-query*
-                            {"select" {"?s" ["*"]}
-                             "where"  [["?s" "schema:age" 50]
-                                       ["?s" "ex:favColor" "Blue"]]}
-                            db)
+                       (syntax/encode-internal-query
+                        {"select" {"?s" ["*"]}
+                         "where"  [["?s" "schema:age" 50]
+                                   ["?s" "ex:favColor" "Blue"]]})
+                       db)
         not-ssc-parsed     (parse/parse-analytical-query*
-                            {"select"  ['?name '?age '?email]
-                             "where"   [['?s "schema:name" "Cam"]
+                            (syntax/encode-internal-query
+                             {"select" ['?name '?age '?email]
+                              "where"  [['?s "schema:name" "Cam"]
                                         ['?s "ex:friend" '?f]
                                         ['?f "schema:name" '?name]
                                         ['?f "schema:age" '?age]
-                                        ['?f "schema:email" '?email]]}
+                                        ['?f "schema:email" '?email]]})
                             db)
         order-group-parsed (parse/parse-analytical-query*
-                            {"select"   ['?name '?favNums]
-                             "where"    [['?s "schema:name" '?name]
-                                         ['?s "ex:favNums" '?favNums]]
-                             "group-by" '?name
-                             "order-by" '?name}
+                            (syntax/encode-internal-query
+                             {"select"   ['?name '?favNums]
+                              "where"    [['?s "schema:name" '?name]
+                                          ['?s "ex:favNums" '?favNums]]
+                              "group-by" '?name
+                              "order-by" '?name})
                             db)
         vars-query-parsed  (parse/parse-analytical-query*
-                            {"select" {"?s" ["*"]}
-                             "where"  [["?s" "schema:name" '?name]]
-                             "vars"   {'?name "Alice"}}
+                            (syntax/encode-internal-query
+                             {"select" {"?s" ["*"]}
+                              "where"  [["?s" "schema:name" '?name]]
+                              "vars"   {'?name "Alice"}})
                             db)
         s+p+o-parsed       (parse/parse-analytical-query
-                            {"select" {"?s" [:*]}
-                             "where"  [["?s" "?p" "?o"]]}
+                            (syntax/encode-internal-query
+                             {"select" {"?s" [:*]}
+                              "where"  [["?s" "?p" "?o"]]})
                             db)
         s+p+o2-parsed      (parse/parse-analytical-query
-                            {"select" {'?s ["*"]}
-                             "where"  [['?s "schema:age" 50]
-                                       ['?s '?p '?o]]}
+                            (syntax/encode-internal-query
+                             {"select" {'?s ["*"]}
+                              "where"  [['?s "schema:age" 50]
+                                        ['?s '?p '?o]]})
                             db)
         s+p+o3-parsed      (parse/parse-analytical-query
-                            {"select" {'?s ["*"]}
-                             "where"  [['?s '?p '?o]
-                                       ['?s "schema:age" 50]]}
+                            (syntax/encode-internal-query
+                             {"select" {'?s ["*"]}
+                              "where"  [['?s '?p '?o]
+                                        ['?s "schema:age" 50]]})
                             db)]
     (testing "simple-subject-crawl?"
       (is (= true

@@ -394,9 +394,9 @@
 
 (defn search
   [db q error-ch]
-  (let [where-clause      (get q "where")
+  (let [where-clause      (:where q)
         initial-solutions (-> q
-                              (get "values")
+                              :values
                               not-empty
                               (or [blank-solution]))
         out-ch            (async/chan)]

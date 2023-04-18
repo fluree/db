@@ -6,7 +6,7 @@
 
 (defn filter
   [q error-ch solution-ch]
-  (if-let [filter-fn (get q "having")]
+  (if-let [filter-fn (:having q)]
     (let [filtered-ch (async/chan)]
       (async/pipeline-async 2
                             filtered-ch

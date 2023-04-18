@@ -116,14 +116,14 @@
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
   [db q error-ch solution-ch]
-  (let [context   (get q "@context")
+  (let [context   (:context q)
         _         (log/debug "format context:" context)
         compact   (json-ld/compact-fn context)
-        selectors (or (get q "select")
-                      (get q "select-one")
-                      (get q "select-distinct"))
+        selectors (or (:select q)
+                      (:select-one q)
+                      (:select-distinct q))
         iri-cache (volatile! {})
-        format-ch (if (contains? q "select-distinct")
+        format-ch (if (contains? q :select-distinct)
                     (chan 1 (distinct))
                     (chan))]
     (async/pipeline-async 1
