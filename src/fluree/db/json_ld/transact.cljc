@@ -210,7 +210,7 @@
 
 (defn ->tx-state
   [db {:keys [bootstrap? issuer context-type] :as _opts}]
-  (let [{:keys [block ecount schema branch ledger policy], db-t :t} db
+  (let [{:keys [block schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
@@ -280,7 +280,7 @@
 
 (defn final-db
   "Returns map of all elements for a stage transaction required to create an updated db."
-  [new-flakes {:keys [t stage-update? db-before] :as tx-state}]
+  [new-flakes {:keys [stage-update? db-before] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
@@ -338,7 +338,7 @@
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
-  [{:keys [schema t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
+  [{:keys [t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
   (log/debug "insert default-ctx:" default-ctx)
   (let [nodes    (-> json-ld
                      (json-ld/expand default-ctx)
@@ -350,7 +350,7 @@
 ;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
 (defn delete
   "Executes a delete statement"
-  [db max-fuel json-ld {:keys [t] :as _tx-state}]
+  [db json-ld {:keys [t] :as _tx-state}]
   (go-try
     (let [{:keys [delete] :as parsed-query}
           (-> json-ld
@@ -417,6 +417,6 @@
           tx-state (->tx-state db* (assoc opts :issuer issuer))
           flakes   (if (and (contains? tx :delete)
                             (contains? tx :where))
-                     (<? (delete db util/max-integer tx tx-state))
+                     (<? (delete db tx tx-state))
                      (<? (insert db tx tx-state)))]
       (<? (flakes->final-db tx-state flakes)))))
