@@ -17,7 +17,7 @@
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.exec.where :as where]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [go]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.json-ld.policy :as perm]
@@ -347,17 +347,15 @@
                          (init-db? db) (into (base-flakes t)))]
     (stage-flakes flakeset tx-state nodes)))
 
-;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
 (defn delete
-  "Executes a delete statement"
   [db json-ld {:keys [t] :as _tx-state}]
-  (go-try
+  (go
     (let [{:keys [delete] :as parsed-query}
           (-> json-ld
               syntax/validate
               (q-parse/parse-delete db))
 
-          [s p o] delete
+          [s p o]      delete
           parsed-query (assoc parsed-query :delete [s p o])
           error-ch     (async/chan)
           flake-ch     (async/chan)
@@ -383,13 +381,10 @@
                                                     (flake/flip-flake f t))))
                                        (completing conj)
                                        (flake/sorted-set-by flake/cmp-flakes-spot)
-                                       flake-ch)
-            flakes    (async/alt!
-                        error-ch ([e]
-                                  (throw e))
-                        delete-ch ([flakes]
-                                   flakes))]
-        flakes))))
+                                       flake-ch)]
+        (async/alt!
+          error-ch ([e] e)
+          delete-ch ([flakes] flakes))))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
