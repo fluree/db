@@ -1,8 +1,10 @@
 (ns fluree.db.query.fql.syntax
   (:require [clojure.string :as str]
+            [clojure.walk :as walk]
             [fluree.db.util.core :as util :refer [pred-ident?]]
             [fluree.db.util.log :as log]
             [fluree.db.constants :as const]
+            [fluree.json-ld :as json-ld]
             [malli.core :as m]
             [fluree.db.util.validation :as v]
             [malli.transform :as mt]))
@@ -63,13 +65,37 @@
 (defn encode-query-key
   [k]
   (if (string? k)
-    (do
-      (log/debug "encoding query key:" k)
-      (let [kebab-k (->kebab-case k)]
-        (if (str/starts-with? kebab-k "@")
-          (-> kebab-k (subs 1) keyword)
-          (keyword kebab-k))))
+    (let [kebab-k (->kebab-case k)]
+      (if (str/starts-with? kebab-k "@")
+        (-> kebab-k (subs 1) keyword)
+        (keyword kebab-k)))
     k))
+
+(defn decode-query
+  [q]
+  (log/debug "decoding query:" q)
+  ;; TODO: Replace this with a :map-with schema once this lands upstream:
+  ;;       https://github.com/metosin/malli/issues/881
+  (walk/postwalk
+   (fn [v]
+     (cond
+       (qualified-keyword? v) (str (namespace v) ":" (name v))
+       (= v :context) "@context"
+       (keyword? v) (name v)
+       :else v))
+   q))
+
+(defn analytical-query-results-transformer
+  [context]
+  ;; TODO: Replace this with a :map-with schema once this lands upstream:
+  ;;       https://github.com/metosin/malli/issues/881
+  (let [kw-context (util/keywordize-keys context)]
+    (mt/transformer
+     {:encoders
+      {:string (fn [s]
+                 (if-let [expanded (json-ld/expand-iri s context)]
+                   (json-ld/compact expanded kw-context)
+                   s))}})))
 
 (def registry
   (merge
@@ -199,7 +225,7 @@
                                 ["where" ::where]
                                 ["values" {:optional true} ::values]]
     ::context                  ::v/context
-    ::analytical-query         [:map
+    ::analytical-query         [:map {:decode/fluree decode-query}
                                 ["where" ::where]
                                 ["t" {:optional true} ::t]
                                 ["@context" {:optional true} ::context]
@@ -246,6 +272,15 @@
 (def encode-internal-query
   (m/encoder ::query {:registry registry}
              (mt/key-transformer {:encode encode-query-key})))
+
+(def coerce-analytical-query
+  (m/coercer ::analytical-query v/fluree-transformer {:registry registry}))
+
+(defn analytical-query-results-encoder
+  [context]
+  (m/encoder ::analytical-query-results
+             {:registry registry}
+             (analytical-query-results-transformer context)))
 
 (def valid-query?
   (m/validator ::query {:registry registry}))

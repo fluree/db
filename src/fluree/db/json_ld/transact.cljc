@@ -32,32 +32,30 @@
 
 (def registry
   (merge
-    (m/base-schemas)
-    (m/type-schemas)
-    v/registry
-    {::iri          ::v/iri
-     ::val          ::v/val
-     ::context      ::v/context
-     ::txn-val      [:orn
-                     [:multiple [:sequential
-                                 [:or [:ref ::txn-map] [:ref ::txn-val]]]]
-                     [:node [:ref ::txn-map]]
-                     [:iri ::iri]
-                     [:val ::val]]
-     ::txn-leaf-map [:map
-                     ["@context" {:optional true} ::context]
-                     [::m/default [:map-of ::iri ::txn-val]]]
-     ::retract-key  [:and ::iri [:re retract-key-re]]
-     ::txn-map      [:orn
-                     [:assert ::txn-leaf-map]
-                     [:retract
-                      [:map
-                       ["@context" {:optional true} ::context]
-                       [::m/default [:map-of ::retract-key ::txn-leaf-map]]]]]
-     ::txn          [:orn
-                     [:single-amp ::txn-map]
-                     [:sequence-of-maps [:sequential ::txn-map]]]
-     ::opts         [map?]}))
+   (m/base-schemas)
+   (m/type-schemas)
+   v/registry
+   {::iri          ::v/iri
+    ::val          ::v/val
+    ::context      ::v/context
+    ::txn-val      [:orn
+                    [:multiple [:sequential
+                                [:or [:ref ::txn-map] [:ref ::txn-val]]]]
+                    [:node [:ref ::txn-map]]
+                    [:iri ::iri]
+                    [:val ::val]]
+    ::txn-leaf-map [:map-of ::iri ::txn-val]
+    ::retract-key  [:and ::iri [:re retract-key-re]]
+    ::txn-map      [:orn
+                    [:assert ::txn-leaf-map]
+                    [:retract [:map-of ::retract-key ::txn-leaf-map]]]
+    ::txn          [:orn
+                    [:single-map ::txn-map]
+                    [:sequence-of-maps [:sequential ::txn-map]]]
+    ::opts         [map?]}))
+
+(def coerce-txn
+  (m/coercer ::txn v/fluree-transformer {:registry registry}))
 
 (declare json-ld-node->flakes)
 
@@ -67,22 +65,22 @@
   flakes if they didn't already exist."
   [class-iris {:keys [t next-pid ^clojure.lang.Volatile iris db-before] :as _tx-state}]
   (go-try
-    (loop [[class-iri & r] (util/sequential class-iris)
-           class-sids   #{}
-           class-flakes #{}]
-      (if class-iri
-        (if-let [existing (<? (jld-reify/get-iri-sid class-iri db-before iris))]
-          (recur r (conj class-sids existing) class-flakes)
-          (let [type-sid (if-let [predefined-pid (get jld-ledger/predefined-properties class-iri)]
-                           predefined-pid
-                           (next-pid))]
-            (vswap! iris assoc class-iri type-sid)
-            (recur r
-                   (conj class-sids type-sid)
-                   (conj class-flakes
-                         (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)
-                         (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
-        [class-sids class-flakes]))))
+   (loop [[class-iri & r] (util/sequential class-iris)
+          class-sids   #{}
+          class-flakes #{}]
+     (if class-iri
+       (if-let [existing (<? (jld-reify/get-iri-sid class-iri db-before iris))]
+         (recur r (conj class-sids existing) class-flakes)
+         (let [type-sid (if-let [predefined-pid (get jld-ledger/predefined-properties class-iri)]
+                          predefined-pid
+                          (next-pid))]
+           (vswap! iris assoc class-iri type-sid)
+           (recur r
+                  (conj class-sids type-sid)
+                  (conj class-flakes
+                        (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)
+                        (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
+       [class-sids class-flakes]))))
 
 
 (defn- new-pid
@@ -97,30 +95,30 @@
   [sid pid {shacl-dt :dt, validate-fn :validate-fn} check-retracts? list? {:keys [value] :as v-map}
    {:keys [t db-before] :as tx-state}]
   (go-try
-    (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
-                        (->> (<? (query-range/index-range db-before :spot = [sid pid]))
-                             (map #(flake/flip-flake % t))))
-          m           (when list?
-                        {:i (-> v-map :idx last)})
-          flakes      (cond
-                        ;; a new node's data is contained, process as another node then link to this one
-                        (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+   (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
+                       (->> (<? (query-range/index-range db-before :spot = [sid pid]))
+                            (map #(flake/flip-flake % t))))
+         m           (when list?
+                       {:i (-> v-map :idx last)})
+         flakes      (cond
+                       ;; a new node's data is contained, process as another node then link to this one
+                       (jld-reify/node? v-map)
+                       (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                         (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
-                        ;; a literal value
-                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
-                        (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                          (when validate-fn
-                            (or (validate-fn value*)
-                                (throw (ex-info (str "Value did not pass SHACL validation: " value)
-                                                {:status 400 :error :db/shacl-validation}))))
-                          [(flake/create sid pid value* dt t true m)])
+                       ;; a literal value
+                       (and (some? value) (not= shacl-dt const/$xsd:anyURI))
+                       (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
+                         (when validate-fn
+                           (or (validate-fn value*)
+                               (throw (ex-info (str "Value did not pass SHACL validation: " value)
+                                               {:status 400 :error :db/shacl-validation}))))
+                         [(flake/create sid pid value* dt t true m)])
 
-                        :else
-                        (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
-                                        {:status 400 :error :db/invalid-transaction})))]
-      (into flakes retractions))))
+                       :else
+                       (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
+                                       {:status 400 :error :db/invalid-transaction})))]
+     (into flakes retractions))))
 
 (defn list-value?
   "returns true if json-ld value is a list object."
@@ -133,11 +131,11 @@
   new-types are a set of newly created types in the transaction."
   [db sid added-classes]
   (go-try
-    (let [type-sids (->> (<? (query-range/index-range db :spot = [sid const/$rdf:type]))
-                         (map flake/o))]
-      (if (seq type-sids)
-        (into added-classes type-sids)
-        added-classes))))
+   (let [type-sids (->> (<? (query-range/index-range db :spot = [sid const/$rdf:type]))
+                        (map flake/o))]
+     (if (seq type-sids)
+       (into added-classes type-sids)
+       added-classes))))
 
 (defn iri-only?
   "Returns true if a JSON-LD node contains only an IRI and no actual property data.
@@ -314,16 +312,16 @@
   "Returns map of all elements for a stage transaction required to create an updated db."
   [new-flakes {:keys [t stage-update? db-before] :as tx-state}]
   (go-try
-    (let [[add remove] (if stage-update?
-                         (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
-                         [new-flakes nil])
-          vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
-          staged-map   {:add        add
-                        :remove     remove}
-          db-after     (cond-> (db-after staged-map tx-state)
-                               vocab-flakes vocab/refresh-schema
-                               vocab-flakes <?)]
-      (assoc staged-map :db-after db-after))))
+   (let [[add remove] (if stage-update?
+                        (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
+                        [new-flakes nil])
+         vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
+         staged-map   {:add    add
+                       :remove remove}
+         db-after     (cond-> (db-after staged-map tx-state)
+                              vocab-flakes vocab/refresh-schema
+                              vocab-flakes <?)]
+     (assoc staged-map :db-after db-after))))
 
 (defn stage-flakes
   [flakeset tx-state nodes]
@@ -348,23 +346,23 @@
   (let [subj-mods' @subj-mods
         root-db    (dbproto/-rootdb db-after)]
     (go-try
-      (loop [[s-flakes & r] (partition-by flake/s add)
-             all-classes #{}]
-        (if s-flakes
-          (let [sid (flake/s (first s-flakes))
-                {:keys [new? classes shacl]} (get subj-mods' sid)]
-            (when shacl
-              (let [all-flakes (if new?
-                                 s-flakes
-                                 (<? (query-range/index-range root-db :spot = [sid])))]
-                (<? (shacl/validate-target root-db shacl all-flakes))))
-            (recur r (into all-classes classes)))
-          (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
-                               (contains? all-classes const/$sh:PropertyShape))]
-            (when new-shacl?
-              ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
-              (vocab/reset-shapes (:schema db-after)))
-            staged-map))))))
+     (loop [[s-flakes & r] (partition-by flake/s add)
+            all-classes #{}]
+       (if s-flakes
+         (let [sid (flake/s (first s-flakes))
+               {:keys [new? classes shacl]} (get subj-mods' sid)]
+           (when shacl
+             (let [all-flakes (if new?
+                                s-flakes
+                                (<? (query-range/index-range root-db :spot = [sid])))]
+               (<? (shacl/validate-target root-db shacl all-flakes))))
+           (recur r (into all-classes classes)))
+         (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
+                              (contains? all-classes const/$sh:PropertyShape))]
+           (when new-shacl?
+             ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
+             (vocab/reset-shapes (:schema db-after)))
+           staged-map))))))
 
 (defn init-db?
   [db]
@@ -386,72 +384,72 @@
   "Executes a delete statement"
   [db max-fuel json-ld {:keys [t] :as _tx-state}]
   (go-try
-    (let [{:keys [delete] :as parsed-query}
-          (-> json-ld
-              syntax/validate-query
-              syntax/encode-internal-query
-              (q-parse/parse-delete db))
+   (let [{:keys [delete] :as parsed-query}
+         (-> json-ld
+             syntax/validate-query
+             syntax/encode-internal-query
+             (q-parse/parse-delete db))
 
-          [s p o] delete
-          parsed-query (assoc parsed-query :delete [s p o])
-          error-ch     (async/chan)
-          flake-ch     (async/chan)
-          where-ch     (where/search db parsed-query error-ch)]
-      (async/pipeline-async 1
-                            flake-ch
-                            (fn [solution ch]
-                              (let [s* (if (::where/val s)
-                                         s
-                                         (get solution (::where/var s)))
-                                    p* (if (::where/val p)
-                                         p
-                                         (get solution (::where/var p)))
-                                    o* (if (::where/val o)
-                                         o
-                                         (get solution (::where/var o)))]
-                                (async/pipe
-                                  (where/resolve-flake-range db error-ch [s* p* o*])
-                                  ch)))
-                            where-ch)
-      (let [delete-ch (async/transduce (comp cat
-                                             (map (fn [f]
-                                                    (flake/flip-flake f t))))
-                                       (completing conj)
-                                       (flake/sorted-set-by flake/cmp-flakes-spot)
-                                       flake-ch)
-            flakes    (async/alt!
-                        error-ch ([e]
-                                  (throw e))
-                        delete-ch ([flakes]
-                                   flakes))]
-        flakes))))
+         [s p o] delete
+         parsed-query (assoc parsed-query :delete [s p o])
+         error-ch     (async/chan)
+         flake-ch     (async/chan)
+         where-ch     (where/search db parsed-query error-ch)]
+     (async/pipeline-async 1
+                           flake-ch
+                           (fn [solution ch]
+                             (let [s* (if (::where/val s)
+                                        s
+                                        (get solution (::where/var s)))
+                                   p* (if (::where/val p)
+                                        p
+                                        (get solution (::where/var p)))
+                                   o* (if (::where/val o)
+                                        o
+                                        (get solution (::where/var o)))]
+                               (async/pipe
+                                 (where/resolve-flake-range db error-ch [s* p* o*])
+                                 ch)))
+                           where-ch)
+     (let [delete-ch (async/transduce (comp cat
+                                            (map (fn [f]
+                                                   (flake/flip-flake f t))))
+                                      (completing conj)
+                                      (flake/sorted-set-by flake/cmp-flakes-spot)
+                                      flake-ch)
+           flakes    (async/alt!
+                       error-ch ([e]
+                                 (throw e))
+                       delete-ch ([flakes]
+                                  flakes))]
+       flakes))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
   [tx-state flakes]
   (go-try
-    (-> flakes
-        (final-db tx-state)
-        <?
-        (validate-rules tx-state)
-        <?
-        (policy/allowed? tx-state)
-        <?)))
+   (-> flakes
+       (final-db tx-state)
+       <?
+       (validate-rules tx-state)
+       <?
+       (policy/allowed? tx-state)
+       <?)))
 
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
   [db json-ld opts]
   (go-try
-    (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
-                                           {:subject json-ld})
-          db* (if-let [policy-opts (perm/policy-opts opts)]
-                (<? (perm/wrap-policy db policy-opts))
-                db)
-          tx-state (->tx-state db* (assoc opts :issuer issuer))
-          flakes   (if (and (contains? tx "delete")
-                            (contains? tx "where"))
-                     (<? (delete db util/max-integer tx tx-state))
-                     (<? (insert db tx tx-state)))]
-      (<? (flakes->final-db tx-state flakes)))))
+   (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
+                                          {:subject json-ld})
+         db*      (if-let [policy-opts (perm/policy-opts opts)]
+                    (<? (perm/wrap-policy db policy-opts))
+                    db)
+         tx-state (->tx-state db* (assoc opts :issuer issuer))
+         flakes   (if (and (contains? tx "delete")
+                           (contains? tx "where"))
+                    (<? (delete db util/max-integer tx tx-state))
+                    (<? (insert db tx tx-state)))]
+     (<? (flakes->final-db tx-state flakes)))))

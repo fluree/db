@@ -268,75 +268,75 @@
                        "ex:friends" [{"id" "ex:john"} {"id" "ex:cam"}]}}
                      (set
                       @(fluree/query loaded-db '{"select" {?s ["*"]}
-                                                 "where"  [[?s "rdf:type" "ex:User"]]})))))))
+                                                 "where"  [[?s "rdf:type" "ex:User"]]}))))))))
 
-       (testing "can load with policies"
-         (with-tmp-dir storage-path
-           (let [conn         @(fluree/connect
-                                {"method"       "file"
-                                 "storage-path" storage-path
-                                 "defaults"
-                                 {"@context" (merge test-utils/default-context
-                                                    {"ex" "http://example.org/ns/"})}})
-                 ledger-alias "load-policy-test"
-                 ledger       @(fluree/create conn ledger-alias)
-                 db           @(fluree/stage
-                                (fluree/db ledger)
-                                [{"id"          "ex:alice",
-                                  "type"        "ex:User",
-                                  "schema:name" "Alice"
-                                  "schema:ssn"  "111-11-1111"
-                                  "ex:friend"   {"id" "ex:john"}}
-                                 {"id"          "ex:john",
-                                  "schema:name" "John"
-                                  "type"        "ex:User",
-                                  "schema:ssn"  "888-88-8888"}
-                                 {"id"      "did:fluree:123"
-                                  "ex:user" {"id" "ex:alice"}
-                                  "f:role"  {"id" "ex:userRole"}}])
-                 db+policy    @(fluree/stage
-                                db
-                                [{"id"            "ex:UserPolicy"
-                                  "type"          ["f:Policy"]
-                                  "f:targetClass" {"id" "ex:User"}
-                                  "f:allow"       [{"id"           "ex:globalViewAllow"
-                                                    "f:targetRole" {"id" "ex:userRole"}
-                                                    "f:action"     [{"id" "f:view"}]}]
-                                  "f:property"
-                                  [{"f:path" {"id" "schema:ssn"}
-                                    "f:allow"
-                                    [{"id"           "ex:ssnViewRule"
-                                      "f:targetRole" {"id" "ex:userRole"}
-                                      "f:action"     [{"id" "f:view"}]
-                                      "f:equals"     {"@list" [{"id" "f:$identity"}
-                                                               {"id" "ex:user"}]}}]}]}])
-                 db+policy    @(fluree/commit! ledger db+policy)
-                 loaded       (test-utils/retry-load conn ledger-alias 100)
-                 loaded-db    (fluree/db loaded)]
-             (is (= (:t db) (:t loaded-db)))
-             (testing "query returns expected policy"
-               (is (= [{"id"            "ex:UserPolicy",
-                        "rdf:type"      ["f:Policy"],
-                        "f:allow"
-                        {"id"           "ex:globalViewAllow",
-                         "f:action"     {"id" "f:view"},
-                         "f:targetRole" {"_id" 211106232532995}},
-                        "f:property"
-                        {"id"     "_:f211106232532999",
-                         "f:allow"
-                         {"id"           "ex:ssnViewRule",
-                          "f:action"     {"id" "f:view"},
-                          "f:targetRole" {"_id" 211106232532995},
-                          "f:equals"     [{"id" "f:$identity"} {"id" "ex:user"}]},
-                         "f:path" {"id" "schema:ssn"}},
-                        "f:targetClass" {"id" "ex:User"}}]
-                      @(fluree/query
-                        loaded-db
-                        '{"select" {?s ["*"
-                                        {"rdf:type" ["_id"]}
-                                        {"f:allow" ["*" {"f:targetRole" ["_id"]}]}
-                                        {"f:property" ["*" {"f:allow" ["*" {"f:targetRole" ["_id"]}]}]}]}
-                          "where"  [[?s "rdf:type" "f:Policy"]]}))))))))))
+     (testing "can load with policies"
+       (with-tmp-dir storage-path
+         (let [conn         @(fluree/connect
+                              {"method"       "file"
+                               "storage-path" storage-path
+                               "defaults"
+                               {"@context" (merge test-utils/default-context
+                                                  {"ex" "http://example.org/ns/"})}})
+               ledger-alias "load-policy-test"
+               ledger       @(fluree/create conn ledger-alias)
+               db           @(fluree/stage
+                              (fluree/db ledger)
+                              [{"id"          "ex:alice",
+                                "type"        "ex:User",
+                                "schema:name" "Alice"
+                                "schema:ssn"  "111-11-1111"
+                                "ex:friend"   {"id" "ex:john"}}
+                               {"id"          "ex:john",
+                                "schema:name" "John"
+                                "type"        "ex:User",
+                                "schema:ssn"  "888-88-8888"}
+                               {"id"      "did:fluree:123"
+                                "ex:user" {"id" "ex:alice"}
+                                "f:role"  {"id" "ex:userRole"}}])
+               db+policy    @(fluree/stage
+                              db
+                              [{"id"            "ex:UserPolicy"
+                                "type"          ["f:Policy"]
+                                "f:targetClass" {"id" "ex:User"}
+                                "f:allow"       [{"id"           "ex:globalViewAllow"
+                                                  "f:targetRole" {"id" "ex:userRole"}
+                                                  "f:action"     [{"id" "f:view"}]}]
+                                "f:property"
+                                [{"f:path" {"id" "schema:ssn"}
+                                  "f:allow"
+                                  [{"id"           "ex:ssnViewRule"
+                                    "f:targetRole" {"id" "ex:userRole"}
+                                    "f:action"     [{"id" "f:view"}]
+                                    "f:equals"     {"@list" [{"id" "f:$identity"}
+                                                             {"id" "ex:user"}]}}]}]}])
+               db+policy    @(fluree/commit! ledger db+policy)
+               loaded       (test-utils/retry-load conn ledger-alias 100)
+               loaded-db    (fluree/db loaded)]
+           (is (= (:t db) (:t loaded-db)))
+           (testing "query returns expected policy"
+             (is (= [{"id"            "ex:UserPolicy",
+                      "rdf:type"      ["f:Policy"],
+                      "f:allow"
+                      {"id"           "ex:globalViewAllow",
+                       "f:action"     {"id" "f:view"},
+                       "f:targetRole" {"_id" 211106232532995}},
+                      "f:property"
+                      {"id"     "_:f211106232532999",
+                       "f:allow"
+                       {"id"           "ex:ssnViewRule",
+                        "f:action"     {"id" "f:view"},
+                        "f:targetRole" {"_id" 211106232532995},
+                        "f:equals"     [{"id" "f:$identity"} {"id" "ex:user"}]},
+                       "f:path" {"id" "schema:ssn"}},
+                      "f:targetClass" {"id" "ex:User"}}]
+                    @(fluree/query
+                      loaded-db
+                      '{"select" {?s ["*"
+                                      {"rdf:type" ["_id"]}
+                                      {"f:allow" ["*" {"f:targetRole" ["_id"]}]}
+                                      {"f:property" ["*" {"f:allow" ["*" {"f:targetRole" ["_id"]}]}]}]}
+                        "where"  [[?s "rdf:type" "f:Policy"]]})))))))))
 
 #?(:clj
    (deftest load-from-memory-test
@@ -573,20 +573,20 @@
                loaded-db    (fluree/db loaded)]
            (is (= (:t db) (:t loaded-db)))
            (testing "query returns expected policy"
-             (is (= [{"id"            "ex:UserPolicy",
-                      "rdf:type"      ["f:Policy"],
+             (is (= [{"id"            "ex:UserPolicy"
+                      "rdf:type"      ["f:Policy"]
                       "f:allow"
-                      {"id"           "ex:globalViewAllow",
-                       "f:action"     {"id" "f:view"},
-                       "f:targetRole" {"_id" 211106232532995}},
+                      {"id"           "ex:globalViewAllow"
+                       "f:action"     {"id" "f:view"}
+                       "f:targetRole" {"_id" 211106232532995}}
                       "f:property"
-                      {"id"     "_:f211106232532999",
+                      {"id"     "_:f211106232532999"
                        "f:allow"
-                       {"id"           "ex:ssnViewRule",
-                        "f:action"     {"id" "f:view"},
-                        "f:targetRole" {"_id" 211106232532995},
-                        "f:equals"     [{"id" "f:$identity"} {"id" "ex:user"}]},
-                       "f:path" {"id" "schema:ssn"}},
+                       {"id"           "ex:ssnViewRule"
+                        "f:action"     {"id" "f:view"}
+                        "f:targetRole" {"_id" 211106232532995}
+                        "f:equals"     [{"id" "f:$identity"} {"id" "ex:user"}]}
+                       "f:path" {"id" "schema:ssn"}}
                       "f:targetClass" {"id" "ex:User"}}]
                     @(fluree/query loaded-db
                                    '{"select" {?s ["*"
