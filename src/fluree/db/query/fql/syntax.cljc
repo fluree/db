@@ -98,7 +98,6 @@
                    (json-ld/compact expanded kw-context)
                    s))}})))
 
-
 (def registry
   (merge
    (m/predicate-schemas)

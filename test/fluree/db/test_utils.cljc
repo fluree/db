@@ -2,7 +2,8 @@
   (:require [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?@(:cljs [[clojure.core.async :refer [go go-loop]]
+            #?@(:clj  [[fluree.sdk.clojure :as fluree-clj]]
+                :cljs [[clojure.core.async :refer [go go-loop]]
                        [clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
@@ -115,6 +116,13 @@
   ([ledger data commit-opts]
    (let [staged @(fluree/stage (fluree/db ledger) data)]
      (fluree/commit! ledger staged commit-opts))))
+
+#?(:clj
+   (defn transact-clj
+     ([ledger data] (transact-clj ledger data {}))
+     ([ledger data commit-opts]
+      (let [staged @(fluree-clj/stage (fluree-clj/db ledger) data)]
+        (fluree-clj/commit! ledger staged commit-opts)))))
 
 (defn retry-promise-wrapped
   "Retries a fn that when deref'd might return a Throwable. Intended for

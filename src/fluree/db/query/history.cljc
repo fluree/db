@@ -1,6 +1,7 @@
 (ns fluree.db.query.history
   (:require
    [clojure.core.async :as async]
+   [fluree.db.query.fql.syntax :as fql]
    [malli.core :as m]
    [fluree.json-ld :as json-ld]
    [fluree.db.constants :as const]
@@ -60,7 +61,7 @@
                               pos-int?
                               [:re datatype/iso8601-datetime-re]]
      ::history-query         [:and
-                              [:map
+                              [:map {:decode/fluree fql/decode-query}
                                ["history" {:optional true}
                                 [:orn
                                  [:subject ::iri]
@@ -96,8 +97,22 @@
                               [:fn {:error/message "Must supply either a \"history\" or \"commit-details\" key."}
                                (fn [{:strs [history commit-details]}]
                                  (or history commit-details))]]
-     ::history-query-result  [:fn history-query-result?]
+     ::results-map           [:map-of :string [:or
+                                               :string
+                                               [:sequential [:ref ::results-map]]
+                                               :any]]
+     ::history-query-result  [:and
+                              ::results-map
+                              [:fn history-query-result?]]
      ::history-query-results [:sequential ::history-query-result]}))
+
+(def coerce-query
+  (m/coercer ::history-query v/fluree-transformer {:registry registry}))
+
+(defn results-encoder
+  [context]
+  (m/encoder ::history-query-results {:registry registry}
+             (fql/keyword-compact-iri-transformer context)))
 
 (def history-query-validator
   (m/validator ::history-query {:registry registry}))
@@ -134,16 +149,16 @@
   [db cache context compact fuel error-ch s-flakes]
   (async/go
     (try*
-      (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
-                                                {:wildcard? true, :depth 0}
-                                                0 s-flakes)]
-        (-> (<? json-chan)
-            ;; add the id in case the iri flake isn't present in s-flakes
-            (assoc "id" (-> s-flakes first flake/s (->> (dbproto/-iri db)) <?
-                            (json-ld/compact compact)))))
-      (catch* e
-              (log/error e "Error transforming s-flakes.")
-              (async/>! error-ch e)))))
+     (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                               {:wildcard? true, :depth 0}
+                                               0 s-flakes)]
+       (-> (<? json-chan)
+           ;; add the id in case the iri flake isn't present in s-flakes
+           (assoc "id" (-> s-flakes first flake/s (->> (dbproto/-iri db)) <?
+                           (json-ld/compact compact)))))
+     (catch* e
+       (log/error e "Error transforming s-flakes.")
+       (async/>! error-ch e)))))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -156,7 +171,7 @@
                          (vals)
                          (async/to-chan!))
 
-        s-out-ch (async/chan)]
+        s-out-ch    (async/chan)]
     (async/pipeline-async 2
                           s-out-ch
                           (fn [assert-flakes ch]

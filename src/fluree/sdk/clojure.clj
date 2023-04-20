@@ -5,6 +5,7 @@
             [fluree.db.util.validation :as v]
             [fluree.db.query.fql.syntax :as fql]
             [fluree.db.query.fql.parse :as fqp]
+            [fluree.db.query.history :as fqh]
             [fluree.json-ld :as json-ld])
   (:refer-clojure :exclude [load]))
 
@@ -106,6 +107,15 @@
           (log/debug->>val "pre-encoded multi query results:")
           encode-results))))
 
- (defn history
-   [ledger query]
-   (api/history ledger query)))
+(defn history
+  [ledger query]
+  (let [latest-db (db ledger)
+        context (json-ld/parse-context (fqp/parse-context query latest-db))
+        encode-results (fqh/results-encoder context)]
+    (future
+     (->> query
+          fqh/coerce-query
+          (api/history ledger)
+          deref
+          (log/debug->>val "pre-encoded history query results:")
+          encode-results))))
