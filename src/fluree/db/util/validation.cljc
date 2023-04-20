@@ -21,7 +21,9 @@
     ::val              [:fn value?]
     ::string-key       [:string {:decode/fluree name
                                  :encode/fluree keyword}]
-    ::context-map      [:map-of ::iri ::iri]
+    ::context-map      [:map-of ::iri [:orn
+                                       [:iri ::iri]
+                                       [:map [:ref ::context-map]]]]
     ::context          [:orn
                         [:sequence [:sequential [:orn
                                                  [:string :string]
