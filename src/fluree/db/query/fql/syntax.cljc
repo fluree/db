@@ -7,6 +7,7 @@
             [fluree.json-ld :as json-ld]
             [malli.core :as m]
             [fluree.db.util.validation :as v]
+            [malli.error :as me]
             [malli.transform :as mt]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -295,5 +296,7 @@
     (throw (ex-info "Invalid Query"
                     {:status  400
                      :error   :db/invalid-query
-                     :reasons (m/explain ::query qry
-                                         {:registry registry})}))))
+                     :query   qry
+                     :reasons (me/humanize
+                               (m/explain ::query qry
+                                          {:registry registry}))}))))
