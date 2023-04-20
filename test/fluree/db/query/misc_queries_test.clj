@@ -36,20 +36,24 @@
 
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query-context" {"defaults" {"@context" ["" {"ex" "http://example.org/ns/"}]}})
+        ledger @(fluree/create conn "query-context"
+                               {"defaults"
+                                {"@context"
+                                 ["" {"ex" "http://example.org/ns/"}]}})
         db     @(test-utils/transact ledger [{"id"   "ex:dan"
                                               "ex:x" 1}])]
-    (is (= [{"id"    "ex:dan"
+
+    (is (= [{"id"   "ex:dan"
              "ex:x" 1}]
            @(fluree/query db {"where"    [['?s "id" "ex:dan"]]
                               "select"   {'?s ["*"]}}))
         "default unwrapped objects")
     (is (= [{"id"    "ex:dan"
              "ex:x" [1]}]
-           @(fluree/query db {"@context" ["" {"ex:x" {"@container" "set"}}]
+           @(fluree/query db {"@context" ["" {"ex:x" {"@container" "@set"}}]
                               "where"    [['?s "id" "ex:dan"]]
                               "select"   {'?s ["*"]}}))
-        "override unwrapping with :set")
+        "override unwrapping with @set")
     (is (= [{"id"    "ex:dan"
              "ex:x" [1]}]
            @(fluree/query db {"@context" ["" {"ex:x" {"@container" "@list"}}]
