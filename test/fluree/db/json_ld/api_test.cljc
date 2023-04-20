@@ -268,11 +268,7 @@
                        "ex:friends" [{"id" "ex:john"} {"id" "ex:cam"}]}}
                      (set
                       @(fluree/query loaded-db '{"select" {?s ["*"]}
-                                                 "where"  [[?s "rdf:type" "ex:User"]]}))
-                    ;; TODO: Delete me and uncomment above
-                    #_(set
-                       @(fluree/query db '{"select" {?s ["*"]}
-                                           "where"  [[?s "rdf:type" "ex:User"]]})))))))
+                                                 "where"  [[?s "rdf:type" "ex:User"]]})))))))
 
        (testing "can load with policies"
          (with-tmp-dir storage-path
