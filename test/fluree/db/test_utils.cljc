@@ -83,7 +83,7 @@
 (defn create-conn
   ([]
    (create-conn {}))
-  ([{:strs [context did]
+  ([{:keys [context did]
      :or   {context default-context
             did     (did/private->did-map default-private-key false)}}]
    (let [conn-p (fluree/connect-memory {"defaults" {"@context" context

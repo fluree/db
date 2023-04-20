@@ -81,21 +81,30 @@
 
 (defn query
   [db query]
-  (let [context (json-ld/parse-context (fqp/parse-context query db))
-        results-encoder (fql/analytical-query-results-encoder context)]
+  (let [context        (json-ld/parse-context (fqp/parse-context query db))
+        encode-results (fql/analytical-query-results-encoder context)]
     (future
      (->> query
           fql/coerce-analytical-query
           (api/query db)
           deref
           (log/debug->>val "pre-encoded query results:")
-          results-encoder))))
+          encode-results))))
 
-(comment
- ;; TODO: Finish these
- (defn multi-query
-   [db query]
-   (api/multi-query db query))
+(defn multi-query
+  [db query]
+  (let [context        (json-ld/parse-context (fqp/parse-context query db))
+        encode-result  (fql/analytical-query-results-encoder context)
+        encode-results #(reduce-kv (fn [rs k r]
+                                     (assoc rs k (encode-result r)))
+                                   {} %)]
+    (future
+     (->> query
+          fql/coerce-multi-query
+          (api/multi-query db)
+          deref
+          (log/debug->>val "pre-encoded multi query results:")
+          encode-results))))
 
  (defn history
    [ledger query]

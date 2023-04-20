@@ -86,7 +86,7 @@
        :else v))
    q))
 
-(defn analytical-query-results-transformer
+(defn keyword-compact-iri-transformer
   [context]
   ;; TODO: Replace this with a :map-with schema once this lands upstream:
   ;;       https://github.com/metosin/malli/issues/881
@@ -97,6 +97,7 @@
                  (if-let [expanded (json-ld/expand-iri s context)]
                    (json-ld/compact expanded kw-context)
                    s))}})))
+
 
 (def registry
   (merge
@@ -277,11 +278,13 @@
 (def coerce-analytical-query
   (m/coercer ::analytical-query v/fluree-transformer {:registry registry}))
 
+(def coerce-multi-query
+  (m/coercer ::multi-query v/fluree-transformer {:registry registry}))
+
 (defn analytical-query-results-encoder
   [context]
-  (m/encoder ::analytical-query-results
-             {:registry registry}
-             (analytical-query-results-transformer context)))
+  (m/encoder ::analytical-query-results {:registry registry}
+             (keyword-compact-iri-transformer context)))
 
 (def valid-query?
   (m/validator ::query {:registry registry}))

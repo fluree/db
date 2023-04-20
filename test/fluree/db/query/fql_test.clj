@@ -191,9 +191,9 @@
         people (test-utils/load-people conn)
         db     (fluree/db people)]
     (testing "multi queries"
-      (let [q       '{"alice" {"select" {?s [:*]}
+      (let [q       '{"alice" {"select" {?s ["*"]}
                                "where"  [[?s "schema:email" "alice@example.org"]]}
-                      "brian" {"select" {?s [:*]}
+                      "brian" {"select" {?s ["*"]}
                                "where"  [[?s "schema:email" "brian@example.org"]]}}
             subject @(fluree/multi-query db q)]
         (is (= {"alice" [{"id"           "ex:alice"
