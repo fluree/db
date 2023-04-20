@@ -1,7 +1,8 @@
 (ns fluree.db.query.fql.syntax
   (:require [fluree.db.constants :as const]
-            [fluree.db.util.core :refer [pred-ident?]]
-            [malli.core :as m]))
+            [fluree.db.util.core :refer [try* catch* pred-ident?]]
+            [malli.core :as m]
+            [malli.transform :as mt]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -49,6 +50,10 @@
 (defn where-op [x]
   (when (map? x)
     (-> x first key)))
+
+(defn string->keyword
+  [x]
+  (cond-> x (string? x) keyword))
 
 (def registry
   (merge
@@ -128,7 +133,8 @@
                              [:clause ::var]
                              [:collection [:sequential ::var]]]
      ::group-by             ::groupBy
-     ::where-op             [:enum :filter :optional :union :bind]
+     ::where-op             [:enum {:decode {:fql string->keyword}}
+                             :filter :optional :union :bind]
      ::where-map            [:and
                              [:map-of {:max 1} ::where-op :any]
                              [:multi {:dispatch where-op}
@@ -217,6 +223,9 @@
 (def query-validator
   (m/validator ::query {:registry registry}))
 
+(def query-coercer
+  (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
+
 (def multi-query?
   (m/validator ::multi-query {:registry registry}))
 
@@ -228,3 +237,12 @@
                     {:status  400
                      :error   :db/invalid-query
                      :reasons (m/explain ::analytical-query qry {:registry registry})}))))
+
+(defn coerce
+  [qry]
+  (try* (query-coercer qry)
+        (catch* _e
+                (throw (ex-info "Invalid Query"
+                                {:status  400
+                                 :error   :db/invalid-query
+                                 :reasons (m/explain ::query qry {:registry registry})})))))
