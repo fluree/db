@@ -247,7 +247,6 @@
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
   (-search [this fparts] (query-range/search this fparts))
   (-query [this query-map] (fql/query this query-map))
-  (-query [this query-map opts] (fql/query this query-map opts))
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
