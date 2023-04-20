@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.syntax
   (:require [fluree.db.constants :as const]
             [fluree.db.util.core :refer [try* catch* pred-ident?]]
+            [fluree.db.util.log :as log]
             [malli.core :as m]
             [malli.transform :as mt]))
 
@@ -122,9 +123,10 @@
                              [:desc [:fn desc?]]]
      ::ordering             [:orn
                              [:scalar ::var]
-                             [:vector [:catn
-                                       [:direction ::direction]
-                                       [:dimension ::var]]]]
+                             [:vector [:and list?
+                                       [:catn
+                                        [:direction ::direction]
+                                        [:dimension ::var]]]]]
      ::orderBy              [:orn
                              [:clause ::ordering]
                              [:collection [:sequential ::ordering]]]
