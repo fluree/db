@@ -51,7 +51,7 @@
     - defaults:
       - did - (optional) DiD information to use, if storing blocks as verifiable credentials,
               or issuing queries against a permissioned database.
-      - context - (optional) Default @context map to use for ledgers formed with this connection."
+      - @context - (optional) Default @context map to use for ledgers formed with this connection."
   [{:strs [method parallelism] :as opts}]
   ;; TODO - do some validation
   (promise-wrap

@@ -573,20 +573,20 @@
                loaded-db    (fluree/db loaded)]
            (is (= (:t db) (:t loaded-db)))
            (testing "query returns expected policy"
-             (is (= [{"id"            "ex:UserPolicy",
-                      "rdf:type"      ["f:Policy"],
+             (is (= [{"id"            "ex:UserPolicy"
+                      "rdf:type"      ["f:Policy"]
                       "f:allow"
-                      {"id"           "ex:globalViewAllow",
-                       "f:action"     {"id" "f:view"},
-                       "f:targetRole" {"_id" 211106232532995}},
+                      {"id"           "ex:globalViewAllow"
+                       "f:action"     {"id" "f:view"}
+                       "f:targetRole" {"_id" 211106232532995}}
                       "f:property"
-                      {"id"     "_:f211106232532999",
+                      {"id"     "_:f211106232532999"
                        "f:allow"
-                       {"id"           "ex:ssnViewRule",
-                        "f:action"     {"id" "f:view"},
-                        "f:targetRole" {"_id" 211106232532995},
-                        "f:equals"     [{"id" "f:$identity"} {"id" "ex:user"}]},
-                       "f:path" {"id" "schema:ssn"}},
+                       {"id"           "ex:ssnViewRule"
+                        "f:action"     {"id" "f:view"}
+                        "f:targetRole" {"_id" 211106232532995}
+                        "f:equals"     [{"id" "f:$identity"} {"id" "ex:user"}]}
+                       "f:path" {"id" "schema:ssn"}}
                       "f:targetClass" {"id" "ex:User"}}]
                     @(fluree/query loaded-db
                                    '{"select" {?s ["*"
