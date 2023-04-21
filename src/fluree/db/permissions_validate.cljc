@@ -132,7 +132,8 @@
   (go-try
    (when-let [fflake (first flakes)]
      (let [class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
-           {defaults :default props :property} (group-policies-by-default policy :f/view class-ids)
+           {defaults :default props :property} (group-policies-by-default
+                                                policy "f:view" class-ids)
            ;; default-allow? will be the default for all flakes that don't have a property-specific policy
            default-allow? (<? (default-allow? db fflake defaults))]
        (cond
