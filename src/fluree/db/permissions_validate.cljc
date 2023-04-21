@@ -54,28 +54,28 @@
 (defn- evaluate-subject-properties
   [db property-policies default-allow? flakes]
   (go-try
-    (let [policies-by-pid (group-property-policies property-policies)]
-      (loop [[flake & r] flakes
-             acc []]
-        (if flake
-          (let [p-policies (->> flake flake/p (get policies-by-pid))]
-            (cond
-              p-policies (let [allow? (loop [[[async? f] & r] p-policies]
-                                        ;; return first truthy response, else false
-                                        (if f
-                                          (let [res (if async?
-                                                      (<? (f db flake))
-                                                      (f db flake))]
-                                            (or res
-                                                (recur r)))
-                                          ;; always default to false! (deny)
-                                          false))]
-                           (if allow?
-                             (recur r (conj acc flake))
-                             (recur r acc)))
-              default-allow? (recur r (conj acc flake))
-              :else (recur r acc)))
-          acc)))))
+   (let [policies-by-pid (group-property-policies property-policies)]
+     (loop [[flake & r] flakes
+            acc []]
+       (if flake
+         (let [p-policies (->> flake flake/p (get policies-by-pid))]
+           (cond
+             p-policies (let [allow? (loop [[[async? f] & r] p-policies]
+                                       ;; return first truthy response, else false
+                                       (if f
+                                         (let [res (if async?
+                                                     (<? (f db flake))
+                                                     (f db flake))]
+                                           (or res
+                                               (recur r)))
+                                         ;; always default to false! (deny)
+                                         false))]
+                          (if allow?
+                            (recur r (conj acc flake))
+                            (recur r acc)))
+             default-allow? (recur r (conj acc flake))
+             :else (recur r acc)))
+         acc)))))
 
 (defn group-policies-by-default
   "Groups policies for the specified action (e.g. :f/view, :f/modify)
@@ -105,8 +105,8 @@
   (go-try
    (log/debug "default-allow? default-allow-policies:" default-allow-policies)
    (loop [[[async? f] & r] (eduction
-                             (map second) (map :function)
-                             default-allow-policies)]
+                            (map second) (map :function)
+                            default-allow-policies)]
      ;; return first truthy response, else false
      (if f
        (let [f-res (if async?
@@ -130,14 +130,12 @@
   the subject can be done and each flake does not need to be checked."
   [{:keys [policy] :as db} flakes]
   (go-try
-    (let [fflake         (first flakes)
-          _              (log/debug "filter-subject-flakes fflake:" fflake)
-          class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
-          _              (log/debug "filter-subject-flakes class-ids:" class-ids)
-          {defaults :default props :property} (group-policies-by-default policy "f:view" class-ids)
-          ;; default-allow? will be the default for all flakes that don't have a property-specific policy
-          default-allow? (<? (default-allow? db fflake defaults))]
-      (cond
-        props (<? (evaluate-subject-properties db props default-allow? flakes))
-        default-allow? flakes
-        :else []))))
+   (when-let [fflake (first flakes)]
+     (let [class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
+           {defaults :default props :property} (group-policies-by-default policy :f/view class-ids)
+           ;; default-allow? will be the default for all flakes that don't have a property-specific policy
+           default-allow? (<? (default-allow? db fflake defaults))]
+       (cond
+         props (<? (evaluate-subject-properties db props default-allow? flakes))
+         default-allow? flakes
+         :else [])))))
