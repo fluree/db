@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql.syntax
   (:require [fluree.db.constants :as const]
             [fluree.db.util.core :refer [try* catch* pred-ident?]]
-            [fluree.db.util.log :as log]
             [malli.core :as m]
+            [malli.error :as me]
             [malli.transform :as mt]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -249,4 +249,4 @@
                 (throw (ex-info "Invalid Query"
                                 {:status  400
                                  :error   :db/invalid-query
-                                 :reasons (m/explain ::query qry {:registry registry})})))))
+                                 :reasons (me/humanize (m/explain ::query qry {:registry registry}))})))))
