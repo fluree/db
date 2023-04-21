@@ -108,3 +108,42 @@
       (is (= []
              alice-db-widget)
           "Alice wasn't given any permissions for class :ex/Product, so should see nothing for widget."))))
+
+
+(deftest ^:integration no-subject-flakes-test
+  (testing "If no subject flakes return from a select, policy code should not be run to avoid error."
+    (let [conn      (test-utils/create-conn)
+          ledger    @(fluree/create conn "policy/b" {:context {:ex "http://example.org/ns/"}})
+          alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
+          db        @(fluree/stage
+                       (fluree/db ledger)
+                       [{:id          :ex/alice,
+                         :type        :ex/User,
+                         :schema/name "alice"}
+                        {:id          :ex/john,
+                         :type        :ex/User,
+                         :schema/name "john"}
+                        {:id           :ex/widget,
+                         :type         :ex/Product,
+                         :schema/price 99.99}
+                        {:id      alice-did
+                         :ex/user :ex/alice
+                         :f/role  :ex/userRole}])
+
+          db+policy @(fluree/stage
+                       db
+                       ;; add policy targeting :ex/rootRole that can view and modify everything
+                       [{:id            :ex/userPolicy,
+                         :type          [:f/Policy],
+                         :f/targetClass :ex/User
+                         :f/allow       [{:id           :ex/globalViewAllow
+                                          :f/targetRole :ex/userRole
+                                          :f/action     [:f/view]}]}])
+
+          alice-db  @(fluree/wrap-policy db+policy {:did  alice-did
+                                                    :role :ex/userRole})]
+
+      (is (= []
+             @(fluree/query alice-db '{:select {?s [:*]}
+                                       :where  [[?s :schema/price 99.99]]}))
+          "There shouldn't be an exception, just empty vector."))))
