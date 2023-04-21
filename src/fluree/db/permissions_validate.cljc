@@ -126,12 +126,12 @@
   the subject can be done and each flake does not need to be checked."
   [{:keys [policy] :as db} flakes]
   (go-try
-    (let [fflake         (first flakes)
-          class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
-          {defaults :default props :property} (group-policies-by-default policy :f/view class-ids)
-          ;; default-allow? will be the default for all flakes that don't have a property-specific policy
-          default-allow? (<? (default-allow? db fflake defaults))]
-      (cond
-        props (<? (evaluate-subject-properties db props default-allow? flakes))
-        default-allow? flakes
-        :else []))))
+    (when-let [fflake (first flakes)]
+      (let [class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
+            {defaults :default props :property} (group-policies-by-default policy :f/view class-ids)
+            ;; default-allow? will be the default for all flakes that don't have a property-specific policy
+            default-allow? (<? (default-allow? db fflake defaults))]
+        (cond
+          props (<? (evaluate-subject-properties db props default-allow? flakes))
+          default-allow? flakes
+          :else [])))))
