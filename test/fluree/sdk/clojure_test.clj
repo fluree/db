@@ -132,7 +132,7 @@
             loaded       (test-utils/retry-load conn ledger-alias 100)
             loaded-db    (fluree/db loaded)]
         (is (= (:t db) (:t loaded-db)))
-        (is (= (:context ledger) (:context loaded))))))
+        (is (= (dbproto/-default-context db) (dbproto/-default-context loaded-db))))))
 
   (testing "can load a file ledger with its own context"
     (with-tmp-dir storage-path #_{::twf/delete-dir false}
