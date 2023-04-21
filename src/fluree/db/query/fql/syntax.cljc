@@ -54,7 +54,9 @@
 
 (defn string->keyword
   [x]
-  (cond-> x (string? x) keyword))
+  (if (string? x)
+    (keyword x)
+    x))
 
 (def registry
   (merge
