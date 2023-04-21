@@ -495,8 +495,9 @@
 
 (defn parse
   [q db]
-  (syntax/validate q)
-  (parse-analytical-query q db))
+  (-> q
+      syntax/coerce
+      (parse-analytical-query db)))
 
 (defn parse-delete
   [q db]
