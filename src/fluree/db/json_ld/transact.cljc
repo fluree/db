@@ -353,7 +353,7 @@
   (go
     (let [{:keys [delete] :as parsed-query}
           (-> json-ld
-              syntax/validate
+              syntax/coerce
               (q-parse/parse-delete db))
 
           [s p o]      delete
