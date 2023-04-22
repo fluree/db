@@ -279,18 +279,19 @@
       (commit-data/add-tt-id new-db))))
 
 (defn final-db
-  "Returns map of all elements for a stage transaction required to create an updated db."
+  "Returns map of all elements for a stage transaction required to create an
+  updated db."
   [new-flakes {:keys [stage-update? db-before] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
-          staged-map   {:add        add
-                        :remove     remove}
+          staged-map   {:add    add
+                        :remove remove}
           db-after     (cond-> (db-after staged-map tx-state)
-                               vocab-flakes vocab/refresh-schema
-                               vocab-flakes <?)]
+                         vocab-flakes vocab/refresh-schema
+                         vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
 
 (defn stage-flakes
@@ -399,6 +400,11 @@
         (policy/allowed? tx-state)
         <?)))
 
+(defn deletion?
+  [tx]
+  (and (contains? tx :delete)
+       (contains? tx :where)))
+
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
@@ -410,8 +416,7 @@
                 (<? (perm/wrap-policy db policy-opts))
                 db)
           tx-state (->tx-state db* (assoc opts :issuer issuer))
-          flakes   (if (and (contains? tx :delete)
-                            (contains? tx :where))
+          flakes   (if (deletion? tx)
                      (<? (delete db tx tx-state))
                      (<? (insert db tx tx-state)))]
       (<? (flakes->final-db tx-state flakes)))))
