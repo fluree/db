@@ -348,13 +348,13 @@
                          (init-db? db) (into (base-flakes t)))]
     (stage-flakes flakeset tx-state nodes)))
 
-(defn delete
+(defn modify
   [db json-ld {:keys [t] :as _tx-state}]
   (go
     (let [{:keys [delete] :as parsed-query}
           (-> json-ld
               syntax/coerce
-              (q-parse/parse-delete db))
+              (q-parse/parse-modification db))
 
           [s p o]      delete
           parsed-query (assoc parsed-query :delete [s p o])
@@ -400,7 +400,7 @@
         (policy/allowed? tx-state)
         <?)))
 
-(defn deletion?
+(defn update?
   [tx]
   (and (contains? tx :delete)
        (contains? tx :where)))
@@ -416,7 +416,7 @@
                 (<? (perm/wrap-policy db policy-opts))
                 db)
           tx-state (->tx-state db* (assoc opts :issuer issuer))
-          flakes   (if (deletion? tx)
-                     (<? (delete db tx tx-state))
+          flakes   (if (update? tx)
+                     (<? (modify db tx tx-state))
                      (<? (insert db tx tx-state)))]
       (<? (flakes->final-db tx-state flakes)))))

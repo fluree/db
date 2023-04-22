@@ -499,7 +499,7 @@
       syntax/coerce
       (parse-analytical-query db)))
 
-(defn parse-delete
+(defn parse-modification
   [q db]
   (when (:delete q)
     (let [context (parse-context q db)
@@ -509,4 +509,8 @@
           (assoc :context context
                  :where where)
           (cond-> (seq values) (assoc :values values))
-          (update :delete parse-triple db context)))))
+          (update :delete parse-triple db context)
+          (as-> mod
+              (if (contains? mod :insert)
+                (update mod :insert parse-triple db context)
+                mod))))))
