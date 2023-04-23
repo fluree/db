@@ -16,6 +16,7 @@
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.exec.delete :as delete]
             [fluree.db.query.exec.where :as where]
             [clojure.core.async :as async :refer [go]]
             [fluree.db.json-ld.credential :as cred]
@@ -348,44 +349,26 @@
                          (init-db? db) (into (base-flakes t)))]
     (stage-flakes flakeset tx-state nodes)))
 
+(defn into-flakeset
+  [flake-ch]
+  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
+    (async/reduce into flakeset flake-ch)))
+
 (defn modify
   [db json-ld {:keys [t] :as _tx-state}]
   (go
-    (let [{:keys [delete] :as parsed-query}
+    (let [parsed-query
           (-> json-ld
               syntax/coerce
               (q-parse/parse-modification db))
 
-          [s p o]      delete
-          parsed-query (assoc parsed-query :delete [s p o])
           error-ch     (async/chan)
-          flake-ch     (async/chan)
-          where-ch     (where/search db parsed-query error-ch)]
-      (async/pipeline-async 1
-                            flake-ch
-                            (fn [solution ch]
-                              (let [s* (if (::where/val s)
-                                         s
-                                         (get solution (::where/var s)))
-                                    p* (if (::where/val p)
-                                         p
-                                         (get solution (::where/var p)))
-                                    o* (if (::where/val o)
-                                         o
-                                         (get solution (::where/var o)))]
-                                (async/pipe
-                                  (where/resolve-flake-range db error-ch [s* p* o*])
-                                  ch)))
-                            where-ch)
-      (let [delete-ch (async/transduce (comp cat
-                                             (map (fn [f]
-                                                    (flake/flip-flake f t))))
-                                       (completing conj)
-                                       (flake/sorted-set-by flake/cmp-flakes-spot)
-                                       flake-ch)]
-        (async/alt!
-          error-ch ([e] e)
-          delete-ch ([flakes] flakes))))))
+          retract-ch   (->> (where/search db parsed-query error-ch)
+                            (delete/retract db parsed-query t error-ch)
+                            into-flakeset)]
+      (async/alt!
+        error-ch   ([e] e)
+        retract-ch ([flakes] flakes)))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
