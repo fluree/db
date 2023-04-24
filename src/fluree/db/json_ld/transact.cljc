@@ -357,18 +357,16 @@
 (defn modify
   [db json-ld {:keys [t] :as _tx-state}]
   (go
-    (let [parsed-query
-          (-> json-ld
-              syntax/coerce-modification
-              (q-parse/parse-modification db))
-
-          error-ch     (async/chan)
-          retract-ch   (->> (where/search db parsed-query error-ch)
-                            (update/retract db parsed-query t error-ch)
-                            into-flakeset)]
+    (let [mdfn      (-> json-ld
+                        syntax/coerce-modification
+                        (q-parse/parse-modification db))
+          error-ch  (async/chan)
+          update-ch (->> (where/search db mdfn error-ch)
+                         (update/modify db mdfn t error-ch)
+                         into-flakeset)]
       (async/alt!
-        error-ch   ([e] e)
-        retract-ch ([flakes] flakes)))))
+        error-ch  ([e] e)
+        update-ch ([flakes] flakes)))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -385,7 +383,8 @@
 
 (defn update?
   [tx]
-  (and (contains? tx :delete)
+  (and (or (update/insert? tx)
+           (update/retract? tx))
        (contains? tx :where)))
 
 (defn stage
