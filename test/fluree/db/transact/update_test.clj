@@ -1,4 +1,4 @@
-(ns fluree.db.transact.delete-test
+(ns fluree.db.transact.update-test
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
