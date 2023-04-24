@@ -79,7 +79,7 @@
         retract-ch      (retract db mdfn t error-ch retract-soln-ch)]
     (async/pipe solution-ch solution-ch*) ; now hook up the solution input
                                           ; after everything is wired
-    (async/merge insert-ch retract-ch)))
+    (async/merge [insert-ch retract-ch])))
 
 (defn insert?
   [mdfn]
