@@ -16,7 +16,7 @@
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.exec.delete :as delete]
+            [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
             [clojure.core.async :as async :refer [go]]
             [fluree.db.json-ld.credential :as cred]
@@ -364,7 +364,7 @@
 
           error-ch     (async/chan)
           retract-ch   (->> (where/search db parsed-query error-ch)
-                            (delete/retract db parsed-query t error-ch)
+                            (update/retract db parsed-query t error-ch)
                             into-flakeset)]
       (async/alt!
         error-ch   ([e] e)
