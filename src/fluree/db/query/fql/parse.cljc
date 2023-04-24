@@ -493,13 +493,22 @@
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
 
-(defn parse
+(defn parse-query
   [q db]
   (-> q
-      syntax/coerce
+      syntax/coerce-query
       (parse-analytical-query db)))
 
-(defn parse-modification
+(defn parse-delete-clause
+  [clause db context]
+  (let [clause* (if (syntax/triple? clause)
+                  [clause]
+                  clause)]
+    (mapv (fn [trip]
+            (parse-triple trip db context))
+          clause*)))
+
+(defn parse-ledger-update
   [q db]
   (when (:delete q)
     (let [context (parse-context q db)
@@ -509,8 +518,14 @@
           (assoc :context context
                  :where where)
           (cond-> (seq values) (assoc :values values))
-          (update :delete parse-triple db context)
+          (update :delete parse-delete-clause db context)
           (as-> mod
               (if (contains? mod :insert)
                 (update mod :insert parse-triple db context)
                 mod))))))
+
+(defn parse-modification
+  [mdfn db]
+  (-> mdfn
+      syntax/coerce-modification
+      (parse-ledger-update db)))

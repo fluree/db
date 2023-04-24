@@ -359,7 +359,7 @@
   (go
     (let [parsed-query
           (-> json-ld
-              syntax/coerce
+              syntax/coerce-modification
               (q-parse/parse-modification db))
 
           error-ch     (async/chan)
