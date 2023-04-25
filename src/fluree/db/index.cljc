@@ -3,7 +3,7 @@
   (:require [clojure.data.avl :as avl]
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
-               :cljs [cljs.core.async :refer [chan go <!] :as async])
+               :cljs [cljs.core.async :refer [chan go <! >!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
