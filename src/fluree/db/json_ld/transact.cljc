@@ -381,12 +381,6 @@
         (policy/allowed? tx-state)
         <?)))
 
-(defn update?
-  [tx]
-  (and (or (update/insert? tx)
-           (update/retract? tx))
-       (contains? tx :where)))
-
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
@@ -398,7 +392,7 @@
                 (<? (perm/wrap-policy db policy-opts))
                 db)
           tx-state (->tx-state db* (assoc opts :issuer issuer))
-          flakes   (if (update? tx)
+          flakes   (if (q-parse/update? tx)
                      (<? (modify db tx tx-state))
                      (<? (insert db tx tx-state)))]
       (<? (flakes->final-db tx-state flakes)))))

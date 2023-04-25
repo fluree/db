@@ -1,7 +1,11 @@
 (ns fluree.db.query.exec.update
   (:require [fluree.db.flake :as flake]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.query.exec.where :as where]
-            [clojure.core.async :as async]))
+            [fluree.db.util.core :refer [try* catch*]]
+            [fluree.db.util.async :refer [<?]]
+            [fluree.db.util.log :as log]
+            [clojure.core.async :as async :refer [>! go]]))
 
 (defn match-component
   [c solution]
@@ -23,7 +27,7 @@
     (where/resolve-flake-range db retract-xf error-ch matched)))
 
 (defn retract-clause
-  [db clause t solution out-ch error-ch]
+  [db clause t solution error-ch out-ch]
   (let [clause-ch  (async/to-chan! clause)]
     (async/pipeline-async 2
                           out-ch
@@ -31,7 +35,8 @@
                             (-> db
                                 (retract-triple triple t solution error-ch)
                                 (async/pipe ch)))
-                          clause-ch)))
+                          clause-ch)
+    out-ch))
 
 (defn retract
   [db mdfn t error-ch solution-ch]
@@ -40,30 +45,53 @@
     (async/pipeline-async 2
                           retract-ch
                           (fn [solution ch]
-                            (retract-clause db delete t solution ch error-ch))
+                            (retract-clause db delete t solution error-ch ch))
                           solution-ch)
     retract-ch))
 
 (defn insert-triple
-  [triple t solution]
-  (let [[s-mch p-mch o-mch] (match-solution triple solution)
-        s                   (::where/val s-mch)
-        p                   (::where/val p-mch)
-        o                   (::where/val o-mch)
-        dt                  (::where/datatype o-mch)]
-    (when (and s p o dt)
-      (flake/create s p o dt t true nil))))
+  [db triple t solution error-ch]
+  (go
+    (try* (let [[s-mch p-mch o-mch] (match-solution triple solution)
+                s                   (::where/val s-mch)
+                p                   (::where/val p-mch)
+                o                   (::where/val o-mch)
+                dt                  (::where/datatype o-mch)]
+            (when (and s p o dt)
+              (let [s* (if-not (number? s)
+                         (<? (dbproto/-subid db s true))
+                         s)]
+                [(flake/create s* p o dt t true nil)]))) ; wrap created flake in
+                                                         ; a vector so the
+                                                         ; output of this
+                                                         ; function has the same
+                                                         ; shape as the retract
+                                                         ; functions
+          (catch* e
+                  (log/error e "Error inserting new triple")
+                  (>! error-ch e)))))
+
+(defn insert-clause
+  [db clause t solution error-ch out-ch]
+  (async/pipeline-async 2
+                        out-ch
+                        (fn [triple ch]
+                          (-> db
+                              (insert-triple triple t solution error-ch)
+                              (async/pipe ch)))
+                        (async/to-chan! clause))
+  out-ch)
 
 (defn insert
-  [mdfn t solution-ch]
-  (let [{:keys [insert]} mdfn
-        insert-xf        (mapcat (fn [soln]
-                                   (->> insert
-                                        (map (fn [triple]
-                                               (insert-triple triple t soln)))
-                                        (remove nil?))))]
-    (async/pipe solution-ch
-                (async/chan 2 insert-xf))))
+  [db mdfn t error-ch solution-ch]
+  (let [clause    (:insert mdfn)
+        insert-ch (async/chan 2)]
+    (async/pipeline-async 2
+                          insert-ch
+                          (fn [solution ch]
+                            (insert-clause db clause t solution error-ch ch))
+                          solution-ch)
+    insert-ch))
 
 (defn insert-retract
   [db mdfn t error-ch solution-ch]
@@ -73,7 +101,7 @@
         solution-mult   (async/mult solution-ch*)
         insert-soln-ch  (->> (async/chan 2)
                              (async/tap solution-mult))
-        insert-ch       (insert mdfn t insert-soln-ch)
+        insert-ch       (insert db mdfn t error-ch insert-soln-ch)
         retract-soln-ch (->> (async/chan 2)
                              (async/tap solution-mult))
         retract-ch      (retract db mdfn t error-ch retract-soln-ch)]
@@ -97,7 +125,7 @@
     (insert-retract db mdfn t error-ch solution-ch)
 
     (insert? mdfn)
-    (insert mdfn t solution-ch)
+    (insert db mdfn t error-ch solution-ch)
 
     (retract? mdfn)
     (retract db mdfn t error-ch solution-ch)))
