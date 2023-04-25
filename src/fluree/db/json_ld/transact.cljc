@@ -16,8 +16,9 @@
             [fluree.db.json-ld.shacl :as shacl]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            [clojure.core.async :as async]
+            [clojure.core.async :as async :refer [go]]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.json-ld.policy :as perm]
@@ -210,7 +211,7 @@
 
 (defn ->tx-state
   [db {:keys [bootstrap? issuer context-type] :as _opts}]
-  (let [{:keys [block ecount schema branch ledger policy], db-t :t} db
+  (let [{:keys [block schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
@@ -279,18 +280,19 @@
       (commit-data/add-tt-id new-db))))
 
 (defn final-db
-  "Returns map of all elements for a stage transaction required to create an updated db."
-  [new-flakes {:keys [t stage-update? db-before] :as tx-state}]
+  "Returns map of all elements for a stage transaction required to create an
+  updated db."
+  [new-flakes {:keys [stage-update? db-before] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
-          staged-map   {:add        add
-                        :remove     remove}
+          staged-map   {:add    add
+                        :remove remove}
           db-after     (cond-> (db-after staged-map tx-state)
-                               vocab-flakes vocab/refresh-schema
-                               vocab-flakes <?)]
+                         vocab-flakes vocab/refresh-schema
+                         vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
 
 (defn stage-flakes
@@ -338,7 +340,7 @@
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
-  [{:keys [schema t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
+  [{:keys [t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
   (log/debug "insert default-ctx:" default-ctx)
   (let [nodes    (-> json-ld
                      (json-ld/expand default-ctx)
@@ -347,49 +349,24 @@
                          (init-db? db) (into (base-flakes t)))]
     (stage-flakes flakeset tx-state nodes)))
 
-;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
-(defn delete
-  "Executes a delete statement"
-  [db max-fuel json-ld {:keys [t] :as _tx-state}]
-  (go-try
-    (let [{:keys [delete] :as parsed-query}
-          (-> json-ld
-              syntax/validate
-              (q-parse/parse-delete db))
+(defn into-flakeset
+  [flake-ch]
+  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
+    (async/reduce into flakeset flake-ch)))
 
-          [s p o] delete
-          parsed-query (assoc parsed-query :delete [s p o])
-          error-ch     (async/chan)
-          flake-ch     (async/chan)
-          where-ch     (where/search db parsed-query error-ch)]
-      (async/pipeline-async 1
-                            flake-ch
-                            (fn [solution ch]
-                              (let [s* (if (::where/val s)
-                                         s
-                                         (get solution (::where/var s)))
-                                    p* (if (::where/val p)
-                                         p
-                                         (get solution (::where/var p)))
-                                    o* (if (::where/val o)
-                                         o
-                                         (get solution (::where/var o)))]
-                                (async/pipe
-                                  (where/resolve-flake-range db error-ch [s* p* o*])
-                                  ch)))
-                            where-ch)
-      (let [delete-ch (async/transduce (comp cat
-                                             (map (fn [f]
-                                                    (flake/flip-flake f t))))
-                                       (completing conj)
-                                       (flake/sorted-set-by flake/cmp-flakes-spot)
-                                       flake-ch)
-            flakes    (async/alt!
-                        error-ch ([e]
-                                  (throw e))
-                        delete-ch ([flakes]
-                                   flakes))]
-        flakes))))
+(defn modify
+  [db json-ld {:keys [t] :as _tx-state}]
+  (go
+    (let [mdfn      (-> json-ld
+                        syntax/coerce-modification
+                        (q-parse/parse-modification db))
+          error-ch  (async/chan)
+          update-ch (->> (where/search db mdfn error-ch)
+                         (update/modify db mdfn t error-ch)
+                         into-flakeset)]
+      (async/alt!
+        error-ch  ([e] e)
+        update-ch ([flakes] flakes)))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -415,8 +392,7 @@
                 (<? (perm/wrap-policy db policy-opts))
                 db)
           tx-state (->tx-state db* (assoc opts :issuer issuer))
-          flakes   (if (and (contains? tx :delete)
-                            (contains? tx :where))
-                     (<? (delete db util/max-integer tx tx-state))
+          flakes   (if (q-parse/update? tx)
+                     (<? (modify db tx tx-state))
                      (<? (insert db tx tx-state)))]
       (<? (flakes->final-db tx-state flakes)))))

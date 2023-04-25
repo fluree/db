@@ -42,7 +42,7 @@
   (if (cache? query-map)
     (cache-query db query-map)
     (let [q   (try*
-                (parse/parse query-map db)
+                (parse/parse-query query-map db)
                 (catch* e e))
           db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
       (if (util/exception? q)

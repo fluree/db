@@ -1,6 +1,7 @@
 (ns fluree.db.query.fql.parse
   (:require [fluree.db.query.exec.eval :as eval]
             [fluree.db.query.exec.where :as where]
+            [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.datatype :as datatype]
@@ -493,20 +494,48 @@
     (or (re-parse-as-simple-subj-crawl parsed)
         parsed)))
 
-(defn parse
+(defn parse-query
   [q db]
   (-> q
-      syntax/coerce
+      syntax/coerce-query
       (parse-analytical-query db)))
 
-(defn parse-delete
-  [q db]
-  (when (:delete q)
-    (let [context (parse-context q db)
-          [vars values] (parse-values q)
-          where   (parse-where q vars db context)]
-      (-> q
+(defn update?
+  [x]
+  (and (or (update/insert? x)
+           (update/retract? x))
+       (contains? x :where)))
+
+(defn parse-update-clause
+  [clause db context]
+  (let [clause* (if (syntax/triple? clause)
+                  [clause]
+                  clause)]
+    (mapv (fn [trip]
+            (parse-triple trip db context))
+          clause*)))
+
+(defn parse-ledger-update
+  [mdfn db]
+  (when (update? mdfn)
+    (let [context (parse-context mdfn db)
+          [vars values] (parse-values mdfn)
+          where   (parse-where mdfn vars db context)]
+      (-> mdfn
           (assoc :context context
                  :where where)
           (cond-> (seq values) (assoc :values values))
-          (update :delete parse-triple db context)))))
+          (as-> mod
+              (if (update/retract? mod)
+                (update mod :delete parse-update-clause db context)
+                mod))
+          (as-> mod
+              (if (update/insert? mod)
+                (update mod :insert parse-update-clause db context)
+                mod))))))
+
+(defn parse-modification
+  [mdfn db]
+  (-> mdfn
+      syntax/coerce-modification
+      (parse-ledger-update db)))

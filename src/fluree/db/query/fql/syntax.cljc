@@ -188,22 +188,16 @@
                              [:single ::single-var-binding]
                              [:multiple ::multiple-var-binding]]
      ::t                    [:or :int :string]
-     ::delete               ::triple
-     ::delete-op            [:map
-                             [:delete ::delete]
-                             [:where ::where]
-                             [:values {:optional true} ::values]]
-     ::context              [:map-of :any :any]
+     ::context              :any
      ::analytical-query     [:map
                              [:where ::where]
                              [:t {:optional true} ::t]
-                             [:context {:optional true} :any]
+                             [:context {:optional true} ::context]
                              [:select {:optional true} ::select]
                              [:selectOne {:optional true} ::selectOne]
                              [:select-one {:optional true} ::select-one]
                              [:selectDistinct {:optional true} ::selectDistinct]
                              [:select-distinct {:optional true} ::select-distinct]
-                             [:delete {:optional true} ::delete]
                              [:orderBy {:optional true} ::orderBy]
                              [:order-by {:optional true} ::order-by]
                              [:groupBy {:optional true} ::groupBy]
@@ -222,7 +216,31 @@
      ::multi-query          [:map-of [:or :string :keyword] ::analytical-query]
      ::query                [:orn
                              [:single ::analytical-query]
-                             [:multi ::multi-query]]}))
+                             [:multi ::multi-query]]
+     ::delete               [:orn
+                             [:single ::triple]
+                             [:collection [:sequential ::triple]]]
+     ::delete-op            [:map
+                             [:context {:optional true} ::context]
+                             [:delete ::delete]
+                             [:where ::where]
+                             [:values {:optional true} ::values]]
+     ::insert               [:orn
+                             [:single ::triple]
+                             [:collection [:sequential ::triple]]]
+     ::insert-op            [:map
+                             [:context {:optional true} ::context]
+                             [:insert ::insert]
+                             [:where ::where]
+                             [:values {:optional true} ::values]]
+     ::modification         [:or ::delete-op ::insert-op]}))
+
+(def triple-validator
+  (m/validator ::triple {:registry registry}))
+
+(defn triple?
+  [x]
+  (triple-validator x))
 
 (def query-validator
   (m/validator ::query {:registry registry}))
@@ -233,7 +251,7 @@
 (def multi-query?
   (m/validator ::multi-query {:registry registry}))
 
-(defn validate
+(defn validate-query
   [qry]
   (if (query-validator qry)
     qry
@@ -242,7 +260,7 @@
                      :error   :db/invalid-query
                      :reasons (m/explain ::analytical-query qry {:registry registry})}))))
 
-(defn coerce
+(defn coerce-query
   [qry]
   (try* (query-coercer qry)
         (catch* _e
@@ -250,3 +268,18 @@
                                 {:status  400
                                  :error   :db/invalid-query
                                  :reasons (me/humanize (m/explain ::query qry {:registry registry}))})))))
+
+(def modification-validator
+  (m/validator ::modification {:registry registry}))
+
+(def modification-coercer
+  (m/coercer ::modification (mt/transformer {:name :fql}) {:registry registry}))
+
+(defn coerce-modification
+  [mdfn]
+  (try* (modification-coercer mdfn)
+        (catch* _e
+                (throw (ex-info "Invalid Ledger Modification"
+                                {:status  400
+                                 :error   :db/invalid-query
+                                 :reasons (me/humanize (m/explain ::modification mdfn {:registry registry}))})))))
