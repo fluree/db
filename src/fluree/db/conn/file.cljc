@@ -289,14 +289,14 @@
                    (fn? indexer)
                    indexer
 
-              (or (map? indexer) (nil? indexer))
-              (fn [opts]
-                (idx-default/create (merge indexer opts)))
+                   (or (map? indexer) (nil? indexer))
+                   (fn [opts]
+                     (idx-default/create (merge indexer opts)))
 
-              :else
-              (throw (ex-info (str "Expected an indexer constructor fn or "
-                                   "default indexer options map. Provided: " indexer)
-                              {:status 400 :error :db/invalid-file-connection})))})
+                   :else
+                   (throw (ex-info (str "Expected an indexer constructor fn or "
+                                        "default indexer options map. Provided: " indexer)
+                                   {:status 400 :error :db/invalid-file-connection})))})
 
 (defn connect
   "Create a new file system connection."

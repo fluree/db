@@ -1,5 +1,6 @@
 (ns fluree.db.json-ld.reify
-  (:require [fluree.json-ld :as json-ld]
+  (:require [clojure.string :as str]
+            [fluree.json-ld :as json-ld]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
@@ -425,11 +426,11 @@
             db*))))))
 
 (defn load-default-context
-  "Loads the default context from the given conn's storage using the given key.
+  "Loads the default context from the given conn's storage using the given address.
   Returns a core.async channel with the context map."
-  [conn key]
+  [conn address]
   (go-try
-    (log/debug "loading default context from storage w/ key:" key)
-    (->> key
-         (conn-proto/-ctx-read conn)
-         <?)))
+   (log/debug "loading default context from storage w/ address:" address)
+   (->> address
+        (conn-proto/-ctx-read conn)
+        <?)))
