@@ -260,14 +260,18 @@
       (with-meta db-json* {:dbid dbid}))))
 
 (defn link-context-to-commit
-  "Takes a commit with an embedded :context and pulls it out, saves it to
-  storage separately (content-addressed).
+  "Takes a commit and a db, writes out the db's default-context to storage
+  (content addressed), and updates the commit w/ a new :defaultContext node.
 
   Returns a two-tuple of [updated-commit context-file-write-response]"
   [{:keys [conn ledger default-context] :as _db} commit]
   (go-try
-    (let [context-res (<? (conn-proto/-ctx-write conn ledger default-context))
-          commit*     (assoc commit (keyword const/iri-default-context) (:address context-res))]
+    (let [{:keys [hash address] :as context-res} (<? (conn-proto/-ctx-write
+                                                      conn ledger default-context))
+          commit*     (assoc commit :defaultContext
+                                    {:id      (str "fluree:context:" hash)
+                                     :type    const/iri-Context
+                                     :address address})]
       [commit* context-res])))
 
 (defn do-commit+push

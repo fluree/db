@@ -15,14 +15,14 @@
                         :subs     {:sub-id :sub-fn}         ;; active subscriptions
                         ;; map of branches, along with current/default branch
                         :branches {}
-                        :branch   {}
+                        :branch   {}}}
 
-                        }}
+
    :await  {:msg-id :async-res-ch}                          ;; map of msg-ids to response chans for messages awaiting responses
-   :stats  {}                                               ;; any stats about the connection itself
-   }
+   :stats  {}})                                               ;; any stats about the connection itself
 
-  )
+
+
 
 
 (defn blank-state
@@ -40,9 +40,9 @@
   (swap! state assoc :closed? true))
 
 (defn clear-state
-  []
+  [])
 
-  )
+
 
 
 (defn await-response
