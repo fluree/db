@@ -232,8 +232,8 @@
                            (conn-proto/-alias conn db-alias))
           branch       (keyword (get-in commit [const/iri-branch :value]))
           default-ctx  (-> commit
-                           (get const/iri-default-context)
-                           :value
+                           (get-in [const/iri-default-context const/iri-address
+                                    :value])
                            (->> (jld-reify/load-default-context conn))
                            <?)
           ledger       (<? (create conn ledger-alias {:branch         branch

@@ -32,14 +32,13 @@
 (def ^:const iri-message "https://ns.flur.ee/ledger#message")
 (def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
 (def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
-(def ^:const iri-context "https://ns.flur.ee/ledger#context")
+(def ^:const iri-default-context "https://ns.flur.ee/ledger#defaultContext")
+(def ^:const iri-Context "https://ns.flur.ee/ledger#Context")
 
 (def ^:const iri-id "@id")
 (def ^:const iri-type "@type")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
-;; TODO, replace usage with iri-context
-(def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
 
 ;; system collection ids
 (def ^:const $_tx -1) ; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
