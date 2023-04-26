@@ -1,6 +1,5 @@
 (ns fluree.db.json-ld.reify
-  (:require [clojure.string :as str]
-            [fluree.json-ld :as json-ld]
+  (:require [fluree.json-ld :as json-ld]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
