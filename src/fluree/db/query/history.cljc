@@ -12,63 +12,76 @@
    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
    [fluree.db.util.log :as log]
    [fluree.db.query.range :as query-range]
-   [fluree.db.db.json-ld :as jld-db]))
+   [fluree.db.db.json-ld :as jld-db]
+   [fluree.db.util.validation :as v]))
 
-(def HistoryQuery
-  [:and
-   [:map {:registry {::iri [:or :keyword :string]
-                     ::context [:map-of :any :any]}}
-    [:history {:optional true}
-     [:orn
-      [:subject ::iri]
-      [:flake
-       [:or
-        [:catn
-         [:s ::iri]]
-        [:catn
-         [:s [:maybe ::iri]]
-         [:p ::iri]]
-        [:catn
-         [:s [:maybe ::iri]]
-         [:p ::iri]
-         [:o [:not :nil]]]]]]]
-    [:commit-details {:optional true} :boolean]
-    [:context {:optional true} ::context]
-    [:t
-     [:and
-      [:map
-       [:from {:optional true} [:or
-                                [:enum "latest"]
-                                pos-int?
-                                datatype/iso8601-datetime-re]]
-       [:to {:optional true} [:or
-                              [:enum "latest"]
-                              pos-int?
-                              datatype/iso8601-datetime-re]]
-       [:at {:optional true} [:or
-                              [:enum "latest"]
-                              pos-int?
-                              datatype/iso8601-datetime-re]]]
-      [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
-       (fn [{:keys [from to at]}]
-         ;; if you have :at, you cannot have :from or :to
-         (if at
-           (not (or from to))
-           (or from to)))]
-      [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
-       (fn [{:keys [from to]}] (if (and (number? from) (number? to))
-                                 (<= from to)
-                                 true))]]]]
-   [:fn {:error/message "Must supply either a :history or :commit-details key."}
-    (fn [{:keys [history commit-details t]}]
-      (or history commit-details))]])
+(def registry
+  (merge
+   (m/base-schemas)
+   (m/type-schemas)
+   (m/predicate-schemas)
+   (m/comparator-schemas)
+   (m/sequence-schemas)
+   v/registry
+   {::iri     ::v/iri
+    ::context ::v/context
+    ::history-query
+    [:and
+     [:map-of :keyword :any]
+     [:map
+      [:history {:optional true}
+       [:orn
+        [:subject ::iri]
+        [:flake
+         [:or
+          [:catn
+           [:s ::iri]]
+          [:catn
+           [:s [:maybe ::iri]]
+           [:p ::iri]]
+          [:catn
+           [:s [:maybe ::iri]]
+           [:p ::iri]
+           [:o [:not :nil]]]]]]]
+      [:commit-details {:optional true} :boolean]
+      [:context {:optional true} ::context]
+      [:opts {:optional true} [:map-of :keyword :any]]
+      [:t
+       [:and
+        [:map-of :keyword :any]
+        [:map
+         [:from {:optional true} [:or
+                                  [:= "latest"]
+                                  [:int {:min 0}]
+                                  [:re datatype/iso8601-datetime-re]]]
+         [:to {:optional true} [:or
+                                [:= "latest"]
+                                [:int {:min 0}]
+                                [:re datatype/iso8601-datetime-re]]]
+         [:at {:optional true} [:or
+                                [:= "latest"]
+                                [:int {:min 0}]
+                                [:re datatype/iso8601-datetime-re]]]]
+        [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+         (fn [{:keys [from to at]}]
+           ;; if you have :at, you cannot have :from or :to
+           (if at
+             (not (or from to))
+             (or from to)))]
+        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+         (fn [{:keys [from to]}] (if (and (number? from) (number? to))
+                                   (<= from to)
+                                   true))]]]]
+     [:fn {:error/message "Must supply either a :history or :commit-details key."}
+      (fn [{:keys [history commit-details t]}]
+        (or history commit-details))]]}))
 
 
 (def history-query-validator
-  (m/validator HistoryQuery))
+  (m/validator ::history-query {:registry registry}))
 
 (def history-query-parser
-  (m/parser HistoryQuery))
+  (m/parser ::history-query {:registry registry}))
 
 (defn history-query?
   "Provide a time range :t and either :history or :commit-details, or both.
@@ -314,7 +327,7 @@
   and chunk together results with consecutive `t`s. "
   [t-key]
   (let [last-t (volatile! nil)
-       last-partition-val (volatile! true)]
+        last-partition-val (volatile! true)]
     (partition-by (fn [result]
                     (let [result-t (get result t-key)
                           chunk-last-t @last-t]
