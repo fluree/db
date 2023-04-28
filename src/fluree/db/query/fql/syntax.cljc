@@ -274,10 +274,10 @@
   [qry]
   (try* (query-coercer qry)
         (catch* _e
-                (throw (ex-info "Invalid Query"
-                                {:status  400
-                                 :error   :db/invalid-query
-                                 :reasons (me/humanize (m/explain ::query qry {:registry registry}))})))))
+          (throw (ex-info "Invalid Query"
+                          {:status  400
+                           :error   :db/invalid-query
+                           :reasons (me/humanize (m/explain ::query qry {:registry registry}))})))))
 
 (def modification-validator
   (m/validator ::modification {:registry registry}))
@@ -289,7 +289,7 @@
   [mdfn]
   (try* (modification-coercer mdfn)
         (catch* _e
-                (throw (ex-info "Invalid Ledger Modification"
-                                {:status  400
-                                 :error   :db/invalid-query
-                                 :reasons (me/humanize (m/explain ::modification mdfn {:registry registry}))})))))
+          (throw (ex-info "Invalid Ledger Modification"
+                          {:status  400
+                           :error   :db/invalid-query
+                           :reasons (me/humanize (m/explain ::modification mdfn {:registry registry}))})))))
