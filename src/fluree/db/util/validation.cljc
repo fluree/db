@@ -8,7 +8,5 @@
 (def registry
   (merge
    (m/type-schemas)
-   {::iri     [:orn
-               [:string :string]
-               [:keyword :keyword]]
+   {::iri     [:or :string :keyword]
     ::context :any}))
