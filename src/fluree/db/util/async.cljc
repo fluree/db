@@ -4,6 +4,7 @@
     [fluree.db.util.log :as log]
     [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
     [clojure.core.async :refer [go <!] :as async]
+    #?(:cljs [cljs.core.async.interop :as interop])
     [clojure.core.async.impl.protocols :as async-protocols])
   #?(:cljs (:require-macros [fluree.db.util.async :refer [<? go-try]])))
 
@@ -107,3 +108,13 @@
   "Returns true if core async channel."
   [x]
   (satisfies? async-protocols/Channel x))
+
+(defn p->c [p]
+  #?(:cljs (interop/p->c p)
+     :clj
+     (let [out (async/promise-chan)]
+       (try
+         (async/put! out (deref p))
+         (catch Throwable e
+           (async/put! out e)))
+       out)))

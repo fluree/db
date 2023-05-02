@@ -1,9 +1,9 @@
 (ns fluree.db.test-utils
-  (:require [fluree.db.did :as did]
+  (:require [clojure.core.async :refer [go go-loop]]
+            [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            #?@(:cljs [[clojure.core.async :refer [go go-loop]]
-                       [clojure.core.async.interop :refer [<p!]]])))
+            #?@(:cljs [[clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
   {:id     "@id"
@@ -91,6 +91,17 @@
                                                    :did          did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
+(defn create-conn'
+  "returns a promise yielding a #fluree.db.conn.memory.MemoryConnection"
+  ([]
+   (create-conn' {}))
+  ([{:keys [context did]
+     :or   {context default-context
+            did     (did/private->did-map default-private-key)}}]
+   (fluree/connect-memory {:defaults {:context      context
+                                      :context-type :keyword
+                                      :did          did}})))
+
 (defn load-movies
   [conn]
   (let [ledger @(fluree/create conn "test/movies")]
@@ -148,3 +159,9 @@
   "Retry calling exists? until it returns true or max-attempts."
   [conn ledger-alias max-atttemts]
   (retry-promise-wrapped #(fluree/exists? conn ledger-alias) max-atttemts true))
+
+(defmacro test-async [go-block]
+  (if (boolean (:ns &env))
+    `(cljs.test/async ~'done
+      (cljs.core.async/take! ~go-block #(~'done)))
+    `(clojure.core.async/<!! ~go-block)))
