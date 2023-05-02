@@ -1,7 +1,7 @@
 (ns fluree.sdk.browser
+  (:require-macros [fluree.sdk.version :refer [version]])
   (:require [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]
-            [fluree.sdk.version :refer [version]]))
+            [fluree.db.util.log :as log]))
 
 (enable-console-print!)
 

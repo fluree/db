@@ -53,7 +53,7 @@
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.3.0"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.20.12"}
+                 thheller/shadow-cljs              {:mvn/version "2.23.3"}
                  com.magnars/test-with-files {:mvn/version "2021-02-17"}}}
 
   :cljtest

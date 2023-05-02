@@ -1,7 +1,6 @@
 (ns fluree.sdk.version
-  #?(:clj  (:require [clojure.java.shell :refer [sh]]
-                     [clojure.edn :as edn])
-     :cljs (:require-macros [fluree.sdk.version :refer [version]])))
+  (:require [clojure.java.shell :refer [sh]]
+            [clojure.edn :as edn]))
 
 
 (defmacro version
