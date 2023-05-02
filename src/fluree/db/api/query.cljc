@@ -28,7 +28,8 @@
             db*                                                    (if-let [policy-opts (perm/policy-opts opts)]
                                                                      (<? (perm/wrap-policy db policy-opts))
                                                                      db)
-            {:keys [context history t commit-details] :as _parsed} (history/history-query-parser query-map)
+            {:keys [history t commit-details] :as parsed} (history/history-query-parser query-map)
+            context (fql-parse/get-context parsed)
 
             ;; from and to are positive ints, need to convert to negative or fill in default values
             {:keys [from to at]} t
