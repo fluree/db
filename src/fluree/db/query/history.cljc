@@ -12,63 +12,76 @@
    [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
    [fluree.db.util.log :as log]
    [fluree.db.query.range :as query-range]
-   [fluree.db.db.json-ld :as jld-db]))
+   [fluree.db.db.json-ld :as jld-db]
+   [fluree.db.util.validation :as v]))
 
-(def HistoryQuery
-  [:and
-   [:map {:registry {::iri [:or :keyword :string]
-                     ::context [:map-of :any :any]}}
-    [:history {:optional true}
-     [:orn
-      [:subject ::iri]
-      [:flake
-       [:or
-        [:catn
-         [:s ::iri]]
-        [:catn
-         [:s [:maybe ::iri]]
-         [:p ::iri]]
-        [:catn
-         [:s [:maybe ::iri]]
-         [:p ::iri]
-         [:o [:not :nil]]]]]]]
-    [:commit-details {:optional true} :boolean]
-    [:context {:optional true} ::context]
-    [:t
-     [:and
-      [:map
-       [:from {:optional true} [:or
-                                [:enum "latest"]
-                                pos-int?
-                                datatype/iso8601-datetime-re]]
-       [:to {:optional true} [:or
-                              [:enum "latest"]
-                              pos-int?
-                              datatype/iso8601-datetime-re]]
-       [:at {:optional true} [:or
-                              [:enum "latest"]
-                              pos-int?
-                              datatype/iso8601-datetime-re]]]
-      [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
-       (fn [{:keys [from to at]}]
-         ;; if you have :at, you cannot have :from or :to
-         (if at
-           (not (or from to))
-           (or from to)))]
-      [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
-       (fn [{:keys [from to]}] (if (and (number? from) (number? to))
-                                 (<= from to)
-                                 true))]]]]
-   [:fn {:error/message "Must supply either a :history or :commit-details key."}
-    (fn [{:keys [history commit-details t]}]
-      (or history commit-details))]])
+(def registry
+  (merge
+   (m/base-schemas)
+   (m/type-schemas)
+   (m/predicate-schemas)
+   (m/comparator-schemas)
+   (m/sequence-schemas)
+   v/registry
+   {::iri     ::v/iri
+    ::context ::v/context
+    ::history-query
+    [:and
+     [:map-of :keyword :any]
+     [:map
+      [:history {:optional true}
+       [:orn
+        [:subject ::iri]
+        [:flake
+         [:or
+          [:catn
+           [:s ::iri]]
+          [:catn
+           [:s [:maybe ::iri]]
+           [:p ::iri]]
+          [:catn
+           [:s [:maybe ::iri]]
+           [:p ::iri]
+           [:o [:not :nil]]]]]]]
+      [:commit-details {:optional true} :boolean]
+      [:context {:optional true} ::context]
+      [:opts {:optional true} [:map-of :keyword :any]]
+      [:t
+       [:and
+        [:map-of :keyword :any]
+        [:map
+         [:from {:optional true} [:or
+                                  [:= :latest]
+                                  [:int {:min 0}]
+                                  [:re datatype/iso8601-datetime-re]]]
+         [:to {:optional true} [:or
+                                [:= :latest]
+                                [:int {:min 0}]
+                                [:re datatype/iso8601-datetime-re]]]
+         [:at {:optional true} [:or
+                                [:= :latest]
+                                [:int {:min 0}]
+                                [:re datatype/iso8601-datetime-re]]]]
+        [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+         (fn [{:keys [from to at]}]
+           ;; if you have :at, you cannot have :from or :to
+           (if at
+             (not (or from to))
+             (or from to)))]
+        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+         (fn [{:keys [from to]}] (if (and (number? from) (number? to))
+                                   (<= from to)
+                                   true))]]]]
+     [:fn {:error/message "Must supply either a :history or :commit-details key."}
+      (fn [{:keys [history commit-details t]}]
+        (or history commit-details))]]}))
 
 
 (def history-query-validator
-  (m/validator HistoryQuery))
+  (m/validator ::history-query {:registry registry}))
 
 (def history-query-parser
-  (m/parser HistoryQuery))
+  (m/parser ::history-query {:registry registry}))
 
 (defn history-query?
   "Provide a time range :t and either :history or :commit-details, or both.
@@ -99,15 +112,15 @@
   [db cache context compact fuel error-ch s-flakes]
   (async/go
     (try*
-      (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
-                                                {:wildcard? true, :depth 0}
-                                                0 s-flakes)]
-        (-> (<? json-chan)
-            ;; add the id in case the iri flake isn't present in s-flakes
-            (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
-      (catch* e
-              (log/error e "Error transforming s-flakes.")
-              (async/>! error-ch e)))))
+     (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                               {:wildcard? true, :depth 0}
+                                               0 s-flakes)]
+       (-> (<? json-chan)
+           ;; add the id in case the iri flake isn't present in s-flakes
+           (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
+     (catch* e
+      (log/error e "Error transforming s-flakes."
+       (async/>! error-ch e))))))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -120,7 +133,7 @@
                          (vals)
                          (async/to-chan!))
 
-        s-out-ch (async/chan)]
+        s-out-ch    (async/chan)]
     (async/pipeline-async 2
                           s-out-ch
                           (fn [assert-flakes ch]
@@ -136,12 +149,12 @@
   [{:id :ex/foo :f/assert [{},,,} :f/retract [{},,,]]}]
   "
   [db context error-ch flakes]
-  (let [fuel  (volatile! 0)
-        cache (volatile! {})
+  (let [fuel        (volatile! 0)
+        cache       (volatile! {})
 
-        compact (json-ld/compact-fn context)
+        compact     (json-ld/compact-fn context)
 
-        out-ch   (async/chan)
+        out-ch      (async/chan)
 
         t-flakes-ch (->> flakes
                          (sort-by flake/t >)
@@ -157,24 +170,24 @@
                           (fn [t-flakes ch]
                             (-> (async/go
                                   (try*
-                                    (let [{assert-flakes true
-                                           retract-flakes false} (group-by flake/op t-flakes)
+                                   (let [{assert-flakes  true
+                                          retract-flakes false} (group-by flake/op t-flakes)
 
-                                          t (- (flake/t (first t-flakes)))
+                                         t        (- (flake/t (first t-flakes)))
 
-                                          asserts (->> (t-flakes->json-ld db context compact cache fuel error-ch assert-flakes)
+                                         asserts  (->> (t-flakes->json-ld db context compact cache fuel error-ch assert-flakes)
                                                        (async/into [])
                                                        (async/<!))
 
-                                          retracts (->> (t-flakes->json-ld db context compact cache fuel error-ch retract-flakes)
-                                                        (async/into [])
-                                                        (async/<!))]
-                                      {t-key t
-                                       assert-key asserts
-                                       retract-key retracts})
-                                    (catch* e
-                                            (log/error e "Error converting history flakes.")
-                                            (async/>! error-ch e))))
+                                         retracts (->> (t-flakes->json-ld db context compact cache fuel error-ch retract-flakes)
+                                                       (async/into [])
+                                                       (async/<!))]
+                                     {t-key       t
+                                      assert-key  asserts
+                                      retract-key retracts})
+                                   (catch* e
+                                    (log/error e "Error converting history flakes."
+                                     (async/>! error-ch e)))))
 
                                 (async/pipe ch)))
                           t-flakes-ch)
@@ -185,28 +198,28 @@
   to subject ids and return the best index to query against."
   [db context query]
   (go-try
-    (let [ ;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
-          [query-type parsed-query] query
+   (let [;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
+         [query-type parsed-query] query
 
-          {:keys [s p o]} (if (= :subject query-type)
-                            {:s parsed-query}
-                            parsed-query)
+         {:keys [s p o]} (if (= :subject query-type)
+                           {:s parsed-query}
+                           parsed-query)
 
-          ids [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
-               (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
-               (when o (jld-db/expand-iri db o context))]
+         ids [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
+              (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
+              (when o (jld-db/expand-iri db o context))]
 
-          [s p o] [(get ids 0) (get ids 1) (get ids 2)]
-          [pattern idx] (cond
-                          (not (nil? s))
-                          [ids :spot]
+         [s p o] [(get ids 0) (get ids 1) (get ids 2)]
+         [pattern idx] (cond
+                         (not (nil? s))
+                         [ids :spot]
 
-                          (and (nil? s) (not (nil? p)) (nil? o))
-                          [[p s o] :psot]
+                         (and (nil? s) (not (nil? p)) (nil? o))
+                         [[p s o] :psot]
 
-                          (and (nil? s) (not (nil? p)) (not (nil? o)))
-                          [[p o s] :post])]
-      [pattern idx])))
+                         (and (nil? s) (not (nil? p)) (not (nil? o)))
+                         [[p o s] :post])]
+     [pattern idx])))
 
 (defn commit-wrapper-flake?
   "Returns `true` for a flake that represents
@@ -243,10 +256,10 @@
   [db context compact cache fuel error-ch t-flakes]
   (async/go
     (try*
-     (let [default-ctx-sid (some #(when (= const/$_ledger:context (flake/p %))
-                                    (flake/o %))
-                                 t-flakes)
-           commit-meta?    (partial commit-metadata-flake? default-ctx-sid)
+     (let [default-ctx-sid     (some #(when (= const/$_ledger:context (flake/p %))
+                                        (flake/o %))
+                                     t-flakes)
+           commit-meta?        (partial commit-metadata-flake? default-ctx-sid)
            {commit-wrapper-flakes :commit-wrapper
             commit-meta-flakes    :commit-meta
             assert-flakes         :assert-flakes
@@ -293,12 +306,12 @@
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."
   [db context error-ch flake-slice-ch]
-  (let [fuel    (volatile! 0)
-        cache   (volatile! {})
-        compact (json-ld/compact-fn context)
+  (let [fuel        (volatile! 0)
+        cache       (volatile! {})
+        compact     (json-ld/compact-fn context)
 
         t-flakes-ch (async/chan 1 (comp cat (partition-by flake/t)))
-        out-ch     (async/chan)]
+        out-ch      (async/chan)]
 
     (async/pipe flake-slice-ch t-flakes-ch)
     (async/pipeline-async 2
@@ -313,10 +326,10 @@
   "Return a transducer that processes a stream of history results
   and chunk together results with consecutive `t`s. "
   [t-key]
-  (let [last-t (volatile! nil)
-       last-partition-val (volatile! true)]
+  (let [last-t             (volatile! nil)
+        last-partition-val (volatile! true)]
     (partition-by (fn [result]
-                    (let [result-t (get result t-key)
+                    (let [result-t     (get result t-key)
                           chunk-last-t @last-t]
                       (vreset! last-t result-t)
                       (if (or (nil? chunk-last-t)
@@ -332,17 +345,17 @@
   Chunks together history results with consecutive `t`s to reduce `time-range`
   calls. "
   [db context error-ch history-results-ch]
-  (let [t-key (json-ld/compact const/iri-t context)
-        out-ch (async/chan 2 cat)
+  (let [t-key      (json-ld/compact const/iri-t context)
+        out-ch     (async/chan 2 cat)
         chunked-ch (async/chan 2 (with-consecutive-ts t-key))]
     (async/pipe history-results-ch chunked-ch)
     (async/pipeline-async 2
                           out-ch
                           (fn [chunk ch]
                             (async/pipe (async/go
-                                          (let [to-t  (- (-> chunk peek (get t-key)))
-                                                from-t  (- (-> chunk (nth 0) (get t-key)))
-                                                flake-slices-ch (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
+                                          (let [to-t                       (- (-> chunk peek (get t-key)))
+                                                from-t                     (- (-> chunk (nth 0) (get t-key)))
+                                                flake-slices-ch            (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
                                                 consecutive-commit-details (<? (async/into [] (commit-flakes->json-ld db context error-ch flake-slices-ch)))]
                                             (map into chunk consecutive-commit-details)))
                                         ch))
