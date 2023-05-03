@@ -1,6 +1,8 @@
 (ns fluree.db.query.fql.syntax
   (:require [fluree.db.constants :as const]
+            [fluree.db.util.core :as util]
             [fluree.db.util.core :refer [try* catch* pred-ident?]]
+            [fluree.db.util.validation :as v]
             [malli.core :as m]
             [malli.error :as me]
             [malli.transform :as mt]))
@@ -58,6 +60,10 @@
     (keyword x)
     x))
 
+(defn decode-json
+  [v]
+  (util/keywordize-keys v))
+
 (def registry
   (merge
     (m/predicate-schemas)
@@ -66,6 +72,7 @@
     (m/type-schemas)
     (m/sequence-schemas)
     (m/base-schemas)
+    v/registry
     {::limit                pos-int?
      ::offset               nat-int?
      ::maxFuel              number?
@@ -78,29 +85,33 @@
      ::contextType          [:enum :string :keyword]
      ::context-type         ::contextType
      ::issuer               [:maybe string?]
-     ::opts                 [:map
-                             [:maxFuel {:optional true} ::maxFuel]
-                             [:max-fuel {:optional true} ::maxFuel]
-                             [:parseJSON {:optional true} ::parseJSON]
-                             [:parse-json {:optional true} ::parse-json]
-                             [:prettyPrint {:optional true} ::prettyPrint]
-                             [:pretty-print {:optional true} ::pretty-print]
-                             [:contextType {:optional true} ::contextType]
-                             [:context-type {:optional true} ::contextType]
-                             [:issuer {:optional true} ::issuer]]
+     ::role                 :any
+     ::did                  :any
+     ::opts                 [:and
+                             [:map-of :keyword :any]
+                             [:map
+                              [:maxFuel {:optional true} ::maxFuel]
+                              [:max-fuel {:optional true} ::maxFuel]
+                              [:parseJSON {:optional true} ::parseJSON]
+                              [:parse-json {:optional true} ::parse-json]
+                              [:prettyPrint {:optional true} ::prettyPrint]
+                              [:pretty-print {:optional true} ::pretty-print]
+                              [:contextType {:optional true} ::contextType]
+                              [:context-type {:optional true} ::contextType]
+                              [:issuer {:optional true} ::issuer]
+                              [:role {:optional true} ::role]
+                              [:did {:optional true} ::did]]]
      ::function             [:orn
                              [:string [:fn fn-string?]]
                              [:list [:fn fn-list?]]]
      ::wildcard             [:fn wildcard?]
      ::var                  [:fn variable?]
      ::val                  [:fn value?]
-     ::iri                  [:orn
-                             [:keyword keyword?]
-                             [:string string?]]
+     ::iri                  ::v/iri
      ::subject              [:orn
                              [:sid [:fn sid?]]
-                             [:iri ::iri]
-                             [:ident [:fn pred-ident?]]]
+                             [:ident [:fn pred-ident?]]
+                             [:iri ::iri]]
      ::subselect-map        [:map-of ::iri [:ref ::subselection]]
      ::subselection         [:sequential [:orn
                                           [:wildcard ::wildcard]
@@ -163,10 +174,9 @@
                                        [:val :any]]]]
      ::where-tuple          [:orn
                              [:triple ::triple]
-                             [:binding [:sequential {:max 2} :any]]
                              [:remote [:sequential {:max 4} :any]]]
      ::where-pattern        [:orn
-                             [:where-map ::where-map]
+                             [:map ::where-map]
                              [:tuple ::where-tuple]]
      ::optional             [:orn
                              [:single ::where-pattern]
@@ -188,8 +198,8 @@
                              [:single ::single-var-binding]
                              [:multiple ::multiple-var-binding]]
      ::t                    [:or :int :string]
-     ::context              :any
-     ::analytical-query     [:map
+     ::context              ::v/context
+     ::analytical-query     [:map {:decode/json decode-json}
                              [:where ::where]
                              [:t {:optional true} ::t]
                              [:context {:optional true} ::context]
@@ -264,10 +274,10 @@
   [qry]
   (try* (query-coercer qry)
         (catch* _e
-                (throw (ex-info "Invalid Query"
-                                {:status  400
-                                 :error   :db/invalid-query
-                                 :reasons (me/humanize (m/explain ::query qry {:registry registry}))})))))
+          (throw (ex-info "Invalid Query"
+                          {:status  400
+                           :error   :db/invalid-query
+                           :reasons (me/humanize (m/explain ::query qry {:registry registry}))})))))
 
 (def modification-validator
   (m/validator ::modification {:registry registry}))
@@ -279,7 +289,7 @@
   [mdfn]
   (try* (modification-coercer mdfn)
         (catch* _e
-                (throw (ex-info "Invalid Ledger Modification"
-                                {:status  400
-                                 :error   :db/invalid-query
-                                 :reasons (me/humanize (m/explain ::modification mdfn {:registry registry}))})))))
+          (throw (ex-info "Invalid Ledger Modification"
+                          {:status  400
+                           :error   :db/invalid-query
+                           :reasons (me/humanize (m/explain ::modification mdfn {:registry registry}))})))))
