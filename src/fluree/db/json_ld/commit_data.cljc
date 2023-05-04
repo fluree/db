@@ -438,7 +438,10 @@
       (update :schema vocab/update-with* -1 commit-schema-flakes)))
 
 (defn commit-metadata-flakes
-  [{:keys [address alias branch data id time v]} t db-sid]
+  "Builds and returns the commit metadata flakes for the given commit, t, and
+  db-sid. Used when committing to an in-memory ledger value and when reifying
+  a ledger from storage on load."
+  [{:keys [address alias branch data id time v] :as _commit} t db-sid]
   (let [{db-id :id db-t :t db-address :address :keys [flakes size]} data]
     [;; link db to associated commit meta: @id
      (flake/create t const/$xsd:anyURI id const/$xsd:string t true nil)
@@ -470,6 +473,73 @@
      (flake/create db-sid const/$_commitdata:flakes flakes const/$xsd:int t true
                    nil)]))
 
+(defn prev-commit-flakes
+  "Builds and returns a channel containing the previous commit flakes for the
+  given db, t, and previous-id (the id of a commit's previous commit). Used when
+  committing to an in-memory ledger and when reifying a ledger from storage on
+  load."
+  [db t previous-id]
+  (go-try
+   (let [prev-sid (<? (dbproto/-subid db previous-id))]
+     [(flake/create t const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
+
+(defn prev-data-flakes
+  "Builds and returns a channel containing the previous data flakes for the
+  given db, db-sid, t, and prev-data-id (the id of commit's data section's
+  previous pointer). Used when committing to an in-memory ledger value and when
+  reifying a ledger from storage on load."
+  [db db-sid t prev-data-id]
+  (go-try
+   (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
+     [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
+
+(defn issuer-flakes
+  "Builds and returns a channel containing the credential issuer's flakes for
+  the given db, t, next-sid, and issuer-iri. next-sid should be a zero-arity fn
+  that returns the next subject id to use if the issuer doesn't already exist in
+  the db and that updates some internal state to reflect that this one is now
+  used. It will only be called if needed. Used when committing to an in-memory
+  ledger value and when reifying a ledger from storage on load."
+  [db t next-sid issuer-iri]
+  (go-try
+   (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
+     ;; create reference to existing issuer
+     [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true
+                    nil)]
+     ;; create new issuer flake and a reference to it
+     (let [new-issuer-sid (next-sid)]
+       [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
+                      true nil)
+        (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
+                      const/$xsd:string t true nil)]))))
+
+(defn message-flakes
+  "Builds and returns the commit message flakes for the given t and message.
+  Used when committing to an in-memory ledger value and when reifying a ledger
+  from storage on load."
+  [t message]
+  [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
+
+(defn default-ctx-flakes
+  "Builds and returns a channel containing the default context flakes for the
+  given db, t, next-sid, and defaultContext. next-sid should be a zero-arity fn
+  that returns the next subject id to use if the defaultContext doesn't already
+  exist in the db and that updates some internal state to reflect that this one
+  is now used. It will only be called if needed. Used when committing to an
+  in-memory ledger value and when reifying a ledger from storage on load."
+  [db t next-sid {:keys [id address] :as _defaultContext}]
+  (go-try
+   (if-let [default-ctx-id (<? (dbproto/-subid db id))]
+     [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t
+                    true nil)]
+     (let [new-default-ctx-id (next-sid)]
+       [(flake/create t const/$_ledger:context new-default-ctx-id
+                      const/$xsd:anyURI t true nil)
+        (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
+                      true nil)
+        (flake/create new-default-ctx-id const/$_address address
+                      const/$xsd:string t true nil)]))))
+
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
@@ -486,35 +556,17 @@
 
          t                  (- db-t)
          db-sid             (next-sid)
-
          base-flakes        (commit-metadata-flakes commit t db-sid)
-
          prev-commit-flakes (when previous-id
-                              (let [prev-sid (<? (dbproto/-subid db previous-id))]
-                                [(flake/create t const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
-
+                              (<? (prev-commit-flakes db t previous-id)))
          prev-db-flakes     (when prev-data-id
-                              (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
-                                [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)]))
-
+                              (<? (prev-data-flakes db db-sid t prev-data-id)))
          issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                              (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
-                                ;; create reference to existing issuer
-                                [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true nil)]
-                                ;; create new issuer flake and a reference to it
-                                (let [new-issuer-sid (next-sid)]
-                                  [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t true nil)
-                                   (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri const/$xsd:string t true nil)])))
+                              (<? (issuer-flakes db t next-sid issuer-iri)))
          message-flakes     (when message
-                              [(flake/create t const/$_commit:message message const/$xsd:string t true nil)])
-         default-ctx-flakes (when-let [default-ctx-iri (:id defaultContext)]
-                              (if-let [default-ctx-id (<? (dbproto/-subid db default-ctx-iri))]
-                                [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t true nil)]
-                                (let [new-default-ctx-id (next-sid)
-                                      address            (:address defaultContext)]
-                                  [(flake/create t const/$_ledger:context new-default-ctx-id const/$xsd:anyURI t true nil)
-                                   (flake/create new-default-ctx-id const/$xsd:anyURI default-ctx-iri const/$xsd:string t true nil)
-                                   (flake/create new-default-ctx-id const/$_address address const/$xsd:string t true nil)])))
+                              (message-flakes t message))
+         default-ctx-flakes (when defaultContext
+                              (<? (default-ctx-flakes db t next-sid defaultContext)))
          commit-flakes      (cond-> base-flakes
                                     prev-commit-flakes (into prev-commit-flakes)
                                     prev-db-flakes (into prev-db-flakes)

@@ -341,9 +341,12 @@
          retract            (db-retract db-data)
          retract-flakes     (<? (retract-flakes db retract t-new iris))
          {:keys [flakes pid sid]} (<? (assert-flakes db assert t-new iris refs))
-         commit-metadata    (commit-data/json-ld->map commit db)
-         [prev-commit _] (some->> commit-metadata :previous :address
-                                  (read-commit conn) <? parse-commit)
+
+         {:keys [previous issuer message defaultContext] :as commit-metadata}
+         (commit-data/json-ld->map commit db)
+
+         [prev-commit _] (some->> previous :address (read-commit conn) <?
+                                  parse-commit)
          last-sid           (volatile! (jld-ledger/last-commit-sid db))
          next-sid           (fn [] (vswap! last-sid inc))
          db-sid             (next-sid)
@@ -351,50 +354,20 @@
                                                                 t-new db-sid)
          previous-id        (when prev-commit (:id prev-commit))
          prev-commit-flakes (when previous-id
-                              (let [prev-sid (<? (dbproto/-subid db previous-id))]
-                                [(flake/create t-new const/$_previous prev-sid
-                                               const/$xsd:anyURI t-new true nil)]))
+                              (<? (commit-data/prev-commit-flakes db t-new
+                                                                  previous-id)))
          prev-data-id       (get-in prev-commit [const/iri-data :id])
          prev-db-flakes     (when prev-data-id
-                              (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
-                                [(flake/create db-sid const/$_previous prev-sid
-                                               const/$xsd:anyURI t-new true nil)]))
-         issuer             (:issuer commit-metadata)
+                              (<? (commit-data/prev-data-flakes db db-sid t-new
+                                                                prev-data-id)))
          issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                              (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
-                                [(flake/create t-new const/$_commit:signer
-                                               issuer-sid const/$xsd:anyURI
-                                               t-new true nil)]
-                                (let [new-issuer-sid (next-sid)]
-                                  [(flake/create t-new const/$_commit:signer
-                                                 new-issuer-sid const/$xsd:anyURI
-                                                 t-new true nil)
-                                   (flake/create new-issuer-sid const/$xsd:anyURI
-                                                 issuer-iri const/$xsd:string
-                                                 t-new true nil)])))
-         message            (:message commit-metadata)
+                              (<? (commit-data/issuer-flakes db t-new next-sid
+                                                             issuer-iri)))
          message-flakes     (when message
-                              [(flake/create t-new const/$_commit:message
-                                             message const/$xsd:string t-new
-                                             true nil)])
-         default-ctx        (:defaultContext commit-metadata)
-         default-ctx-flakes (when-let [default-ctx-iri (:id default-ctx)]
-                              (if-let [default-ctx-id (<? (dbproto/-subid db default-ctx-iri))]
-                                [(flake/create t-new const/$_ledger:context
-                                               default-ctx-id const/$xsd:anyURI
-                                               t-new true nil)]
-                                (let [new-default-ctx-id (next-sid)
-                                      address            (:address default-ctx)]
-                                  [(flake/create t-new const/$_ledger:context
-                                                 new-default-ctx-id
-                                                 const/$xsd:anyURI t-new true nil)
-                                   (flake/create new-default-ctx-id
-                                                 const/$xsd:anyURI
-                                                 default-ctx-iri
-                                                 const/$xsd:string t-new true nil)
-                                   (flake/create new-default-ctx-id
-                                                 const/$_address address
-                                                 const/$xsd:string t-new true nil)])))
+                              (commit-data/message-flakes t-new message))
+         default-ctx-flakes (when defaultContext
+                              (<? (commit-data/default-ctx-flakes
+                                   db t-new next-sid defaultContext)))
          all-flakes         (-> db
                                 (get-in [:novelty :spot])
                                 empty
