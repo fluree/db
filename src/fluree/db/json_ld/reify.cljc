@@ -374,18 +374,19 @@
                                 (into metadata-flakes)
                                 (into retract-flakes)
                                 (into flakes)
-                                (cond-> prev-commit-flakes
-                                  (into prev-commit-flakes))
-                                (cond-> prev-db-flakes
-                                  (into prev-db-flakes))
-                                (cond-> issuer-flakes
-                                  (into issuer-flakes))
-                                (cond-> message-flakes
-                                  (into message-flakes))
-                                (cond-> default-ctx-flakes
-                                  (into default-ctx-flakes))
-                                (cond-> (= -1 t-new)
-                                  (into commit-data/commit-schema-flakes)))
+                                (cond->
+                                 prev-commit-flakes
+                                 (into prev-commit-flakes)
+                                 prev-db-flakes
+                                 (into prev-db-flakes)
+                                 issuer-flakes
+                                 (into issuer-flakes)
+                                 message-flakes
+                                 (into message-flakes)
+                                 default-ctx-flakes
+                                 (into default-ctx-flakes)
+                                 (= -1 t-new)
+                                 (into commit-data/commit-schema-flakes)))
          ecount*            (assoc ecount const/$_predicate pid
                                           const/$_default sid)]
      (when (empty? all-flakes)
