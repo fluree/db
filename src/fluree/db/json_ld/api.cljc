@@ -3,7 +3,7 @@
             [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
-            [fluree.db.conn.s3 :as s3-conn]
+            #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.platform :as platform]
