@@ -10,25 +10,29 @@
 
 (deftest ^:integration default-context-stability-memory-from-load
   (let [conn     (test-utils/create-conn)
-        ledger   @(fluree/create conn "ctx/stability-mem-ld" {:defaultContext {:id   "@id"
-                                                                               :type "@type"
-                                                                               :ex   "http://example.org/ns/"
-                                                                               :blah "http://blah.me/wow/ns/"}})
+        ledger   @(fluree/create conn "ctx/stability-mem-ld"
+                                 {:defaultContext {:id   "@id"
+                                                   :type "@type"
+                                                   :ex   "http://example.org/ns/"
+                                                   :blah "http://blah.me/wow/ns/"}})
         db1      @(test-utils/transact ledger [{:id      :blah/one
                                                 :ex/name "One"}])
-        db1-load (fluree/db @(fluree/load conn "ctx/stability-mem-ld"))
+        db1-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"
+                                                   100))
 
         db2      (->> @(fluree/stage db1-load [{:id      :blah/two
                                                 :ex/name "Two"}])
                       (fluree/commit! ledger)
                       deref)
-        db2-load (fluree/db @(fluree/load conn "ctx/stability-mem-ld"))
+        db2-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"
+                                                   100))
 
         db3      (->> @(fluree/stage db2-load [{:id      :blah/three
                                                 :ex/name "Three"}])
                       (fluree/commit! ledger)
                       deref)
-        db3-load (fluree/db @(fluree/load conn "ctx/stability-mem-ld"))]
+        db3-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem-ld"
+                                                   100))]
 
     (testing "Loaded default context is same as initial db's"
       (is (= (dbproto/-default-context db1-load)
@@ -61,13 +65,13 @@
                                                                             :blah "http://blah.me/wow/ns/"}})
         db1      @(test-utils/transact ledger [{:id      :blah/one
                                                 :ex/name "One"}])
-        db1-load (fluree/db @(fluree/load conn "ctx/stability-mem"))
+        db1-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem" 100))
         db2      @(test-utils/transact ledger [{:id      :blah/two
                                                 :ex/name "Two"}])
-        db2-load (fluree/db @(fluree/load conn "ctx/stability-mem"))
+        db2-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem" 100))
         db3      @(test-utils/transact ledger [{:id      :blah/three
                                                 :ex/name "Three"}])
-        db3-load (fluree/db @(fluree/load conn "ctx/stability-mem"))]
+        db3-load (fluree/db (test-utils/retry-load conn "ctx/stability-mem" 100))]
 
     (testing "Loaded default context is same as initial db's"
       (is (= (dbproto/-default-context db1-load)

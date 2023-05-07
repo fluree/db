@@ -302,42 +302,97 @@
 (defn parse-commit
   "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
-  (let [cred-subj (get commit-data "https://www.w3.org/2018/credentials#credentialSubject")
+  (let [cred-subj (get commit-data const/iri-cred-subj)
         commit    (or cred-subj commit-data)]
     [commit (when cred-subj commit-data)]))
 
 (defn read-commit
   [conn commit-address]
   (go-try
-    (let [file-data (<? (conn-proto/-c-read conn commit-address))]
-      (json-ld/expand file-data))))
+   (let [file-data (<? (conn-proto/-c-read conn commit-address))
+         addr-key-path (if (contains? file-data "credentialSubject")
+                         ["credentialSubject" "address"]
+                         ["address"])
+         commit    (assoc-in file-data addr-key-path commit-address)]
+     (log/debug "read-commit commit:" commit)
+     (json-ld/expand commit))))
+
+(defn read-db
+  [conn db-address]
+  (go-try
+   (let [file-data (<? (conn-proto/-c-read conn db-address))
+         db        (assoc file-data "f:address" db-address)]
+     (json-ld/expand db))))
 
 (defn merge-commit
   [conn {:keys [ecount t] :as db} commit merged-db?]
   (go-try
-    (let [iris           (volatile! {})
-          refs           (volatile! (-> db :schema :refs))
-          db-address     (get-in commit [const/iri-data const/iri-address :value])
-          db-data        (<? (read-commit conn db-address))
-          _              (log/debug "merge-commit read commit:" db-data)
-          t-new          (- (db-t db-data))
-          _              (when (and (not= t-new (dec t))
-                                    (not merged-db?)) ;; when including multiple dbs, t values will get reused.
-                           (throw (ex-info (str "Commit t value: " (- t-new)
-                                                " has a gap from latest commit t value: " (- t) ".")
-                                           {:status 500 :error :db/invalid-commit})))
-          assert         (db-assert db-data)
-          retract        (db-retract db-data)
-          retract-flakes (<? (retract-flakes db retract t-new iris))
-          {:keys [flakes pid sid]} (<? (assert-flakes db assert t-new iris refs))
-          all-flakes     (-> (empty (get-in db [:novelty :spot]))
-                             (into retract-flakes)
-                             (into flakes))
-          ecount*        (assoc ecount const/$_predicate pid
-                                       const/$_default sid)]
-      (when (empty? all-flakes)
-        (commit-error "Commit has neither assertions or retractions!" commit))
-      (merge-flakes (assoc db :ecount ecount*) t-new @refs all-flakes))))
+   (let [iris               (volatile! {})
+         refs               (volatile! (-> db :schema :refs))
+         db-address         (get-in commit [const/iri-data const/iri-address :value])
+         db-data            (<? (read-db conn db-address))
+         t-new              (- (db-t db-data))
+         _                  (when (and (not= t-new (dec t))
+                                       (not merged-db?)) ;; when including multiple dbs, t values will get reused.
+                              (throw (ex-info (str "Commit t value: " (- t-new)
+                                                   " has a gap from latest commit t value: " (- t) ".")
+                                              {:status 500 :error :db/invalid-commit})))
+         assert             (db-assert db-data)
+         retract            (db-retract db-data)
+         retract-flakes     (<? (retract-flakes db retract t-new iris))
+         {:keys [flakes pid sid]} (<? (assert-flakes db assert t-new iris refs))
+
+         {:keys [previous issuer message defaultContext] :as commit-metadata}
+         (commit-data/json-ld->map commit db)
+
+         [prev-commit _] (some->> previous :address (read-commit conn) <?
+                                  parse-commit)
+         last-sid           (volatile! (jld-ledger/last-commit-sid db))
+         next-sid           (fn [] (vswap! last-sid inc))
+         db-sid             (next-sid)
+         metadata-flakes    (commit-data/commit-metadata-flakes commit-metadata
+                                                                t-new db-sid)
+         previous-id        (when prev-commit (:id prev-commit))
+         prev-commit-flakes (when previous-id
+                              (<? (commit-data/prev-commit-flakes db t-new
+                                                                  previous-id)))
+         prev-data-id       (get-in prev-commit [const/iri-data :id])
+         prev-db-flakes     (when prev-data-id
+                              (<? (commit-data/prev-data-flakes db db-sid t-new
+                                                                prev-data-id)))
+         issuer-flakes      (when-let [issuer-iri (:id issuer)]
+                              (<? (commit-data/issuer-flakes db t-new next-sid
+                                                             issuer-iri)))
+         message-flakes     (when message
+                              (commit-data/message-flakes t-new message))
+         default-ctx-flakes (when defaultContext
+                              (<? (commit-data/default-ctx-flakes
+                                   db t-new next-sid defaultContext)))
+         all-flakes         (-> db
+                                (get-in [:novelty :spot])
+                                empty
+                                (into metadata-flakes)
+                                (into retract-flakes)
+                                (into flakes)
+                                (cond->
+                                 prev-commit-flakes
+                                 (into prev-commit-flakes)
+                                 prev-db-flakes
+                                 (into prev-db-flakes)
+                                 issuer-flakes
+                                 (into issuer-flakes)
+                                 message-flakes
+                                 (into message-flakes)
+                                 default-ctx-flakes
+                                 (into default-ctx-flakes)
+                                 (= -1 t-new)
+                                 (into commit-data/commit-schema-flakes)))
+         ecount*            (assoc ecount const/$_predicate pid
+                                          const/$_default sid)]
+     (when (empty? all-flakes)
+       (commit-error "Commit has neither assertions or retractions!"
+                     commit-metadata))
+     (merge-flakes (assoc db :ecount ecount*) t-new @refs all-flakes))))
 
 ;; TODO - validate commit signatures
 (defn validate-commit

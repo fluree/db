@@ -26,6 +26,7 @@
 (def ^:const iri-ledger "https://ns.flur.ee/ledger#ledger")
 (def ^:const iri-branch "https://ns.flur.ee/ledger#branch")
 (def ^:const iri-issuer "https://www.w3.org/2018/credentials#issuer")
+(def ^:const iri-cred-subj "https://www.w3.org/2018/credentials#credentialSubject")
 (def ^:const iri-index "https://ns.flur.ee/ledger#index")
 (def ^:const iri-ns "https://ns.flur.ee/ledger#ns")
 (def ^:const iri-time "https://ns.flur.ee/ledger#time")

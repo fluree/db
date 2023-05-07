@@ -214,17 +214,15 @@
 (defn load
   [conn db-alias]
   (go-try
-    (let [base-context {:base db-alias}
-          commit-addr  (<? (conn-proto/-lookup conn db-alias))
+    (let [commit-addr  (<? (conn-proto/-lookup conn db-alias))
           _            (when-not commit-addr
                          (throw (ex-info (str "Unable to load. No commit exists for: " db-alias)
                                          {:status 400 :error :db/invalid-commit-address})))
-          commit-data  (<? (conn-proto/-c-read conn commit-addr))
+          commit-data  (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit-data
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))
-          commit-data* (json-ld/expand commit-data base-context)
-          [commit proof] (jld-reify/parse-commit commit-data*)
+          [commit proof] (jld-reify/parse-commit commit-data)
           _            (when proof
                          (jld-reify/validate-commit db commit proof))
           _            (log/debug "load commit:" commit)

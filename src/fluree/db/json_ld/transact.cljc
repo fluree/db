@@ -1,31 +1,48 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.db.json-ld.commit-data :as commit-data]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.json-ld :as json-ld]
+  (:refer-clojure :exclude [vswap!])
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
-            [fluree.db.flake :as flake]
-            [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.json-ld.reify :as jld-reify]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util :refer [vswap!]]
-            [fluree.db.json-ld.branch :as branch]
-            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.json-ld.policy :as perm]
+            [fluree.db.json-ld.reify :as jld-reify]
             [fluree.db.json-ld.shacl :as shacl]
-            [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.where :as where]
-            [clojure.core.async :as async :refer [go]]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.json-ld.policy :as perm]
-            [fluree.db.util.log :as log])
-  (:refer-clojure :exclude [vswap!]))
+            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [vswap!]]
+            [fluree.db.util.log :as log]
+            [fluree.db.util.validation :as v]
+            [fluree.json-ld :as json-ld]
+            [malli.core :as m]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(def registry
+  (merge
+   (m/base-schemas)
+   (m/type-schemas)
+   v/registry
+   {::txn-leaf-map [:map-of
+                    [:orn [:string :string] [:keyword :keyword]]
+                    :any]
+    ::txn-map      [:orn
+                    [:assert ::txn-leaf-map]
+                    [:retract [:map :retract ::txn-leaf-map]]]
+    ::txn          [:orn
+                    [:single-map ::txn-map]
+                    [:sequence-of-maps [:sequential ::txn-map]]]}))
 
 (declare json-ld-node->flakes)
 
