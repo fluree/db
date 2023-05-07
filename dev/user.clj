@@ -6,7 +6,6 @@
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.flake :as flake]
-            [fluree.db.dbfunctions.fns :as dbfunctions]
             [fluree.db.constants :as constants]
             [fluree.db.util.json :as json]
             [fluree.db.serde.json :as serdejson]
@@ -20,14 +19,6 @@
             [criterium.core :refer [bench]]
             ;; cljs
             [figwheel-sidecar.repl-api :as ra]))
-
-
-;; async/query todo
-;; fluree.db.query.fql/query
-;; dbproto/-query
-;; api/query
-;; fluree.db.dbfunctions.internal/query
-
 
 ;; make sure all of following response are async
 ;; http-api/db-handler* (transator)
