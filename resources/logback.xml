@@ -1,6 +1,6 @@
 <configuration scan="true">
   <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
-    <encoder><pattern>%-5level %logger{24} - %message</pattern></encoder>
+    <encoder><pattern>%-5level %logger{24} - %message%n</pattern></encoder>
   </appender>
 
   <root level="INFO">
