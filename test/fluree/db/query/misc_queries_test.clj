@@ -2,7 +2,9 @@
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.dbproto :as db-proto]))
 
 (deftest ^:integration select-sid
   (testing "Select index's subject id in query using special keyword"
@@ -34,28 +36,87 @@
 (deftest ^:integration result-formatting
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query-context" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-        db     @(test-utils/transact ledger [{:id   :ex/dan
-                                              :ex/x 1}])]
-    (is (= [{:id    :foo/dan
-             :foo/x 1}]
-           @(fluree/query db {"@context" ["" {:foo "http://example.org/ns/"}]
-                              :where     [['?s :id :foo/dan]]
-                              :select    {'?s [:*]}}))
-        "default unwrapped objects")
-    (is (= [{:id    :foo/dan
-             :foo/x [1]}]
-           @(fluree/query db {"@context" ["" {:foo   "http://example.org/ns/"
-                                              :foo/x {:container :set}}]
-                              :where     [['?s :id :foo/dan]]
-                              :select    {'?s [:*]}}))
-        "override unwrapping with :set")
-    (is (= [{:id     :ex/dan
-             "foo:x" [1]}]
-           @(fluree/query db {"@context" ["" {"foo"   "http://example.org/ns/"
-                                              "foo:x" {"@container" "@list"}}]
-                              :where     [['?s "@id" "foo:dan"]]
-                              :select    {'?s ["*"]}}))
-        "override unwrapping with @list")))
+        db     @(fluree/stage (fluree/db ledger) [{:id :ex/dan :ex/x 1}
+                                                  {:id :ex/wes :ex/x 2}])]
+
+    @(fluree/commit! ledger db)
+
+    (testing "current query"
+      (is (= [{:id   :ex/dan
+               :ex/x 1}]
+             @(fluree/query db {:where  [["?s" :id :ex/dan]]
+                                :select {"?s" [:*]}}))
+          "default context")
+      (is (= [{:id    :foo/dan
+               :foo/x 1}]
+             @(fluree/query db {"@context" ["" {:foo "http://example.org/ns/"}]
+                                :where     [["?s" :id :foo/dan]]
+                                :select    {"?s" [:*]}}))
+          "default unwrapped objects")
+      (is (= [{:id    :foo/dan
+               :foo/x [1]}]
+             @(fluree/query db {"@context" ["" {:foo   "http://example.org/ns/"
+                                                :foo/x {:container :set}}]
+                                :where     [["?s" :id :foo/dan]]
+                                :select    {"?s" [:*]}}))
+          "override unwrapping with :set")
+      (is (= [{:id     :ex/dan
+               "foo:x" [1]}]
+             @(fluree/query db {"@context" ["" {"foo"   "http://example.org/ns/"
+                                                "foo:x" {"@container" "@list"}}]
+                                :where     [["?s" "@id" "foo:dan"]]
+                                :select    {"?s" ["*"]}}))
+          "override unwrapping with @list")
+      (is (= [{"@id"                     "http://example.org/ns/dan"
+               "http://example.org/ns/x" 1}]
+             @(fluree/query db {"@context" nil
+                                :where     [["?s" "@id" "http://example.org/ns/dan"]]
+                                :select    {"?s" ["*"]}}))
+          "clear context with nil")
+      (is (= [{"@id"                     "http://example.org/ns/dan"
+               "http://example.org/ns/x" 1}]
+             @(fluree/query db {"@context" {}
+                                :where     [["?s" "@id" "http://example.org/ns/dan"]]
+                                :select    {"?s" ["*"]}}))
+          "clear context with empty context")
+      (is (= [{"@id" "http://example.org/ns/dan"
+               "http://example.org/ns/x" 1}]
+             @(fluree/query db {"@context" []
+                                :where [["?s" "@id" "http://example.org/ns/dan"]]
+                                :select {"?s" ["*"]}}))
+          "clear context with empty context vector"))
+    (testing "history query"
+      (is (= [{:f/t       1
+               :f/assert  [{:id :ex/dan :ex/x 1}]
+               :f/retract []}]
+             @(fluree/history ledger {:history :ex/dan :t {:from 1}}))
+          "default context")
+      (is (= [{"https://ns.flur.ee/ledger#t"       1
+               "https://ns.flur.ee/ledger#assert"
+               [{"@id"                     "http://example.org/ns/dan"
+                 :id                       "http://example.org/ns/dan"
+                 "http://example.org/ns/x" 1}]
+               "https://ns.flur.ee/ledger#retract" []}]
+             @(fluree/history ledger {"@context" nil
+                                      :history   "http://example.org/ns/dan"
+                                      :t         {:from 1}}))
+          "clear context on history query"))
+    (testing "multi-query"
+      (is (= {:dan [{:id :ex/dan, :ex/x 1}],
+              :wes [{:id :ex/wes, :ex/x 2}]}
+             @(fluree/multi-query db {:dan {:where [["?s" :id :ex/dan]]
+                                            :select {"?s" [:*]}}
+                                      :wes {:where [["?s" :id :ex/wes]]
+                                            :select {"?s" [:*]}}}))
+          "default context")
+      (is (= {:dan [{"@id" "http://example.org/ns/dan", "http://example.org/ns/x" 1}],
+              :wes [{:id :ex/wes, :ex/x 2}]}
+             @(fluree/multi-query db {:dan {:context nil
+                                            :where [["?s" "@id" "http://example.org/ns/dan"]]
+                                            :select {"?s" [:*]}}
+                                      :wes {:where [["?s" :id :ex/wes]]
+                                            :select {"?s" [:*]}}}))
+          "clear context on multi-query"))))
 
 (deftest ^:integration s+p+o-full-db-queries
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
