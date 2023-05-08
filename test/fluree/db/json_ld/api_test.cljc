@@ -640,4 +640,28 @@
                                                             {:rdf/type [:_id]}
                                                             {:f/allow [:* {:f/targetRole [:_id]}]}
                                                             {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                                               :where  [[?s :rdf/type :f/Policy]]})))))))))
+                                               :where  [[?s :rdf/type :f/Policy]]})))))))
+     (testing "loading predefined properties"
+       (let [conn (test-utils/create-conn {:context test-utils/default-str-context
+                                           :context-type :string})
+             ledger @(fluree/create conn "predefined-props" {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+             db1 @(test-utils/transact ledger {"@id" "ex:UserShape",
+                                               "@type" ["sh:NodeShape"],
+                                               "sh:targetClass" {"@id" "ex:User"},
+                                               "sh:property" [{"sh:path" {"@id" "schema:name"},
+                                                               "sh:datatype" {"@id" "xsd:string"}}]})
+
+             ledger2 @(fluree/load conn "predefined-props")
+             db2 (fluree/db ledger2)]
+         (is (= [{"id" "ex:UserShape",
+                  "rdf:type" ["sh:NodeShape"],
+                  "sh:targetClass" {"id" "ex:User"},
+                  "sh:property" {"id" "_:f211106232532993"}}]
+                @(fluree/query db1 {:select {"?s" ["*"]},
+                                    :where [["?s", "sh:targetClass", "?property"]]})))
+         (is (= [{"id" "ex:UserShape",
+                  "rdf:type" ["sh:NodeShape"],
+                  "sh:targetClass" {"id" "ex:User"},
+                  "sh:property" {"id" "_:f211106232532993"}}]
+                @(fluree/query db2 {:select {"?s" ["*"]},
+                                    :where [["?s", "sh:targetClass", "?property"]]})))))))
