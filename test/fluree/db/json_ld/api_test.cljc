@@ -101,11 +101,12 @@
                               db
                               {:id         :ex/brian
                                :ex/favNums 7})
-               _            @(fluree/commit! ledger db)
+               db           @(fluree/commit! ledger db)
+               target-t     (:t db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               loaded       (test-utils/retry-load conn ledger-alias 100)
+               loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
                loaded-db    (fluree/db loaded)]
-           (is (= (:t db) (:t loaded-db)))
+           (is (= target-t (:t loaded-db)))
            (is (= (:context ledger) (:context loaded))))))
 
      (testing "can load a file ledger with multi-cardinality predicates"
@@ -146,11 +147,12 @@
                               ;; test a multi-cardinality retraction
                               [{:id         :ex/alice
                                 :ex/favNums [42 76 9]}])
-               _            @(fluree/commit! ledger db)
+               db           @(fluree/commit! ledger db)
+               target-t     (:t db)
                ;; TODO: Replace this w/ :syncTo equivalent once we have it
-               loaded       (test-utils/retry-load conn ledger-alias 100)
+               loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
                loaded-db    (fluree/db loaded)]
-           (is (= (:t db) (:t loaded-db)))
+           (is (= target-t (:t loaded-db)))
            (is (= (dbproto/-default-context db) (dbproto/-default-context loaded-db))))))
 
      (testing "can load a file ledger with its own context"
@@ -180,14 +182,17 @@
                                                    :schema/name  "Jake"
                                                    :schema/email "jake@example.org"}}])
                db             @(fluree/commit! ledger db)
-               loaded         (test-utils/retry-load conn ledger-alias 100)
+               target-t       (:t db)
+               loaded         (test-utils/load-to-t conn ledger-alias target-t
+                                                    100)
                loaded-db      (fluree/db loaded)
-               merged-ctx     (merge (ctx-util/stringify-context conn-context) (ctx-util/stringify-context ledger-context))
+               merged-ctx     (merge (ctx-util/stringify-context conn-context)
+                                     (ctx-util/stringify-context ledger-context))
                query          {:where  '[[?p :schema/email "wes@example.org"]]
                                :select '{?p [:*]}}
                results        @(fluree/query loaded-db query)
                full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
-           (is (= (:t db) (:t loaded-db)))
+           (is (= target-t (:t loaded-db)))
            (is (= merged-ctx (dbproto/-default-context loaded-db)))
            (is (= [{full-type-url   [:ex/User]
                     :id             :ex/wes
@@ -255,6 +260,7 @@
                                                    :schema/name  "Jake"
                                                    :schema/email "jake@example.org"}}])
                db             @(fluree/commit! ledger db)
+               target-t       (:t db)
                conn2-context  {:id  "@id", :type "@type"
                                :xsd "http://www.w3.org/2001/XMLSchema#"
                                :foo "http://foobar.com/"
@@ -263,10 +269,12 @@
                                 {:method   :file, :storage-path storage-path
                                  :defaults {:context      conn2-context
                                             :context-type :keyword}})
-               loaded         (test-utils/retry-load conn2 ledger-alias 100)
+               loaded         (test-utils/load-to-t conn2 ledger-alias target-t
+                                                    100)
                loaded-db      (fluree/db loaded)
-               merged-ctx     (merge (ctx-util/stringify-context conn1-context) (ctx-util/stringify-context ledger-context))]
-           (is (= (:t db) (:t loaded-db)))
+               merged-ctx     (merge (ctx-util/stringify-context conn1-context)
+                                     (ctx-util/stringify-context ledger-context))]
+           (is (= target-t (:t loaded-db)))
            (is (= merged-ctx (dbproto/-default-context loaded-db))))))
 
      (testing "can load a ledger with `list` values"
@@ -291,9 +299,10 @@
                                {:id   :ex/john,
                                 :type :ex/User}])
                db           @(fluree/commit! ledger db)
-               loaded       (test-utils/retry-load conn ledger-alias 100)
+               target-t     (:t db)
+               loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
                loaded-db    (fluree/db loaded)]
-           (is (= (:t db) (:t loaded-db)))
+           (is (= target-t (:t loaded-db)))
            (testing "query returns expected `list` values"
              (is (= [{:id         :ex/cam,
                       :rdf/type   [:ex/User],
@@ -335,18 +344,24 @@
                                 [{:id            :ex/UserPolicy,
                                   :type          [:f/Policy],
                                   :f/targetClass :ex/User
-                                  :f/allow       [{:id           :ex/globalViewAllow
-                                                   :f/targetRole :ex/userRole
-                                                   :f/action     [:f/view]}]
-                                  :f/property    [{:f/path  :schema/ssn
-                                                   :f/allow [{:id           :ex/ssnViewRule
-                                                              :f/targetRole :ex/userRole
-                                                              :f/action     [:f/view]
-                                                              :f/equals     {:list [:f/$identity :ex/user]}}]}]}])
+                                  :f/allow
+                                  [{:id           :ex/globalViewAllow
+                                    :f/targetRole :ex/userRole
+                                    :f/action     [:f/view]}]
+                                  :f/property
+                                  [{:f/path  :schema/ssn
+                                    :f/allow
+                                    [{:id           :ex/ssnViewRule
+                                      :f/targetRole :ex/userRole
+                                      :f/action     [:f/view]
+                                      :f/equals
+                                      {:list [:f/$identity :ex/user]}}]}]}])
                  db+policy    @(fluree/commit! ledger db+policy)
-                 loaded       (test-utils/retry-load conn ledger-alias 100)
+                 target-t     (:t db+policy)
+                 loaded       (test-utils/load-to-t conn ledger-alias target-t
+                                                    100)
                  loaded-db    (fluree/db loaded)]
-             (is (= (:t db) (:t loaded-db)))
+             (is (= target-t (:t loaded-db)))
              (testing "query returns expected policy"
                (is (= [{:id            :ex/UserPolicy,
                         :rdf/type      [:f/Policy],
@@ -355,7 +370,7 @@
                          :f/action     {:id :f/view},
                          :f/targetRole {:_id 211106232532995}},
                         :f/property
-                        {:id     "_:f211106232532999",
+                        {:id "_:f211106232532999",
                          :f/allow
                          {:id           :ex/ssnViewRule,
                           :f/action     {:id :f/view},
@@ -363,11 +378,15 @@
                           :f/equals     [{:id :f/$identity} {:id :ex/user}]},
                          :f/path {:id :schema/ssn}},
                         :f/targetClass {:id :ex/User}}]
-                      @(fluree/query loaded-db '{:select {?s [:*
-                                                              {:rdf/type [:_id]}
-                                                              {:f/allow [:* {:f/targetRole [:_id]}]}
-                                                              {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                                                 :where  [[?s :rdf/type :f/Policy]]}))))))))))
+                      @(fluree/query loaded-db
+                                     '{:select
+                                       {?s [:*
+                                            {:rdf/type [:_id]}
+                                            {:f/allow [:* {:f/targetRole [:_id]}]}
+                                            {:f/property
+                                             [:* {:f/allow
+                                                  [:* {:f/targetRole [:_id]}]}]}]}
+                                       :where  [[?s :rdf/type :f/Policy]]}))))))))))
 
 #?(:clj
    (deftest load-from-memory-test
@@ -400,11 +419,12 @@
                             db
                             {:id         :ex/brian
                              :ex/favNums 7})
-             _            @(fluree/commit! ledger db)
+             db            @(fluree/commit! ledger db)
+             target-t      (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
-             loaded       (test-utils/retry-load conn ledger-alias 100)
+             loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
              loaded-db    (fluree/db loaded)]
-         (is (= (:t db) (:t loaded-db)))
+         (is (= target-t (:t loaded-db)))
          (is (= (:context ledger) (:context loaded)))))
 
      (testing "can load a memory ledger with multi-cardinality predicates"
@@ -444,11 +464,12 @@
                             ;; test a multi-cardinality retraction
                             [{:id         :ex/alice
                               :ex/favNums [42 76 9]}])
-             _            @(fluree/commit! ledger db)
+             db            @(fluree/commit! ledger db)
+             target-t      (:t db)
              ;; TODO: Replace this w/ :syncTo equivalent once we have it
-             loaded       (test-utils/retry-load conn ledger-alias 100)
+             loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
              loaded-db    (fluree/db loaded)]
-         (is (= (:t db) (:t loaded-db)))
+         (is (= target-t (:t loaded-db)))
          (is (= (dbproto/-default-context db) (dbproto/-default-context loaded-db)))))
 
      (testing "can load a memory ledger with its own context"
@@ -476,14 +497,15 @@
                                                  :schema/name  "Jake"
                                                  :schema/email "jake@example.org"}}])
              db             @(fluree/commit! ledger db)
-             loaded         (test-utils/retry-load conn ledger-alias 100)
+             target-t       (:t db)
+             loaded         (test-utils/load-to-t conn ledger-alias target-t 100)
              loaded-db      (fluree/db loaded)
              merged-ctx     (merge (ctx-util/stringify-context conn-context) (ctx-util/stringify-context ledger-context))
              query          {:where  '[[?p :schema/email "wes@example.org"]]
                              :select '{?p [:*]}}
              results        @(fluree/query loaded-db query)
              full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
-         (is (= (:t db) (:t loaded-db)))
+         (is (= target-t (:t loaded-db)))
          (is (= merged-ctx (dbproto/-default-context loaded-db)))
          (is (= [{full-type-url   [:ex/User]
                   :id             :ex/wes
@@ -542,9 +564,10 @@
                              {:id   :ex/john,
                               :type :ex/User}])
              db           @(fluree/commit! ledger db)
-             loaded       (test-utils/retry-load conn ledger-alias 100)
+             target-t     (:t db)
+             loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
              loaded-db    (fluree/db loaded)]
-         (is (= (:t db) (:t loaded-db)))
+         (is (= target-t (:t loaded-db)))
          (testing "query returns expected `list` values"
            (is (= [{:id         :ex/cam,
                     :rdf/type   [:ex/User],
@@ -593,9 +616,10 @@
                                                             :f/action     [:f/view]
                                                             :f/equals     {:list [:f/$identity :ex/user]}}]}]}])
                db+policy    @(fluree/commit! ledger db+policy)
-               loaded       (test-utils/retry-load conn ledger-alias 100)
+               target-t     (:t db+policy)
+               loaded       (test-utils/load-to-t conn ledger-alias target-t 100)
                loaded-db    (fluree/db loaded)]
-           (is (= (:t db) (:t loaded-db)))
+           (is (= target-t (:t loaded-db)))
            (testing "query returns expected policy"
              (is (= [{:id            :ex/UserPolicy,
                       :rdf/type      [:f/Policy],
