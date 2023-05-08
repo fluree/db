@@ -207,9 +207,9 @@
       (loop [[type-item & r] type
              acc []]
         (if type-item
-          (let [existing-id (or (<? (get-iri-sid type-item db iris))
-                                (get jld-ledger/predefined-properties type-item))
+          (let [existing-id (<? (get-iri-sid type-item db iris))
                 type-id     (or existing-id
+                                (get jld-ledger/predefined-properties type-item)
                                 (jld-ledger/generate-new-pid type-item iris
                                                              next-pid nil nil))
                 type-flakes (when-not existing-id
