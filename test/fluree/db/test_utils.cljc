@@ -17,6 +17,18 @@
    :wiki   "https://www.wikidata.org/wiki/"
    :f      "https://ns.flur.ee/ledger#"})
 
+(def default-str-context
+  {"id" "@id"
+   "type" "@type"
+   "xsd" "http://www.w3.org/2001/XMLSchema#"
+   "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+   "sh" "http://www.w3.org/ns/shacl#"
+   "schema" "http://schema.org/"
+   "skos" "http://www.w3.org/2008/05/skos#"
+   "wiki" "https://www.wikidata.org/wiki/"
+   "f" "https://ns.flur.ee/ledger#"})
+
 (def default-private-key
   "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")
 
