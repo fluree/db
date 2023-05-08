@@ -2,7 +2,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [cognitect.aws.client.api :as aws]
-            [clojure.core.async :as async :refer [go <!]]
+            [clojure.core.async :as async :refer [go go-loop <! >!]]
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.proto :as conn-proto]
@@ -54,24 +54,40 @@
       (cond-> resp
               body-str (assoc :Body body-str)))))
 
-(defn s3-list
-  ([conn path] (s3-list conn path nil))
+(defn s3-list*
+  ([conn path] (s3-list* conn path nil))
   ([{:keys [s3-client s3-bucket s3-prefix]} path continuation-token]
-   (let [ch       (async/promise-chan (map handle-s3-response))
-         base-req {:op      :ListObjectsV2
-                   :ch      ch
-                   :request {:Bucket s3-bucket}}
+   (let [ch        (async/promise-chan (map handle-s3-response))
+         base-req  {:op      :ListObjectsV2
+                    :ch      ch
+                    :request {:Bucket s3-bucket}}
          full-path (if (empty? s3-prefix)
                      path
                      (str s3-prefix "/" path))
-         req      (cond-> base-req
-                          (not= full-path "/") (assoc-in [:request :Prefix]
-                                                         full-path)
-                          continuation-token (assoc-in
-                                              [:request :ContinuationToken]
-                                              continuation-token))]
+         req       (cond-> base-req
+                           (not= full-path "/") (assoc-in [:request :Prefix]
+                                                          full-path)
+                           continuation-token (assoc-in
+                                               [:request :ContinuationToken]
+                                               continuation-token))]
+     (log/debug "s3-list* req:" req)
      (aws/invoke-async s3-client req)
      ch)))
+
+(defn s3-list
+  "Returns a core.async channel that will contain one or more result batches of
+  1000 or fewer object names. You should continue to take from the channel until
+  it closes (i.e. returns nil)."
+  [conn path]
+  (let [ch (async/chan 1)]
+    (go-loop [results (<! (s3-list* conn path))]
+      (>! ch results)
+      (let [truncated?         (:IsTruncated results)
+            continuation-token (:NextContinuationToken results)]
+        (if truncated?
+          (recur (<! (s3-list* conn path continuation-token)))
+          (async/close! ch))))
+    ch))
 
 (defn s3-key-exists?
   [conn key]
@@ -102,19 +118,19 @@
 (defn write-data
   [conn ledger data-type data]
   (go
-    (let [alias      (ledger-proto/-alias ledger)
-          branch     (-> ledger ledger-proto/-branch :name name)
-          json       (if (string? data)
-                       data
-                       (json-ld/normalize-data data))
-          bytes      (.getBytes ^String json)
-          hash       (crypto/sha2-256 bytes :hex)
-          type-dir   (name data-type)
-          path       (str alias
-                          (when branch (str "/" branch))
-                          (str "/" type-dir "/")
-                          hash ".json")
-          result     (<! (write-s3-data conn path bytes))]
+    (let [alias    (ledger-proto/-alias ledger)
+          branch   (-> ledger ledger-proto/-branch :name name)
+          json     (if (string? data)
+                     data
+                     (json-ld/normalize-data data))
+          bytes    (.getBytes ^String json)
+          hash     (crypto/sha2-256 bytes :hex)
+          type-dir (name data-type)
+          path     (str alias
+                        (when branch (str "/" branch))
+                        (str "/" type-dir "/")
+                        hash ".json")
+          result   (<! (write-s3-data conn path bytes))]
       (if (instance? Throwable result)
         result
         {:name    hash
@@ -196,8 +212,8 @@
   (-id [_] id)
   (-default-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]
-   (let [indexer-fn (:indexer ledger-defaults)]
-     (indexer-fn opts)))
+    (let [indexer-fn (:indexer ledger-defaults)]
+      (indexer-fn opts)))
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ _] (throw (ex-info "Unsupported S3Connection op: msg-in" {})))
   (-msg-out [_ _] (throw (ex-info "Unsupported S3Connection op: msg-out" {})))
@@ -206,20 +222,20 @@
 
   index/Resolver
   (resolve [conn {:keys [id leaf tempid] :as node}]
-   (let [cache-key [::resolve id tempid]]
-     (if (= :empty id)
-       (storage/resolve-empty-leaf node)
-       (conn-cache/lru-lookup lru-cache-atom cache-key
-                              (fn [_]
-                                (storage/resolve-index-node
-                                 conn node
-                                 (fn [] (conn-cache/lru-evict lru-cache-atom
-                                                              cache-key))))))))
+    (let [cache-key [::resolve id tempid]]
+      (if (= :empty id)
+        (storage/resolve-empty-leaf node)
+        (conn-cache/lru-lookup lru-cache-atom cache-key
+                               (fn [_]
+                                 (storage/resolve-index-node
+                                  conn node
+                                  (fn [] (conn-cache/lru-evict lru-cache-atom
+                                                               cache-key))))))))
 
   full-text/IndexConnection
   (open-storage [_conn _network _dbid _lang]
-   (throw (ex-info "S3 connection does not support full text operations."
-                   {:status 400, :error :db/unsupported-operation}))))
+    (throw (ex-info "S3 connection does not support full text operations."
+                    {:status 400, :error :db/unsupported-operation}))))
 
 (defn ledger-defaults
   [{:keys [context context-type did indexer]}]
