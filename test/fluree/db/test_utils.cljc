@@ -83,11 +83,12 @@
 (defn create-conn
   ([]
    (create-conn {}))
-  ([{:keys [context did]
+  ([{:keys [context did context-type]
      :or   {context default-context
+            context-type :keyword
             did     (did/private->did-map default-private-key)}}]
    (let [conn-p (fluree/connect-memory {:defaults {:context      context
-                                                   :context-type :keyword
+                                                   :context-type context-type
                                                    :did          did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
