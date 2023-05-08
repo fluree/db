@@ -10,7 +10,8 @@
             [fluree.db.util.core :as util]
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
                       :as twf]
-               :cljs [test-with-files.tools :as-alias twf])))
+               :cljs [test-with-files.tools :as-alias twf])
+            [clojure.set :as set]))
 
 (deftest exists?-test
   (testing "returns false before committing data to a ledger"
@@ -367,7 +368,50 @@
                                                               {:rdf/type [:_id]}
                                                               {:f/allow [:* {:f/targetRole [:_id]}]}
                                                               {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                                                 :where  [[?s :rdf/type :f/Policy]]}))))))))))
+                                                 :where  [[?s :rdf/type :f/Policy]]}))))))))
+
+     (testing "can load a ledger with predefined properties"
+       (let [context {"ex" "http://example.com/ns/"
+                      "id" "@id"
+                      "type" "@type"
+                      "xsd" "http://www.w3.org/2001/XMLSchema#"
+                      "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+                      "rdfs" "http://www.w3.org/2000/01/rdf-schema#"
+                      "sh" "http://www.w3.org/ns/shacl#"
+                      "schema" "http://schema.org/"
+                      "skos" "http://www.w3.org/2008/05/skos#"
+                      "wiki" "https://www.wikidata.org/wiki/"
+                      "f" "https://ns.flur.ee/ledger#"}
+             conn   @(fluree/connect {:method :memory})
+             ledger @(fluree/create conn "shape-type-null")
+             db1    @(test-utils/transact ledger {"@context" context
+                                                  "@type"          "sh:NodeShape",
+                                                  "sh:targetClass" {"id" "schema:Person"},
+                                                  "sh:property"
+                                                  [{"sh:path"     {"id" "schema:familyName"},
+                                                    "sh:datatype" {"id" "xsd:string"}}]})
+             q1     @(fluree/query db1 {"@context" context
+                                        :select {"?s" ["*"]}, :where [["?s" "sh:property" "?property"]]})
+             loaded @(fluree/load conn "shape-type-null")
+             db2    (fluree/db loaded)
+             q2     @(fluree/query db2 {"@context" context
+                                        :select {"?s" ["*"]}, :where [["?s" "sh:property" "?property"]]})]
+         #_(is (= #{}
+                (->> (set/difference (-> db1 :novelty :spot)
+                                     (-> db2 :novelty :spot))
+                     (map vec)
+                     (into #{})))
+             "same flakes before and after load")
+         (is (= [{"id" "_:f211106232532992",
+                  "rdf:type" ["sh:NodeShape"],
+                  "sh:targetClass" {"id" "schema:Person"},
+                  "sh:property" {"id" "_:f211106232532993"}}]
+                q1))
+         (is (= [{"id" "_:f211106232532992",
+                  "rdf:type" ["sh:NodeShape"],
+                  "sh:targetClass" {"id" "schema:Person"},
+                  "sh:property" {"id" "_:f211106232532993"}}]
+                q2))))))
 
 #?(:clj
    (deftest load-from-memory-test
