@@ -444,7 +444,6 @@
 
                             o
                             (<? (index-range db :opst = [o p s t] opts)))]
-       (log/debug "search res:" res)
        (if tag-predicate?
          (<? (coerce-tag-flakes db res))
          res)))))
