@@ -27,7 +27,6 @@
     ::context ::v/context
     ::history-query
     [:and
-     [:map-of :keyword :any]
      [:map
       [:history {:optional true}
        [:orn
