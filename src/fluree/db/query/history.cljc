@@ -13,7 +13,9 @@
    [fluree.db.util.log :as log]
    [fluree.db.query.range :as query-range]
    [fluree.db.db.json-ld :as jld-db]
-   [fluree.db.util.validation :as v]))
+   [fluree.db.util.validation :as v]
+   [malli.error :as me]
+   [malli.transform :as mt]))
 
 (def registry
   (merge
@@ -23,11 +25,12 @@
    (m/comparator-schemas)
    (m/sequence-schemas)
    v/registry
-   {::iri     ::v/iri
-    ::context ::v/context
+   {::iri             ::v/iri
+    ::json-ld-keyword ::v/json-ld-keyword
+    ::context         ::v/context
     ::history-query
     [:and
-     [:map-of :keyword :any]
+     [:map-of ::json-ld-keyword :any]
      [:map
       [:history {:optional true}
        [:orn
@@ -76,20 +79,13 @@
       (fn [{:keys [history commit-details t]}]
         (or history commit-details))]]}))
 
-
-(def history-query-validator
-  (m/validator ::history-query {:registry registry}))
-
-(def history-query-parser
-  (m/parser ::history-query {:registry registry}))
-
-(defn history-query?
+(def coerce-history-query
   "Provide a time range :t and either :history or :commit-details, or both.
 
   :history - either a subject iri or a vector in the pattern [s p o] with either the
   s or the p is required. If the o is supplied it must not be nil.
 
-  :context - json-ld context to use in expanding the :history iris.
+  :context or \"@context\" - json-ld context to use in expanding the :history iris.
 
   :commit-details - if true, each result will have a :commit key with the commit map as a value.
 
@@ -100,10 +96,19 @@
   accepted values for t maps:
        - positive t-value
        - datetime string
-       - :latest keyword "
-  [query]
-  (history-query-validator query))
+       - :latest keyword"
+  (m/coercer ::history-query (mt/transformer {:name :fql})
+             {:registry registry}))
 
+(def explain-error
+  (m/explainer ::history-query {:registry registry}))
+
+(defn humanize-error
+  [query-validation-error]
+  (-> query-validation-error Throwable->map :data :data :explain me/humanize))
+
+(def parse-history-query
+  (m/parser ::history-query {:registry registry}))
 
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.

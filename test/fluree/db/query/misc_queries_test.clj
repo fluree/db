@@ -79,11 +79,11 @@
                                 :where     [["?s" "@id" "http://example.org/ns/dan"]]
                                 :select    {"?s" ["*"]}}))
           "clear context with empty context")
-      (is (= [{"@id" "http://example.org/ns/dan"
+      (is (= [{"@id"                     "http://example.org/ns/dan"
                "http://example.org/ns/x" 1}]
              @(fluree/query db {"@context" []
-                                :where [["?s" "@id" "http://example.org/ns/dan"]]
-                                :select {"?s" ["*"]}}))
+                                :where     [["?s" "@id" "http://example.org/ns/dan"]]
+                                :select    {"?s" ["*"]}}))
           "clear context with empty context vector"))
     (testing "history query"
       (is (= [{:f/t       1
