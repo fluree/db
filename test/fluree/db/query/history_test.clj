@@ -167,14 +167,15 @@
           "timestamp translates to first t before ts")
 
       (is (= (str "There is no data as of " ts-primeval)
-             (-> @(fluree/history ledger {:history [:ex/dan :ex/x] :t {:from ts-primeval}})
-                 (Throwable->map)
+             (-> @(fluree/history ledger {:history [:ex/dan :ex/x]
+                                          :t {:from ts-primeval}})
+                 Throwable->map
                  :cause))))
 
     (testing "invalid query"
       (is (= "History query not properly formatted. Provided {:history []}"
              (-> @(fluree/history ledger {:history []})
-                 (Throwable->map)
+                 Throwable->map
                  :cause))))
 
     (testing "small cache"

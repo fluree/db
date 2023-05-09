@@ -66,14 +66,6 @@
       (-> mq (assoc :opts opts) (dissoc "opts")))
     mq))
 
-(defn decode-json-ld-keyword
-  [v]
-  (if (string? v)
-    (if (= \@ (first v))
-      (-> v (subs 1) keyword)
-      (keyword v))
-    v))
-
 (def registry
   (merge
    (m/predicate-schemas)
@@ -209,8 +201,7 @@
                             [:multiple ::multiple-var-binding]]
     ::t                    [:or :int :string]
     ::context              ::v/context
-    ::json-ld-keyword      [:keyword {:decode/json decode-json-ld-keyword
-                                      :decode/fql  decode-json-ld-keyword}]
+    ::json-ld-keyword      ::v/json-ld-keyword
     ::analytical-query     [:and
                             [:map-of ::json-ld-keyword :any]
                             [:map
