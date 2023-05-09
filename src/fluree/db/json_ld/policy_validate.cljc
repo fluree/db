@@ -78,7 +78,7 @@
   All policy functions are evaluated for a truthy or falsey result which determines if the provided flake
   can be operated on/viewed."
   [rule property-path]
-  (if (= :f/$identity (first property-path))
+  (if (= const/iri-$identity (first property-path))
     ;; make certain first element of path is :f/$identity which following fn only considers. Will support other path constructs in the future
     (let [path-no-identity (rest property-path)             ;; remove :f/$identity - following logic will "substitute" the user's actual identity in its place
           f                (fn [db flake]
