@@ -22,9 +22,9 @@
                      :sh/path     {:id :schema/email},
                      :sh/minCount 1,
                      :sh/maxCount 1,
-                     :sh/nodeKind {:id :sh/IRI}}]}
+                     :sh/nodeKind {:id :sh/IRI}}]})
 
-  )
+
 
 
 ;; property min & max
@@ -45,14 +45,14 @@
 
 (defn apply-flake-changes
   [existing-flakes changed-flakes]
-  :TODO
+  :TODO)
 
-  )
+
 
 (defn throw-property-shape-exception!
   [msg]
   (throw (ex-info (str "SHACL PropertyShape exception - " msg ".")
-                      {:status 400 :error :db/shacl-validation})))
+                  {:status 400 :error :db/shacl-validation})))
 
 (def numeric-types
   #{const/$xsd:int
