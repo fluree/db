@@ -664,4 +664,33 @@
                   "sh:targetClass" {"id" "ex:User"},
                   "sh:property" {"id" "_:f211106232532993"}}]
                 @(fluree/query db2 {:select {"?s" ["*"]},
-                                    :where [["?s", "sh:targetClass", "?property"]]})))))))
+                                    :where [["?s", "sh:targetClass", "?property"]]})))))
+     (testing "load id only retracts"
+       (let [conn (test-utils/create-conn {:context test-utils/default-str-context
+                                           :context-type :string})
+             ledger @(fluree/create conn "shacl/a" {:defaultContext ["" {"ex" "http://example.org/ns/"}]})
+
+             db1 @(test-utils/transact ledger
+                                       {"@type" "sh:NodeShape",
+                                        "sh:targetClass" {"@type" "@id" "@value" "schema:Person"},
+                                        "sh:property"
+                                        [{"sh:path" {"@type" "@id" "@value" "schema:familyName"},
+                                          "sh:datatype" {"@type" "@id" "@value" "xsd:string"}}]})
+
+             shape-id (-> @(fluree/query db1 {:select {"?s" ["id"]}, :where [["?s" "sh:property" "?property"]]})
+                          first
+                          (get "id"))
+             loaded1 @(fluree/load conn "shacl/a")
+             db2 @(test-utils/transact loaded1
+                                       {"@id" shape-id
+                                        "sh:property"
+                                        [{"sh:path" {"@type" "@id" "@value" "schema:age"},
+                                          "sh:datatype" {"@type" "@id" "@value" "xsd:string"}}]})
+
+             loaded2 @(fluree/load conn "shacl/a")]
+         (is (= [{"id" shape-id
+                  "rdf:type" ["sh:NodeShape"],
+                  "sh:targetClass" {"id" "schema:Person"},
+                  "sh:property" {"id" "_:f211106232532994"}}]
+                @(fluree/query (fluree/db loaded2) {:select {"?s" ["*"]},
+                                                    :where [["?s" "sh:property" "?property"]]})))))))

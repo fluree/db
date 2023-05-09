@@ -85,11 +85,22 @@
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
       (log/debug "retract v-map:" v-map)
-      (let [[value dt] (datatype/from-expanded v-map nil)
-            acc** (conj acc* (flake/create sid pid value dt t false nil))]
-        (if (seq r-v-maps)
-          (recur r-v-maps acc**)
-          acc**)))))
+
+      (let [ref-id (:id v-map)]
+        (cond (and ref-id (node? v-map))
+              (let [ref-sid (<? (get-iri-sid ref-id db iri-cache))
+                    ;; wrong! need to retract the reference, not the referent
+                    acc** (conj acc* (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))]
+                (if (seq r-v-maps)
+                  (recur r-v-maps acc**)
+                  acc**))
+
+              :else
+              (let [[value dt] (datatype/from-expanded v-map nil)
+                    acc** (conj acc* (flake/create sid pid value dt t false nil))]
+                (if (seq r-v-maps)
+                  (recur r-v-maps acc**)
+                  acc**)))))))
 
 (defn- retract-node*
   [{:keys [db type-retractions iri-cache] :as retract-state} node]
