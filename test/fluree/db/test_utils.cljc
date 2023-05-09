@@ -122,11 +122,11 @@
   [pwrapped max-attempts & [retry-on-false?]]
   (#?(:clj loop :cljs go-loop) [attempt 0]
     (let [res' (try*
-                 (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
-                   (if (util/exception? res)
-                     (throw res)
-                     res))
-                 (catch* e e))]
+                (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
+                  (if (util/exception? res)
+                    (throw res)
+                    res))
+                (catch* e e))]
       (if (= (inc attempt) max-attempts)
         (if (util/exception? res')
           (throw res')
@@ -143,6 +143,18 @@
   once JSON-LD code has an equivalent to :syncTo"
   [conn ledger-alias max-attempts]
   (retry-promise-wrapped #(fluree/load conn ledger-alias) max-attempts))
+
+(defn load-to-t
+  "Retries loading a ledger until it gets a db whose t value is equal to or
+  greater than the given t arg or max-attempts is reached."
+  [conn ledger-alias t max-attempts]
+  (let [attempts-per-batch (/ max-attempts 10)]
+    (loop [attempts-left (- max-attempts attempts-per-batch)]
+      (let [ledger (retry-load conn ledger-alias attempts-per-batch)
+            db-t   (-> ledger fluree/db :t)]
+        (if (and (< db-t t) (pos-int? attempts-left))
+          (recur (- attempts-left attempts-per-batch))
+          ledger)))))
 
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."
