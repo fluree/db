@@ -89,7 +89,6 @@
       (let [ref-id (:id v-map)]
         (cond (and ref-id (node? v-map))
               (let [ref-sid (<? (get-iri-sid ref-id db iri-cache))
-                    ;; wrong! need to retract the reference, not the referent
                     acc** (conj acc* (flake/create sid pid ref-sid const/$xsd:anyURI t false nil))]
                 (if (seq r-v-maps)
                   (recur r-v-maps acc**)
