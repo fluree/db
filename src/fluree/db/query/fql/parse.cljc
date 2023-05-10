@@ -19,11 +19,15 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn get-context
+  [q]
+  (cond (contains? q :context) (:context q)
+        (contains? q "@context") (get q "@context")
+        :else ::dbproto/default-context))
+
 (defn parse-context
   [{:keys [opts] :as q} db]
-  (dbproto/-context db
-                    (or (:context q) (get q "@context"))
-                    (:context-type opts)))
+  (dbproto/-context db (get-context q) (:context-type opts)))
 
 (defn parse-var-name
   "Returns a `x` as a symbol if `x` is a valid '?variable'."

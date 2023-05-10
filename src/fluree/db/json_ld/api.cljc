@@ -3,6 +3,7 @@
             [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
+            #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.platform :as platform]
@@ -66,7 +67,10 @@
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
                 (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)))))
+        :memory (memory-conn/connect opts*)
+        :s3     #?(:clj  (s3-conn/connect opts*)
+                   :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
+                                         {:status 400, :error :db/unsupported-operation})))))))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.

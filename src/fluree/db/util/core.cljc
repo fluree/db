@@ -187,7 +187,7 @@
                           {:status 500 :error :db/unexpected-error}))))
 
 (defn keywordize-keys
-  "Does simple (top-level keys only) keyworize-keys if the key is a string."
+  "Does simple (top-level keys only) keywordize-keys if the key is a string."
   [m]
   (reduce-kv
     (fn [acc k v]

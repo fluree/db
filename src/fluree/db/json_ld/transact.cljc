@@ -238,7 +238,7 @@
      :policy      policy
      :bootstrap?  bootstrap?
      :default-ctx (if context-type
-                    (dbproto/-context db nil context-type)
+                    (dbproto/-context db ::dbproto/default-context context-type)
                     (dbproto/-context db))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
