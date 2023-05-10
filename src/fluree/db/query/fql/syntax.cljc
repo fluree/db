@@ -1,6 +1,5 @@
 (ns fluree.db.query.fql.syntax
-  (:require [fluree.db.constants :as const]
-            [fluree.db.util.core :refer [try* catch* pred-ident?]]
+  (:require [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.validation :as v]
             [malli.core :as m]
             [malli.error :as me]
@@ -8,34 +7,9 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn fn-string?
-  [x]
-  (and (string? x)
-       (re-matches #"^\(.+\)$" x)))
-
-(defn fn-list?
-  [x]
-  (and (list? x)
-       (-> x first symbol?)))
-
-(defn query-fn?
-  [x]
-  (or (fn-string? x) (fn-list? x)))
-
 (defn wildcard?
   [x]
   (#{"*" :* '*} x))
-
-(defn variable?
-  [x]
-  (and (or (string? x) (symbol? x) (keyword? x))
-       (-> x name first (= \?))))
-
-(def value? (complement coll?))
-
-(defn sid?
-  [x]
-  (int? x))
 
 (defn asc?
   [x]
@@ -44,20 +18,6 @@
 (defn desc?
   [x]
   (boolean (#{'desc "desc" :desc} x)))
-
-(defn iri-key?
-  [x]
-  (= const/iri-id x))
-
-(defn where-op [x]
-  (when (map? x)
-    (-> x first key)))
-
-(defn string->keyword
-  [x]
-  (if (string? x)
-    (keyword x)
-    x))
 
 (defn decode-multi-query-opts
   [mq]
@@ -103,17 +63,11 @@
                              [:issuer {:optional true} ::issuer]
                              [:role {:optional true} ::role]
                              [:did {:optional true} ::did]]]
-    ::function             [:orn
-                            [:string [:fn fn-string?]]
-                            [:list [:fn fn-list?]]]
+    ::function             ::v/function
     ::wildcard             [:fn wildcard?]
-    ::var                  [:fn variable?]
-    ::val                  [:fn value?]
+    ::var                  ::v/var
     ::iri                  ::v/iri
-    ::subject              [:orn
-                            [:sid [:fn sid?]]
-                            [:ident [:fn pred-ident?]]
-                            [:iri ::iri]]
+    ::subject              ::v/subject
     ::subselect-map        [:map-of ::iri [:ref ::subselection]]
     ::subselection         [:sequential [:orn
                                          [:wildcard ::wildcard]
@@ -150,55 +104,10 @@
                             [:clause ::var]
                             [:collection [:sequential ::var]]]
     ::group-by             ::groupBy
-    ::where-op             [:enum {:decode {:fql string->keyword}}
-                            :filter :optional :union :bind]
-    ::where-map            [:and
-                            [:map-of {:max 1} ::where-op :any]
-                            [:multi {:dispatch where-op}
-                             [:filter [:map [:filter [:ref ::filter]]]]
-                             [:optional [:map [:optional [:ref ::optional]]]]
-                             [:union [:map [:union [:ref ::union]]]]
-                             [:bind [:map [:bind [:ref ::bind]]]]]]
-    ::iri-key              [:fn iri-key?]
-    ::iri-map              [:map-of {:max 1}
-                            ::iri-key ::iri]
-    ::triple               [:catn
-                            [:subject [:orn
-                                       [:var ::var]
-                                       [:val ::subject]]]
-                            [:predicate [:orn
-                                         [:var ::var]
-                                         [:iri ::iri]]]
-                            [:object [:orn
-                                      [:var ::var]
-                                      [:ident [:fn pred-ident?]]
-                                      [:iri-map ::iri-map]
-                                      [:val :any]]]]
-    ::where-tuple          [:orn
-                            [:triple ::triple]
-                            [:remote [:sequential {:max 4} :any]]]
-    ::where-pattern        [:orn
-                            [:map ::where-map]
-                            [:tuple ::where-tuple]]
-    ::optional             [:orn
-                            [:single ::where-pattern]
-                            [:collection [:sequential ::where-pattern]]]
-    ::filter               [:sequential ::function]
-    ::union                [:sequential [:sequential ::where-pattern]]
-    ::bind                 [:map-of ::var :any]
-    ::where                [:sequential [:orn
-                                         [:where-map ::where-map]
-                                         [:tuple ::where-tuple]]]
-    ::var-collection       [:sequential ::var]
-    ::val-collection       [:sequential ::val]
-    ::single-var-binding   [:tuple ::var ::val-collection]
-    ::value-binding        [:sequential ::val]
-    ::multiple-var-binding [:tuple
-                            ::var-collection
-                            [:sequential ::value-binding]]
-    ::values               [:orn
-                            [:single ::single-var-binding]
-                            [:multiple ::multiple-var-binding]]
+    ::triple               ::v/triple
+    ::filter               ::v/filter
+    ::where                ::v/where
+    ::values               ::v/values
     ::t                    [:or :int :string]
     ::context              ::v/context
     ::json-ld-keyword      ::v/json-ld-keyword
@@ -235,27 +144,7 @@
     ::query                [:orn
                             [:single ::analytical-query]
                             [:multi ::multi-query]]
-    ::delete               [:orn
-                            [:single ::triple]
-                            [:collection [:sequential ::triple]]]
-    ::delete-op            [:and
-                            [:map-of ::json-ld-keyword :any]
-                            [:map
-                             [:context {:optional true} ::context]
-                             [:delete ::delete]
-                             [:where ::where]
-                             [:values {:optional true} ::values]]]
-    ::insert               [:orn
-                            [:single ::triple]
-                            [:collection [:sequential ::triple]]]
-    ::insert-op            [:and
-                            [:map-of ::json-ld-keyword :any]
-                            [:map
-                             [:context {:optional true} ::context]
-                             [:insert ::insert]
-                             [:where ::where]
-                             [:values {:optional true} ::values]]]
-    ::modification         [:or ::delete-op ::insert-op]}))
+    ::modification         ::v/modification-txn}))
 
 (def triple-validator
   (m/validator ::triple {:registry registry}))
