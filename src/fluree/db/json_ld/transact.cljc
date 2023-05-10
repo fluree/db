@@ -23,7 +23,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.util.log :as log]
-            [fluree.db.util.validation :as v]
+            [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]
             [malli.core :as m]))
 
@@ -34,12 +34,18 @@
    (m/base-schemas)
    (m/type-schemas)
    v/registry
-   {::txn-leaf-map [:map-of
+   {::triple       ::v/triple
+    ::txn-leaf-map [:map-of
                     [:orn [:string :string] [:keyword :keyword]]
                     :any]
-    ::txn-map      [:orn
-                    [:assert ::txn-leaf-map]
-                    [:retract [:map :retract ::txn-leaf-map]]]
+    ::retract      [:map [:retract ::txn-leaf-map]]
+    ::modification ::v/modification-txn
+    ::txn-map      [:and
+                    [:map-of :keyword :any]
+                    [:orn
+                     [:retract ::retract]
+                     [:modification ::modification]
+                     [:assert ::txn-leaf-map]]]
     ::txn          [:orn
                     [:single-map ::txn-map]
                     [:sequence-of-maps [:sequential ::txn-map]]]}))

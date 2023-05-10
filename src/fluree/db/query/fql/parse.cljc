@@ -13,6 +13,7 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.validation :as v]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             #?(:cljs [cljs.reader :refer [read-string]])))
@@ -32,7 +33,7 @@
 (defn parse-var-name
   "Returns a `x` as a symbol if `x` is a valid '?variable'."
   [x]
-  (when (syntax/variable? x)
+  (when (v/variable? x)
     (symbol x)))
 
 (defn parse-variable
@@ -187,7 +188,7 @@
 
 (defn parse-sid
   [x]
-  (when (syntax/sid? x)
+  (when (v/sid? x)
     (where/anonymous-value x)))
 
 (defn parse-subject
@@ -217,7 +218,7 @@
 
 (defn parse-iri-predicate
   [x]
-  (when (syntax/iri-key? x)
+  (when (v/iri-key? x)
     (where/->predicate const/$xsd:anyURI)))
 
 (defn iri->pred-id
@@ -283,7 +284,7 @@
            keys
            first
            (json-ld/expand-iri context)
-           syntax/iri-key?)))
+           v/iri-key?)))
 
 (defn parse-iri-map
   [x context]
@@ -356,7 +357,7 @@
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
     (if (and (= const/$rdf:type (::where/val p))
-             (not (syntax/variable? o-pat)))
+             (not (v/variable? o-pat)))
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
       (if (= const/$xsd:anyURI (::where/val p))
@@ -406,8 +407,8 @@
 (defn parse-selector
   [db context depth s]
   (cond
-    (syntax/variable? s) (-> s parse-var-name select/variable-selector)
-    (syntax/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
+    (v/variable? s) (-> s parse-var-name select/variable-selector)
+    (v/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
     (select-map? s) (let [{:keys [variable selection depth spec]}
                           (parse-subselection db context s depth)]
                       (select/subgraph-selector variable selection depth spec))))
