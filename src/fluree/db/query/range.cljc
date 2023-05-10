@@ -230,7 +230,6 @@
    error-ch
    {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
   (let [idx-root (get db idx)
-        idx-cmp  (get-in db [:comparators idx])
         novelty  (get-in db [:novelty idx])]
     (->> (resolve-flake-slices conn idx-root novelty error-ch opts)
          (filter-authorized db start-flake end-flake error-ch)
