@@ -260,7 +260,6 @@
   (-class-ids [this subject] (class-ids this subject))
   (-iri [this subject-id] (iri this subject-id identity))
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
-  (-search [this fparts] (query-range/search this fparts))
   (-query [this query-map] (fql/query this query-map))
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
