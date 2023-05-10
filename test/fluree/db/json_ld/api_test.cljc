@@ -648,10 +648,10 @@
 
              db1 @(test-utils/transact ledger
                                        {"@type" "sh:NodeShape",
-                                        "sh:targetClass" {"@type" "@id" "@value" "schema:Person"},
+                                        "sh:targetClass" {"id" "schema:Person"}
                                         "sh:property"
-                                        [{"sh:path" {"@type" "@id" "@value" "schema:familyName"},
-                                          "sh:datatype" {"@type" "@id" "@value" "xsd:string"}}]})
+                                        [{"sh:path" {"id" "schema:familyName"}
+                                          "sh:datatype" {"id" "xsd:string"}}]})
              property-query {:select {"?s" ["*"]}, :where [["?s" "sh:property" "?property"]]}
              shape-id (-> @(fluree/query db1 property-query)
                           first
@@ -671,8 +671,8 @@
            (let [db2 @(test-utils/transact loaded1
                                            {"@id" shape-id
                                             "sh:property"
-                                            [{"sh:path" {"@type" "@id" "@value" "schema:age"},
-                                              "sh:datatype" {"@type" "@id" "@value" "xsd:string"}}]})
+                                            [{"sh:path" {"id" "schema:age"}
+                                              "sh:datatype" {"id" "xsd:string"}}]})
                  loaded2 @(fluree/load conn "shacl/a")]
              (is (= [{"id" shape-id
                       "rdf:type" ["sh:NodeShape"],
