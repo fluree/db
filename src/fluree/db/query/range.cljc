@@ -190,7 +190,7 @@
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (true? (get-in policy [:f/view :root?]))
+     (if (true? (get-in policy [const/iri-view :root?]))
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)
@@ -444,7 +444,6 @@
 
                             o
                             (<? (index-range db :opst = [o p s t] opts)))]
-       (log/debug "search res:" res)
        (if tag-predicate?
          (<? (coerce-tag-flakes db res))
          res)))))

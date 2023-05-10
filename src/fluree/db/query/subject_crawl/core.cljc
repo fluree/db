@@ -1,5 +1,6 @@
 (ns fluree.db.query.subject-crawl.core
   (:require [clojure.core.async :refer [go <!] :as async]
+            [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try merge-into?]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -86,7 +87,8 @@
                      :filter-map    filter-map
                      :limit         (if order-by util/max-long limit) ;; if ordering, limit performed by finish-fn after sort
                      :offset        (if order-by 0 offset)
-                     :permissioned? (not (get-in db [:policy :f/view :root?]))
+                     :permissioned? (not (get-in db [:policy const/iri-view
+                                                     :root?]))
                      :parallelism   3
                      :f-where       f-where
                      :parse-json?   (:parse-json? opts)

@@ -1,5 +1,6 @@
 (ns fluree.db.policy.enforce-tx
-  (:require [fluree.db.util.async :refer [<? go-try]]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
             [fluree.db.permissions-validate :as validate]))
 
@@ -8,7 +9,7 @@
 (defn root?
   "Returns true if policy has root modify permissions."
   [policy]
-  (= {:root? true} (get policy :f/modify)))
+  (= {:root? true} (get policy const/iri-modify)))
 
 
 (defn- check-property-policies
@@ -57,7 +58,11 @@
             (let [fflake         (first s-flakes)
                   sid            (flake/s fflake)
                   {:keys [classes]} (get subj-mods' sid)
-                  {defaults :default props :property} (validate/group-policies-by-default policy :f/modify classes)
+
+                  {defaults :default props :property}
+                  (validate/group-policies-by-default policy const/iri-modify
+                                                      classes)
+
                   default-allow? (<? (validate/default-allow? db-after fflake defaults))
                   allow?         (if props
                                    (<? (check-property-policies db-after props default-allow? s-flakes))

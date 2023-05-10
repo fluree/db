@@ -172,12 +172,9 @@
   to the value associated with that variable from the `filter` specification
   map."
   [triple-pattern solution filters]
-  (log/debug "assign-matched-values triple-pattern:" triple-pattern)
-  (log/debug "assign-matched-values solution:" solution)
   (mapv (fn [component]
           (if-let [variable (::var component)]
             (let [match (get solution variable)]
-              (log/debug "assign-matched-values variable:" variable)
               (if-let [value (::val match)]
                 (let [dt (::datatype match)]
                   (match-value component value dt))
@@ -186,7 +183,6 @@
                                          (map (fn [f]
                                                 (partial f solution)))
                                          (apply every-pred))]
-                  (log/debug "assign-matched-values filter-fn:" filter-fn)
                   (assoc component ::fn filter-fn))))
             component))
         triple-pattern))
@@ -280,7 +276,6 @@
   [db solution pattern filters error-ch]
   (let [triple   (val pattern)
         [s p o] (assign-matched-values triple solution filters)
-        _        (log/debug "assign-matched-values returned:" s p o)
         cls      (::val o)
         classes  (into [cls] (dbproto/-class-prop db :subclasses cls))
         class-ch (async/to-chan! classes)
@@ -292,7 +287,6 @@
                           match-ch
                           (fn [cls ch]
                             (-> (resolve-flake-range db error-ch [s p (assoc o ::val cls)])
-                                (log/debug->val "match-pattern :class pipeline fn flake range:")
                                 (async/pipe ch)))
                           class-ch)
     match-ch))
@@ -319,7 +313,6 @@
         filters    (::filters clause)
         patterns   (::patterns clause)]
     (reduce (fn [solution-ch pattern]
-              (log/debug "calling with-constraint w/ pattern:" pattern)
               (with-constraint db pattern filters error-ch solution-ch))
             initial-ch patterns)))
 
@@ -381,15 +374,12 @@
 (defmethod match-pattern :bind
   [_db solution pattern _ error-ch]
   (let [bind (val pattern)]
-    (log/debug "match-pattern :bind bind:" bind)
-    (log/debug "match-pattern :bind solution:" solution)
     (go
       (reduce (fn [solution* b]
                 (let [f        (::fn b)
                       var-name (::var b)]
                   (try*
                     (->> (f solution)
-                         (log/debug->>val "bind fn result:")
                          (add-fn-result-to-solution solution* var-name))
                     (catch* e (>! error-ch e)))))
               solution (vals bind)))))
@@ -407,9 +397,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [initial-solution ch]
-                            (log/debug "search calling match-clause w/ where-clause:" where-clause)
                             (-> (match-clause db initial-solution where-clause error-ch)
-                                #_(log/debug-async->vals "match-clause results:")
                                 (async/pipe ch)))
                           (async/to-chan! initial-solutions))
     out-ch))
