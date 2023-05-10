@@ -1,7 +1,7 @@
 (ns fluree.db.query.fql.syntax
   (:require [fluree.db.constants :as const]
             [fluree.db.util.core :refer [try* catch* pred-ident?]]
-            [fluree.db.util.validation :as v]
+            [fluree.db.validation :as v]
             [malli.core :as m]
             [malli.error :as me]
             [malli.transform :as mt]))

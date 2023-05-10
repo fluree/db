@@ -23,7 +23,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.util.log :as log]
-            [fluree.db.util.validation :as v]
+            [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]
             [malli.core :as m]))
 

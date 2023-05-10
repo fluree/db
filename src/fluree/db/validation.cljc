@@ -1,4 +1,4 @@
-(ns fluree.db.util.validation
+(ns fluree.db.validation
   (:require [malli.core :as m]))
 
 (defn iri?
