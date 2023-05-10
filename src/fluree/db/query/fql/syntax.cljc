@@ -264,44 +264,31 @@
   [x]
   (triple-validator x))
 
-(def query-validator
-  (m/validator ::query {:registry registry}))
-
-(def query-coercer
+(def coerce-query*
   (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
 
 (def multi-query?
   (m/validator ::multi-query {:registry registry}))
 
-(defn validate-query
-  [qry]
-  (if (query-validator qry)
-    qry
-    (throw (ex-info "Invalid Query"
-                    {:status  400
-                     :error   :db/invalid-query
-                     :reasons (m/explain ::analytical-query qry {:registry registry})}))))
-
 (defn coerce-query
   [qry]
-  (try* (query-coercer qry)
-        (catch* _e
-          (throw (ex-info "Invalid Query"
-                          {:status  400
-                           :error   :db/invalid-query
-                           :reasons (me/humanize (m/explain ::query qry {:registry registry}))})))))
+  (try*
+   (coerce-query* qry)
+   (catch* e
+     (throw (ex-info "Invalid Query"
+                     {:status  400
+                      :error   :db/invalid-query
+                      :reasons (-> e ex-data :data :explain me/humanize)})))))
 
-(def modification-validator
-  (m/validator ::modification {:registry registry}))
-
-(def modification-coercer
+(def coerce-modification*
   (m/coercer ::modification (mt/transformer {:name :fql}) {:registry registry}))
 
 (defn coerce-modification
   [mdfn]
-  (try* (modification-coercer mdfn)
-        (catch* _e
-          (throw (ex-info "Invalid Ledger Modification"
-                          {:status  400
-                           :error   :db/invalid-query
-                           :reasons (me/humanize (m/explain ::modification mdfn {:registry registry}))})))))
+  (try*
+   (coerce-modification* mdfn)
+   (catch* e
+     (throw (ex-info "Invalid Ledger Modification"
+                     {:status  400
+                      :error   :db/invalid-query
+                      :reasons (-> e ex-data :data :explain me/humanize)})))))
