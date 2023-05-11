@@ -640,4 +640,42 @@
                                                             {:rdf/type [:_id]}
                                                             {:f/allow [:* {:f/targetRole [:_id]}]}
                                                             {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                                               :where  [[?s :rdf/type :f/Policy]]})))))))))
+                                               :where  [[?s :rdf/type :f/Policy]]})))))))
+     (testing "loading predefined properties"
+       (let [conn (test-utils/create-conn {:context test-utils/default-str-context
+                                           :context-type :string})
+             ledger @(fluree/create conn "shacl/a" {:defaultContext ["" {"ex" "http://example.org/ns/"}]})
+
+             db1 @(test-utils/transact ledger
+                                       {"@type" "sh:NodeShape",
+                                        "sh:targetClass" {"id" "schema:Person"}
+                                        "sh:property"
+                                        [{"sh:path" {"id" "schema:familyName"}
+                                          "sh:datatype" {"id" "xsd:string"}}]})
+             property-query {:select {"?s" ["*"]}, :where [["?s" "sh:property" "?property"]]}
+             shape-id (-> @(fluree/query db1 property-query)
+                          first
+                          (get "id"))
+             loaded1 @(fluree/load conn "shacl/a")]
+         (is (= [{"id" shape-id
+                  "rdf:type" ["sh:NodeShape"],
+                  "sh:targetClass" {"id" "schema:Person"},
+                  "sh:property" {"id" "_:f211106232532993"}}]
+                @(fluree/query db1 property-query)))
+         (is (= [{"id" shape-id
+                  "rdf:type" ["sh:NodeShape"],
+                  "sh:targetClass" {"id" "schema:Person"},
+                  "sh:property" {"id" "_:f211106232532993"}}]
+                @(fluree/query (fluree/db loaded1) property-query)))
+         (testing "load ref retracts"
+           (let [db2 @(test-utils/transact loaded1
+                                           {"@id" shape-id
+                                            "sh:property"
+                                            [{"sh:path" {"id" "schema:age"}
+                                              "sh:datatype" {"id" "xsd:string"}}]})
+                 loaded2 @(fluree/load conn "shacl/a")]
+             (is (= [{"id" shape-id
+                      "rdf:type" ["sh:NodeShape"],
+                      "sh:targetClass" {"id" "schema:Person"},
+                      "sh:property" {"id" "_:f211106232532994"}}]
+                    @(fluree/query (fluree/db loaded2) property-query)))))))))
