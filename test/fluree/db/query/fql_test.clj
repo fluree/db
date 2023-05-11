@@ -123,7 +123,19 @@
                                                 ["cam@example.org" 37]]]}]
             (is (= [["Alice" 50]]
                    @(fluree/query db q))
-                "returns only the results related to the existing bound values")))))))
+                "returns only the results related to the existing bound values"))))
+      (testing "with string vars"
+        (let [q {:select  ["?name" "?age"]
+                 :where   [["?s" :schema/email "?email"]
+                           ["?s" :schema/name "?name"]
+                           ["?s" :schema/age "?age"]]
+                 :values  ["?age" [13]]}]
+          (is (= [["Liam" 13]]
+                 @(fluree/query db q))
+              "returns only the results related to the bound values"))))))
+
+
+
 
 (deftest ^:integration bind-query-test
   (let [conn   (test-utils/create-conn)

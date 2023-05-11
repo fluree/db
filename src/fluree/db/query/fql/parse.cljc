@@ -53,11 +53,11 @@
   [q]
   (when-let [values (:values q)]
     (let [[vars vals] values
-          vars*     (util/sequential vars)
-          vals*     (mapv util/sequential vals)
-          var-count (count vars*)]
-      (if (every? (fn [bdg]
-                    (= (count bdg) var-count))
+          vars*       (keep parse-var-name (util/sequential vars))
+          vals*       (mapv util/sequential vals)
+          var-count   (count vars*)]
+      (if (every? (fn [binding]
+                    (= (count binding) var-count))
                   vals*)
         [vars* (mapv (partial parse-value-binding vars*)
                      vals*)]
