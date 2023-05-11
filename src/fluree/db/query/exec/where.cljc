@@ -375,14 +375,18 @@
   [_db solution pattern _ error-ch]
   (let [bind (val pattern)]
     (go
-      (reduce (fn [solution* b]
-                (let [f        (::fn b)
-                      var-name (::var b)]
-                  (try*
-                    (->> (f solution)
-                         (add-fn-result-to-solution solution* var-name))
-                    (catch* e (>! error-ch e)))))
-              solution (vals bind)))))
+      (let [result
+            (reduce (fn [solution* b]
+                      (let [f        (::fn b)
+                            var-name (::var b)]
+                        (try*
+                         (->> (f solution)
+                              (add-fn-result-to-solution solution* var-name))
+                         (catch* e (update solution* ::errors conj e)))))
+                    solution (vals bind))]
+        (when-let [errors (::errors result)]
+          (async/onto-chan! error-ch errors))
+        result))))
 
 (def blank-solution {})
 
