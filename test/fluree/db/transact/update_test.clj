@@ -1,8 +1,7 @@
 (ns fluree.db.transact.update-test
   (:require [clojure.test :refer :all]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.log :as log]))
+            [fluree.db.json-ld.api :as fluree]))
 
 (deftest ^:integration deleting-data
   (testing "Deletions of entire subjects."
@@ -91,33 +90,33 @@
              ["Bob" "Alice"])
           "Only Bob and Alice should be left in the db.")
 
-    (testing "Updating property value only if it's current value is a match."
-      (is (= [{:id          :ex/bob,
-               :rdf/type    [:ex/User],
-               :schema/name "Bob"
-               :schema/age  23}]
-             @(fluree/query db-update-bob
-                            '{:select {?s [:*]}
-                              :where  [[?s :id :ex/bob]]}))
-          "Bob's age should now be updated to 23 (from 22)."))
+      (testing "Updating property value only if it's current value is a match."
+        (is (= [{:id          :ex/bob,
+                 :rdf/type    [:ex/User],
+                 :schema/name "Bob"
+                 :schema/age  23}]
+               @(fluree/query db-update-bob
+                              '{:select {?s [:*]}
+                                :where  [[?s :id :ex/bob]]}))
+            "Bob's age should now be updated to 23 (from 22)."))
 
-    (testing "No update should happen if there is no match."
-      (is (= [{:id          :ex/bob,
-               :rdf/type    [:ex/User],
-               :schema/name "Bob"
-               :schema/age  22}]
-             @(fluree/query db-update-bob2
-                            '{:select {?s [:*]}
-                              :where  [[?s :id :ex/bob]]}))
-          "Bob's age should have not been changed and still be 22."))
+      (testing "No update should happen if there is no match."
+        (is (= [{:id          :ex/bob,
+                 :rdf/type    [:ex/User],
+                 :schema/name "Bob"
+                 :schema/age  22}]
+               @(fluree/query db-update-bob2
+                              '{:select {?s [:*]}
+                                :where  [[?s :id :ex/bob]]}))
+            "Bob's age should have not been changed and still be 22."))
 
-    (testing "Replacing existing property value with new property value."
-      (is (= [{:id           :ex/jane,
-               :rdf/type     [:ex/User],
-               :schema/name  "Jane"
-               :schema/email "jane@flur.ee"
-               :schema/age   31}]
-             @(fluree/query db-update-jane
-                            '{:select {?s [:*]}
-                              :where  [[?s :id :ex/jane]]}))
-          "Jane's age should now be updated to 31 (from 30).")))))
+      (testing "Replacing existing property value with new property value."
+        (is (= [{:id           :ex/jane,
+                 :rdf/type     [:ex/User],
+                 :schema/name  "Jane"
+                 :schema/email "jane@flur.ee"
+                 :schema/age   31}]
+               @(fluree/query db-update-jane
+                              '{:select {?s [:*]}
+                                :where  [[?s :id :ex/jane]]}))
+            "Jane's age should now be updated to 31 (from 30).")))))
