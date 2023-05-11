@@ -332,8 +332,10 @@
 
 (defn parse-bind-map
   [bind]
-  (reduce (fn [m k] (update m k #(parse-bind-function k %)))
-          bind (keys bind)))
+  (reduce-kv (fn [m k v]
+               (let [parsed-k (parse-var-name k)]
+                 (assoc m parsed-k (parse-bind-function parsed-k v))))
+           {} bind))
 
 (defn parse-where-clause
   [clause vars db context]
