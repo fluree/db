@@ -38,14 +38,14 @@
     ::txn-leaf-map [:map-of
                     [:orn [:string :string] [:keyword :keyword]]
                     :any]
-    ::retract      [:map [:retract ::txn-leaf-map]]
-    ::modification ::v/modification-txn
-    ::txn-map      [:and
+    ::retract      [:and
                     [:map-of :keyword :any]
-                    [:orn
-                     [:retract ::retract]
-                     [:modification ::modification]
-                     [:assert ::txn-leaf-map]]]
+                    [:map [:retract ::txn-leaf-map]]]
+    ::modification ::v/modification-txn
+    ::txn-map      [:orn
+                    [:retract ::retract]
+                    [:modification ::modification]
+                    [:assert ::txn-leaf-map]]
     ::txn          [:orn
                     [:single-map ::txn-map]
                     [:sequence-of-maps [:sequential ::txn-map]]]}))
