@@ -27,4 +27,4 @@
   (let [total (reduce (fn [total ctr]
                         (+ total @ctr))
                       0 @trkr)]
-    (assoc result ::total)))
+    (assoc result ::total total)))
