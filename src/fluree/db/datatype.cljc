@@ -334,7 +334,7 @@
    - numbers in strings
    - the strings 'true' or 'false' to a boolean"
   [value required-type]
-  (log/debug "coerce value:" value "to type:" required-type)
+  (log/trace "coerce value:" value "to type:" required-type)
   (uc/case (int required-type)
     const/$xsd:string
     (when (string? value)
@@ -400,7 +400,7 @@
   (let [type-id (if type
                   (get default-data-types type)
                   (infer value))
-        _       (log/debug "from-expanded type:" type-id)
+        _       (log/trace "from-expanded type:" type-id)
         value*  (coerce value type-id)]
     (cond (and required-type (not= type-id required-type))
           (throw (ex-info (str "Required data type " required-type

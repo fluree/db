@@ -130,7 +130,7 @@
 
 (defn parse-code
   [x]
-  (log/debug "parse-code:" x)
+  (log/trace "parse-code:" x)
   (if (list? x)
     x
     (safe-read x)))
@@ -150,9 +150,9 @@
   "Evals and returns bind function."
   [var-name fn-code]
   (let [code (parse-code fn-code)
-        _    (log/debug "parse-bind-function code:" code)
+        _    (log/trace "parse-bind-function code:" code)
         f    (eval/compile code false)]
-    (log/debug "parse-bind-function f:" f)
+    (log/trace "parse-bind-function f:" f)
     (where/->function var-name f)))
 
 (def ^:const default-recursion-depth 100)
@@ -303,7 +303,7 @@
 
 (defmulti parse-pattern
   (fn [pattern _vars _db _context]
-    (log/debug "parse-pattern pattern:" pattern)
+    (log/trace "parse-pattern pattern:" pattern)
     (cond
       (map? pattern) (->> pattern keys first)
       (map-entry? pattern) :binding
@@ -342,13 +342,12 @@
   [clause vars db context]
   (let [patterns (->> clause
                       (remove filter-pattern?)
-                      (log/debug->>val "patterns to parse:")
                       (mapv (fn [pattern]
                               (parse-pattern pattern vars db context))))
         filters  (->> clause
                       (filter filter-pattern?)
                       (parse-filter-maps vars))]
-    (log/debug "parse-where-clause patterns:" patterns)
+    (log/trace "parse-where-clause patterns:" patterns)
     (where/->where-clause patterns filters)))
 
 (defn parse-triple
@@ -367,7 +366,7 @@
 
 (defmethod parse-pattern :triple
   [triple _ db context]
-  (log/debug "parse-triple:" triple)
+  (log/trace "parse-triple:" triple)
   (parse-triple triple db context))
 
 (defmethod parse-pattern :union
@@ -388,14 +387,14 @@
 (defmethod parse-pattern :bind
   [{:keys [bind]} _vars _db _context]
   (let [parsed (parse-bind-map bind)
-        _ (log/debug "parsed bind map:" parsed)
+        _ (log/trace "parsed bind map:" parsed)
         pattern (where/->pattern :bind parsed)]
-    (log/debug "parse-pattern :bind pattern:" pattern)
+    (log/trace "parse-pattern :bind pattern:" pattern)
     pattern))
 
 (defmethod parse-pattern :binding
   [[v f] _vars _db _context]
-  (log/debug "parse-pattern binding v:" v "- f:" f)
+  (log/trace "parse-pattern binding v:" v "- f:" f)
   (where/->pattern :binding [v f]))
 
 (defn parse-where
@@ -477,12 +476,12 @@
 
 (defn parse-analytical-query*
   [q db]
-  (let [context  (parse-context q db)
+  (log/debug "parsing analytical query:" q)
+  (let [context       (parse-context q db)
         [vars values] (parse-values q)
-        _        (log/debug "parse-analytical-query*:" q)
-        where    (parse-where q vars db context)
-        grouping (parse-grouping q)
-        ordering (parse-ordering q)]
+        where         (parse-where q vars db context)
+        grouping      (parse-grouping q)
+        ordering      (parse-ordering q)]
     (-> q
         (assoc :context context
                :where where)
