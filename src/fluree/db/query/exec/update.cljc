@@ -20,32 +20,32 @@
         pattern))
 
 (defn retract-triple
-  [db triple t solution error-ch]
+  [db triple t solution fuel-tracker error-ch]
   (let [retract-xf (map (fn [f]
                           (flake/flip-flake f t)))
         matched    (match-solution triple solution)]
-    (where/resolve-flake-range db retract-xf error-ch matched)))
+    (where/resolve-flake-range db fuel-tracker retract-xf error-ch matched)))
 
 (defn retract-clause
-  [db clause t solution error-ch out-ch]
+  [db clause t solution fuel-tracker error-ch out-ch]
   (let [clause-ch  (async/to-chan! clause)]
     (async/pipeline-async 2
                           out-ch
                           (fn [triple ch]
                             (-> db
-                                (retract-triple triple t solution error-ch)
+                                (retract-triple triple t solution fuel-tracker error-ch)
                                 (async/pipe ch)))
                           clause-ch)
     out-ch))
 
 (defn retract
-  [db mdfn t error-ch solution-ch]
+  [db mdfn t fuel-tracker error-ch solution-ch]
   (let [{:keys [delete]} mdfn
         retract-ch       (async/chan 2)]
     (async/pipeline-async 2
                           retract-ch
                           (fn [solution ch]
-                            (retract-clause db delete t solution error-ch ch))
+                            (retract-clause db delete t solution fuel-tracker error-ch ch))
                           solution-ch)
     retract-ch))
 
@@ -94,7 +94,7 @@
     insert-ch))
 
 (defn insert-retract
-  [db mdfn t error-ch solution-ch]
+  [db mdfn t fuel-tracker error-ch solution-ch]
   (let [solution-ch*    (async/chan 2) ; create an extra channel to multiply so
                                        ; solutions don't get dropped before we
                                        ; can add taps to process them.
@@ -104,7 +104,7 @@
         insert-ch       (insert db mdfn t error-ch insert-soln-ch)
         retract-soln-ch (->> (async/chan 2)
                              (async/tap solution-mult))
-        retract-ch      (retract db mdfn t error-ch retract-soln-ch)]
+        retract-ch      (retract db mdfn t fuel-tracker error-ch retract-soln-ch)]
     (async/pipe solution-ch solution-ch*) ; now hook up the solution input
                                           ; after everything is wired
     (async/merge [insert-ch retract-ch])))
@@ -118,14 +118,14 @@
   (contains? mdfn :delete))
 
 (defn modify
-  [db mdfn t error-ch solution-ch]
+  [db mdfn t fuel-tracker error-ch solution-ch]
   (cond
     (and (insert? mdfn)
          (retract? mdfn))
-    (insert-retract db mdfn t error-ch solution-ch)
+    (insert-retract db mdfn t fuel-tracker error-ch solution-ch)
 
     (insert? mdfn)
-    (insert db mdfn t error-ch solution-ch)
+    (insert db mdfn t fuel-tracker error-ch solution-ch)
 
     (retract? mdfn)
-    (retract db mdfn t error-ch solution-ch)))
+    (retract db mdfn t fuel-tracker error-ch solution-ch)))
