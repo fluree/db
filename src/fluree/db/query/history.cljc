@@ -13,7 +13,7 @@
    [fluree.db.util.log :as log]
    [fluree.db.query.range :as query-range]
    [fluree.db.db.json-ld :as jld-db]
-   [fluree.db.util.validation :as v]
+   [fluree.db.validation :as v]
    [malli.error :as me]
    [malli.transform :as mt]))
 

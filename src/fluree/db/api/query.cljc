@@ -153,21 +153,21 @@
          queries             (reduce-kv
                               (fn [acc alias query]
                                 (let [query-opts (:opts query)]
-                                  (if-let [policy-opts (perm/policy-opts query-opts)]
+                                  (if (perm/policy-opts query-opts)
                                     (throw (ex-info "Applying policy via `:opts` on individual queries in a multi-query is not supported."
                                                     {:status 400
                                                      :error  :db/invalid-query}))
-                                        (let [query-meta   (:meta query-opts)
-                                              context-type (-> query-opts
-                                                               :context-type
-                                                               (or global-context-type))
-                                              meta?        (or global-meta query-meta)
-                                              remove-meta? (and meta? (not query-meta)) ;; query didn't ask for meta, but multiquery did so must strip it
-                                              opts*        (-> (:opts query)
-                                                               (assoc :meta meta? :-remove-meta? remove-meta?)
-                                                               (cond-> context-type (assoc :context-type context-type)))
-                                              query*       (assoc query :opts opts*)]
-                                            (assoc acc alias query*)))))
+                                    (let [query-meta   (:meta query-opts)
+                                          context-type (-> query-opts
+                                                           :context-type
+                                                           (or global-context-type))
+                                          meta?        (or global-meta query-meta)
+                                          remove-meta? (and meta? (not query-meta)) ;; query didn't ask for meta, but multiquery did so must strip it
+                                          opts*        (-> (:opts query)
+                                                           (assoc :meta meta? :-remove-meta? remove-meta?)
+                                                           (cond-> context-type (assoc :context-type context-type)))
+                                          query*       (assoc query :opts opts*)]
+                                      (assoc acc alias query*)))))
                               {} (dissoc flureeQL :opts))
          start-time #?(:clj (System/nanoTime) :cljs (util/current-time-millis))
          ;; kick off all queries in parallel, each alias now mapped to core async channel

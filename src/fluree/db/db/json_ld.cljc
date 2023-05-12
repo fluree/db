@@ -24,8 +24,8 @@
 
 (def root-policy-map
   "Base policy (permissions) map that will give access to all flakes."
-  {:f/view   {:root? true}
-   :f/modify {:root? true}})
+  {const/iri-view   {:root? true}
+   const/iri-modify {:root? true}})
 
 
 (defn expand-iri

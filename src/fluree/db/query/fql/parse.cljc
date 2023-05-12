@@ -13,6 +13,7 @@
             [fluree.json-ld :as json-ld]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.validation :as v]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             #?(:cljs [cljs.reader :refer [read-string]])))
@@ -32,7 +33,7 @@
 (defn parse-var-name
   "Returns a `x` as a symbol if `x` is a valid '?variable'."
   [x]
-  (when (syntax/variable? x)
+  (when (v/variable? x)
     (symbol x)))
 
 (defn parse-variable
@@ -52,11 +53,11 @@
   [q]
   (when-let [values (:values q)]
     (let [[vars vals] values
-          vars*     (util/sequential vars)
-          vals*     (mapv util/sequential vals)
-          var-count (count vars*)]
-      (if (every? (fn [bdg]
-                    (= (count bdg) var-count))
+          vars*       (keep parse-var-name (util/sequential vars))
+          vals*       (mapv util/sequential vals)
+          var-count   (count vars*)]
+      (if (every? (fn [binding]
+                    (= (count binding) var-count))
                   vals*)
         [vars* (mapv (partial parse-value-binding vars*)
                      vals*)]
@@ -130,7 +131,6 @@
 
 (defn parse-code
   [x]
-  (log/trace "parse-code:" x)
   (if (list? x)
     x
     (safe-read x)))
@@ -150,9 +150,7 @@
   "Evals and returns bind function."
   [var-name fn-code]
   (let [code (parse-code fn-code)
-        _    (log/trace "parse-bind-function code:" code)
         f    (eval/compile code false)]
-    (log/trace "parse-bind-function f:" f)
     (where/->function var-name f)))
 
 (def ^:const default-recursion-depth 100)
@@ -187,7 +185,7 @@
 
 (defn parse-sid
   [x]
-  (when (syntax/sid? x)
+  (when (v/sid? x)
     (where/anonymous-value x)))
 
 (defn parse-subject
@@ -217,7 +215,7 @@
 
 (defn parse-iri-predicate
   [x]
-  (when (syntax/iri-key? x)
+  (when (v/iri-key? x)
     (where/->predicate const/$xsd:anyURI)))
 
 (defn iri->pred-id
@@ -283,7 +281,7 @@
            keys
            first
            (json-ld/expand-iri context)
-           syntax/iri-key?)))
+           v/iri-key?)))
 
 (defn parse-iri-map
   [x context]
@@ -303,7 +301,6 @@
 
 (defmulti parse-pattern
   (fn [pattern _vars _db _context]
-    (log/trace "parse-pattern pattern:" pattern)
     (cond
       (map? pattern) (->> pattern keys first)
       (map-entry? pattern) :binding
@@ -335,8 +332,10 @@
 
 (defn parse-bind-map
   [bind]
-  (reduce (fn [m k] (update m k #(parse-bind-function k %)))
-          bind (keys bind)))
+  (reduce-kv (fn [m k v]
+               (let [parsed-k (parse-var-name k)]
+                 (assoc m parsed-k (parse-bind-function parsed-k v))))
+           {} bind))
 
 (defn parse-where-clause
   [clause vars db context]
@@ -347,7 +346,6 @@
         filters  (->> clause
                       (filter filter-pattern?)
                       (parse-filter-maps vars))]
-    (log/trace "parse-where-clause patterns:" patterns)
     (where/->where-clause patterns filters)))
 
 (defn parse-triple
@@ -355,7 +353,7 @@
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
     (if (and (= const/$rdf:type (::where/val p))
-             (not (syntax/variable? o-pat)))
+             (not (v/variable? o-pat)))
       (let [cls (parse-class o-pat db context)]
         (where/->pattern :class [s p cls]))
       (if (= const/$xsd:anyURI (::where/val p))
@@ -366,7 +364,6 @@
 
 (defmethod parse-pattern :triple
   [triple _ db context]
-  (log/trace "parse-triple:" triple)
   (parse-triple triple db context))
 
 (defmethod parse-pattern :union
@@ -387,14 +384,11 @@
 (defmethod parse-pattern :bind
   [{:keys [bind]} _vars _db _context]
   (let [parsed (parse-bind-map bind)
-        _ (log/trace "parsed bind map:" parsed)
         pattern (where/->pattern :bind parsed)]
-    (log/trace "parse-pattern :bind pattern:" pattern)
     pattern))
 
 (defmethod parse-pattern :binding
   [[v f] _vars _db _context]
-  (log/trace "parse-pattern binding v:" v "- f:" f)
   (where/->pattern :binding [v f]))
 
 (defn parse-where
@@ -405,8 +399,8 @@
 (defn parse-selector
   [db context depth s]
   (cond
-    (syntax/variable? s) (-> s parse-var-name select/variable-selector)
-    (syntax/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
+    (v/variable? s) (-> s parse-var-name select/variable-selector)
+    (v/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
     (select-map? s) (let [{:keys [variable selection depth spec]}
                           (parse-subselection db context s depth)]
                       (select/subgraph-selector variable selection depth spec))))
@@ -476,12 +470,11 @@
 
 (defn parse-analytical-query*
   [q db]
-  (log/debug "parsing analytical query:" q)
-  (let [context       (parse-context q db)
+  (let [context  (parse-context q db)
         [vars values] (parse-values q)
-        where         (parse-where q vars db context)
-        grouping      (parse-grouping q)
-        ordering      (parse-ordering q)]
+        where    (parse-where q vars db context)
+        grouping (parse-grouping q)
+        ordering (parse-ordering q)]
     (-> q
         (assoc :context context
                :where where)
