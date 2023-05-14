@@ -268,6 +268,24 @@
          out-of-range (concat stale-flakes subsequent)]
      (flake/disj-all latest out-of-range))))
 
+(defn resolve-t-range
+  [resolver node novelty from-t to-t]
+  (go-try
+    (let [resolved (<? (resolve resolver node))
+          flakes   (t-range resolved novelty from-t to-t)]
+      (-> resolved
+          (dissoc :t)
+          (assoc :from-t from-t
+                 :to-t   to-t
+                 :flakes  flakes)))))
+
+(defrecord TRangeResolver [node-resolver novelty from-t to-t]
+  Resolver
+  (resolve [_ {:keys [id tempid tt-id] :as node}]
+    (if (branch? node)
+      (resolve node-resolver node)
+      (resolve-t-range node-resolver node novelty from-t to-t))))
+
 (defrecord CachedTRangeResolver [node-resolver novelty from-t to-t lru-cache-atom]
   Resolver
   (resolve [_ {:keys [id tempid tt-id] :as node}]
@@ -277,14 +295,7 @@
         lru-cache-atom
         [::t-range id tempid tt-id from-t to-t]
         (fn [_]
-          (go-try
-            (let [resolved (<? (resolve node-resolver node))
-                  flakes   (t-range resolved novelty from-t to-t)]
-              (-> resolved
-                  (dissoc :t)
-                  (assoc :from-t from-t
-                         :to-t   to-t
-                         :flakes  flakes)))))))))
+          (resolve-t-range node-resolver node novelty from-t to-t))))))
 
 (defn history-t-range
   "Returns a sorted set of flakes between the transactions `from-t` and `to-t`."
