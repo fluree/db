@@ -60,5 +60,9 @@
                             (take-limit q)
                             (collect-results q))]
       (async/alt!
-        error-ch  ([e] e)
-        result-ch ([result] result)))))
+        error-ch  ([e]
+                   (fuel/tally fuel-tracker {::error e})
+                   e)
+        result-ch ([result]
+                   (fuel/tally fuel-tracker {::result result})
+                   result)))))
