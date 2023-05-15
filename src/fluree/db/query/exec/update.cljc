@@ -1,5 +1,6 @@
 (ns fluree.db.query.exec.update
   (:require [fluree.db.flake :as flake]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :refer [try* catch*]]
@@ -21,8 +22,12 @@
 
 (defn retract-triple
   [db triple t solution error-ch]
-  (let [retract-xf (map (fn [f]
-                          (flake/flip-flake f t)))
+  (let [retract-xf (keep (fn [f]
+                           ;;do not retract the flakes which map subject ids to iris.
+                           ;;they are an internal optimization, which downstream code
+                           ;;(eg the commit pipeline) relies on
+                           (when-not (= const/$xsd:anyURI (flake/p f))
+                             (flake/flip-flake f t))))
         matched    (match-solution triple solution)]
     (where/resolve-flake-range db retract-xf error-ch matched)))
 
