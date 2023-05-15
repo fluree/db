@@ -125,7 +125,7 @@
     (insert-retract db mdfn t fuel-tracker error-ch solution-ch)
 
     (insert? mdfn)
-    (insert db mdfn t fuel-tracker error-ch solution-ch)
+    (insert db mdfn t error-ch solution-ch)
 
     (retract? mdfn)
     (retract db mdfn t fuel-tracker error-ch solution-ch)))
