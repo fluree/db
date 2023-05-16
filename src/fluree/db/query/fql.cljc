@@ -297,8 +297,7 @@
   ([db fuel max-fuel res select-spec opts]
    (process-ad-hoc-group db fuel max-fuel res select-spec nil opts))
   ([db fuel max-fuel {:keys [vars] :as res} {:keys [aggregates orderBy offset groupBy select limit expandMaps? selectDistinct? inVector? prettyPrint] :as select-spec} group-limit opts]
-   (go-try (if
-             (and aggregates (= 1 (count select)))          ;; only aggregate
+   (go-try (if (and aggregates (= 1 (count select))) ;; only aggregate
              (let [res  (second (analytical/calculate-aggregate res (first aggregates)))
                    res' (if prettyPrint
                           {(-> select first :as str (subs 1)) res}
@@ -402,11 +401,16 @@
               (loop [[[k tuples] & r] group-map
                      acc {}]
                 (if k
-                  (let [group-as-res {:headers headers :vars vars :tuples tuples}
-                        v            (<? (process-ad-hoc-group db fuel max-fuel
-                                                               group-as-res
-                                                               (assoc select-spec :orderBy nil :offset 0 :limit nil)
-                                                               (assoc opts :offset 0 :limit nil)))]
+                  (let [group-as-res   {:headers headers :vars vars :tuples tuples}
+                        order-group-by (when (and orderBy (nil? order-fn))
+                                         ;; if orderBy is not nil but order-fn is
+                                         ;; that means we need to sort w/in each group
+                                         orderBy)
+                        v              (<? (process-ad-hoc-group
+                                            db fuel max-fuel group-as-res
+                                            (assoc select-spec :orderBy order-group-by
+                                                               :offset 0 :limit nil)
+                                            (assoc opts :offset 0 :limit nil)))]
                     (recur r (assoc acc k v)))
                   acc)))
             ; no group by
