@@ -644,6 +644,7 @@
      (testing "loading predefined properties"
        (let [conn (test-utils/create-conn {:context test-utils/default-str-context
                                            :context-type :string})
+             ledger-alias  "shacl/a"
              ledger @(fluree/create conn "shacl/a" {:defaultContext ["" {"ex" "http://example.org/ns/"}]})
 
              db1 @(test-utils/transact ledger
@@ -656,7 +657,7 @@
              shape-id (-> @(fluree/query db1 property-query)
                           first
                           (get "id"))
-             loaded1 @(fluree/load conn "shacl/a")]
+             loaded1 (test-utils/retry-load conn ledger-alias 100)]
          (is (= [{"id" shape-id
                   "rdf:type" ["sh:NodeShape"],
                   "sh:targetClass" {"id" "schema:Person"},
@@ -673,9 +674,58 @@
                                             "sh:property"
                                             [{"sh:path" {"id" "schema:age"}
                                               "sh:datatype" {"id" "xsd:string"}}]})
-                 loaded2 @(fluree/load conn "shacl/a")]
+                 loaded2 (test-utils/retry-load conn ledger-alias 100)]
              (is (= [{"id" shape-id
                       "rdf:type" ["sh:NodeShape"],
                       "sh:targetClass" {"id" "schema:Person"},
                       "sh:property" {"id" "_:f211106232532994"}}]
-                    @(fluree/query (fluree/db loaded2) property-query)))))))))
+                    @(fluree/query (fluree/db loaded2) property-query)))))))
+    (testing "can load after deletion of entire subjects"
+       (let [conn              @(fluree/connect
+                                  {:method :memory
+                                   :defaults
+                                   {:context      test-utils/default-context
+                                    :context-type :keyword}})
+             ledger-alias      "tx/delete"
+             ledger            @(fluree/create conn ledger-alias {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+             db1               @(fluree/stage
+                                  (fluree/db ledger)
+                                  {:graph
+                                   [{:id                 :ex/fluree
+                                     :type               :schema/Organization
+                                     :schema/description "We ❤️ Data"}
+                                    {:id                 :ex/w3c
+                                     :type               :schema/Organization
+                                     :schema/description "We ❤️ Internet"}
+                                    {:id                 :ex/mosquitos
+                                     :type               :ex/Monster
+                                     :schema/description "We ❤️ human blood"}
+                                    {:id                 :ex/kittens
+                                     :type               :ex/Animal
+                                     :schema/description "We ❤️ catnip"}]})
+             description-query '{:select {?s [:id]}
+                                 :where  [[?s :schema/description ?description]]}
+             _                 @(fluree/commit! ledger db1)
+             loaded1           (test-utils/retry-load conn ledger-alias 100)
+             loaded-db1        (fluree/db loaded1)
+             db2               @(fluree/stage
+                                  loaded-db1
+                                  '{:delete [:ex/mosquitos ?p ?o]
+                                    :where  [[:ex/mosquitos ?p ?o]]})
+             _                 @(fluree/commit! ledger db2)
+             loaded2           (test-utils/retry-load conn ledger-alias 100)
+             loaded-db2        (fluree/db loaded2)]
+         (is (= [{:id :ex/kittens} {:id :ex/w3c} {:id :ex/fluree}]
+                @(fluree/query loaded-db2 description-query))
+             "The id :ex/mosquitos should be removed")
+         (let [db3        @(fluree/stage
+                             loaded-db2
+                             '{:delete [?s ?p ?o]
+                               :where  [[?s :rdf/type :schema/Organization]
+                                        [?s ?p ?o]]})
+               _          @(fluree/commit! ledger db3)
+               loaded3  (test-utils/retry-load conn ledger-alias 100)
+               loaded-db3 (fluree/db loaded3)]
+           (is (= [{:id :ex/kittens}]
+                  @(fluree/query loaded-db3 description-query))
+               "Only :ex/kittens should be left")))) ))
