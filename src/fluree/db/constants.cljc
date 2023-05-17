@@ -115,7 +115,7 @@
 (def ^:const $_predicate:txSpecDoc 25)
 (def ^:const $_predicate:restrictTag 26)
 (def ^:const $_predicate:fullText 27)
-(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
+(def ^:const $_predicate:equivalentProperty 35)                          ;; any unique alias for predicate
 (def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
 ;; TODO - jumping predicate ids - rethink ordering a bit
 (def ^:const $rdf:type 200)
