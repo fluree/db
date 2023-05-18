@@ -487,7 +487,7 @@
 (defn parse-analytical-query
   [q db]
   (let [parsed (parse-analytical-query* q db)]
-    (or (re-parse-as-simple-subj-crawl parsed)
+    (or (re-parse-as-simple-subj-crawl parsed db)
         parsed)))
 
 (defn parse-query

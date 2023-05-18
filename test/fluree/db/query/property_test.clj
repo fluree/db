@@ -8,7 +8,7 @@
     (let [conn    (test-utils/create-conn)
           ledger  @(fluree/create conn "query/equivalent-properties")
           context {"vocab1" "http://vocab1.example.org/"
-                   "vocab2" "http://vocab1.example.org/"
+                   "vocab2" "http://vocab2.example.org/"
                    "vocab3" "http://vocab3.example.fr/"
                    "ex"     "http://example.org/ns/"
                    "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
@@ -27,6 +27,7 @@
                       deref
                       (fluree/stage {"@context" context
                                      "@graph"   [{"@id"              "ex:brian"
+                                                  "ex:age"           50
                                                   "vocab1:givenName" "Brian"}
                                                  {"@id"              "ex:ben"
                                                   "vocab2:firstName" "Ben"}
@@ -36,14 +37,14 @@
       (testing "querying for the property defined to be equivalent"
         (is (= [["Brian"] ["Ben"] ["Francois"]]
                @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab2" "http://vocab1.example.org/"}
+                                               "vocab2" "http://vocab2.example.org/"}
                                    :select    [?name]
                                    :where     [[?s "vocab2:firstName" ?name]]}))
             "returns all values"))
       (testing "querying for the symmetric property"
         (is (= [["Brian"] ["Ben"] ["Francois"]]
                @(fluree/query db '{"@context" {"vocab1" "http://vocab1.example.org/"
-                                               "vocab2" "http://vocab1.example.org/"}
+                                               "vocab2" "http://vocab2.example.org/"}
                                    :select    [?name]
                                    :where     [[?s "vocab1:givenName" ?name]]}))
             "returns all values"))
@@ -53,4 +54,19 @@
                                                "vocab3" "http://vocab3.example.fr/"}
                                    :select    [?name]
                                    :where     [[?s "vocab3:prenom" ?name]]}))
+            "returns all values"))
+      (testing "querying with graph crawl"
+        (is (= [{"@id" "ex:brian"
+                 "vocab1:givenName" "Brian"
+                 "ex:age" 50}
+                {"@id" "ex:ben"
+                 "vocab2:firstName" "Ben"}
+                {"@id" "ex:francois"
+                 "vocab3:prenom" "Francois"}]
+               @(fluree/query db '{"@context"  {"ex" "http://example.org/ns/"
+                                                "vocab1" "http://vocab1.example.org/"
+                                                "vocab2" "http://vocab2.example.org/"
+                                                "vocab3" "http://vocab3.example.fr/"}
+                                   :select    {?s [:*]}
+                                   :where     [[?s "vocab2:firstName" ?name]]}))
             "returns all values")))))
