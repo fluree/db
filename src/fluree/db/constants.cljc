@@ -169,6 +169,12 @@
 (def ^:const $sh:lessThan 244)
 (def ^:const $sh:lessThanOrEquals 248)
 
+;; logical constraints
+(def ^:const $sh:not 251)
+(def ^:const $sh:and 252)
+(def ^:const $sh:or 253)
+(def ^:const $sh:xone 254)
+
 ;; fluree-specific
 (def ^:const $fluree:context 250)
 
