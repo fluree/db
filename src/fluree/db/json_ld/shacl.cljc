@@ -235,7 +235,7 @@
 
 (defn validate-target
   "Some new flakes don't need extra validation."
-  [db {:keys [shapes datatype] :as shape-map} all-flakes]
+  [{:keys [shapes] :as _shape-map} all-flakes]
   (go-try
    (let [flake-p-partitions (partition-by flake/p all-flakes)]
      (doseq [shape shapes]
