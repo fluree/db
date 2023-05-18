@@ -66,12 +66,12 @@
       (if where-smt
         (when (and (= :tuple type)
                    (= first-s (clause-subject-var where-smt)))
-          (let [{::where/keys [val var]} o 
+          (let [{::where/keys [val var]} o
                 f (cond
                     val
                     (fn [flake _] (= val (flake/o flake)))
 
-                    ;;TODO: filters are not yet supported 
+                    ;;TODO: filters are not yet supported
                     #_#_filter
                     (let [{:keys [params variable function]} filter]
                       (if (= 1 (count params))
@@ -101,7 +101,7 @@
         [s p o] (if (= :tuple type)
                   pattern
                   (let [[_type-kw tuple] pattern]
-                    tuple)) 
+                    tuple))
         reparse-component (fn [component]
                             (let [{::where/keys [var val]} component]
                               (cond
