@@ -169,6 +169,12 @@
 (def ^:const $sh:lessThan 244)
 (def ^:const $sh:lessThanOrEquals 248)
 
+;; logical constraints
+(def ^:const $sh:not 251)
+(def ^:const $sh:and 252)
+(def ^:const $sh:or 253)
+(def ^:const $sh:xone 254)
+
 ;; fluree-specific
 (def ^:const $fluree:context 250)
 
@@ -185,11 +191,11 @@
 (def ^:const $xsd:boolean 2)
 (def ^:const $xsd:date 3)
 (def ^:const $xsd:dateTime 4)
+;; xsd number types
 (def ^:const $xsd:decimal 5)
 (def ^:const $xsd:double 6)
 (def ^:const $xsd:integer 7)
 (def ^:const $xsd:long 8)
-;; xsd number types
 (def ^:const $xsd:int 10)
 (def ^:const $xsd:short 11)
 (def ^:const $xsd:float 12)
