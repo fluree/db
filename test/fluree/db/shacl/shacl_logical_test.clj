@@ -149,15 +149,3 @@
                :schema/favNums  [9004 9008 9015 9016 9023 9042]}]
              ok-results)
           (str "unexpected query result: " (pr-str ok-results))))))
-
-(deftest ^:integration shacl-and-test
-  ;; TOOD: Write me
-  (is true))
-
-(deftest ^:integration shacl-or-test
-  ;; TOOD: Write me
-  (is true))
-
-(deftest ^:integration shacl-xone-test
-  ;; TOOD: Write me
-  (is true))
