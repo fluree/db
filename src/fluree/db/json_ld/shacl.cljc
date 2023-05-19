@@ -104,7 +104,7 @@
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive logical-constraint] :as _p-shape}
+           max-exclusive logical-constraint min-length max-length] :as _p-shape}
    p-flakes]
   (cond
     (or min-count max-count)
@@ -142,7 +142,25 @@
                              [true (when max-exclusive (str "sh:not sh:maxExclusive: value " val " must be greater than or equal to " max-exclusive))])]]
                       (coalesce-validation-results flake-results logical-constraint)))]
       (log/debug "value range results:" results)
-      (coalesce-validation-results results))))
+      (coalesce-validation-results results))
+
+    (or min-length max-length)
+    (let [results (for [flake p-flakes
+                        :let [[val dt] (flake-value flake)
+                              str-val  (if (= const/$xsd:string dt)
+                                         val
+                                         (str val))]]
+                    (let [str-length (count str-val)
+                          flake-results
+                          [(if (and min-length (> min-length str-length))
+                             [false (str "sh:minLength: value " str-val " has string length smaller than minimum: " min-length)]
+                             [true (when min-length (str "sh:not sh:minLength value: " str-val " must have string length less than " str-length))])
+                           (if (and max-length (< max-length str-length))
+                             [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
+                             [true (when max-length (str "sh:not sh:maxLength value: " str-val " must have string length larger than " str-length))])]]
+                      (coalesce-validation-results flake-results logical-constraint)))]
+      (coalesce-validation-results results logical-constraint))))
+
 
 
 (defn validate-pair-property

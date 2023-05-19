@@ -690,3 +690,71 @@
               "Exception, because :schema/age is not a number")
           (is (str/starts-with? (ex-message db-string)
                                 "SHACL PropertyShape exception - sh:minExclusive: value 10")))))))
+
+(deftest ^:integration shacl-string-constraints
+  (testing "shacl string constraint errors"
+    (let [conn       (test-utils/create-conn)
+          ledger     @(fluree/create conn "shacl/str" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query {:select {'?s [:*]}
+                      :where  [['?s :rdf/type :ex/User]]}
+          db         @(fluree/stage
+                        (fluree/db ledger)
+                        {:id             :ex/UserShape
+                         :type           [:sh/NodeShape]
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:sh/path      :schema/name
+                                           :sh/minLength 4
+                                           :sh/maxLength 10}]})
+          db-ok-str  @(fluree/stage
+                        db
+                        {:id          :ex/john,
+                         :type        [:ex/User],
+                         :schema/name "John"})
+
+          db-ok-non-str @(fluree/stage
+                           db
+                           {:id          :ex/john,
+                            :type        [:ex/User],
+                            :schema/name 12345})
+
+          db-too-short-str    (try
+                                @(fluree/stage
+                                   db
+                                   {:id          :ex/al,
+                                    :type        :ex/User,
+                                    :schema/name "Al"})
+                                (catch Exception e e))
+          db-too-long-str     (try
+                                @(fluree/stage
+                                   db
+                                   {:id          :ex/jean-claude
+                                    :type        :ex/User,
+                                    :schema/name "Jean-Claude"})
+                                (catch Exception e e))
+          db-too-long-non-str (try
+                                @(fluree/stage
+                                   db
+                                   {:id          :ex/john
+                                    :type        :ex/User,
+                                    :schema/name 12345678910})
+                                (catch Exception e e))]
+      (is (util/exception? db-too-short-str)
+          "Exception, because :schema/name is shorter than minimum string length")
+      (is (str/starts-with? (ex-message db-too-short-str)
+                            "SHACL PropertyShape exception - sh:minLength"))
+      (is (util/exception? db-too-long-str)
+          "Exception, because :schema/name is longer than maximum string length")
+      (is (str/starts-with? (ex-message db-too-long-str)
+                            "SHACL PropertyShape exception - sh:maxLength"))
+      (is (util/exception? db-too-long-non-str)
+          "Exception, because :schema/name is longer than maximum string length")
+      (is (str/starts-with? (ex-message db-too-long-non-str)
+                            "SHACL PropertyShape exception - sh:maxLength"))
+      (is (= @(fluree/query db-ok-str user-query)
+             [{:id          :ex/john,
+               :rdf/type    [:ex/User],
+               :schema/name "John"}]))
+      (is (= @(fluree/query db-ok-non-str user-query)
+             [{:id          :ex/john,
+               :rdf/type    [:ex/User],
+               :schema/name 12345}])))))
