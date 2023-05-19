@@ -91,20 +91,15 @@
      (<? (history* db coerced-query)))))
 
 (defn query
-  "Execute a query against a database source, or optionally
-  additional sources if the query spans multiple data sets.
-  Returns core async channel containing result or exception."
-  [sources query]
+  "Execute a query against a database source. Returns core async channel
+  containing result or exception."
+  [db query]
   (go-try
    (let [{query :subject, issuer :issuer}
          (or (<? (cred/verify query))
              {:subject query})
 
          {:keys [opts t]} query
-         db            (if (async-util/channel? sources) ;; only support 1 source currently
-                         (<? sources)
-                         sources)
-
          db*           (if-let [policy-opts (perm/policy-opts opts)]
                          (<? (perm/wrap-policy db policy-opts))
                          db)
