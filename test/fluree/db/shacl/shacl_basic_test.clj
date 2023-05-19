@@ -691,8 +691,8 @@
           (is (str/starts-with? (ex-message db-string)
                                 "SHACL PropertyShape exception - sh:minExclusive: value 10")))))))
 
-(deftest ^:integration shacl-string-constraints
-  (testing "shacl string constraint errors"
+(deftest ^:integration shacl-string-length-constraints
+  (testing "shacl string length constraint errors"
     (let [conn       (test-utils/create-conn)
           ledger     @(fluree/create conn "shacl/str" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
@@ -758,3 +758,61 @@
                :rdf/type    [:ex/User],
                :schema/name 12345}]
              @(fluree/query db-ok-non-str user-query))))))
+
+(deftest ^:integration shacl-string-pattern-constraints
+  (testing "shacl string regex constraint errors"
+    (let [conn           (test-utils/create-conn)
+          ledger         @(fluree/create conn "shacl/str" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query     {:select {'?s [:*]}
+                          :where  [['?s :rdf/type :ex/User]]}
+          db             @(fluree/stage
+                            (fluree/db ledger)
+                            {:id             :ex/UserShape
+                             :type           [:sh/NodeShape]
+                             :sh/targetClass :ex/User
+                             :sh/property    [{:sh/path    :ex/greeting
+                                               :sh/pattern "hello.*"}
+                                              {:sh/path    :ex/birthYear
+                                               :sh/pattern "(19|20)[0-9][0-9]"}]})
+          db-ok-greeting @(fluree/stage
+                            db
+                            {:id          :ex/brian,
+                             :type        :ex/User,
+                             :ex/greeting "hello!"})
+
+          db-ok-birthyear        @(fluree/stage
+                                    db
+                                    {:id           :ex/john,
+                                     :type         :ex/User,
+                                     :ex/birthYear 1984})
+          db-wrong-case-greeting (try
+                                   @(fluree/stage
+                                      db
+                                      {:id          :ex/alice
+                                       :type        :ex/User,
+                                       :ex/greeting "HELLO!"})
+                                   (catch Exception e e))
+          db-wrong-birth-year    (try
+                                   @(fluree/stage
+                                      db
+                                      {:id           :ex/alice
+                                       :type         :ex/User,
+                                       :ex/birthYear 1776})
+                                   (catch Exception e e))]
+      (is (util/exception? db-wrong-case-greeting)
+          "Exception, because :ex/greeting does not match pattern")
+      (is (str/starts-with? (ex-message db-wrong-case-greeting)
+                            "SHACL PropertyShape exception - sh:pattern"))
+
+      (is (util/exception? db-wrong-birth-year)
+          "Exception, because :ex/birthYear does not match pattern")
+      (is (str/starts-with? (ex-message db-wrong-birth-year)
+                            "SHACL PropertyShape exception - sh:pattern"))
+      (is (= [{:id          :ex/brian,
+               :rdf/type    [:ex/User],
+               :ex/greeting "hello!"}]
+             @(fluree/query db-ok-greeting user-query)))
+      (is (= [{:id           :ex/john
+               :rdf/type     [:ex/User],
+               :ex/birthYear 1984}]
+             @(fluree/query db-ok-birthyear user-query))))))

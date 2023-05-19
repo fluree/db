@@ -103,8 +103,9 @@
 (defn validate-property
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
-  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive logical-constraint min-length max-length] :as _p-shape}
+  [{:keys [min-count max-count min-inclusive min-exclusive
+           max-inclusive max-exclusive logical-constraint
+           min-length max-length pattern] :as _p-shape}
    p-flakes]
   (cond
     (or min-count max-count)
@@ -158,6 +159,20 @@
                            (if (and max-length (< max-length str-length))
                              [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
                              [true (when max-length (str "sh:not sh:maxLength value: " str-val " must have string length greater than " max-length))])]]
+                      (coalesce-validation-results flake-results logical-constraint)))]
+      (coalesce-validation-results results))
+
+    pattern
+    (let [results (for [flake p-flakes
+                        :let [[val dt] (flake-value flake)
+                              str-val  (if (= const/$xsd:string dt)
+                                         val
+                                         (str val))]]
+                    (let [matches? (some? (re-matches pattern str-val))
+                          flake-results
+                          [(if-not matches?
+                             [false (str "sh:pattern: value " str-val " does not match pattern \"" pattern "\"")]
+                             [true (when pattern (str "sh:not sh:pattern: value " str-val " must not match pattern \"" pattern "\""))])]]
                       (coalesce-validation-results flake-results logical-constraint)))]
       (coalesce-validation-results results))))
 
