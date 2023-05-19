@@ -750,11 +750,11 @@
           "Exception, because :schema/name is longer than maximum string length")
       (is (str/starts-with? (ex-message db-too-long-non-str)
                             "SHACL PropertyShape exception - sh:maxLength"))
-      (is (= @(fluree/query db-ok-str user-query)
-             [{:id          :ex/john,
+      (is (= [{:id          :ex/john,
                :rdf/type    [:ex/User],
-               :schema/name "John"}]))
-      (is (= @(fluree/query db-ok-non-str user-query)
-             [{:id          :ex/john,
+               :schema/name "John"}]
+             @(fluree/query db-ok-str user-query)))
+      (is (= [{:id          :ex/john,
                :rdf/type    [:ex/User],
-               :schema/name 12345}])))))
+               :schema/name 12345}]
+             @(fluree/query db-ok-non-str user-query))))))
