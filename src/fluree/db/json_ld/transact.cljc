@@ -349,7 +349,7 @@
               (let [all-flakes (if new?
                                  s-flakes
                                  (<? (query-range/index-range root-db :spot = [sid])))]
-                (<? (shacl/validate-target root-db shacl all-flakes))))
+                (<? (shacl/validate-target shacl all-flakes))))
             (recur r (into all-classes classes)))
           (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
                                (contains? all-classes const/$sh:PropertyShape))]

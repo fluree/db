@@ -70,6 +70,10 @@
           "http://www.w3.org/ns/shacl#minInclusive"             const/$sh:minInclusive
           "http://www.w3.org/ns/shacl#maxExclusive"             const/$sh:maxExclusive
           "http://www.w3.org/ns/shacl#maxInclusive"             const/$sh:maxInclusive
+          "http://www.w3.org/ns/shacl#not"                      const/$sh:not
+          "http://www.w3.org/ns/shacl#and"                      const/$sh:and
+          "http://www.w3.org/ns/shacl#or"                       const/$sh:or
+          "http://www.w3.org/ns/shacl#xone"                     const/$sh:xone
           ;; fluree
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context
           const/iri-default-context                             const/$fluree:default-context}))

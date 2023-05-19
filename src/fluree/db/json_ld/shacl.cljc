@@ -85,87 +85,143 @@
   [flake]
   [(flake/o flake) (flake/dt flake)])
 
+(defn coalesce-validation-results
+  ([results] (coalesce-validation-results results nil))
+  ([results logical-constraint]
+   (log/debug "coalesce-validation-results results:" results)
+   (let [results-map   (reduce (fn [acc [valid? err-msg]]
+                                 (if err-msg
+                                   (update acc (-> valid? str keyword) conj err-msg)
+                                   acc))
+                               {} results)
+         short-circuit (if (= :not logical-constraint) :true :false)
+         err-msgs      (get results-map short-circuit)]
+     (if (empty? err-msgs)
+       [true]
+       [false (str/join "; " err-msgs)]))))
+
 (defn validate-property
-  "Validates a PropertyShape for a single predicate
-  against a set of flakes"
-  [{:keys [min-count max-count node-kind min-inclusive min-exclusive max-inclusive max-exclusive]} p-flakes]
-  (when (or min-count max-count)
-    (let [n (count p-flakes)]
-      (when (and min-count
-                 (> min-count n))
-        (throw-property-shape-exception! (str "sh:minCount of " min-count " higher than actual count of " n)))
-      (when (and max-count
-                 (> n max-count))
-        (throw-property-shape-exception! (str "sh:maxCount of " max-count " lower than actual count of " n)))))
-  (when (or min-inclusive
-            min-exclusive
-            max-inclusive
-            max-exclusive)
-    (doseq [flake p-flakes
-            :let [[val dt] (flake-value flake)
-                  non-numeric-val? (not (contains? numeric-types dt))]]
+  "Validates a PropertyShape for a single predicate against a set of flakes.
+  Returns a tuple of [valid? error-msg]."
+  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
+           max-exclusive logical-constraint] :as _p-shape}
+   p-flakes]
+  (cond
+    (or min-count max-count)
+    (let [n          (count p-flakes)
+          min-result (if (and min-count
+                              (> min-count n))
+                       [false (str "sh:minCount of " min-count " higher than actual count of " n)]
+                       [true (when min-count (str "sh:not sh:minCount of " min-count " requires lower count but actual count was " n))])
+          max-result (if (and max-count
+                              (> n max-count))
+                       [false (str "sh:maxCount of " max-count " lower than actual count of " n)]
+                       [true (when max-count (str "sh:not sh:maxCount of " max-count " requires higher count but actual count was " n))])
+          results    [min-result max-result]]
+      (coalesce-validation-results results logical-constraint))
 
-      (when (and min-inclusive (or non-numeric-val? (< val min-inclusive)))
-        (throw-property-shape-exception! (str "sh:minInclusive: value " val " is either non-numeric or lower than minimum of " min-inclusive)))
+    (or min-inclusive min-exclusive max-inclusive max-exclusive)
+    (let [results (for [flake p-flakes
+                        :let [[val dt] (flake-value flake)
+                              non-numeric-val? (not (contains? numeric-types dt))]]
+                    (let [flake-results
+                          [(if (and min-inclusive (or non-numeric-val? (< val min-inclusive)))
+                             [false (str "sh:minInclusive: value " val " is either non-numeric or lower than minimum of " min-inclusive)]
+                             [true (when min-inclusive (str "sh:not sh:minInclusive: value " val " must be less than " min-inclusive))])
 
-      (when (and min-exclusive (or non-numeric-val? (<= val min-exclusive)))
-        (throw-property-shape-exception! (str "sh:minExclusive: value " val " is either non-numeric or lower than exclusive minimum of " min-exclusive)))
+                           (if (and min-exclusive (or non-numeric-val? (<= val min-exclusive)))
+                             [false (str "sh:minExclusive: value " val " is either non-numeric or lower than exclusive minimum of " min-exclusive)]
+                             [true (when min-exclusive (str "sh:not sh:minExclusive: value " val " must be less than or equal to " min-exclusive))])
 
-      (when (and max-inclusive (or non-numeric-val? (> val max-inclusive)))
-        (throw-property-shape-exception! (str "sh:maxInclusive: value " val " is either non-numeric or higher than maximum of " max-inclusive)))
+                           (if (and max-inclusive (or non-numeric-val? (> val max-inclusive)))
+                             [false (str "sh:maxInclusive: value " val " is either non-numeric or higher than maximum of " max-inclusive)]
+                             [true (when max-inclusive (str "sh:not sh:maxInclusive: value " val " must be greater than " max-inclusive))])
 
-      (when (and max-exclusive (or non-numeric-val? (>= val max-exclusive)))
-        (throw-property-shape-exception! (str "sh:maxExclusive: value " val " is either non-numeric or higher than exclusive maximum of " max-exclusive))))))
+                           (if (and max-exclusive (or non-numeric-val? (>= val max-exclusive)))
+                             [false (str "sh:maxExclusive: value " val " is either non-numeric or higher than exclusive maximum of " max-exclusive)]
+                             [true (when max-exclusive (str "sh:not sh:maxExclusive: value " val " must be greater than or equal to " max-exclusive))])]]
+                      (coalesce-validation-results flake-results logical-constraint)))]
+      (log/debug "value range results:" results)
+      (coalesce-validation-results results))))
 
 
 (defn validate-pair-property
-  "Validates a PropertyShape that compares values
-  for a pair of predicates."
-  [{:keys [pair-constraint] :as _p-shape} lhs-flakes rhs-flakes]
+  "Validates a PropertyShape that compares values for a pair of predicates.
+  Returns a tuple of [valid? error-msg]."
+  [{:keys [pair-constraint logical-constraint] :as _p-shape} lhs-flakes rhs-flakes]
   (case pair-constraint
 
-    (:equals :disjoint) (let [lhs-values (into #{} (map flake-value) lhs-flakes)
-                              rhs-values (into #{} (map flake-value) rhs-flakes)]
-                          (case pair-constraint
-                            :equals
-                            (when (not= lhs-values rhs-values)
-                              (throw-property-shape-exception!
-                               (str "sh:equals: " (mapv flake/o lhs-flakes) " not equal to " (mapv flake/o rhs-flakes))))
-                            :disjoint
-                            (when (seq (set/intersection lhs-values rhs-values))
-                              (throw-property-shape-exception!
-                               (str "sh:disjoint: " (mapv flake/o lhs-flakes) " not disjoint from " (mapv flake/o rhs-flakes))))))
+    (:equals :disjoint)
+    (let [lhs-values (into #{} (map flake-value) lhs-flakes)
+          rhs-values (into #{} (map flake-value) rhs-flakes)]
+      (case pair-constraint
+        :equals
+        (if (not= lhs-values rhs-values)
+          [(= :not logical-constraint)
+           (str "sh:equals: "
+                (mapv flake/o lhs-flakes)
+                " not equal to "
+                (mapv flake/o rhs-flakes))]
+          [(not= :not logical-constraint)
+           (str "sh:not sh:equals: "
+                (mapv flake/o lhs-flakes)
+                " is required to be not equal to "
+                (mapv flake/o rhs-flakes))])
+        :disjoint
+        (if (seq (set/intersection lhs-values rhs-values))
+          [(= :not logical-constraint)
+           (str "sh:disjoint: "
+                (mapv flake/o lhs-flakes)
+                " not disjoint from "
+                (mapv flake/o rhs-flakes))]
+          [(not= :not logical-constraint)
+           (str "sh:not sh:disjoint: "
+                (mapv flake/o lhs-flakes)
+                " is disjoint from "
+                (mapv flake/o rhs-flakes))])))
 
-    (:lessThan :lessThanOrEquals) (let [allowed-cmp-results (cond-> #{-1}
-                                                              (= pair-constraint :lessThanOrEquals) (conj 0))
-                                        valid-cmp-types (into numeric-types time-types)]
-                                    (doseq [l-flake lhs-flakes
-                                            r-flake rhs-flakes
-                                            :let [[l-flake-o l-flake-dt] (flake-value l-flake)
-                                                  [r-flake-o r-flake-dt] (flake-value r-flake)]]
-                                      (when (or (not= l-flake-dt
-                                                      r-flake-dt)
-                                                (not (contains? valid-cmp-types l-flake-dt))
-                                                (not (contains? allowed-cmp-results
-                                                                (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt))))
-                                        (throw-property-shape-exception!
-                                         (str "sh" pair-constraint ": " l-flake-o " not less than "
-                                              (when (= pair-constraint :lessThanOrEquals) "or equal to ")
-                                              r-flake-o ", or values are not valid for comparison")))))))
+    (:lessThan :lessThanOrEquals)
+    (let [allowed-cmp-results (cond-> #{-1}
+                                      (= pair-constraint :lessThanOrEquals) (conj 0))
+          valid-cmp-types     (into numeric-types time-types)
+          results             (for [l-flake lhs-flakes
+                                    r-flake rhs-flakes
+                                    :let [[l-flake-o l-flake-dt] (flake-value l-flake)
+                                          [r-flake-o r-flake-dt] (flake-value r-flake)]]
+                                (if (or (not= l-flake-dt
+                                              r-flake-dt)
+                                        (not (contains? valid-cmp-types l-flake-dt))
+                                        (not (contains? allowed-cmp-results
+                                                        (flake/cmp-obj l-flake-o l-flake-dt r-flake-o r-flake-dt))))
+                                  [false
+                                   (str "sh" pair-constraint ": " l-flake-o " not less than "
+                                        (when (= pair-constraint :lessThanOrEquals) "or equal to ")
+                                        r-flake-o ", or values are not valid for comparison")]
+                                  [true
+                                   (str "sh:not sh" pair-constraint ": " l-flake-o " is less than "
+                                        (when (= pair-constraint :lessThanOrEquals) "or equal to ")
+                                        r-flake-o)]))]
+      (coalesce-validation-results results logical-constraint))))
 
 (defn validate-shape
-  [{:keys [property closed-props] :as shape} flake-p-partitions all-flakes]
+  [{:keys [property closed-props] :as shape}
+   flake-p-partitions all-flakes]
+  (log/debug "validate-shape shape:" shape)
   (loop [[p-flakes & r] flake-p-partitions
          required (:required shape)]
     (if p-flakes
       (let [pid      (flake/p (first p-flakes))
             p-shapes (get property pid)
-            error?   (some (fn [p-shape]
-                             (if-let [rhs-property (:rhs-property p-shape)]
-                               (let [rhs-flakes (filter #(= rhs-property (flake/p %)) all-flakes)]
-                                 (validate-pair-property p-shape p-flakes rhs-flakes))
-                               (validate-property p-shape p-flakes)))
-                           p-shapes)]
+            results  (map (fn [p-shape]
+                           (if-let [rhs-property (:rhs-property p-shape)]
+                             (let [rhs-flakes (filter #(= rhs-property (flake/p %)) all-flakes)]
+                               (validate-pair-property p-shape p-flakes rhs-flakes))
+                             (validate-property p-shape p-flakes)))
+                          p-shapes)
+            _ (log/debug "validate-shape results:" results)
+            [valid? err-msg] (coalesce-validation-results results)]
+        (when (not valid?)
+          (throw-property-shape-exception! err-msg))
         (when closed-props
           (when-not (closed-props pid)
             (throw (ex-info (str "SHACL shape is closed, property: " pid
@@ -179,7 +235,7 @@
 
 (defn validate-target
   "Some new flakes don't need extra validation."
-  [db {:keys [shapes datatype] :as shape-map} all-flakes]
+  [{:keys [shapes] :as _shape-map} all-flakes]
   (go-try
    (let [flake-p-partitions (partition-by flake/p all-flakes)]
      (doseq [shape shapes]
@@ -202,7 +258,7 @@
 
           const/$sh:minCount
           (cond-> (assoc acc :min-count o)
-                  (>= o 1) (assoc :required? true))         ;; min-count >= 1 means property is required
+                  (>= o 1) (assoc :required? true)) ; min-count >= 1 means property is required
 
           const/$sh:maxCount
           (assoc acc :max-count o)
@@ -270,6 +326,12 @@
           acc)))
     {}
     property-flakes))
+
+(defn build-not-shape
+  [property-flakes]
+  (-> property-flakes
+      build-property-shape
+      (assoc :logical-constraint :not, :required? false)))
 
 ;; TODO - pass along additional shape metadata to provided better error message.
 (defn register-datatype
@@ -400,9 +462,13 @@
                                  (if flake
                                    (let [p (flake/p flake)
                                          o (flake/o flake)]
-                                     (if (= const/$sh:property p)
-                                       (let [{:keys [path] :as property-shape} (-> (<? (query-range/index-range db :spot = [o]))
-                                                                                   (build-property-shape))
+                                     (if (#{const/$sh:property const/$sh:not} p)
+                                       (let [flakes (<? (query-range/index-range db :spot = [o]))
+                                             {:keys [path] :as property-shape} (condp = p
+                                                                                 const/$sh:property
+                                                                                 (build-property-shape flakes)
+                                                                                 const/$sh:not
+                                                                                 (build-not-shape flakes))
                                              ;; we key the property shapes map with the property subj id (sh:path)
                                              p-shapes*      (update p-shapes path util/conjv property-shape)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs

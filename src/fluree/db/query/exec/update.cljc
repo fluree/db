@@ -1,5 +1,6 @@
 (ns fluree.db.query.exec.update
   (:require [fluree.db.flake :as flake]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.core :refer [try* catch*]]
@@ -19,10 +20,18 @@
           (match-component c solution))
         pattern))
 
+(defn iri-mapping?
+  [flake]
+  (= const/$xsd:anyURI (flake/p flake)))
+
 (defn retract-triple
   [db triple t solution fuel-tracker error-ch]
-  (let [retract-xf (map (fn [f]
-                          (flake/flip-flake f t)))
+  (let [retract-xf (keep (fn [f]
+                           ;;do not retract the flakes which map subject ids to iris.
+                           ;;they are an internal optimization, which downstream code
+                           ;;(eg the commit pipeline) relies on
+                           (when-not (iri-mapping? f)
+                             (flake/flip-flake f t))))
         matched    (match-solution triple solution)]
     (where/resolve-flake-range db fuel-tracker retract-xf error-ch matched)))
 
