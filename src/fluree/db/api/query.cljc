@@ -79,7 +79,10 @@
   "Return a summary of the changes over time, optionally with the full commit details included."
   [db query-map]
   (go-try
-   (let [coerced-query (try*
+   (let [{query-map :subject, issuer :issuer}
+         (or (<? (cred/verify query-map))
+             {:subject query-map})
+         coerced-query (try*
                         (history/coerce-history-query query-map)
                         (catch* e
                           (throw
@@ -145,7 +148,9 @@
            - errors - map of query alias to their respective error"
   [source flureeQL]
   (go-try
-   (let [global-opts         (:opts flureeQL)
+   (let [{flureeQL :subject, issuer :issuer} (or (<? (cred/verify flureeQL))
+                                                 {:subject flureeQL})
+         global-opts         (:opts flureeQL)
          db                  (if-let [policy-opts (perm/policy-opts global-opts)]
                                (<? (perm/wrap-policy source policy-opts))
                                source)

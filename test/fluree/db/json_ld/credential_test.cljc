@@ -2,7 +2,10 @@
   (:require [fluree.db.json-ld.credential :as cred]
             [clojure.core.async :as async]
             #?(:clj [clojure.test :as t :refer [deftest testing is]]
-               :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])))
+               :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.test-utils :as test-utils]))
 
 (def auth
   {:id "did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh"
@@ -96,6 +99,53 @@
                   (let [non-cred example-cred-subject]
                     (is (nil? (async/<! (cred/verify non-cred))))
                     (done)))))))
+
+#?(:clj
+   (deftest ^:integration cred-wrapped-transactions-and-queries
+     (let [conn   @(fluree/connect {:method :memory})
+           ledger @(fluree/create conn "credentialtest" {:defaultContext {"@base" "ledger:credentialtest/" "@vocab" ""}})
+           db0    (fluree/db ledger)
+
+           tx  {"@id" "dan" "name" "Daniel" "favnums" [1 2 3]}
+           db1 @(test-utils/transact ledger (async/<!! (cred/generate tx (:private auth))))
+
+           mdfn {"delete" [["?s" "name" "Daniel"]
+                           ["?s" "favnums" 1]]
+                 "insert" [["?s" "name" "D"]
+                           ["?s" "favnums" 4]
+                           ["?s" "favnums" 5]
+                           ["?s" "favnums" 6]]
+                 "where"  [["?s" "@id" "dan"]]}
+           db2  @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
+
+           query {"select" {"?s" ["*"]} "where" [["?s" "@id" "dan"]]}]
+
+       (is (= [tx]
+              @(fluree/query db1 query))
+           "insert transaction credential")
+       (is (= [{"@id" "dan" "name" "D" "favnums" [2 3 4 5 6]}]
+              @(fluree/query db2 query))
+           "modify transaction credential")
+
+       (is (= [{"@id" "dan" "name" "D" "favnums" [2 3 4 5 6]}]
+              @(fluree/query db2 (async/<!! (cred/generate query (:private auth)))))
+           "query credential")
+
+       (is (= {"nums" [2 3 4 5 6],
+               "dan" [{"@id" "dan", "name" "D", "favnums" [2 3 4 5 6]}]}
+              @(fluree/multi-query db2
+                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]} "dan" query}
+                                                             (:private auth)))))
+           "multiquery credential")
+       (is (= [{"https://ns.flur.ee/ledger#t" 1,
+                "https://ns.flur.ee/ledger#assert" [{"@id" "dan", "name" "Daniel", "favnums" [1 2 3], :id "dan"}],
+                "https://ns.flur.ee/ledger#retract" []}
+
+               {"https://ns.flur.ee/ledger#t" 2,
+                "https://ns.flur.ee/ledger#assert"  [{"name" "D", "favnums" [4 5 6], :id "dan"}],
+                "https://ns.flur.ee/ledger#retract" [{"name" "Daniel", "favnums" 1, :id "dan"}]}]
+              @(fluree/history ledger (async/<!! (cred/generate {:history "dan" :t {:from 1}} (:private auth)))))
+           "history query credential"))))
 
 (comment
   #?(:cljs
