@@ -154,12 +154,12 @@
                           flake-results
                           [(if (and min-length (> min-length str-length))
                              [false (str "sh:minLength: value " str-val " has string length smaller than minimum: " min-length)]
-                             [true (when min-length (str "sh:not sh:minLength value: " str-val " must have string length less than " str-length))])
+                             [true (when min-length (str "sh:not sh:minLength value: " str-val " must have string length less than " min-length))])
                            (if (and max-length (< max-length str-length))
                              [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
-                             [true (when max-length (str "sh:not sh:maxLength value: " str-val " must have string length larger than " str-length))])]]
+                             [true (when max-length (str "sh:not sh:maxLength value: " str-val " must have string length greater than " max-length))])]]
                       (coalesce-validation-results flake-results logical-constraint)))]
-      (coalesce-validation-results results logical-constraint))))
+      (coalesce-validation-results results))))
 
 
 
