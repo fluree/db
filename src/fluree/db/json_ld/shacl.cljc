@@ -100,50 +100,57 @@
        [true]
        [false (str/join "; " err-msgs)]))))
 
+(defn validate-count-properties
+  [{:keys [min-count max-count logical-constraint] :as _p-shape} p-flakes]
+  (let [n          (count p-flakes)
+        min-result (if (and min-count (> min-count n))
+                     [false (str "sh:minCount of " min-count " higher than actual count of " n)]
+                     [true (when min-count (str "sh:not sh:minCount of " min-count " requires lower count but actual count was " n))])
+        max-result (if (and max-count (> n max-count))
+                     [false (str "sh:maxCount of " max-count " lower than actual count of " n)]
+                     [true (when max-count (str "sh:not sh:maxCount of " max-count " requires higher count but actual count was " n))])
+        results    [min-result max-result]]
+    (coalesce-validation-results results logical-constraint)))
+
+(defn validate-value-range-properties
+  [{:keys [min-inclusive min-exclusive max-inclusive max-exclusive
+           logical-constraint] :as _p-shape} p-flakes]
+  (let [results (for [flake p-flakes
+                      :let [[val dt] (flake-value flake)
+                            non-numeric-val? (not (contains? numeric-types dt))]]
+                  (let [flake-results
+                        [(if (and min-inclusive (or non-numeric-val? (< val min-inclusive)))
+                           [false (str "sh:minInclusive: value " val " is either non-numeric or lower than minimum of " min-inclusive)]
+                           [true (when min-inclusive (str "sh:not sh:minInclusive: value " val " must be less than " min-inclusive))])
+
+                         (if (and min-exclusive (or non-numeric-val? (<= val min-exclusive)))
+                           [false (str "sh:minExclusive: value " val " is either non-numeric or lower than exclusive minimum of " min-exclusive)]
+                           [true (when min-exclusive (str "sh:not sh:minExclusive: value " val " must be less than or equal to " min-exclusive))])
+
+                         (if (and max-inclusive (or non-numeric-val? (> val max-inclusive)))
+                           [false (str "sh:maxInclusive: value " val " is either non-numeric or higher than maximum of " max-inclusive)]
+                           [true (when max-inclusive (str "sh:not sh:maxInclusive: value " val " must be greater than " max-inclusive))])
+
+                         (if (and max-exclusive (or non-numeric-val? (>= val max-exclusive)))
+                           [false (str "sh:maxExclusive: value " val " is either non-numeric or higher than exclusive maximum of " max-exclusive)]
+                           [true (when max-exclusive (str "sh:not sh:maxExclusive: value " val " must be greater than or equal to " max-exclusive))])]]
+                    (coalesce-validation-results flake-results logical-constraint)))]
+    (coalesce-validation-results results)))
+
 (defn validate-property
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive logical-constraint] :as _p-shape}
-   p-flakes]
-  (cond
-    (or min-count max-count)
-    (let [n          (count p-flakes)
-          min-result (if (and min-count
-                              (> min-count n))
-                       [false (str "sh:minCount of " min-count " higher than actual count of " n)]
-                       [true (when min-count (str "sh:not sh:minCount of " min-count " requires lower count but actual count was " n))])
-          max-result (if (and max-count
-                              (> n max-count))
-                       [false (str "sh:maxCount of " max-count " lower than actual count of " n)]
-                       [true (when max-count (str "sh:not sh:maxCount of " max-count " requires higher count but actual count was " n))])
-          results    [min-result max-result]]
-      (coalesce-validation-results results logical-constraint))
-
-    (or min-inclusive min-exclusive max-inclusive max-exclusive)
-    (let [results (for [flake p-flakes
-                        :let [[val dt] (flake-value flake)
-                              non-numeric-val? (not (contains? numeric-types dt))]]
-                    (let [flake-results
-                          [(if (and min-inclusive (or non-numeric-val? (< val min-inclusive)))
-                             [false (str "sh:minInclusive: value " val " is either non-numeric or lower than minimum of " min-inclusive)]
-                             [true (when min-inclusive (str "sh:not sh:minInclusive: value " val " must be less than " min-inclusive))])
-
-                           (if (and min-exclusive (or non-numeric-val? (<= val min-exclusive)))
-                             [false (str "sh:minExclusive: value " val " is either non-numeric or lower than exclusive minimum of " min-exclusive)]
-                             [true (when min-exclusive (str "sh:not sh:minExclusive: value " val " must be less than or equal to " min-exclusive))])
-
-                           (if (and max-inclusive (or non-numeric-val? (> val max-inclusive)))
-                             [false (str "sh:maxInclusive: value " val " is either non-numeric or higher than maximum of " max-inclusive)]
-                             [true (when max-inclusive (str "sh:not sh:maxInclusive: value " val " must be greater than " max-inclusive))])
-
-                           (if (and max-exclusive (or non-numeric-val? (>= val max-exclusive)))
-                             [false (str "sh:maxExclusive: value " val " is either non-numeric or higher than exclusive maximum of " max-exclusive)]
-                             [true (when max-exclusive (str "sh:not sh:maxExclusive: value " val " must be greater than or equal to " max-exclusive))])]]
-                      (coalesce-validation-results flake-results logical-constraint)))]
-      (log/debug "value range results:" results)
-      (coalesce-validation-results results))))
-
+           max-exclusive] :as p-shape} p-flakes]
+  ;; TODO: Refactor this to thread a value through via e.g. cond->
+  ;;       Should embed results and error messages and short-circuit as appropriate
+  (let [cardinality-validation (if (or min-count max-count)
+                                 (validate-count-properties p-shape p-flakes)
+                                 [true])]
+    (if (and (first cardinality-validation)
+             (or min-inclusive min-exclusive max-inclusive max-exclusive))
+      (validate-value-range-properties p-shape p-flakes)
+      cardinality-validation)))
 
 (defn validate-pair-property
   "Validates a PropertyShape that compares values for a pair of predicates.
