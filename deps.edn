@@ -64,10 +64,11 @@
 
   :cljtest
   {:extra-paths ["test" "dev-resources"]
-   :extra-deps  {lambdaisland/kaocha         {:mvn/version "1.82.1306"}
+   :extra-deps  {lambdaisland/kaocha         {:mvn/version "1.83.1314"}
                  org.clojure/test.check      {:mvn/version "1.1.1"}
                  io.github.cap10morgan/test-with-files {:git/tag "v1.0.0"
                                                         :git/sha "9181a2e"}}
+   :main-opts   ["-m" "kaocha.runner"]
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {}}
 

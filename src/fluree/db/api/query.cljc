@@ -1,7 +1,8 @@
 (ns fluree.db.api.query
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [clojure.core.async :as async]
+  (:require [clojure.core.async :as async :refer [<! go]]
+            [fluree.db.fuel :as fuel]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as fql-parse]
@@ -91,39 +92,41 @@
      (<? (history* db coerced-query)))))
 
 (defn query
-  "Execute a query against a database source, or optionally
-  additional sources if the query spans multiple data sets.
-  Returns core async channel containing result or exception."
-  [sources query]
+  "Execute a query against a database source. Returns core async channel
+  containing result or exception."
+  [db query]
   (go-try
-   (let [{query :subject, issuer :issuer}
-         (or (<? (cred/verify query))
-             {:subject query})
+    (let [{query :subject, issuer :issuer}
+          (or (<? (cred/verify query))
+              {:subject query})
 
-         {:keys [opts t]} query
-         db            (if (async-util/channel? sources) ;; only support 1 source currently
-                         (<? sources)
-                         sources)
-
-         db*           (if-let [policy-opts (perm/policy-opts opts)]
-                         (<? (perm/wrap-policy db policy-opts))
-                         db)
-
-         db**          (-> (if t
-                             (<? (time-travel/as-of db* t))
-                             db*)
-                           (assoc-in [:policy :cache] (atom {})))
-         opts*         (-> opts
-                           (assoc :issuer issuer)
-                           (dissoc :meta))
-         start #?(:clj (System/nanoTime)
-                  :cljs (util/current-time-millis))
-         result        (<? (fql/query db** (assoc query :opts opts*)))]
-     (if (:meta opts)
-       {:status 200
-        :result result
-        :time   (util/response-time-formatted start)}
-       result))))
+          {:keys [opts t]} query
+          db*              (if-let [policy-opts (perm/policy-opts opts)]
+                             (<? (perm/wrap-policy db policy-opts))
+                             db)
+          db**             (-> (if t
+                                 (<? (time-travel/as-of db* t))
+                                 db*)
+                               (assoc-in [:policy :cache] (atom {})))
+          query*           (-> query
+                               (update :opts assoc :issuer issuer)
+                               (update :opts dissoc :meta))
+          start            #?(:clj  (System/nanoTime)
+                              :cljs (util/current-time-millis)) ]
+      (if (:meta opts)
+        (let [fuel-tracker (fuel/tracker)]
+          (try* (let [result (<? (fql/query db** fuel-tracker query*))]
+                  {:status 200
+                   :result result
+                   :time   (util/response-time-formatted start)
+                   :fuel   (fuel/tally fuel-tracker)})
+                (catch* e
+                  (throw (ex-info "Error executing query"
+                                  {:status (-> e ex-data :status)
+                                   :time   (util/response-time-formatted start)
+                                   :fuel   (fuel/tally fuel-tracker)}
+                                  e)))))
+        (<? (fql/query db** query*))))))
 
 (defn multi-query
   "Performs multiple queries in a map, with the key being the alias for the query
