@@ -121,11 +121,11 @@
                    :time   (util/response-time-formatted start)
                    :fuel   (fuel/tally fuel-tracker)})
                 (catch* e
-                        (ex-info "Error executing query"
-                                 {:status (-> e ex-data :status)
-                                  :time   (util/response-time-formatted start)
-                                  :fuel   (fuel/tally fuel-tracker)}
-                                 e))))
+                  (throw (ex-info "Error executing query"
+                                  {:status (-> e ex-data :status)
+                                   :time   (util/response-time-formatted start)
+                                   :fuel   (fuel/tally fuel-tracker)}
+                                  e)))))
         (<? (fql/query db** query*))))))
 
 (defn multi-query
