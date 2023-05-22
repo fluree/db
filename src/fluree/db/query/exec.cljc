@@ -1,7 +1,6 @@
 (ns fluree.db.query.exec
   "Find and format results of queries against database values."
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.fuel :as fuel]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.group :as group]
@@ -47,10 +46,9 @@
   "Execute the parsed query `q` against the database value `db`. Returns an async
   channel which will eventually contain a single vector of results, or an
   exception if there was an error."
-  [db q]
+  [db fuel-tracker q]
   (go
     (let [error-ch     (async/chan)
-          fuel-tracker (fuel/tracker)
           result-ch    (->> (where/search db q fuel-tracker error-ch)
                             (group/combine q)
                             (having/filter q error-ch)
@@ -60,9 +58,5 @@
                             (take-limit q)
                             (collect-results q))]
       (async/alt!
-        error-ch  ([e]
-                   (fuel/tally fuel-tracker {::error e})
-                   e)
-        result-ch ([result]
-                   (fuel/tally fuel-tracker {::result result})
-                   result)))))
+        error-ch  ([e] e)
+        result-ch ([result] result)))))

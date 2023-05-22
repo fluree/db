@@ -23,8 +23,7 @@
          (rf result))))))
 
 (defn tally
-  [trkr result]
-  (let [total (reduce (fn [total ctr]
-                        (+ total @ctr))
-                      0 @trkr)]
-    (assoc result ::total total)))
+  [trkr]
+  (reduce (fn [total ctr]
+            (+ total @ctr))
+          0 @trkr))

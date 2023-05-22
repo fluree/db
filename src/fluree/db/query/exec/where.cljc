@@ -53,10 +53,11 @@
                    novelty     (get-in db [:novelty idx])
                    start-flake (flake/create s* p o* o-dt* nil nil util/min-integer)
                    end-flake   (flake/create s* p o* o-dt* nil nil util/max-integer)
-                   track-fuel  (fuel/track fuel-tracker)
-                   flake-xf*   (if flake-xf
-                                 (comp flake-xf track-fuel)
-                                 track-fuel)
+                   track-fuel  (when fuel-tracker
+                                 (fuel/track fuel-tracker))
+                   flake-xf*   (->> [flake-xf track-fuel]
+                                    (remove nil?)
+                                    (apply comp))
                    opts        (cond-> {:idx         idx
                                         :from-t      t
                                         :to-t        t
