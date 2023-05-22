@@ -40,8 +40,6 @@
 ;; - have a set of allowed and reject if not in the list
 ;; - set includes all properties from above + ignoredProperties
 
-;; sh:pattern - assume datatype xsd:string if not specified
-
 
 (defn apply-flake-changes
   [existing-flakes changed-flakes]
@@ -369,7 +367,7 @@
 ;; TODO - pass along additional shape metadata to provided better error message.
 (defn register-datatype
   "Optimization to elevate data types to top of shape for easy coersion when processing transactions"
-  [{:keys [dt validate-fn] :as dt-map} {:keys [datatype pattern path] :as property-shape}]
+  [{:keys [dt validate-fn] :as dt-map} {:keys [datatype path] :as property-shape}]
   (when (and dt
              (not= dt
                    datatype))
@@ -377,22 +375,8 @@
                          " has multiple conflicting datatype declarations of: "
                          dt " and " datatype ".")
                     {:status 400 :error :db/shacl-validation})))
-  (when (and pattern
-             (not= const/$xsd:string datatype))
-    (log/warn (str "SHACL PropertyShape defines a pattern, " pattern
-                   " however the datatype defined is not xsd:string."
-                   " Ignoring pattern for validation.")))
-  (if pattern
-    (if validate-fn
-      {:dt          datatype
-       :validate-fn (fn [x]
-                      (when (re-matches pattern x)
-                        ;; if prior condition fails, return falsey and stop evaluation
-                        (validate-fn x)))}
-      {:dt          datatype
-       :validate-fn (fn [x] (re-matches pattern x))})
-    {:dt          datatype
-     :validate-fn validate-fn}))
+  {:dt          datatype
+   :validate-fn validate-fn})
 
 (defn register-nodetype
   "Optimization to elevate node type designations"
