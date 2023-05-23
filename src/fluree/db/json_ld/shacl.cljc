@@ -170,16 +170,21 @@
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive] :as p-shape} p-flakes]
+           max-exclusive min-length max-length pattern] :as p-shape} p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
   ;;       Should embed results and error messages and short-circuit as appropriate
-  (let [cardinality-validation (if (or min-count max-count)
-                                 (validate-count-properties p-shape p-flakes)
-                                 [true])]
-    (if (and (first cardinality-validation)
-             (or min-inclusive min-exclusive max-inclusive max-exclusive))
-      (validate-value-range-properties p-shape p-flakes)
-      cardinality-validation)))
+  (let [validation (if (or min-count max-count)
+                     (validate-count-properties p-shape p-flakes)
+                     [true])
+        validation (if (and (first validation)
+                            (or min-inclusive min-exclusive max-inclusive max-exclusive))
+                     (validate-value-range-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation)
+                            (or min-length max-length pattern))
+                     (validate-string-properties p-shape p-flakes)
+                     validation)]
+    validation))
 
 (defn validate-pair-property
   "Validates a PropertyShape that compares values for a pair of predicates.
