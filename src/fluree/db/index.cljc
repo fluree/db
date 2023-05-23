@@ -121,7 +121,6 @@
    :first flake/maximum
    :rhs nil
    :size 0
-   :block 0
    :t 0
    :leftmost? true})
 
@@ -175,7 +174,6 @@
      :rhs nil
      :children children
      :size 0
-     :block 0
      :t 0
      :leftmost? true}))
 

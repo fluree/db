@@ -452,7 +452,7 @@
 
 (defn refresh
   [indexer
-   {:keys [ecount novelty block t network ledger-id] :as db}
+   {:keys [ecount novelty t network ledger-id] :as db}
    {:keys [remove-preds changes-ch]}]
   (go-try
     (let [start-time-ms (util/current-time-millis)
@@ -460,7 +460,6 @@
           init-stats    {:network      network
                          :ledger-id    ledger-id
                          :t            t
-                         :block        block
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]
       (if (or (dirty? db)
