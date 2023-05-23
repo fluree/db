@@ -98,12 +98,43 @@
        [true]
        [false (str/join "; " err-msgs)]))))
 
+
+(defn validate-string-properties
+  "String-based constraint components specify conditions on the string representation of values,
+  as defined the SPARQL `str` function. See:
+
+  - https://www.w3.org/TR/shacl/#core-components-string
+  - https://www.w3.org/TR/sparql11-query/#func-str
+
+  Therefore, we transform the value to a string (if it isn't one already)
+  before performing validation."
+  [{:keys [min-length max-length pattern logical-constraint] :as _p-shape} p-flakes]
+  (let [results (for [flake p-flakes
+                      :let [[val dt] (flake-value flake)
+                            str-val  (if (= const/$xsd:string dt)
+                                       val
+                                       (str val))]]
+                  (let [str-length (count str-val)
+                        min-length-result (if (and min-length (> min-length str-length))
+                                            [false (str "sh:minLength: value " str-val " has string length smaller than minimum: " min-length)]
+                                            [true (when min-length (str "sh:not sh:minLength: value " str-val " must have string length less than " min-length))])
+                        max-length-result (if (and max-length (< max-length str-length))
+                                            [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
+                                            [true (when max-length (str "sh:not sh:maxLength: value " str-val " must have string length greater than " max-length))])
+                        pattern-result    (if (and pattern (not (some? (re-matches pattern str-val))))
+                                            [false (str "sh:pattern: value " str-val " does not match pattern \"" pattern "\"")]
+                                            [true (when pattern (str "sh:not sh:pattern: value " str-val " must not match pattern \"" pattern "\""))])
+                        flake-results [min-length-result max-length-result pattern-result]]
+
+                    (coalesce-validation-results flake-results logical-constraint)))]
+    (coalesce-validation-results results)))
+
 (defn validate-property
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive
            max-inclusive max-exclusive logical-constraint
-           min-length max-length pattern] :as _p-shape}
+           min-length max-length pattern] :as p-shape}
    p-flakes]
   (cond
     (or min-count max-count)
@@ -142,37 +173,8 @@
                       (coalesce-validation-results flake-results logical-constraint)))]
       (log/debug "value range results:" results)
       (coalesce-validation-results results))
-
-    (or min-length max-length)
-    (let [results (for [flake p-flakes
-                        :let [[val dt] (flake-value flake)
-                              str-val  (if (= const/$xsd:string dt)
-                                         val
-                                         (str val))]]
-                    (let [str-length (count str-val)
-                          flake-results
-                          [(if (and min-length (> min-length str-length))
-                             [false (str "sh:minLength: value " str-val " has string length smaller than minimum: " min-length)]
-                             [true (when min-length (str "sh:not sh:minLength: value " str-val " must have string length less than " min-length))])
-                           (if (and max-length (< max-length str-length))
-                             [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
-                             [true (when max-length (str "sh:not sh:maxLength: value " str-val " must have string length greater than " max-length))])]]
-                      (coalesce-validation-results flake-results logical-constraint)))]
-      (coalesce-validation-results results))
-
-    pattern
-    (let [results (for [flake p-flakes
-                        :let [[val dt] (flake-value flake)
-                              str-val  (if (= const/$xsd:string dt)
-                                         val
-                                         (str val))]]
-                    (let [matches? (some? (re-matches pattern str-val))
-                          flake-results
-                          [(if-not matches?
-                             [false (str "sh:pattern: value " str-val " does not match pattern \"" pattern "\"")]
-                             [true (when pattern (str "sh:not sh:pattern: value " str-val " must not match pattern \"" pattern "\""))])]]
-                      (coalesce-validation-results flake-results logical-constraint)))]
-      (coalesce-validation-results results))))
+    (or min-length max-length pattern)
+    (validate-string-properties p-shape p-flakes)))
 
 
 
