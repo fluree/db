@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [clojure.string :as str]
-            [clojure.set :as set]))
+            [clojure.set :as set])
+  #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
   ;; a raw SHACL shape looks something like this:
@@ -98,6 +99,7 @@
        [true]
        [false (str/join "; " err-msgs)]))))
 
+
 (defn validate-string-properties
   "String-based constraint components specify conditions on the string representation of values,
   as defined the SPARQL `str` function. See:
@@ -107,8 +109,11 @@
 
   Therefore, we transform the value to a string (if it isn't one already)
   before performing validation."
-  [{:keys [min-length max-length pattern logical-constraint] :as _p-shape} p-flakes]
-  (let [results (for [flake p-flakes
+  [{:keys [min-length max-length pattern flags logical-constraint] :as _p-shape} p-flakes]
+  (let [pattern (some-> pattern
+                        #?(:clj (Pattern/compile (or flags 0))
+                           :cljs (js/RegExp. (or flags ""))))
+        results (for [flake p-flakes
                       :let [[val dt] (flake-value flake)
                             str-val  (if (= const/$xsd:string dt)
                                        val
@@ -120,7 +125,7 @@
                         max-length-result (if (and max-length (< max-length str-length))
                                             [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
                                             [true (when max-length (str "sh:not sh:maxLength: value " str-val " must have string length greater than " max-length))])
-                        pattern-result    (if (and pattern (not (some? (re-matches pattern str-val))))
+                        pattern-result    (if (and pattern (not (some? (re-find pattern str-val))))
                                             [false (str "sh:pattern: value " str-val " does not match pattern \"" pattern "\"")]
                                             [true (when pattern (str "sh:not sh:pattern: value " str-val " must not match pattern \"" pattern "\""))])
                         flake-results [min-length-result max-length-result pattern-result]]
@@ -282,6 +287,25 @@
      (doseq [shape shapes]
        (validate-shape shape flake-p-partitions all-flakes)))))
 
+
+(defn get-regex-flag
+  "Given an `sh:flag` value, returns the corresponding regex flag
+  for the current platform. If the provided flag is not found,
+  it will be ignored by validation.
+
+  Note that js does not have support for `x` or `q` flag behavior."
+  [flag]
+  #?(:clj (case flag
+            "i" Pattern/CASE_INSENSITIVE
+            "m" Pattern/MULTILINE
+            "s" Pattern/DOTALL
+            "q" Pattern/LITERAL
+            "x" Pattern/COMMENTS
+            0)
+     :cljs (if (#{"i" "m" "s"} flag)
+             flag
+             "")))
+
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
   [property-flakes]
@@ -317,13 +341,17 @@
           (assoc acc :node-kind o)
 
           const/$sh:pattern
-          (assoc acc :pattern (re-pattern o))
+          (assoc acc :pattern o)
 
           const/$sh:minLength
           (assoc acc :min-length o)
 
           const/$sh:maxLength
           (assoc acc :max-length o)
+
+          const/$sh:flags
+          #?(:clj (update acc :flags (fnil + 0) (get-regex-flag o))
+             :cljs (update acc :flags str (get-regex-flag o)))
 
           const/$sh:languageIn
           (assoc acc :language-in o)

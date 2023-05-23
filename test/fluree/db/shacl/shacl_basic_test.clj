@@ -770,14 +770,15 @@
                              :type           [:sh/NodeShape]
                              :sh/targetClass :ex/User
                              :sh/property    [{:sh/path    :ex/greeting
-                                               :sh/pattern "hello.*"}
+                                               :sh/pattern "hello   (.*?)world"
+                                               :sh/flags   ["x" "s"]}
                                               {:sh/path    :ex/birthYear
                                                :sh/pattern "(19|20)[0-9][0-9]"}]})
           db-ok-greeting @(fluree/stage
                             db
                             {:id          :ex/brian,
                              :type        :ex/User,
-                             :ex/greeting "hello!"})
+                             :ex/greeting "hello\nworld!"})
 
           db-ok-birthyear        @(fluree/stage
                                     db
@@ -789,7 +790,7 @@
                                       db
                                       {:id          :ex/alice
                                        :type        :ex/User,
-                                       :ex/greeting "HELLO!"})
+                                       :ex/greeting "HELLO\nWORLD!"})
                                    (catch Exception e e))
           db-wrong-birth-year    (try
                                    @(fluree/stage
@@ -809,7 +810,7 @@
                             "SHACL PropertyShape exception - sh:pattern"))
       (is (= [{:id          :ex/brian,
                :rdf/type    [:ex/User],
-               :ex/greeting "hello!"}]
+               :ex/greeting "hello\nworld!"}]
              @(fluree/query db-ok-greeting user-query)))
       (is (= [{:id           :ex/john
                :rdf/type     [:ex/User],

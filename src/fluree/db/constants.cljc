@@ -147,6 +147,7 @@
 (def ^:const $sh:BlankNodeOrLiteral 228)
 (def ^:const $sh:Literal 229)
 ;; string validation
+(def ^:const $sh:flags 249)
 (def ^:const $sh:minLength 230)
 (def ^:const $sh:maxLength 231)
 (def ^:const $sh:pattern 232)
