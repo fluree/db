@@ -7,14 +7,10 @@
         </encoder>
     </appender>
 
-    <root level="INFO">
+    <root level="DEBUG">
         <appender-ref ref="STDOUT"/>
     </root>
 
-    <logger name="user" level="ALL"/>
     <logger name="ch.qos.logback" level="WARN"/>
-    <logger name="fluree.db" level="TRACE"/>
-    <logger name="fluree.db.consensus" level="INFO"/>
-    <logger name="fluree.db.messaging" level="INFO"/>
 
 </configuration>

@@ -157,8 +157,7 @@
                              :schema/name  "John"
                              :schema/email "john@flur.ee"})
                           (catch Exception e e))]
-      (is (util/exception? db-extra-prop)
-          "Exception, because :schema/name is an integer and not a string.")
+      (is (util/exception? db-extra-prop))
       (is (str/starts-with? (ex-message db-extra-prop)
                             "SHACL shape is closed"))
 
@@ -816,3 +815,88 @@
                :rdf/type     [:ex/User],
                :ex/birthYear 1984}]
              @(fluree/query db-ok-birthyear user-query))))))
+
+(deftest shacl-multiple-properties-test
+  (testing "multiple properties works"
+    (let [conn         (test-utils/create-conn)
+          ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query   {:select {'?s [:*]}
+                        :where  [['?s :rdf/type :ex/User]]}
+          db           @(fluree/stage
+                         (fluree/db ledger)
+                         {:id             :ex/UserShape
+                          :type           [:sh/NodeShape]
+                          :sh/targetClass :ex/User
+                          :sh/property    [{:sh/path     :schema/name
+                                            :sh/datatype :xsd/string
+                                            :sh/minCount 1
+                                            :sh/maxCount 1}
+                                           {:sh/path         :schema/age
+                                            :sh/minCount     1
+                                            :sh/maxCount     1
+                                            :sh/minInclusive 0
+                                            :sh/maxInclusive 130}
+                                           {:sh/path     :schema/email
+                                            :sh/datatype :xsd/string}]})
+          db-ok        @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   40
+                          :schema/email "john@example.org"})
+          db-no-name   @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/age   40
+                          :schema/email "john@example.org"})
+          db-two-names @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  ["John" "Billy"]
+                          :schema/age   40
+                          :schema/email "john@example.org"})
+          db-too-old   @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   140
+                          :schema/email "john@example.org"})
+          db-two-ages  @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   [40 21]
+                          :schema/email "john@example.org"})
+          db-num-email @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   40
+                          :schema/email 42})]
+      (is (util/exception? db-no-name))
+      (is (str/starts-with? (ex-message db-no-name)
+                            "Required properties not present:"))
+      (is (util/exception? db-two-names))
+      (is (str/starts-with? (ex-message db-two-names)
+                            "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2"))
+      (is (util/exception? db-too-old))
+      (is (str/starts-with? (ex-message db-too-old)
+                            "SHACL PropertyShape exception - sh:maxInclusive: value 140 is either non-numeric or higher than maximum of 130"))
+      (is (util/exception? db-two-ages))
+      (is (str/starts-with? (ex-message db-two-ages)
+                            "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2"))
+      (is (util/exception? db-num-email))
+      (is (str/starts-with? (ex-message db-num-email)
+                            "Required data type"))
+      (is (= [{:id           :ex/john
+               :rdf/type     [:ex/User]
+               :schema/age   40
+               :schema/email "john@example.org"
+               :schema/name  "John"}]
+             @(fluree/query db-ok user-query))))))

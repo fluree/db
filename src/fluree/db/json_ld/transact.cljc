@@ -5,6 +5,7 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.flake :as flake]
+            [fluree.db.fuel :as fuel]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as cred]
@@ -380,13 +381,14 @@
 (defn modify
   [db json-ld {:keys [t] :as _tx-state}]
   (go
-    (let [mdfn      (-> json-ld
-                        syntax/coerce-modification
-                        (q-parse/parse-modification db))
-          error-ch  (async/chan)
-          update-ch (->> (where/search db mdfn error-ch)
-                         (update/modify db mdfn t error-ch)
-                         into-flakeset)]
+    (let [mdfn         (-> json-ld
+                           syntax/coerce-modification
+                           (q-parse/parse-modification db))
+          error-ch     (async/chan)
+          fuel-tracker (fuel/tracker)
+          update-ch    (->> (where/search db mdfn fuel-tracker error-ch)
+                            (update/modify db mdfn t fuel-tracker error-ch)
+                            into-flakeset)]
       (async/alt!
         error-ch  ([e] e)
         update-ch ([flakes] flakes)))))
