@@ -110,10 +110,7 @@
   Therefore, we transform the value to a string (if it isn't one already)
   before performing validation."
   [{:keys [min-length max-length pattern flags logical-constraint] :as _p-shape} p-flakes]
-  (let [pattern (some-> pattern
-                        #?(:clj (Pattern/compile (or flags 0))
-                           :cljs (js/RegExp. (or flags ""))))
-        results (for [flake p-flakes
+  (let [results (for [flake p-flakes
                       :let [[val dt] (flake-value flake)
                             str-val  (if (= const/$xsd:string dt)
                                        val
@@ -499,6 +496,15 @@
                          (into (keys property)))]
     (assoc shape :closed-props closed-props)))
 
+(defn build-pattern
+  "Builds regex pattern out of input string
+  and any flags that were provided."
+  [{:keys [:pattern :flags] :as _shape}]
+  (-> pattern
+      #?(:clj (Pattern/compile (or flags 0))
+         :cljs (js/RegExp. (or flags "")))))
+
+
 (defn build-class-shapes
   "Given a class SID, returns class shape"
   [db type-sid]
@@ -525,7 +531,10 @@
                                                                                  const/$sh:not
                                                                                  (build-not-shape flakes))
                                              ;; we key the property shapes map with the property subj id (sh:path)
-                                             p-shapes*      (update p-shapes path util/conjv property-shape)
+                                             property-shape* (if (:pattern property-shape)
+                                                               (assoc property-shape :pattern (build-pattern property-shape))
+                                                               property-shape)
+                                             p-shapes*      (update p-shapes path util/conjv property-shape*)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)
