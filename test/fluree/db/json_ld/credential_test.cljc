@@ -5,7 +5,8 @@
                :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
             [fluree.db.json-ld.api :as fluree]
             [fluree.json-ld :as json-ld]
-            [fluree.db.test-utils :as test-utils]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.did :as did]))
 
 (def auth
   {:id "did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh"
@@ -13,7 +14,7 @@
    :private "509553eece84d5a410f1012e8e19e84e938f226aa3ad144e2d12f36df0f51c1e"})
 
 (def example-cred-subject {"@context" {"a" "http://a.com/"} "a:foo" "bar"})
-(def example-issuer "did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh")
+(def example-issuer (did/encode-did-key (:public auth)))
 
 (def clj-generated-jws
   "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19..HDBFAiEA80-G5gUH6BT9D1Mc-YyWbjuwbL7nKfWj6BrsHS6whQ0CIAcjzJvo0sW52FIlgvxy0hPBKNWolIwLvoedG_4HQu_V")
@@ -25,7 +26,7 @@
   {"@context"          "https://www.w3.org/2018/credentials/v1"
    "id"                ""
    "type"              ["VerifiableCredential" "CommitProof"]
-   "issuer"            example-issuer
+   "issuer"            (:id auth)
    "issuanceDate"      "1970-01-01T00:00:00.00000Z"
    "credentialSubject" example-cred-subject
    "proof"             {"type"               "EcdsaSecp256k1RecoverySignature2020"
