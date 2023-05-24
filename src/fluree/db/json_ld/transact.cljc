@@ -76,14 +76,6 @@
                          (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
         [class-sids class-flakes]))))
 
-
-(defn- new-pid
-  "Generates a new property id (pid)"
-  [property ref? {:keys [iris next-pid refs] :as _tx-state}]
-  (let [new-id (jld-ledger/generate-new-pid property iris next-pid ref? refs)]
-    new-id))
-
-
 (defn add-property
   "Adds property. Parameters"
   [sid pid {shacl-dt :dt, validate-fn :validate-fn} check-retracts? list? {:keys [value] :as v-map}
@@ -169,7 +161,7 @@
   If property-id is non-nil, it can be checked when assigning new subject id for the node
   if it meets certain criteria. It will only be non-nil for nested subjects in the json-ld."
   [{:keys [id type] :as node}
-   {:keys [t next-pid next-sid iris db-before subj-mods] :as tx-state}
+   {:keys [t next-pid next-sid iris refs db-before subj-mods] :as tx-state}
    referring-pid]
   (go-try
     (let [existing-sid (when id
@@ -213,7 +205,7 @@
                 existing-pid     (<? (jld-reify/get-iri-sid k db-before iris))
                 pid              (or existing-pid
                                      (get jld-ledger/predefined-properties k)
-                                     (new-pid k ref? tx-state))
+                                     (jld-ledger/generate-new-pid k iris next-pid ref? refs))
                 datatype-map     (get-in shacl-map [:datatype pid])
                 property-flakes* (if existing-pid
                                    property-flakes
@@ -364,7 +356,7 @@
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
   [{:keys [t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
-  (log/debug "insert default-ctx:" default-ctx)
+  (log/trace "insert default-ctx:" default-ctx)
   (let [nodes    (-> json-ld
                      (json-ld/expand default-ctx)
                      util/sequential)
