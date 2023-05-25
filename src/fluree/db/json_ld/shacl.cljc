@@ -104,8 +104,8 @@
   "String-based constraint components specify conditions on the string representation of values,
   as defined the SPARQL `str` function. See:
 
-  - https://www.w3.org/TR/shacl/#core-components-string
-  - https://www.w3.org/TR/sparql11-query/#func-str
+    - https://www.w3.org/TR/shacl/#core-components-string
+    - https://www.w3.org/TR/sparql11-query/#func-str
 
   Therefore, we transform the value to a string (if it isn't one already)
   before performing validation."
@@ -117,17 +117,22 @@
                                         (str val))]]
                   (let [str-length        (count str-val)
                         min-length-result (if (and min-length (> min-length str-length))
-                                            [false (str "sh:minLength: value " str-val " has string length smaller than minimum: " min-length)]
-                                            [true (when min-length (str "sh:not sh:minLength: value " str-val " must have string length less than " min-length))])
+                                            [false (str "sh:minLength: value " str-val
+                                                        " has string length smaller than minimum: " min-length)]
+                                            [true (when min-length (str "sh:not sh:minLength: value " str-val
+                                                                        " must have string length less than " min-length))])
                         max-length-result (if (and max-length (< max-length str-length))
-                                            [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
-                                            [true (when max-length (str "sh:not sh:maxLength: value " str-val " must have string length greater than " max-length))])
+                                            [false (str "sh:maxLength: value " str-val
+                                                        "has string length larger than " max-length)]
+                                            [true (when max-length (str "sh:not sh:maxLength: value " str-val
+                                                                        " must have string length greater than " max-length))])
                         flag-msg          (when flags (str " with provided sh:flags: " flags))
                         pattern-result    (if (and pattern (not (some? (re-find pattern str-val))))
-                                            [false (str "sh:pattern: value " str-val " does not match pattern \"" pattern "\"" flag-msg)]
-                                            [true (when pattern (str "sh:not sh:pattern: value " str-val " must not match pattern \"" pattern "\"" flag-msg))])
+                                            [false (str "sh:pattern: value " str-val
+                                                        " does not match pattern \"" pattern "\"" flag-msg)]
+                                            [true (when pattern (str "sh:not sh:pattern: value " str-val
+                                                                     " must not match pattern \"" pattern "\"" flag-msg))])
                         flake-results     [min-length-result max-length-result pattern-result]]
-
                     (coalesce-validation-results flake-results logical-constraint)))]
     (coalesce-validation-results results)))
 
