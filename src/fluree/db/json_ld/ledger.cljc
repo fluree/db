@@ -61,6 +61,7 @@
           "http://www.w3.org/ns/shacl#lessThanOrEquals"         const/$sh:lessThanOrEquals
           "http://www.w3.org/ns/shacl#disjoint"                 const/$sh:disjoint
           "http://www.w3.org/ns/shacl#pattern"                  const/$sh:pattern
+          "http://www.w3.org/ns/shacl#flags"                    const/$sh:flags
           "http://www.w3.org/ns/shacl#languageIn"               const/$sh:languageIn
           "http://www.w3.org/ns/shacl#uniqueLang"               const/$sh:uniqueLang
           "http://www.w3.org/ns/shacl#class"                    const/$sh:class

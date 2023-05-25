@@ -148,4 +148,78 @@
                :schema/age      42
                :schema/favNums  [9004 9008 9015 9016 9023 9042]}]
              ok-results)
-          (str "unexpected query result: " (pr-str ok-results))))))
+          (str "unexpected query result: " (pr-str ok-results)))))
+
+  (testing "shacl not w/ string constraints works"
+    (let [conn         (test-utils/create-conn)
+          ledger       @(fluree/create conn "shacl/str"
+                                       {:defaultContext
+                                        ["" {:ex "http://example.org/ns/"}]})
+          user-query   {:select {'?s [:*]}
+                        :where  [['?s :rdf/type :ex/User]]}
+          db           @(fluree/stage
+                          (fluree/db ledger)
+                          {:id             :ex/UserShape
+                           :type           [:sh/NodeShape]
+                           :sh/targetClass :ex/User
+                           :sh/not    [{:sh/path      :ex/tag
+                                        :sh/minLength 4}
+                                       {:sh/path      :schema/name
+                                        :sh/maxLength 10}
+                                       {:sh/path     :ex/greeting
+                                        :sh/pattern  "hello.*"}]})
+          db-ok-name     @(fluree/stage
+                           db
+                           {:id          :ex/jean-claude
+                            :type        :ex/User,
+                            :schema/name "Jean-Claude"})
+          db-ok-tag    @(fluree/stage
+                              db
+                              {:id          :ex/al,
+                               :type        :ex/User,
+                               :ex/tag 1})
+
+          db-ok-greeting    @(fluree/stage
+                               db
+                               {:id          :ex/al,
+                                :type        :ex/User,
+                                :ex/greeting "HOWDY"})
+          db-name-too-short  (try @(fluree/stage
+                                     db
+                                     {:id          :ex/john,
+                                      :type        [:ex/User],
+                                      :schema/name "John"})
+                                  (catch Exception e e))
+          db-tag-too-long (try @(fluree/stage
+                                  db
+                                  {:id          :ex/john,
+                                   :type        [:ex/User],
+                                   :ex/tag 12345})
+                               (catch Exception e e))
+          db-greeting-incorrect (try @(fluree/stage
+                                        db
+                                        {:id          :ex/john,
+                                         :type        [:ex/User],
+                                         :ex/greeting "hello!"})
+                                     (catch Exception e e))]
+      (is (util/exception? db-name-too-short))
+      (is (= "SHACL PropertyShape exception - sh:not sh:maxLength: value John must have string length greater than 10."
+             (ex-message db-name-too-short)))
+      (is (util/exception? db-tag-too-long))
+      (is (= "SHACL PropertyShape exception - sh:not sh:minLength: value 12345 must have string length less than 4."
+             (ex-message db-tag-too-long)))
+      (is (util/exception? db-greeting-incorrect))
+      (is (str/starts-with? (ex-message db-greeting-incorrect)
+                            "SHACL PropertyShape exception - sh:not sh:pattern: value hello! must not match pattern"))
+      (is (= [{:id          :ex/jean-claude
+               :rdf/type    [:ex/User],
+               :schema/name "Jean-Claude"}]
+             @(fluree/query db-ok-name user-query)))
+      (is (= [{:id       :ex/al,
+               :rdf/type [:ex/User],
+               :ex/tag   1}]
+             @(fluree/query db-ok-tag user-query)))
+      (is (= [{:id       :ex/al,
+               :rdf/type [:ex/User],
+               :ex/greeting   "HOWDY"}]
+             @(fluree/query db-ok-greeting user-query))))))

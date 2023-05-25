@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [clojure.string :as str]
-            [clojure.set :as set]))
+            [clojure.set :as set])
+  #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
   ;; a raw SHACL shape looks something like this:
@@ -39,8 +40,6 @@
 ;; sh:closed true
 ;; - have a set of allowed and reject if not in the list
 ;; - set includes all properties from above + ignoredProperties
-
-;; sh:pattern - assume datatype xsd:string if not specified
 
 
 (defn apply-flake-changes
@@ -100,6 +99,49 @@
        [true]
        [false (str/join "; " err-msgs)]))))
 
+
+(defn validate-string-properties
+  "String-based constraint components specify conditions on the string representation of values,
+  as defined the SPARQL `str` function. See:
+
+    - https://www.w3.org/TR/shacl/#core-components-string
+    - https://www.w3.org/TR/sparql11-query/#func-str
+
+  Therefore, we transform the value to a string (if it isn't one already)
+  before performing validation."
+  [{:keys [min-length max-length pattern flags logical-constraint] :as _p-shape} p-flakes]
+  (let [results (for [flake p-flakes
+                      :let  [[val dt] (flake-value flake)
+                             ref?     (and (number? val)
+                                           (= const/$xsd:anyURI dt))
+                             str-val  (if (string? val)
+                                        val
+                                        (str val))]]
+                  (let [str-length        (count str-val)
+                        min-length-result (if (and min-length (or ref? (> min-length str-length)))
+                                            [false (str "sh:minLength: value " str-val
+                                                        " has string length smaller than minimum: " min-length
+                                                        " or it is not a literal value")]
+                                            [true (when min-length (str "sh:not sh:minLength: value " str-val
+                                                                        " must have string length less than " min-length))])
+                        max-length-result (if (and max-length (or ref? (< max-length str-length)))
+                                            [false (str "sh:maxLength: value " str-val
+                                                        "has string length larger than " max-length
+                                                        " or it is not a literal value")]
+                                            [true (when max-length (str "sh:not sh:maxLength: value " str-val
+                                                                        " must have string length greater than " max-length))])
+                        flag-msg          (when flags (str " with provided sh:flags: " flags))
+                        pattern-result    (if (and pattern (or ref? (not (some? (re-find pattern str-val)))))
+                                            [false (str "sh:pattern: value " str-val
+                                                        " does not match pattern \"" pattern "\"" flag-msg
+                                                        " or it is not a literal value")]
+                                            [true (when pattern (str "sh:not sh:pattern: value " str-val
+                                                                     " must not match pattern \"" pattern "\"" flag-msg))])
+                        flake-results     [min-length-result max-length-result pattern-result]]
+                    (coalesce-validation-results flake-results logical-constraint)))]
+    (coalesce-validation-results results)))
+
+
 (defn validate-count-properties
   [{:keys [min-count max-count logical-constraint] :as _p-shape} p-flakes]
   (let [n          (count p-flakes)
@@ -141,16 +183,21 @@
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive] :as p-shape} p-flakes]
+           max-exclusive min-length max-length pattern] :as p-shape} p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
   ;;       Should embed results and error messages and short-circuit as appropriate
-  (let [cardinality-validation (if (or min-count max-count)
-                                 (validate-count-properties p-shape p-flakes)
-                                 [true])]
-    (if (and (first cardinality-validation)
-             (or min-inclusive min-exclusive max-inclusive max-exclusive))
-      (validate-value-range-properties p-shape p-flakes)
-      cardinality-validation)))
+  (let [validation (if (or min-count max-count)
+                     (validate-count-properties p-shape p-flakes)
+                     [true])
+        validation (if (and (first validation)
+                            (or min-inclusive min-exclusive max-inclusive max-exclusive))
+                     (validate-value-range-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation)
+                            (or min-length max-length pattern))
+                     (validate-string-properties p-shape p-flakes)
+                     validation)]
+    validation))
 
 (defn validate-pair-property
   "Validates a PropertyShape that compares values for a pair of predicates.
@@ -248,6 +295,7 @@
      (doseq [shape shapes]
        (validate-shape shape flake-p-partitions all-flakes)))))
 
+
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
   [property-flakes]
@@ -283,13 +331,16 @@
           (assoc acc :node-kind o)
 
           const/$sh:pattern
-          (assoc acc :pattern (re-pattern o))
+          (assoc acc :pattern o)
 
           const/$sh:minLength
           (assoc acc :min-length o)
 
           const/$sh:maxLength
           (assoc acc :max-length o)
+
+          const/$sh:flags
+          (update acc :flags (fnil conj []) o)
 
           const/$sh:languageIn
           (assoc acc :language-in o)
@@ -343,7 +394,7 @@
 ;; TODO - pass along additional shape metadata to provided better error message.
 (defn register-datatype
   "Optimization to elevate data types to top of shape for easy coersion when processing transactions"
-  [{:keys [dt validate-fn] :as dt-map} {:keys [datatype pattern path] :as property-shape}]
+  [{:keys [dt validate-fn] :as dt-map} {:keys [datatype path] :as property-shape}]
   (when (and dt
              (not= dt
                    datatype))
@@ -351,22 +402,8 @@
                          " has multiple conflicting datatype declarations of: "
                          dt " and " datatype ".")
                     {:status 400 :error :db/shacl-validation})))
-  (when (and pattern
-             (not= const/$xsd:string datatype))
-    (log/warn (str "SHACL PropertyShape defines a pattern, " pattern
-                   " however the datatype defined is not xsd:string."
-                   " Ignoring pattern for validation.")))
-  (if pattern
-    (if validate-fn
-      {:dt          datatype
-       :validate-fn (fn [x]
-                      (when (re-matches pattern x)
-                        ;; if prior condition fails, return falsey and stop evaluation
-                        (validate-fn x)))}
-      {:dt          datatype
-       :validate-fn (fn [x] (re-matches pattern x))})
-    {:dt          datatype
-     :validate-fn validate-fn}))
+  {:dt          datatype
+   :validate-fn validate-fn})
 
 (defn register-nodetype
   "Optimization to elevate node type designations"
@@ -451,6 +488,39 @@
                          (into (keys property)))]
     (assoc shape :closed-props closed-props)))
 
+
+
+(defn get-regex-flag
+  "Given an `sh:flag` value, returns the corresponding regex flag
+  for the current platform. If the provided flag is not found,
+  it will be ignored by validation.
+
+  Note that js does not have support for `x` or `q` flag behavior."
+  [flag]
+  #?(:clj (case flag
+            "i" Pattern/CASE_INSENSITIVE
+            "m" Pattern/MULTILINE
+            "s" Pattern/DOTALL
+            "q" Pattern/LITERAL
+            "x" Pattern/COMMENTS
+            0)
+     :cljs (if (#{"i" "m" "s"} flag)
+             flag
+             "")))
+
+
+(defn build-pattern
+  "Builds regex pattern out of input string
+  and any flags that were provided."
+  [{:keys [:pattern :flags] :as _shape}]
+  (let [valid-flags (->> (map get-regex-flag flags)
+                         #?(:clj (apply +)
+                            :cljs (apply str)))]
+    (-> pattern
+        #?(:clj (Pattern/compile (or valid-flags 0))
+           :cljs (js/RegExp. (or valid-flags ""))))))
+
+
 (defn build-class-shapes
   "Given a class SID, returns class shape"
   [db type-sid]
@@ -477,7 +547,10 @@
                                                                                  const/$sh:not
                                                                                  (build-not-shape flakes))
                                              ;; we key the property shapes map with the property subj id (sh:path)
-                                             p-shapes*      (update p-shapes path util/conjv property-shape)
+                                             property-shape* (if (:pattern property-shape)
+                                                               (assoc property-shape :pattern (build-pattern property-shape))
+                                                               property-shape)
+                                             p-shapes*      (update p-shapes path util/conjv property-shape*)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)
