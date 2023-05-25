@@ -111,25 +111,30 @@
   before performing validation."
   [{:keys [min-length max-length pattern flags logical-constraint] :as _p-shape} p-flakes]
   (let [results (for [flake p-flakes
-                      :let  [val      (flake/o flake)
+                      :let  [[val dt] (flake-value flake)
+                             ref?     (and (number? val)
+                                           (= const/$xsd:anyURI dt))
                              str-val  (if (string? val)
                                         val
                                         (str val))]]
                   (let [str-length        (count str-val)
-                        min-length-result (if (and min-length (> min-length str-length))
+                        min-length-result (if (and min-length (or ref? (> min-length str-length)))
                                             [false (str "sh:minLength: value " str-val
-                                                        " has string length smaller than minimum: " min-length)]
+                                                        " has string length smaller than minimum: " min-length
+                                                        " or it is not a literal value")]
                                             [true (when min-length (str "sh:not sh:minLength: value " str-val
                                                                         " must have string length less than " min-length))])
-                        max-length-result (if (and max-length (< max-length str-length))
+                        max-length-result (if (and max-length (or ref? (< max-length str-length)))
                                             [false (str "sh:maxLength: value " str-val
-                                                        "has string length larger than " max-length)]
+                                                        "has string length larger than " max-length
+                                                        " or it is not a literal value")]
                                             [true (when max-length (str "sh:not sh:maxLength: value " str-val
                                                                         " must have string length greater than " max-length))])
                         flag-msg          (when flags (str " with provided sh:flags: " flags))
-                        pattern-result    (if (and pattern (not (some? (re-find pattern str-val))))
+                        pattern-result    (if (and pattern (or ref? (not (some? (re-find pattern str-val)))))
                                             [false (str "sh:pattern: value " str-val
-                                                        " does not match pattern \"" pattern "\"" flag-msg)]
+                                                        " does not match pattern \"" pattern "\"" flag-msg
+                                                        " or it is not a literal value")]
                                             [true (when pattern (str "sh:not sh:pattern: value " str-val
                                                                      " must not match pattern \"" pattern "\"" flag-msg))])
                         flake-results     [min-length-result max-length-result pattern-result]]

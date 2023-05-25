@@ -736,7 +736,14 @@
                                    {:id          :ex/john
                                     :type        :ex/User,
                                     :schema/name 12345678910})
-                                (catch Exception e e))]
+                                (catch Exception e e))
+          db-ref-value         (try
+                                 @(fluree/stage
+                                    db
+                                    {:id          :ex/john
+                                     :type        :ex/User,
+                                     :schema/name :ex/ref})
+                                 (catch Exception e e)) ]
       (is (util/exception? db-too-short-str)
           "Exception, because :schema/name is shorter than minimum string length")
       (is (str/starts-with? (ex-message db-too-short-str)
@@ -749,6 +756,10 @@
           "Exception, because :schema/name is longer than maximum string length")
       (is (str/starts-with? (ex-message db-too-long-non-str)
                             "SHACL PropertyShape exception - sh:maxLength"))
+      (is (util/exception? db-ref-value)
+          "Exception, because :schema/name is not a literal value")
+      (is (str/starts-with? (ex-message db-ref-value)
+                            "SHACL PropertyShape exception - sh:maxLength:"))
       (is (= [{:id          :ex/john,
                :rdf/type    [:ex/User],
                :schema/name "John"}]
@@ -798,7 +809,14 @@
                                       {:id           :ex/alice
                                        :type         :ex/User,
                                        :ex/birthYear 1776})
-                                   (catch Exception e e))]
+                                   (catch Exception e e))
+          db-ref-value         (try
+                                 @(fluree/stage
+                                    db
+                                    {:id          :ex/john
+                                     :type        :ex/User,
+                                     :ex/birthYear :ex/ref})
+                                 (catch Exception e e))]
       (is (util/exception? db-wrong-case-greeting)
           "Exception, because :ex/greeting does not match pattern")
       (is (str/starts-with? (ex-message db-wrong-case-greeting)
@@ -809,6 +827,10 @@
           "Exception, because :ex/birthYear does not match pattern")
       (is (str/starts-with? (ex-message db-wrong-birth-year)
                             "SHACL PropertyShape exception - sh:pattern"))
+      (is (util/exception? db-ref-value)
+          "Exception, because :schema/name is not a literal value")
+      (is (str/starts-with? (ex-message db-ref-value)
+                            "SHACL PropertyShape exception - sh:pattern:"))
       (is (= [{:id          :ex/brian,
                :rdf/type    [:ex/User],
                :ex/greeting "hello\nworld!"}]
