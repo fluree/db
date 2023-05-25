@@ -803,7 +803,8 @@
           "Exception, because :ex/greeting does not match pattern")
       (is (str/starts-with? (ex-message db-wrong-case-greeting)
                             "SHACL PropertyShape exception - sh:pattern"))
-
+      (is (str/includes? (ex-message db-wrong-case-greeting)
+                         "with provided sh:flags: [\"s\" \"x\"]"))
       (is (util/exception? db-wrong-birth-year)
           "Exception, because :ex/birthYear does not match pattern")
       (is (str/starts-with? (ex-message db-wrong-birth-year)

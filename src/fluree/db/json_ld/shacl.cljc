@@ -122,9 +122,10 @@
                         max-length-result (if (and max-length (< max-length str-length))
                                             [false (str "sh:maxLength: value " str-val "has string length larger than " max-length)]
                                             [true (when max-length (str "sh:not sh:maxLength: value " str-val " must have string length greater than " max-length))])
+                        flag-msg          (when flags (str " with provided sh:flags: " flags))
                         pattern-result    (if (and pattern (not (some? (re-find pattern str-val))))
-                                            [false (str "sh:pattern: value " str-val " does not match pattern \"" pattern "\"")]
-                                            [true (when pattern (str "sh:not sh:pattern: value " str-val " must not match pattern \"" pattern "\""))])
+                                            [false (str "sh:pattern: value " str-val " does not match pattern \"" pattern "\"" flag-msg)]
+                                            [true (when pattern (str "sh:not sh:pattern: value " str-val " must not match pattern \"" pattern "\"" flag-msg))])
                         flake-results     [min-length-result max-length-result pattern-result]]
 
                     (coalesce-validation-results flake-results logical-constraint)))]
@@ -285,24 +286,6 @@
        (validate-shape shape flake-p-partitions all-flakes)))))
 
 
-(defn get-regex-flag
-  "Given an `sh:flag` value, returns the corresponding regex flag
-  for the current platform. If the provided flag is not found,
-  it will be ignored by validation.
-
-  Note that js does not have support for `x` or `q` flag behavior."
-  [flag]
-  #?(:clj (case flag
-            "i" Pattern/CASE_INSENSITIVE
-            "m" Pattern/MULTILINE
-            "s" Pattern/DOTALL
-            "q" Pattern/LITERAL
-            "x" Pattern/COMMENTS
-            0)
-     :cljs (if (#{"i" "m" "s"} flag)
-             flag
-             "")))
-
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
   [property-flakes]
@@ -347,8 +330,7 @@
           (assoc acc :max-length o)
 
           const/$sh:flags
-          #?(:clj (update acc :flags (fnil + 0) (get-regex-flag o))
-             :cljs (update acc :flags str (get-regex-flag o)))
+          (update acc :flags (fnil conj []) o)
 
           const/$sh:languageIn
           (assoc acc :language-in o)
@@ -496,13 +478,37 @@
                          (into (keys property)))]
     (assoc shape :closed-props closed-props)))
 
+
+
+(defn get-regex-flag
+  "Given an `sh:flag` value, returns the corresponding regex flag
+  for the current platform. If the provided flag is not found,
+  it will be ignored by validation.
+
+  Note that js does not have support for `x` or `q` flag behavior."
+  [flag]
+  #?(:clj (case flag
+            "i" Pattern/CASE_INSENSITIVE
+            "m" Pattern/MULTILINE
+            "s" Pattern/DOTALL
+            "q" Pattern/LITERAL
+            "x" Pattern/COMMENTS
+            0)
+     :cljs (if (#{"i" "m" "s"} flag)
+             flag
+             "")))
+
+
 (defn build-pattern
   "Builds regex pattern out of input string
   and any flags that were provided."
   [{:keys [:pattern :flags] :as _shape}]
-  (-> pattern
-      #?(:clj (Pattern/compile (or flags 0))
-         :cljs (js/RegExp. (or flags "")))))
+  (let [valid-flags (->> (map get-regex-flag flags)
+                         #?(:clj (apply +)
+                            :cljs (apply str)))]
+    (-> pattern
+        #?(:clj (Pattern/compile (or valid-flags 0))
+           :cljs (js/RegExp. (or valid-flags ""))))))
 
 
 (defn build-class-shapes
