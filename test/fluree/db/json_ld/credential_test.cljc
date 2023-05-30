@@ -8,13 +8,14 @@
             [fluree.db.test-utils :as test-utils]
             [fluree.db.did :as did]))
 
-(def auth
-  {:id "did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh"
-   :public "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
+
+(def kp
+  {:public "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
    :private "509553eece84d5a410f1012e8e19e84e938f226aa3ad144e2d12f36df0f51c1e"})
+(def auth (did/private->did-map (:private kp)))
 
 (def example-cred-subject {"@context" {"a" "http://a.com/"} "a:foo" "bar"})
-(def example-issuer (did/encode-did-key (:public auth)))
+(def example-issuer (:id auth))
 
 (def clj-generated-jws
   "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19..HDBFAiEA80-G5gUH6BT9D1Mc-YyWbjuwbL7nKfWj6BrsHS6whQ0CIAcjzJvo0sW52FIlgvxy0hPBKNWolIwLvoedG_4HQu_V")
