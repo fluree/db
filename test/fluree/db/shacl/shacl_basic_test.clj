@@ -157,8 +157,7 @@
                              :schema/name  "John"
                              :schema/email "john@flur.ee"})
                           (catch Exception e e))]
-      (is (util/exception? db-extra-prop)
-          "Exception, because :schema/name is an integer and not a string.")
+      (is (util/exception? db-extra-prop))
       (is (str/starts-with? (ex-message db-extra-prop)
                             "SHACL shape is closed"))
 
@@ -690,3 +689,238 @@
               "Exception, because :schema/age is not a number")
           (is (str/starts-with? (ex-message db-string)
                                 "SHACL PropertyShape exception - sh:minExclusive: value 10")))))))
+
+(deftest ^:integration shacl-string-length-constraints
+  (testing "shacl string length constraint errors"
+    (let [conn       (test-utils/create-conn)
+          ledger     @(fluree/create conn "shacl/str" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query {:select {'?s [:*]}
+                      :where  [['?s :rdf/type :ex/User]]}
+          db         @(fluree/stage
+                        (fluree/db ledger)
+                        {:id             :ex/UserShape
+                         :type           [:sh/NodeShape]
+                         :sh/targetClass :ex/User
+                         :sh/property    [{:sh/path      :schema/name
+                                           :sh/minLength 4
+                                           :sh/maxLength 10}]})
+          db-ok-str  @(fluree/stage
+                        db
+                        {:id          :ex/john,
+                         :type        [:ex/User],
+                         :schema/name "John"})
+
+          db-ok-non-str @(fluree/stage
+                           db
+                           {:id          :ex/john,
+                            :type        [:ex/User],
+                            :schema/name 12345})
+
+          db-too-short-str    (try
+                                @(fluree/stage
+                                   db
+                                   {:id          :ex/al,
+                                    :type        :ex/User,
+                                    :schema/name "Al"})
+                                (catch Exception e e))
+          db-too-long-str     (try
+                                @(fluree/stage
+                                   db
+                                   {:id          :ex/jean-claude
+                                    :type        :ex/User,
+                                    :schema/name "Jean-Claude"})
+                                (catch Exception e e))
+          db-too-long-non-str (try
+                                @(fluree/stage
+                                   db
+                                   {:id          :ex/john
+                                    :type        :ex/User,
+                                    :schema/name 12345678910})
+                                (catch Exception e e))
+          db-ref-value         (try
+                                 @(fluree/stage
+                                    db
+                                    {:id          :ex/john
+                                     :type        :ex/User,
+                                     :schema/name :ex/ref})
+                                 (catch Exception e e)) ]
+      (is (util/exception? db-too-short-str)
+          "Exception, because :schema/name is shorter than minimum string length")
+      (is (str/starts-with? (ex-message db-too-short-str)
+                            "SHACL PropertyShape exception - sh:minLength"))
+      (is (util/exception? db-too-long-str)
+          "Exception, because :schema/name is longer than maximum string length")
+      (is (str/starts-with? (ex-message db-too-long-str)
+                            "SHACL PropertyShape exception - sh:maxLength"))
+      (is (util/exception? db-too-long-non-str)
+          "Exception, because :schema/name is longer than maximum string length")
+      (is (str/starts-with? (ex-message db-too-long-non-str)
+                            "SHACL PropertyShape exception - sh:maxLength"))
+      (is (util/exception? db-ref-value)
+          "Exception, because :schema/name is not a literal value")
+      (is (str/starts-with? (ex-message db-ref-value)
+                            "SHACL PropertyShape exception - sh:maxLength:"))
+      (is (= [{:id          :ex/john,
+               :rdf/type    [:ex/User],
+               :schema/name "John"}]
+             @(fluree/query db-ok-str user-query)))
+      (is (= [{:id          :ex/john,
+               :rdf/type    [:ex/User],
+               :schema/name 12345}]
+             @(fluree/query db-ok-non-str user-query))))))
+
+(deftest ^:integration shacl-string-pattern-constraints
+  (testing "shacl string regex constraint errors"
+    (let [conn           (test-utils/create-conn)
+          ledger         @(fluree/create conn "shacl/str" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query     {:select {'?s [:*]}
+                          :where  [['?s :rdf/type :ex/User]]}
+          db             @(fluree/stage
+                            (fluree/db ledger)
+                            {:id             :ex/UserShape
+                             :type           [:sh/NodeShape]
+                             :sh/targetClass :ex/User
+                             :sh/property    [{:sh/path    :ex/greeting
+                                               :sh/pattern "hello   (.*?)world"
+                                               :sh/flags   ["x" "s"]}
+                                              {:sh/path    :ex/birthYear
+                                               :sh/pattern "(19|20)[0-9][0-9]"}]})
+          db-ok-greeting @(fluree/stage
+                            db
+                            {:id          :ex/brian,
+                             :type        :ex/User,
+                             :ex/greeting "hello\nworld!"})
+
+          db-ok-birthyear        @(fluree/stage
+                                    db
+                                    {:id           :ex/john,
+                                     :type         :ex/User,
+                                     :ex/birthYear 1984})
+          db-wrong-case-greeting (try
+                                   @(fluree/stage
+                                      db
+                                      {:id          :ex/alice
+                                       :type        :ex/User,
+                                       :ex/greeting "HELLO\nWORLD!"})
+                                   (catch Exception e e))
+          db-wrong-birth-year    (try
+                                   @(fluree/stage
+                                      db
+                                      {:id           :ex/alice
+                                       :type         :ex/User,
+                                       :ex/birthYear 1776})
+                                   (catch Exception e e))
+          db-ref-value         (try
+                                 @(fluree/stage
+                                    db
+                                    {:id          :ex/john
+                                     :type        :ex/User,
+                                     :ex/birthYear :ex/ref})
+                                 (catch Exception e e))]
+      (is (util/exception? db-wrong-case-greeting)
+          "Exception, because :ex/greeting does not match pattern")
+      (is (str/starts-with? (ex-message db-wrong-case-greeting)
+                            "SHACL PropertyShape exception - sh:pattern"))
+      (is (str/includes? (ex-message db-wrong-case-greeting)
+                         "with provided sh:flags: [\"s\" \"x\"]"))
+      (is (util/exception? db-wrong-birth-year)
+          "Exception, because :ex/birthYear does not match pattern")
+      (is (str/starts-with? (ex-message db-wrong-birth-year)
+                            "SHACL PropertyShape exception - sh:pattern"))
+      (is (util/exception? db-ref-value)
+          "Exception, because :schema/name is not a literal value")
+      (is (str/starts-with? (ex-message db-ref-value)
+                            "SHACL PropertyShape exception - sh:pattern:"))
+      (is (= [{:id          :ex/brian,
+               :rdf/type    [:ex/User],
+               :ex/greeting "hello\nworld!"}]
+             @(fluree/query db-ok-greeting user-query)))
+      (is (= [{:id           :ex/john
+               :rdf/type     [:ex/User],
+               :ex/birthYear 1984}]
+             @(fluree/query db-ok-birthyear user-query))))))
+
+(deftest shacl-multiple-properties-test
+  (testing "multiple properties works"
+    (let [conn         (test-utils/create-conn)
+          ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          user-query   {:select {'?s [:*]}
+                        :where  [['?s :rdf/type :ex/User]]}
+          db           @(fluree/stage
+                         (fluree/db ledger)
+                         {:id             :ex/UserShape
+                          :type           [:sh/NodeShape]
+                          :sh/targetClass :ex/User
+                          :sh/property    [{:sh/path     :schema/name
+                                            :sh/datatype :xsd/string
+                                            :sh/minCount 1
+                                            :sh/maxCount 1}
+                                           {:sh/path         :schema/age
+                                            :sh/minCount     1
+                                            :sh/maxCount     1
+                                            :sh/minInclusive 0
+                                            :sh/maxInclusive 130}
+                                           {:sh/path     :schema/email
+                                            :sh/datatype :xsd/string}]})
+          db-ok        @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   40
+                          :schema/email "john@example.org"})
+          db-no-name   @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/age   40
+                          :schema/email "john@example.org"})
+          db-two-names @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  ["John" "Billy"]
+                          :schema/age   40
+                          :schema/email "john@example.org"})
+          db-too-old   @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   140
+                          :schema/email "john@example.org"})
+          db-two-ages  @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   [40 21]
+                          :schema/email "john@example.org"})
+          db-num-email @(fluree/stage
+                         db
+                         {:id           :ex/john
+                          :type         [:ex/User]
+                          :schema/name  "John"
+                          :schema/age   40
+                          :schema/email 42})]
+      (is (util/exception? db-no-name))
+      (is (str/starts-with? (ex-message db-no-name)
+                            "Required properties not present:"))
+      (is (util/exception? db-two-names))
+      (is (str/starts-with? (ex-message db-two-names)
+                            "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2"))
+      (is (util/exception? db-too-old))
+      (is (str/starts-with? (ex-message db-too-old)
+                            "SHACL PropertyShape exception - sh:maxInclusive: value 140 is either non-numeric or higher than maximum of 130"))
+      (is (util/exception? db-two-ages))
+      (is (str/starts-with? (ex-message db-two-ages)
+                            "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2"))
+      (is (util/exception? db-num-email))
+      (is (str/starts-with? (ex-message db-num-email)
+                            "Required data type"))
+      (is (= [{:id           :ex/john
+               :rdf/type     [:ex/User]
+               :schema/age   40
+               :schema/email "john@example.org"
+               :schema/name  "John"}]
+             @(fluree/query db-ok user-query))))))
