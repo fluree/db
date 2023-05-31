@@ -361,7 +361,7 @@
                      (json-ld/expand default-ctx)
                      util/sequential)
         flakeset (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                         (init-db? db) (into (base-flakes t)))]
+                   (init-db? db) (into (base-flakes t)))]
     (stage-flakes flakeset tx-state nodes)))
 
 (defn into-flakeset
