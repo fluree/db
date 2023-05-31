@@ -123,9 +123,11 @@
                   (get predefined-properties id)
                   (if (or (class-or-property? node)
                           (#{const/$rdfs:subClassOf
-                             const/$sh:path const/$sh:ignoredProperties
+                             const/$sh:path
+                             const/$sh:ignoredProperties
                              const/$sh:targetClass
-                             const/$sh:targetSubjectsOf const/$sh:targetObjectsOf
+                             const/$sh:targetSubjectsOf
+                             const/$sh:targetObjectsOf
                              const/$sh:equals
                              const/$sh:disjoint
                              const/$sh:lessThan
