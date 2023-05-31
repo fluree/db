@@ -6,7 +6,8 @@
             [fluree.db.json-ld.policy-validate :as validate]
             [fluree.db.query.fql :refer [query]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.query.fql :as fql]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -496,24 +497,34 @@
   (-> (select-keys opts [:did :role :credential])
       not-empty))
 
+(defn roles-for-did
+  [db did]
+  (go-try
+    (try
+      (->> (<? (fql/query db {"select" "?role"
+                              "where" [[did "https://ns.flur.ee/ledger#role" "?role"]]}))
+           (not-empty))
+      ;; in case no "f:role" exists
+      (catch Exception _))))
+
 (defn wrap-policy
   "Given a db object and a map containing the identity,
   wraps specified policy permissions"
   [{:keys [policy] :as db} {:keys [did role credential]}]
-  ;; TODO - not yet paying attention to verifiable credentials that are present
   (go-try
-    (cond
-      (or (:ident policy) (:roles policy))
-      (throw (ex-info (str "Policy already in place for this db. "
-                           "Applying policy more than once, via multiple uses of `wrap-policy` and/or supplying "
-                           "an identity via `:opts`, is not supported.")
-                      {:status 400
-                       :error  :db/policy-exception}))
+    (let [roles (or role (when did (<? (roles-for-did db did))))]
+      (cond
+        (or (:ident policy) (:roles policy))
+        (throw (ex-info (str "Policy already in place for this db. "
+                             "Applying policy more than once, via multiple uses of `wrap-policy` and/or supplying "
+                             "an identity via `:opts`, is not supported.")
+                        {:status 400
+                         :error  :db/policy-exception}))
 
-      (not role)
-      (throw (ex-info "Applying policy without a role is not yet supported."
-                      {:status 400
-                       :error  :db/policy-exception}))
+        (not roles)
+        (throw (ex-info "Applying policy without a role is not yet supported."
+                        {:status 400
+                         :error  :db/policy-exception}))
 
-      :else
-      (assoc db :policy (<? (policy-map db did role credential))))))
+        :else
+        (assoc db :policy (<? (policy-map db did roles credential)))))))

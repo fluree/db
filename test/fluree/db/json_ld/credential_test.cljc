@@ -14,6 +14,11 @@
    :private "509553eece84d5a410f1012e8e19e84e938f226aa3ad144e2d12f36df0f51c1e"})
 (def auth (did/private->did-map (:private kp)))
 
+(def pleb-kp
+  {:private "f6b009cc18dee16675ecb03b2a4b725f52bd699df07980cfd483766c75253f4b",
+   :public "02e84dd4d9c88e0a276be24596c5c8d741a890956bda35f9c977dba296b8c7148a"})
+(def pleb-auth (did/private->did-map (:private pleb-kp)))
+
 (def example-cred-subject {"@context" {"a" "http://a.com/"} "a:foo" "bar"})
 (def example-issuer (:id auth))
 
@@ -105,10 +110,13 @@
 #?(:clj
    (deftest ^:integration cred-wrapped-transactions-and-queries
      (let [conn   @(fluree/connect {:method :memory})
-           ledger @(fluree/create conn "credentialtest" {:defaultContext {"@base" "ledger:credentialtest/" "@vocab" ""}})
+           ledger @(fluree/create conn "credentialtest" {:defaultContext [test-utils/default-str-context {"@base" "ledger:credentialtest/" "@vocab" ""}]})
            db0    (fluree/db ledger)
 
-           tx  {"@id" "dan" "name" "Daniel" "favnums" [1 2 3]}
+
+           root-user {"id" (:id auth) "name" "Daniel" "f:role" {"id" "role:cool"} "favnums" [1 2 3]}
+           pleb-user {"id" (:id pleb-auth) "name" "Plebian" "f:role" {"id" "role:notcool"}}
+           tx  [root-user pleb-user]
            db1 @(test-utils/transact ledger (async/<!! (cred/generate tx (:private auth))))
 
            mdfn {"delete" [["?s" "name" "Daniel"]
@@ -117,37 +125,68 @@
                            ["?s" "favnums" 4]
                            ["?s" "favnums" 5]
                            ["?s" "favnums" 6]]
-                 "where"  [["?s" "@id" "dan"]]}
+                 "where"  [["?s" "@id" (:id auth)]]}
+           policy {"id" "rootPolicy"
+                   "type" "f:Policy"
+                   "f:targetNode" {"id" "f:allNodes"}
+                   "f:allow" [{"f:targetRole" {"id" "role:cool"}
+                               "f:action" [{"id" "f:view"} {"id" "f:modify"}]}]}
            db2  @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
+           ;; need a policy to allow viewing
+           db3  @(test-utils/transact ledger (async/<!! (cred/generate policy  (:private auth))))
 
-           query {"select" {"?s" ["*"]} "where" [["?s" "@id" "dan"]]}]
-
-       (is (= [tx]
+           query {"select" {"?s" ["*"]} "where" [["?s" "@id" (:id auth)]]}]
+       (is (= [root-user]
               @(fluree/query db1 query))
            "insert transaction credential")
-       (is (= [{"@id" "dan" "name" "D" "favnums" [2 3 4 5 6]}]
+       (is (= [{"id" (:id auth) "name" "D" "favnums" [2 3 4 5 6] "f:role" {"id" "role:cool"}}]
               @(fluree/query db2 query))
            "modify transaction credential")
 
-       (is (= [{"@id" "dan" "name" "D" "favnums" [2 3 4 5 6]}]
+       (is (= []
               @(fluree/query db2 (async/<!! (cred/generate query (:private auth)))))
-           "query credential")
+           "query credential w/no policy allowing access")
+       (is (= []
+              @(fluree/query db3 (async/<!! (cred/generate query (:private pleb-auth)))))
+           "query credential w/ policy forbidding access")
+       (is (= [{"id" (:id auth)
+                "name" "D"
+                "favnums" [2 3 4 5 6]
+                "f:role" {"id" "role:cool"}}]
+              @(fluree/query db3 (async/<!! (cred/generate query (:private auth)))))
+           "query credential w/ policy allowing access")
 
        (is (= {"nums" [2 3 4 5 6],
-               "dan" [{"@id" "dan", "name" "D", "favnums" [2 3 4 5 6]}]}
-              @(fluree/multi-query db2
-                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]} "dan" query}
+               "root" [{"id" (:id auth)
+                       "name" "D",
+                       "favnums" [2 3 4 5 6]
+                       "f:role" {"id" "role:cool"}}]}
+              @(fluree/multi-query db3
+                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
+                                                              "root" query}
                                                              (:private auth)))))
-           "multiquery credential")
-       (is (= [{"https://ns.flur.ee/ledger#t" 1,
-                "https://ns.flur.ee/ledger#assert" [{"@id" "dan", "name" "Daniel", "favnums" [1 2 3], :id "dan"}],
-                "https://ns.flur.ee/ledger#retract" []}
+           "multiquery credential - allowing access")
+       (is (= {"nums" [],
+               "root" []}
+              @(fluree/multi-query db3
+                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
+                                                              "root" query}
+                                                             (:private pleb-auth)))))
+           "multiquery credential - forbidding access")
+       (is (= [{"f:t" 1,
+                "f:assert" [{"id" (:id auth) "name" "Daniel", "favnums" [1 2 3], :id (:id auth) "f:role" {"id" "role:cool"}}],
+                "f:retract" []}
 
-               {"https://ns.flur.ee/ledger#t" 2,
-                "https://ns.flur.ee/ledger#assert"  [{"name" "D", "favnums" [4 5 6], :id "dan"}],
-                "https://ns.flur.ee/ledger#retract" [{"name" "Daniel", "favnums" 1, :id "dan"}]}]
-              @(fluree/history ledger (async/<!! (cred/generate {:history "dan" :t {:from 1}} (:private auth)))))
-           "history query credential"))))
+               {"f:t" 2,
+                "f:assert" [{"name" "D", "favnums" [4 5 6], :id (:id auth)}],
+                "f:retract" [{"name" "Daniel", "favnums" 1, :id (:id auth)}]}]
+              @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private auth)))))
+           "history query credential - allowing access")
+       (is (= "Subject identity does not exist: did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh"
+              (-> @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth))))
+                  (Throwable->map)
+                  (:cause)))
+           "history query credential - forbidding access"))))
 
 (comment
   #?(:cljs

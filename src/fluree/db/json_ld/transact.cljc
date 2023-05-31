@@ -413,6 +413,7 @@
   (go-try
     (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
                                            {:subject json-ld})
+          opts* (cond-> opts issuer (assoc :did issuer))
           db* (if-let [policy-opts (perm/policy-opts opts)]
                 (<? (perm/wrap-policy db policy-opts))
                 db)

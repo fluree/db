@@ -79,20 +79,20 @@
   "Return a summary of the changes over time, optionally with the full commit details included."
   [db query-map]
   (go-try
-   (let [{query-map :subject, issuer :issuer}
-         (or (<? (cred/verify query-map))
-             {:subject query-map})
+   (let [{query-map :subject, issuer :issuer} (or (<? (cred/verify query-map))
+                                                  {:subject query-map})
          coerced-query (try*
-                        (history/coerce-history-query query-map)
-                        (catch* e
-                          (throw
-                           (ex-info
-                            (str "History query not properly formatted. Provided "
-                                 (pr-str query-map))
-                            {:status  400
-                             :message (history/humanize-error e)
-                             :error   :db/invalid-query}))))]
-     (<? (history* db coerced-query)))))
+                         (history/coerce-history-query query-map)
+                         (catch* e
+                                 (throw
+                                   (ex-info
+                                     (str "History query not properly formatted. Provided "
+                                          (pr-str query-map))
+                                     {:status  400
+                                      :message (history/humanize-error e)
+                                      :error   :db/invalid-query}))))
+         history-query (cond-> coerced-query issuer (assoc-in [:opts :did] issuer))]
+     (<? (history* db history-query)))))
 
 (defn query
   "Execute a query against a database source. Returns core async channel
@@ -104,7 +104,7 @@
               {:subject query})
 
           {:keys [opts t]} query
-          db*              (if-let [policy-opts (perm/policy-opts opts)]
+          db*              (if-let [policy-opts (perm/policy-opts (cond-> opts issuer (assoc :did issuer)))]
                              (<? (perm/wrap-policy db policy-opts))
                              db)
           db**             (-> (if t
@@ -150,7 +150,7 @@
   (go-try
    (let [{flureeQL :subject, issuer :issuer} (or (<? (cred/verify flureeQL))
                                                  {:subject flureeQL})
-         global-opts         (:opts flureeQL)
+         global-opts         (cond-> (:opts flureeQL) issuer (assoc :did issuer))
          db                  (if-let [policy-opts (perm/policy-opts global-opts)]
                                (<? (perm/wrap-policy source policy-opts))
                                source)
