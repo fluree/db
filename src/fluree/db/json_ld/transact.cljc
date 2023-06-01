@@ -404,20 +404,22 @@
         (validate-rules tx-state)
         <?
         (policy/allowed? tx-state)
-        <?)))
+        <?
+        ;; unwrap the policy
+        (dbproto/-rootdb))))
 
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
   [db json-ld opts]
   (go-try
-    (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
-                                           {:subject json-ld})
-          opts* (cond-> opts issuer (assoc :did issuer))
-          db* (if-let [policy-opts (perm/policy-opts opts)]
+    (let [{tx :subject did :issuer} (or (<? (cred/verify json-ld))
+                                        {:subject json-ld})
+          opts* (cond-> opts did (assoc :did did))
+          db* (if-let [policy-opts (perm/policy-opts opts*)]
                 (<? (perm/wrap-policy db policy-opts))
                 db)
-          tx-state (->tx-state db* (assoc opts :issuer issuer))
+          tx-state (->tx-state db* (assoc opts* :issuer did))
           flakes   (if (q-parse/update? tx)
                      (<? (modify db tx tx-state))
                      (<? (insert db tx tx-state)))]

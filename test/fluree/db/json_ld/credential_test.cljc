@@ -110,14 +110,20 @@
 #?(:clj
    (deftest ^:integration cred-wrapped-transactions-and-queries
      (let [conn   @(fluree/connect {:method :memory})
-           ledger @(fluree/create conn "credentialtest" {:defaultContext [test-utils/default-str-context {"@base" "ledger:credentialtest/" "@vocab" ""}]})
-           db0    (fluree/db ledger)
-
+           ledger @(fluree/create conn "credentialtest" {:defaultContext
+                                                         [test-utils/default-str-context
+                                                          {"@base" "ledger:credentialtest/" "@vocab" ""}]})
 
            root-user {"id" (:id auth) "name" "Daniel" "f:role" {"id" "role:cool"} "favnums" [1 2 3]}
            pleb-user {"id" (:id pleb-auth) "name" "Plebian" "f:role" {"id" "role:notcool"}}
-           tx  [root-user pleb-user]
-           db1 @(test-utils/transact ledger (async/<!! (cred/generate tx (:private auth))))
+           policy {"id" "rootPolicy"
+                   "type" "f:Policy"
+                   "f:targetNode" {"id" "f:allNodes"}
+                   "f:allow" [{"f:targetRole" {"id" "role:cool"}
+                               "f:action" [{"id" "f:view"} {"id" "f:modify"}]}]}
+           tx  [root-user pleb-user policy]
+           ;; can't use credentials until after an identity with a role has been created
+           db1 @(test-utils/transact ledger tx)
 
            mdfn {"delete" [["?s" "name" "Daniel"]
                            ["?s" "favnums" 1]]
@@ -126,14 +132,8 @@
                            ["?s" "favnums" 5]
                            ["?s" "favnums" 6]]
                  "where"  [["?s" "@id" (:id auth)]]}
-           policy {"id" "rootPolicy"
-                   "type" "f:Policy"
-                   "f:targetNode" {"id" "f:allNodes"}
-                   "f:allow" [{"f:targetRole" {"id" "role:cool"}
-                               "f:action" [{"id" "f:view"} {"id" "f:modify"}]}]}
+
            db2  @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
-           ;; need a policy to allow viewing
-           db3  @(test-utils/transact ledger (async/<!! (cred/generate policy  (:private auth))))
 
            query {"select" {"?s" ["*"]} "where" [["?s" "@id" (:id auth)]]}]
        (is (= [root-user]
@@ -144,31 +144,28 @@
            "modify transaction credential")
 
        (is (= []
-              @(fluree/query db2 (async/<!! (cred/generate query (:private auth)))))
-           "query credential w/no policy allowing access")
-       (is (= []
-              @(fluree/query db3 (async/<!! (cred/generate query (:private pleb-auth)))))
+              @(fluree/query (fluree/db ledger) (async/<!! (cred/generate query (:private pleb-auth)))))
            "query credential w/ policy forbidding access")
        (is (= [{"id" (:id auth)
                 "name" "D"
                 "favnums" [2 3 4 5 6]
                 "f:role" {"id" "role:cool"}}]
-              @(fluree/query db3 (async/<!! (cred/generate query (:private auth)))))
+              @(fluree/query db2 (async/<!! (cred/generate query (:private auth)))))
            "query credential w/ policy allowing access")
 
        (is (= {"nums" [2 3 4 5 6],
                "root" [{"id" (:id auth)
-                       "name" "D",
-                       "favnums" [2 3 4 5 6]
-                       "f:role" {"id" "role:cool"}}]}
-              @(fluree/multi-query db3
+                        "name" "D",
+                        "favnums" [2 3 4 5 6]
+                        "f:role" {"id" "role:cool"}}]}
+              @(fluree/multi-query db2
                                    (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
                                                               "root" query}
                                                              (:private auth)))))
            "multiquery credential - allowing access")
        (is (= {"nums" [],
                "root" []}
-              @(fluree/multi-query db3
+              @(fluree/multi-query db2
                                    (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
                                                               "root" query}
                                                              (:private pleb-auth)))))
@@ -187,6 +184,40 @@
                   (Throwable->map)
                   (:cause)))
            "history query credential - forbidding access"))))
+
+(comment
+  (def conn @(fluree/connect {:method :memory}))
+  (def ledger @(fluree/create conn "credentialtest" {:defaultContext
+                                                     [test-utils/default-str-context
+                                                      {"@base" "ledger:credentialtest/" "@vocab" ""}]}))
+
+  (def root-user {"id" (:id auth) "name" "Daniel" "f:role" {"id" "role:cool"} "favnums" [1 2 3]})
+  (def pleb-user {"id" (:id pleb-auth) "name" "Plebian" "f:role" {"id" "role:notcool"}})
+  (def policy {"id" "rootPolicy"
+               "type" "f:Policy"
+               "f:targetNode" {"id" "f:allNodes"}
+               "f:allow" [{"f:targetRole" {"id" "role:cool"}
+                           "f:action" [{"id" "f:view"} {"id" "f:modify"}]}]})
+
+  (def tx [root-user pleb-user policy])
+  ;; can't use credentials until after an identity with a role has been created
+  (def db0 (fluree/db ledger))
+  (def db1 @(fluree/stage db0 tx))
+
+  (def mdfn {"delete" [["?s" "name" "Daniel"]
+                       ["?s" "favnums" 1]]
+             "insert" [["?s" "name" "D"]
+                       ["?s" "favnums" 4]
+                       ["?s" "favnums" 5]
+                       ["?s" "favnums" 6]]
+             "where"  [["?s" "@id" (:id auth)]]})
+
+  (def db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth)))))
+
+  (def query {"select" {"?s" ["*"]} "where" [["?s" "@id" (:id auth)]]})
+
+
+  )
 
 (comment
   #?(:cljs
