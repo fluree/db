@@ -157,7 +157,6 @@
                 [:schema/email :id "http://schema.org/email"]
                 [:schema/name :id "http://schema.org/name"]
                 [:ex/User :id "http://example.org/ns/User"]
-                [:ex/User :rdf/type :rdfs/Class]
                 [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
                 [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
                 [:id :id "@id"]]
@@ -233,8 +232,7 @@
                 {:id :schema/age}
                 {:id :schema/email}
                 {:id :schema/name}
-                {:id :ex/User, :rdf/type [:rdfs/Class]}
-                {:id :ex/User, :rdf/type [:rdfs/Class]}
+                {:id :ex/User}
                 {:id :rdfs/Class}
                 {:id :rdf/type}
                 {:id :id}]
@@ -259,16 +257,15 @@
                   ["fluree:context:b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee" :id "fluree:context:b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]
                   ["fluree:context:b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee" :f/address "fluree:memory://b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]
                   ["did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6" :id "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :id "fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank"]
-                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/address "fluree:memory://2921503e8e62f47b598d4504f990a25bc7f7b841c11367599d87884d4bf5f0f8"]
-                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/flakes 25]
-                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/size 1888]
-                  ["fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank" :f/t 1]
+                  ["fluree:db:sha256:btjaah6rs4wff6m2bd7n2rps6rkjpvnktbf3lxvwsijvbcdv3asw" :id "fluree:db:sha256:btjaah6rs4wff6m2bd7n2rps6rkjpvnktbf3lxvwsijvbcdv3asw"]
+                  ["fluree:db:sha256:btjaah6rs4wff6m2bd7n2rps6rkjpvnktbf3lxvwsijvbcdv3asw" :f/address "fluree:memory://4b649219b27c258c20b6b0e189287014228e2288a3e79726a1275de331b0931b"]
+                  ["fluree:db:sha256:btjaah6rs4wff6m2bd7n2rps6rkjpvnktbf3lxvwsijvbcdv3asw" :f/flakes 24]
+                  ["fluree:db:sha256:btjaah6rs4wff6m2bd7n2rps6rkjpvnktbf3lxvwsijvbcdv3asw" :f/size 1838]
+                  ["fluree:db:sha256:btjaah6rs4wff6m2bd7n2rps6rkjpvnktbf3lxvwsijvbcdv3asw" :f/t 1]
                   [:schema/age :id "http://schema.org/age"]
                   [:schema/email :id "http://schema.org/email"]
                   [:schema/name :id "http://schema.org/name"]
                   [:ex/User :id "http://example.org/ns/User"]
-                  [:ex/User :rdf/type :rdfs/Class]
                   [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
                   [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
                   [:f/t :id "https://ns.flur.ee/ledger#t"]
@@ -285,15 +282,15 @@
                   [:f/message :id "https://ns.flur.ee/ledger#message"]
                   [:f/previous :id "https://ns.flur.ee/ledger#previous"]
                   [:id :id "@id"]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :id "fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk"]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :f/time 720000]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" "https://www.w3.org/2018/credentials#issuer" "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :f/v 0]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :f/address "fluree:memory://5655d063e0961148c89150ab65bd03c205cdc8b7153f9aa079d8c461a5b291a7"]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :f/data "fluree:db:sha256:beh3as6tvb6shyvxs5w4zdt4gbpaa7xterlvqe42sc7r6u625ank"]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :f/alias "query/everything"]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :f/branch "main"]
-                  ["fluree:commit:sha256:bbgqwgdkhagy6rhdhk7aungz5fnbischldoqohyzvrluwetkhyrfk" :f/defaultContext "fluree:context:b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :id "fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg"]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :f/time 720000]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" "https://www.w3.org/2018/credentials#issuer" "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6"]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :f/v 0]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :f/address "fluree:memory://87d951b0c27423f8e07de484e2e68bcb36db5baca9ea3aca05c86a1a19faf4b5"]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :f/data "fluree:db:sha256:btjaah6rs4wff6m2bd7n2rps6rkjpvnktbf3lxvwsijvbcdv3asw"]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :f/alias "query/everything"]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :f/branch "main"]
+                  ["fluree:commit:sha256:bgc3scabiyx6v22isv7kchxpktilynx2xgcx3mtau6dxoeph5dwg" :f/defaultContext "fluree:context:b6dcf8968183239ecc7a664025f247de5b7859ac18cdeaace89aafc421eeddee"]]
                  @(fluree/query db* {:select ['?s '?p '?o]
                                      :where  [['?s '?p '?o]]}))))))))
 
@@ -348,9 +345,7 @@
       (is (= [[:ex/dave :ex/nonUser]
               [:ex/jane :ex/User]
               [:ex/bob :ex/User]
-              [:ex/alice :ex/User]
-              [:ex/nonUser :rdfs/Class]
-              [:ex/User :rdfs/Class]]
+              [:ex/alice :ex/User]]
              @(fluree/query db '{:select [?s ?class]
                                  :where  [[?s :rdf/type ?class]]}))))
     (testing "shacl targetClass"
