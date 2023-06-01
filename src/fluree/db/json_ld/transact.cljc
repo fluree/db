@@ -72,8 +72,7 @@
             (recur r
                    (conj class-sids type-sid)
                    (conj class-flakes
-                         (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)
-                         (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
+                         (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)))))
         [class-sids class-flakes]))))
 
 (defn add-property
