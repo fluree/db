@@ -109,4 +109,4 @@
         (when (not (crypto/verify-signature pubkey signing-input signature))
           (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
         ;; everything is good
-        {:subject subject :issuer auth-did}))))
+        {:subject subject :did auth-did}))))

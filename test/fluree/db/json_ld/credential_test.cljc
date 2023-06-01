@@ -53,8 +53,8 @@
        (testing "verify correct signature"
          (let [clj-result (async/<!! (cred/verify example-credential))
                cljs-result (async/<!! (cred/verify (assoc-in example-credential ["proof" "jws"] cljs-generated-jws)))]
-           (is (= {:subject example-cred-subject :issuer example-issuer} clj-result))
-           (is (= {:subject example-cred-subject :issuer example-issuer} cljs-result))))
+           (is (= {:subject example-cred-subject :did example-issuer} clj-result))
+           (is (= {:subject example-cred-subject :did example-issuer} cljs-result))))
 
        (testing "verify incorrect signature"
          (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
@@ -84,8 +84,8 @@
                 (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [cljs-result (async/<! (cred/verify example-credential))
                         clj-result  (async/<! (cred/verify (assoc-in example-credential ["proof" "jws"] clj-generated-jws)))]
-                    (is (= {:subject example-cred-subject :issuer example-issuer} cljs-result))
-                    (is (= {:subject example-cred-subject :issuer example-issuer} clj-result))
+                    (is (= {:subject example-cred-subject :did example-issuer} cljs-result))
+                    (is (= {:subject example-cred-subject :did example-issuer} clj-result))
                     (done)))))))
 
 #?(:cljs
@@ -184,40 +184,6 @@
                   (Throwable->map)
                   (:cause)))
            "history query credential - forbidding access"))))
-
-(comment
-  (def conn @(fluree/connect {:method :memory}))
-  (def ledger @(fluree/create conn "credentialtest" {:defaultContext
-                                                     [test-utils/default-str-context
-                                                      {"@base" "ledger:credentialtest/" "@vocab" ""}]}))
-
-  (def root-user {"id" (:id auth) "name" "Daniel" "f:role" {"id" "role:cool"} "favnums" [1 2 3]})
-  (def pleb-user {"id" (:id pleb-auth) "name" "Plebian" "f:role" {"id" "role:notcool"}})
-  (def policy {"id" "rootPolicy"
-               "type" "f:Policy"
-               "f:targetNode" {"id" "f:allNodes"}
-               "f:allow" [{"f:targetRole" {"id" "role:cool"}
-                           "f:action" [{"id" "f:view"} {"id" "f:modify"}]}]})
-
-  (def tx [root-user pleb-user policy])
-  ;; can't use credentials until after an identity with a role has been created
-  (def db0 (fluree/db ledger))
-  (def db1 @(fluree/stage db0 tx))
-
-  (def mdfn {"delete" [["?s" "name" "Daniel"]
-                       ["?s" "favnums" 1]]
-             "insert" [["?s" "name" "D"]
-                       ["?s" "favnums" 4]
-                       ["?s" "favnums" 5]
-                       ["?s" "favnums" 6]]
-             "where"  [["?s" "@id" (:id auth)]]})
-
-  (def db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth)))))
-
-  (def query {"select" {"?s" ["*"]} "where" [["?s" "@id" (:id auth)]]})
-
-
-  )
 
 (comment
   #?(:cljs
