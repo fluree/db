@@ -11,7 +11,8 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]))
+            [fluree.db.constants :as const]
+            [fluree.db.util.json :as json]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -37,6 +38,15 @@
               (catch* e
                       (log/error e "Error displaying iri:" v)
                       (>! error-ch e)))))))
+
+(defmethod display const/$rdf:json
+  [match db iri-cach compact error-ch]
+  (go
+    (let [v (::where/val match)]
+      (try* (json/parse v false)
+            (catch* e
+                    (log/error e "Error displaying json:" v)
+                    (>! error-ch e))))))
 
 (defprotocol ValueSelector
   "Format a where search solution (map of pattern matches) by extracting and

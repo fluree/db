@@ -3,7 +3,9 @@
             [fluree.db.util.core :as util]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [fluree.db.util.json :as json]
+            [fluree.json-ld :as json-ld]))
 
 (deftest ^:integration staging-data
   (testing "Disallow staging invalid transactions"
@@ -62,4 +64,35 @@
               [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
               [:id :id "@id"]]
              @(fluree/query db-bool '{:select  [?s ?p ?o]
-                                      :where   [[?s ?p ?o]]}))))))
+                                      :where   [[?s ?p ?o]]})))))
+  (testing "Allow transacting `json` values"
+    (let [conn    @(fluree/connect {:method :memory})
+          ledger  @(fluree/create conn "tx/bools" {:defaultContext {"ex" "http://example.org/ns/"}})
+          db0  (fluree/db ledger)
+          db1 @(fluree/stage
+                 (fluree/db ledger)
+                 {"@context" {"ex:json" {"@type" "@json"}}
+                  "@graph" [{"@id" "ex:alice"
+                             "@type" "ex:Person"
+                             "ex:json" {"json" "data"
+                                        "is" ["cool" "right?" 1 false 1.0]}}
+                            {"@id" "ex:bob"
+                             "@type" "ex:Person"
+                             "ex:json" {:edn "data"
+                                        :is ["cool" "right?" 1 false 1.0]}}]})]
+      (is (= [{"@id" "ex:bob",
+               "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" ["ex:Person"],
+               "ex:json" {"edn" "data", "is" ["cool" "right?" 1 false 1.0M]}}
+              {"@id" "ex:alice",
+               "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" ["ex:Person"],
+               "ex:json" {"json" "data", "is" ["cool" "right?" 1 false 1.0M]}}]
+             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
+                                 "select" {"?s" ["*"]}
+                                 "where" [["?s" "@type" "ex:Person"]]}))
+          "comes out as data from subject crawl")
+      (is (= [{"edn" "data", "is" ["cool" "right?" 1 false 1.0M]}
+              {"json" "data", "is" ["cool" "right?" 1 false 1.0M]}]
+             @(fluree/query db1 {"@context" {"ex" "http://example.org/ns/"}
+                                 "select" "?json"
+                                 "where" [["?s" "ex:json" "?json"]]}))
+          "comes out as data from select clause"))))

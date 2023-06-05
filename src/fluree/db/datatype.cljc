@@ -1,9 +1,11 @@
 (ns fluree.db.datatype
   (:require [fluree.db.constants :as const]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [clojure.string :as str]
             #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc]))
+               :cljs [fluree.db.util.cljs-const :as uc])
+            [fluree.db.util.json :as json])
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
@@ -43,7 +45,8 @@
    "http://www.w3.org/2001/XMLSchema#byte"               const/$xsd:byte
    "http://www.w3.org/2001/XMLSchema#unsignedByte"       const/$xsd:unsignedByte
    "http://www.w3.org/2001/XMLSchema#hexBinary"          const/$xsd:hexBinary
-   "http://www.w3.org/2001/XMLSchema#base64Binary"       const/$xsd:base64Binary})
+   "http://www.w3.org/2001/XMLSchema#base64Binary"       const/$xsd:base64Binary
+   :json                                                 const/$rdf:json})
 
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
@@ -302,6 +305,12 @@
         (str/replace #"\s+" " ")
         str/trim)))
 
+(defn- coerce-json
+  [value]
+  (try*
+    (json/stringify value)
+    (catch* _)))
+
 (defn- check-signed
   "Returns nil if required-type and n conflict in terms of signedness
   (e.g. unsignedInt but n is negative, nonPositiveInteger but n is greater than
@@ -387,6 +396,9 @@
 
     (const/$xsd:token const/$xsd:language)
     (coerce-token value)
+
+    const/$rdf:json
+    (coerce-json value)
 
     ;; else
     value))

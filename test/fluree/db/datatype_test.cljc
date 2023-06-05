@@ -274,6 +274,11 @@
     (is (= "en-US" (coerce " en-US" const/$xsd:language)))
     (is (= "es-MX" (coerce "\tes-MX" const/$xsd:language))))
 
+  (testing "json"
+    (is (= #?(:clj "{\"foo\":{\"bar\":[1,false,9.0,null]}}"
+              :cljs "{\"foo\":{\"bar\":[1,false,9,null]}}")
+           (coerce {"foo" {:bar [1 false 9.0 nil]}} const/$rdf:json))))
+
   (testing "non-coerced datatypes"
     (is (= "whatever" (coerce "whatever" const/$xsd:hexBinary)))
     (is (= "thingy" (coerce "thingy" const/$xsd:duration)))))

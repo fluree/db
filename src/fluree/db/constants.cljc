@@ -224,7 +224,7 @@
 (def ^:const $xsd:hexBinary 32)
 (def ^:const $xsd:base64Binary 33)
 ;; NOTE: Add multibyte type?
-;; NOTE: Add JSON type?
+(def ^:const $rdf:json 36)
 ;; NOTE: Add geo types? string-encoded GeoJSON?
 
 
