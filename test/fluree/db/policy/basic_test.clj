@@ -33,7 +33,7 @@
                        {:id                   :ex/widget,
                         :type                 :ex/Product,
                         :schema/name          "Widget"
-                        :schema/price         99.99
+                        :schema/price         99.99M
                         :schema/priceCurrency "USD"}
                        ;; assign root-did to :ex/rootRole
                        {:id     root-did
@@ -125,7 +125,7 @@
       (is (= [{:id                   :ex/widget,
                :rdf/type             [:ex/Product],
                :schema/name          "Widget",
-               :schema/price         99.99,
+               :schema/price         99.99M,
                :schema/priceCurrency "USD"}]
              @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
                                        :where  [['?s :rdf/type :ex/Product]]

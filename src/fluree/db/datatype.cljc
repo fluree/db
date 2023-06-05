@@ -413,4 +413,4 @@
                           {:status 400 :error :db/shacl-value-coercion}))
 
           :else
-          [value type-id])))
+          [value* type-id])))

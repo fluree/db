@@ -98,13 +98,13 @@
                 "Alice should be allowed to update her own name.")))
         (testing "using role only"
           (let [update-price @(fluree/stage db+policy {:id          :ex/widget
-                                                       :schema/price 105.99}
+                                                       :schema/price 105.99M}
                                             {:role :ex/rootRole})]
 
             (is (= [{:id :ex/widget,
                      :rdf/type [:ex/Product],
                      :schema/name "Widget",
-                     :schema/price 105.99,
+                     :schema/price 105.99M,
                      :schema/priceCurrency "USD"}]
                    @(fluree/query update-price
                                   {:select {'?s [:*]}
