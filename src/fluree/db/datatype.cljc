@@ -391,26 +391,27 @@
     ;; else
     value))
 
+(defn validate
+  [{:keys [type value] :as _value-map}]
+  (let [type-id (if type
+                  (get default-data-types type)
+                  (infer value))]
+    (if (some? (coerce value type-id))
+      [value type-id]
+      (throw (ex-info (str "Data type " type
+                           " cannot be coerced from provided value: " value ".")
+                      {:status 400 :error :db/shacl-value-coercion})))))
+
 (defn from-expanded
   "Returns a tuple of the value (possibly coerced from string) and the data type sid from
   an expanded json-ld value map. If type is defined but not a predefined data type, will
   return nil prompting downstream process to look up (or create) a custom data
   type. Value coercion is only attempted when a required-type is supplied."
-  [{:keys [type value] :as _value-map} required-type]
-  (let [type-id (if type
-                  (get default-data-types type)
-                  (infer value))
-        _       (log/trace "from-expanded type:" type-id)
-        value*  (coerce value type-id)]
-    (cond (and required-type (not= type-id required-type))
-          (throw (ex-info (str "Required data type " required-type
-                               " does not match provided data type: " type ".")
-                          {:status 400 :error :db/shacl-required}))
-
-          (nil? value*)
-          (throw (ex-info (str "Data type " type-id
-                               " cannot be coerced from provided value: " value ".")
-                          {:status 400 :error :db/shacl-value-coercion}))
-
-          :else
-          [value type-id])))
+  [value-map required-type]
+  (let [[value type-id] (validate value-map)]
+    (if (and required-type
+             (not= type-id required-type))
+      (throw (ex-info (str "Required data type " required-type
+                           " does not match provided data type: " type ".")
+                      {:status 400 :error :db/shacl-required}))
+      [value type-id])))
