@@ -19,6 +19,11 @@
    :public "02e84dd4d9c88e0a276be24596c5c8d741a890956bda35f9c977dba296b8c7148a"})
 (def pleb-auth (did/private->did-map (:private pleb-kp)))
 
+(def other-kp
+  {:private "f6b009cc18dee16675ecb03b2a4b725f52bd699df07980cfd483766c75253f4b",
+   :public "02e84dd4d9c88e0a276be24596c5c8d741a890956bda35f9c977dba296b8c7148a"})
+(def other-auth (did/private->did-map (:private other-kp)))
+
 (def example-cred-subject {"@context" {"a" "http://a.com/"} "a:foo" "bar"})
 (def example-issuer (:id auth))
 
@@ -143,17 +148,18 @@
               @(fluree/query db0 {"select" {"?s" ["*"]}
                                   "where" [["?s" "@id" "open"]]}))
            "can see everything when no identity is asserted")
-       (is (= []
-              @(fluree/query db0 (async/<!! (cred/generate {"select" {"?s" ["*"]}
-                                                            "where" [["?s" "@id" "open"]]}
-                                                           (:private auth)))))
+       (is (= "Applying policy without a role is not yet supported."
+              (-> @(fluree/query db0 (async/<!! (cred/generate {"select" {"?s" ["*"]}
+                                                                "where" [["?s" "@id" "open"]]}
+                                                               (:private auth))))
+                  (Throwable->map)
+                  :cause))
            "cannot see anything before policies are mapped to identities")
        (is (= [root-user]
-              @(fluree/query db1 query))
-           "insert transaction credential")
+              @(fluree/query db1 query)))
        (is (= [{"id" (:id auth) "name" "D" "favnums" [2 3 4 5 6] "f:role" {"id" "role:cool"}}]
               @(fluree/query db2 query))
-           "modify transaction credential")
+           "modify transaction in credential")
 
        (is (= []
               @(fluree/query (fluree/db ledger) (async/<!! (cred/generate query (:private pleb-auth)))))
@@ -164,6 +170,10 @@
                 "f:role"  {"id" "role:cool"}}]
               @(fluree/query db2 (async/<!! (cred/generate query (:private auth)))))
            "query credential w/ policy allowing access")
+
+       (is (= []
+              @(fluree/query db2 (async/<!! (cred/generate query (:private other-auth)))))
+           "query credential w/ no roles")
 
        (is (= {"nums" [2 3 4 5 6],
                "root" [{"id"      (:id auth)
