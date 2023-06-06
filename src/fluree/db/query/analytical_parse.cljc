@@ -885,8 +885,8 @@
     (if (sequential? supplied-vars)
       (mapv symbolize-var-keys supplied-vars)
       (let [supplied-vars* (symbolize-var-keys supplied-vars)
-            rel-binding?   (and (some sequential? (vals supplied-vars*))
-                                (not (every? #(util/pred-ident? %) (vals supplied-vars*))))]
+            var-vals       (vals supplied-vars*)
+            rel-binding?   (some sequential? var-vals)]
         (if rel-binding?
           (expand-var-rel-binding supplied-vars*)
           supplied-vars*)))))
