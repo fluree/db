@@ -4,10 +4,11 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.policy-validate :as validate]
-            [fluree.db.query.fql :refer [query]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log]
-            [fluree.db.query.fql :as fql]))
+            [fluree.db.query.fql :as fql]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.flake :as flake]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -35,15 +36,15 @@
   [db]
   (go-try
     ;; TODO - once supported, use context to always return :f/allow and :f/property as vectors so we don't need to coerce downstream
-    (<? (query db {:context nil
-                   :select  {'?s [:*
-                                  {const/iri-rdf-type [:_id]}
-                                  {const/iri-allow [:* {const/iri-target-role
-                                                        [:_id]}]}
-                                  {const/iri-property
-                                   [:* {const/iri-allow
-                                        [:* {const/iri-target-role [:_id]}]}]}]}
-                   :where   [['?s const/iri-rdf-type const/iri-policy]]}))))
+    (<? (fql/query db {:context nil
+                       :select {'?s [:*
+                                     {const/iri-rdf-type [:_id]}
+                                     {const/iri-allow [:* {const/iri-target-role
+                                                           [:_id]}]}
+                                     {const/iri-property
+                                      [:* {const/iri-allow
+                                           [:* {const/iri-target-role [:_id]}]}]}]}
+                       :where [['?s const/iri-rdf-type const/iri-policy]]}))))
 
 (defn policies-for-roles*
   "Filters all rules into only those that apply to the given roles."
@@ -497,22 +498,28 @@
   (-> (select-keys opts [:did :role :credential])
       not-empty))
 
-(defn roles-for-did
-  [db did]
-  (go-try
-    (try
-      (->> (<? (fql/query db {"select" "?role"
-                              "where" [[did "https://ns.flur.ee/ledger#role" "?role"]]}))
-           (not-empty))
-      ;; in case no "f:role" exists
-      (catch Exception _))))
+(defn roles-for-sid
+  [db sid]
+  (let [in-ch        (async/chan 2 cat)
+        out-ch       (async/chan 2 (comp cat (map flake/o)))
+        did-roles-ch (query-range/index-range db :spot = [sid const/$_role])]
+
+    (async/pipe did-roles-ch in-ch)
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [did-role-flake ch]
+                            (-> (query-range/index-range db :spot = [(flake/o did-role-flake) const/$xsd:anyURI])
+                                (async/pipe ch)))
+
+                          in-ch)
+    (async/into [] out-ch)))
 
 (defn wrap-policy
   "Given a db object and a map containing the identity,
   wraps specified policy permissions"
   [{:keys [policy] :as db} {:keys [did role credential]}]
   (go-try
-    (let [roles (or role (when did (<? (roles-for-did db did))))]
+    (let [roles (or role (when did (<? (roles-for-sid db (<? (dbproto/-subid db did))))))]
       (cond
         (or (:ident policy) (:roles policy))
         (throw (ex-info (str "Policy already in place for this db. "
