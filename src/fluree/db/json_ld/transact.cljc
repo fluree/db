@@ -51,8 +51,6 @@
                     [:single-map ::txn-map]
                     [:sequence-of-maps [:sequential ::txn-map]]]}))
 
-(declare json-ld-node->flakes)
-
 (defn json-ld-type-data
   "Returns two-tuple of [class-subject-ids class-flakes]
   where class-flakes will only contain newly generated class
@@ -75,36 +73,6 @@
                          (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)))))
         [class-sids class-flakes]))))
 
-(defn add-property
-  "Adds property. Parameters"
-  [sid pid {shacl-dt :dt, validate-fn :validate-fn} check-retracts? list? {:keys [value] :as v-map}
-   {:keys [t db-before] :as tx-state}]
-  (go-try
-    (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
-                        (->> (<? (query-range/index-range db-before :spot = [sid pid]))
-                             (map #(flake/flip-flake % t))))
-          m           (when list?
-                        {:i (-> v-map :idx last)})
-          flakes      (cond
-                        ;; a new node's data is contained, process as another node then link to this one
-                        (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
-
-                        ;; a literal value
-                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
-                        (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                          (when validate-fn
-                            (or (validate-fn value*)
-                                (throw (ex-info (str "Value did not pass SHACL validation: " value)
-                                                {:status 400 :error :db/shacl-validation}))))
-                          [(flake/create sid pid value* dt t true m)])
-
-                        :else
-                        (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
-                                        {:status 400 :error :db/invalid-transaction})))]
-      (into flakes retractions))))
-
 (defn list-value?
   "returns true if json-ld value is a list object."
   [v]
@@ -116,11 +84,10 @@
   new-types are a set of newly created types in the transaction."
   [db sid added-classes]
   (go-try
-    (let [type-sids (->> (<? (query-range/index-range db :spot = [sid const/$rdf:type]))
-                         (map flake/o))]
-      (if (seq type-sids)
-        (into added-classes type-sids)
-        added-classes))))
+    (if-let [type-sids (seq (<? (query-range/index-range db :spot = [sid const/$rdf:type]
+                                                         {:flake-xf (map flake/o)})))]
+      (into added-classes type-sids)
+      added-classes)))
 
 (defn iri-only?
   "Returns true if a JSON-LD node contains only an IRI and no actual property data.
@@ -153,76 +120,196 @@
                                     "All items for a single subject should be consolidated.")
                                {:status 400 :error :db/invalid-transaction})))))))
 
-(defn json-ld-node->flakes
+(defn retract?
+  [value-map]
+  (nil? value-map))
+
+(defn retract-existing-flakes
+  [db t sid pid]
+  (let [range-opts {:flake-xf (map (fn [f]
+                                     (flake/flip-flake f t)))}]
+    (query-range/index-range db :spot = [sid pid] range-opts)))
+
+(defn literal?
+  [{:keys [value]} expected-dt]
+  (and (some? value)
+       (not= const/$xsd:anyURI expected-dt)))
+
+(defn create-literal-flake
+  [sid pid value-map t required-dt m validate-fn]
+  (let [[value* dt] (datatype/from-expanded value-map required-dt)]
+    (when validate-fn
+      (or (validate-fn value*)
+          (throw (ex-info (str "Value did not pass SHACL validation: " (:value value-map))
+                          {:status 400 :error :db/shacl-validation}))))
+    (flake/create sid pid value* dt t true m)))
+
+(defn sid->blank-node-id
+  [sid]
+  (str "_:f" sid))
+
+(defn produce-sid
+  [db {:keys [id] :as node} iri-cache referring-pid next-pid next-sid]
+  (go-try
+    (if id
+      (if-let [sid (get @iri-cache id)]
+        [sid id :cached]
+        (if-let [sid (<? (dbproto/-subid db id))]
+          (do (vswap! iri-cache assoc id sid)
+              [sid id :retrieved])
+          (let [sid (jld-ledger/generate-new-sid node referring-pid iri-cache next-pid next-sid)]
+            (vswap! iri-cache assoc id sid)
+            [sid id :generated])))
+      (let [sid (jld-ledger/generate-new-sid node referring-pid iri-cache next-pid next-sid)
+            id  (sid->blank-node-id sid)]
+        (vswap! iri-cache assoc id sid)
+        [sid id :blank-node]))))
+
+(defn node-update?
+  [m]
+  (seq (dissoc m :idx :id)))
+
+(defn new-pid
+  [prop-iri value iri-cache ref-cache next-pid]
+  (let [first-obj (->> (or (:list value) value)
+                       util/sequential
+                       first)
+        ;; either a ref or a value
+        ref? (not (:value first-obj))]
+
+    (or (get jld-ledger/predefined-properties prop-iri)
+        (jld-ledger/generate-new-pid prop-iri iri-cache next-pid ref? ref-cache))))
+
+(defn assert-property-flakes
+  [sid pid v t
+   {:keys [next-pid next-sid iris db-before] :as _tx-state}
+   shacl-dt validate-fn]
+  (go-try
+    (let [list-obj? (list-value? v)
+          v*        (if list-obj?
+                      (let [list-vals (:list v)]
+                        (when-not (sequential? list-vals)
+                          (throw (ex-info (str "List values have to be vectors, provided: " v)
+                                          {:status 400 :error :db/invalid-transaction})))
+                        list-vals)
+                      (util/sequential v))]
+      (loop [[v-map & r] v*
+             flakes      []
+             nodes       []]
+        (if v-map
+          (let [m (when list-obj?
+                    {:i (-> v-map :idx last)})]
+            (cond
+              ;; a new node's data is contained, process as another node then link to this one
+              (jld-reify/node? v-map)
+              (let [[obj-sid obj-id status] (<? (produce-sid db-before v-map iris pid next-pid next-sid))
+                    obj-node-flakes (cond-> [(flake/create sid pid obj-sid const/$xsd:anyURI t true m)]
+                                      (#{:generated :blank-node} status)
+                                      (conj (flake/create obj-sid const/$xsd:anyURI obj-id const/$xsd:string t true nil)))
+                    flakes*         (into flakes obj-node-flakes)
+                    nodes*          (cond-> nodes
+                                      (node-update? v-map)
+                                      (conj (assoc v-map :id obj-id)))]
+                (recur r flakes* nodes*))
+
+              ;; a literal value
+              (literal? v-map shacl-dt)
+              (let [flakes* (conj flakes (create-literal-flake sid pid v-map t shacl-dt m validate-fn))]
+                (recur r flakes* nodes))
+
+              :else
+              (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
+                              {:status 400 :error :db/invalid-transaction}))))
+          [flakes nodes])))))
+
+(defn create-nested-flakes
+  [node sid shacl-map
+   {:keys [t next-pid iris refs db-before] :as tx-state}
+   new-subj?]
+  (go-try
+    (loop [[[k v] & r]  (dissoc node :id :idx :type)
+           flakes       []
+           nested-nodes []]
+      (if k
+        (if-let [pid (<? (jld-reify/get-iri-sid k db-before iris))]
+          (if (and (retract? v)
+                   (not new-subj?))
+            (let [retractions (<? (retract-existing-flakes db-before t sid pid))
+                  flakes*     (into flakes retractions)]
+              (recur r flakes* nested-nodes))
+            (let [{shacl-dt :dt, validate-fn :validate-fn}
+                  (get-in shacl-map [:datatype pid])
+
+                  [assertions obj-nodes] (<? (assert-property-flakes sid pid v t tx-state shacl-dt validate-fn))
+                  flakes*                (cond-> flakes
+                                           (not new-subj?) (into (<? (retract-existing-flakes db-before t sid pid)))
+                                           true            (into assertions))
+                  nested-nodes*          (into nested-nodes obj-nodes)]
+              (recur r flakes* nested-nodes*)))
+          (let [pid (new-pid k v iris refs next-pid)]
+            (if (retract? v)
+              (throw (ex-info (str "Attempting to retract a property that isn't present: " k)
+                              {:status 400, :error :db/invalid-transaction}))
+              (let [{shacl-dt :dt, validate-fn :validate-fn}
+                    (get-in shacl-map [:datatype pid])
+
+                    [assertions obj-nodes] (<? (assert-property-flakes sid pid v t tx-state  shacl-dt validate-fn))
+                    flakes*                (-> flakes
+                                               (into assertions)
+                                               (conj (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))
+                    nested-nodes* (into nested-nodes obj-nodes)]
+                (recur r flakes* nested-nodes*)))))
+
+        [flakes nested-nodes]))))
+
+(defn json-ld->flakes
   "Returns two-tuple of [sid node-flakes] that will contain the top-level sid
   and all flakes from the target node and all children nodes that ultimately get processed.
 
   If property-id is non-nil, it can be checked when assigning new subject id for the node
   if it meets certain criteria. It will only be non-nil for nested subjects in the json-ld."
-  [{:keys [id type] :as node}
-   {:keys [t next-pid next-sid iris refs db-before subj-mods] :as tx-state}
+  [json-ld
+   {:keys [t next-pid next-sid iris db-before subj-mods default-ctx] :as tx-state}
    referring-pid]
-  (go-try
-    (let [existing-sid (when id
-                         (<? (jld-reify/get-iri-sid id db-before iris)))
-          new-subj?    (not existing-sid)
-          [new-type-sids type-flakes] (when type
-                                        (<? (json-ld-type-data type tx-state)))
-          sid          (if new-subj?
-                         ;; TODO - this will check if subject is rdfs:Class, but we already have the new-type-sids above and know that - this can be a little faster, but reify.cljc also uses this logic and they need to align
-                         (jld-ledger/generate-new-sid node referring-pid iris next-pid next-sid)
-                         existing-sid)
-          classes      (if new-subj?
-                         new-type-sids
-                         (<? (get-subject-types db-before sid new-type-sids)))
-          shacl-map    (<? (shacl/class-shapes db-before classes))
-          id*          (if (and new-subj? (nil? id))
-                         (str "_:f" sid) ;; create a blank node id
-                         id)
-          base-flakes  (cond-> []
-                               new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
-                               new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
-      ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
-      (register-node subj-mods node sid {:iri-only? (iri-only? node)
-                                         :shacl     shacl-map
-                                         :new?      new-subj?
-                                         :classes   classes})
-      (loop [[[k v] & r] (dissoc node :id :idx :type)
-             property-flakes type-flakes ;; only used if generating new Class and Property flakes
-             subj-flakes     base-flakes]
-        (if k
-          (let [list?            (list-value? v)
-                retract?         (nil? v)
-                v*               (if list?
-                                   (let [list-vals (:list v)]
-                                     (when-not (sequential? list-vals)
-                                       (throw (ex-info (str "List values have to be vectors, provided: " v)
-                                                       {:status 400 :error :db/invalid-transaction})))
-                                     list-vals)
-                                   (util/sequential v))
-                ref?             (not (:value (first v*))) ;; either a ref or a value
-                existing-pid     (<? (jld-reify/get-iri-sid k db-before iris))
-                pid              (or existing-pid
-                                     (get jld-ledger/predefined-properties k)
-                                     (jld-ledger/generate-new-pid k iris next-pid ref? refs))
-                datatype-map     (get-in shacl-map [:datatype pid])
-                property-flakes* (if existing-pid
-                                   property-flakes
-                                   (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))
-                ;; check-retracts? - a new subject or property don't require checking for flake retractions
-                check-retracts?  (or (not new-subj?) existing-pid)
-                flakes*          (if retract?
-                                   (->> (<? (query-range/index-range db-before :spot = [sid pid]))
-                                        (map #(flake/flip-flake % t)))
-                                   (loop [[v' & r] v*
-                                          flakes* subj-flakes]
-                                     (if v'
-                                       (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
-                                       (cond-> flakes*
-                                               property-flakes (into property-flakes)))))]
-            (recur r property-flakes* flakes*))
-          ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
-          [sid (into subj-flakes property-flakes)])))))
+  (let [nodes (-> json-ld
+                  (json-ld/expand default-ctx)
+                  util/sequential)]
+    (go-try
+      (loop [[node & r] nodes
+             all-flakes []]
+        (if node
+          (if (empty? (dissoc node :idx :id))
+            (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
+                                 (some->> (:id node)
+                                          (str " for @id: "))
+                                 ".")
+                            {:status 400 :error :db/invalid-transaction}))
+            (let [{:keys [type]} node
+                  [new-type-sids type-flakes] (when type
+                                                (<? (json-ld-type-data type tx-state)))
+
+                  [sid id status] (<? (produce-sid db-before node iris referring-pid next-pid next-sid))
+                  new-subj?       (#{:generated :blank-node} status)
+                  classes         (<? (get-subject-types db-before sid new-type-sids))
+                  shacl-map       (<? (shacl/class-shapes db-before classes))
+                  base-flakes     (cond-> []
+                                    new-subj?     (conj (flake/create sid const/$xsd:anyURI id const/$xsd:string t true nil))
+                                    new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
+              (register-node subj-mods node sid {:iri-only? (iri-only? node)
+                                                 :shacl     shacl-map
+                                                 :new?      new-subj?
+                                                 :classes   classes})
+              (let [[property-flakes nested-nodes]
+                    (<? (create-nested-flakes node sid shacl-map tx-state new-subj?))
+
+                    nodes*      (into r nested-nodes)
+
+                    all-flakes* (-> all-flakes
+                                    (into base-flakes)
+                                    (into type-flakes)
+                                    (into property-flakes))]
+                (recur nodes* all-flakes*))))
+          all-flakes)))))
 
 (defn ->tx-state
   [db {:keys [bootstrap? issuer context-type] :as _opts}]
@@ -309,22 +396,6 @@
                          vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
 
-(defn stage-flakes
-  [flakeset tx-state nodes]
-  (go-try
-    (loop [[node & r] nodes
-           flakes* flakeset]
-      (if node
-        (if (empty? (dissoc node :idx :id))
-          (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
-                               (some->> (:id node)
-                                        (str " for @id: "))
-                               ".")
-                          {:status 400 :error :db/invalid-transaction}))
-          (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
-            (recur r (into flakes* node-flakes))))
-        flakes*))))
-
 (defn validate-rules
   [{:keys [db-after add] :as staged-map} {:keys [subj-mods] :as _tx-state}]
   (let [subj-mods' @subj-mods
@@ -354,14 +425,11 @@
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
-  [{:keys [t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
-  (log/trace "insert default-ctx:" default-ctx)
-  (let [nodes    (-> json-ld
-                     (json-ld/expand default-ctx)
-                     util/sequential)
-        flakeset (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                   (init-db? db) (into (base-flakes t)))]
-    (stage-flakes flakeset tx-state nodes)))
+  [{:keys [t] :as db} json-ld tx-state]
+  (go-try
+    (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
+      (init-db? db) (into (base-flakes t))
+      true          (into (<? (json-ld->flakes json-ld tx-state nil))))))
 
 (defn into-flakeset
   [flake-ch]
