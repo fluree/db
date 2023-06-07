@@ -4,9 +4,11 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.policy-validate :as validate]
-            [fluree.db.query.fql :refer [query]]
             [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.log :as log]))
+            [fluree.db.util.log :as log]
+            [fluree.db.query.fql :as fql]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.flake :as flake]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -34,15 +36,15 @@
   [db]
   (go-try
     ;; TODO - once supported, use context to always return :f/allow and :f/property as vectors so we don't need to coerce downstream
-    (<? (query db {:context nil
-                   :select  {'?s [:*
-                                  {const/iri-rdf-type [:_id]}
-                                  {const/iri-allow [:* {const/iri-target-role
-                                                        [:_id]}]}
-                                  {const/iri-property
-                                   [:* {const/iri-allow
-                                        [:* {const/iri-target-role [:_id]}]}]}]}
-                   :where   [['?s const/iri-rdf-type const/iri-policy]]}))))
+    (<? (fql/query db {:context nil
+                       :select {'?s [:*
+                                     {const/iri-rdf-type [:_id]}
+                                     {const/iri-allow [:* {const/iri-target-role
+                                                           [:_id]}]}
+                                     {const/iri-property
+                                      [:* {const/iri-allow
+                                           [:* {const/iri-target-role [:_id]}]}]}]}
+                       :where [['?s const/iri-rdf-type const/iri-policy]]}))))
 
 (defn policies-for-roles*
   "Filters all rules into only those that apply to the given roles."
@@ -95,7 +97,7 @@
   If any exception occurs during resolution, returns the error immediately."
   [db subjects]
   (async/go-loop [[next-sid & r] (map #(dbproto/-subid db %) subjects)
-                  acc []]
+                  acc #{}]
     (if next-sid
       (let [next-res (async/<! next-sid)]
         (if (util/exception? next-res)
@@ -457,31 +459,25 @@
 
 (defn policy-map
   "perm-action is a set of the action(s) being filtered for."
-  [db identity role credential]
+  [db did-sid role-sids credential]
   (async/go
     (try*
-     (let [ident-sid         (some->> identity
-                                      (dbproto/-subid db)
-                                      <?)
-           role-sids         (if (sequential? role)
-                               (->> (<? (subids db role))
-                                    (into #{}))
-                               #{(<? (dbproto/-subid db role))})
-           policies          {:ident ident-sid
-                              :roles role-sids
-                              :cache (atom {})}
-           ;; TODO - query for all rules is very cacheable - but cache must be cleared when any new tx updates a rule
-           ;; TODO - (easier said than done, as they are nested nodes whose top node is the only one required to have a specific class type)
-           role-policies     (<? (policies-for-roles db policies))
+      (let [policies {:ident did-sid
+                      :roles role-sids
+                      :cache (atom {})}
 
-           compiled-policies (->> (<? (compile-policies db role-policies))
-                                  (reduce (fn [acc [ks m]]
-                                            (assoc-in acc ks m))
-                                          policies))
-           root-access?      (= compiled-policies
-                                {const/iri-view {:node {:root? true}}})]
+            ;; TODO - query for all rules is very cacheable - but cache must be cleared when any new tx updates a rule
+            ;; TODO - (easier said than done, as they are nested nodes whose top node is the only one required to have a specific class type)
+            role-policies (<? (policies-for-roles db policies))
+
+            compiled-policies (->> (<? (compile-policies db role-policies))
+                                   (reduce (fn [acc [ks m]]
+                                             (assoc-in acc ks m))
+                                           policies))
+            root-access?      (= compiled-policies
+                                 {const/iri-view {:node {:root? true}}})]
        (cond-> compiled-policies
-               root-access? (assoc-in [const/iri-view :root?] true)))
+         root-access? (assoc-in [const/iri-view :root?] true)))
      (catch* e
        (if (= :db/invalid-query (:error (ex-data e)))
          (throw (ex-info (str "There are no Fluree rules in the db, a policy-driven database cannot be retrieved. "
@@ -496,19 +492,32 @@
   (-> (select-keys opts [:did :role :credential])
       not-empty))
 
+(defn role-sids-for-sid
+  [db sid]
+  (go-try
+    (->> (<? (query-range/index-range db :spot = [sid const/$_role] {:flake-xf (map flake/o)}))
+         (into #{}))))
+
 (defn wrap-policy
   "Given a db object and a map containing the identity,
   wraps specified policy permissions"
   [{:keys [policy] :as db} {:keys [did role credential]}]
-  ;; TODO - not yet paying attention to verifiable credentials that are present
   (go-try
-    (cond
-      (or (:ident policy) (:roles policy)) (throw (ex-info (str "Policy already in place for this db. "
-                                                                "Applying policy more than once, via multiple uses of `wrap-policy` and/or supplying an identity via `:opts`, is not supported.")
-                                                           {:status 400
-                                                            :error  :db/policy-exception}))
-      (not role) (throw (ex-info "Applying policy without a role is not yet supported."
-                                 {:status 400
-                                  :error  :db/policy-exception}))
-      :else (assoc db :policy
-                      (<? (policy-map db did role credential))))))
+    (let [did-sid (and did (<? (dbproto/-subid db did)))
+          role-sids (or (and role (<? (subids db (util/sequential role))))
+                        (and did-sid (<? (role-sids-for-sid db did-sid))))]
+      (cond
+        (or (:ident policy) (:roles policy))
+        (throw (ex-info (str "Policy already in place for this db. "
+                             "Applying policy more than once, via multiple uses of `wrap-policy` and/or supplying "
+                             "an identity via `:opts`, is not supported.")
+                        {:status 400
+                         :error  :db/policy-exception}))
+
+        (empty? role-sids)
+        (throw (ex-info "Applying policy without a role is not yet supported."
+                        {:status 400
+                         :error  :db/policy-exception}))
+
+        :else
+        (assoc db :policy (<? (policy-map db did-sid role-sids credential)))))))

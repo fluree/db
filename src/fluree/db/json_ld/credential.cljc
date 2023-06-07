@@ -58,36 +58,36 @@
 
 (defn generate
   "Generate a VerifiableCredential given a subject and some issuer opts."
-  ([credential-subject private] (generate credential-subject private
-                                          (did/private->did-map private)))
+  ([credential-subject private]
+   (generate credential-subject private (did/private->did-map private)))
   ([credential-subject private did]
    (go-try
-     (let [proof #?(:clj (create-proof (-> credential-subject
-                                           jld-processor/canonize
-                                           crypto/sha2-256)
-                                       (did/encode-did-key (:public did))
-                                       private)
-                    :cljs (let [canonicalized (<p! (jld-processor/canonize credential-subject))]
-                            (create-proof (crypto/sha2-256 canonicalized)
-                                          (did/encode-did-key (:public did))
-                                          private)))]
+     (let [canonicalized #?(:clj (jld-processor/canonize credential-subject)
+                            :cljs (<p! (jld-processor/canonize credential-subject)))
+
+           ;; TODO: assert this once our credential subjects are proper json-ld
+           ;; _ (when (= "" canonicalized) (throw (ex-info "Unsupported credential subject" {:credential-subject credential-subject})))
+
+           did-key (did/encode-did-key (:public did))
+           proof (create-proof (crypto/sha2-256 canonicalized)
+                               did-key
+                               private)]
        {"@context"          "https://www.w3.org/2018/credentials/v1"
         "id"                ""
         "type"              ["VerifiableCredential" "CommitProof"]
         "issuer"            (:id did)
         "issuanceDate"      (util/current-time-iso)
         "credentialSubject" credential-subject
-        "proof" proof}))))
+        "proof"             proof}))))
 
 (defn verify
-  "Takes a credential and returns the credential subject and issuer id if it verifies. If
-  credential does not have a jws returns the credential without verifying it. If the
-  credential is invalid an exception will be thrown."
+  "Takes a credential and returns the credential subject and signing did if it
+  verifies. If credential does not have a jws returns nil. If the credential is invalid
+  an exception will be thrown."
   [credential]
   (go-try
     (when-let [jws (get-in credential ["proof" "jws"])]
       (let [subject (get credential "credentialSubject")
-            issuer  (get credential "issuer")
             {:keys [header signature]} (deserialize-jws jws)
 
             signing-input #?(:clj (-> (jld-processor/canonize subject)
@@ -96,7 +96,9 @@
                                             (.then (fn [res] (crypto/sha2-256 res))))))
 
             proof-did     (get-in credential ["proof" "verificationMethod"])
-            pubkey        (did/decode-did-key proof-did)]
+            pubkey        (did/decode-did-key proof-did)
+            id            (crypto/account-id-from-public pubkey)
+            auth-did      (did/auth-id->did id)]
         (when (not= jws-header-json header)
           (throw (ex-info "Unsupported jws header in credential."
                           {:error :credential/unknown-signing-algorithm
@@ -107,4 +109,4 @@
         (when (not (crypto/verify-signature pubkey signing-input signature))
           (throw (ex-info "Verification failed." {:error :credential/invalid-signature :credential credential})))
         ;; everything is good
-        {:subject subject :issuer issuer}))))
+        {:subject subject :did auth-did}))))

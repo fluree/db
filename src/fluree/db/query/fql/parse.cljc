@@ -500,7 +500,8 @@
   [x]
   (and (or (update/insert? x)
            (update/retract? x))
-       (contains? x :where)))
+       (or (contains? x :where)
+           (contains? x "where"))))
 
 (defn parse-update-clause
   [clause db context]

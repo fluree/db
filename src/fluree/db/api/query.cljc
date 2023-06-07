@@ -79,29 +79,31 @@
   "Return a summary of the changes over time, optionally with the full commit details included."
   [db query-map]
   (go-try
-   (let [coerced-query (try*
-                        (history/coerce-history-query query-map)
-                        (catch* e
-                          (throw
-                           (ex-info
-                            (str "History query not properly formatted. Provided "
-                                 (pr-str query-map))
-                            {:status  400
-                             :message (history/humanize-error e)
-                             :error   :db/invalid-query}))))]
-     (<? (history* db coerced-query)))))
+   (let [{query-map :subject, did :did} (or (<? (cred/verify query-map))
+                                                  {:subject query-map})
+         coerced-query (try*
+                         (history/coerce-history-query query-map)
+                         (catch* e
+                                 (throw
+                                   (ex-info
+                                     (str "History query not properly formatted. Provided "
+                                          (pr-str query-map))
+                                     {:status  400
+                                      :message (history/humanize-error e)
+                                      :error   :db/invalid-query}))))
+         history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
+     (<? (history* db history-query)))))
 
 (defn query
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
   [db query]
   (go-try
-    (let [{query :subject, issuer :issuer}
-          (or (<? (cred/verify query))
-              {:subject query})
+    (let [{query :subject, did :did} (or (<? (cred/verify query))
+                                         {:subject query})
 
           {:keys [opts t]} query
-          db*              (if-let [policy-opts (perm/policy-opts opts)]
+          db*              (if-let [policy-opts (perm/policy-opts (cond-> opts did (assoc :did did)))]
                              (<? (perm/wrap-policy db policy-opts))
                              db)
           db**             (-> (if t
@@ -109,10 +111,10 @@
                                  db*)
                                (assoc-in [:policy :cache] (atom {})))
           query*           (-> query
-                               (update :opts assoc :issuer issuer)
+                               (update :opts assoc :issuer did)
                                (update :opts dissoc :meta))
           start            #?(:clj  (System/nanoTime)
-                              :cljs (util/current-time-millis)) ]
+                              :cljs (util/current-time-millis))]
       (if (:meta opts)
         (let [fuel-tracker (fuel/tracker)]
           (try* (let [result (<? (fql/query db** fuel-tracker query*))]
@@ -145,7 +147,9 @@
            - errors - map of query alias to their respective error"
   [source flureeQL]
   (go-try
-   (let [global-opts         (:opts flureeQL)
+   (let [{flureeQL :subject, did :did} (or (<? (cred/verify flureeQL))
+                                              {:subject flureeQL})
+         global-opts         (cond-> (:opts flureeQL) did (assoc :did did))
          db                  (if-let [policy-opts (perm/policy-opts global-opts)]
                                (<? (perm/wrap-policy source policy-opts))
                                source)
