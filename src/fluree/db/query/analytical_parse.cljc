@@ -29,9 +29,10 @@
                         {:status 400 :error :db/invalid-query})))
       res)
     (catch* e
-            (log/warn "Invalid query function attempted: " code-str " with error message: " (ex-message e))
-            (throw (ex-info (code-str "Invalid query function: " code-str)
-                            {:status 400 :error :db/invalid-query})))))
+      (log/warn "Invalid query function attempted: " code-str " with error message: "
+                (ex-message e))
+      (throw (ex-info (code-str "Invalid query function: " code-str)
+                      {:status 400 :error :db/invalid-query})))))
 
 (def built-in-aggregates
   (letfn [(sum [coll] (reduce + 0 coll))
@@ -867,7 +868,7 @@
   [supplied-vars]
   (let [ks (keys supplied-vars)]
     (->> (vals supplied-vars)
-         (mapv #(if (sequential? %)                         ;; scalar values get turned into infite lazy seqs of value
+         (mapv #(if (sequential? %) ; scalar values get turned into infite lazy seqs of value
                   %
                   (repeat %)))
          (apply interleave)
@@ -884,8 +885,8 @@
     (if (sequential? supplied-vars)
       (mapv symbolize-var-keys supplied-vars)
       (let [supplied-vars* (symbolize-var-keys supplied-vars)
-            rel-binding?   (and (some sequential? (vals supplied-vars*))
-                                (not (every? #(util/pred-ident? %) (vals supplied-vars*))))]
+            var-vals       (vals supplied-vars*)
+            rel-binding?   (some sequential? var-vals)]
         (if rel-binding?
           (expand-var-rel-binding supplied-vars*)
           supplied-vars*)))))
