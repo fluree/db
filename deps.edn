@@ -12,7 +12,7 @@
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
-         ch.qos.logback/logback-classic  {:mvn/version "1.4.6"}
+         ch.qos.logback/logback-classic  {:mvn/version "1.4.7"}
          org.slf4j/slf4j-api             {:mvn/version "2.0.7"}
 
          ;; Lucene
@@ -28,7 +28,7 @@
          ;; serialization / compression
          com.fluree/abracad              {:mvn/version "0.4.19"}
          com.taoensso/nippy              {:mvn/version "3.2.0"}
-         org.xerial.snappy/snappy-java   {:mvn/version "1.1.9.1"}
+         org.xerial.snappy/snappy-java   {:mvn/version "1.1.10.0"}
          com.fluree/alphabase            {:mvn/version "3.3.0"}
 
          ;; cryptography
@@ -68,7 +68,7 @@
 
   :cljtest
   {:extra-paths ["test"]
-   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.80.1274"}
+   :extra-deps  {lambdaisland/kaocha    {:mvn/version "1.84.1335"}
                  org.clojure/test.check {:mvn/version "1.1.1"}}
    :main-opts   ["-m" "kaocha.runner"]}
 
@@ -110,7 +110,7 @@
    :main-opts   ["-m" "cloverage.coverage" "-p" "src" "-s" "test" "--output" "scanning_results/coverage"]}
 
   :eastwood
-  {:extra-deps {jonase/eastwood {:mvn/version "1.3.0"}}
+  {:extra-deps {jonase/eastwood {:mvn/version "1.4.0"}}
    :main-opts  ["-m" "eastwood.lint"
                 {:source-paths ["src" "src-docs"]
                  :test-paths   ["test"]}]}
@@ -120,5 +120,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.03.17"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.05.26"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
