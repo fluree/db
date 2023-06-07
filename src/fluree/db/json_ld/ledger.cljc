@@ -114,6 +114,26 @@
   (or (-> db :ecount (get const/$_shard))
       (dec (flake/->sid const/$_shard 0))))
 
+(def property-constraints
+  "The set of property ids for which every object of that property must also be a
+  property"
+  #{const/$rdfs:subClassOf
+    const/$sh:path
+    const/$sh:ignoredProperties
+    const/$sh:targetClass
+    const/$sh:targetSubjectsOf
+    const/$sh:targetObjectsOf
+    const/$sh:equals
+    const/$sh:disjoint
+    const/$sh:lessThan
+    const/$sh:lessThanOrEquals})
+
+(defn property-constraint?
+  "Returns true if any object of the supplied property id `pid` must itself be a
+  property."
+  [pid]
+  (contains? property-constraints pid))
+
 (defn generate-new-sid
   "Generates a new subject ID. If it is known this is a property or class will
   assign the lower range of subject ids."
@@ -121,17 +141,7 @@
   (let [new-sid (or
                   (get predefined-properties id)
                   (if (or (class-or-property? node)
-                          (#{const/$rdfs:subClassOf
-                             const/$sh:path
-                             const/$sh:ignoredProperties
-                             const/$sh:targetClass
-                             const/$sh:targetSubjectsOf
-                             const/$sh:targetObjectsOf
-                             const/$sh:equals
-                             const/$sh:disjoint
-                             const/$sh:lessThan
-                             const/$sh:lessThanOrEquals}
-                           referring-pid))
+                          (property-constraint? referring-pid))
                     (next-pid)
                     (next-sid)))]
     (vswap! iris assoc id new-sid)
