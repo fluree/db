@@ -50,13 +50,13 @@ install: target/fluree-db.jar
 deploy: target/fluree-db.jar
 	clojure -T:build deploy
 
-js-packages/nodejs/package.json: package.json
+js-packages/nodejs/package.json: package.json build.clj
 	clojure -T:build sync-package-json :target $(@D)/package.json :node? true
 
-js-packages/browser/package.json: package.json
+js-packages/browser/package.json: package.json build.clj
 	clojure -T:build sync-package-json :target $(@D)/package.json
 
-js-packages/webworker/package.json: package.json
+js-packages/webworker/package.json: package.json build.clj
 	clojure -T:build sync-package-json :target $(@D)/package.json
 
 js-packages/nodejs/flureenjs.js: out/flureenjs.js
