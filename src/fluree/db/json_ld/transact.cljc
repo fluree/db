@@ -234,13 +234,13 @@
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap? issuer context-type] :as _opts}]
+  [db {:keys [bootstrap? did context-type] :as _opts}]
   (let [{:keys [block schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t        (-> commit-t inc -)] ;; commit-t is always positive, need to make negative for internal indexing
-    {:issuer      issuer
+    {:did         did
      :db-before   (dbproto/-rootdb db)
      :policy      policy
      :bootstrap?  bootstrap?
@@ -404,19 +404,22 @@
         (validate-rules tx-state)
         <?
         (policy/allowed? tx-state)
-        <?)))
+        <?
+        ;; unwrap the policy
+        (dbproto/-rootdb))))
 
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
   [db json-ld opts]
   (go-try
-    (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
-                                           {:subject json-ld})
-          db* (if-let [policy-opts (perm/policy-opts opts)]
+    (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
+                                        {:subject json-ld})
+          opts* (cond-> opts did (assoc :did did))
+          db* (if-let [policy-opts (perm/policy-opts opts*)]
                 (<? (perm/wrap-policy db policy-opts))
                 db)
-          tx-state (->tx-state db* (assoc opts :issuer issuer))
+          tx-state (->tx-state db* opts*)
           flakes   (if (q-parse/update? tx)
                      (<? (modify db tx tx-state))
                      (<? (insert db tx tx-state)))]

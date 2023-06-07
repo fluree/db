@@ -214,7 +214,7 @@
               (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
               (when o (jld-db/expand-iri db o context))]
 
-         [s p o] [(get ids 0) (get ids 1) (get ids 2)]
+         [s p o] ids
          [pattern idx] (cond
                          (not (nil? s))
                          [ids :spot]

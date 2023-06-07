@@ -2,15 +2,30 @@
   (:require [fluree.db.json-ld.credential :as cred]
             [clojure.core.async :as async]
             #?(:clj [clojure.test :as t :refer [deftest testing is]]
-               :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])))
+               :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
+            [fluree.db.json-ld.api :as fluree]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.did :as did]))
 
-(def auth
-  {:id "did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh"
-   :public "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
+
+(def kp
+  {:public "03b160698617e3b4cd621afd96c0591e33824cb9753ab2f1dace567884b4e242b0"
    :private "509553eece84d5a410f1012e8e19e84e938f226aa3ad144e2d12f36df0f51c1e"})
+(def auth (did/private->did-map (:private kp)))
+
+(def pleb-kp
+  {:private "f6b009cc18dee16675ecb03b2a4b725f52bd699df07980cfd483766c75253f4b",
+   :public "02e84dd4d9c88e0a276be24596c5c8d741a890956bda35f9c977dba296b8c7148a"})
+(def pleb-auth (did/private->did-map (:private pleb-kp)))
+
+(def other-kp
+  {:private "f6b009cc18dee16675ecb03b2a4b725f52bd699df07980cfd483766c75253f4b",
+   :public "02e84dd4d9c88e0a276be24596c5c8d741a890956bda35f9c977dba296b8c7148a"})
+(def other-auth (did/private->did-map (:private other-kp)))
 
 (def example-cred-subject {"@context" {"a" "http://a.com/"} "a:foo" "bar"})
-(def example-issuer "did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh")
+(def example-issuer (:id auth))
 
 (def clj-generated-jws
   "eyJhbGciOiJFUzI1NkstUiIsImI2NCI6ZmFsc2UsImNyaXQiOlsiYjY0Il19..HDBFAiEA80-G5gUH6BT9D1Mc-YyWbjuwbL7nKfWj6BrsHS6whQ0CIAcjzJvo0sW52FIlgvxy0hPBKNWolIwLvoedG_4HQu_V")
@@ -22,7 +37,7 @@
   {"@context"          "https://www.w3.org/2018/credentials/v1"
    "id"                ""
    "type"              ["VerifiableCredential" "CommitProof"]
-   "issuer"            example-issuer
+   "issuer"            (:id auth)
    "issuanceDate"      "1970-01-01T00:00:00.00000Z"
    "credentialSubject" example-cred-subject
    "proof"             {"type"               "EcdsaSecp256k1RecoverySignature2020"
@@ -43,8 +58,8 @@
        (testing "verify correct signature"
          (let [clj-result (async/<!! (cred/verify example-credential))
                cljs-result (async/<!! (cred/verify (assoc-in example-credential ["proof" "jws"] cljs-generated-jws)))]
-           (is (= {:subject example-cred-subject :issuer example-issuer} clj-result))
-           (is (= {:subject example-cred-subject :issuer example-issuer} cljs-result))))
+           (is (= {:subject example-cred-subject :did example-issuer} clj-result))
+           (is (= {:subject example-cred-subject :did example-issuer} cljs-result))))
 
        (testing "verify incorrect signature"
          (let [wrong-cred (assoc example-credential "credentialSubject" {"@context" {"a" "http://a.com/"} "a:foo" "DIFFERENT!"})]
@@ -74,8 +89,8 @@
                 (with-redefs [fluree.db.util.core/current-time-iso (constantly "1970-01-01T00:00:00.00000Z")]
                   (let [cljs-result (async/<! (cred/verify example-credential))
                         clj-result  (async/<! (cred/verify (assoc-in example-credential ["proof" "jws"] clj-generated-jws)))]
-                    (is (= {:subject example-cred-subject :issuer example-issuer} cljs-result))
-                    (is (= {:subject example-cred-subject :issuer example-issuer} clj-result))
+                    (is (= {:subject example-cred-subject :did example-issuer} cljs-result))
+                    (is (= {:subject example-cred-subject :did example-issuer} clj-result))
                     (done)))))))
 
 #?(:cljs
@@ -96,6 +111,101 @@
                   (let [non-cred example-cred-subject]
                     (is (nil? (async/<! (cred/verify non-cred))))
                     (done)))))))
+
+#?(:clj
+   (deftest ^:integration cred-wrapped-transactions-and-queries
+     (let [conn   @(fluree/connect {:method :memory})
+           ledger @(fluree/create conn "credentialtest" {:defaultContext
+                                                         [test-utils/default-str-context
+                                                          {"@base" "ledger:credentialtest/" "@vocab" ""}]})
+
+           db0       @(test-utils/transact ledger {"@id" "open" "foo" "bar"})
+           root-user {"id" (:id auth) "name" "Daniel" "f:role" {"id" "role:cool"} "favnums" [1 2 3]}
+           pleb-user {"id" (:id pleb-auth) "name" "Plebian" "f:role" [{"id" "role:notcool"}
+                                                                      { "id" "role:irrelevant"}]}
+           policy    {"id"           "rootPolicy"
+                      "type"         "f:Policy"
+                      "f:targetNode" {"id" "f:allNodes"}
+                      "f:allow"      [{"f:targetRole" {"id" "role:cool"}
+                                       "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}
+           tx        [root-user pleb-user policy]
+           ;; can't use credentials until after an identity with a role has been created
+           db1       @(test-utils/transact ledger tx)
+
+           mdfn {"delete" [["?s" "name" "Daniel"]
+                           ["?s" "favnums" 1]]
+                 "insert" [["?s" "name" "D"]
+                           ["?s" "favnums" 4]
+                           ["?s" "favnums" 5]
+                           ["?s" "favnums" 6]]
+                 "where"  [["?s" "@id" (:id auth)]]}
+
+           db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
+
+           query {"select" {"?s" ["*"]} "where" [["?s" "@id" (:id auth)]]}]
+
+       (is (= [{"id" "open", "foo" "bar"}]
+              @(fluree/query db0 {"select" {"?s" ["*"]}
+                                  "where" [["?s" "@id" "open"]]}))
+           "can see everything when no identity is asserted")
+       (is (= "Applying policy without a role is not yet supported."
+              (-> @(fluree/query db0 (async/<!! (cred/generate {"select" {"?s" ["*"]}
+                                                                "where" [["?s" "@id" "open"]]}
+                                                               (:private auth))))
+                  (Throwable->map)
+                  :cause))
+           "cannot see anything before policies are mapped to identities")
+       (is (= [root-user]
+              @(fluree/query db1 query)))
+       (is (= [{"id" (:id auth) "name" "D" "favnums" [2 3 4 5 6] "f:role" {"id" "role:cool"}}]
+              @(fluree/query db2 query))
+           "modify transaction in credential")
+
+       (is (= []
+              @(fluree/query (fluree/db ledger) (async/<!! (cred/generate query (:private pleb-auth)))))
+           "query credential w/ policy forbidding access")
+       (is (= [{"id"      (:id auth)
+                "name"    "D"
+                "favnums" [2 3 4 5 6]
+                "f:role"  {"id" "role:cool"}}]
+              @(fluree/query db2 (async/<!! (cred/generate query (:private auth)))))
+           "query credential w/ policy allowing access")
+
+       (is (= []
+              @(fluree/query db2 (async/<!! (cred/generate query (:private other-auth)))))
+           "query credential w/ no roles")
+
+       (is (= {"nums" [2 3 4 5 6],
+               "root" [{"id"      (:id auth)
+                        "name"    "D",
+                        "favnums" [2 3 4 5 6]
+                        "f:role"  {"id" "role:cool"}}]}
+              @(fluree/multi-query db2
+                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
+                                                              "root" query}
+                                                             (:private auth)))))
+           "multiquery credential - allowing access")
+       (is (= {"nums" [],
+               "root" []}
+              @(fluree/multi-query db2
+                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
+                                                              "root" query}
+                                                             (:private pleb-auth)))))
+           "multiquery credential - forbidding access")
+       (is (= [{"f:t"       2,
+                "f:assert"  [{"id" (:id auth) "name" "Daniel", "favnums" [1 2 3], :id (:id auth) "f:role" {"id" "role:cool"}}],
+                "f:retract" []}
+
+               {"f:t"       3,
+                "f:assert"  [{"name" "D", "favnums" [4 5 6], :id (:id auth)}],
+                "f:retract" [{"name" "Daniel", "favnums" 1, :id (:id auth)}]}]
+              @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private auth)))))
+           "history query credential - allowing access")
+       (is (= "Subject identity does not exist: did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh"
+              (-> @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth))))
+                  (Throwable->map)
+                  (:cause)))
+           "history query credential - forbidding access"))))
 
 (comment
   #?(:cljs

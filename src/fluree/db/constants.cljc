@@ -49,6 +49,7 @@
 (def ^:const iri-all-nodes "https://ns.flur.ee/ledger#allNodes")
 (def ^:const iri-view "https://ns.flur.ee/ledger#view")
 (def ^:const iri-modify "https://ns.flur.ee/ledger#modify")
+(def ^:const iri-role "https://ns.flur.ee/ledger#role")
 
 (def ^:const iri-id "@id")
 (def ^:const iri-type "@type")

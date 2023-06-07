@@ -85,12 +85,12 @@
                                                         :f/equals     {:list [:f/$identity :ex/user]}}]}]}])]
 
       (testing "Policy map for classes and props within classes is properly formed"
-        (let [policy-alice  (-> @(fluree/promise-wrap (policy/policy-map db alice-did :ex/userRole nil))
-                                replace-policy-fns)
-              sid-User      @(fluree/internal-id db :ex/User)
+        (let [sid-User      @(fluree/internal-id db :ex/User)
               sid-ssn       @(fluree/internal-id db :schema/ssn)
               sid-alice-did @(fluree/internal-id db alice-did)
-              sid-userRole  @(fluree/internal-id db :ex/userRole)]
+              sid-userRole  @(fluree/internal-id db :ex/userRole)
+              policy-alice  (-> @(fluree/promise-wrap (policy/policy-map db sid-alice-did #{sid-userRole} nil))
+                                replace-policy-fns)]
           (is (= {const/iri-modify
                   {:class
                    {sid-User {:default {const/iri-equals      [{"@id" const/iri-$identity}
@@ -116,10 +116,10 @@
                  policy-alice)
               "Policies for only :ex/userRole should return")))
       (testing "Root policy contains {:root? true} for each applicable :f/action"
-        (let [policy-root  (-> @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))
-                               replace-policy-fns)
-              sid-root-did @(fluree/internal-id db root-did)
-              sid-rootRole @(fluree/internal-id db :ex/rootRole)]
+        (let [sid-root-did @(fluree/internal-id db root-did)
+              sid-rootRole @(fluree/internal-id db :ex/rootRole)
+              policy-root  (-> @(fluree/promise-wrap (policy/policy-map db sid-root-did #{sid-rootRole} nil))
+                               replace-policy-fns)]
           (is (= {"https://ns.flur.ee/ledger#modify" {:root? true}
                   "https://ns.flur.ee/ledger#view"   {:root? true}
                   :ident                             sid-root-did
@@ -141,10 +141,10 @@
                                         "f:targetRole" {"id" "ex:rootRole"}
                                         "f:action"     [{"id" "f:view"} {"id" "f:modify"}]}]}])]
       (testing "Root policy contains {:root? true} for each applicable :f/action"
-        (let [policy-root  (-> @(fluree/promise-wrap (policy/policy-map db root-did :ex/rootRole nil))
-                               replace-policy-fns)
-              sid-root-did @(fluree/internal-id db root-did)
-              sid-rootRole @(fluree/internal-id db :ex/rootRole)]
+        (let [sid-root-did @(fluree/internal-id db root-did)
+              sid-rootRole @(fluree/internal-id db :ex/rootRole)
+              policy-root  (-> @(fluree/promise-wrap (policy/policy-map db sid-root-did #{sid-rootRole} nil))
+                               replace-policy-fns)]
           (is (= {"https://ns.flur.ee/ledger#modify" {:root? true}
                   "https://ns.flur.ee/ledger#view"   {:root? true}
                   :ident                             sid-root-did

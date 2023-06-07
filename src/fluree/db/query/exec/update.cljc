@@ -120,11 +120,13 @@
 
 (defn insert?
   [mdfn]
-  (contains? mdfn :insert))
+  (or (contains? mdfn :insert)
+      (contains? mdfn "insert")))
 
 (defn retract?
   [mdfn]
-  (contains? mdfn :delete))
+  (or (contains? mdfn :delete)
+      (contains? mdfn "delete")))
 
 (defn modify
   [db mdfn t fuel-tracker error-ch solution-ch]

@@ -77,6 +77,7 @@
           "http://www.w3.org/ns/shacl#xone"                     const/$sh:xone
           ;; fluree
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context
+          const/iri-role                                        const/$_role
           const/iri-default-context                             const/$fluree:default-context}))
 
 (def predefined-sids
