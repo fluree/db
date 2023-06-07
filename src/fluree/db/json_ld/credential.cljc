@@ -81,9 +81,9 @@
         "proof"             proof}))))
 
 (defn verify
-  "Takes a credential and returns the credential subject and issuer id if it verifies. If
-  credential does not have a jws returns the credential without verifying it. If the
-  credential is invalid an exception will be thrown."
+  "Takes a credential and returns the credential subject and signing did if it
+  verifies. If credential does not have a jws returns nil. If the credential is invalid
+  an exception will be thrown."
   [credential]
   (go-try
     (when-let [jws (get-in credential ["proof" "jws"])]

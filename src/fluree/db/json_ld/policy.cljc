@@ -514,7 +514,7 @@
                         {:status 400
                          :error  :db/policy-exception}))
 
-        (not (not-empty role-sids))
+        (empty? role-sids)
         (throw (ex-info "Applying policy without a role is not yet supported."
                         {:status 400
                          :error  :db/policy-exception}))
