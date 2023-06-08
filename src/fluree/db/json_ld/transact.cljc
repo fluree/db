@@ -63,15 +63,8 @@
            class-sids   #{}
            class-flakes #{}]
       (if class-iri
-        (if-let [existing-type-sid (<? (jld-reify/get-iri-sid class-iri db-before iris))]
-          (let [class-flake (-> (query-range/index-range db-before :spot = [existing-type-sid const/$rdf:type const/$rdfs:Class])
-                               <?
-                               first)]
-            (if class-flake
-              (recur r (conj class-sids existing-type-sid) class-flakes)
-              (recur r
-                     (conj class-sids existing-type-sid)
-                     (conj class-flakes (flake/create existing-type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
+        (if-let [existing (<? (jld-reify/get-iri-sid class-iri db-before iris))]
+          (recur r (conj class-sids existing) class-flakes)
           (let [type-sid (if-let [predefined-pid (get jld-ledger/predefined-properties class-iri)]
                            predefined-pid
                            (next-pid))]
