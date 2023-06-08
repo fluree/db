@@ -479,6 +479,6 @@
                 db)
           tx-state (->tx-state db* opts*)
           flakes   (if (q-parse/update? tx)
-                     (<? (modify db tx tx-state))
-                     (<? (insert db tx tx-state)))]
+                     (<? (modify db* tx tx-state))
+                     (<? (insert db* tx tx-state)))]
       (<? (flakes->final-db tx-state flakes)))))
