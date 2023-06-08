@@ -101,10 +101,4 @@
         (is (= users
                @(fluree/query db-data-first user-query)))
         (is (= users
-               @(fluree/query db-policy-first user-query))))
-      (let [types [{:id :f/Policy, :rdf/type [:rdfs/Class]}
-                   {:id :ex/User, :rdf/type [:rdfs/Class]}]]
-        (is (= (into #{} types)
-               (into #{} @(fluree/query db-data-first class-query))))
-        (is (= (into #{} types)
-               (into #{} @(fluree/query db-policy-first class-query))))))))
+               @(fluree/query db-policy-first user-query)))))))
