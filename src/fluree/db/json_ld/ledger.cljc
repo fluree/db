@@ -78,6 +78,7 @@
           ;; fluree
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context
           const/iri-role                                        const/$_role
+          const/iri-target-class                                const/$fluree:targetClass
           const/iri-default-context                             const/$fluree:default-context}))
 
 (def predefined-sids
@@ -126,6 +127,7 @@
                              const/$sh:path
                              const/$sh:ignoredProperties
                              const/$sh:targetClass
+                             const/$fluree:targetClass
                              const/$sh:targetSubjectsOf
                              const/$sh:targetObjectsOf
                              const/$sh:equals

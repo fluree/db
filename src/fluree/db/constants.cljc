@@ -179,6 +179,7 @@
 
 ;; fluree-specific
 (def ^:const $fluree:context 250)
+(def ^:const $fluree:targetClass 255)
 
 ;; owl
 (def ^:const $owl:Class 245)

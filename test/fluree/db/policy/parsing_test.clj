@@ -98,7 +98,7 @@
                                         const/iri-target-role {:_id sid-userRole}
                                         :function             [true
                                                                ::replaced-policy-function]
-                                        "@id"                 "_:f211106232533008"}}}}
+                                        "@id"                 "_:f211106232533007"}}}}
                   const/iri-view
                   {:class
                    {sid-User {sid-ssn  {const/iri-equals      [{"@id" const/iri-$identity}
