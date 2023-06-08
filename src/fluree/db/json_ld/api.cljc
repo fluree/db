@@ -12,7 +12,6 @@
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.dbproto :as db-proto]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as perm])
@@ -209,7 +208,7 @@
   "Performs a transaction and queues change if valid (does not commit)"
   ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
-   (let [result-ch (db-proto/-stage db json-ld opts)]
+   (let [result-ch (dbproto/-stage db json-ld opts)]
      (promise-wrap result-ch))))
 
 
@@ -321,9 +320,9 @@
 (defn expand-iri
   "Expands given IRI with the default database context, or provided context."
   ([db compact-iri]
-   (db-proto/-expand-iri db compact-iri))
+   (dbproto/-expand-iri db compact-iri))
   ([db compact-iri context]
-   (db-proto/-expand-iri db compact-iri context)))
+   (dbproto/-expand-iri db compact-iri context)))
 
 (defn internal-id
   "Returns the internal Fluree integer id for a given IRI.
@@ -334,4 +333,4 @@
   [db iri]
   (promise-wrap
     (->> (expand-iri db iri)
-         (db-proto/-subid db))))
+         (dbproto/-subid db))))
