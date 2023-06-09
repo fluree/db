@@ -1,5 +1,6 @@
 (ns fluree.db.query.exec.update
   (:require [fluree.db.flake :as flake]
+            [fluree.db.fuel :as fuel]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.exec.where :as where]
@@ -92,9 +93,11 @@
   out-ch)
 
 (defn insert
-  [db mdfn t error-ch solution-ch]
+  [db mdfn t fuel-tracker error-ch solution-ch]
   (let [clause    (:insert mdfn)
-        insert-ch (async/chan 2)]
+        insert-ch (if fuel-tracker
+                    (async/chan 2 (fuel/track fuel-tracker))
+                    (async/chan 2))]
     (async/pipeline-async 2
                           insert-ch
                           (fn [solution ch]
@@ -110,7 +113,7 @@
         solution-mult   (async/mult solution-ch*)
         insert-soln-ch  (->> (async/chan 2)
                              (async/tap solution-mult))
-        insert-ch       (insert db mdfn t error-ch insert-soln-ch)
+        insert-ch       (insert db mdfn t fuel-tracker error-ch insert-soln-ch)
         retract-soln-ch (->> (async/chan 2)
                              (async/tap solution-mult))
         retract-ch      (retract db mdfn t fuel-tracker error-ch retract-soln-ch)]
@@ -136,7 +139,7 @@
     (insert-retract db mdfn t fuel-tracker error-ch solution-ch)
 
     (insert? mdfn)
-    (insert db mdfn t error-ch solution-ch)
+    (insert db mdfn t fuel-tracker error-ch solution-ch)
 
     (retract? mdfn)
     (retract db mdfn t fuel-tracker error-ch solution-ch)))

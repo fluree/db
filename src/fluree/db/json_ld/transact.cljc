@@ -310,20 +310,25 @@
       (assoc staged-map :db-after db-after))))
 
 (defn stage-flakes
-  [flakeset tx-state nodes]
+  [flakeset fuel-tracker tx-state nodes]
   (go-try
-    (loop [[node & r] nodes
-           flakes* flakeset]
-      (if node
-        (if (empty? (dissoc node :idx :id))
-          (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
-                               (some->> (:id node)
-                                        (str " for @id: "))
-                               ".")
-                          {:status 400 :error :db/invalid-transaction}))
-          (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
-            (recur r (into flakes* node-flakes))))
-        flakes*))))
+    (let [track-fuel (when fuel-tracker
+                       (fuel/track fuel-tracker))]
+      (loop [[node & r] nodes
+             flakes    flakeset]
+        (if node
+          (if (empty? (dissoc node :idx :id))
+            (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
+                                 (some->> (:id node)
+                                          (str " for @id: "))
+                                 ".")
+                            {:status 400 :error :db/invalid-transaction}))
+            (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))
+                  flakes*                 (if track-fuel
+                                            (into flakes track-fuel node-flakes)
+                                            (into flakes node-flakes))]
+              (recur r flakes*)))
+          flakes)))))
 
 (defn validate-rules
   [{:keys [db-after add] :as staged-map} {:keys [subj-mods] :as _tx-state}]
@@ -354,14 +359,14 @@
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
-  [{:keys [t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
+  [{:keys [t] :as db} fuel-tracker json-ld {:keys [default-ctx] :as tx-state}]
   (log/trace "insert default-ctx:" default-ctx)
   (let [nodes    (-> json-ld
                      (json-ld/expand default-ctx)
                      util/sequential)
         flakeset (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
                    (init-db? db) (into (base-flakes t)))]
-    (stage-flakes flakeset tx-state nodes)))
+    (stage-flakes flakeset fuel-tracker tx-state nodes)))
 
 (defn into-flakeset
   [flake-ch]
@@ -369,13 +374,12 @@
     (async/reduce into flakeset flake-ch)))
 
 (defn modify
-  [db json-ld {:keys [t] :as _tx-state}]
+  [db fuel-tracker json-ld {:keys [t] :as _tx-state}]
   (go
     (let [mdfn         (-> json-ld
                            syntax/coerce-modification
                            (q-parse/parse-modification db))
           error-ch     (async/chan)
-          fuel-tracker (fuel/tracker)
           update-ch    (->> (where/search db mdfn fuel-tracker error-ch)
                             (update/modify db mdfn t fuel-tracker error-ch)
                             into-flakeset)]
@@ -413,8 +417,8 @@
                  db)
            tx-state (->tx-state db* opts*)
            flakes   (if (q-parse/update? tx)
-                      (<? (modify db tx tx-state))
-                      (<? (insert db tx tx-state)))]
+                      (<? (modify db fuel-tracker tx tx-state))
+                      (<? (insert db fuel-tracker tx tx-state)))]
        (<? (flakes->final-db tx-state flakes))))))
 
 (defn stage-ledger
