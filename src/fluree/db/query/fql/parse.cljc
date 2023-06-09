@@ -163,11 +163,14 @@
 
   If not a recursion predicate, returns nil."
   [predicate context]
-  (when (or (string? predicate)
-            (keyword? predicate))
-    (when-let [[_ pred recur-n] (re-find #"(.+)\+(\d+)?$" (name predicate))]
-      [(json-ld/expand (keyword (namespace predicate) pred)
-                       context)
+  (let [recur-pattern #"(.+)\+(\d+)?$"]
+    (when-let [[pred-iri recur-n]
+               (cond
+                 (keyword? predicate) (when-let [[_ pred recur-n] (re-find recur-pattern (name predicate))]
+                                        [(keyword (namespace predicate) pred) recur-n])
+                 (string? predicate) (when-let [[_ pred recur-n] (re-find recur-pattern predicate)]
+                                       [pred recur-n]))]
+      [(json-ld/expand-iri pred-iri context)
        (if recur-n
          (util/str->int recur-n)
          default-recursion-depth)])))
