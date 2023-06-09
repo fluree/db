@@ -924,3 +924,35 @@
                :schema/email "john@example.org"
                :schema/name  "John"}]
              @(fluree/query db-ok user-query))))))
+
+(deftest shacl-class-test
+  (let [conn   @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "classtest" {:defaultContext test-utils/default-str-context})
+        db0    (fluree/db ledger)
+        db1    @(fluree/stage db0 [{"@type"          ["sh:NodeShape"],
+                                    "sh:targetClass" {"@id" "https://example.com/Country"},
+                                    "sh:property"
+                                    [{"sh:path"     {"@id" "https://example.com/name"},
+                                      "sh:datatype" {"@id" "xsd:string"},
+                                      "sh:minCount" 1,
+                                      "sh:maxCount" 1}]}
+                                   {"@type"          ["sh:NodeShape"],
+                                    "sh:targetClass" {"@id" "https://example.com/Actor"},
+                                    "sh:property"
+                                    [{"sh:path"        {"@id" "https://example.com/country"},
+                                      "sh:class"       {"@id" "https://example.com/Country"},
+                                      "sh:maxCount"    1,
+                                      "sh:description" "Birth country"}
+                                     {"sh:path"     {"@id" "https://example.com/name"},
+                                      "sh:minCount" 1,
+                                      "sh:maxCount" 1,
+                                      "sh:datatype" {"@id" "xsd:string"}}]}])
+        db2    @(fluree/stage db1 {"@id"                           "https://example.com/Actor/65731",
+                                   "https://example.com/country"   {"@id" "https://example.com/Country/AU"},
+                                   "https://example.com/gender"    "Male",
+                                   "https://example.com/character" ["Jake Sully" "Marcus Wright"],
+                                   "https://example.com/movie"     [{"@id" "https://example.com/Movie/19995"}
+                                                                    {"@id" "https://example.com/Movie/534"}],
+                                   "@type"                         "https://example.com/Actor",
+                                   "https://example.com/name"      "Sam Worthington"})]
+    (is (not (util/exception? db2)))))
