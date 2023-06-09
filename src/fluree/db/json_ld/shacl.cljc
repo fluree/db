@@ -328,7 +328,7 @@
           ;; Note that multiple values for sh:class are interpreted as a conjunction,
           ;; i.e. the values need to be SHACL instances of all of them.
           const/$sh:class
-          (assoc acc :node-kind o)
+          (assoc acc :class o)
 
           const/$sh:pattern
           (assoc acc :pattern o)
