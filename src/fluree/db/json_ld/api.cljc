@@ -9,6 +9,7 @@
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.query :as query-api]
+            [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
@@ -226,6 +227,11 @@
    (promise-wrap
      (ledger-proto/-commit! ledger db opts))))
 
+(defn transact!
+  "Stages and commits the transaction `json-ld` to the specified `ledger`"
+  [ledger json-ld opts]
+  (promise-wrap
+    (transact-api/transact! ledger json-ld opts)))
 
 (defn status
   "Returns current status of ledger branch."
