@@ -401,16 +401,34 @@
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
-  [db json-ld opts]
-  (go-try
-    (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
-                                        {:subject json-ld})
-          opts* (cond-> opts did (assoc :did did))
-          db* (if-let [policy-opts (perm/policy-opts opts*)]
-                (<? (perm/wrap-policy db policy-opts))
-                db)
-          tx-state (->tx-state db* opts*)
-          flakes   (if (q-parse/update? tx)
-                     (<? (modify db tx tx-state))
-                     (<? (insert db tx tx-state)))]
-      (<? (flakes->final-db tx-state flakes)))))
+  ([db json-ld opts]
+   (stage db nil json-ld opts))
+  ([db fuel-tracker json-ld opts]
+   (go-try
+     (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
+                                      {:subject json-ld})
+           opts* (cond-> opts did (assoc :did did))
+           db* (if-let [policy-opts (perm/policy-opts opts*)]
+                 (<? (perm/wrap-policy db policy-opts))
+                 db)
+           tx-state (->tx-state db* opts*)
+           flakes   (if (q-parse/update? tx)
+                      (<? (modify db tx tx-state))
+                      (<? (insert db tx tx-state)))]
+       (<? (flakes->final-db tx-state flakes))))))
+
+(defn stage-ledger
+  ([ledger json-ld opts]
+   (stage-ledger ledger nil json-ld opts))
+  ([ledger fuel-tracker json-ld opts]
+   (-> ledger
+       ledger-proto/-db
+       (stage fuel-tracker json-ld opts))))
+
+(defn transact!
+  ([ledger json-ld opts]
+   (transact! ledger nil json-ld opts))
+  ([ledger fuel-tracker json-ld opts]
+   (go-try
+     (let [staged (<? (stage-ledger ledger fuel-tracker json-ld opts))]
+       (<? (ledger-proto/-commit! ledger staged))))))
