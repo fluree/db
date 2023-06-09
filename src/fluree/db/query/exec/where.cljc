@@ -229,14 +229,38 @@
       (get-in [:schema :pred prop :equivalentProperty])
       not-empty))
 
+
+(defn recursive-resolve-flake-range
+  [db [{first-s ::val} p o] recur-n fuel-tracker error-ch]
+  (let [result-ch (async/chan 2 cat)]
+    (go
+      (loop [visited #{}
+             stack []]
+        (let [[new-query-sid recur-r]  (if (seq stack)
+                                         [(flake/o (ffirst stack)) (second (first stack))]
+                                         [(if (and first-s (not (number? first-s)))
+                                            (<? (dbproto/-subid db first-s true))
+                                            first-s) recur-n])]
+          (if (and new-query-sid
+                   (not (contains? visited new-query-sid))
+                   (not= 0 recur-r))
+            ;;TODO probably don't just want {::val sid}, want to preserve filters?
+            (let [fs (<? (resolve-flake-range db fuel-tracker error-ch [{::val new-query-sid} p]))]
+              (async/>! result-ch fs)
+              (recur (conj visited new-query-sid)
+                     (into (rest stack) (map (fn [f] [f (dec recur-r)]) fs))))
+            (async/close! result-ch)))))
+    (async/into [] result-ch)))
+
+
 (defmethod match-pattern :tuple
   [db fuel-tracker solution pattern filters error-ch]
   (let [[s p o]  (assign-matched-values pattern solution filters)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
                                             (match-flake solution pattern flake)))))
-        p-val    (::val p)]
-
+        p-val    (::val p)
+        recur-n (::recur p)]
     (if-let [props (and p-val (get-equivalent-properties db p-val))]
       (let [prop-ch (async/to-chan! (conj props p-val))]
         (async/pipeline-async 2
@@ -248,9 +272,13 @@
                                       (async/pipe ch))))
                               prop-ch))
 
-      (-> db
-          (resolve-flake-range fuel-tracker error-ch [s p o])
-          (async/pipe match-ch)))
+      (if recur-n
+        (-> db
+            (recursive-resolve-flake-range [s p o] recur-n fuel-tracker error-ch)
+            (async/pipe match-ch))
+        (-> db
+            (resolve-flake-range fuel-tracker error-ch [s p o])
+            (async/pipe match-ch))))
 
     match-ch))
 
