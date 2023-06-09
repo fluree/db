@@ -369,9 +369,12 @@
     (stage-flakes flakeset fuel-tracker tx-state nodes)))
 
 (defn into-flakeset
-  [flake-ch]
+  [fuel-tracker flake-ch]
   (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
-    (async/reduce into flakeset flake-ch)))
+    (if fuel-tracker
+      (let [track-fuel (fuel/track fuel-tracker)]
+        (async/transduce track-fuel into flakeset flake-ch))
+      (async/reduce into flakeset flake-ch))))
 
 (defn modify
   [db fuel-tracker json-ld {:keys [t] :as _tx-state}]
@@ -382,7 +385,7 @@
           error-ch     (async/chan)
           update-ch    (->> (where/search db mdfn fuel-tracker error-ch)
                             (update/modify db mdfn t fuel-tracker error-ch)
-                            into-flakeset)]
+                            (into-flakeset fuel-tracker))]
       (async/alt!
         error-ch  ([e] e)
         update-ch ([flakes] flakes)))))
