@@ -1,5 +1,6 @@
 (ns fluree.db.query.exec.update
   (:require [fluree.db.flake :as flake]
+            [fluree.db.fuel :as fuel]
             [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.query.exec.where :as where]

@@ -9,10 +9,6 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 
-(defn deserialize-block
-  [block]
-  (assoc block :flakes (mapv flake/parts->Flake (:flakes block))))
-
 (defn- deserialize-child-node
   "Turns :first and :rhs into flakes"
   [child-node]
@@ -83,11 +79,6 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
-  (-serialize-block [_ block]
-    (throw (ex-info "-serialize-block not supported for JSON." {})))
-  (-deserialize-block [_ block]
-    (-> (json/parse block)
-        (deserialize-block)))
   (-serialize-db-root [_ {:keys [t block prevIndex timestamp stats
                                  ledger-id ecount fork forkBlock
                                  spot psot post opst tspo] :as db-root}]
