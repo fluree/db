@@ -261,6 +261,7 @@
   (-query [this query-map] (fql/query this query-map))
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
+  (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
   (-context [_] (retrieve-context default-context context-cache ::dbproto/default-context context-type))
   (-context [_ context] (retrieve-context default-context context-cache context context-type))

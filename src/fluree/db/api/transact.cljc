@@ -2,7 +2,8 @@
   (:require [fluree.db.fuel :as fuel]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
-            [fluree.db.json-ld.transact :as tx]))
+            [fluree.db.json-ld.transact :as tx]
+            [fluree.db.dbproto :as dbproto]))
 
 (defn stage
   [db json-ld opts]
@@ -11,7 +12,7 @@
       (let [start-time   #?(:clj  (System/nanoTime)
                             :cljs (util/current-time-millis))
             fuel-tracker (fuel/tracker)]
-        (try* (let [result (<? (tx/stage db fuel-tracker json-ld opts))]
+        (try* (let [result (<? (dbproto/-stage db fuel-tracker json-ld opts))]
                 {:status 200
                  :result result
                  :time   (util/response-time-formatted start-time)
@@ -22,7 +23,7 @@
                                           ex-data
                                           (assoc :time (util/response-time-formatted start-time)
                                                  :fuel (fuel/tally fuel-tracker))))))))
-      (<? (tx/stage db json-ld opts)))))
+      (<? (dbproto/-stage db json-ld opts)))))
 
 (defn transact!
   [ledger json-ld opts]
