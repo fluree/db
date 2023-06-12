@@ -218,8 +218,7 @@
                                           flakes* subj-flakes]
                                      (if v'
                                        (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
-                                       (cond-> flakes*
-                                               property-flakes (into property-flakes)))))]
+                                       flakes*)))]
             (recur r property-flakes* flakes*))
           ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
           [sid (into subj-flakes property-flakes)])))))
