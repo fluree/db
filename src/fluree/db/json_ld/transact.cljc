@@ -308,13 +308,25 @@
                          vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
 
+(defn track-into
+  [flakes track-fuel additions]
+  (if track-fuel
+    (into flakes track-fuel additions)
+    (into flakes additions)))
+
+(defn init-db?
+  [db]
+  (-> db :t zero?))
+
 (defn stage-flakes
-  [flakeset fuel-tracker tx-state nodes]
+  [{:keys [t] :as db} fuel-tracker tx-state nodes]
   (go-try
     (let [track-fuel (when fuel-tracker
-                       (fuel/track fuel-tracker))]
+                       (fuel/track fuel-tracker))
+          flakeset   (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
+                       (init-db? db) (track-into track-fuel (base-flakes t)))]
       (loop [[node & r] nodes
-             flakes    flakeset]
+             flakes     flakeset]
         (if node
           (if (empty? (dissoc node :idx :id))
             (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
@@ -323,9 +335,7 @@
                                  ".")
                             {:status 400 :error :db/invalid-transaction}))
             (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))
-                  flakes*                 (if track-fuel
-                                            (into flakes track-fuel node-flakes)
-                                            (into flakes node-flakes))]
+                  flakes*                 (track-into flakes track-fuel node-flakes)]
               (recur r flakes*)))
           flakes)))))
 
@@ -352,20 +362,14 @@
               (vocab/reset-shapes (:schema db-after)))
             staged-map))))))
 
-(defn init-db?
-  [db]
-  (-> db :t zero?))
-
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
-  [{:keys [t] :as db} fuel-tracker json-ld {:keys [default-ctx] :as tx-state}]
+  [db fuel-tracker json-ld {:keys [default-ctx] :as tx-state}]
   (log/trace "insert default-ctx:" default-ctx)
   (let [nodes    (-> json-ld
                      (json-ld/expand default-ctx)
-                     util/sequential)
-        flakeset (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                   (init-db? db) (into (base-flakes t)))]
-    (stage-flakes flakeset fuel-tracker tx-state nodes)))
+                     util/sequential)]
+    (stage-flakes db fuel-tracker tx-state nodes)))
 
 (defn into-flakeset
   [fuel-tracker flake-ch]
