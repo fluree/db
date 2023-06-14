@@ -1,11 +1,15 @@
 (ns fluree.db.query.exec.eval
-  (:refer-clojure :exclude [compile rand])
+  (:refer-clojure :exclude [compile rand concat replace])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
             [clojure.set :as set]
             [clojure.string :as str]
-            [clojure.walk :refer [postwalk]])
+            [clojure.walk :refer [postwalk]]
+            [clojure.math :as math]
+            [fluree.db.datatype :as datatype]
+            [fluree.crypto :as crypto]
+            [fluree.db.constants :as const])
   #?(:clj (:import (java.time Instant))))
 
 (defn sum
@@ -54,13 +58,7 @@
         (> n 0) (-> n int)
         (< n 0) (-> n int dec)))
 
-(def groupconcat concat)
-
-(defn rand
-  ([coll]
-   (rand-nth coll))
-  ([n coll]
-   (vec (repeatedly n #(rand-nth coll)))))
+(def groupconcat clojure.core/concat)
 
 (defn sample
   [n coll]
@@ -106,7 +104,7 @@
 
 (defn now
   []
-  #?(:clj (.toEpochMilli (Instant/now))))
+  #?(:clj (str (Instant/now))))
 
 (defn strStarts
   [s substr]
@@ -117,15 +115,165 @@
   (str/ends-with? s substr))
 
 (defn subStr
-  [s start end]
-  (subs s start end))
+  ([s start]
+   (subStr s start (count s)))
+  ([s start length]
+   ;; The index of the first character in a string is 1.
+   (let [start (dec start)]
+     (subs s start (min (+ start length)
+                        (count s))))))
+
+(defn strLen
+  [s]
+  (count s))
+
+(defn ucase
+  [s]
+  (str/upper-case s))
+
+(defn lcase
+  [s]
+  (str/lower-case s))
+
+(defn contains
+  [s substr]
+  (str/includes? s substr))
+
+(defn strBefore
+  [s substr]
+  (-> (str/split s (re-pattern substr))
+      first
+      str))
+
+(defn strAfter
+  [s substr]
+  (-> (str/split s (re-pattern substr))
+      last
+      str))
+
+(defn concat
+  [& strs]
+  (apply str strs))
+
+(defn regex
+  [text pattern]
+  (boolean (re-find (re-pattern pattern) text)))
+
+(defn replace
+  [s pattern replacement]
+  (str/replace s (re-pattern pattern) replacement))
+
+(defn rand
+  []
+  (clojure.core/rand))
+
+(defn year
+  [datetime-string]
+  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+    (.getYear datetime)))
+
+(defn month
+  [datetime-string]
+  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+    #?(:clj (.getMonthValue datetime)
+       :cljs (.getMonth datetime))))
+
+(defn day
+  [datetime-string]
+  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+    #?(:clj (.getDayOfMonth datetime)
+       :cljs (.getDate datetime))))
+
+(defn hours
+  [datetime-string]
+  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+    #?(:clj (.getHour datetime)
+       :cljs (.getHours datetime))))
+
+(defn minutes
+  [datetime-string]
+  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+    #?(:clj (.getMinute datetime)
+       :cljs (.getMinutes datetime))))
+
+(defn seconds
+  [datetime-string]
+  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+    #?(:clj (.getSecond datetime)
+       :cljs (.getSeconds datetime))))
+
+(defn tz
+  [datetime-string]
+  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+    #?(:clj (.toString (.getOffset datetime))
+       :cljs (.getTimeZoneOffset datetime))))
+
+(defn sha256
+  [x]
+  (crypto/sha2-256 x))
+
+(defn sha512
+  [x]
+  (crypto/sha2-512 x))
 
 (def allowed-scalar-fns
-  '#{abs && || ! > < >= <= = + - * / quot and bound coalesce if nil?
-     not not= now or re-find re-pattern strStarts strEnds subStr})
+  '#{ && || ! > < >= <= = + - * / quot and bound coalesce if nil?
+     not not= or re-find re-pattern
+     ;; string fns
+     strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
+     ;; numeric fns
+     abs round ceil floor rand
+     ;; datetime fns
+     now year month day hours minutes seconds tz
+     ;; hash fns
+     sha256 sha512})
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
+
+(def qualified-symbols
+  '{
+    !           fluree.db.query.exec.eval/!
+    ||          fluree.db.query.exec.eval/||
+    &&          fluree.db.query.exec.eval/&&
+    abs         clojure.core/abs
+    avg         fluree.db.query.exec.eval/avg
+    bound       fluree.db.query.exec.eval/bound
+    ceil        fluree.db.query.exec.eval/ceil
+    coalesce    fluree.db.query.exec.eval/coalesce
+    concat      fluree.db.query.exec.eval/concat
+    contains    fluree.db.query.exec.eval/contains
+    count       fluree.db.query.exec.eval/count-distinct
+    floor       fluree.db.query.exec.eval/floor
+    groupconcat fluree.db.query.exec.eval/groupconcat
+    lcase       fluree.db.query.exec.eval/lcase
+    median      fluree.db.query.exec.eval/median
+    now         fluree.db.query.exec.eval/now
+    rand        fluree.db.query.exec.eval/rand
+    regex       fluree.db.query.exec.eval/regex
+    replace     fluree.db.query.exec.eval/replace
+    round       clojure.math/round
+    sample      fluree.db.query.exec.eval/sample
+    stddev      fluree.db.query.exec.eval/stddev
+    strAfter    fluree.db.query.exec.eval/strAfter
+    strBefore   fluree.db.query.exec.eval/strBefore
+    strEnds     fluree.db.query.exec.eval/strEnds
+    strLen      fluree.db.query.exec.eval/strLen
+    strStarts   fluree.db.query.exec.eval/strStarts
+    subStr      fluree.db.query.exec.eval/subStr
+    sum         fluree.db.query.exec.eval/sum
+    ucase       fluree.db.query.exec.eval/ucase
+    variance    fluree.db.query.exec.eval/variance
+    year        fluree.db.query.exec.eval/year
+    month       fluree.db.query.exec.eval/month
+    day         fluree.db.query.exec.eval/day
+    hours       fluree.db.query.exec.eval/hours
+    minutes     fluree.db.query.exec.eval/minutes
+    seconds     fluree.db.query.exec.eval/seconds
+    tz          fluree.db.query.exec.eval/tz
+    sha256      fluree.db.query.exec.eval/sha256
+    sha512      fluree.db.query.exec.eval/sha512
+    })
 
 (defn variable?
   [sym]
@@ -152,29 +300,6 @@
   (->> code
        symbols
        (filter variable?)))
-
-(def qualified-symbols
-  '{abs         fluree.db.query.exec.eval/abs
-    avg         fluree.db.query.exec.eval/avg
-    bound       fluree.db.query.exec.eval/bound
-    ceil        fluree.db.query.exec.eval/ceil
-    coalesce    fluree.db.query.exec.eval/coalesce
-    count       fluree.db.query.exec.eval/count-distinct
-    floor       fluree.db.query.exec.eval/floor
-    groupconcat fluree.db.query.exec.eval/groupconcat
-    median      fluree.db.query.exec.eval/median
-    now         fluree.db.query.exec.eval/now
-    rand        fluree.db.query.exec.eval/rand
-    sample      fluree.db.query.exec.eval/sample
-    stddev      fluree.db.query.exec.eval/stddev
-    strStarts   fluree.db.query.exec.eval/strStarts
-    strEnds     fluree.db.query.exec.eval/strEnds
-    subStr      fluree.db.query.exec.eval/subStr
-    sum         fluree.db.query.exec.eval/sum
-    variance    fluree.db.query.exec.eval/variance
-    !           fluree.db.query.exec.eval/!
-    &&          fluree.db.query.exec.eval/&&
-    ||          fluree.db.query.exec.eval/||})
 
 (defn qualify
   [sym allow-aggregates?]
