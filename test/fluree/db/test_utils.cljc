@@ -190,35 +190,35 @@
 
 (defn did?
   [s]
-  (boolean (re-matches did-regex s)))
+  (and (string? s) (re-matches did-regex s)))
 
 (def addr-regex
   (re-pattern (str "fluree:(memory|file|ipfs)://.+")))
 
 (defn address?
   [s]
-  (boolean (re-matches addr-regex s)))
+  (and (string? s) (re-matches addr-regex s)))
 
 (def context-id-regex
   (re-pattern (str "fluree:context:" base64-pattern "{64}")))
 
 (defn context-id?
   [s]
-  (boolean (re-matches context-id-regex s)))
+  (and (string? s) (re-matches context-id-regex s)))
 
 (def db-id-regex
   (re-pattern (str "fluree:db:sha256:" base32-pattern "{52,53}")))
 
 (defn db-id?
   [s]
-  (boolean (re-matches db-id-regex s)))
+  (and (string? s) (re-matches db-id-regex s)))
 
 (def commit-id-regex
   (re-pattern (str "fluree:commit:sha256:" base32-pattern "{52,53}")))
 
 (defn commit-id?
   [s]
-  (boolean (re-matches commit-id-regex s)))
+  (and (string? s) (re-matches commit-id-regex s)))
 
 (defn- coalesce-deep-match-values
   [values]
