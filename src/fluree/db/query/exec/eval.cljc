@@ -118,10 +118,10 @@
   (str/ends-with? s substr))
 
 (defn subStr
+  ;; The index of the first character in a string is 1.
   ([s start]
-   (subStr s start (count s)))
+   (subs s (dec start)))
   ([s start length]
-   ;; The index of the first character in a string is 1.
    (let [start (dec start)]
      (subs s start (min (+ start length)
                         (count s))))))
