@@ -144,15 +144,17 @@
 
 (defn strBefore
   [s substr]
-  (-> (str/split s (re-pattern substr))
-      first
-      str))
+  (let [[before :as split] (str/split s (re-pattern substr))]
+    (if (> (count split) 1)
+      before
+      "")))
 
 (defn strAfter
   [s substr]
-  (-> (str/split s (re-pattern substr))
-      last
-      str))
+  (let [split (str/split s (re-pattern substr))]
+    (if (> (count split) 1)
+      (last split)
+      "")))
 
 (defn concat
   [& strs]
