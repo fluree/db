@@ -1,5 +1,7 @@
 (ns fluree.db.test-utils
-  (:require [fluree.db.did :as did]
+  (:require [clojure.string :as str]
+            [clojure.test :as clj-test]
+            [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             #?@(:cljs [[clojure.core.async :refer [go go-loop]]
@@ -173,3 +175,117 @@
   "Retry calling exists? until it returns true or max-attempts."
   [conn ledger-alias max-atttemts]
   (retry-promise-wrapped #(fluree/exists? conn ledger-alias) max-atttemts true))
+
+(def base32-pattern
+  "[a-z2-7]")
+
+(def base58-pattern
+  "[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]")
+
+(def base64-pattern
+  "[0-9a-fA-F]")
+
+(def did-regex
+  (re-pattern (str "did:fluree:" base58-pattern "{35}")))
+
+(defn did?
+  [s]
+  (boolean (re-matches did-regex s)))
+
+(def addr-regex
+  (re-pattern (str "fluree:(memory|file|ipfs)://.+")))
+
+(defn address?
+  [s]
+  (boolean (re-matches addr-regex s)))
+
+(def context-id-regex
+  (re-pattern (str "fluree:context:" base64-pattern "{64}")))
+
+(defn context-id?
+  [s]
+  (boolean (re-matches context-id-regex s)))
+
+(def db-id-regex
+  (re-pattern (str "fluree:db:sha256:" base32-pattern "{52,53}")))
+
+(defn db-id?
+  [s]
+  (boolean (re-matches db-id-regex s)))
+
+(def commit-id-regex
+  (re-pattern (str "fluree:commit:sha256:" base32-pattern "{52,53}")))
+
+(defn commit-id?
+  [s]
+  (boolean (re-matches commit-id-regex s)))
+
+(defn- coalesce-deep-match-values
+  [values]
+  (let [flattened (->> values (remove nil?) flatten)]
+    (if (= 1 (count flattened))
+      (first flattened)
+      (vec flattened))))
+
+(defn- coalesce-deep-match-results
+  [results]
+  (if (every? :result results)
+    {:result true}
+    {:result   false
+     :expected (coalesce-deep-match-values (map :expected results))
+     :actual   (coalesce-deep-match-values (map :actual results))
+     :details  (->> results (map :details) (remove nil?) (str/join "\n"))}))
+
+(defn pred-match?*
+  "Does a deep compare of expected and actual map values but any fns in expected
+  are run with the equivalent value from actual and the result is used to
+  determine whether there is a match. Returns a map with the following keys:
+
+  :result will be true if expected and actual match, false otherwise.
+  :expected will be the tested expected value or a description thereof (only on failure)
+  :actual will be the tested actual value or a description thereof (only on failure)"
+  [expected actual]
+  (if (= expected actual)
+    {:result true}
+    (cond
+      (fn? expected)
+      (let [result (expected actual)]
+        (if result
+          {:result true}
+          {:result   false
+           :expected (str "(" expected " "
+                          (pr-str actual) ") => true")
+           :actual   (str "(" expected " "
+                          (pr-str actual) ") => false")}))
+
+      (and (map? expected) (map? actual))
+      (let [expected-keyset (-> expected keys set)
+            actual-keyset   (-> actual keys set)]
+        (if (= expected-keyset actual-keyset)
+          (let [results (map (fn [[k v]]
+                               (pred-match?* (get expected k) v))
+                             actual)]
+            (coalesce-deep-match-results results))
+          {:result   false
+           :expected (str "map with keys: " expected-keyset)
+           :actual   (str "map with keys: " actual-keyset)}))
+
+      (and (coll? expected) (coll? actual))
+      (let [results (map pred-match?* expected actual)]
+        (coalesce-deep-match-results results))
+
+      :else
+      {:result   false
+       :expected expected
+       :actual   actual})))
+
+(declare pred-match?)
+
+(defmethod clj-test/assert-expr 'pred-match?
+  [msg form]
+  `(let [result#      (pred-match?* ~(nth form 1) ~(nth form 2))
+         result-type# (if (:result result#) :pass :fail)]
+     (clj-test/do-report {:type     result-type#
+                          :message  ~msg
+                          :expected (:expected result#)
+                          :actual   (:actual result#)})))
