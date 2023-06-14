@@ -125,50 +125,14 @@
   (let [conn @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "functions" {:defaultContext [test-utils/default-str-context
                                                                   {"ex" "http://example.com/"}]})
-        db0 (fluree/db ledger)
-        db1 @(fluree/stage db0 [{"id" "ex:create-predicates"
-                                 ;; string functions
-                                 "ex:strLen" 0
-                                 "ex:subStr" 0
-                                 "ex:ucase" 0
-                                 "ex:lcase" 0
-                                 "ex:strStarts" 0
-                                 "ex:strEnds" 0
-                                 "ex:contains" 0
-                                 "ex:strBefore" 0
-                                 "ex:strAfter" 0
-                                 "ex:encodeForUri" 0
-                                 "ex:concat" 0
-                                 "ex:langMatches" 0
-                                 "ex:regex" 0
-                                 "ex:replace" 0
-                                 ;; numeric functions
-                                 "ex:abs" 0
-                                 "ex:round" 0
-                                 "ex:ceil" 0
-                                 "ex:floor" 0
-                                 "ex:rand" 0
-                                 ;; date/time functions
-                                 "ex:now" 0
-                                 "ex:year" 0
-                                 "ex:month" 0
-                                 "ex:day" 0
-                                 "ex:hours" 0
-                                 "ex:minutes" 0
-                                 "ex:seconds" 0
-                                 "ex:timezone" 0
-                                 "ex:tz" 0
-                                 ;; hash functions
-                                 "ex:md5" 0
-                                 "ex:sha1" 0
-                                 "ex:sha256" 0
-                                 "ex:sha384" 0
-                                 "ex:sha512" 0}])]
+        db1 (fluree/db ledger)]
 
     (testing "hash functions"
       (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
-        (let [updated (-> @(fluree/stage db1 {"id" "ex:hash-fns"
-                                              "ex:message" "abc"})
+        (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                               "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
+                                              {"id" "ex:hash-fns"
+                                               "ex:message" "abc"}])
                           (fluree/stage {"delete" []
                                          "where" [["?s" "id" "ex:hash-fns"]
                                                   ["?s" "ex:message" "?message"]
@@ -183,10 +147,13 @@
                                                              "ex:sha256"]}}))))))
     (testing "datetime functions"
       (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
-        (let [updated (-> @(fluree/stage db1 {"id" "ex:datetime-fns"
-                                              "ex:localdatetime" "2023-06-13T14:17:22.435"
-                                              "ex:offsetdatetime" "2023-06-13T14:17:22.435-05:00"
-                                              "ex:utcdatetime" "2023-06-13T14:17:22.435Z"})
+        (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                               "ex:now" 0 "ex:year" 0 "ex:month" 0 "ex:day" 0 "ex:hours" 0
+                                               "ex:minutes" 0 "ex:seconds" 0 "ex:timezone" 0 "ex:tz" 0}
+                                              {"id" "ex:datetime-fns"
+                                               "ex:localdatetime" "2023-06-13T14:17:22.435"
+                                               "ex:offsetdatetime" "2023-06-13T14:17:22.435-05:00"
+                                               "ex:utcdatetime" "2023-06-13T14:17:22.435Z"}])
                           (fluree/stage {"delete" []
                                          "where" [["?s" "id" "ex:datetime-fns"]
                                                   ["?s" "ex:localdatetime" "?localdatetime"]
@@ -219,20 +186,16 @@
                   "ex:seconds" 22
                   "ex:tz" ["-05:00" "Z"]}
                  @(fluree/query @updated {"where" [["?s" "id" "ex:datetime-fns"]]
-                                          "selectOne" {"?s" ["ex:now"
-                                                             "ex:year"
-                                                             "ex:month"
-                                                             "ex:day"
-                                                             "ex:hours"
-                                                             "ex:minutes"
-                                                             "ex:seconds"
+                                          "selectOne" {"?s" ["ex:now" "ex:year" "ex:month" "ex:day" "ex:hours" "ex:minutes" "ex:seconds"
                                                              "ex:tz"]}}))))))
 
     (testing "numeric functions"
-      (let [updated (-> @(fluree/stage db1 {"id" "ex:numeric-fns"
-                                            "ex:pos-int" 2
-                                            "ex:neg-int" -2
-                                            "ex:decimal" 1.4})
+      (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                             "ex:abs" 0 "ex:round" 0 "ex:ceil" 0 "ex:floor" 0 "ex:rand" 0}
+                                            {"id" "ex:numeric-fns"
+                                             "ex:pos-int" 2
+                                             "ex:neg-int" -2
+                                             "ex:decimal" 1.4}])
                         (fluree/stage {"delete" []
                                        "where" [["?s" "id" "ex:numeric-fns"]
                                                 ["?s" "ex:pos-int" "?pos-int"]
@@ -262,7 +225,12 @@
                                            "selectOne" "?rand"})))))
 
     (testing "string functions"
-      (let [updated  (-> @(fluree/stage db1 {"id" "ex:string-fns" "ex:text" "Abcdefg"})
+      (let [updated  (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                              "ex:strLen" 0 "ex:subStr" 0 "ex:ucase" 0 "ex:lcase" 0 "ex:strStarts" 0 "ex:strEnds" 0
+                                              "ex:contains" 0 "ex:strBefore" 0 "ex:strAfter" 0 "ex:encodeForUri" 0 "ex:concat" 0
+                                              "ex:langMatches" 0 "ex:regex" 0 "ex:replace" 0}
+                                             {"id" "ex:string-fns"
+                                              "ex:text" "Abcdefg"}])
                          (fluree/stage {"delete" []
                                         "where" [["?s" "id" "ex:string-fns"]
                                                  ["?s" "ex:text" "?text"]
@@ -302,20 +270,9 @@
                 "ex:strAfter" "efg"
                 "ex:concat" "Abcdefg STR1 STR2"}
                @(fluree/query @updated {"where" [["?s" "id" "ex:string-fns"]]
-                                        "selectOne" {"?s" ["ex:strLen"
-                                                           "ex:subStr"
-                                                           "ex:ucase"
-                                                           "ex:lcase"
-                                                           "ex:strStarts"
-                                                           "ex:strEnds"
-                                                           "ex:contains"
-                                                           "ex:strBefore"
-                                                           "ex:strAfter"
-                                                           "ex:encodeForUri"
-                                                           "ex:concat"
-                                                           "ex:langMatches"
-                                                           "ex:regex"
-                                                           "ex:replace"]}})))))
+                                        "selectOne" {"?s" ["ex:strLen" "ex:subStr" "ex:ucase" "ex:lcase" "ex:strStarts" "ex:strEnds"
+                                                           "ex:contains" "ex:strBefore" "ex:strAfter" "ex:encodeForUri" "ex:concat"
+                                                           "ex:langMatches" "ex:regex" "ex:replace"]}})))))
 
     #_(testing "functional forms")
     #_(testing "scalar functions")))
