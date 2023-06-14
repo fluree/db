@@ -229,26 +229,23 @@
       (get-in [:schema :pred prop :equivalentProperty])
       not-empty))
 
-
 (defn recursive-resolve-flake-range
-  [db [{first-s ::val} p o] recur-n fuel-tracker error-ch]
-  (let [result-ch (async/chan 2 cat)]
+  [db [s p o] recur-n fuel-tracker error-ch]
+  (let [{first-s ::val} s
+        result-ch (async/chan 2 cat)]
     (go
       (loop [visited #{}
-             stack []]
-        (let [[new-query-sid recur-r]  (if (seq stack)
-                                         [(flake/o (ffirst stack)) (second (first stack))]
-                                         [(if (and first-s (not (number? first-s)))
-                                            (<? (dbproto/-subid db first-s true))
-                                            first-s) recur-n])]
+             stack [[(if (and first-s (not (number? first-s)))
+                       (<? (dbproto/-subid db first-s true))
+                       first-s) recur-n]]]
+        (let [[new-query-sid recur-r]  (first stack)]
           (if (and new-query-sid
                    (not (contains? visited new-query-sid))
                    (not= 0 recur-r))
-            ;;TODO probably don't just want {::val sid}, want to preserve filters?
-            (let [fs (<? (resolve-flake-range db fuel-tracker error-ch [{::val new-query-sid} p]))]
+            (let [fs (<? (resolve-flake-range db fuel-tracker error-ch [(assoc s ::val new-query-sid) p o]))]
               (async/>! result-ch fs)
               (recur (conj visited new-query-sid)
-                     (into (rest stack) (map (fn [f] [f (dec recur-r)]) fs))))
+                     (into (rest stack) (map (fn [f] [(flake/o f) (dec recur-r)]) fs))))
             (async/close! result-ch)))))
     (async/into [] result-ch)))
 
