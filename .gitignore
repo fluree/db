@@ -31,3 +31,4 @@ package-lock.json
 /js-packages/browser/flureedb.js
 /js-packages/nodejs/flureenjs.js
 /js-packages/webworker/flureeworker.js
+/.shadow-cljs/
