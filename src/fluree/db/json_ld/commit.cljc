@@ -10,8 +10,8 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [clojure.core.async  :as async]
-               :cljs [cljs.core.async  :as async])
+            #?(:clj  [clojure.core.async :as async]
+               :cljs [cljs.core.async :as async])
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
@@ -113,10 +113,12 @@
                   (let [{assert-flakes  true,
                          retract-flakes false} (group-by flake/op non-iri-flakes)
                         s-assert  (when assert-flakes
-                                    (-> (<? (subject-block assert-flakes db id->iri ctx compact-fn))
+                                    (-> (<? (subject-block assert-flakes db
+                                                           id->iri ctx compact-fn))
                                         (assoc id-key s-iri)))
                         s-retract (when retract-flakes
-                                    (-> (<? (subject-block retract-flakes db id->iri ctx compact-fn))
+                                    (-> (<? (subject-block retract-flakes db
+                                                           id->iri ctx compact-fn))
                                         (assoc id-key s-iri)))]
                     [(cond-> assert
                              s-assert (conj s-assert))
@@ -143,16 +145,16 @@
     (mapv stringify-context context)
     (if (map? context)
       (reduce-kv
-        (fn [acc k v]
-          (let [k* (if (keyword? k)
-                     (name k)
-                     k)
-                v* (if (and (map? v)
-                            (not (contains? v :id)))
-                     (stringify-context v)
-                     v)]
-            (assoc acc k* v*)))
-        {} context)
+       (fn [acc k v]
+         (let [k* (if (keyword? k)
+                    (name k)
+                    k)
+               v* (if (and (map? v)
+                           (not (contains? v :id)))
+                    (stringify-context v)
+                    v)]
+           (assoc acc k* v*)))
+       {} context)
       context)))
 
 (defn- enrich-commit-opts
@@ -268,10 +270,10 @@
   (go-try
     (let [{:keys [hash address] :as context-res} (<? (conn-proto/-ctx-write
                                                       conn ledger default-context))
-          commit*     (assoc commit :defaultContext
-                                    {:id      (str "fluree:context:" hash)
-                                     :type    const/iri-Context
-                                     :address address})]
+          commit* (assoc commit :defaultContext
+                                {:id      (str "fluree:context:" hash)
+                                 :type    const/iri-Context
+                                 :address address})]
       [commit* context-res])))
 
 (defn do-commit+push
@@ -297,10 +299,10 @@
           new-commit*** (commit-data/update-commit-address new-commit** (:address commit-res))
           db*           (assoc db :commit new-commit***
                                   :new-context? false)
-          db**         (if new-t?
-                         (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
-                         db*)
-          db***          (ledger-proto/-commit-update ledger branch db**)]
+          db**          (if new-t?
+                          (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
+                          db*)
+          db***         (ledger-proto/-commit-update ledger branch db**)]
       ;; push is asynchronous!
       (when push?
         (let [address     (ledger-proto/-address ledger)
@@ -336,7 +338,7 @@
         update-fn (update-commit-fn db commit-opts)]
     ;; call indexing process with update-commit-fn to push out an updated commit once complete
     (idx-proto/-index indexer db {:update-commit update-fn
-                                  :changes-ch changes-ch})))
+                                  :changes-ch    changes-ch})))
 
 
 (defn commit
@@ -359,8 +361,8 @@
                              context-key context}
           new-commit        (commit-data/new-db-commit-map base-commit-map)
           db*               (assoc db
-                                   :commit new-commit
-                                   :prev-commit commit)
+                              :commit new-commit
+                              :prev-commit commit)
           {db**              :db
            commit-file-meta  :commit-res
            context-file-meta :context-res} (<? (do-commit+push db* opts*))

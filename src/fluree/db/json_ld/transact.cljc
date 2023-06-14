@@ -406,7 +406,7 @@
         (policy/allowed? tx-state)
         <?
         ;; unwrap the policy
-        (dbproto/-rootdb))))
+        dbproto/-rootdb)))
 
 (defn stage
   "Stages changes, but does not commit.

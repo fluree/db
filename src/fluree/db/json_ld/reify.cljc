@@ -286,14 +286,17 @@
 
 (defn commit-error
   [message commit-data]
-  (throw (ex-info message {:status 400, :error :db/invalid-commit, :commit commit-data})))
+  (throw
+   (ex-info message
+            {:status 400, :error :db/invalid-commit, :commit commit-data})))
 
 (defn db-t
   "Returns 't' value from commit data."
   [db-data]
   (let [db-t (get-in db-data [const/iri-t :value])]
     (when-not (pos-int? db-t)
-      (commit-error (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
+      (commit-error
+       (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
     db-t))
 
 (defn db-assert
@@ -318,20 +321,20 @@
 (defn read-commit
   [conn commit-address]
   (go-try
-   (let [file-data (<? (conn-proto/-c-read conn commit-address))
-         addr-key-path (if (contains? file-data "credentialSubject")
-                         ["credentialSubject" "address"]
-                         ["address"])
-         commit    (assoc-in file-data addr-key-path commit-address)]
-     (log/debug "read-commit commit:" commit)
-     (json-ld/expand commit))))
+    (let [file-data (<? (conn-proto/-c-read conn commit-address))
+          addr-key-path (if (contains? file-data "credentialSubject")
+                          ["credentialSubject" "address"]
+                          ["address"])
+          commit    (assoc-in file-data addr-key-path commit-address)]
+      (log/trace "read-commit commit:" commit)
+      (json-ld/expand commit))))
 
 (defn read-db
   [conn db-address]
   (go-try
-   (let [file-data (<? (conn-proto/-c-read conn db-address))
-         db        (assoc file-data "f:address" db-address)]
-     (json-ld/expand db))))
+    (let [file-data (<? (conn-proto/-c-read conn db-address))
+          db        (assoc file-data "f:address" db-address)]
+      (json-ld/expand db))))
 
 (defn merge-commit
   [conn {:keys [ecount t] :as db} commit merged-db?]
