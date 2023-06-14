@@ -63,9 +63,44 @@
               [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
               [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
               [:id :id "@id"]]
-             @(fluree/query db-bool '{:select  [?s ?p ?o]
-                                      :where   [[?s ?p ?o]]}))))))
+             @(fluree/query db-bool '{:select [?s ?p ?o]
+                                      :where  [[?s ?p ?o]]})))))
 
+  (testing "mixed data types (ref & string) are handled correctly"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "tx/mixed-dts"
+                                 {:defaultContext
+                                  ["" {:ex "http://example.org/ns/"}]})
+          db     @(fluree/stage (fluree/db ledger)
+                                {:id               :ex/brian
+                                 :ex/favCoffeeShop [:wiki/Q37158
+                                                    "Clemmons Coffee"]})
+          _db    @(fluree/commit! ledger db)
+          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db     (fluree/db loaded)
+          query  '{:select {?b [:*]}
+                   :where  [[?b :id :ex/brian]]}]
+      (is (= [{:id               :ex/brian
+               :ex/favCoffeeShop [{:id :wiki/Q37158} "Clemmons Coffee"]}]
+             @(fluree/query db query)))))
+
+  (testing "mixed data types (num & string) are handled correctly"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "tx/mixed-dts"
+                                 {:defaultContext
+                                  ["" {:ex "http://example.org/ns/"}]})
+          db     @(fluree/stage (fluree/db ledger)
+                                {:id :ex/wes
+                                 :ex/aFewOfMyFavoriteThings
+                                 {"@list" [2011 "jabalí"]}})
+          _db    @(fluree/commit! ledger db)
+          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db     (fluree/db loaded)
+          query  '{:select {?b [:*]}
+                   :where  [[?b :id :ex/wes]]}]
+      (is (= [{:id                        :ex/wes
+               :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
+             @(fluree/query db query))))))
 
 (deftest policy-ordering-test
   (testing "transaction order does not affect query results"
@@ -94,9 +129,7 @@
                              (fluree/db ledger)
                              (into policy data))
           user-query      '{:select {?s [:*]}
-                            :where  [[?s :rdf/type :ex/User]]}
-          class-query     '{:select {?type [:*]}
-                            :where  [[?type :rdf/type :rdfs/Class]]}]
+                            :where  [[?s :rdf/type :ex/User]]}]
       (let [users [{:id :ex/john, :rdf/type [:ex/User], :schema/name "John"}
                    {:id :ex/alice, :rdf/type [:ex/User], :schema/name "Alice"}]]
         (is (= users
