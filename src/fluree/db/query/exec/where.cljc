@@ -232,7 +232,7 @@
 (defn recursive-resolve-flake-range
   [db [s p o] recur-n fuel-tracker error-ch]
   (let [{first-s ::val} s
-        result-ch (async/chan 2 cat)]
+        result-ch (async/chan)]
     (go
       (loop [visited #{}
              stack [[(if (and first-s (not (number? first-s)))
@@ -247,7 +247,7 @@
               (recur (conj visited new-query-sid)
                      (into (rest stack) (map (fn [f] [(flake/o f) (dec recur-r)]) fs))))
             (async/close! result-ch)))))
-    (async/into [] result-ch)))
+    result-ch))
 
 
 (defmethod match-pattern :tuple
