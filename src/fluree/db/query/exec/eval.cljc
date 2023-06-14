@@ -10,7 +10,10 @@
             [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const])
-  #?(:clj (:import (java.time Instant))))
+  #?(:clj (:import (java.time Instant)
+                   (java.time OffsetDateTime LocalDateTime))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn sum
   [coll]
@@ -169,42 +172,42 @@
 
 (defn year
   [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+  (let [datetime ^LocalDateTime (datatype/coerce datetime-string const/$xsd:dateTime)]
     (.getYear datetime)))
 
 (defn month
   [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+  (let [datetime ^LocalDateTime (datatype/coerce datetime-string const/$xsd:dateTime)]
     #?(:clj (.getMonthValue datetime)
        :cljs (.getMonth datetime))))
 
 (defn day
   [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+  (let [datetime ^LocalDateTime (datatype/coerce datetime-string const/$xsd:dateTime)]
     #?(:clj (.getDayOfMonth datetime)
        :cljs (.getDate datetime))))
 
 (defn hours
   [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+  (let [datetime ^LocalDateTime (datatype/coerce datetime-string const/$xsd:dateTime)]
     #?(:clj (.getHour datetime)
        :cljs (.getHours datetime))))
 
 (defn minutes
   [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+  (let [datetime ^LocalDateTime (datatype/coerce datetime-string const/$xsd:dateTime)]
     #?(:clj (.getMinute datetime)
        :cljs (.getMinutes datetime))))
 
 (defn seconds
   [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+  (let [datetime ^LocalDateTime (datatype/coerce datetime-string const/$xsd:dateTime)]
     #?(:clj (.getSecond datetime)
        :cljs (.getSeconds datetime))))
 
 (defn tz
   [datetime-string]
-  (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
+  (let [datetime ^OffsetDateTime (datatype/coerce datetime-string const/$xsd:dateTime)]
     #?(:clj (.toString (.getOffset datetime))
        :cljs (.getTimeZoneOffset datetime))))
 
