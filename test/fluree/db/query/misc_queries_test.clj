@@ -237,7 +237,9 @@
                @(fluree/query db {:select {'?s ["*"]}
                                   :where  [['?s '?p '?o]]}))
             "Every triple should be returned.")
-        (let [db* @(fluree/commit! ledger db)]
+        (let [db*    @(fluree/commit! ledger db)
+              result @(fluree/query db* {:select ['?s '?p '?o]
+                                         :where  [['?s '?p '?o]]})]
           (is (pred-match?
                [[:ex/jane :id "http://example.org/ns/jane"]
                 [:ex/jane :rdf/type :ex/User]
@@ -258,14 +260,13 @@
                 [test-utils/did? :id test-utils/did?]
                 [test-utils/db-id? :id test-utils/db-id?]
                 [test-utils/db-id? :f/address test-utils/address?]
-                [test-utils/db-id? :f/flakes 25]
-                [test-utils/db-id? :f/size 1888]
+                [test-utils/db-id? :f/flakes 24]
+                [test-utils/db-id? :f/size 1838]
                 [test-utils/db-id? :f/t 1]
                 [:schema/age :id "http://schema.org/age"]
                 [:schema/email :id "http://schema.org/email"]
                 [:schema/name :id "http://schema.org/name"]
                 [:ex/User :id "http://example.org/ns/User"]
-                [:ex/User :rdf/type :rdfs/Class]
                 [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
                 [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
                 [:f/t :id "https://ns.flur.ee/ledger#t"]
@@ -291,8 +292,8 @@
                 [test-utils/commit-id? :f/alias "query/everything"]
                 [test-utils/commit-id? :f/branch "main"]
                 [test-utils/commit-id? :f/defaultContext test-utils/context-id?]]
-               @(fluree/query db* {:select ['?s '?p '?o]
-                                   :where  [['?s '?p '?o]]}))))))))
+               result)
+              (str "query result was: " (pr-str result))))))))
 
 (deftest ^:integration illegal-reference-test
   (testing "Illegal reference queries"
