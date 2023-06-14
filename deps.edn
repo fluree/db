@@ -67,7 +67,6 @@
                  org.clojure/test.check      {:mvn/version "1.1.1"}
                  io.github.cap10morgan/test-with-files {:git/tag "v1.0.0"
                                                         :git/sha "9181a2e"}}
-   :main-opts   ["-m" "kaocha.runner"]
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {}}
 
