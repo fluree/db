@@ -100,7 +100,44 @@
                    :where  [[?b :id :ex/wes]]}]
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
-             @(fluree/query db query))))))
+             @(fluree/query db query)))))
+>>>>>>> 7a327f66 (Add a test for transacting mixed data types)
+
+  (testing "mixed data types (ref & string) are handled correctly"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "tx/mixed-dts"
+                                 {:defaultContext
+                                  ["" {:ex "http://example.org/ns/"}]})
+          db     @(fluree/stage (fluree/db ledger)
+                                {:id               :ex/brian
+                                 :ex/favCoffeeShop [:wiki/Q37158
+                                                    "Clemmons Coffee"]})
+          _db    @(fluree/commit! ledger db)
+          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db     (fluree/db loaded)
+          query  '{:select {?b [:*]}
+                   :where  [[?b :id :ex/brian]]}]
+      (is (= [{:id               :ex/brian
+               :ex/favCoffeeShop [{:id :wiki/Q37158} "Clemmons Coffee"]}]
+             @(fluree/query db query)))))
+
+  (testing "mixed data types (num & string) are handled correctly"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "tx/mixed-dts"
+                                 {:defaultContext
+                                  ["" {:ex "http://example.org/ns/"}]})
+          db     @(fluree/stage (fluree/db ledger)
+                                {:id :ex/wes
+                                 :ex/aFewOfMyFavoriteThings
+                                 {"@list" [2011 "jabalí"]}})
+          _db    @(fluree/commit! ledger db)
+          loaded (test-utils/retry-load conn "tx/mixed-dts" 100)
+          db     (fluree/db loaded)
+          query  '{:select {?b [:*]}
+                   :where  [[?b :id :ex/wes]]}]
+      (is (= [{:id                        :ex/wes
+               :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
+             @(fluree/query db query)))))
 
 (deftest policy-ordering-test
   (testing "transaction order does not affect query results"
