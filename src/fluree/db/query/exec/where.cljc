@@ -234,18 +234,15 @@
   (let [{first-s ::val} s
         result-ch (async/chan)]
     (go
-      (loop [visited #{}
-             stack [[(if (and first-s (not (number? first-s)))
+      (loop [stack [[(if (and first-s (not (number? first-s)))
                        (<? (dbproto/-subid db first-s true))
                        first-s) recur-n]]]
         (let [[new-query-sid recur-r]  (first stack)]
           (if (and new-query-sid
-                   (not (contains? visited new-query-sid))
                    (not= 0 recur-r))
             (let [fs (<? (resolve-flake-range db fuel-tracker error-ch [(assoc s ::val new-query-sid) p o]))]
               (async/>! result-ch fs)
-              (recur (conj visited new-query-sid)
-                     (into (rest stack) (map (fn [f] [(flake/o f) (dec recur-r)]) fs))))
+              (recur (into (rest stack) (map (fn [f] [(flake/o f) (dec recur-r)]) fs))))
             (async/close! result-ch)))))
     result-ch))
 

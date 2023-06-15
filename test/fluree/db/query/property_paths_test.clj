@@ -30,39 +30,23 @@
                    {:id          :ex/jerry
                     :schema/name "jerry"
                     :type        :ex/User}])]
-    (is (= [{:id          :ex/brian,
-             :rdf/type    [:ex/User],
-             :schema/name "Brian",
-             :ex/last     "Smith",
-             :ex/friend   {:id :ex/alice}}
-            {:id          :ex/alice,
-             :rdf/type    [:ex/User],
-             :schema/name "Alice",
-             :ex/friend   [{:id :ex/david}
-                           {:id :ex/jerry}]}
-            {:id          :ex/david,
-             :rdf/type    [:ex/User],
-             :schema/name "David",
-             :ex/friend   {:id :ex/cam}}
-            {:id          :ex/jerry,
-             :rdf/type    [:ex/User],
-             :schema/name "jerry"}
-            {:id          :ex/cam,
-             :rdf/type    [:ex/User],
-             :schema/name "Cam",
-             :ex/last     "Jones",
-             :ex/friend   {:id :ex/brian}}]
-           @(fluree/query db {:select {'?friend [:*]}
-                              :where  [[:ex/cam :ex/friend+ '?friend]]})))
-    (is (= [{:id          :ex/brian,
-             :rdf/type    [:ex/User]
-             :schema/name "Brian",
-             :ex/last     "Smith",
-             :ex/friend   {:id :ex/alice}}
-            {:id          :ex/alice,
-             :rdf/type    [:ex/User],
-             :schema/name "Alice",
-             :ex/friend   [{:id :ex/david}
-                           {:id :ex/jerry}]}]
-           @(fluree/query db {:select {'?friend [:*]}
-                              :where  [[:ex/cam :ex/friend+2 '?friend]]})))))
+    (testing "no depth supplied, contains a loop"
+      (is (= [[:ex/brian "Brian"]
+              [:ex/alice "Alice"]
+              [:ex/david "David"]
+              [:ex/jerry "jerry"]
+              [:ex/cam "Cam"]
+              [:ex/brian "Brian"]
+              [:ex/alice "Alice"]
+              [:ex/david "David"]
+              [:ex/jerry "jerry"]
+              [:ex/cam "Cam"]]
+             (take 10 @(fluree/query db {:select ['?friend '?name]
+                                        :where  [[:ex/cam :ex/friend+ '?friend]
+                                                 ['?friend :schema/name '?name]]})))))
+    (testing "with supplied depth"
+      (is (= [[:ex/brian "Brian"]
+              [:ex/alice "Alice"]]
+             @(fluree/query db {:select ['?friend '?name]
+                                :where  [[:ex/cam :ex/friend+2 '?friend]
+                                         ['?friend :schema/name '?name]]}))))))
