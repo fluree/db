@@ -230,22 +230,28 @@
       not-empty))
 
 (defn recursive-resolve-flake-range
-  [db [s p o] recur-n fuel-tracker error-ch]
+  [db solution pattern [s p o] recur-n fuel-tracker error-ch]
   (let [{first-s ::val} s
         result-ch (async/chan)]
     (go
-      (loop [stack [[(if (and first-s (not (number? first-s)))
-                       (<? (dbproto/-subid db first-s true))
-                       first-s) recur-n]]]
-        (let [[new-query-sid recur-r :as next]  (first stack)]
+      (loop [stack [[solution recur-n]]]
+        (let [[prev-solution recur-r :as next] (first stack)
+              [old-s _p new-s :as new-trip] (assign-matched-values pattern prev-solution nil)
+              {new-query-sid ::val} new-s
+              new-query-sid (or new-query-sid
+                                ;;first time through
+                                (if (and first-s (not (number? first-s)))
+                                  (<? (dbproto/-subid db first-s true))
+                                  first-s))]
           (if (and next
                    (not= 0 recur-r))
-            (let [fs (<? (resolve-flake-range db fuel-tracker error-ch [(assoc s ::val new-query-sid) p o]))]
+            (let [fs (<? (resolve-flake-range db fuel-tracker error-ch [(assoc s ::val new-query-sid) p o]))
+                  matched-fs (map (fn [f] (match-flake solution pattern f)) fs)]
+              ;;TODO return solutions instead of flakes
               (async/>! result-ch fs)
-              (recur (into (rest stack) (map (fn [f] [(flake/o f) (dec recur-r)]) fs))))
+              (recur (into (rest stack) (map (fn [f] [(match-flake solution pattern f) (dec recur-r)]) fs))))
             (async/close! result-ch)))))
     result-ch))
-
 
 (defmethod match-pattern :tuple
   [db fuel-tracker solution pattern filters error-ch]
@@ -268,7 +274,7 @@
 
       (if recur-n
         (-> db
-            (recursive-resolve-flake-range [s p o] recur-n fuel-tracker error-ch)
+            (recursive-resolve-flake-range solution pattern [s p o] recur-n fuel-tracker error-ch)
             (async/pipe match-ch))
         (-> db
             (resolve-flake-range fuel-tracker error-ch [s p o])
