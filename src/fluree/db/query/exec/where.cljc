@@ -237,8 +237,8 @@
       (loop [stack [[(if (and first-s (not (number? first-s)))
                        (<? (dbproto/-subid db first-s true))
                        first-s) recur-n]]]
-        (let [[new-query-sid recur-r]  (first stack)]
-          (if (and new-query-sid
+        (let [[new-query-sid recur-r :as next]  (first stack)]
+          (if (and next
                    (not= 0 recur-r))
             (let [fs (<? (resolve-flake-range db fuel-tracker error-ch [(assoc s ::val new-query-sid) p o]))]
               (async/>! result-ch fs)

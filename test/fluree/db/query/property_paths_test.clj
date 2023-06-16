@@ -42,8 +42,22 @@
               [:ex/jerry "jerry"]
               [:ex/cam "Cam"]]
              (take 10 @(fluree/query db {:select ['?friend '?name]
-                                        :where  [[:ex/cam :ex/friend+ '?friend]
-                                                 ['?friend :schema/name '?name]]})))))
+                                         :where  [[:ex/cam :ex/friend+ '?friend]
+                                                  ['?friend :schema/name '?name]]}))))
+      (is (= [[:ex/brian "Brian"]
+              [:ex/alice "Alice"]
+              [:ex/david "David"]
+              [:ex/jerry "jerry"]
+              [:ex/cam "Cam"]
+              [:ex/brian "Brian"]
+              [:ex/alice "Alice"]
+              [:ex/david "David"]
+              [:ex/jerry "jerry"]
+              [:ex/cam "Cam"]]
+             (take 10 @(fluree/query db {:select ['?friend '?name]
+                                         :where  [['?s :id :ex/cam]
+                                                  ['?s :ex/friend+ '?friend]
+                                                  ['?friend :schema/name '?name]]})))))
     (testing "with supplied depth"
       (is (= [[:ex/brian "Brian"]
               [:ex/alice "Alice"]]
