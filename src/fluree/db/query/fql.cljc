@@ -440,7 +440,7 @@
 (defn relationship-binding
   [{:keys [vars] :as opts}]
   (async/go-loop [[next-vars & rest-vars] vars
-                  acc []]
+                  acc (if (:groupBy opts) {} [])]
     (if next-vars
       (let [opts' (assoc opts :vars next-vars)
             res   (<? (process-ad-hoc-query opts'))]
