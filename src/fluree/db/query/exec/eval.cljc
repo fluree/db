@@ -107,7 +107,8 @@
 
 (defn now
   []
-  #?(:clj (str (Instant/now))))
+  #?(:clj (str (Instant/now))
+     :cljs (.toISOString (Date.))))
 
 (defn strStarts
   [s substr]
@@ -221,6 +222,27 @@
   [x]
   (crypto/sha2-512 x))
 
+(defn uuid
+  []
+  (str "urn:uuid:" (random-uuid)))
+
+(defn struuid
+  []
+  (str (random-uuid)))
+
+(defn isNumeric
+  [x]
+  (number? x))
+
+(defn isBlank
+  [x]
+  (and (string? x)
+       (str/starts-with? x "_:")))
+
+(defn sparql-str
+  [x]
+  (str x))
+
 (def allowed-scalar-fns
   '#{ && || ! > < >= <= = + - * / quot and bound coalesce if nil?
      not not= or re-find re-pattern
@@ -231,7 +253,10 @@
      ;; datetime fns
      now year month day hours minutes seconds tz
      ;; hash fns
-     sha256 sha512})
+     sha256 sha512
+     ;; rdf term fns
+     uuid struuid isNumeric isBlank str
+     })
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -278,6 +303,11 @@
     tz          fluree.db.query.exec.eval/tz
     sha256      fluree.db.query.exec.eval/sha256
     sha512      fluree.db.query.exec.eval/sha512
+    uuid        fluree.db.query.exec.eval/uuid
+    struuid     fluree.db.query.exec.eval/struuid
+    isNumeric   fluree.db.query.exec.eval/isNumeric
+    isBlank     fluree.db.query.exec.eval/isBlank
+    str         fluree.db.query.exec.eval/sparql-str
     })
 
 (defn variable?

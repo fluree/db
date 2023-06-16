@@ -273,6 +273,89 @@
                                         "selectOne" {"?s" ["ex:strLen" "ex:subStr" "ex:ucase" "ex:lcase" "ex:strStarts" "ex:strEnds"
                                                            "ex:contains" "ex:strBefore" "ex:strAfter" "ex:encodeForUri" "ex:concat"
                                                            "ex:langMatches" "ex:regex" "ex:replace"]}})))))
+    (testing "rdf term functions"
+      (with-redefs [fluree.db.query.exec.eval/uuid (fn [] "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47")
+                    fluree.db.query.exec.eval/struuid (fn [] "34bdb25f-9fae-419b-9c50-203b5f306e47")]
+        (let [updated  (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                                "ex:isBlank" 0 "ex:isNumeric" 0 "ex:str" 0 "ex:uuid" 0
+                                                "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0
+                                                ;; "ex:isIRI" 0 "ex:isURI" 0 "ex:isLiteral" 0 "ex:lang" 0 "ex:IRI" 0
+                                                ;; "ex:datatype" 0 "ex:bnode" 0 "ex:strdt" 0 "ex:strLang" 0
+                                                }
+                                               {"id" "ex:rdf-term-fns"
+                                                "ex:text" "Abcdefg"
+                                                "ex:number" 1
+                                                "ex:ref" {"ex:bool" false}}
+                                               {"ex:foo" "bar"}])
+                           (fluree/stage {"delete" []
+                                          "where" [["?s" "id" "ex:rdf-term-fns"]
+                                                   ["?s" "ex:text" "?text"]
+                                                   ["?s" "ex:number" "?num"]
+                                                   ["?s" "ex:ref" "?r"]
+                                                   {"bind" {"?str" "(str ?num)"
+                                                            "?uuid" "(uuid)"
+                                                            "?struuid" "(struuid)"
+                                                            "?isBlank" "(isBlank ?s)"
+                                                            "?isNotBlank" "(isBlank ?num)"
+                                                            "?isnum" "(isNumeric ?num)"
+                                                            "?isNotNum" "(isNumeric ?text)"}}]
+                                          "insert" [["?s" "ex:uuid" "?uuid"]
+                                                    ["?s" "ex:struuid" "?struuid"]
+                                                    ["?s" "ex:str" "?str"]
+                                                    ["?s" "ex:str" "?str2"]
+                                                    ["?s" "ex:isNumeric" "?isnum"]
+                                                    ["?s" "ex:isNotNumeric" "?isNotNum"]
+                                                    ["?s" "ex:isBlank" "?isBlank"]
+                                                    ["?s" "ex:isNotBlank" "?isNotBlank"]]}))]
+          (is (= {"ex:str" "1"
+                  "ex:uuid" "urn:uuid:34bdb25f-9fae-419b-9c50-203b5f306e47"
+                  "ex:struuid" "34bdb25f-9fae-419b-9c50-203b5f306e47",
+                  "ex:isBlank" false
+                  "ex:isNotBlank" false
+                  "ex:isNumeric" true
+                  "ex:isNotNumeric" false}
+                 @(fluree/query @updated {"where" [["?s" "id" "ex:rdf-term-fns"]]
+                                          "selectOne" {"?s" ["ex:isIRI" "ex:isURI" "ex:isLiteral"
+                                                             "ex:lang" "ex:datatype" "ex:IRI" "ex:bnode" "ex:strdt" "ex:strLang"
+                                                             "ex:isBlank"
+                                                             "ex:isNotBlank"
+                                                             "ex:isNumeric"
+                                                             "ex:isNotNumeric"
+                                                             "ex:str"
+                                                             "ex:uuid"
+                                                             "ex:struuid"]}}))))))
 
-    #_(testing "functional forms")
-    #_(testing "scalar functions")))
+    ;; errors: undefined symbol, type error, mismatching parens
+    (testing "functional forms"
+        (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                               "ex:bound" 0
+                                               "ex:if" 0
+                                               "ex:coalesce" 0
+                                               "ex:not-exists" 0
+                                               "ex:exists" 0
+                                               "ex:logical-or" 0
+                                               "ex:logical-and" 0
+                                               "ex:rdfterm-equal" 0
+                                               "ex:sameTerm" 0
+                                               "ex:in" 0
+                                               "ex:not-in" 0}
+                                              {"id" "ex:functional-fns"
+                                               "ex:text" "Abcdefg"}])
+                          (fluree/stage {"delete" []
+                                         "where" [["?s" "id" "ex:functional-fns"]
+                                                  ["?s" "ex:text" "?text"]
+                                                  {"bind" {"?bound" "(bound ?text)"}}]
+                                         "insert" [["?s" "ex:bound" "?bound"]]}))]
+          (is (= {"ex:bound" true}
+                 @(fluree/query @updated {"where" [["?s" "id" "ex:functional-fns"]]
+                                          "selectOne" {"?s" ["ex:bound"
+                                                             "ex:if"
+                                                             "ex:coalesce"
+                                                             "ex:not-exists"
+                                                             "ex:exists"
+                                                             "ex:logical-or"
+                                                             "ex:logical-and"
+                                                             "ex:rdfterm-equal"
+                                                             "ex:sameTerm"
+                                                             "ex:in"
+                                                             "ex:not-in"]}})))))))
