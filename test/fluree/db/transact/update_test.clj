@@ -128,23 +128,23 @@
         db1 (fluree/db ledger)]
 
     (testing "hash functions"
-      (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
-        (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
-                                               "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
-                                              {"id" "ex:hash-fns"
-                                               "ex:message" "abc"}])
-                          (fluree/stage {"delete" []
-                                         "where" [["?s" "id" "ex:hash-fns"]
-                                                  ["?s" "ex:message" "?message"]
-                                                  {"bind" {"?sha256" "(sha256 ?message)"}}
-                                                  {"bind" {"?sha512" "(sha512 ?message)"}}]
-                                         "insert" [["?s" "ex:sha256" "?sha256"]
-                                                   ["?s" "ex:sha512" "?sha512"]]}))]
-          (is (= {"ex:sha512" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-                  "ex:sha256" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
-                 @(fluree/query @updated {"where" [["?s" "id" "ex:hash-fns"]]
-                                          "selectOne" {"?s" ["ex:sha512"
-                                                             "ex:sha256"]}}))))))
+        (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
+          (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                                 "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
+                                                {"id" "ex:hash-fns"
+                                                 "ex:message" "abc"}])
+                            (fluree/stage {"delete" []
+                                           "where" [["?s" "id" "ex:hash-fns"]
+                                                    ["?s" "ex:message" "?message"]
+                                                    {"bind" {"?sha256" "(sha256 ?message)"
+                                                             "?sha512" "(sha512 ?message)"}}]
+                                           "insert" [["?s" "ex:sha256" "?sha256"]
+                                                     ["?s" "ex:sha512" "?sha512"]]}))]
+            (is (= {"ex:sha512" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+                    "ex:sha256" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
+                   @(fluree/query @updated {"where" [["?s" "id" "ex:hash-fns"]]
+                                            "selectOne" {"?s" ["ex:sha512"
+                                                               "ex:sha256"]}}))))))
     (testing "datetime functions"
       (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
         (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
@@ -159,15 +159,15 @@
                                                   ["?s" "ex:localdatetime" "?localdatetime"]
                                                   ["?s" "ex:offsetdatetime" "?offsetdatetime"]
                                                   ["?s" "ex:utcdatetime" "?utcdatetime"]
-                                                  {"bind" {"?now" "(now)"}}
-                                                  {"bind" {"?year" "(year ?localdatetime)"}}
-                                                  {"bind" {"?month" "(month ?localdatetime)"}}
-                                                  {"bind" {"?day" "(day ?localdatetime)"}}
-                                                  {"bind" {"?hours" "(hours ?localdatetime)"}}
-                                                  {"bind" {"?minutes" "(minutes ?localdatetime)"}}
-                                                  {"bind" {"?seconds" "(seconds ?localdatetime)"}}
-                                                  {"bind" {"?tz1" "(tz ?utcdatetime)"}}
-                                                  {"bind" {"?tz2" "(tz ?offsetdatetime)"}}]
+                                                  {"bind" {"?now" "(now)"
+                                                           "?year" "(year ?localdatetime)"
+                                                           "?month" "(month ?localdatetime)"
+                                                           "?day" "(day ?localdatetime)"
+                                                           "?hours" "(hours ?localdatetime)"
+                                                           "?minutes" "(minutes ?localdatetime)"
+                                                           "?seconds" "(seconds ?localdatetime)"
+                                                           "?tz1" "(tz ?utcdatetime)"
+                                                           "?tz2" "(tz ?offsetdatetime)"}}]
                                          "insert" [["?s" "ex:now" "?now"]
                                                    ["?s" "ex:year" "?year"]
                                                    ["?s" "ex:month" "?month"]
@@ -201,11 +201,11 @@
                                                 ["?s" "ex:pos-int" "?pos-int"]
                                                 ["?s" "ex:neg-int" "?neg-int"]
                                                 ["?s" "ex:decimal" "?decimal"]
-                                                {"bind" {"?abs" "(abs ?neg-int)"}}
-                                                {"bind" {"?round" "(round ?decimal)"}}
-                                                {"bind" {"?ceil" "(ceil ?decimal)"}}
-                                                {"bind" {"?floor" "(floor ?decimal)"}}
-                                                {"bind" {"?rand" "(rand)"}}]
+                                                {"bind" {"?abs" "(abs ?neg-int)"
+                                                         "?round" "(round ?decimal)"
+                                                         "?ceil" "(ceil ?decimal)"
+                                                         "?floor" "(floor ?decimal)"
+                                                         "?rand" "(rand)"}}]
                                        "insert" [["?s" "ex:abs" "?abs"]
                                                  ["?s" "ex:round" "?round"]
                                                  ["?s" "ex:ceil" "?ceil"]
@@ -234,18 +234,18 @@
                          (fluree/stage {"delete" []
                                         "where" [["?s" "id" "ex:string-fns"]
                                                  ["?s" "ex:text" "?text"]
-                                                 {"bind" {"?strlen" "(strLen ?text)"}}
-                                                 {"bind" {"?sub1" "(subStr ?text 5)"}}
-                                                 {"bind" {"?sub2" "(subStr ?text 1 4)"}}
-                                                 {"bind" {"?upcased" "(ucase ?text)"}}
-                                                 {"bind" {"?downcased" "(lcase ?text)"}}
-                                                 {"bind" {"?a-start" "(strStarts ?text \"x\")"}}
-                                                 {"bind" {"?a-end" "(strEnds ?text \"x\")"}}
-                                                 {"bind" {"?contains" "(contains ?text \"x\")"}}
-                                                 {"bind" {"?strBefore" "(strBefore ?text \"bcd\")"}}
-                                                 {"bind" {"?strAfter" "(strAfter ?text \"bcd\")"}}
-                                                 {"bind" {"?concatted" "(concat ?text \" \" \"STR1 \" \"STR2\")"}}
-                                                 {"bind" {"?matched" "(regex ?text \"^Abc\")"}}]
+                                                 {"bind" {"?strlen" "(strLen ?text)"
+                                                          "?sub1" "(subStr ?text 5)"
+                                                          "?sub2" "(subStr ?text 1 4)"
+                                                          "?upcased" "(ucase ?text)"
+                                                          "?downcased" "(lcase ?text)"
+                                                          "?a-start" "(strStarts ?text \"x\")"
+                                                          "?a-end" "(strEnds ?text \"x\")"
+                                                          "?contains" "(contains ?text \"x\")"
+                                                          "?strBefore" "(strBefore ?text \"bcd\")"
+                                                          "?strAfter" "(strAfter ?text \"bcd\")"
+                                                          "?concatted" "(concat ?text \" \" \"STR1 \" \"STR2\")"
+                                                          "?matched" "(regex ?text \"^Abc\")"}}]
                                         "insert" [["?s" "ex:strStarts" "?a-start"]
                                                   ["?s" "ex:strEnds" "?a-end"]
                                                   ["?s" "ex:subStr" "?sub1"]
