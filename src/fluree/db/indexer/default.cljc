@@ -460,7 +460,6 @@
           init-stats    {:network      network
                          :ledger-id    ledger-id
                          :t            t
-                         :block        block
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]
       (if (or (dirty? db)

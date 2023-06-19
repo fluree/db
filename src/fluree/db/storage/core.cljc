@@ -78,7 +78,7 @@
     (let [{:keys [conn ledger ledger-id t]} db
           t'          (- t) ;; use positive t integer
           data        {:ledger-id ledger-id
-                       :block     t'
+                       :t         t'
                        :garbage   garbage}
           ser         (serdeproto/-serialize-garbage (serde conn) data)]
       (<? (conn-proto/-index-file-write conn ledger :garbage ser)))))
@@ -213,8 +213,8 @@
   [conn {:keys [id comparator leftmost?] :as branch}]
   (go-try
     (if-let [{:keys [children]} (<? (read-branch conn id))]
-      (let [branch-metadata (select-keys branch [:comparator :network :ledger-id
-                                                 :block :t :tt-id :tempid])
+      (let [branch-metadata (select-keys branch [:comparator :network :ledger-id :t
+                                                 :tt-id :tempid])
             child-attrs     (map-indexed (fn [i child]
                                            (-> branch-metadata
                                                (assoc :leftmost? (and leftmost?

@@ -491,5 +491,5 @@
       sql
       parse-rule
       first
-      (select-keys [:select :selectDistinct :selectOne :where :block :prefixes
+      (select-keys [:select :selectDistinct :selectOne :where :prefixes
                     :vars :opts])))
