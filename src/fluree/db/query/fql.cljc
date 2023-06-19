@@ -324,22 +324,30 @@
                  (<? (pipeline-expandmaps-result select pp-keys single-result? db fuel max-fuel opts 8 result))
                  result))))))
 
-
 (defn ad-hoc-group-by
-  [{:keys [headers tuples] :as res} groupBy]
+  [{:keys [headers vars tuples] :as res} groupBy]
+  (log/info "Result passed to group-by:" res)
   (let [[inVector? groupBy] (cond (vector? groupBy) [true (map symbol groupBy)]
                                   (string? groupBy) [false [(symbol groupBy)]]
                                   :else (throw (ex-info
                                                  (str "Invalid groupBy clause, must be a string or vector. Provided: " groupBy)
                                                  {:status 400 :error :db/invalid-query})))
-        group-idxs (map #(util/index-of headers %) groupBy)
-        _          (when (some nil? group-idxs)
-                     (throw (ex-info
-                              (str "Invalid groupBy clause - are all groupBy vars declared in the where clause. Provided: " groupBy)
-                              {:status 400 :error :db/invalid-query})))]
+        group-idxs (map (fn [group-var]
+                          (if-let [group-idx (util/index-of headers group-var)]
+                            {::idx group-idx}
+                            (if-let [group-val (get vars group-var)]
+                              {::value group-val}
+                              (throw (ex-info
+                                       (str "Invalid groupBy clause - are all groupBy vars declared in the where clause. Provided: " groupBy)
+                                       {:status 400 :error :db/invalid-query})))))
+                        groupBy)]
     (reduce
       (fn [res tuple]
-        (let [k  (map #(nth tuple %) group-idxs)
+        (let [k  (map (fn [val-spec]
+                        (if-let [idx (::idx val-spec)]
+                          (nth tuple idx)
+                          (::value val-spec)))
+                      group-idxs)
               k' (if inVector? (into [] k) (first k))
               v  tuple]
           (assoc res k' (conj (get res k' []) v))))
@@ -432,7 +440,7 @@
 (defn relationship-binding
   [{:keys [vars] :as opts}]
   (async/go-loop [[next-vars & rest-vars] vars
-                  acc []]
+                  acc (if (:groupBy opts) {} [])]
     (if next-vars
       (let [opts' (assoc opts :vars next-vars)
             res   (<? (process-ad-hoc-query opts'))]

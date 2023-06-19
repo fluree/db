@@ -623,10 +623,17 @@
 
 
 (defn calculate-aggregate
-  [tuples aggregate-fn-map]
+  [{:keys [headers vars tuples]} aggregate-fn-map]
   (let [{:keys [variable as function]} aggregate-fn-map
-        agg-params (flatten (select-from-tuples [variable] tuples))
-        agg-result (function agg-params)]
+        var        (or (as-variable variable)
+                       (:variable variable))
+        value      (if-let [var-idx (util/index-of headers var)]
+                     (map #(nth % var-idx) tuples)
+                     (if-let [val (get vars var)]
+                       (map (constantly val) tuples)
+                       (throw (ex-info (str "Invalid aggregate variable:" var)
+                                       {:status 400 :error :db/invalid-query}))))
+        agg-result (function value)]
     [as agg-result]))
 
 (defn add-aggregate-cols
