@@ -414,8 +414,8 @@
 
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
-  First commit will be t value of `to-t` and increment from there."
-  [conn latest-commit to-t]
+  First commit will be t value of `from-t` and increment from there."
+  [conn latest-commit from-t]
   (go-try
     (loop [commit  latest-commit
            last-t  nil
@@ -442,7 +442,7 @@
                            :commit-data (if (> (count (str commit)) 500)
                                           (str (subs (str commit) 0 500) "...")
                                           (str commit))})))
-        (if (= to-t commit-t)
+        (if (= from-t commit-t)
           commits*
           (let [commit-data (<? (read-commit conn prev-commit-addr))
                 [commit proof] (parse-commit commit-data)]
