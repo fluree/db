@@ -63,27 +63,6 @@
     (leaf? node)   (dissoc node :flakes)
     (branch? node) (dissoc node :children)))
 
-(defn lookup
-  [branch flake]
-  (when (and (branch? branch)
-             (resolved? branch))
-    (let [{:keys [children]} branch]
-      (-> children
-          (avl/nearest <= flake)
-          (or (first children))
-          val))))
-
-(defn lookup-leaf
-  [r branch flake]
-  (go-try
-   (when (and (branch? branch)
-              (resolved? branch))
-     (loop [child (lookup branch flake)]
-       (if (leaf? child)
-         child
-         (recur (<? (resolve r child))))))))
-
-
 (defn add-flakes
   [leaf flakes]
   (let [new-leaf (-> leaf
