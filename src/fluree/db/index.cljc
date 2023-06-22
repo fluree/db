@@ -1,7 +1,6 @@
 (ns fluree.db.index
   (:refer-clojure :exclude [resolve])
-  (:require [clojure.data.avl :as avl]
-            [fluree.db.flake :as flake]
+  (:require [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
                :cljs [cljs.core.async :refer [chan go <! >!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
@@ -196,20 +195,20 @@
        (flake/disj-all flakes)))
 
 (defn novelty-subrange
-  [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]
+  [{:keys [rhs leftmost?], first-flake :first, :as _node} through-t novelty]
   (log/trace "novelty-subrange: first-flake:" first-flake "\nrhs:" rhs "\nleftmost?" leftmost?)
   (let [subrange (cond
                    ;; standard case: both left and right boundaries
                    (and rhs (not leftmost?))
-                   (avl/subrange novelty > first-flake <= rhs)
+                   (flake/subrange novelty > first-flake <= rhs)
 
                    ;; right only boundary
                    (and rhs leftmost?)
-                   (avl/subrange novelty <= rhs)
+                   (flake/subrange novelty <= rhs)
 
                    ;; left only boundary
                    (and (nil? rhs) (not leftmost?))
-                   (avl/subrange novelty > first-flake)
+                   (flake/subrange novelty > first-flake)
 
                    ;; no boundary
                    (and (nil? rhs) leftmost?)
