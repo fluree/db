@@ -10,7 +10,7 @@
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
             #?@(:cljs [["fs" :as fs]
