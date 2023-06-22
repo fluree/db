@@ -89,10 +89,9 @@
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `network`, `ledger-id`, and index
   comparator `cmp`."
-  [network ledger-id cmp]
+  [ledger-alias cmp]
   {:comparator cmp
-   :network network
-   :ledger-id ledger-id
+   :ledger-id ledger-alias
    :id :empty
    :tempid (random-uuid)
    :leaf true
@@ -102,18 +101,11 @@
    :t 0
    :leftmost? true})
 
-(defn new-leaf
-  [network ledger-id cmp flakes]
-  (let [empty-set (flake/sorted-set-by cmp)]
-    (-> (empty-leaf network ledger-id cmp)
-        (assoc :flakes empty-set)
-        (add-flakes flakes))))
-
 (defn descendant?
   "Checks if the `node` passed in the second argument is a descendant of the
   `branch` passed in the first argument"
   [{:keys [rhs leftmost?], cmp :comparator, first-flake :first, :as branch}
-   {node-first :first, node-rhs :rhs, :as node}]
+   {node-first :first, node-rhs :rhs, :as _node}]
   (if-not (branch? branch)
     false
     (and (or leftmost?
@@ -139,12 +131,11 @@
 (defn empty-branch
   "Returns a blank branch node which contains a single empty leaf node for the
   provided `network`, `ledger-id`, and index comparator `cmp`."
-  [network ledger-id cmp]
-  (let [child-node (empty-leaf network ledger-id cmp)
+  [ledger-alias cmp]
+  (let [child-node (empty-leaf ledger-alias cmp)
         children   (child-map cmp child-node)]
     {:comparator cmp
-     :network network
-     :ledger-id ledger-id
+     :ledger-id ledger-alias
      :id :empty
      :tempid (random-uuid)
      :leaf false
@@ -154,21 +145,6 @@
      :size 0
      :t 0
      :leftmost? true}))
-
-(defn reset-children
-  [{:keys [comparator size] :as branch} new-child-nodes]
-  (let [new-kids  (apply child-map comparator new-child-nodes)
-        new-first (or (some-> new-kids first key)
-                      flake/maximum)
-        new-size  (->> new-child-nodes
-                       (map :size)
-                       (reduce + size))]
-    (assoc branch :first new-first, :size new-size, :children new-kids)))
-
-(defn new-branch
-  [network ledger-id cmp child-nodes]
-  (-> (empty-branch network ledger-id cmp)
-      (reset-children child-nodes)))
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
@@ -257,7 +233,7 @@
 
 (defrecord TRangeResolver [node-resolver novelty from-t to-t]
   Resolver
-  (resolve [_ {:keys [id tempid tt-id] :as node}]
+  (resolve [_ node]
     (if (branch? node)
       (resolve node-resolver node)
       (resolve-t-range node-resolver node novelty from-t to-t))))
