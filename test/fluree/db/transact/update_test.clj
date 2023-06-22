@@ -128,23 +128,23 @@
         db1 (fluree/db ledger)]
 
     (testing "hash functions"
-        (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
-          (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
-                                                 "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
-                                                {"id" "ex:hash-fns"
-                                                 "ex:message" "abc"}])
-                            (fluree/stage {"delete" []
-                                           "where" [["?s" "id" "ex:hash-fns"]
-                                                    ["?s" "ex:message" "?message"]
-                                                    {"bind" {"?sha256" "(sha256 ?message)"
-                                                             "?sha512" "(sha512 ?message)"}}]
-                                           "insert" [["?s" "ex:sha256" "?sha256"]
-                                                     ["?s" "ex:sha512" "?sha512"]]}))]
-            (is (= {"ex:sha512" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
-                    "ex:sha256" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
-                   @(fluree/query @updated {"where" [["?s" "id" "ex:hash-fns"]]
-                                            "selectOne" {"?s" ["ex:sha512"
-                                                               "ex:sha256"]}}))))))
+      (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
+        (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                               "ex:md5" 0 "ex:sha1" 0 "ex:sha256" 0 "ex:sha384" 0 "ex:sha512" 0}
+                                              {"id" "ex:hash-fns"
+                                               "ex:message" "abc"}])
+                          (fluree/stage {"delete" []
+                                         "where" [["?s" "id" "ex:hash-fns"]
+                                                  ["?s" "ex:message" "?message"]
+                                                  {"bind" {"?sha256" "(sha256 ?message)"
+                                                           "?sha512" "(sha512 ?message)"}}]
+                                         "insert" [["?s" "ex:sha256" "?sha256"]
+                                                   ["?s" "ex:sha512" "?sha512"]]}))]
+          (is (= {"ex:sha512" "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+                  "ex:sha256" "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}
+                 @(fluree/query @updated {"where" [["?s" "id" "ex:hash-fns"]]
+                                          "selectOne" {"?s" ["ex:sha512"
+                                                             "ex:sha256"]}}))))))
     (testing "datetime functions"
       (with-redefs [fluree.db.query.exec.eval/now (fn [] "2023-06-13T19:53:57.234345Z")]
         (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
@@ -325,37 +325,66 @@
                                                              "ex:uuid"
                                                              "ex:struuid"]}}))))))
 
-    ;; errors: undefined symbol, type error, mismatching parens
     (testing "functional forms"
-        (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
-                                               "ex:bound" 0
-                                               "ex:if" 0
-                                               "ex:coalesce" 0
-                                               "ex:not-exists" 0
-                                               "ex:exists" 0
-                                               "ex:logical-or" 0
-                                               "ex:logical-and" 0
-                                               "ex:rdfterm-equal" 0
-                                               "ex:sameTerm" 0
-                                               "ex:in" 0
-                                               "ex:not-in" 0}
-                                              {"id" "ex:functional-fns"
-                                               "ex:text" "Abcdefg"}])
-                          (fluree/stage {"delete" []
-                                         "where" [["?s" "id" "ex:functional-fns"]
-                                                  ["?s" "ex:text" "?text"]
-                                                  {"bind" {"?bound" "(bound ?text)"}}]
-                                         "insert" [["?s" "ex:bound" "?bound"]]}))]
-          (is (= {"ex:bound" true}
-                 @(fluree/query @updated {"where" [["?s" "id" "ex:functional-fns"]]
-                                          "selectOne" {"?s" ["ex:bound"
-                                                             "ex:if"
-                                                             "ex:coalesce"
-                                                             "ex:not-exists"
-                                                             "ex:exists"
-                                                             "ex:logical-or"
-                                                             "ex:logical-and"
-                                                             "ex:rdfterm-equal"
-                                                             "ex:sameTerm"
-                                                             "ex:in"
-                                                             "ex:not-in"]}})))))))
+      (let [updated (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                             "ex:bound" 0
+                                             "ex:if" 0
+                                             "ex:coalesce" 0
+                                             "ex:not-exists" 0
+                                             "ex:exists" 0
+                                             "ex:logical-or" 0
+                                             "ex:logical-and" 0
+                                             "ex:rdfterm-equal" 0
+                                             "ex:sameTerm" 0
+                                             "ex:in" 0
+                                             "ex:not-in" 0}
+                                            {"id" "ex:functional-fns"
+                                             "ex:text" "Abcdefg"}])
+                        (fluree/stage {"delete" []
+                                       "where" [["?s" "id" "ex:functional-fns"]
+                                                ["?s" "ex:text" "?text"]
+                                                {"bind" {"?bound" "(bound ?text)"}}]
+                                       "insert" [["?s" "ex:bound" "?bound"]]}))]
+        (is (= {"ex:bound" true}
+               @(fluree/query @updated {"where" [["?s" "id" "ex:functional-fns"]]
+                                        "selectOne" {"?s" ["ex:bound"
+                                                           "ex:if"
+                                                           "ex:coalesce"
+                                                           "ex:not-exists"
+                                                           "ex:exists"
+                                                           "ex:logical-or"
+                                                           "ex:logical-and"
+                                                           "ex:rdfterm-equal"
+                                                           "ex:sameTerm"
+                                                           "ex:in"
+                                                           "ex:not-in"]}})))))
+    (testing "error handling"
+      (let [db2 @(fluree/stage db1 [{"id" "ex:create-predicates"
+                                     "ex:text" 0
+                                     "ex:error" 0}
+                                    {"id" "ex:error"
+                                     "ex:text" "Abcdefg"}])
+            parse-err @(fluree/stage db2 {"delete" []
+                                          "where" [["?s" "id" "ex:error"]
+                                                   ["?s" "ex:text" "?text"]
+                                                   {"bind" {"?err" "(foo ?text)"}}]
+                                          "insert" [["?s" "ex:text" "?err"]]})
+
+            run-err   @(fluree/stage db2 {"delete" []
+                                          "where" [["?s" "id" "ex:error"]
+                                                   ["?s" "ex:text" "?text"]
+                                                   {"bind" {"?err" "(abs ?text)"}}]
+                                          "insert" [["?s" "ex:error" "?err"]]})]
+        (is (= "Query function references illegal symbol: foo"
+               (-> parse-err
+                   Throwable->map
+                   :cause))
+            "mdfn parse error")
+        (is (= "Query function references illegal symbol: foo"
+               (-> @(fluree/query db2 {"where" [["?s" "id" "ex:error"]
+                                                ["?s" "ex:text" "?text"]
+                                                {"bind" {"?err" "(foo ?text)"}}]
+                                       "select" "?err"})
+                   Throwable->map
+                   :cause))
+            "query parse error")))))
