@@ -101,7 +101,6 @@
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
              @(fluree/query db query)))))
->>>>>>> 7a327f66 (Add a test for transacting mixed data types)
 
   (testing "mixed data types (ref & string) are handled correctly"
     (let [conn   (test-utils/create-conn)
@@ -137,7 +136,7 @@
                    :where  [[?b :id :ex/wes]]}]
       (is (= [{:id                        :ex/wes
                :ex/aFewOfMyFavoriteThings [2011 "jabalí"]}]
-             @(fluree/query db query)))))
+             @(fluree/query db query))))))
 
 (deftest policy-ordering-test
   (testing "transaction order does not affect query results"

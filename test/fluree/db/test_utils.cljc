@@ -1,6 +1,5 @@
 (ns fluree.db.test-utils
-  (:require [clojure.string :as str]
-            [clojure.test :as clj-test]
+  (:require [clojure.set :as set]
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
@@ -220,72 +219,22 @@
   [s]
   (and (string? s) (re-matches commit-id-regex s)))
 
-(defn- coalesce-deep-match-values
-  [values]
-  (let [flattened (->> values (remove nil?) flatten)]
-    (if (= 1 (count flattened))
-      (first flattened)
-      (vec flattened))))
-
-(defn- coalesce-deep-match-results
-  [results]
-  (if (every? :result results)
-    {:result true}
-    {:result   false
-     :expected (coalesce-deep-match-values (map :expected results))
-     :actual   (coalesce-deep-match-values (map :actual results))
-     :details  (->> results (map :details) (remove nil?) (str/join "\n"))}))
-
-(defn pred-match?*
-  "Does a deep compare of expected and actual map values but any fns in expected
-  are run with the equivalent value from actual and the result is used to
-  determine whether there is a match. Returns a map with the following keys:
-
-  :result will be true if expected and actual match, false otherwise.
-  :expected will be the tested expected value or a description thereof (only on failure)
-  :actual will be the tested actual value or a description thereof (only on failure)"
+(defn pred-match?
+  "Does a deep compare of expected and actual map values but any predicate fns
+  in expected are run with the equivalent value from actual and the result is
+  used to determine whether there is a match. Returns true if all pred fns
+  return true and all literal values match or false otherwise."
   [expected actual]
-  (if (= expected actual)
-    {:result true}
-    (cond
-      (fn? expected)
-      (let [result (expected actual)]
-        (if result
-          {:result true}
-          {:result   false
-           :expected (str "(" expected " "
-                          (pr-str actual) ") => true")
-           :actual   (str "(" expected " "
-                          (pr-str actual) ") => false")}))
+  (or (= expected actual)
+      (cond
+        (fn? expected)
+        (expected actual)
 
-      (and (map? expected) (map? actual))
-      (let [expected-keyset (-> expected keys set)
-            actual-keyset   (-> actual keys set)]
-        (if (= expected-keyset actual-keyset)
-          (let [results (map (fn [[k v]]
-                               (pred-match?* (get expected k) v))
-                             actual)]
-            (coalesce-deep-match-results results))
-          {:result   false
-           :expected (str "map with keys: " expected-keyset)
-           :actual   (str "map with keys: " actual-keyset)}))
+        (and (map? expected) (map? actual))
+        (every? (fn [k] (pred-match? (get expected k) (get actual k)))
+                (set/union (keys actual) (keys expected)))
 
-      (and (coll? expected) (coll? actual))
-      (let [results (map pred-match?* expected actual)]
-        (coalesce-deep-match-results results))
+        (and (coll? expected) (coll? actual))
+        (every? (fn [[e a]] (pred-match? e a)) (zipmap expected actual))
 
-      :else
-      {:result   false
-       :expected expected
-       :actual   actual})))
-
-(declare pred-match?)
-
-(defmethod clj-test/assert-expr 'pred-match?
-  [msg form]
-  `(let [result#      (pred-match?* ~(nth form 1) ~(nth form 2))
-         result-type# (if (:result result#) :pass :fail)]
-     (clj-test/do-report {:type     result-type#
-                          :message  ~msg
-                          :expected (:expected result#)
-                          :actual   (:actual result#)})))
+        :else false)))
