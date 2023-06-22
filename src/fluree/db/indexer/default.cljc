@@ -1,7 +1,7 @@
 (ns fluree.db.indexer.default
   (:require [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.index :as index]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [clojure.core.async :as async]

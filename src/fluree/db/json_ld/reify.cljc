@@ -6,7 +6,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]

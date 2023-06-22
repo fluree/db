@@ -1,6 +1,6 @@
 (ns fluree.db.conn.memory
   (:require [clojure.core.async :as async :refer [go]]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
