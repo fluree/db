@@ -214,7 +214,7 @@
   (if (overflow-leaf? leaf)
     (let [target-size (/ *overflow-bytes* 2)]
       (log/debug "Rebalancing index leaf:"
-                 (select-keys leaf [:id :network :ledger-id]))
+                 (select-keys leaf [:id :ledger-alias]))
       (loop [[f & r] flakes
              cur-size  0
              cur-first f
@@ -346,7 +346,7 @@
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
   [db idx node error-ch updated-ids]
   (let [node         (dissoc node ::old-id)
-        display-node (select-keys node [:id :ledger-id])]
+        display-node (select-keys node [:id :ledger-alias])]
     (async/go
       (try*
         (if (index/leaf? node)
@@ -452,13 +452,12 @@
 
 (defn refresh
   [indexer
-   {:keys [ecount novelty t network ledger-id] :as db}
+   {:keys [ecount novelty t ledger-alias] :as db}
    {:keys [remove-preds changes-ch]}]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
-          init-stats    {:network      network
-                         :ledger-id    ledger-id
+          init-stats    {:ledger-alias ledger-alias
                          :t            t
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]

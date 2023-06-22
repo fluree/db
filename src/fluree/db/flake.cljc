@@ -1,6 +1,7 @@
 (ns fluree.db.flake
   (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take last])
   (:require [clojure.data.avl :as avl]
+            [me.tonsky.persistent-sorted-set :as pss]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util])
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))

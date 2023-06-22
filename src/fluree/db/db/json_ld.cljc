@@ -330,7 +330,7 @@
     (map->JsonLdDb {:ledger          ledger
                     :conn            conn
                     :method          method
-                    :alias           alias
+                    :ledger-alias    alias
                     :branch          (:name branch)
                     :commit          (:commit branch)
                     :t               0

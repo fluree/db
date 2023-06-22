@@ -43,7 +43,7 @@
           (catch* e
                   (log/error e
                              "Error resolving index node:"
-                             (select-keys node [:id :network :ledger-id]))
+                             (select-keys node [:id :ledger-aliasd]))
                   (>! error-ch e)))))
 
 (defn resolved?
@@ -87,19 +87,19 @@
     (assoc new-leaf :first new-first)))
 
 (defn empty-leaf
-  "Returns a blank leaf node map for the provided `network`, `ledger-id`, and index
+  "Returns a blank leaf node map for the provided `ledger-alias` and index
   comparator `cmp`."
   [ledger-alias cmp]
-  {:comparator cmp
-   :ledger-id ledger-alias
-   :id :empty
-   :tempid (random-uuid)
-   :leaf true
-   :first flake/maximum
-   :rhs nil
-   :size 0
-   :t 0
-   :leftmost? true})
+  {:comparator   cmp
+   :ledger-alias ledger-alias
+   :id           :empty
+   :tempid       (random-uuid)
+   :leaf         true
+   :first        flake/maximum
+   :rhs          nil
+   :size         0
+   :t            0
+   :leftmost?    true})
 
 (defn descendant?
   "Checks if the `node` passed in the second argument is a descendant of the
@@ -130,21 +130,21 @@
 
 (defn empty-branch
   "Returns a blank branch node which contains a single empty leaf node for the
-  provided `network`, `ledger-id`, and index comparator `cmp`."
+  provided `ledger-alias` and index comparator `cmp`."
   [ledger-alias cmp]
   (let [child-node (empty-leaf ledger-alias cmp)
         children   (child-map cmp child-node)]
-    {:comparator cmp
-     :ledger-id ledger-alias
-     :id :empty
-     :tempid (random-uuid)
-     :leaf false
-     :first flake/maximum
-     :rhs nil
-     :children children
-     :size 0
-     :t 0
-     :leftmost? true}))
+    {:comparator   cmp
+     :ledger-alias ledger-alias
+     :id           :empty
+     :tempid       (random-uuid)
+     :leaf         false
+     :first        flake/maximum
+     :rhs          nil
+     :children     children
+     :size         0
+     :t            0
+     :leftmost?    true}))
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
