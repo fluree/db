@@ -119,6 +119,20 @@
   (let [child-node (unresolve node)]
     [first child-node]))
 
+(defn child-key
+  [entry]
+  (get entry 0))
+
+(defn child
+  [entry]
+  (get entry 1))
+
+(defn compare-children
+  [cmp entry-x entry-y]
+  (let [x-key (child-key entry-x)
+        y-key (child-key entry-y)]
+    (cmp x-key y-key)))
+
 (defn child-map
   "Returns avl sorted map whose keys are the first flakes of the index node
   sequence `child-nodes`, and whose values are the corresponding nodes from

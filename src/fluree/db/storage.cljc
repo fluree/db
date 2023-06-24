@@ -4,7 +4,7 @@
             [clojure.string :as str]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.index :as index]
-            [clojure.core.async :refer [go <!] :as async]
+            [clojure.core.async :refer [go] :as async]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.json-ld.vocab :as vocab]
