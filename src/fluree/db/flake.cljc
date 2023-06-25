@@ -226,7 +226,12 @@
 
 (def maximum
   "The largest flake possible"
-  (->Flake util/max-long 0 util/max-long const/$xsd:decimal 0 true nil))
+  (->Flake util/max-long util/max-long util/max-long
+           util/max-integer util/min-integer true util/max-long))
+
+(def minimum
+  (->Flake util/min-long util/min-long util/min-long
+           util/min-integer 0 false util/min-long))
 
 (defn- assoc-flake
   "Assoc for Flakes"
