@@ -925,6 +925,34 @@
                :schema/name  "John"}]
              @(fluree/query db-ok user-query))))))
 
+(deftest property-paths
+  (let [conn   @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "propertypathstest" {:defaultContext [test-utils/default-str-context {"ex" "http://example.com/"}]})
+        db0    (fluree/db ledger)
+        ;; a valid Pal is anybody who has a pal with a name
+        db1    @(fluree/stage db0 [{"@type" "sh:NodeShape"
+                                    ;; "sh:targetNode" {"@id" "ex:good-pal"}
+                                    "sh:targetClass" {"@id" "ex:Pal"}
+                                    "sh:property" [{"sh:path" {"@list" [{"id" "ex:pal"} {"id" "schema:name"}]}
+                                                    "sh:minCount" 1}]}])
+        valid-pal @(fluree/stage db1 {"id" "ex:good-pal"
+                                      "type" "ex:Pal"
+                                      "schema:name" "J.D."
+                                      "ex:pal" {"schema:name" "Turk"}})
+        invalid-pal @(fluree/stage db1 {"id" "ex:bad-pal"
+                                        "type" "ex:Pal"
+                                        "schema:name" "Darth Vader"
+                                        "ex:pal" {"ex:evil" true}})]
+    (is (= [{"id" "ex:good-pal",
+             "rdf:type" ["ex:Pal"]
+             "schema:name" "J.D.",
+             "ex:pal" {"schema:name" "Turk"}}]
+           @(fluree/query valid-pal {"select" {"?s" ["*" {"ex:pal" ["schema:name"]}]}
+                                     "where" [["?s" "id" "ex:good-pal"]]})))
+    (is (util/exception? invalid-pal))
+    (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+           (ex-message invalid-pal)))))
+
 (deftest shacl-class-test
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "classtest" {:defaultContext test-utils/default-str-context})

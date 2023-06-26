@@ -6,7 +6,8 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.log :as log]
             [clojure.string :as str]
-            [clojure.set :as set])
+            [clojure.set :as set]
+            [clojure.core.async :as async])
   #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
@@ -179,25 +180,43 @@
                     (coalesce-validation-results flake-results logical-constraint)))]
     (coalesce-validation-results results)))
 
+(defn sequence-flakes
+  [db sequence-path p-flakes]
+  (go-try
+    (loop [[path-pid & r] sequence-path
+           p-flakes p-flakes]
+      (if-let [sequence-flake (first (filter #(= path-pid (flake/p %)) p-flakes))] ;; repeat for each sequence flake?
+        (if-let [next-path-pid (first r)]
+          (recur r (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-path-pid])))
+          p-flakes)
+        ;; no p-flakes found for path
+        []))))
+
 (defn validate-property
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
-  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive min-length max-length pattern] :as p-shape} p-flakes]
+  [db
+   {:keys [min-count max-count min-inclusive min-exclusive max-inclusive
+           max-exclusive min-length max-length pattern path] :as p-shape}
+   p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
   ;;       Should embed results and error messages and short-circuit as appropriate
-  (let [validation (if (or min-count max-count)
-                     (validate-count-properties p-shape p-flakes)
-                     [true])
-        validation (if (and (first validation)
-                            (or min-inclusive min-exclusive max-inclusive max-exclusive))
-                     (validate-value-range-properties p-shape p-flakes)
-                     validation)
-        validation (if (and (first validation)
-                            (or min-length max-length pattern))
-                     (validate-string-properties p-shape p-flakes)
-                     validation)]
-    validation))
+  (go-try
+    (let [p-flakes*  (if (sequential? path)
+                       (<? (sequence-flakes db path p-flakes))
+                       p-flakes)
+          validation (if (or min-count max-count)
+                       (validate-count-properties p-shape p-flakes*)
+                       [true])
+          validation (if (and (first validation)
+                              (or min-inclusive min-exclusive max-inclusive max-exclusive))
+                       (validate-value-range-properties p-shape p-flakes*)
+                       validation)
+          validation (if (and (first validation)
+                              (or min-length max-length pattern))
+                       (validate-string-properties p-shape p-flakes*)
+                       validation)]
+      validation)))
 
 (defn validate-pair-property
   "Validates a PropertyShape that compares values for a pair of predicates.
@@ -258,7 +277,7 @@
       (coalesce-validation-results results logical-constraint))))
 
 (defn validate-shape
-  [{:keys [property closed-props] :as shape}
+  [db {:keys [property closed-props] :as shape}
    flake-p-partitions all-flakes]
   (log/debug "validate-shape shape:" shape)
   (loop [[p-flakes & r] flake-p-partitions
@@ -267,10 +286,10 @@
       (let [pid      (flake/p (first p-flakes))
             p-shapes (get property pid)
             results  (map (fn [p-shape]
-                           (if-let [rhs-property (:rhs-property p-shape)]
-                             (let [rhs-flakes (filter #(= rhs-property (flake/p %)) all-flakes)]
-                               (validate-pair-property p-shape p-flakes rhs-flakes))
-                             (validate-property p-shape p-flakes)))
+                            (if-let [rhs-property (:rhs-property p-shape)]
+                              (let [rhs-flakes (filter #(= rhs-property (flake/p %)) all-flakes)]
+                                (validate-pair-property p-shape p-flakes rhs-flakes))
+                              (async/<!! (validate-property db p-shape p-flakes))))
                           p-shapes)
             _ (log/debug "validate-shape results:" results)
             [valid? err-msg] (coalesce-validation-results results)]
@@ -289,11 +308,11 @@
 
 (defn validate-target
   "Some new flakes don't need extra validation."
-  [{:keys [shapes] :as _shape-map} all-flakes]
+  [{:keys [shapes] :as _shape-map} db s-flakes]
   (go-try
-   (let [flake-p-partitions (partition-by flake/p all-flakes)]
-     (doseq [shape shapes]
-       (validate-shape shape flake-p-partitions all-flakes)))))
+    (let [flake-p-partitions (partition-by flake/p s-flakes)]
+      (doseq [shape shapes]
+        (validate-shape db shape flake-p-partitions s-flakes)))))
 
 
 (defn build-property-shape
@@ -304,7 +323,11 @@
       (let [o (flake/o property-flake)]
         (condp = (flake/p property-flake)
           const/$sh:path
-          (assoc acc :path o)
+          ;; if we come across more than one path predicate, turn it into a sequence
+          (update acc :path (fn [path]
+                              (if path
+                                (conj (util/sequential path) o)
+                                o)))
 
           ;; The datatype of all value nodes (e.g., xsd:integer).
           ;; A shape has at most one value for sh:datatype.
@@ -550,19 +573,21 @@
                                              property-shape* (if (:pattern property-shape)
                                                                (assoc property-shape :pattern (build-pattern property-shape))
                                                                property-shape)
-                                             p-shapes*      (update p-shapes path util/conjv property-shape*)
+                                             p-shape-key    (first (util/sequential path))
+                                             p-shapes*      (update p-shapes p-shape-key util/conjv property-shape*)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
+                                             required-prop  (peek (util/sequential path))
                                              shape*         (cond-> shape
-                                                                    (:required? property-shape)
-                                                                    (update :required util/conjs (:path property-shape))
+                                                              (:required? property-shape)
+                                                              (update :required util/conjs required-prop)
 
-                                                                    (:datatype property-shape)
-                                                                    (update-in [:datatype (:path property-shape)]
-                                                                               register-datatype property-shape)
+                                                              (:datatype property-shape)
+                                                              (update-in [:datatype (:path property-shape)]
+                                                                         register-datatype property-shape)
 
-                                                                    (:node-kind property-shape)
-                                                                    (update-in [:datatype (:path property-shape)]
-                                                                               register-nodetype property-shape))]
+                                                              (:node-kind property-shape)
+                                                              (update-in [:datatype (:path property-shape)]
+                                                                         register-nodetype property-shape))]
 
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p
