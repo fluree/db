@@ -223,7 +223,7 @@
 
 (defn resolve-index-node
   ([conn node]
-   (resolve-index-node node nil))
+   (resolve-index-node conn node nil))
   ([conn {:keys [comparator leaf] :as node} error-fn]
    (assert comparator "Cannot resolve index node; configuration does not have a comparator.")
    (let [return-ch (async/chan)]
