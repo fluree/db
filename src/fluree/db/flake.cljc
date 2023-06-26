@@ -4,6 +4,10 @@
             [me.tonsky.persistent-sorted-set :as pss]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util])
+  (:import (clojure.lang Associative Counted ILookup IPersistentCollection
+                         IPersistentMap MapEntry Reversible Seqable Sorted)
+           (me.tonsky.persistent_sorted_set PersistentSortedSet)
+           (java.lang IllegalArgumentException))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -453,81 +457,130 @@
 (defn slice
   "From and to are Flakes"
   [ss from to]
-  (cond
-    (and from to) (avl/subrange ss >= from <= to)
-    (nil? from) (avl/subrange ss <= to)
-    (nil? to) (avl/subrange ss >= from)
-    :else (throw (ex-info "Unexpected error performing slice, both from and to conditions are nil. Please report."
-                          {:status 500
-                           :error  :db/unexpected-error}))))
+  (pss/slice ss from to))
 
-(defn match-spot
-  "Returns all matching flakes to a specific subject, and optionaly also a predicate if provided
-  Must be provided with subject/predicate integer ids, no lookups are performed."
-  [ss sid pid]
-  (if pid
-    (avl/subrange ss >= (->Flake sid pid nil -1 nil nil nil)
-                  <= (->Flake sid (inc pid) nil util/max-long nil nil nil))
-    (avl/subrange ss > (->Flake (inc sid) MAX-COLL-SUBJECTS nil nil nil nil nil)
-                  < (->Flake (dec sid) -1 nil nil nil nil nil))))
-
-
-(defn match-post
-  "Returns all matching flakes to a predicate + object match."
-  [ss pid o dt]
-  (avl/subrange ss
-                >= (->Flake util/max-long pid o dt nil nil nil)
-                <= (->Flake 0 pid o dt nil nil nil)))
 
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
   [ss t]
-  (avl/subrange ss
-                >= (->Flake util/max-long nil nil nil t nil nil)
-                <= (->Flake util/min-long nil nil nil t nil nil)))
-
-(defn lookup
-  [ss start-flake end-flake]
-  (avl/subrange ss >= start-flake <= end-flake))
-
-(defn subrange
-  ([ss test flake]
-   (avl/subrange ss test flake))
-  ([ss start-test start-flake end-test end-flake]
-   (avl/subrange ss start-test start-flake end-test end-flake)))
-
-
-(defn split-at
-  [n ss]
-  (avl/split-at n ss))
+  (pss/slice ss
+             (->Flake util/max-long nil nil nil t nil nil)
+             (->Flake util/min-long nil nil nil t nil nil)))
 
 (defn lower-than-all?
   [f ss]
-  (let [[lower e _] (avl/split-key f ss)]
-    (and (nil? e)
-         (empty? lower))))
+  (-> ss
+      (pss/rslice f nil)
+      empty?))
 
 (defn higher-than-all?
   [f ss]
-  (let [[_ e upper] (avl/split-key f ss)]
-    (and (nil? e)
-         (empty? upper))))
-
-(defn split-by-flake
-  "Splits a sorted set at a given flake. If there is an exact match for flake,
-  puts it in the left-side. Primarily for use with last-flake."
-  [f ss]
-  (let [[l e r] (avl/split-key f ss)]
-    [(if e (conj l e) l) r]))
-
+  (-> ss
+      (pss/slice f nil)
+      empty?))
 
 (defn sorted-set-by
-  [comparator & flakes]
-  (apply avl/sorted-set-by comparator flakes))
+  ([comparator]
+   (pss/sorted-set-by comparator))
+  ([comparator & flakes]
+   (pss/from-sequential comparator flakes)))
+
+(defn ->entry-comparator
+  [cmp]
+  (fn [entry-x entry-y]
+    (cmp (key entry-x) (key entry-y))))
+
+(deftype SortedMap [^PersistentSortedSet contents]
+  Associative
+  (assoc [_ k v]
+    (let [entry (MapEntry. k v)]
+      (SortedMap. (conj contents entry))))
+  (containsKey [_ k]
+    (let [entry (MapEntry. k nil)]
+      (contains? contents entry)))
+  (entryAt [_ k]
+    (let [entry (MapEntry. k nil)]
+      (when-let [slice (pss/slice contents entry entry)]
+        (first slice))))
+
+  Counted
+  (count [_]
+    (count contents))
+
+  ILookup
+  (valAt [this k]
+    (.valAt this k nil))
+
+  (valAt [_ k not-found]
+    (let [entry (MapEntry. k nil)]
+      (if-let [slice (pss/slice contents entry entry)]
+        (first slice)
+        not-found)))
+
+  IPersistentCollection
+  (empty [_]
+    (SortedMap. (empty contents)))
+
+  IPersistentMap
+  (without [_ k]
+    (let [entry (MapEntry. k nil)]
+      (SortedMap. (disj entry))))
+
+
+  Reversible
+  (rseq [_]
+    (rseq contents))
+
+  Seqable
+  (seq [_]
+    (seq contents))
+
+  Sorted
+  (seq [_ ascending?]
+    (if ascending?
+      (seq contents)
+      (rseq contents)))
+
+  (seqFrom [_ k ascending?]
+    (if ascending?
+      (pss/slice contents k nil)
+      (pss/rslice contents k nil)))
+
+  (entryKey [_ entry]
+    (key entry))
+
+  (comparator [_]
+    (comparator contents))
+
+  java.lang.Iterable
+  (iterator [_]
+    (.iterator contents)))
 
 (defn sorted-map-by
-  [comparator & entries]
-  (apply avl/sorted-map-by comparator entries))
+  [comparator & key-vals]
+  (let [cmp      (->entry-comparator comparator)
+        entries  (->> key-vals
+                      (partition-all 2)
+                      (map (fn [[k v]]
+                             (if (some? v)
+                               (MapEntry. k v)
+                               (throw (IllegalArgumentException.
+                                        (str "No value specified for key: " k)))))))
+        contents (pss/from-sequential cmp entries)]
+    (SortedMap. contents)))
+
+(defn map-slice
+  [^SortedMap sm from to]
+  (pss/slice (.contents sm) from to))
+
+(defn map-rslice
+  [^SortedMap sm from to]
+  (pss/rslice (.contents sm) from to))
+
+(defn entry-seek
+  [slc to]
+  (let [entry (MapEntry. to nil)]
+    (pss/seek slc entry)))
 
 (defn transient-reduce
   [reducer ss coll]
