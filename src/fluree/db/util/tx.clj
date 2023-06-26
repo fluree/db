@@ -68,7 +68,7 @@
   been computed when performing the transaction."
   ([tx-flakes]
    ;; sort in block sort order as defined by fluree.db.flake/cmp-flakes-block
-   (-> (apply flake/sorted-set-by flake/cmp-flakes-block tx-flakes)
+   (-> (flake/sorted-set-by flake/cmp-flakes-block tx-flakes)
        (gen-tx-hash true)))
   ([tx-flakes sorted?]
    (if-not sorted?

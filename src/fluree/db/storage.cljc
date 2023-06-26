@@ -207,7 +207,7 @@
                                          children)
             child-entries   (mapcat (juxt :first identity)
                                     child-attrs)]
-        (apply flake/sorted-map-by comparator child-entries))
+        (flake/sorted-map-by comparator child-entries))
       (throw (ex-info (str "Unable to retrieve index branch with id "
                            id " from storage.")
                       {:status 500, :error :db/storage-error})))))
@@ -216,7 +216,7 @@
   [conn {:keys [id comparator]}]
   (go-try
     (if-let [{:keys [flakes] :as leaf} (<? (read-leaf conn id))]
-      (apply flake/sorted-set-by comparator flakes)
+      (flake/sorted-set-by comparator flakes)
       (throw (ex-info (str "Unable to retrieve leaf node with id: "
                            id " from storage")
                       {:status 500, :error :db/storage-error})))))

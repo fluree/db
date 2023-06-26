@@ -140,7 +140,7 @@
   [cmp & child-nodes]
   (->> child-nodes
        (mapcat child-entry)
-       (apply flake/sorted-map-by cmp)))
+       (flake/sorted-map-by cmp)))
 
 (defn empty-branch
   "Returns a blank branch node which contains a single empty leaf node for the

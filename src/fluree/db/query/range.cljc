@@ -145,7 +145,7 @@
    {:keys [from-t to-t start-flake end-flake] :as opts}]
   (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
         cmp       (:comparator root)
-        range-set (flake/sorted-set-by cmp start-flake end-flake)
+        range-set (flake/sorted-set-by cmp [start-flake end-flake])
         in-range? (fn [node]
                     (intersects-range? node range-set))
         query-xf  (extract-query-flakes opts)]
@@ -283,7 +283,7 @@
 
          ;; resolve-flake-slices
          resolver  (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:lru-cache-atom conn))
-         range-set (flake/sorted-set-by idx-cmp start-flake end-flake)
+         range-set (flake/sorted-set-by idx-cmp [start-flake end-flake])
          in-range? (fn [node] (intersects-range? node range-set))
          query-xf  (extract-query-flakes {:idx         idx
                                           :start-test  start-test

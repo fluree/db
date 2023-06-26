@@ -43,7 +43,7 @@
                                          (dedupe)))]
     (let [idx-root  (get db idx*)
           cmp       (:comparator idx-root)
-          range-set (flake/sorted-set-by cmp fflake lflake)
+          range-set (flake/sorted-set-by cmp)
           in-range? (fn [node]
                       (query-range/intersects-range? node range-set))
           query-xf  (where-subj-xf {:start-test  >=

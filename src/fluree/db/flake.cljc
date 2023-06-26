@@ -482,7 +482,7 @@
 (defn sorted-set-by
   ([comparator]
    (pss/sorted-set-by comparator))
-  ([comparator & flakes]
+  ([comparator flakes]
    (pss/from-sequential comparator flakes)))
 
 (defn ->entry-comparator
@@ -557,7 +557,7 @@
     (.iterator contents)))
 
 (defn sorted-map-by
-  [comparator & key-vals]
+  [comparator key-vals]
   (let [cmp      (->entry-comparator comparator)
         entries  (->> key-vals
                       (partition-all 2)
