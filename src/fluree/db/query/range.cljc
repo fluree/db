@@ -128,9 +128,7 @@
   [{:keys [start-flake start-test end-flake end-test flake-xf] :as opts}]
   (let [query-xf (comp (map :flakes)
                        (map (fn [flakes]
-                              (flake/subrange flakes
-                                              start-test start-flake
-                                              end-test end-flake)))
+                              (flake/slice flakes start-flake end-flake)))
                        (map (fn [flakes]
                               (into [] (query-filter opts) flakes))))]
     (if flake-xf

@@ -15,11 +15,8 @@
   [{:keys [start-test start-flake end-test end-flake xf]}]
   (apply comp (cond-> [(map :flakes)
                        (map (fn [flakes]
-                              (flake/subrange flakes
-                                              start-test start-flake
-                                              end-test end-flake)))]
-                      xf
-                      (conj xf))))
+                              (flake/slice flakes start-flake end-flake)))]
+                xf (conj xf))))
 
 
 (defn result-af

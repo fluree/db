@@ -220,7 +220,7 @@
              cur-first f
              leaves    []]
         (if (empty? r)
-          (let [subrange  (flake/subrange flakes >= cur-first)
+          (let [subrange  (flake/slice flakes cur-first nil)
                 last-leaf (-> leaf
                               (assoc :flakes subrange
                                      :first cur-first
@@ -229,7 +229,7 @@
             (conj leaves last-leaf))
           (let [new-size (-> f flake/size-flake (+ cur-size) long)]
             (if (> new-size target-size)
-              (let [subrange (flake/subrange flakes >= cur-first < f)
+              (let [subrange (flake/slice flakes cur-first f)
                     new-leaf (-> leaf
                                  (assoc :flakes subrange
                                         :first cur-first

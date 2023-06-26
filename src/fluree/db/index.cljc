@@ -190,15 +190,15 @@
   (let [subrange (cond
                    ;; standard case: both left and right boundaries
                    (and rhs (not leftmost?))
-                   (flake/subrange novelty > first-flake <= rhs)
+                   (flake/slice novelty first-flake rhs)
 
                    ;; right only boundary
                    (and rhs leftmost?)
-                   (flake/subrange novelty <= rhs)
+                   (flake/slice novelty flake/minimum rhs)
 
                    ;; left only boundary
                    (and (nil? rhs) (not leftmost?))
-                   (flake/subrange novelty > first-flake)
+                   (flake/slice novelty first-flake nil)
 
                    ;; no boundary
                    (and (nil? rhs) leftmost?)

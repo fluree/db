@@ -58,9 +58,9 @@
 
 (defn get-vocab-flakes
   [flakes]
-  (flake/subrange flakes
-                  >= (flake/parts->Flake [(flake/max-subject-id const/$_collection) -1])
-                  <= (flake/parts->Flake [0 -1])))
+  (flake/slice flakes
+               (flake/parts->Flake [(flake/max-subject-id const/$_collection) -1])
+               (flake/parts->Flake [0 -1])))
 
 (defn- get-type-retractions
   [{:keys [db iri-cache sid t]} type]
