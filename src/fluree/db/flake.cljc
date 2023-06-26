@@ -571,11 +571,15 @@
 
 (defn map-slice
   [^SortedMap sm from to]
-  (pss/slice (.contents sm) from to))
+  (let [from-entry (MapEntry. from nil)
+        to-entry   (MapEntry. to nil)]
+    (pss/slice (.contents sm) from-entry to-entry)))
 
 (defn map-rslice
   [^SortedMap sm from to]
-  (pss/rslice (.contents sm) from to))
+  (let [from-entry (MapEntry. from nil)
+        to-entry   (MapEntry. to nil)]
+    (pss/rslice (.contents sm) from-entry to-entry)))
 
 (defn entry-seek
   [slc to]
