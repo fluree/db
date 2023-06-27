@@ -180,19 +180,7 @@
                     (coalesce-validation-results flake-results logical-constraint)))]
     (coalesce-validation-results results)))
 
-(defn sequence-flakes
-  [db sequence-path p-flakes]
-  (go-try
-    (loop [[path-pid & r] sequence-path
-           p-flakes p-flakes]
-      (if-let [sequence-flake (first (filter #(= path-pid (flake/p %)) p-flakes))] ;; repeat for each sequence flake?
-        (if-let [next-path-pid (first r)]
-          (recur r (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-path-pid])))
-          p-flakes)
-        ;; no p-flakes found for path
-        []))))
-
-(defn validate-property
+(defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [db
@@ -201,24 +189,20 @@
    p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
   ;;       Should embed results and error messages and short-circuit as appropriate
-  (go-try
-    (let [p-flakes*  (if (sequential? path)
-                       (<? (sequence-flakes db path p-flakes))
-                       p-flakes)
-          validation (if (or min-count max-count)
-                       (validate-count-properties p-shape p-flakes*)
-                       [true])
-          validation (if (and (first validation)
-                              (or min-inclusive min-exclusive max-inclusive max-exclusive))
-                       (validate-value-range-properties p-shape p-flakes*)
-                       validation)
-          validation (if (and (first validation)
-                              (or min-length max-length pattern))
-                       (validate-string-properties p-shape p-flakes*)
-                       validation)]
-      validation)))
+  (let [validation (if (or min-count max-count)
+                     (validate-count-properties p-shape p-flakes)
+                     [true])
+        validation (if (and (first validation)
+                            (or min-inclusive min-exclusive max-inclusive max-exclusive))
+                     (validate-value-range-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation)
+                            (or min-length max-length pattern))
+                     (validate-string-properties p-shape p-flakes)
+                     validation)]
+    validation))
 
-(defn validate-pair-property
+(defn validate-pair-constraints
   "Validates a PropertyShape that compares values for a pair of predicates.
   Returns a tuple of [valid? error-msg]."
   [{:keys [pair-constraint logical-constraint] :as _p-shape} lhs-flakes rhs-flakes]
@@ -276,35 +260,58 @@
                                         r-flake-o)]))]
       (coalesce-validation-results results logical-constraint))))
 
+(defn sequence-flakes
+  [db sequence-path p-flakes]
+  (go-try
+    (loop [[path-pid & r] sequence-path
+           p-flakes p-flakes]
+      (if-let [sequence-flake (first (filter #(= path-pid (flake/p %)) p-flakes))] ;; repeat for each sequence flake?
+        (if-let [next-path-pid (first r)]
+          (recur r (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-path-pid])))
+          p-flakes)
+        ;; no p-flakes found for path
+        []))))
+
+(defn validate-properties
+  [db p-shapes p-flakes s-flakes]
+  (go-try
+    (loop [[{:keys [path] :as p-shape} & r] p-shapes
+           results       []]
+      (if p-shape
+        (let [p-flakes*    (if (sequential? path)
+                             (<? (sequence-flakes db path p-flakes))
+                             p-flakes)
+              rhs-property (:rhs-property p-shape)
+              res (if rhs-property
+                    (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
+                      (validate-pair-constraints p-shape p-flakes* rhs-flakes))
+                    (validate-property-constraints db p-shape p-flakes*))]
+          (recur r (conj results res)))
+        (coalesce-validation-results results)))))
+
 (defn validate-shape
   [db {:keys [property closed-props] :as shape}
-   flake-p-partitions all-flakes]
+   flake-p-partitions s-flakes]
   (log/debug "validate-shape shape:" shape)
-  (loop [[p-flakes & r] flake-p-partitions
-         required (:required shape)]
-    (if p-flakes
-      (let [pid      (flake/p (first p-flakes))
-            p-shapes (get property pid)
-            results  (map (fn [p-shape]
-                            (if-let [rhs-property (:rhs-property p-shape)]
-                              (let [rhs-flakes (filter #(= rhs-property (flake/p %)) all-flakes)]
-                                (validate-pair-property p-shape p-flakes rhs-flakes))
-                              (async/<!! (validate-property db p-shape p-flakes))))
-                          p-shapes)
-            _ (log/debug "validate-shape results:" results)
-            [valid? err-msg] (coalesce-validation-results results)]
-        (when (not valid?)
-          (throw-property-shape-exception! err-msg))
-        (when closed-props
-          (when-not (closed-props pid)
-            (throw (ex-info (str "SHACL shape is closed, property: " pid
-                                 " is not an allowed.")
-                            {:status 400 :error :db/shacl-validation}))))
-        (recur r (disj required pid)))
-      (if (seq required)
-        (throw (ex-info (str "Required properties not present: " required)
-                        {:status 400 :error :db/shacl-validation}))
-        true))))
+  (go-try
+    (loop [[p-flakes & r] flake-p-partitions
+           required       (:required shape)]
+      (if p-flakes
+        (let [pid      (flake/p (first p-flakes))
+              p-shapes (get property pid)
+              [valid? err-msg] (<? (validate-properties db p-shapes p-flakes s-flakes))]
+          (when (not valid?)
+            (throw-property-shape-exception! err-msg))
+          (when closed-props
+            (when-not (closed-props pid)
+              (throw (ex-info (str "SHACL shape is closed, property: " pid
+                                   " is not an allowed.")
+                              {:status 400 :error :db/shacl-validation}))))
+          (recur r (disj required pid)))
+        (if (seq required)
+          (throw (ex-info (str "Required properties not present: " required)
+                          {:status 400 :error :db/shacl-validation}))
+          true)))))
 
 (defn validate-target
   "Some new flakes don't need extra validation."
@@ -312,7 +319,7 @@
   (go-try
     (let [flake-p-partitions (partition-by flake/p s-flakes)]
       (doseq [shape shapes]
-        (validate-shape db shape flake-p-partitions s-flakes)))))
+        (<? (validate-shape db shape flake-p-partitions s-flakes))))))
 
 
 (defn build-property-shape
