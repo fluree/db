@@ -95,7 +95,7 @@
    :id           :empty
    :tempid       (random-uuid)
    :leaf         true
-   :first        flake/maximum
+   :first        nil
    :rhs          nil
    :size         0
    :t            0
@@ -153,7 +153,7 @@
      :id           :empty
      :tempid       (random-uuid)
      :leaf         false
-     :first        flake/maximum
+     :first        nil
      :rhs          nil
      :children     children
      :size         0
@@ -194,7 +194,7 @@
 
                    ;; right only boundary
                    (and rhs leftmost?)
-                   (flake/slice novelty flake/minimum rhs)
+                   (flake/slice novelty nil rhs)
 
                    ;; left only boundary
                    (and (nil? rhs) (not leftmost?))
@@ -293,23 +293,6 @@
                   (assoc :from-t from-t
                          :to-t   to-t
                          :flakes  flakes)))))))))
-
-(defn at-t
-  "Find the value of `leaf` at transaction `t` by adding new flakes from
-  `idx-novelty` to `leaf` if `t` is newer than `leaf`, or removing flakes later
-  than `t` from `leaf` if `t` is older than `leaf`."
-  [{:keys [rhs leftmost? flakes], leaf-t :t, :as leaf} t idx-novelty]
-  (if (= leaf-t t)
-    leaf
-    (cond-> leaf
-      (> leaf-t t)
-      (add-flakes (novelty-subrange leaf t idx-novelty))
-
-      (< leaf-t t)
-      (rem-flakes (filter-after t flakes))
-
-      true
-      (assoc :t t))))
 
 (defn- mark-expanded
   [node]
