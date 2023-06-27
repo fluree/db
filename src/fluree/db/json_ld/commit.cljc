@@ -10,8 +10,8 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.util.async :refer [<? go-try]]
-            #?(:clj  [clojure.core.async  :as async]
-               :cljs [cljs.core.async  :as async])
+            #?(:clj  [clojure.core.async :as async]
+               :cljs [cljs.core.async :as async])
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
@@ -35,46 +35,57 @@
         (vswap! iri-map assoc sid iri)
         iri))))
 
-(defn get-ref-iris
-  "Returns a list of object IRIs from a set of flakes.
-  Only to be used for ref? predicates"
-  [db iri-map compact-fn flakes]
+(defn- subject-block-pred
+  [db iri-map compact-fn list? p-flakes]
   (go-try
-    (loop [[flake & r] flakes
-           acc []]
-      (if flake
-        (recur r (conj acc (<? (get-s-iri (flake/o flake) db iri-map compact-fn))))
-        acc))))
+    (loop [[p-flake & r'] p-flakes
+           all-refs? nil
+           acc'      nil]
+      (let [pdt       (flake/dt p-flake)
+            ref?      (= const/$xsd:anyURI pdt)
+            [obj all-refs?] (if ref?
+                              [{"@id" (<? (get-s-iri (flake/o p-flake)
+                                                     db iri-map
+                                                     compact-fn))}
+                               (if (nil? all-refs?) true all-refs?)]
+                              [{"@value" (flake/o p-flake)} false])
+            obj*      (if list?
+                        (assoc obj :i (-> p-flake flake/m :i))
+                        obj)
+            next-acc' (conj acc' obj*)]
+        (if (seq r')
+          (recur r' all-refs? next-acc')
+          [next-acc' all-refs?])))))
+
+(defn- set-refs-type-in-ctx
+  [^clojure.lang.Volatile ctx p-iri refs]
+  (vswap! ctx assoc-in [p-iri "@type"] "@id")
+  (map #(get % "@id") refs))
+
+(defn- handle-list-values
+  [objs]
+  {"@list" (->> objs (sort-by :i) (map #(dissoc % :i)))})
 
 (defn- subject-block
   [s-flakes db iri-map ^clojure.lang.Volatile ctx compact-fn]
   (go-try
     (loop [[p-flakes & r] (partition-by flake/p s-flakes)
            acc nil]
-      (if p-flakes
-        (let [fflake    (first p-flakes)
-              p-iri     (<? (get-s-iri (flake/p fflake) db iri-map compact-fn))
-              ref?      (= const/$xsd:anyURI (flake/dt fflake))
-              list?     (:i (flake/m fflake))
-              p-flakes* (if list?
-                          (sort-by #(:i (flake/m %)) p-flakes)
-                          p-flakes)
-              objs      (if ref?
-                          (do
-                            (vswap! ctx assoc-in [p-iri "@type"] "@id")
-                            (<? (get-ref-iris db iri-map compact-fn p-flakes*)))
-                          (mapv flake/o p-flakes*))
-              objs*     (cond
-                          list?
-                          {"@list" objs}
-
-                          (= 1 (count objs))
-                          (first objs)
-
-                          :else
-                          objs)]
-          (recur r (assoc acc p-iri objs*)))
-        acc))))
+      (let [fflake          (first p-flakes)
+            list?           (-> fflake flake/m :i)
+            p-iri           (-> fflake flake/p (get-s-iri db iri-map compact-fn) <?)
+            [objs all-refs?] (<? (subject-block-pred db iri-map compact-fn
+                                                     list? p-flakes))
+            handle-all-refs (partial set-refs-type-in-ctx ctx p-iri)
+            objs*           (cond-> objs
+                                    ;; next line is for compatibility with json-ld/parse-type's expectations; should maybe revisit
+                                    (and all-refs? (not list?)) handle-all-refs
+                                    list? handle-list-values
+                                    (= 1 (count objs)) first)
+            next-acc        (assoc acc p-iri objs*)]
+        (if (seq r)
+          (recur r next-acc)
+          next-acc)))))
 
 (defn generate-commit
   "Generates assertion and retraction flakes for a given set of flakes
@@ -87,6 +98,7 @@
   :flakes - all considered flakes, for any downstream processes that need it"
   [flakes db {:keys [compact-fn id-key type-key] :as _opts}]
   (go-try
+    (log/trace "generate-commit flakes:" flakes)
     (let [id->iri (volatile! (jld-ledger/predefined-sids-compact compact-fn))
           ctx     (volatile! {})]
       (loop [[s-flakes & r] (partition-by flake/s flakes)
@@ -113,10 +125,12 @@
                   (let [{assert-flakes  true,
                          retract-flakes false} (group-by flake/op non-iri-flakes)
                         s-assert  (when assert-flakes
-                                    (-> (<? (subject-block assert-flakes db id->iri ctx compact-fn))
+                                    (-> (<? (subject-block assert-flakes db
+                                                           id->iri ctx compact-fn))
                                         (assoc id-key s-iri)))
                         s-retract (when retract-flakes
-                                    (-> (<? (subject-block retract-flakes db id->iri ctx compact-fn))
+                                    (-> (<? (subject-block retract-flakes db
+                                                           id->iri ctx compact-fn))
                                         (assoc id-key s-iri)))]
                     [(cond-> assert
                              s-assert (conj s-assert))
@@ -143,16 +157,16 @@
     (mapv stringify-context context)
     (if (map? context)
       (reduce-kv
-        (fn [acc k v]
-          (let [k* (if (keyword? k)
-                     (name k)
-                     k)
-                v* (if (and (map? v)
-                            (not (contains? v :id)))
-                     (stringify-context v)
-                     v)]
-            (assoc acc k* v*)))
-        {} context)
+       (fn [acc k v]
+         (let [k* (if (keyword? k)
+                    (name k)
+                    k)
+               v* (if (and (map? v)
+                           (not (contains? v :id)))
+                    (stringify-context v)
+                    v)]
+           (assoc acc k* v*)))
+       {} context)
       context)))
 
 (defn- enrich-commit-opts
@@ -268,10 +282,10 @@
   (go-try
     (let [{:keys [hash address] :as context-res} (<? (conn-proto/-ctx-write
                                                       conn ledger default-context))
-          commit*     (assoc commit :defaultContext
-                                    {:id      (str "fluree:context:" hash)
-                                     :type    const/iri-Context
-                                     :address address})]
+          commit* (assoc commit :defaultContext
+                                {:id      (str "fluree:context:" hash)
+                                 :type    const/iri-Context
+                                 :address address})]
       [commit* context-res])))
 
 (defn do-commit+push
@@ -297,10 +311,10 @@
           new-commit*** (commit-data/update-commit-address new-commit** (:address commit-res))
           db*           (assoc db :commit new-commit***
                                   :new-context? false)
-          db**         (if new-t?
-                         (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
-                         db*)
-          db***          (ledger-proto/-commit-update ledger branch db**)]
+          db**          (if new-t?
+                          (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
+                          db*)
+          db***         (ledger-proto/-commit-update ledger branch db**)]
       ;; push is asynchronous!
       (when push?
         (let [address     (ledger-proto/-address ledger)
@@ -336,7 +350,7 @@
         update-fn (update-commit-fn db commit-opts)]
     ;; call indexing process with update-commit-fn to push out an updated commit once complete
     (idx-proto/-index indexer db {:update-commit update-fn
-                                  :changes-ch changes-ch})))
+                                  :changes-ch    changes-ch})))
 
 
 (defn commit
@@ -359,8 +373,8 @@
                              context-key context}
           new-commit        (commit-data/new-db-commit-map base-commit-map)
           db*               (assoc db
-                                   :commit new-commit
-                                   :prev-commit commit)
+                              :commit new-commit
+                              :prev-commit commit)
           {db**              :db
            commit-file-meta  :commit-res
            context-file-meta :context-res} (<? (do-commit+push db* opts*))
