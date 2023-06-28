@@ -165,12 +165,12 @@
 (defn update-branch
   [{:keys [comparator], branch-t :t, :as branch} idx t child-nodes]
   (if (some-update-after? branch-t child-nodes)
-    (let [children    (apply index/child-map comparator child-nodes)
+    (let [children    (index/sorted-node-set-by comparator child-nodes)
           size        (->> child-nodes
                            (map :size)
                            (reduce +))
-          first-flake (->> children first key)
-          rhs         (->> children flake/last val :rhs)
+          first-flake (->> children first :first)
+          rhs         (->> children flake/last :rhs)
           new-id      (random-uuid)]
       (assoc branch
         :id new-id
@@ -334,12 +334,12 @@
 
   Takes original node, and map of temp left ids to final leaf ids for updating children."
   [temp->final-ids {:keys [children] :as branch-node}]
-  (let [children* (reduce-kv
-                    (fn [acc k v]
+  (let [children* (reduce
+                    (fn [acc v]
                       (if-let [updated-id (get temp->final-ids (:id v))]
-                        (assoc acc k (assoc v :id updated-id))
+                        (conj acc (assoc v :id updated-id))
                         acc))
-                    children children)]
+                    (empty children) children)]
     (assoc branch-node :children children*)))
 
 (defn write-node

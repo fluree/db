@@ -86,6 +86,21 @@
                       flake/maximum)]
     (assoc new-leaf :first new-first)))
 
+(defn ->node-comparator
+  [cmp]
+  (fn [node-x node-y]
+    (let [first-x   (:first node-x)
+          first-y   (:first node-y)]
+      (cmp (first-x first-y)))))
+
+(defn sorted-node-set-by
+  ([cmp]
+   (let [node-cmp (->node-comparator cmp)]
+     (flake/sorted-set-by node-cmp)))
+  ([cmp nodes]
+   (let [node-cmp (->node-comparator cmp)]
+     (flake/sorted-set-by node-cmp nodes))))
+
 (defn empty-leaf
   "Returns a blank leaf node map for the provided `ledger-alias` and index
   comparator `cmp`."
@@ -114,40 +129,12 @@
              (and (not (nil? node-rhs))
                   (not (pos? (cmp node-rhs rhs))))))))
 
-(defn child-entry
-  [{:keys [first] :as node}]
-  (let [child-node (unresolve node)]
-    [first child-node]))
-
-(defn child-key
-  [entry]
-  (get entry 0))
-
-(defn child
-  [entry]
-  (get entry 1))
-
-(defn compare-children
-  [cmp entry-x entry-y]
-  (let [x-key (child-key entry-x)
-        y-key (child-key entry-y)]
-    (cmp x-key y-key)))
-
-(defn child-map
-  "Returns avl sorted map whose keys are the first flakes of the index node
-  sequence `child-nodes`, and whose values are the corresponding nodes from
-  `child-nodes`."
-  [cmp & child-nodes]
-  (->> child-nodes
-       (mapcat child-entry)
-       (flake/sorted-map-by cmp)))
-
 (defn empty-branch
   "Returns a blank branch node which contains a single empty leaf node for the
   provided `ledger-alias` and index comparator `cmp`."
   [ledger-alias cmp]
   (let [child-node (empty-leaf ledger-alias cmp)
-        children   (child-map cmp child-node)]
+        children   (sorted-node-set-by cmp [child-node])]
     {:comparator   cmp
      :ledger-alias ledger-alias
      :id           :empty
@@ -318,7 +305,7 @@
   (if (resolved? branch)
     (->> branch
          :children
-         (map (fn [[_ child]]
+         (map (fn [child]
                 (resolve-when r resolve? error-ch child)))
          (async/map vector))
     (go [])))
@@ -350,7 +337,7 @@
                  (let [children (<! (resolve-children-when r resolve? error-ch node))
                        stack**  (-> stack*
                                     (conj (mark-expanded node))
-                                    (into (rseq children)))]
+                                    (into children))]
                    (recur stack**))))))
          (async/close! out)))
      out)))

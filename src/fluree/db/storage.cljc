@@ -63,9 +63,7 @@
   the `:id` key"
   [db idx-type  {:keys [children] :as branch}]
   (go-try
-    (let [child-vals  (->> children
-                           (map val)
-                           (mapv child-data))
+    (let [child-vals  (mapv child-data children)
           data        {:children child-vals}
           res         (<? (write-branch-data db idx-type data))]
       (assoc branch :id (:address res)))))
@@ -199,15 +197,13 @@
     (if-let [{:keys [children]} (<? (read-branch conn id))]
       (let [branch-metadata (select-keys branch [:comparator :ledger-alias
                                                  :t :tt-id :tempid])
-            child-attrs     (map-indexed (fn [i child]
+            child-nodes     (map-indexed (fn [i child]
                                            (-> branch-metadata
                                                (assoc :leftmost? (and leftmost?
                                                                       (zero? i)))
                                                (merge child)))
-                                         children)
-            child-entries   (mapcat (juxt :first identity)
-                                    child-attrs)]
-        (flake/sorted-map-by comparator child-entries))
+                                         children)]
+        (index/sorted-node-set-by comparator child-nodes))
       (throw (ex-info (str "Unable to retrieve index branch with id "
                            id " from storage.")
                       {:status 500, :error :db/storage-error})))))
@@ -215,7 +211,7 @@
 (defn fetch-leaf-flakes
   [conn {:keys [id comparator]}]
   (go-try
-    (if-let [{:keys [flakes] :as leaf} (<? (read-leaf conn id))]
+    (if-let [{:keys [flakes]} (<? (read-leaf conn id))]
       (flake/sorted-set-by comparator flakes)
       (throw (ex-info (str "Unable to retrieve leaf node with id: "
                            id " from storage")

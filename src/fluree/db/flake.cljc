@@ -4,10 +4,6 @@
             [me.tonsky.persistent-sorted-set :as pss]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util])
-  (:import (clojure.lang Associative Counted ILookup IPersistentCollection
-                         IPersistentMap MapEntry Reversible Seqable Sorted)
-           (me.tonsky.persistent_sorted_set PersistentSortedSet)
-           (java.lang IllegalArgumentException))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -485,107 +481,6 @@
   ([comparator flakes]
    (pss/from-sequential comparator flakes)))
 
-(defn ->entry-comparator
-  [cmp]
-  (fn [entry-x entry-y]
-    (cmp (key entry-x) (key entry-y))))
-
-(deftype SortedMap [^PersistentSortedSet contents]
-  Associative
-  (assoc [_ k v]
-    (let [entry (MapEntry. k v)]
-      (SortedMap. (conj contents entry))))
-  (containsKey [_ k]
-    (let [entry (MapEntry. k nil)]
-      (contains? contents entry)))
-  (entryAt [_ k]
-    (let [entry (MapEntry. k nil)]
-      (when-let [slice (pss/slice contents entry entry)]
-        (first slice))))
-
-  Counted
-  (count [_]
-    (count contents))
-
-  ILookup
-  (valAt [this k]
-    (.valAt this k nil))
-
-  (valAt [_ k not-found]
-    (let [entry (MapEntry. k nil)]
-      (if-let [slice (pss/slice contents entry entry)]
-        (first slice)
-        not-found)))
-
-  IPersistentCollection
-  (empty [_]
-    (SortedMap. (empty contents)))
-
-  IPersistentMap
-  (without [_ k]
-    (let [entry (MapEntry. k nil)]
-      (SortedMap. (disj entry))))
-
-
-  Reversible
-  (rseq [_]
-    (rseq contents))
-
-  Seqable
-  (seq [_]
-    (seq contents))
-
-  Sorted
-  (seq [_ ascending?]
-    (if ascending?
-      (seq contents)
-      (rseq contents)))
-
-  (seqFrom [_ k ascending?]
-    (if ascending?
-      (pss/slice contents k nil)
-      (pss/rslice contents k nil)))
-
-  (entryKey [_ entry]
-    (key entry))
-
-  (comparator [_]
-    (comparator contents))
-
-  java.lang.Iterable
-  (iterator [_]
-    (.iterator contents)))
-
-(defn sorted-map-by
-  [comparator key-vals]
-  (let [cmp      (->entry-comparator comparator)
-        entries  (->> key-vals
-                      (partition-all 2)
-                      (map (fn [[k v]]
-                             (if (some? v)
-                               (MapEntry. k v)
-                               (throw (IllegalArgumentException.
-                                        (str "No value specified for key: " k)))))))
-        contents (pss/from-sequential cmp entries)]
-    (SortedMap. contents)))
-
-(defn map-slice
-  [^SortedMap sm from to]
-  (let [from-entry (MapEntry. from nil)
-        to-entry   (MapEntry. to nil)]
-    (pss/slice (.contents sm) from-entry to-entry)))
-
-(defn map-rslice
-  [^SortedMap sm from to]
-  (let [from-entry (MapEntry. from nil)
-        to-entry   (MapEntry. to nil)]
-    (pss/rslice (.contents sm) from-entry to-entry)))
-
-(defn entry-seek
-  [slc to]
-  (let [entry (MapEntry. to nil)]
-    (pss/seek slc entry)))
-
 (defn transient-reduce
   [reducer ss coll]
   (->> coll
@@ -607,16 +502,6 @@
   of AVL-backed sorted sets."
   [ss to-remove]
   (transient-reduce disj! ss to-remove))
-
-(defn assoc-all
-  [sm entries]
-  (transient-reduce (fn [m [k v]]
-                      (assoc! m k v))
-                    sm entries))
-
-(defn dissoc-all
-  [sm ks]
-  (transient-reduce dissoc! sm ks))
 
 (defn last
   "Returns the last item in `ss` in constant time as long as `ss` is a sorted

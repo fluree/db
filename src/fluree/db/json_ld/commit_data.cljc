@@ -421,9 +421,9 @@
     (-> (reduce
           (fn [db* idx]
             (let [{:keys [children] :as node} (get db* idx)
-                  children* (reduce-kv
-                              (fn [children* k v]
-                                (assoc children* k (assoc v :tt-id tt-id)))
+                  children* (reduce
+                              (fn [children* v]
+                                (conj children* (assoc v :tt-id tt-id)))
                               (empty children) children)]
               (assoc db* idx (assoc node :tt-id tt-id
                                          :children children*))))
