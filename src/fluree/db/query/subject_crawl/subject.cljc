@@ -46,9 +46,7 @@
           range-set (flake/sorted-set-by cmp)
           in-range? (fn [node]
                       (query-range/intersects-range? node range-set))
-          query-xf  (where-subj-xf {:start-test  >=
-                                    :start-flake fflake
-                                    :end-test    <=
+          query-xf  (where-subj-xf {:start-flake fflake
                                     :end-flake   lflake
                                     ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
                                     :xf          (when filter-fn

@@ -4,7 +4,6 @@
             [fluree.db.index :as index]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go go-loop <! >!] :as async]
@@ -13,15 +12,6 @@
             [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn- pred-id-strict
-  "Will throw if predicate doesn't exist."
-  [db p]
-  (when p
-    (or (dbproto/-p-prop db :id p)
-        (throw (ex-info (str "Invalid predicate, does not exist: " p)
-                        {:status 400, :error :db/invalid-predicate})))))
-
 
 (defn- coerce-predicate
   "If a predicate is provided as a string value, coerce to pid"
@@ -76,14 +66,6 @@
     :opst subject-max-match
     :tspo txn-max-match))
 
-(defn resolve-subid
-  "Expands an IRI @id for a subject and returns the index's subject-id integer (sid).
-
-  Only called when integer or nil is not provided, so can assume always have a compact
-  or full IRI as either a keyword or string."
-  [db id]
-  (dbproto/-subid db id))
-
 (defn resolve-match-flake
   [test s p o t op m]
   (let [[o' dt] (if (vector? o)
@@ -125,7 +107,7 @@
   map. The result of the transformation will be a stream of collections of
   flakes from the leaf nodes in the input stream, with one flake collection for
   each input leaf."
-  [{:keys [start-flake start-test end-flake end-test flake-xf] :as opts}]
+  [{:keys [start-flake end-flake flake-xf] :as opts}]
   (let [query-xf (comp (map :flakes)
                        (map (fn [flakes]
                               (flake/slice flakes start-flake end-flake)))
@@ -286,9 +268,7 @@
          range-set (flake/sorted-set-by idx-cmp [start-flake end-flake])
          in-range? (fn [node] (intersects-range? node range-set))
          query-xf  (extract-query-flakes {:idx         idx
-                                          :start-test  start-test
                                           :start-flake start-flake
-                                          :end-test    end-test
                                           :end-flake   end-flake})]
      (go-try
        (let [history-ch (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
@@ -337,7 +317,7 @@
      (go-try
        (let [s1*         (if (or (number? s1) (nil? s1))
                            s1
-                           (<? (resolve-subid db s1)))
+                           (<? (dbproto/-subid db s1)))
              start-flake (resolve-match-flake start-test s1* p1 o1 t1 op1 m1)
              s2*         (cond
                            (or (number? s2) (nil? s2))
@@ -347,7 +327,7 @@
                            s1*
 
                            :else
-                           (<? (resolve-subid db s2)))
+                           (<? (dbproto/-subid db s2)))
              end-flake   (resolve-match-flake end-test s2* p2 o2 t2 op2 m2)
              error-ch    (chan)
              range-ch    (index-range* db
@@ -356,9 +336,7 @@
                                          :idx idx
                                          :from-t t
                                          :to-t t
-                                         :start-test start-test
                                          :start-flake start-flake
-                                         :end-test end-test
                                          :end-flake end-flake
                                          :object-fn object-fn))]
          (async/alt!

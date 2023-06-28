@@ -61,9 +61,7 @@
                    opts        (cond-> {:idx         idx
                                         :from-t      t
                                         :to-t        t
-                                        :start-test  >=
                                         :start-flake start-flake
-                                        :end-test    <=
                                         :end-flake   end-flake
                                         :flake-xf    flake-xf*}
                                  s-fn (assoc :subject-fn s-fn)
