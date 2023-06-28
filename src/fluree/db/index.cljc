@@ -43,7 +43,7 @@
           (catch* e
                   (log/error e
                              "Error resolving index node:"
-                             (select-keys node [:id :ledger-aliasd]))
+                             (select-keys node [:id :ledger-alias]))
                   (>! error-ch e)))))
 
 (defn resolved?
