@@ -1,7 +1,6 @@
 (ns fluree.db.flake
   (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take last])
-  (:require [clojure.data.avl :as avl]
-            [me.tonsky.persistent-sorted-set :as pss]
+  (:require [me.tonsky.persistent-sorted-set :as pss]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util])
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
@@ -561,12 +560,3 @@
       (/ 1000)
       (double)
       (Math/round)))
-
-
-(defn take
-  "Takes n flakes from a sorted flake set, retaining the set itself."
-  [n flake-set]
-  (if (>= n (count flake-set))
-    flake-set
-    (let [k (nth flake-set n)]
-      (first (avl/split-key k flake-set)))))

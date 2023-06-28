@@ -3,7 +3,6 @@
         org.clojure/core.async                      {:mvn/version "1.6.673"}
         org.clojure/core.cache                      {:mvn/version "1.0.225"}
         org.clojars.mmb90/cljs-cache                {:mvn/version "0.1.4"}
-        org.clojure/data.avl                        {:mvn/version "0.1.0"}
         org.clojure/data.xml                        {:mvn/version "0.2.0-alpha8"}
         environ/environ                             {:mvn/version "1.2.0"}
         byte-streams/byte-streams                   {:mvn/version "0.2.4"}
