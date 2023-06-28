@@ -692,58 +692,60 @@
 
 (deftest ^:integration shacl-string-length-constraints
   (testing "shacl string length constraint errors"
-    (let [conn       (test-utils/create-conn)
-          ledger     @(fluree/create conn "shacl/str" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-          user-query {:select {'?s [:*]}
-                      :where  [['?s :rdf/type :ex/User]]}
-          db         @(fluree/stage
-                        (fluree/db ledger)
-                        {:id             :ex/UserShape
-                         :type           [:sh/NodeShape]
-                         :sh/targetClass :ex/User
-                         :sh/property    [{:sh/path      :schema/name
-                                           :sh/minLength 4
-                                           :sh/maxLength 10}]})
-          db-ok-str  @(fluree/stage
-                        db
-                        {:id          :ex/john,
-                         :type        [:ex/User],
-                         :schema/name "John"})
+    (let [conn                (test-utils/create-conn)
+          ledger              @(fluree/create conn "shacl/str"
+                                              {:defaultContext
+                                               ["" {:ex "http://example.org/ns/"}]})
+          user-query          {:select {'?s [:*]}
+                               :where  [['?s :rdf/type :ex/User]]}
+          db                  @(fluree/stage
+                                (fluree/db ledger)
+                                {:id             :ex/UserShape
+                                 :type           [:sh/NodeShape]
+                                 :sh/targetClass :ex/User
+                                 :sh/property    [{:sh/path      :schema/name
+                                                   :sh/minLength 4
+                                                   :sh/maxLength 10}]})
+          db-ok-str           @(fluree/stage
+                                db
+                                {:id          :ex/john
+                                 :type        [:ex/User]
+                                 :schema/name "John"})
 
-          db-ok-non-str @(fluree/stage
-                           db
-                           {:id          :ex/john,
-                            :type        [:ex/User],
-                            :schema/name 12345})
+          db-ok-non-str       @(fluree/stage
+                                db
+                                {:id          :ex/john
+                                 :type        [:ex/User]
+                                 :schema/name 12345})
 
           db-too-short-str    (try
                                 @(fluree/stage
-                                   db
-                                   {:id          :ex/al,
-                                    :type        :ex/User,
-                                    :schema/name "Al"})
+                                  db
+                                  {:id          :ex/al,
+                                   :type        :ex/User,
+                                   :schema/name "Al"})
                                 (catch Exception e e))
           db-too-long-str     (try
                                 @(fluree/stage
-                                   db
-                                   {:id          :ex/jean-claude
-                                    :type        :ex/User,
-                                    :schema/name "Jean-Claude"})
+                                  db
+                                  {:id          :ex/jean-claude
+                                   :type        :ex/User,
+                                   :schema/name "Jean-Claude"})
                                 (catch Exception e e))
           db-too-long-non-str (try
                                 @(fluree/stage
-                                   db
-                                   {:id          :ex/john
-                                    :type        :ex/User,
-                                    :schema/name 12345678910})
+                                  db
+                                  {:id          :ex/john
+                                   :type        :ex/User,
+                                   :schema/name 12345678910})
                                 (catch Exception e e))
-          db-ref-value         (try
-                                 @(fluree/stage
-                                    db
-                                    {:id          :ex/john
-                                     :type        :ex/User,
-                                     :schema/name :ex/ref})
-                                 (catch Exception e e)) ]
+          db-ref-value        (try
+                                @(fluree/stage
+                                  db
+                                  {:id          :ex/john
+                                   :type        :ex/User
+                                   :schema/name :ex/ref})
+                                (catch Exception e e))]
       (is (util/exception? db-too-short-str)
           "Exception, because :schema/name is shorter than minimum string length")
       (is (str/starts-with? (ex-message db-too-short-str)
@@ -771,52 +773,54 @@
 
 (deftest ^:integration shacl-string-pattern-constraints
   (testing "shacl string regex constraint errors"
-    (let [conn           (test-utils/create-conn)
-          ledger         @(fluree/create conn "shacl/str" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
-          user-query     {:select {'?s [:*]}
-                          :where  [['?s :rdf/type :ex/User]]}
-          db             @(fluree/stage
-                            (fluree/db ledger)
-                            {:id             :ex/UserShape
-                             :type           [:sh/NodeShape]
-                             :sh/targetClass :ex/User
-                             :sh/property    [{:sh/path    :ex/greeting
-                                               :sh/pattern "hello   (.*?)world"
-                                               :sh/flags   ["x" "s"]}
-                                              {:sh/path    :ex/birthYear
-                                               :sh/pattern "(19|20)[0-9][0-9]"}]})
-          db-ok-greeting @(fluree/stage
-                            db
-                            {:id          :ex/brian,
-                             :type        :ex/User,
-                             :ex/greeting "hello\nworld!"})
+    (let [conn                   (test-utils/create-conn)
+          ledger                 @(fluree/create conn "shacl/str"
+                                                 {:defaultContext
+                                                  ["" {:ex "http://example.org/ns/"}]})
+          user-query             {:select {'?s [:*]}
+                                  :where  [['?s :rdf/type :ex/User]]}
+          db                     @(fluree/stage
+                                   (fluree/db ledger)
+                                   {:id             :ex/UserShape
+                                    :type           [:sh/NodeShape]
+                                    :sh/targetClass :ex/User
+                                    :sh/property    [{:sh/path    :ex/greeting
+                                                      :sh/pattern "hello   (.*?)world"
+                                                      :sh/flags   ["x" "s"]}
+                                                     {:sh/path    :ex/birthYear
+                                                      :sh/pattern "(19|20)[0-9][0-9]"}]})
+          db-ok-greeting         @(fluree/stage
+                                   db
+                                   {:id          :ex/brian
+                                    :type        :ex/User
+                                    :ex/greeting "hello\nworld!"})
 
           db-ok-birthyear        @(fluree/stage
-                                    db
-                                    {:id           :ex/john,
-                                     :type         :ex/User,
-                                     :ex/birthYear 1984})
+                                   db
+                                   {:id           :ex/john,
+                                    :type         :ex/User,
+                                    :ex/birthYear 1984})
           db-wrong-case-greeting (try
                                    @(fluree/stage
-                                      db
-                                      {:id          :ex/alice
-                                       :type        :ex/User,
-                                       :ex/greeting "HELLO\nWORLD!"})
+                                     db
+                                     {:id          :ex/alice
+                                      :type        :ex/User
+                                      :ex/greeting "HELLO\nWORLD!"})
                                    (catch Exception e e))
           db-wrong-birth-year    (try
                                    @(fluree/stage
-                                      db
-                                      {:id           :ex/alice
-                                       :type         :ex/User,
-                                       :ex/birthYear 1776})
+                                     db
+                                     {:id           :ex/alice
+                                      :type         :ex/User
+                                      :ex/birthYear 1776})
                                    (catch Exception e e))
-          db-ref-value         (try
-                                 @(fluree/stage
-                                    db
-                                    {:id          :ex/john
-                                     :type        :ex/User,
-                                     :ex/birthYear :ex/ref})
-                                 (catch Exception e e))]
+          db-ref-value           (try
+                                   @(fluree/stage
+                                     db
+                                     {:id           :ex/john
+                                      :type         :ex/User
+                                      :ex/birthYear :ex/ref})
+                                   (catch Exception e e))]
       (is (util/exception? db-wrong-case-greeting)
           "Exception, because :ex/greeting does not match pattern")
       (is (str/starts-with? (ex-message db-wrong-case-greeting)
@@ -956,3 +960,73 @@
                                    "@type"                         "https://example.com/Actor",
                                    "https://example.com/name"      "Sam Worthington"})]
     (is (not (util/exception? db2)))))
+
+(deftest shacl-in-test
+  (testing "value nodes"
+    (let [conn   @(fluree/connect {:method :memory
+                                   :defaults
+                                   {:context test-utils/default-str-context}})
+          ledger @(fluree/create conn "shacl-in-test"
+                                 {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+          db0    (fluree/db ledger)
+          db1    @(fluree/stage db0 [{"type"           ["sh:NodeShape"]
+                                      "sh:targetClass" {"id" "ex:Pony"}
+                                      "sh:property"    [{"sh:path" {"id" "ex:color"}
+                                                         "sh:in"   '("cyan" "magenta")}]}])
+          db2    @(fluree/stage db1 {"id"       "ex:YellowPony"
+                                     "type"     "ex:Pony"
+                                     "ex:color" "yellow"})]
+      (is (util/exception? db2))
+      (is (str/includes? (ex-message db2) "sh:in"))))
+  (testing "node refs"
+    (let [conn   @(fluree/connect {:method :memory
+                                   :defaults
+                                   {:context test-utils/default-str-context}})
+          ledger @(fluree/create conn "shacl-in-test")
+          db0    (fluree/db ledger)
+          db1    @(fluree/stage db0 [{"type"           ["sh:NodeShape"]
+                                      "sh:targetClass" {"id" "ex:Pony"}
+                                      "sh:property"    [{"sh:path" {"id" "ex:color"}
+                                                         "sh:in"   '({"id" "ex:Pink"}
+                                                                     {"id" "ex:Purple"})}]}])
+          db2    @(fluree/stage db1 [{"id"   "ex:Pink"
+                                      "type" "ex:color"}
+                                     {"id"   "ex:Purple"
+                                      "type" "ex:color"}
+                                     {"id"   "ex:Green"
+                                      "type" "ex:color"}
+                                     {"id"       "ex:RainbowPony"
+                                      "type"     "ex:Pony"
+                                      "ex:color" [{"id" "ex:Pink"}
+                                                  {"id" "ex:Green"}]}])
+          db3    @(fluree/stage db1 [{"id"       "ex:PastelPony"
+                                      "type"     "ex:Pony"
+                                      "ex:color" [{"id" "ex:Pink"}
+                                                  {"id" "ex:Purple"}]}])]
+      (is (util/exception? db2))
+      (is (str/includes? (ex-message db2) "sh:in"))
+
+      (is (not (util/exception? db3)))
+      (is (= [{"id" "ex:PastelPony"
+               "rdf:type" ["ex:Pony"]
+               "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}]
+             @(fluree/query db3 '{"select" {"?p" ["*"]}
+                                  "where"  [["?p" "type" "ex:Pony"]]})))))
+  (testing "mixed values and refs"
+    (let [conn   @(fluree/connect {:method :memory
+                                   :defaults
+                                   {:context test-utils/default-str-context}})
+          ledger @(fluree/create conn "shacl-in-test")
+          db0    (fluree/db ledger)
+          db1    @(fluree/stage db0 [{"type"           ["sh:NodeShape"]
+                                      "sh:targetClass" {"id" "ex:Pony"}
+                                      "sh:property"    [{"sh:path" {"id" "ex:color"}
+                                                         "sh:in"   '({"id" "ex:Pink"}
+                                                                     {"id" "ex:Purple"}
+                                                                     "green")}]}])
+          db2    @(fluree/stage db1 [{"id"       "ex:RainbowPony"
+                                      "type"     "ex:Pony"
+                                      "ex:color" [{"id" "ex:Pink"}
+                                                  {"id" "ex:Green"}]}])]
+      (is (util/exception? db2))
+      (is (str/includes? (ex-message db2) "sh:in")))))
