@@ -66,17 +66,17 @@
                          (catch Exception e e))]
       (is (util/exception? db-no-names)
           "Exception, because :schema/name requires at least 1 value.")
-      (is (str/starts-with? (ex-message db-no-names)
-                            "Required properties not present:"))
+      (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+             (ex-message db-no-names)))
       (is (util/exception? db-two-names)
           "Exception, because :schema/name can have at most 1 value.")
-      (is (= (ex-message db-two-names)
-             "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."))
-      (is (= @(fluree/query db-ok user-query)
-             [{:id              :ex/john,
+      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+             (ex-message db-two-names)))
+      (is (= [{:id              :ex/john,
                :rdf/type        [:ex/User],
                :schema/name     "John",
-               :schema/callSign "j-rock"}])
+               :schema/callSign "j-rock"}]
+             @(fluree/query db-ok user-query))
           "basic rdf:type query response not correct"))))
 
 
@@ -904,17 +904,17 @@
                           :schema/age   40
                           :schema/email 42})]
       (is (util/exception? db-no-name))
-      (is (str/starts-with? (ex-message db-no-name)
-                            "Required properties not present:"))
+      (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+             (ex-message db-no-name)))
       (is (util/exception? db-two-names))
-      (is (str/starts-with? (ex-message db-two-names)
-                            "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2"))
+      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+             (ex-message db-two-names)))
       (is (util/exception? db-too-old))
-      (is (str/starts-with? (ex-message db-too-old)
-                            "SHACL PropertyShape exception - sh:maxInclusive: value 140 is either non-numeric or higher than maximum of 130"))
+      (is (= "SHACL PropertyShape exception - sh:maxInclusive: value 140 is either non-numeric or higher than maximum of 130."
+             (ex-message db-too-old)))
       (is (util/exception? db-two-ages))
-      (is (str/starts-with? (ex-message db-two-ages)
-                            "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2"))
+      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+             (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
       (is (str/starts-with? (ex-message db-num-email)
                             "Required data type"))
