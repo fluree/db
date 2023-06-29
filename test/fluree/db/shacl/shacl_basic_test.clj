@@ -943,7 +943,7 @@
             invalid-pal @(fluree/stage db1 {"id"          "ex:bad-pal"
                                             "type"        "ex:Pal"
                                             "schema:name" "Darth Vader"
-                                            "ex:pal"      {"ex:evil" true}})]
+                                            "ex:pal"      {"ex:evil" "has no name"}})]
         (is (= [{"id"          "ex:good-pal",
                  "rdf:type"    ["ex:Pal"]
                  "schema:name" "J.D.",
@@ -952,8 +952,8 @@
                                          "where"  [["?s" "id" "ex:good-pal"]]})))
         (is (util/exception? invalid-pal))
         (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
-               (ex-message invalid-pal))))
-      #_(testing "inverse path"
+               (ex-message invalid-pal)))))
+      (testing "inverse path"
         (let [ ;; a valid Parent is anybody who is the object of a parent predicate
               db1 @(fluree/stage db0 [{"@type" "sh:NodeShape"
                                        "id" "ex:ParentShape"
@@ -965,19 +965,22 @@
                                                 "ex:parent" {"id" "ex:Anakin"
                                                              "type" "ex:Parent"
                                                              "schema:name" "Anakin"}}])
-              ;; invalid-pal @(fluree/stage db1 {"id"          "ex:bad-parent"
-              ;;                                 "type"        "ex:Parent"
-              ;;                                 "schema:name" "Darth Vader"})
-              ]
+              invalid-pal @(fluree/stage db1 {"id"          "ex:bad-parent"
+                                              "type"        "ex:Parent"
+                                              "schema:name" "Darth Vader"})]
 
-          (is (= []
+          (is (= [{"id" "ex:Luke",
+                   "schema:name" "Luke",
+                   "ex:parent" {"id" "ex:Anakin"
+                                "type" "ex:Parent"
+                                "schema:name" "Anakin"}}]
                  @(fluree/query valid-parent {"select" {"?s" ["*" {"ex:parent" ["*"]}]}
                                               "where" [["?s" "id" "ex:Luke"]]})))
 
-          #_ (is (util/exception? invalid-pal))
+          (is (util/exception? invalid-pal))
 
-          #_ (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
-                    (ex-message invalid-pal))))))))
+          (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+                 (ex-message invalid-pal)))))))
 
 (deftest shacl-class-test
   (let [conn   @(fluree/connect {:method :memory})
