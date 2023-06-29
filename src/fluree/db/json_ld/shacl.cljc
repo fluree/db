@@ -272,26 +272,51 @@
         ;; no p-flakes found for path
         []))))
 
+(defn resolve-path-flakes
+  [db sid path p-flakes]
+  (go-try
+    (loop [[path-pid & r] (util/sequential path)
+           path-flakes p-flakes]
+      (if path-pid
+        (let [[pid type] (util/sequential path-pid)
+              _  (println "DEP resolve-path-flakes" pid (pr-str type) (pr-str path-flakes))
+              path-flakes* (cond
+                             (first r) ;; sequence path - only handles predicate paths at the moment
+                             (let [[next-pid next-type] (util/sequential (first r))
+                                   sequence-flake (first (filter #(= path-pid (flake/p %)) path-flakes))]
+                               (if sequence-flake
+                                 (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-pid]))
+                                 path-flakes))
+                             (= type :inverse) (<? (query-range/index-range db :post = [pid sid]))
+                             (= type :alternative) (throw (ex-info "Unsupported property path: alternativePath." {:path path}))
+                             (= type :zero-plus) (throw (ex-info "Unsupported property path: zeroOrMorePath." {:path path}))
+                             (= type :one-plus) (throw (ex-info "Unsupported property path: oneOrMorePath." {:path path}))
+                             (= type :zero-one) (throw (ex-info "Unsupported property path: zeroOrOnePath." {:path path}))
+                             ;; regular predicate path, no processing needed
+                             :predicate-path path-flakes)]
+          (recur r path-flakes*))
+        path-flakes))))
+
 (defn validate-properties
   [db p-shapes p-flakes s-flakes]
   (go-try
     (loop [[{:keys [path] :as p-shape} & r] p-shapes
            results       []]
       (if p-shape
-        (let [p-flakes*    (if (sequential? path)
-                             (<? (sequence-flakes db path p-flakes))
-                             p-flakes)
+        (let [
+              sid          (flake/s (first s-flakes))
+              path-flakes  (<? (resolve-path-flakes db sid path p-flakes))
               rhs-property (:rhs-property p-shape)
+
               res (if rhs-property
                     (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
-                      (validate-pair-constraints p-shape p-flakes* rhs-flakes))
-                    (validate-property-constraints db p-shape p-flakes*))]
+                      (validate-pair-constraints p-shape path-flakes rhs-flakes))
+                    (validate-property-constraints db p-shape path-flakes))]
           (recur r (conj results res)))
         (coalesce-validation-results results)))))
 
 (defn validate-shape
-  [db {:keys [property closed-props] :as shape}
-   flake-p-partitions s-flakes]
+  [db {:keys [property closed-props] :as shape} flake-p-partitions s-flakes]
   (log/debug "validate-shape shape:" shape)
   (go-try
     (loop [[p-flakes & r] flake-p-partitions
@@ -550,6 +575,26 @@
         #?(:clj (Pattern/compile (or valid-flags 0))
            :cljs (js/RegExp. (or valid-flags ""))))))
 
+(defn path-type
+  "Tag the path types appropriately. Simple predicate paths recieve no tag."
+  [db path-pid]
+  (println "DEP path-type"  path-pid)
+  (go-try
+    (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid]))
+                             (remove #(#{const/$xsd:anyURI} (flake/p %)))
+                             (first))]
+      (let [o (flake/o path-flake)
+            p (flake/p path-flake)]
+        (println "DEP path-flakes" (pr-str path-flake))
+        (cond
+          (= p const/$sh:inversePath)     [o :inverse]
+          (= p const/$sh:alternativePath) [o :alternative]
+          (= p const/$sh:zeroOrMorePath)  [o :zero-plus]
+          (= p const/$sh:oneOrMorePath)   [o :one-plus]
+          (= p const/$sh:zeroOrOnePath)   [o :zero-one]
+          :else
+          path-pid))
+      path-pid)))
 
 (defn build-class-shapes
   "Given a class SID, returns class shape"
@@ -576,24 +621,31 @@
                                                                                  (build-property-shape flakes)
                                                                                  const/$sh:not
                                                                                  (build-not-shape flakes))
+
+                                             path* (loop [[path-pid & rem-path] (util/sequential path)
+                                                          tagged-path []]
+                                                     (if path-pid
+                                                       (recur rem-path (conj tagged-path (<? (path-type db path-pid))))
+                                                       tagged-path))
+
                                              ;; we key the property shapes map with the property subj id (sh:path)
-                                             property-shape* (if (:pattern property-shape)
-                                                               (assoc property-shape :pattern (build-pattern property-shape))
-                                                               property-shape)
-                                             p-shape-key    (first (util/sequential path))
+                                             property-shape* (cond-> (assoc property-shape :path path*)
+                                                               (:pattern property-shape) (assoc :pattern (build-pattern property-shape)))
+                                             p-shape-key    (first (util/sequential (first path*)))
+                                             target-key     (first (util/sequential (peek path*)))
                                              p-shapes*      (update p-shapes p-shape-key util/conjv property-shape*)
-                                             ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
-                                             required-prop  (peek (util/sequential path))
+                                             ;; elevate following conditions to top-level custom keys to optimize validations
+                                             ;; when processing txs
                                              shape*         (cond-> shape
                                                               (:required? property-shape)
-                                                              (update :required util/conjs required-prop)
+                                                              (update :required util/conjs target-key)
 
                                                               (:datatype property-shape)
-                                                              (update-in [:datatype (:path property-shape)]
+                                                              (update-in [:datatype target-key]
                                                                          register-datatype property-shape)
 
                                                               (:node-kind property-shape)
-                                                              (update-in [:datatype (:path property-shape)]
+                                                              (update-in [:datatype target-key]
                                                                          register-nodetype property-shape))]
 
                                          (recur r' shape* p-shapes*))
@@ -616,7 +668,7 @@
                                                       shape)]
                                          (recur r' shape* p-shapes))))
                                    (cond-> (assoc shape :property p-shapes)
-                                           (:closed? shape) add-closed-props)))]
+                                     (:closed? shape) add-closed-props)))]
               (let [datatype* (merge-with merge-datatype datatype (:datatype shape))]
                 (recur r datatype* (conj shapes shape))))
             {:shapes   shapes

@@ -50,6 +50,11 @@
           "http://www.w3.org/ns/shacl#ignoredProperties"        const/$sh:ignoredProperties
           "http://www.w3.org/ns/shacl#property"                 const/$sh:property
           "http://www.w3.org/ns/shacl#path"                     const/$sh:path
+          "http://www.w3.org/ns/shacl#inversePath"              const/$sh:inversePath
+          "http://www.w3.org/ns/shacl#alternativePath"          const/$sh:alternativePath
+          "http://www.w3.org/ns/shacl#zeroOrMorePath"           const/$sh:zeroOrMorePath
+          "http://www.w3.org/ns/shacl#oneOrMorePath"            const/$sh:oneOrMorePath
+          "http://www.w3.org/ns/shacl#zeroOrOnePath"            const/$sh:zeroOrOnePath
           "http://www.w3.org/ns/shacl#minCount"                 const/$sh:minCount
           "http://www.w3.org/ns/shacl#maxCount"                 const/$sh:maxCount
           "http://www.w3.org/ns/shacl#datatype"                 const/$sh:datatype

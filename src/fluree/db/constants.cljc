@@ -177,6 +177,13 @@
 (def ^:const $sh:or 253)
 (def ^:const $sh:xone 254)
 
+;; path types
+(def ^:const $sh:alternativePath 256)
+(def ^:const $sh:zeroOrMorePath 257)
+(def ^:const $sh:oneOrMorePath 258)
+(def ^:const $sh:zeroOrOnePath 259)
+(def ^:const $sh:inversePath 260)
+
 ;; fluree-specific
 (def ^:const $fluree:context 250)
 (def ^:const $fluree:targetClass 255)
