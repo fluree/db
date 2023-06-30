@@ -582,7 +582,6 @@
                                                                                  first
                                                                                  flake/o)
                                                                        next-ciris (conj ciris ciri)]
-                                                                   (log/trace "next-ciris:" next-ciris)
                                                                    (if (seq csids)
                                                                      (recur csids next-ciris)
                                                                      next-ciris))))
