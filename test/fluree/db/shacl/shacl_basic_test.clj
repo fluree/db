@@ -953,6 +953,7 @@
                                       "sh:datatype" {"@id" "xsd:string"}}]}])
         db2    @(fluree/stage db1 {"@id"                           "https://example.com/Actor/65731"
                                    "https://example.com/country"   {"@id"                      "https://example.com/Country/AU"
+                                                                    "@type"                    "https://example.com/Country"
                                                                     "https://example.com/name" "Oz"}
                                    "https://example.com/gender"    "Male"
                                    "https://example.com/character" ["Jake Sully" "Marcus Wright"]
