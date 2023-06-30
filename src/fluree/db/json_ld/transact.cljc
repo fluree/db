@@ -88,8 +88,13 @@
           flakes      (cond
                         ;; a new node's data is contained, process as another node then link to this one
                         (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+                        (do
+                          (when validate-fn
+                            (or (validate-fn v-map)
+                                (throw (ex-info (str "Node did not pass SHACL validation: " v-map)
+                                                {:status 400, :error :db/shacl-validation}))))
+                          (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                            (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m))))
 
                         ;; a literal value
                         (and (some? value) (not= shacl-dt const/$xsd:anyURI))
@@ -230,13 +235,13 @@
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t        (-> commit-t inc -)] ;; commit-t is always positive, need to make negative for internal indexing
-    {:did         did
-     :db-before   (dbproto/-rootdb db)
-     :policy      policy
-     :bootstrap?  bootstrap?
-     :default-ctx (if context-type
-                    (dbproto/-context db ::dbproto/default-context context-type)
-                    (dbproto/-context db))
+    {:did           did
+     :db-before     (dbproto/-rootdb db)
+     :policy        policy
+     :bootstrap?    bootstrap?
+     :default-ctx   (if context-type
+                      (dbproto/-context db ::dbproto/default-context context-type)
+                      (dbproto/-context db))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
@@ -304,8 +309,8 @@
           staged-map   {:add    add
                         :remove remove}
           db-after     (cond-> (db-after staged-map tx-state)
-                         vocab-flakes vocab/refresh-schema
-                         vocab-flakes <?)]
+                               vocab-flakes vocab/refresh-schema
+                               vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
 
 (defn track-into
@@ -324,9 +329,9 @@
     (let [track-fuel (when fuel-tracker
                        (fuel/track fuel-tracker))
           flakeset   (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                       (init-db? db) (track-into track-fuel (base-flakes t)))]
+                             (init-db? db) (track-into track-fuel (base-flakes t)))]
       (loop [[node & r] nodes
-             flakes     flakeset]
+             flakes flakeset]
         (if node
           (if (empty? (dissoc node :idx :id))
             (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
@@ -335,7 +340,7 @@
                                  ".")
                             {:status 400 :error :db/invalid-transaction}))
             (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))
-                  flakes*                 (track-into flakes track-fuel node-flakes)]
+                  flakes* (track-into flakes track-fuel node-flakes)]
               (recur r flakes*)))
           flakes)))))
 
@@ -366,9 +371,9 @@
   "Performs insert transaction. Returns async chan with resulting flakes."
   [db fuel-tracker json-ld {:keys [default-ctx] :as tx-state}]
   (log/trace "insert default-ctx:" default-ctx)
-  (let [nodes    (-> json-ld
-                     (json-ld/expand default-ctx)
-                     util/sequential)]
+  (let [nodes (-> json-ld
+                  (json-ld/expand default-ctx)
+                  util/sequential)]
     (stage-flakes db fuel-tracker tx-state nodes)))
 
 (defn into-flakeset
@@ -382,16 +387,16 @@
 (defn modify
   [db fuel-tracker json-ld {:keys [t] :as _tx-state}]
   (go
-    (let [mdfn         (-> json-ld
-                           syntax/coerce-modification
-                           (q-parse/parse-modification db))
-          error-ch     (async/chan)
-          update-ch    (->> (where/search db mdfn fuel-tracker error-ch)
-                            (update/modify db mdfn t fuel-tracker error-ch)
-                            (into-flakeset fuel-tracker))]
+    (let [mdfn      (-> json-ld
+                        syntax/coerce-modification
+                        (q-parse/parse-modification db))
+          error-ch  (async/chan)
+          update-ch (->> (where/search db mdfn fuel-tracker error-ch)
+                         (update/modify db mdfn t fuel-tracker error-ch)
+                         (into-flakeset fuel-tracker))]
       (async/alt!
-        error-ch  ([e] e)
-        update-ch ([flakes] flakes)))))
+       error-ch ([e] e)
+       update-ch ([flakes] flakes)))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -406,7 +411,7 @@
         (policy/allowed? tx-state)
         <?
         ;; unwrap the policy
-        (dbproto/-rootdb))))
+        dbproto/-rootdb)))
 
 (defn stage
   "Stages changes, but does not commit.
@@ -417,10 +422,10 @@
    (go-try
      (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
                                       {:subject json-ld})
-           opts* (cond-> opts did (assoc :did did))
-           db* (if-let [policy-opts (perm/policy-opts opts*)]
-                 (<? (perm/wrap-policy db policy-opts))
-                 db)
+           opts*    (cond-> opts did (assoc :did did))
+           db*      (if-let [policy-opts (perm/policy-opts opts*)]
+                      (<? (perm/wrap-policy db policy-opts))
+                      db)
            tx-state (->tx-state db* opts*)
            flakes   (if (q-parse/update? tx)
                       (<? (modify db fuel-tracker tx tx-state))
