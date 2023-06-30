@@ -263,21 +263,18 @@
   "Return the relevant flakes that are associated with the property shape's path."
   [db sid path pid->p-flakes]
   (go-try
-    (loop [[path-pid & r] (util/sequential path)
-           path-flakes (get pid->p-flakes (first (util/sequential path-pid)))]
-      (if path-pid
-        (let [[pid type] (util/sequential path-pid)
-              path-flakes* (cond
+    (loop [[[pid type] & [[next-pid next-type] :as r]] path
+           path-flakes (get pid->p-flakes pid)]
+      (if pid
+        (let [path-flakes* (cond
                              ;; sequence path
-                             (first r)
-                             (let [[next-pid next-type] (util/sequential (first r))
-                                   sequence-flake (first (filter #(= path-pid (flake/p %)) path-flakes))]
-                               (if sequence-flake
-                                 ;; TODO: support other path types in a sequence
-                                 (case next-type
-                                   ;; predicate path
-                                   (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-pid])))
-                                 path-flakes))
+                             next-pid
+                             (if-let [sequence-flake (first (filter #(= pid (flake/p %)) path-flakes))]
+                               ;; TODO: support other path types in a sequence
+                               (case next-type
+                                 ;; predicate path
+                                 (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-pid])))
+                               path-flakes)
 
                              (= type :inverse)
                              (<? (query-range/index-range db :post = [pid sid]))
@@ -345,11 +342,7 @@
       (let [o (flake/o property-flake)]
         (condp = (flake/p property-flake)
           const/$sh:path
-          ;; if we come across more than one path predicate, turn it into a sequence
-          (update acc :path (fn [path]
-                              (if path
-                                (conj (util/sequential path) o)
-                                o)))
+          (update acc :path (fnil conj []) o)
 
           ;; The datatype of all value nodes (e.g., xsd:integer).
           ;; A shape has at most one value for sh:datatype.
@@ -570,13 +563,13 @@
           (= p const/$sh:oneOrMorePath)   [o :one-plus]
           (= p const/$sh:zeroOrOnePath)   [o :zero-one]
           :else
-          path-pid))
-      path-pid)))
+          [path-pid :predicate]))
+      [path-pid :predicate])))
 
 (defn resolve-path-types
   [db path]
   (go-try
-    (loop [[path-pid & r] (util/sequential path)
+    (loop [[path-pid & r] path
            tagged-path []]
       (if path-pid
         (recur r (conj tagged-path (<? (resolve-path-type db path-pid))))
@@ -613,8 +606,8 @@
                                              property-shape* (cond-> (assoc property-shape :path tagged-path)
                                                                (:pattern property-shape) (assoc :pattern (build-pattern property-shape)))
 
-                                             p-shape-key    (first (util/sequential (first tagged-path)))
-                                             target-key     (first (util/sequential (peek tagged-path)))
+                                             p-shape-key    (first (first tagged-path))
+                                             target-key     (first (peek tagged-path))
                                              p-shapes*     (conj p-shapes property-shape*)
                                              ;; elevate following conditions to top-level custom keys to optimize validations
                                              ;; when processing txs
