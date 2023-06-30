@@ -101,35 +101,29 @@
                           :schema/callSign "j-rock"
                           :schema/age      42
                           :schema/favNums  [9004 9008 9015 9016 9023 9042]})
-          db-too-old   (try
-                         @(fluree/stage
-                           db
-                           {:id                 :ex/john,
-                            :type               [:ex/User],
-                            :schema/companyName "WrongCo"
-                            :schema/callSign    "j-rock"
-                            :schema/age         131})
-                         (catch Exception e e))
-          db-too-low   (try
-                         @(fluree/stage
-                           db
-                           {:id                 :ex/john,
-                            :type               [:ex/User],
-                            :schema/companyName ["John", "Johnny"]
-                            :schema/callSign    "j-rock"
-                            :schema/age         27
-                            :schema/favNums     [4 8 15 16 23 42]})
-                         (catch Exception e e))
-          db-two-probs (try
-                         @(fluree/stage
-                           db
-                           {:id              :ex/john
-                            :type            [:ex/User]
-                            :schema/name     "Johnny Boy"
-                            :schema/callSign "Johnny Boy"
-                            :schema/age      900
-                            :schema/favNums  [4 8 15 16 23 42]})
-                         (catch Exception e e))
+          db-too-old   @(fluree/stage
+                          db
+                          {:id                 :ex/john,
+                           :type               [:ex/User],
+                           :schema/companyName "WrongCo"
+                           :schema/callSign    "j-rock"
+                           :schema/age         131})
+          db-too-low   @(fluree/stage
+                          db
+                          {:id                 :ex/john,
+                           :type               [:ex/User],
+                           :schema/companyName ["John", "Johnny"]
+                           :schema/callSign    "j-rock"
+                           :schema/age         27
+                           :schema/favNums     [4 8 15 16 23 42]})
+          db-two-probs @(fluree/stage
+                          db
+                          {:id              :ex/john
+                           :type            [:ex/User]
+                           :schema/name     "Johnny Boy"
+                           :schema/callSign "Johnny Boy"
+                           :schema/age      900
+                           :schema/favNums  [4 8 15 16 23 42]})
           ok-results   @(fluree/query db-ok user-query)]
       (is (util/exception? db-too-old))
       (is (str/starts-with? (ex-message db-too-old)

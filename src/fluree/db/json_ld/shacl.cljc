@@ -377,7 +377,7 @@
   (go-try
     (let [sid (flake/s (first s-flakes))]
       (loop [[{:keys [path rhs-property] :as p-shape} & r] property2
-             pid->p-flakes pid->p-flakes
+             validated-properties #{}
              results []]
         (if p-shape
           ;; check property shapes
@@ -389,12 +389,11 @@
                         (validate-pair-constraints p-shape path-flakes rhs-flakes))
                       (validate-property-constraints p-shape path-flakes))]
             (println "DEP res2" (pr-str res))
-            (recur r (dissoc pid->p-flakes pid) (conj results res)))
+            (recur r (conj validated-properties pid) (conj results res)))
           ;; check node shape
           (let [[valid? err-msg] (coalesce-validation-results results)
-                ignored-properties (or ignored-properties #{})
                 unvalidated-properties (->> (keys pid->p-flakes)
-                                            (remove ignored-properties))]
+                                            (remove (set/union ignored-properties validated-properties)))]
             (println "DEP validation" (pr-str valid?) (pr-str err-msg) (pr-str closed?) (pr-str unvalidated-properties))
             (when (not valid?)
               (throw-property-shape-exception! err-msg))
@@ -411,7 +410,6 @@
       (doseq [shape shapes]
         (<? (validate-shape2 db shape pid->p-flakes s-flakes))
         #_(<? (validate-shape db shape flake-p-partitions s-flakes))))))
-
 
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
