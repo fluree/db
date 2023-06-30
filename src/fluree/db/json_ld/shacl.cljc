@@ -574,20 +574,18 @@
                                              p-shapes*      (update p-shapes path util/conjv property-shape*)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
                                              class-iris      (when-let [class-sids (:class property-shape)]
-                                                               (let [id-path (fn [sid] [sid const/iri-id])]
-                                                                 (loop [[csid & csids] class-sids
-                                                                        ciris []]
-                                                                   (let [ciri (->> csid
-                                                                                   id-path
-                                                                                   (query-range/index-range db :spot =)
-                                                                                   <?
-                                                                                   first
-                                                                                   flake/o)
-                                                                         next-ciris (conj ciris ciri)]
-                                                                     (log/trace "next-ciris:" next-ciris)
-                                                                     (if (seq csids)
-                                                                       (recur csids next-ciris)
-                                                                       next-ciris)))))
+                                                               (loop [[csid & csids] class-sids
+                                                                      ciris []]
+                                                                 (let [ciri (->> [csid const/iri-id]
+                                                                                 (query-range/index-range db :spot =)
+                                                                                 <?
+                                                                                 first
+                                                                                 flake/o)
+                                                                       next-ciris (conj ciris ciri)]
+                                                                   (log/trace "next-ciris:" next-ciris)
+                                                                   (if (seq csids)
+                                                                     (recur csids next-ciris)
+                                                                     next-ciris))))
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)
                                                                     (update :required util/conjs (:path property-shape))
