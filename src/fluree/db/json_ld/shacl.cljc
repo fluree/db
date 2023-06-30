@@ -342,7 +342,7 @@
           ;; Note that multiple values for sh:class are interpreted as a conjunction,
           ;; i.e. the values need to be SHACL instances of all of them.
           const/$sh:class
-          (assoc acc :class o)
+          (update acc :class (fnil conj []) o)
 
           const/$sh:pattern
           (assoc acc :pattern o)
@@ -460,6 +460,18 @@
                       {:status 400 :error :db/shacl-validation})))
     dt-map*))
 
+(defn register-class
+  [{:keys [dt] :as dt-map} class-iris]
+  (log/trace "register-class dt-map:" dt-map)
+  (log/trace "register-class class-iris:" class-iris)
+  {:dt          dt
+   :class       class-iris
+   :validate-fn (fn [{:keys [type]}]
+                  (log/trace "class validate-fn class-iris:" class-iris)
+                  (log/trace "class validate-fn type:" type)
+                  (let [types (if (coll? type) type [type])]
+                    (= (set class-iris) (set types))))})
+
 
 (defn- merge-datatype
   "Merging functions for use with 'merge-with'.
@@ -561,6 +573,21 @@
                                                                property-shape)
                                              p-shapes*      (update p-shapes path util/conjv property-shape*)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
+                                             class-iris      (when-let [class-sids (:class property-shape)]
+                                                               (let [id-path (fn [sid] [sid const/iri-id])]
+                                                                 (loop [[csid & csids] class-sids
+                                                                        ciris []]
+                                                                   (let [ciri (->> csid
+                                                                                   id-path
+                                                                                   (query-range/index-range db :spot =)
+                                                                                   <?
+                                                                                   first
+                                                                                   flake/o)
+                                                                         next-ciris (conj ciris ciri)]
+                                                                     (log/trace "next-ciris:" next-ciris)
+                                                                     (if (seq csids)
+                                                                       (recur csids next-ciris)
+                                                                       next-ciris)))))
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)
                                                                     (update :required util/conjs (:path property-shape))
@@ -571,7 +598,11 @@
 
                                                                     (:node-kind property-shape)
                                                                     (update-in [:datatype (:path property-shape)]
-                                                                               register-nodetype property-shape))]
+                                                                               register-nodetype property-shape)
+
+                                                                    (:class property-shape)
+                                                                    (update-in [:datatype (:path property-shape)]
+                                                                               register-class class-iris))]
 
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p

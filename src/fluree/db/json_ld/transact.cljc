@@ -88,8 +88,13 @@
           flakes      (cond
                         ;; a new node's data is contained, process as another node then link to this one
                         (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+                        (do
+                          (when validate-fn
+                            (or (validate-fn v-map)
+                                (throw (ex-info (str "Node did not pass SHACL validation: " v-map)
+                                                {:status 400, :error :db/shacl-validation}))))
+                          (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                            (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m))))
 
                         ;; a literal value
                         (and (some? value) (not= shacl-dt const/$xsd:anyURI))
