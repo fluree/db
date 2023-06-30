@@ -951,8 +951,9 @@
                                       "sh:minCount" 1
                                       "sh:maxCount" 1
                                       "sh:datatype" {"@id" "xsd:string"}}]}])
-                                   "https://example.com/country"   {"@id" "https://example.com/Country/AU"},
         db2    @(fluree/stage db1 {"@id"                           "https://example.com/Actor/65731"
+                                   "https://example.com/country"   {"@id"                      "https://example.com/Country/AU"
+                                                                    "https://example.com/name" "Oz"}
                                    "https://example.com/gender"    "Male"
                                    "https://example.com/character" ["Jake Sully" "Marcus Wright"]
                                    "https://example.com/movie"     [{"@id" "https://example.com/Movie/19995"}
