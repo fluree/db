@@ -277,8 +277,50 @@
   "Return the relevant flakes that are associated with the property shape's path."
   [db sid path pid->p-flakes]
   (go-try
-    (loop [[[pid type] & [[next-pid next-type] :as r]] path
-           path-flakes (get pid->p-flakes pid)]
+    (let [cached-flakes {sid pid->p-flakes}]
+      (loop [[[pid type] & [[next-pid next-type] :as r]] path
+             sid sid
+             path-flakes (get pid->p-flakes pid)]
+        (println "DEP resolve-path-flakes" (pr-str pid) type next-pid next-type (pr-str path-flakes))
+        (if pid
+          (let [path-flakes* (case type
+                               ;; sequence path
+                               ;; next-pid
+                               ;; (if-let [sequence-flake (first (filter #(= pid (flake/p %)) path-flakes))]
+                               ;;   ;; TODO: support other path types in a sequence
+                               ;;   (case next-type
+                               ;;     :inverse (<? (query-range/index-range db :post = [pid sid]))
+                               ;;     ;; predicate path
+                               ;;     (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-pid])))
+                               ;;   path-flakes)
+
+
+
+                               :alternative
+                               (throw (ex-info "Unsupported property path: alternativePath." {:path path}))
+
+                               :zero-plus
+                               (throw (ex-info "Unsupported property path: zeroOrMorePath." {:path path}))
+
+                               :one-plus
+                               (throw (ex-info "Unsupported property path: oneOrMorePath." {:path path}))
+
+                               :zero-one
+                               (throw (ex-info "Unsupported property path: zeroOrOnePath." {:path path}))
+
+                               :inverse
+                               (<? (query-range/index-range db :post = [pid sid]))
+
+                               :predicate
+                               (or (get-in cached-flakes [sid pid])
+                                   (loop [[f & r] path-flakes
+                                          res []]
+                                     (if f
+                                       (recur r (into res (<? (query-range/index-range db :spot = [(flake/o f) pid]))))
+                                       res))))]
+            (println "DEP path-flakes*" (pr-str path-flakes*))
+            (recur r :invalidate-cache path-flakes*))
+          path-flakes)))))
       (if pid
         (let [path-flakes* (cond
                              ;; sequence path
