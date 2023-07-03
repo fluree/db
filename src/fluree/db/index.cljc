@@ -87,20 +87,24 @@
     (assoc new-leaf :first new-first)))
 
 (defn ->node-comparator
-  [cmp]
+  "Return an index node comparator that compares nodes by considering two nodes
+  equal if their flake intervals overlap. Otherwise, a node is considered lower
+  than another if that node's flake interval is lower. The interval comparisons
+  are based on the supplied flake comparator `flake-cmp`."
+  [flake-cmp]
   (fn [node-x node-y]
     (let [rhs-x   (:rhs node-x)
           first-y (:first node-y)]
       (if (and rhs-x
                first-y
-               (<= (cmp rhs-x first-y)
+               (<= (flake-cmp rhs-x first-y)
                    0))
         -1
         (let [first-x (:first node-x)
               rhs-y   (:rhs node-y)]
           (if (and first-x
                    rhs-y
-                   (>= (cmp first-x rhs-y)
+                   (>= (flake-cmp first-x rhs-y)
                        0))
             1
             0))))))
