@@ -131,7 +131,7 @@
         in-range? (fn [node]
                     (intersects-range? node range-set))
         query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
+    (index/tree-chan resolver root start-flake end-flake (constantly true) resolved-leaf? 1 query-xf error-ch)))
 
 (defn unauthorized?
   [f]
@@ -271,7 +271,7 @@
                                           :start-flake start-flake
                                           :end-flake   end-flake})]
      (go-try
-       (let [history-ch (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
+       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake (constantly true) resolved-leaf? 1 query-xf error-ch)
                              (filter-authorized db start-flake end-flake error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!

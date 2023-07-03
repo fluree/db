@@ -53,7 +53,7 @@
                                                    (map (fn [flakes]
                                                           (filter filter-fn flakes))))})
           resolver  (index/->CachedTRangeResolver conn (get novelty idx*) t t (:lru-cache-atom conn))
-          tree-chan (index/tree-chan resolver idx-root in-range? query-range/resolved-leaf? 1 query-xf error-ch)]
+          tree-chan (index/tree-chan resolver idx-root fflake lflake (constantly true) query-range/resolved-leaf? 1 query-xf error-ch)]
       (async/go-loop []
         (let [next-chunk (<! tree-chan)]
           (if (nil? next-chunk)

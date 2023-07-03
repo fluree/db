@@ -313,13 +313,17 @@
       (async/put! node))))
 
 (defn resolve-children-when
-  [r resolve? error-ch branch]
+  [r start-flake end-flake resolve? error-ch branch]
   (if (resolved? branch)
-    (->> branch
-         :children
-         (map (fn [child]
-                (resolve-when r resolve? error-ch child)))
-         (async/map vector))
+    (let [start-node {:first start-flake, :rhs start-flake}
+          end-node   {:first end-flake, :rhs end-flake}
+          slice      (-> branch
+                         :children
+                         (flake/rslice end-node start-node))]
+      (->> slice
+           (map (fn [child]
+                  (resolve-when r resolve? error-ch child)))
+           (async/map vector)))
     (go [])))
 
 (defn tree-chan
@@ -333,8 +337,10 @@
   and `xf` is an optional transducer that will transform the output stream if
   supplied."
   ([r root resolve? include? error-ch]
-   (tree-chan r root resolve? include? 1 identity error-ch))
-  ([r root resolve? include? n xf error-ch]
+   (tree-chan r root flake/minimum flake/maximum resolve? include? 1 identity error-ch))
+  ([r root start-flake end-flake resolve? include? error-ch]
+   (tree-chan r root start-flake end-flake resolve? include? 1 identity error-ch))
+  ([r root start-flake end-flake resolve? include? n xf error-ch]
    (let [out (chan n xf)]
      (go
        (let [root-node (<! (resolve-when r resolve? error-ch root))]
@@ -346,7 +352,7 @@
                  (do (when (include? node)
                        (>! out (unmark-expanded node)))
                      (recur stack*))
-                 (let [children (<! (resolve-children-when r resolve? error-ch node))
+                 (let [children (<! (resolve-children-when r start-flake end-flake resolve? error-ch node))
                        stack**  (-> stack*
                                     (conj (mark-expanded node))
                                     (into children))]
