@@ -89,9 +89,21 @@
 (defn ->node-comparator
   [cmp]
   (fn [node-x node-y]
-    (let [first-x   (:first node-x)
-          first-y   (:first node-y)]
-      (cmp (first-x first-y)))))
+    (let [rhs-x   (:rhs node-x)
+          first-y (:first node-y)]
+      (if (and rhs-x
+               first-y
+               (<= (cmp rhs-x first-y)
+                   0))
+        -1
+        (let [first-x (:first node-x)
+              rhs-y   (:rhs node-y)]
+          (if (and first-x
+                   rhs-y
+                   (>= (cmp first-x rhs-y)
+                       0))
+            1
+            0))))))
 
 (defn sorted-node-set-by
   ([cmp]
