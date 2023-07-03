@@ -340,11 +340,11 @@
   is an optional parameter specifying the number of nodes to load concurrently,
   and `xf` is an optional transducer that will transform the output stream if
   supplied."
-  ([r root resolve? include? error-ch]
-   (tree-chan r root flake/minimum flake/maximum resolve? include? 1 identity error-ch))
-  ([r root start-flake end-flake resolve? include? error-ch]
-   (tree-chan r root start-flake end-flake resolve? include? 1 identity error-ch))
-  ([r root start-flake end-flake resolve? include? n xf error-ch]
+  ([r root resolve? error-ch]
+   (tree-chan r root flake/minimum flake/maximum resolve? 1 identity error-ch))
+  ([r root start-flake end-flake resolve? error-ch]
+   (tree-chan r root start-flake end-flake resolve? 1 identity error-ch))
+  ([r root start-flake end-flake resolve? n xf error-ch]
    (let [out (chan n xf)]
      (go
        (let [root-node (<! (resolve-when r resolve? error-ch root))]
@@ -353,8 +353,7 @@
              (let [stack* (pop stack)]
                (if (or (leaf? node)
                        (expanded? node))
-                 (do (when (include? node)
-                       (>! out (unmark-expanded node)))
+                 (do (>! out (unmark-expanded node))
                      (recur stack*))
                  (let [children (<! (resolve-children-when r start-flake end-flake resolve? error-ch node))
                        stack**  (-> stack*

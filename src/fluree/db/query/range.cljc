@@ -94,7 +94,8 @@
   flakes from the leaf nodes in the input stream, with one flake collection for
   each input leaf."
   [{:keys [start-flake end-flake flake-xf] :as opts}]
-  (let [query-xf (comp (map :flakes)
+  (let [query-xf (comp (filter index/leaf?)
+                       (map :flakes)
                        (map (fn [flakes]
                               (flake/slice flakes start-flake end-flake)))
                        (map (fn [flakes]
@@ -111,9 +112,9 @@
   transaction range starting at `from-t` and ending at `to-t`."
   [{:keys [lru-cache-atom] :as conn} root novelty error-ch
    {:keys [from-t to-t start-flake end-flake] :as opts}]
-  (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
-        query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root start-flake end-flake (constantly true) index/leaf? 1 query-xf error-ch)))
+  (let [resolver (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
+        query-xf (extract-query-flakes opts)]
+    (index/tree-chan resolver root start-flake end-flake (constantly true) 1 query-xf error-ch)))
 
 (defn unauthorized?
   [f]
@@ -245,12 +246,12 @@
          novelty  (get-in db [:novelty idx])
 
          ;; resolve-flake-slices
-         resolver  (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:lru-cache-atom conn))
-         query-xf  (extract-query-flakes {:idx         idx
-                                          :start-flake start-flake
-                                          :end-flake   end-flake})]
+         resolver (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:lru-cache-atom conn))
+         query-xf (extract-query-flakes {:idx         idx
+                                         :start-flake start-flake
+                                         :end-flake   end-flake})]
      (go-try
-       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake (constantly true) index/leaf? 1 query-xf error-ch)
+       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake (constantly true) 1 query-xf error-ch)
                              (filter-authorized db start-flake end-flake error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
