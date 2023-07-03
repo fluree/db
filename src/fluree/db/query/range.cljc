@@ -94,17 +94,14 @@
   flakes from the leaf nodes in the input stream, with one flake collection for
   each input leaf."
   [{:keys [start-flake end-flake flake-xf] :as opts}]
-  (let [query-xf (comp (filter index/leaf?)
-                       (map :flakes)
-                       (map (fn [flakes]
-                              (flake/slice flakes start-flake end-flake)))
-                       (map (fn [flakes]
-                              (into [] (query-filter opts) flakes))))]
-    (if flake-xf
-      (let [slice-xf (map (fn [flakes]
-                            (sequence flake-xf flakes)))]
-        (comp query-xf slice-xf))
-      query-xf)))
+  (let [flake-xf* (cond-> (query-filter opts)
+                    flake-xf (comp flake-xf))]
+    (comp (filter index/leaf?)
+          (map :flakes)
+          (map (fn [flakes]
+                 (flake/slice flakes start-flake end-flake)))
+          (map (fn [flakes]
+                 (into [] flake-xf* flakes))))))
 
 (defn resolve-flake-slices
   "Returns a channel that will contain a stream of chunked flake collections that
