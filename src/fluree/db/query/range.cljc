@@ -74,11 +74,6 @@
         m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
     (flake/create s p o' dt t op m')))
 
-(defn resolved-leaf?
-  [node]
-  (and (index/leaf? node)
-       (index/resolved? node)))
-
 (defn query-filter
   "Returns a transducer to filter flakes according to the boolean function values
   of the `:subject-fn`, `:predicate-fn`, and `:object-fn` keys from the supplied
@@ -118,7 +113,7 @@
    {:keys [from-t to-t start-flake end-flake] :as opts}]
   (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
         query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root start-flake end-flake (constantly true) resolved-leaf? 1 query-xf error-ch)))
+    (index/tree-chan resolver root start-flake end-flake (constantly true) index/leaf? 1 query-xf error-ch)))
 
 (defn unauthorized?
   [f]
@@ -255,7 +250,7 @@
                                           :start-flake start-flake
                                           :end-flake   end-flake})]
      (go-try
-       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake (constantly true) resolved-leaf? 1 query-xf error-ch)
+       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake (constantly true) index/leaf? 1 query-xf error-ch)
                              (filter-authorized db start-flake end-flake error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
