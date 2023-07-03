@@ -728,4 +728,4 @@
                loaded-db3 (fluree/db loaded3)]
            (is (= [{:id :ex/kittens}]
                   @(fluree/query loaded-db3 description-query))
-               "Only :ex/kittens should be left")))) ))
+               "Only :ex/kittens should be left"))))))

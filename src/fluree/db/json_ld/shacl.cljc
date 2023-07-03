@@ -179,11 +179,22 @@
                     (coalesce-validation-results flake-results logical-constraint)))]
     (coalesce-validation-results results)))
 
+(defn validate-value-properties
+  ;; TODO: Only supports 'in' so far. Add the others.
+  [{:keys [in logical-constraint] :as _p-shape} p-flakes]
+  (let [results (for [flake p-flakes
+                      :let [[val] (flake-value flake)
+                            in-set (set in)]]
+                  (if (in-set val)
+                    [true (str "sh:not sh:in: value " val " must not be one of " in)]
+                    [false (str "sh:in: value " val " must be one of " in)]))]
+    (coalesce-validation-results results logical-constraint)))
+
 (defn validate-property
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive min-length max-length pattern] :as p-shape} p-flakes]
+           max-exclusive min-length max-length pattern in] :as p-shape} p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
   ;;       Should embed results and error messages and short-circuit as appropriate
   (let [validation (if (or min-count max-count)
@@ -196,6 +207,9 @@
         validation (if (and (first validation)
                             (or min-length max-length pattern))
                      (validate-string-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation) in)
+                     (validate-value-properties p-shape p-flakes)
                      validation)]
     validation))
 
@@ -260,7 +274,7 @@
 (defn validate-shape
   [{:keys [property closed-props] :as shape}
    flake-p-partitions all-flakes]
-  (log/debug "validate-shape shape:" shape)
+  (log/trace "validate-shape shape:" shape)
   (loop [[p-flakes & r] flake-p-partitions
          required (:required shape)]
     (if p-flakes
@@ -328,7 +342,7 @@
           ;; Note that multiple values for sh:class are interpreted as a conjunction,
           ;; i.e. the values need to be SHACL instances of all of them.
           const/$sh:class
-          (assoc acc :class o)
+          (update acc :class (fnil conj []) o)
 
           const/$sh:pattern
           (assoc acc :pattern o)
@@ -352,7 +366,7 @@
           (assoc acc :has-value o)
 
           const/$sh:in
-          (assoc acc :in o)
+          (update acc :in (fnil conj []) o)
 
           const/$sh:minExclusive
           (assoc acc :min-exclusive o)
@@ -369,14 +383,11 @@
           const/$sh:equals
           (assoc acc :pair-constraint :equals :rhs-property o)
 
-
           const/$sh:disjoint
           (assoc acc :pair-constraint :disjoint  :rhs-property o)
 
-
           const/$sh:lessThan
           (assoc acc :pair-constraint :lessThan  :rhs-property o)
-
 
           const/$sh:lessThanOrEquals
           (assoc acc :pair-constraint :lessThanOrEquals  :rhs-property o)
@@ -449,6 +460,18 @@
                       {:status 400 :error :db/shacl-validation})))
     dt-map*))
 
+(defn register-class
+  [{:keys [dt] :as dt-map} class-iris]
+  (log/trace "register-class dt-map:" dt-map)
+  (log/trace "register-class class-iris:" class-iris)
+  {:dt          dt
+   :class       class-iris
+   :validate-fn (fn [{:keys [type]}]
+                  (log/trace "class validate-fn class-iris:" class-iris)
+                  (log/trace "class validate-fn type:" type)
+                  (let [types (if (coll? type) type [type])]
+                    (= (set class-iris) (set types))))})
+
 
 (defn- merge-datatype
   "Merging functions for use with 'merge-with'.
@@ -487,8 +510,6 @@
                          (conj 0)                           ;; pid 0 holds the IRI and is always allowed
                          (into (keys property)))]
     (assoc shape :closed-props closed-props)))
-
-
 
 (defn get-regex-flag
   "Given an `sh:flag` value, returns the corresponding regex flag
@@ -552,6 +573,18 @@
                                                                property-shape)
                                              p-shapes*      (update p-shapes path util/conjv property-shape*)
                                              ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
+                                             class-iris      (when-let [class-sids (:class property-shape)]
+                                                               (loop [[csid & csids] class-sids
+                                                                      ciris []]
+                                                                 (let [ciri (->> [csid const/iri-id]
+                                                                                 (query-range/index-range db :spot =)
+                                                                                 <?
+                                                                                 first
+                                                                                 flake/o)
+                                                                       next-ciris (conj ciris ciri)]
+                                                                   (if (seq csids)
+                                                                     (recur csids next-ciris)
+                                                                     next-ciris))))
                                              shape*         (cond-> shape
                                                                     (:required? property-shape)
                                                                     (update :required util/conjs (:path property-shape))
@@ -562,7 +595,11 @@
 
                                                                     (:node-kind property-shape)
                                                                     (update-in [:datatype (:path property-shape)]
-                                                                               register-nodetype property-shape))]
+                                                                               register-nodetype property-shape)
+
+                                                                    (:class property-shape)
+                                                                    (update-in [:datatype (:path property-shape)]
+                                                                               register-class class-iris))]
 
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p

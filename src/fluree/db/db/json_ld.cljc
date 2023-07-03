@@ -196,9 +196,6 @@
 (defn retrieve-context
   "Returns the parsed context. Caches."
   [default-context context-cache supplied-context context-type]
-  (log/trace "retrieve-context - default: " default-context
-             "supplied:" supplied-context
-             "context-type: " context-type)
   (or (get-in @context-cache [context-type supplied-context])
       (let [context (cond (= ::dbproto/default-context supplied-context)
                           (if (= :keyword context-type)

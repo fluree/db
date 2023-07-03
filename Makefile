@@ -109,12 +109,12 @@ browser-test: out/fluree-browser-sdk.js
 cljstest: cljs-browser-test cljs-node-test
 
 cljtest:
-	clojure -X:cljtest
+	clojure -X:dev:cljtest
 
 test: cljtest cljstest nodejs-test browser-test
 
 eastwood:
-	clojure -M:cljtest:eastwood
+	clojure -M:dev:cljtest:eastwood
 
 ci: test eastwood
 
