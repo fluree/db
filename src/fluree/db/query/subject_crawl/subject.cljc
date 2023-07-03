@@ -42,10 +42,6 @@
         return-chan (async/chan 10 (comp (map flake/s)
                                          (dedupe)))]
     (let [idx-root  (get db idx*)
-          cmp       (:comparator idx-root)
-          range-set (flake/sorted-set-by cmp)
-          in-range? (fn [node]
-                      (query-range/intersects-range? node range-set))
           query-xf  (where-subj-xf {:start-flake fflake
                                     :end-flake   lflake
                                     ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values

@@ -79,15 +79,6 @@
   (and (index/leaf? node)
        (index/resolved? node)))
 
-(defn intersects-range?
-  "Returns true if the supplied `node` contains flakes between the `lower` and
-  `upper` flakes, according to the `node`'s comparator."
-  [node range-set]
-  (not (or (and (:rhs node)
-                (flake/lower-than-all? (:rhs node) range-set))
-           (and (not (:leftmost? node))
-                (flake/higher-than-all? (:first node) range-set)))))
-
 (defn query-filter
   "Returns a transducer to filter flakes according to the boolean function values
   of the `:subject-fn`, `:predicate-fn`, and `:object-fn` keys from the supplied
@@ -126,10 +117,6 @@
   [{:keys [lru-cache-atom] :as conn} root novelty error-ch
    {:keys [from-t to-t start-flake end-flake] :as opts}]
   (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
-        cmp       (:comparator root)
-        range-set (flake/sorted-set-by cmp [start-flake end-flake])
-        in-range? (fn [node]
-                    (intersects-range? node range-set))
         query-xf  (extract-query-flakes opts)]
     (index/tree-chan resolver root start-flake end-flake (constantly true) resolved-leaf? 1 query-xf error-ch)))
 
@@ -260,13 +247,10 @@
 
          ;; index-range*
          idx-root (get db idx)
-         idx-cmp  (get-in db [:comparators idx])
          novelty  (get-in db [:novelty idx])
 
          ;; resolve-flake-slices
          resolver  (index/->CachedHistoryRangeResolver conn novelty from-t to-t (:lru-cache-atom conn))
-         range-set (flake/sorted-set-by idx-cmp [start-flake end-flake])
-         in-range? (fn [node] (intersects-range? node range-set))
          query-xf  (extract-query-flakes {:idx         idx
                                           :start-flake start-flake
                                           :end-flake   end-flake})]

@@ -466,18 +466,6 @@
              (->Flake util/max-long nil nil nil t nil nil)
              (->Flake util/min-long nil nil nil t nil nil)))
 
-(defn lower-than-all?
-  [f ss]
-  (-> ss
-      (pss/rslice f nil)
-      empty?))
-
-(defn higher-than-all?
-  [f ss]
-  (-> ss
-      (pss/slice f nil)
-      empty?))
-
 (defn sorted-set-by
   ([comparator]
    (pss/sorted-set-by comparator))
