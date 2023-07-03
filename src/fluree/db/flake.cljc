@@ -226,11 +226,11 @@
 (def maximum
   "The largest flake possible"
   (->Flake util/max-long util/max-long util/max-long
-           util/max-integer util/min-integer true util/max-long))
+           util/max-integer util/min-integer true util/max-integer))
 
 (def minimum
   (->Flake util/min-long util/min-long util/min-long
-           util/min-integer 0 false util/min-long))
+           util/min-integer 0 false util/min-integer))
 
 (defn- assoc-flake
   "Assoc for Flakes"
@@ -453,6 +453,10 @@
   "From and to are Flakes"
   [ss from to]
   (pss/slice ss from to))
+
+(defn rslice
+  [ss from to]
+  (pss/rslice ss from to))
 
 
 (defn match-tspo
