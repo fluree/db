@@ -1,9 +1,11 @@
 (ns fluree.db.flake
   (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take last])
   (:require [me.tonsky.persistent-sorted-set :as pss]
+            [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util])
-  #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
+  #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]]))
+  (:import (me.tonsky.persistent_sorted_set PersistentSortedSet)))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -455,9 +457,20 @@
   (pss/slice ss from to))
 
 (defn rslice
-  [ss from to]
-  (pss/rslice ss from to))
+  [ss to from]
+  (pss/rslice ss to from))
 
+(defn sorted-set-by
+  "Create a new sorted set according to `comparator`. If a collection of flakes or
+  index nodes is supplied as the `elts` argument, the returned set will contain
+  all of the elements in the collection. If the `elts` collection is supplied,
+  it *must* already be sorted."
+  ([comparator]
+   (pss/sorted-set-by comparator))
+  ([comparator elts]
+   (->> elts
+        arrays/into-array
+        (pss/from-sorted-array comparator))))
 
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
@@ -465,12 +478,6 @@
   (pss/slice ss
              (->Flake util/max-long nil nil nil t nil nil)
              (->Flake util/min-long nil nil nil t nil nil)))
-
-(defn sorted-set-by
-  ([comparator]
-   (pss/sorted-set-by comparator))
-  ([comparator flakes]
-   (pss/from-sequential comparator flakes)))
 
 (defn transient-reduce
   [reducer ss coll]
