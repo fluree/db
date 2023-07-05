@@ -36,16 +36,6 @@
     "Populate the supplied index branch or leaf node maps with either the child
      node attributes or the flakes they store, respectively."))
 
-(defn try-resolve
-  [r error-ch node]
-  (go
-    (try* (<? (resolve r node))
-          (catch* e
-                  (log/error e
-                             "Error resolving index node:"
-                             (select-keys node [:id :ledger-alias]))
-                  (>! error-ch e)))))
-
 (defn resolved?
   "Returns `true` if the data associated with the index node map `node` is fully
   resolved from storage"
@@ -53,6 +43,11 @@
   (cond
     (leaf? node)   (not (nil? (:flakes node)))
     (branch? node) (not (nil? (:children node)))))
+
+(defn resolved-leaf?
+  [node]
+  (and (leaf? node)
+       (resolved? node)))
 
 (defn unresolve
   "Clear the populated child node attributes from the supplied `node` map if it
@@ -309,25 +304,77 @@
   [node]
   (-> node ::expanded true?))
 
+(defn trim-start?
+  [cmp start-flake first-flake]
+  (if (some? first-flake)
+    (if (some? start-flake)
+      (> 0 (cmp start-flake first-flake))
+      false)
+    (if (some? start-flake)
+      true
+      false)))
+
+(defn trim-end?
+  [cmp end-flake rhs]
+  (if (some? rhs)
+    (if (some? end-flake)
+      (> 0 (cmp end-flake rhs))
+      false)
+    (if (some? end-flake)
+      true
+      false)))
+
+(defn trim-branch
+  [branch new-first new-rhs]
+  (let [start-node {:first new-first, :rhs new-first}
+        end-node   {:first new-rhs, :rhs new-rhs}]
+    (update branch :children flake/rslice end-node start-node)))
+
+(defn trim-leaf
+  [leaf new-first new-rhs]
+  (update leaf :flakes flake/subrange new-first new-rhs))
+
+(defn trim-node
+  [node start-flake end-flake]
+  (let [cmp         (:comparator node)
+        first-flake (:first node)
+        rhs         (:rhs node)
+        new-first   (when (trim-start? cmp start-flake first-flake)
+                      start-flake)
+        new-rhs     (when (trim-end? cmp end-flake rhs)
+                      end-flake)]
+    (if (or new-first new-rhs)
+      (if (leaf? node)
+        (trim-leaf node new-first new-rhs)
+        (trim-branch node new-first new-rhs))
+      node)))
+
+(defn try-resolve
+  [r start-flake end-flake error-ch node]
+  (go
+    (try* (let [resolved (<? (resolve r node))]
+            (trim-node resolved start-flake end-flake))
+          (catch* e
+                  (log/error e
+                             "Error resolving index node:"
+                             (select-keys node [:id :ledger-alias]))
+                  (>! error-ch e)))))
+
 (defn resolve-when
-  [r resolve? error-ch node]
+  [r start-flake end-flake resolve? error-ch node]
   (if (resolve? node)
-    (try-resolve r error-ch node)
+    (try-resolve r start-flake end-flake error-ch node)
     (doto (chan)
       (async/put! node))))
 
 (defn resolve-children-when
   [r start-flake end-flake resolve? error-ch branch]
   (if (resolved? branch)
-    (let [start-node {:first start-flake, :rhs start-flake}
-          end-node   {:first end-flake, :rhs end-flake}
-          slice      (-> branch
-                         :children
-                         (flake/rslice end-node start-node))]
-      (->> slice
-           (map (fn [child]
-                  (resolve-when r resolve? error-ch child)))
-           (async/map vector)))
+    (->> branch
+         :children
+         (map (fn [child]
+                (resolve-when r start-flake end-flake resolve? error-ch child)))
+         (async/map vector))
     (go [])))
 
 (defn tree-chan
@@ -347,7 +394,7 @@
   ([r root start-flake end-flake resolve? n xf error-ch]
    (let [out (chan n xf)]
      (go
-       (let [root-node (<! (resolve-when r resolve? error-ch root))]
+       (let [root-node (<! (resolve-when r start-flake end-flake resolve? error-ch root))]
          (loop [stack [root-node]]
            (when-let [node (peek stack)]
              (let [stack* (pop stack)]

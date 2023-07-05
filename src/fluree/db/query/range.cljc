@@ -87,11 +87,6 @@
                      object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
     (apply comp filter-xfs)))
 
-(defn resolved-leaf?
-  [node]
-  (and (index/leaf? node)
-       (index/resolved? node)))
-
 (defn extract-query-flakes
   "Returns a transducer to extract flakes from each leaf from a stream of index
   leaf nodes that satisfy the bounds specified in the supplied query options
@@ -101,10 +96,8 @@
   [{:keys [start-flake end-flake flake-xf] :as opts}]
   (let [flake-xf* (cond-> (query-filter opts)
                     flake-xf (comp flake-xf))]
-    (comp (filter resolved-leaf?)
+    (comp (filter index/resolved-leaf?)
           (map :flakes)
-          (map (fn [flakes]
-                 (flake/slice flakes start-flake end-flake)))
           (map (fn [flakes]
                  (into [] flake-xf* flakes))))))
 

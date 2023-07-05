@@ -13,11 +13,9 @@
 
 (defn where-subj-xf
   "Transducing function to extract matching subjects from initial where clause."
-  [{:keys [start-test start-flake end-test end-flake xf]}]
-  (apply comp (cond-> [(filter index/leaf?)
-                       (map :flakes)
-                       (map (fn [flakes]
-                              (flake/slice flakes start-flake end-flake)))]
+  [{:keys [xf]}]
+  (apply comp (cond-> [(filter index/resolved-leaf?)
+                       (map :flakes)]
                 xf (conj xf))))
 
 
