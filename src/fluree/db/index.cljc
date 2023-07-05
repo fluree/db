@@ -126,17 +126,26 @@
    :size         0
    :t            0})
 
+(defn leftmost?
+  [node]
+  (-> node :first nil?))
+
+(defn rightmost?
+  [node]
+  (-> node :rhs nil?))
+
 (defn descendant?
   "Checks if the `node` passed in the second argument is a descendant of the
   `branch` passed in the first argument"
   [{:keys [rhs], cmp :comparator, first-flake :first, :as branch}
-   {node-first :first, node-rhs :rhs, :as _node}]
+   {node-first :first, node-rhs :rhs, :as node}]
   (if-not (branch? branch)
     false
-    (and (or (nil? first-flake)
-             (not (pos? (cmp first-flake node-first))))
-         (or (nil? rhs)
-             (and (not (nil? node-rhs))
+    (and (or (leftmost? branch)
+             (and (not (leftmost? node))
+                  (not (pos? (cmp first-flake node-first)))))
+         (or (rightmost? branch)
+             (and (not (rightmost? node))
                   (not (pos? (cmp node-rhs rhs))))))))
 
 (defn empty-branch
@@ -181,10 +190,10 @@
        (flake/disj-all flakes)))
 
 (defn novelty-subrange
-  [{:keys [rhs], first-flake :first, :as _node} through-t novelty]
+  [{:keys [rhs], first-flake :first, :as node} through-t novelty]
   (log/trace "novelty-subrange: first-flake:" first-flake "\nrhs:" rhs)
-  (let [subrange (if (and (nil? first-flake)
-                          (nil? rhs))
+  (let [subrange (if (and (leftmost? node)
+                          (rightmost? node))
                    novelty
                    (flake/slice novelty first-flake rhs))]
     (flakes-through through-t subrange)))
