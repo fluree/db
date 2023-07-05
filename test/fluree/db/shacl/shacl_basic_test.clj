@@ -951,7 +951,7 @@
           (is (= [{"id" "ex:Luke",
                    "schema:name" "Luke",
                    "ex:parent" {"id" "ex:Anakin"
-                                "type" "ex:Parent"
+                                "rdf:type" ["ex:Parent"]
                                 "schema:name" "Anakin"}}]
                  @(fluree/query valid-parent {"select" {"?s" ["*" {"ex:parent" ["*"]}]}
                                               "where" [["?s" "id" "ex:Luke"]]})))

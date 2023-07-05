@@ -138,7 +138,12 @@
                              const/$sh:equals
                              const/$sh:disjoint
                              const/$sh:lessThan
-                             const/$sh:lessThanOrEquals}
+                             const/$sh:lessThanOrEquals
+                             const/$sh:inversePath
+                             const/$sh:alternativePath
+                             const/$sh:zeroOrMorePath
+                             const/$sh:oneOrMorePath
+                             const/$sh:zeroOrOnePath}
                            referring-pid))
                     (next-pid)
                     (next-sid)))]
