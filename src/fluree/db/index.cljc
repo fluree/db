@@ -124,17 +124,16 @@
    :first        nil
    :rhs          nil
    :size         0
-   :t            0
-   :leftmost?    true})
+   :t            0})
 
 (defn descendant?
   "Checks if the `node` passed in the second argument is a descendant of the
   `branch` passed in the first argument"
-  [{:keys [rhs leftmost?], cmp :comparator, first-flake :first, :as branch}
+  [{:keys [rhs], cmp :comparator, first-flake :first, :as branch}
    {node-first :first, node-rhs :rhs, :as _node}]
   (if-not (branch? branch)
     false
-    (and (or leftmost?
+    (and (or (nil? first-flake)
              (not (pos? (cmp first-flake node-first))))
          (or (nil? rhs)
              (and (not (nil? node-rhs))
@@ -155,8 +154,7 @@
      :rhs          nil
      :children     children
      :size         0
-     :t            0
-     :leftmost?    true}))
+     :t            0}))
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
@@ -183,24 +181,12 @@
        (flake/disj-all flakes)))
 
 (defn novelty-subrange
-  [{:keys [rhs leftmost?], first-flake :first, :as _node} through-t novelty]
-  (log/trace "novelty-subrange: first-flake:" first-flake "\nrhs:" rhs "\nleftmost?" leftmost?)
-  (let [subrange (cond
-                   ;; standard case: both left and right boundaries
-                   (and rhs (not leftmost?))
-                   (flake/slice novelty first-flake rhs)
-
-                   ;; right only boundary
-                   (and rhs leftmost?)
-                   (flake/slice novelty nil rhs)
-
-                   ;; left only boundary
-                   (and (nil? rhs) (not leftmost?))
-                   (flake/slice novelty first-flake nil)
-
-                   ;; no boundary
-                   (and (nil? rhs) leftmost?)
-                   novelty)]
+  [{:keys [rhs], first-flake :first, :as _node} through-t novelty]
+  (log/trace "novelty-subrange: first-flake:" first-flake "\nrhs:" rhs)
+  (let [subrange (if (and (nil? first-flake)
+                          (nil? rhs))
+                   novelty
+                   (flake/slice novelty first-flake rhs))]
     (flakes-through through-t subrange)))
 
 (defn stale-by

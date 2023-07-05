@@ -130,8 +130,7 @@
             (:first index-data) (update :first flake/parts->Flake)
             true (assoc :comparator cmp
                         :ledger-alias ledger-alias
-                        :t t
-                        :leftmost? true))))
+                        :t t))))
 
 
 (defn reify-db-root
@@ -192,17 +191,14 @@
            db*))))))
 
 (defn fetch-child-attributes
-  [conn {:keys [id comparator leftmost?] :as branch}]
+  [conn {:keys [id comparator] :as branch}]
   (go-try
     (if-let [{:keys [children]} (<? (read-branch conn id))]
       (let [branch-metadata (select-keys branch [:comparator :ledger-alias
                                                  :t :tt-id :tempid])
-            child-nodes     (map-indexed (fn [i child]
-                                           (-> branch-metadata
-                                               (assoc :leftmost? (and leftmost?
-                                                                      (zero? i)))
-                                               (merge child)))
-                                         children)]
+            child-nodes     (map (fn [child]
+                                   (merge branch-metadata child))
+                                 children)]
         (index/sorted-node-set-by comparator child-nodes))
       (throw (ex-info (str "Unable to retrieve index branch with id "
                            id " from storage.")

@@ -181,22 +181,13 @@
         :rhs rhs))
     branch))
 
-(defn update-sibling-leftmost
-  [[maybe-leftmost & not-leftmost]]
-  (into [maybe-leftmost]
-        (map (fn [non-left-node]
-               (assoc non-left-node
-                 :leftmost? false)))
-        not-leftmost))
-
 (defn rebalance-children
   [branch idx t child-nodes]
   (let [target-count (/ *overflow-children* 2)]
     (->> child-nodes
          (partition-all target-count)
          (map (fn [kids]
-                (update-branch branch idx t kids)))
-         update-sibling-leftmost)))
+                (update-branch branch idx t kids))))))
 
 (defn filter-predicates
   [preds & flake-sets]
@@ -210,7 +201,7 @@
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
   `*overflow-bytes*`."
-  [{:keys [flakes leftmost? rhs] :as leaf}]
+  [{:keys [flakes rhs] :as leaf}]
   (if (overflow-leaf? leaf)
     (let [target-size (/ *overflow-bytes* 2)]
       (log/debug "Rebalancing index leaf:"
@@ -224,8 +215,7 @@
                 last-leaf (-> leaf
                               (assoc :flakes subrange
                                      :first cur-first
-                                     :rhs rhs)
-                              (dissoc :id :leftmost?))]
+                                     :rhs rhs))]
             (conj leaves last-leaf))
           (let [new-size (-> f flake/size-flake (+ cur-size) long)]
             (if (> new-size target-size)
@@ -233,9 +223,7 @@
                     new-leaf (-> leaf
                                  (assoc :flakes subrange
                                         :first cur-first
-                                        :rhs f
-                                        :leftmost? (and (empty? leaves)
-                                                        leftmost?))
+                                        :rhs f)
                                  (dissoc :id))]
                 (recur r 0 f (conj leaves new-leaf)))
               (recur r new-size cur-first leaves))))))
