@@ -59,26 +59,24 @@
 
 (defn add-flakes
   [leaf flakes]
-  (let [new-leaf (-> leaf
-                     (update :flakes flake/conj-all flakes)
-                     (update :size (fn [size]
-                                     (->> flakes
-                                          (map flake/size-flake)
-                                          (reduce + size)))))
-        new-first (or (some-> new-leaf :flakes first)
-                      flake/maximum)]
+  (let [new-leaf  (-> leaf
+                      (update :flakes flake/conj-all flakes)
+                      (update :size (fn [size]
+                                      (->> flakes
+                                           (map flake/size-flake)
+                                           (reduce + size)))))
+        new-first (some-> new-leaf :flakes first)]
     (assoc new-leaf :first new-first)))
 
 (defn rem-flakes
   [leaf flakes]
-  (let [new-leaf (-> leaf
-                     (update :flakes flake/disj-all flakes)
-                     (update :size (fn [size]
-                                     (->> flakes
-                                          (map flake/size-flake)
-                                          (reduce - size)))))
-        new-first (or (some-> new-leaf :flakes first)
-                      flake/maximum)]
+  (let [new-leaf  (-> leaf
+                      (update :flakes flake/disj-all flakes)
+                      (update :size (fn [size]
+                                      (->> flakes
+                                           (map flake/size-flake)
+                                           (reduce - size)))))
+        new-first (some-> new-leaf :flakes first)]
     (assoc new-leaf :first new-first)))
 
 (defn ->node-comparator
@@ -387,7 +385,7 @@
   and `xf` is an optional transducer that will transform the output stream if
   supplied."
   ([r root resolve? error-ch]
-   (tree-chan r root flake/minimum flake/maximum resolve? 1 identity error-ch))
+   (tree-chan r root nil nil resolve? error-ch))
   ([r root start-flake end-flake resolve? error-ch]
    (tree-chan r root start-flake end-flake resolve? 1 identity error-ch))
   ([r root start-flake end-flake resolve? n xf error-ch]

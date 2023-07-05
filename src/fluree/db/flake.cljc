@@ -224,15 +224,6 @@
   [flake]
   [(s flake) (p flake) (o flake) (dt flake) (t flake) (op flake) (m flake)])
 
-(def maximum
-  "The largest flake possible"
-  (->Flake util/max-long util/max-long util/max-long
-           util/max-integer util/min-integer true util/max-integer))
-
-(def minimum
-  (->Flake util/min-long util/min-long util/min-long
-           util/min-integer 0 false util/min-integer))
-
 (defn- assoc-flake
   "Assoc for Flakes"
   [flake k v]
