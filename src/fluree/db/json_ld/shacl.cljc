@@ -275,82 +275,31 @@
 
 (defn resolve-path-flakes
   "Return the relevant flakes that are associated with the property shape's path."
-  [db sid path pid->p-flakes]
-  (go-try
-    (let [cached-flakes {sid pid->p-flakes}]
-      (loop [[[pid type] & [[next-pid next-type] :as r]] path
-             sid sid
-             path-flakes (get pid->p-flakes pid)]
-        (println "DEP resolve-path-flakes" (pr-str pid) type next-pid next-type (pr-str path-flakes))
-        (if pid
-          (let [path-flakes* (case type
-                               ;; sequence path
-                               ;; next-pid
-                               ;; (if-let [sequence-flake (first (filter #(= pid (flake/p %)) path-flakes))]
-                               ;;   ;; TODO: support other path types in a sequence
-                               ;;   (case next-type
-                               ;;     :inverse (<? (query-range/index-range db :post = [pid sid]))
-                               ;;     ;; predicate path
-                               ;;     (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-pid])))
-                               ;;   path-flakes)
-
-
-
-                               :alternative
-                               (throw (ex-info "Unsupported property path: alternativePath." {:path path}))
-
-                               :zero-plus
-                               (throw (ex-info "Unsupported property path: zeroOrMorePath." {:path path}))
-
-                               :one-plus
-                               (throw (ex-info "Unsupported property path: oneOrMorePath." {:path path}))
-
-                               :zero-one
-                               (throw (ex-info "Unsupported property path: zeroOrOnePath." {:path path}))
-
-                               :inverse
-                               (<? (query-range/index-range db :post = [pid sid]))
-
-                               :predicate
-                               (or (get-in cached-flakes [sid pid])
-                                   (loop [[f & r] path-flakes
-                                          res []]
-                                     (if f
-                                       (recur r (into res (<? (query-range/index-range db :spot = [(flake/o f) pid]))))
-                                       res))))]
-            (println "DEP path-flakes*" (pr-str path-flakes*))
-            (recur r :invalidate-cache path-flakes*))
-          path-flakes)))))
-      (if pid
-        (let [path-flakes* (cond
-                             ;; sequence path
-                             next-pid
-                             (if-let [sequence-flake (first (filter #(= pid (flake/p %)) path-flakes))]
-                               ;; TODO: support other path types in a sequence
-                               (case next-type
-                                 ;; predicate path
-                                 (<? (query-range/index-range db :spot = [(flake/o sequence-flake) next-pid])))
-                               path-flakes)
-
-                             (= type :inverse)
-                             (<? (query-range/index-range db :post = [pid sid]))
-
-                             (= type :alternative)
-                             (throw (ex-info "Unsupported property path: alternativePath." {:path path}))
-
-                             (= type :zero-plus)
-                             (throw (ex-info "Unsupported property path: zeroOrMorePath." {:path path}))
-
-                             (= type :one-plus)
-                             (throw (ex-info "Unsupported property path: oneOrMorePath." {:path path}))
-
-                             (= type :zero-one)
-                             (throw (ex-info "Unsupported property path: zeroOrOnePath." {:path path}))
-                             ;; regular predicate path, no processing needed
-                             :predicate-path
-                             path-flakes)]
-          (recur r path-flakes*))
-        path-flakes))))
+  ([db sid path pid->p-flakes]
+   (go-try
+     (let [[[first-pid type] & r] path
+           path-flakes (case type
+                         :inverse (<? (query-range/index-range db :post = [first-pid sid]))
+                         :predicate (get pid->p-flakes first-pid)
+                         (throw (ex-info "Unsupported property path." {:path-type type :path path})))]
+       (<? (resolve-path-flakes db r path-flakes)))))
+  ([db path p-flakes]
+   (go-try
+     (loop [[[pid type] & r] path
+            path-flakes p-flakes]
+       (if pid
+         (let [path-flakes* (loop [[f & r] path-flakes
+                                   res []]
+                              (if f
+                                (let [path-flakes*
+                                      (case type
+                                        :inverse (into res (<? (query-range/index-range db :post = [pid (flake/s f)])))
+                                        :predicate (into res (<? (query-range/index-range db :spot = [(flake/o f) pid])))
+                                        (throw (ex-info "Unsupported property path." {:path-type type :path path})))]
+                                  (recur r path-flakes*))
+                                res))]
+           (recur r path-flakes*))
+         path-flakes)))))
 
 (defn validate-shape
   "Check to see if each property shape is valid, then check node shape constraints."

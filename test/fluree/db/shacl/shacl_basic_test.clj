@@ -948,7 +948,6 @@
               invalid-pal @(fluree/stage db1 {"id"          "ex:bad-parent"
                                               "type"        "ex:Parent"
                                               "schema:name" "Darth Vader"})]
-
           (is (= [{"id" "ex:Luke",
                    "schema:name" "Luke",
                    "ex:parent" {"id" "ex:Anakin"
@@ -976,8 +975,7 @@
               invalid-pal @(fluree/stage db1 {"id" "ex:bad-pal"
                                               "type" "ex:Pal"
                                               "schema:name" "Darth Vader"
-                                              "ex:pal" {"ex:evil" "has no name"}})
-              ]
+                                              "ex:pal" {"ex:evil" "has no name"}})]
           (is (= [{"id" "ex:good-pal",
                    "rdf:type" ["ex:Pal"]
                    "schema:name" "J.D.",
@@ -1003,20 +1001,18 @@
                                                               "ex:child" {"id" "ex:Mork"
                                                                           "type" "ex:Princess"
                                                                           "schema:name" "Mork"}}}])
-              ;; invalid-princess @(fluree/stage db1 {"id" "ex:Pleb"
-              ;;                                      "schema:name" "Pleb"
-              ;;                                      "ex:child" {"id" "ex:Gerb"
-              ;;                                                  "type" "ex:Princess"
-              ;;                                                  "schema:name" "Gerb"}})
-              ]
-          (is (= []
+              invalid-princess @(fluree/stage db1 {"id" "ex:Pleb"
+                                                   "schema:name" "Pleb"
+                                                   "ex:child" {"id" "ex:Gerb"
+                                                               "type" "ex:Princess"
+                                                               "schema:name" "Gerb"}})]
+          (is (= [{"id" "ex:Mork", "rdf:type" ["ex:Princess"], "schema:name" "Mork"}]
                  @(fluree/query valid-princess {"select" {"?s" ["*"]}
                                                 "where" [["?s" "id" "ex:Mork"]]})))
 
-          ;; (is (util/exception? invalid-princess))
-          ;; (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
-          ;;        (ex-message invalid-princess)))
-          ))))
+          (is (util/exception? invalid-princess))
+          (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+                 (ex-message invalid-princess)))))))
 
 (deftest shacl-class-test
   (let [conn   @(fluree/connect {:method :memory})
