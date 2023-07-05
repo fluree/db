@@ -4,8 +4,7 @@
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util])
-  #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]]))
-  (:import (me.tonsky.persistent_sorted_set PersistentSortedSet)))
+  #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -471,12 +470,6 @@
    (->> elts
         arrays/into-array
         (pss/from-sorted-array comparator))))
-
-(defn subrange
-  [^PersistentSortedSet ss from to]
-  (let [cmp (.comparator ss)]
-    (->> (slice ss from to)
-         (sorted-set-by cmp))))
 
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
