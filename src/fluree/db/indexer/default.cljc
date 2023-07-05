@@ -201,7 +201,7 @@
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
   `*overflow-bytes*`."
-  [{:keys [flakes rhs] :as leaf}]
+  [{:keys [comparator flakes rhs] :as leaf}]
   (if (overflow-leaf? leaf)
     (let [target-size (/ *overflow-bytes* 2)]
       (log/debug "Rebalancing index leaf:"
@@ -211,7 +211,8 @@
              cur-first f
              leaves    []]
         (if (empty? r)
-          (let [subrange  (flake/slice flakes cur-first nil)
+          (let [subrange  (->> (flake/slice flakes cur-first nil)
+                               (flake/sorted-set-by comparator))
                 last-leaf (-> leaf
                               (assoc :flakes subrange
                                      :first cur-first
@@ -219,7 +220,10 @@
             (conj leaves last-leaf))
           (let [new-size (-> f flake/size-flake (+ cur-size) long)]
             (if (> new-size target-size)
-              (let [subrange (flake/slice flakes cur-first f)
+              (let [subrange (->> (flake/slice flakes cur-first f)
+                                  drop-last ; drop `f` because it will be
+                                            ; included in the next leaf.
+                                  (flake/sorted-set-by comparator))
                     new-leaf (-> leaf
                                  (assoc :flakes subrange
                                         :first cur-first
