@@ -290,8 +290,8 @@
   [node]
   (-> node ::expanded true?))
 
-(defn trim-start?
-  [cmp start-flake first-flake]
+(defn trim-left?
+  [cmp first-flake start-flake]
   (if (some? first-flake)
     (if (some? start-flake)
       (> 0 (cmp start-flake first-flake))
@@ -300,8 +300,8 @@
       true
       false)))
 
-(defn trim-end?
-  [cmp end-flake rhs]
+(defn trim-right?
+  [cmp rhs end-flake]
   (if (some? rhs)
     (if (some? end-flake)
       (> 0 (cmp end-flake rhs))
@@ -314,26 +314,30 @@
   [branch new-first new-rhs]
   (let [start-node {:first new-first, :rhs new-first}
         end-node   {:first new-rhs, :rhs new-rhs}]
+    ;; Take an rslice here because `tree-chan` expects a branch node's children
+    ;; to be resolved in reverse order to ensure that the node sequence returned
+    ;; from `tree-chan` is in depth-first order.
     (update branch :children flake/rslice end-node start-node)))
 
 (defn trim-leaf
   [leaf new-first new-rhs]
-  (update leaf :flakes flake/subrange new-first new-rhs))
+  (update leaf :flakes flake/slice new-first new-rhs))
 
 (defn trim-node
   [node start-flake end-flake]
   (let [cmp         (:comparator node)
         first-flake (:first node)
         rhs         (:rhs node)
-        new-first   (when (trim-start? cmp start-flake first-flake)
+        new-first   (when (trim-left? cmp first-flake start-flake)
                       start-flake)
-        new-rhs     (when (trim-end? cmp end-flake rhs)
+        new-rhs     (when (trim-right? cmp rhs end-flake)
                       end-flake)]
-    (if (or new-first new-rhs)
-      (if (leaf? node)
+    (if (leaf? node)
+      (if (or new-first new-rhs)
         (trim-leaf node new-first new-rhs)
-        (trim-branch node new-first new-rhs))
-      node)))
+        node)
+      (trim-branch node new-first new-rhs)))) ; always trim branches to reverse
+                                              ; their children
 
 (defn try-resolve
   [r start-flake end-flake error-ch node]
