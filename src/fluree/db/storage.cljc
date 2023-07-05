@@ -44,7 +44,7 @@
   (go-try
     (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)
           res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
-      (log/warn "WRITE-LEAF COMPLETE WITH: " res)
+      (log/info "WRITE-LEAF COMPLETE WITH: " res)
       res)))
 
 (defn write-branch-data
@@ -54,7 +54,7 @@
   (go-try
     (let [ser (serdeproto/-serialize-branch (serde conn) data)
           res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
-      (log/warn "WRITE-BRANCH COMPLETE WITH: " res)
+      (log/info "WRITE-BRANCH COMPLETE WITH: " res)
       res)))
 
 (defn write-branch
