@@ -313,7 +313,7 @@
   [cmp rhs end-flake]
   (if (some? rhs)
     (if (some? end-flake)
-      (> 0 (cmp end-flake rhs))
+      (> 0 (cmp rhs end-flake))
       false)
     (if (some? end-flake)
       true
