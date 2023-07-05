@@ -61,7 +61,7 @@
                  thheller/shadow-cljs              {:mvn/version "2.23.3"}}}
 
   :cljtest
-  {:extra-paths ["test" "dev-resources"]
+  {:extra-paths ["test" "dev-resources" "test-resources"]
    :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.83.1314"}
                  org.clojure/test.check                {:mvn/version "1.1.1"}
                  io.github.cap10morgan/test-with-files {:git/tag "v1.0.0"
