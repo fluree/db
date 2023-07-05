@@ -472,6 +472,12 @@
         arrays/into-array
         (pss/from-sorted-array comparator))))
 
+(defn subrange
+  [^PersistentSortedSet ss from to]
+  (let [cmp (.comparator ss)]
+    (->> (slice ss from to)
+         (sorted-set-by cmp))))
+
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
   [ss t]
