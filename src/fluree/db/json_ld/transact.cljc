@@ -146,7 +146,12 @@
 
                ;; if previously updated, but prior updates were only the IRI then it is OK
                (:iri-only? existing)
-               node-meta-map
+               (if (and (:shacl existing)
+                        ;;shacl constraint may have been discovered on previous node.
+                        ;; in that case, we'd want to keep it and not override it.
+                        (nil? (:shacl node-meta-map)))
+                 (assoc node-meta-map :shacl (:shacl existing))
+                 node-meta-map)
 
                :else
                (throw (ex-info (str "Subject " (:id node) " is being updated in more than one JSON-LD map. "
@@ -175,7 +180,9 @@
           classes      (if new-subj?
                          new-type-sids
                          (<? (get-subject-types db-before sid new-type-sids)))
-          shacl-map    (<? (shacl/class-shapes db-before classes))
+          class-shapes(<? (shacl/class-shapes db-before classes))
+          pred-shapes (<? (shacl/targetobject-shapes db-before [referring-pid]))
+          shacl-map   (merge-with into class-shapes pred-shapes)
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
                          id)
@@ -205,7 +212,11 @@
                 pid              (or existing-pid
                                      (get jld-ledger/predefined-properties k)
                                      (jld-ledger/generate-new-pid k iris next-pid ref? refs))
-                datatype-map     (get-in shacl-map [:datatype pid])
+                ;;it's possible the shacl constraint was discovered via a different node,
+                ;; as in `sh:targetObjectsOf`. In that case, the relevant shape would already be
+                ;; in `subj-mods`.
+                shacl-map* (or shacl-map (get-in @subj-mods [sid :shacl]))
+                datatype-map     (get-in shacl-map* [:datatype pid])
                 property-flakes* (if existing-pid
                                    property-flakes
                                    (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))

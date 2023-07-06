@@ -1030,3 +1030,50 @@
                                                   {"id" "ex:Green"}]}])]
       (is (util/exception? db2))
       (is (str/includes? (ex-message db2) "sh:in")))))
+
+(deftest shacl-targetobjectsof-test
+  (testing "datatype constraint"
+    (let [conn   @(fluree/connect {:method :memory
+                                   :defaults
+                                   {:context test-utils/default-str-context}})
+          ledger @(fluree/create conn "shacl-target-objects-of-test"
+                                 {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+          db1  @(fluree/stage (fluree/db ledger)
+                             [{"@id" "ex:friendShape"
+                               "type"           ["sh:NodeShape"]
+                               "sh:targetObjectsOf" {"@id" "ex:friend"}
+                               "sh:property"    [{"sh:path" {"@id" "ex:name"}
+                                                  "sh:datatype" {"@id" "xsd:string"}}]}])
+          db-bad-friend-name  @(fluree/stage db1
+                               [{"id"       "ex:Alice"
+                                  "ex:name"   "Alice"
+                                  "type"     "ex:User"
+                                 "ex:friend" {"@id" "ex:Bob"}}
+                                {"id"       "ex:Bob"
+                                 "ex:name"  123
+                                 "type"     "ex:User"}])]
+      (is (util/exception? db-bad-friend-name))
+      (is (str/includes? (ex-message db-bad-friend-name) "data type"))))
+(testing "other constraint"
+    (let [conn   @(fluree/connect {:method :memory
+                                   :defaults
+                                   {:context test-utils/default-str-context}})
+          ledger @(fluree/create conn "shacl-target-objects-of-test"
+                                 {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+          db1  @(fluree/stage (fluree/db ledger)
+                              [{"@id" "ex:friendShape"
+                                "type"           ["sh:NodeShape"]
+                                "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                "sh:property"    [{"sh:path" {"@id" "ex:ssn"}
+                                                   "sh:maxCount" 1}]}])
+          db-excess-ssn  @(fluree/stage db1
+                                        [{"id"       "ex:Alice"
+                                          "ex:name"   "Alice"
+                                          "type"     "ex:User"
+                                          "ex:friend" {"@id" "ex:Bob"}}
+                                         {"id"       "ex:Bob"
+                                          "ex:ssn"   ["111-11-1111"
+                                                     "222-22-2222"]
+                                          "type"     "ex:User"}])]
+      (is (util/exception? db-excess-ssn))
+      (is (str/includes? (ex-message db-excess-ssn)  "sh:maxCount")))))
