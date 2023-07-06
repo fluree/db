@@ -565,8 +565,8 @@
   "Associate each property path object with its path type in order to govern path flake resolution during validation."
   [db path-pid]
   (go-try
-    (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid]))
-                             (remove #(#{const/$xsd:anyURI} (flake/p %)))
+    (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid] {:predicate-fn (complement #{const/$xsd:anyURI})
+                                                                                 :flake-limit 1}))
                              (first))]
       (let [o (flake/o path-flake)
             p (flake/p path-flake)]
