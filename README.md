@@ -41,8 +41,10 @@ All contributors must complete a [Contributor License Agreement](https://cla-ass
 2. Install Node & NPM
    1. macOS: `brew install node`
    2. Arch Linux: `pacman -S nodejs`
+   3. Windows: Download installer here https://nodejs.org/en/download
 3. Install babashka
    1. macOS: `brew install borkdude/brew/babashka`
+   2. Windows: `scoop install babashka`
 
 ### Building
 
