@@ -9,12 +9,10 @@
 
 (deftest ^:integration default-context-update
   (let [conn                (test-utils/create-conn)
-        ledger              (with-redefs
-                             [util/current-time-iso
-                              (constantly "1970-01-01T00:00:00.00000Z")]
-                             @(fluree/create conn "default-context-update"
-                                             {:defaultContext
-                                              ["" {:ex "http://example.org/ns/"}]}))
+        ledger              @(fluree/create conn "default-context-update"
+                                            {:defaultContext
+                                             ["" {:ex "http://example.org/ns/"}]})
+        
         db1                 (with-redefs
                              [util/current-time-iso
                               (constantly "1971-01-01T00:00:00.00000Z")]
@@ -25,13 +23,11 @@
         db1-load            (fluree/db ledger1-load)
 
         ;; change "ex" alias in default context to "ex-new"
-        db-update-ctx       (with-redefs
-                             [util/current-time-iso
-                              (constantly "1980-01-01T00:00:00.00000Z")]
-                             (fluree/update-default-context
-                              db1-load (-> (dbproto/-default-context db1-load)
-                                           (dissoc "ex")
-                                           (assoc "ex-new" "http://example.org/ns/"))))
+        db-update-ctx       (fluree/update-default-context
+                             db1-load (-> (dbproto/-default-context db1-load)
+                                          (dissoc "ex")
+                                          (assoc "ex-new" "http://example.org/ns/")))
+
         db-update-cmt       (with-redefs
                              [util/current-time-iso
                               (constantly "1981-01-01T00:00:00.00000Z")]

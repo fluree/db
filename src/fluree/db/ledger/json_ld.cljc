@@ -4,6 +4,7 @@
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.history :as history]
+            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.branch :as branch]
@@ -98,9 +99,13 @@
   [ledger t]
   (go-try
     (let [latest-db (db ledger nil)
+          t*        (cond
+                      (string? t) (<? (time-travel/datetime->t latest-db t))
+                      (pos-int? t) (- t)
+                      (neg-int? t) t)
           db-conn   (:conn latest-db)
           flakes-ch (query-range/time-range latest-db :tspo = []
-                                            {:from-t t, :to-t t})
+                                            {:from-t t*, :to-t t*})
           context   (json-ld/parse-context {:f "https://ns.flur.ee/ledger#"})
           error-ch  (async/chan)
           commits   (async/alt!
@@ -139,7 +144,7 @@
   (-did [_] did)
   (-alias [_] alias)
   (-address [_] address)
-  (-default-context [ledger t] (default-context ledger (- t)))
+  (-default-context [ledger t] (default-context ledger t))
   (-close [ledger] (close-ledger ledger)))
 
 
