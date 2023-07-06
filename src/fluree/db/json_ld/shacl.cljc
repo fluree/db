@@ -641,10 +641,6 @@
 
                                              shape* (cond-> (update shape :properties
                                                                     (fnil conj #{}) target-key)
-                                                      ;; hopefully obsolete
-                                                      (:required? property-shape)
-                                                      (update :required util/conjs target-key)
-
                                                       (:datatype property-shape)
                                                       (update-in [:datatype target-key]
                                                                  register-datatype property-shape)
