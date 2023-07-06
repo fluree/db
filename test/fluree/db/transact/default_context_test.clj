@@ -7,25 +7,25 @@
 
 
 (deftest ^:integration default-context-update
-  (let [conn            (test-utils/create-conn)
-        ledger          @(fluree/create conn "default-context-update" {:defaultContext ["", {:ex "http://example.org/ns/"}]})
-        db1             @(test-utils/transact ledger [{:id   :ex/foo
-                                                       :ex/x "foo-1"
-                                                       :ex/y "bar-1"}])
-        ledger1-load    @(fluree/load conn "default-context-update")
-        db1-load        (fluree/db ledger1-load)
+  (let [conn                (test-utils/create-conn)
+        ledger              @(fluree/create conn "default-context-update" {:defaultContext ["", {:ex "http://example.org/ns/"}]})
+        db1                 @(test-utils/transact ledger [{:id   :ex/foo
+                                                           :ex/x "foo-1"
+                                                           :ex/y "bar-1"}])
+        ledger1-load        @(fluree/load conn "default-context-update")
+        db1-load            (fluree/db ledger1-load)
 
         ;; change "ex" alias in default context to "ex-new"
-        db-update-ctx   (fluree/update-default-context db1-load (-> (dbproto/-default-context db1-load)
-                                                                    (dissoc "ex")
-                                                                    (assoc "ex-new" "http://example.org/ns/")))
-        db-update-cmt   (->> [{:id       :ex-new/foo2
-                               :ex-new/x "foo-2"
-                               :ex-new/y "bar-2"}]
-                             (fluree/stage db-update-ctx)
-                             deref
-                             (fluree/commit! ledger)
-                             deref)
+        db-update-ctx       (fluree/update-default-context db1-load (-> (dbproto/-default-context db1-load)
+                                                                        (dissoc "ex")
+                                                                        (assoc "ex-new" "http://example.org/ns/")))
+        db-update-cmt       (->> [{:id       :ex-new/foo2
+                                   :ex-new/x "foo-2"
+                                   :ex-new/y "bar-2"}]
+                                 (fluree/stage db-update-ctx)
+                                 deref
+                                 (fluree/commit! ledger)
+                                 deref)
 
         db-updated-load @(fluree/load conn "default-context-update")]
 
