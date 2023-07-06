@@ -21,4 +21,5 @@
   ;; alias name for graph
   (-alias [ledger] "Returns the ledger local alias / graph name")
   (-address [ledger] "Returns the permanent ledger address")
+  (-default-context [ledger t] "Returns the default context at time t")
   (-close [ledger] "Shuts down ledger processes and clears used resources."))

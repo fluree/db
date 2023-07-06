@@ -1,6 +1,9 @@
 (ns fluree.db.ledger.json-ld
-  (:require [fluree.db.ledger.proto :as ledger-proto]
+  (:require [clojure.core.async :as async]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.query.history :as history]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.branch :as branch]
@@ -90,6 +93,26 @@
         db*   (or db (ledger-proto/-db ledger (:branch opts*)))]
     (jld-commit/commit ledger db* opts*)))
 
+(defn default-context
+  "Returns default context at t (must be internal negative value)"
+  [ledger t]
+  (go-try
+    (let [latest-db (db ledger nil)
+          db-conn   (:conn latest-db)
+          flakes-ch (query-range/time-range latest-db :tspo = []
+                                            {:from-t t, :to-t t})
+          context   (json-ld/parse-context {:f "https://ns.flur.ee/ledger#"})
+          error-ch  (async/chan)
+          commits   (async/alt!
+                     (async/into [] (history/commit-flakes->json-ld
+                                     latest-db context error-ch flakes-ch))
+                     ([result] result)
+                     error-ch ([e] e))
+          _         (when (util/exception? commits) (throw commits))
+          [{:keys [f/commit]}] commits]
+      (->> commit :f/defaultContext :f/address
+           (jld-reify/load-default-context db-conn) <?))))
+
 (defn close-ledger
   "Shuts down ledger and resources."
   [{:keys [indexer cache state] :as _ledger}]
@@ -116,6 +139,7 @@
   (-did [_] did)
   (-alias [_] alias)
   (-address [_] address)
+  (-default-context [ledger t] (default-context ledger (- t)))
   (-close [ledger] (close-ledger ledger)))
 
 
@@ -173,31 +197,31 @@
 
                             :else
                             (conn-proto/-new-indexer
-                              conn (util/without-nils
-                                     {:reindex-min-bytes reindex-min-bytes
-                                      :reindex-max-bytes reindex-max-bytes})))
+                             conn (util/without-nils
+                                   {:reindex-min-bytes reindex-min-bytes
+                                    :reindex-max-bytes reindex-max-bytes})))
           ledger-alias*   (normalize-alias ledger-alias)
           address         (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
           method-type     (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
           branches        {branch (branch/new-branch-map nil ledger-alias* branch)}
           ledger          (map->JsonLDLedger
-                            {:id      (random-uuid)
-                             :did     did*
-                             :state   (atom {:closed?  false
-                                             :branches branches
-                                             :branch   branch
-                                             :graphs   {}
-                                             :push     {:complete {:t   0
-                                                                   :dag nil}
-                                                        :pending  {:t   0
-                                                                   :dag nil}}})
-                             :alias   ledger-alias
-                             :address address
-                             :method  method-type
-                             :cache   (atom {})
-                             :indexer indexer
-                             :conn    conn})
+                           {:id      (random-uuid)
+                            :did     did*
+                            :state   (atom {:closed?  false
+                                            :branches branches
+                                            :branch   branch
+                                            :graphs   {}
+                                            :push     {:complete {:t   0
+                                                                  :dag nil}
+                                                       :pending  {:t   0
+                                                                  :dag nil}}})
+                            :alias   ledger-alias
+                            :address address
+                            :method  method-type
+                            :cache   (atom {})
+                            :indexer indexer
+                            :conn    conn})
           blank-db        (jld-db/create ledger default-context context-type* new-context?)
           bootstrap?      (boolean initial-tx)
           db              (if bootstrap?

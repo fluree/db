@@ -262,17 +262,21 @@
   (async/go
     (try*
      (let [default-ctx-sid     (some #(when (= const/$_ledger:context (flake/p %))
-                                        (flake/o %))
-                                     t-flakes)
+                                       (flake/o %))
+                                    t-flakes)
            commit-meta?        (partial commit-metadata-flake? default-ctx-sid)
+           default-ctx-flake?  #(= (flake/s %) default-ctx-sid)
            {commit-wrapper-flakes :commit-wrapper
             commit-meta-flakes    :commit-meta
+            default-ctx-flakes    :default-ctx-flakes
             assert-flakes         :assert-flakes
-            retract-flakes        :retract-flakes}
+            retract-flakes        :retract-flakes
+            ignore-flakes         :ignore-flakes}
            (group-by (fn [f]
                        (cond
                          (commit-wrapper-flake? f) :commit-wrapper
                          (commit-meta? f) :commit-meta
+                         (default-ctx-flake? f) :default-ctx-flakes
                          (and (flake/op f) (not (extra-data-flake? f))
                               (not= default-ctx-sid (flake/s f))) :assert-flakes
                          (and (not (flake/op f)) (not (extra-data-flake? f))) :retract-flakes
@@ -286,8 +290,13 @@
                                                          {:wildcard? true, :depth 0}
                                                          0 commit-meta-flakes)
 
+           default-ctx-chan    (json-ld-resp/flakes->res db cache context compact fuel 1000000
+                                                         {:wildcard? true, :depth 0}
+                                                         0 default-ctx-flakes)
+
            commit-wrapper      (<? commit-wrapper-chan)
            commit-meta         (<? commit-meta-chan)
+           default-ctx         (<? default-ctx-chan)
            asserts             (->> (t-flakes->json-ld db context compact cache fuel error-ch assert-flakes)
                                     (async/into [])
                                     (async/<!))
@@ -298,12 +307,15 @@
            assert-key          (json-ld/compact const/iri-assert compact)
            retract-key         (json-ld/compact const/iri-retract compact)
            data-key            (json-ld/compact const/iri-data compact)
-           commit-key          (json-ld/compact const/iri-commit compact)]
-
-       (-> {commit-key commit-wrapper}
-           (assoc-in [commit-key data-key] commit-meta)
-           (assoc-in [commit-key data-key assert-key] asserts)
-           (assoc-in [commit-key data-key retract-key] retracts)))
+           default-ctx-key     (json-ld/compact const/iri-default-context compact)
+           commit-key          (json-ld/compact const/iri-commit compact)
+           jld                 (-> {commit-key commit-wrapper}
+                                   (assoc-in [commit-key data-key] commit-meta)
+                                   (assoc-in [commit-key data-key assert-key] asserts)
+                                   (assoc-in [commit-key data-key retract-key] retracts))]
+       (if default-ctx
+         (assoc-in jld [commit-key default-ctx-key] default-ctx)
+         jld))
      (catch* e
        (log/error e "Error converting commit flakes.")
        (async/>! error-ch e)))))
