@@ -116,7 +116,8 @@
           _         (when (util/exception? commits) (throw commits))
           [{:keys [f/commit]}] commits]
       (->> commit :f/defaultContext :f/address
-           (jld-reify/load-default-context db-conn) <?))))
+           (jld-reify/load-default-context db-conn)
+           <?))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
