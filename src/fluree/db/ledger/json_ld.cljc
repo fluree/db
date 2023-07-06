@@ -1,9 +1,8 @@
 (ns fluree.db.ledger.json-ld
-  (:require [clojure.core.async :as async]
+  (:require [fluree.db.flake :as flake]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.query.range :as query-range]
-            [fluree.db.query.history :as history]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.bootstrap :as bootstrap]
@@ -103,21 +102,22 @@
                       (string? t) (<? (time-travel/datetime->t latest-db t))
                       (pos-int? t) (- t)
                       (neg-int? t) t)
-          db-conn   (:conn latest-db)
-          flakes-ch (query-range/time-range latest-db :tspo = []
-                                            {:from-t t*, :to-t t*})
-          context   (json-ld/parse-context {:f "https://ns.flur.ee/ledger#"})
-          error-ch  (async/chan)
-          commits   (async/alt!
-                     (async/into [] (history/commit-flakes->json-ld
-                                     latest-db context error-ch flakes-ch))
-                     ([result] result)
-                     error-ch ([e] e))
-          _         (when (util/exception? commits) (throw commits))
-          [{:keys [f/commit]}] commits]
-      (->> commit :f/defaultContext :f/address
-           (jld-reify/load-default-context db-conn)
-           <?))))
+          dc-sid    (-> latest-db
+                        (query-range/index-range :spot =
+                                                 [t* const/$_ledger:context]
+                                                 {:flake-limit 1})
+                        <?
+                        first
+                        flake/o)
+          dc-addr   (-> latest-db
+                        (query-range/index-range :spot =
+                                                 [dc-sid const/$_address]
+                                                 {:flake-limit 1})
+                        <?
+                        first
+                        flake/o)
+          db-conn   (:conn latest-db)]
+      (<? (jld-reify/load-default-context db-conn dc-addr)))))
 
 (defn close-ledger
   "Shuts down ledger and resources."
