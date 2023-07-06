@@ -223,8 +223,6 @@
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))
           [commit proof] (jld-reify/parse-commit commit-data)
-          _            (when proof
-                         (jld-reify/validate-commit db commit proof))
           _            (log/debug "load commit:" commit)
           ledger-alias (or (get-in commit [const/iri-alias :value])
                            (conn-proto/-alias conn db-alias))
@@ -239,6 +237,13 @@
                                                       :defaultContext default-ctx
                                                       :new-context?   false}))
           db           (ledger-proto/-db ledger)
-          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
-      (ledger-proto/-commit-update ledger branch db*)
-      ledger)))
+          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))
+          valid?       (if proof
+                         (jld-reify/validate-commit db* commit proof)
+                         true)]
+      (if valid?
+        (do
+          (ledger-proto/-commit-update ledger branch db*)
+          ledger)
+        (throw (ex-info "Invalid commit proof"
+                        {:status 400, :error :db/invalid-commit}))))))
