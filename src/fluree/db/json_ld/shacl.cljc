@@ -570,13 +570,12 @@
                              (first))]
       (let [o (flake/o path-flake)
             p (flake/p path-flake)]
-        (cond
-          (= p const/$sh:inversePath)     [o :inverse]
-          (= p const/$sh:alternativePath) [o :alternative]
-          (= p const/$sh:zeroOrMorePath)  [o :zero-plus]
-          (= p const/$sh:oneOrMorePath)   [o :one-plus]
-          (= p const/$sh:zeroOrOnePath)   [o :zero-one]
-          :else
+        (condp = p
+          const/$sh:inversePath     [o :inverse]
+          const/$sh:alternativePath [o :alternative]
+          const/$sh:zeroOrMorePath  [o :zero-plus]
+          const/$sh:oneOrMorePath   [o :one-plus]
+          const/$sh:zeroOrOnePath   [o :zero-one]
           [path-pid :predicate]))
       [path-pid :predicate])))
 
