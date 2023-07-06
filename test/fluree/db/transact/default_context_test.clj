@@ -27,7 +27,7 @@
                                  (fluree/commit! ledger)
                                  deref)
 
-        db-updated-load @(fluree/load conn "default-context-update")]
+        ledger-updated-load @(fluree/load conn "default-context-update")]
 
     (testing "Default context on db is correct."
       (is (= {"ex"     "http://example.org/ns/"
@@ -69,7 +69,7 @@
              (dbproto/-default-context db-update-ctx))))
 
     (testing "Updated context db loaded is same as one before commit."
-      (is (= (dbproto/-default-context (fluree/db db-updated-load))
+      (is (= (dbproto/-default-context (fluree/db ledger-updated-load))
              (dbproto/-default-context db-update-ctx))))
 
 
@@ -80,6 +80,6 @@
               {:ex-new/x "foo-1"
                :ex-new/y "bar-1"
                :id       :ex-new/foo}]
-             @(fluree/query (fluree/db db-updated-load)
+             @(fluree/query (fluree/db ledger-updated-load)
                             `{:select {?s [:*]}
                               :where  [[?s :ex-new/x nil]]}))))))
