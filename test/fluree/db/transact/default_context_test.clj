@@ -82,4 +82,31 @@
                :id       :ex-new/foo}]
              @(fluree/query (fluree/db ledger-updated-load)
                             `{:select {?s [:*]}
-                              :where  [[?s :ex-new/x nil]]}))))))
+                              :where  [[?s :ex-new/x nil]]}))))
+
+    (testing "All default contexts can be retrieved by t"
+      (is (= {"ex" "http://example.org/ns/",
+              "f" "https://ns.flur.ee/ledger#",
+              "id" "@id",
+              "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+              "rdfs" "http://www.w3.org/2000/01/rdf-schema#",
+              "schema" "http://schema.org/",
+              "sh" "http://www.w3.org/ns/shacl#",
+              "skos" "http://www.w3.org/2008/05/skos#",
+              "type" "@type",
+              "wiki" "https://www.wikidata.org/wiki/",
+              "xsd" "http://www.w3.org/2001/XMLSchema#"}
+             @(fluree/default-context-at-t ledger-updated-load 1)))
+
+      (is (= {"ex-new" "http://example.org/ns/",
+              "f" "https://ns.flur.ee/ledger#",
+              "id" "@id",
+              "rdf" "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+              "rdfs" "http://www.w3.org/2000/01/rdf-schema#",
+              "schema" "http://schema.org/",
+              "sh" "http://www.w3.org/ns/shacl#",
+              "skos" "http://www.w3.org/2008/05/skos#",
+              "type" "@type",
+              "wiki" "https://www.wikidata.org/wiki/",
+              "xsd" "http://www.w3.org/2001/XMLSchema#"}
+             @(fluree/default-context-at-t ledger-updated-load 2))))))
