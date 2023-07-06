@@ -1,6 +1,6 @@
 (ns fluree.db.query.history
   (:require
-   [clojure.core.async :as async]
+   [clojure.core.async :as async :refer [go]]
    [malli.core :as m]
    [fluree.json-ld :as json-ld]
    [fluree.db.constants :as const]
@@ -319,12 +319,14 @@
         out-ch      (async/chan)]
 
     (async/pipe flake-slice-ch t-flakes-ch)
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [t-flakes ch]
-                            (-> (commit-t-flakes->json-ld db context compact cache fuel error-ch t-flakes)
-                                (async/pipe ch)))
-                          t-flakes-ch)
+    (async/pipeline-async
+      2
+      out-ch
+      (fn [t-flakes ch]
+        (-> (commit-t-flakes->json-ld db context compact cache fuel error-ch
+                                      t-flakes)
+            (async/pipe ch)))
+      t-flakes-ch)
     out-ch))
 
 (defn with-consecutive-ts
@@ -354,15 +356,23 @@
         out-ch     (async/chan 2 cat)
         chunked-ch (async/chan 2 (with-consecutive-ts t-key))]
     (async/pipe history-results-ch chunked-ch)
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [chunk ch]
-                            (async/pipe (async/go
-                                          (let [to-t                       (- (-> chunk peek (get t-key)))
-                                                from-t                     (- (-> chunk (nth 0) (get t-key)))
-                                                flake-slices-ch            (query-range/time-range db :tspo = [] {:from-t from-t :to-t to-t})
-                                                consecutive-commit-details (<? (async/into [] (commit-flakes->json-ld db context error-ch flake-slices-ch)))]
-                                            (map into chunk consecutive-commit-details)))
-                                        ch))
-                          chunked-ch)
+    (async/pipeline-async
+     2
+     out-ch
+     (fn [chunk ch]
+       (async/pipe
+        (go
+          (let [to-t                       (- (-> chunk peek (get t-key)))
+                from-t                     (- (-> chunk (nth 0) (get t-key)))
+                flake-slices-ch            (query-range/time-range
+                                            db :tspo = []
+                                            {:from-t from-t, :to-t to-t})
+                consecutive-commit-details (->> flake-slices-ch
+                                                (commit-flakes->json-ld
+                                                 db context error-ch)
+                                                (async/into [])
+                                                <?)]
+            (map into chunk consecutive-commit-details)))
+        ch))
+     chunked-ch)
     out-ch))
