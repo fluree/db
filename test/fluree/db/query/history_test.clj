@@ -222,8 +222,7 @@
                           :f/address        test-utils/address?
                           :f/alias          "committest"
                           :f/branch         "main"
-                          :f/defaultContext {:id        test-utils/context-id?
-                                             :f/address test-utils/address?}
+                          :f/defaultContext {:id test-utils/context-id?}
                           :f/data           #:f{:address test-utils/address?
                                                 :assert  [{:ex/x "foo-1"
                                                            :ex/y "bar-1"
@@ -411,8 +410,7 @@
                           :f/address        test-utils/address?
                           :f/alias          "committest"
                           :f/branch         "main"
-                          :f/defaultContext {:id        test-utils/context-id?
-                                             :f/address test-utils/address?}
+                          :f/defaultContext {:id test-utils/context-id?}
                           :f/data           #:f{:address test-utils/address?
                                                 :assert  [{:ex/x "foo-1"
                                                            :ex/y "bar-1"
