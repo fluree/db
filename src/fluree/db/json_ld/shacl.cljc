@@ -1,10 +1,12 @@
 (ns fluree.db.json-ld.shacl
   (:require [fluree.db.util.async :refer [<? go-try]]
+            #?(:clj  [fluree.db.util.clj-const :as uc]
+               :cljs [fluree.db.util.cljs-const :as uc])
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [clojure.string :as str]
             [clojure.set :as set]
             [clojure.core.async :as async])
@@ -570,7 +572,7 @@
                              (first))]
       (let [o (flake/o path-flake)
             p (flake/p path-flake)]
-        (condp = p
+        (uc/case p
           const/$sh:inversePath     [o :inverse]
           const/$sh:alternativePath [o :alternative]
           const/$sh:zeroOrMorePath  [o :zero-plus]
