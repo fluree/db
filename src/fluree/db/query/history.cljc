@@ -1,6 +1,6 @@
 (ns fluree.db.query.history
   (:require
-   [clojure.core.async :as async :refer [go]]
+   [clojure.core.async :as async :refer [go >! <!]]
    [malli.core :as m]
    [fluree.json-ld :as json-ld]
    [fluree.db.constants :as const]
@@ -115,7 +115,7 @@
 
   {:id :ex/foo :ex/x 1 :ex/y 2}"
   [db cache context compact fuel error-ch s-flakes]
-  (async/go
+  (go
     (try*
      (let [json-chan (json-ld-resp/flakes->res db cache context compact fuel 1000000
                                                {:wildcard? true, :depth 0}
@@ -124,8 +124,8 @@
            ;; add the id in case the iri flake isn't present in s-flakes
            (assoc :id (json-ld/compact (<? (dbproto/-iri db (flake/s (first s-flakes)))) compact))))
      (catch* e
-      (log/error e "Error transforming s-flakes."
-       (async/>! error-ch e))))))
+       (log/error e "Error transforming s-flakes.")
+       (>! error-ch e)))))
 
 (defn t-flakes->json-ld
   "Build a collection of subject maps out of a set of flakes with the same t.
@@ -139,12 +139,14 @@
                          (async/to-chan!))
 
         s-out-ch    (async/chan)]
-    (async/pipeline-async 2
-                          s-out-ch
-                          (fn [assert-flakes ch]
-                            (-> (s-flakes->json-ld db cache context compact fuel error-ch assert-flakes)
-                                (async/pipe ch)))
-                          s-flakes-ch)
+    (async/pipeline-async
+     2
+     s-out-ch
+     (fn [assert-flakes ch]
+       (-> db
+           (s-flakes->json-ld cache context compact fuel error-ch assert-flakes)
+           (async/pipe ch)))
+     s-flakes-ch)
     s-out-ch))
 
 (defn history-flakes->json-ld
@@ -170,32 +172,37 @@
         assert-key  (json-ld/compact const/iri-assert compact)
         retract-key (json-ld/compact const/iri-retract compact)]
 
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [t-flakes ch]
-                            (-> (async/go
-                                  (try*
-                                   (let [{assert-flakes  true
-                                          retract-flakes false} (group-by flake/op t-flakes)
+    (async/pipeline-async
+     2
+     out-ch
+     (fn [t-flakes ch]
+       (-> (go
+             (try*
+              (let [{assert-flakes  true
+                     retract-flakes false} (group-by flake/op t-flakes)
 
-                                         t        (- (flake/t (first t-flakes)))
+                    t        (- (flake/t (first t-flakes)))
 
-                                         asserts  (->> (t-flakes->json-ld db context compact cache fuel error-ch assert-flakes)
-                                                       (async/into [])
-                                                       (async/<!))
+                    asserts  (->> assert-flakes
+                                  (t-flakes->json-ld db context compact cache
+                                   fuel error-ch)
+                                  (async/into [])
+                                  <!)
 
-                                         retracts (->> (t-flakes->json-ld db context compact cache fuel error-ch retract-flakes)
-                                                       (async/into [])
-                                                       (async/<!))]
-                                     {t-key       t
-                                      assert-key  asserts
-                                      retract-key retracts})
-                                   (catch* e
-                                    (log/error e "Error converting history flakes."
-                                     (async/>! error-ch e)))))
+                    retracts (->> retract-flakes
+                                  (t-flakes->json-ld db context compact cache
+                                   fuel error-ch)
+                                  (async/into [])
+                                  <!)]
+                {t-key       t
+                 assert-key  asserts
+                 retract-key retracts})
+              (catch* e
+                (log/error e "Error converting history flakes.")
+                (>! error-ch e))))
 
-                                (async/pipe ch)))
-                          t-flakes-ch)
+           (async/pipe ch)))
+     t-flakes-ch)
     out-ch))
 
 (defn history-pattern
@@ -203,28 +210,28 @@
   to subject ids and return the best index to query against."
   [db context query]
   (go-try
-   (let [;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
-         [query-type parsed-query] query
+    (let [;; parses to [:subject <:id>] or [:flake {:s <> :p <> :o <>}]}
+          [query-type parsed-query] query
 
-         {:keys [s p o]} (if (= :subject query-type)
-                           {:s parsed-query}
-                           parsed-query)
+          {:keys [s p o]} (if (= :subject query-type)
+                            {:s parsed-query}
+                            parsed-query)
 
-         ids [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
-              (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
-              (when o (jld-db/expand-iri db o context))]
+          ids [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
+               (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
+               (when o (jld-db/expand-iri db o context))]
 
-         [s p o] ids
-         [pattern idx] (cond
-                         (not (nil? s))
-                         [ids :spot]
+          [s p o] ids
+          [pattern idx] (cond
+                          (not (nil? s))
+                          [ids :spot]
 
-                         (and (nil? s) (not (nil? p)) (nil? o))
-                         [[p s o] :psot]
+                          (and (nil? s) (not (nil? p)) (nil? o))
+                          [[p s o] :psot]
 
-                         (and (nil? s) (not (nil? p)) (not (nil? o)))
-                         [[p o s] :post])]
-     [pattern idx])))
+                          (and (nil? s) (not (nil? p)) (not (nil? o)))
+                          [[p o s] :post])]
+      [pattern idx])))
 
 (defn commit-wrapper-flake?
   "Returns `true` for a flake that represents
@@ -259,11 +266,11 @@
 (defn commit-t-flakes->json-ld
   "Build a commit maps given a set of all flakes with the same t."
   [db context compact cache fuel error-ch t-flakes]
-  (async/go
+  (go
     (try*
      (let [default-ctx-sid     (some #(when (= const/$_ledger:context (flake/p %))
-                                       (flake/o %))
-                                    t-flakes)
+                                        (flake/o %))
+                                     t-flakes)
            commit-meta?        (partial commit-metadata-flake? default-ctx-sid)
            default-ctx-flake?  #(= (flake/s %) default-ctx-sid)
            {commit-wrapper-flakes :commit-wrapper
@@ -297,12 +304,16 @@
            commit-wrapper      (<? commit-wrapper-chan)
            commit-meta         (<? commit-meta-chan)
            default-ctx         (<? default-ctx-chan)
-           asserts             (->> (t-flakes->json-ld db context compact cache fuel error-ch assert-flakes)
+           asserts             (->> assert-flakes
+                                    (t-flakes->json-ld db context compact cache
+                                                       fuel error-ch)
                                     (async/into [])
-                                    (async/<!))
-           retracts            (->> (t-flakes->json-ld db context compact cache fuel error-ch retract-flakes)
+                                    <!)
+           retracts            (->> retract-flakes
+                                    (t-flakes->json-ld db context compact cache
+                                                       fuel error-ch)
                                     (async/into [])
-                                    (async/<!))
+                                    <!)
 
            assert-key          (json-ld/compact const/iri-assert compact)
            retract-key         (json-ld/compact const/iri-retract compact)
@@ -318,7 +329,7 @@
          jld))
      (catch* e
        (log/error e "Error converting commit flakes.")
-       (async/>! error-ch e)))))
+       (>! error-ch e)))))
 
 (defn commit-flakes->json-ld
   "Create a collection of commit maps."
@@ -332,13 +343,13 @@
 
     (async/pipe flake-slice-ch t-flakes-ch)
     (async/pipeline-async
-      2
-      out-ch
-      (fn [t-flakes ch]
-        (-> (commit-t-flakes->json-ld db context compact cache fuel error-ch
-                                      t-flakes)
-            (async/pipe ch)))
-      t-flakes-ch)
+     2
+     out-ch
+     (fn [t-flakes ch]
+       (-> (commit-t-flakes->json-ld db context compact cache fuel error-ch
+                                     t-flakes)
+           (async/pipe ch)))
+     t-flakes-ch)
     out-ch))
 
 (defn with-consecutive-ts
