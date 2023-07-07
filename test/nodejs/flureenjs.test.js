@@ -8,15 +8,15 @@ test("expect all flureenjs functions to be defined", () => {
     "connect",
     "create",
     "db",
+    "defaultContext",
+    "defaultContextAtT",
     "exists",
     "load",
     "loadFromAddress",
     "query",
     "setLogging",
     "stage",
-    "status",
-    "defaultContext",
-    "defaultContextAtT"
+    "status"
   ]);
 });
 
