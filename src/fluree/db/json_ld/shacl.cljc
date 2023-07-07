@@ -295,10 +295,10 @@
                               (if f
                                 (let [path-flakes*
                                       (case type
-                                        :inverse (into res (<? (query-range/index-range db :post = [pid (flake/s f)])))
-                                        :predicate (into res (<? (query-range/index-range db :spot = [(flake/o f) pid])))
+                                        :inverse (<? (query-range/index-range db :post = [pid (flake/s f)]))
+                                        :predicate (<? (query-range/index-range db :spot = [(flake/o f) pid]))
                                         (throw (ex-info "Unsupported property path." {:path-type type :path path})))]
-                                  (recur r path-flakes*))
+                                  (recur r (into res path-flakes*)))
                                 res))]
            (recur r path-flakes*))
          path-flakes)))))
