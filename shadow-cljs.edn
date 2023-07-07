@@ -1,4 +1,4 @@
-{:deps {:aliases [:dev]}
+{:deps     {:aliases [:dev]}
 
  :dev-http {8000 "dev/browser/"}
 
@@ -22,17 +22,19 @@
    :output-to        "out/nodejs/fluree-node-sdk.js"
    :closure-defines  {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}
-   :exports          {:commit          fluree.sdk.node/commit
-                      :connect         fluree.sdk.node/connect
-                      :create          fluree.sdk.node/create
-                      :db              fluree.sdk.node/db
-                      :exists          fluree.sdk.node/exists
-                      :load            fluree.sdk.node/load
-                      :loadFromAddress fluree.sdk.node/loadFromAddress
-                      :query           fluree.sdk.node/query
-                      :setLogging      fluree.sdk.node/setLogging
-                      :stage           fluree.sdk.node/stage
-                      :status          fluree.sdk.node/status}}
+   :exports          {:commit            fluree.sdk.node/commit
+                      :connect           fluree.sdk.node/connect
+                      :create            fluree.sdk.node/create
+                      :defaultContext    fluree.sdk.node/defaultContext
+                      :defaultContextAtT fluree.sdk.node/defaultContextAtT
+                      :db                fluree.sdk.node/db
+                      :exists            fluree.sdk.node/exists
+                      :load              fluree.sdk.node/load
+                      :loadFromAddress   fluree.sdk.node/loadFromAddress
+                      :query             fluree.sdk.node/query
+                      :setLogging        fluree.sdk.node/setLogging
+                      :stage             fluree.sdk.node/stage
+                      :status            fluree.sdk.node/status}}
 
   :fluree-webworker
   {:target          :esm
@@ -49,22 +51,22 @@
                        :init-fn fluree.sdk.webworker/init}}
    :build-hooks     [(shadow.cljs.build-report/hook)]}
 
-  :node-test                            ; runs the cljs tests on node
+  :node-test ; runs the cljs tests on node
   {:target           :node-test
    :output-to        "out/nodejs-test/node-tests.js"
    :autorun          true
    :closure-defines  {fluree.db.platform/BROWSER false}
    :compiler-options {:optimizations :simple}}
 
-  :browser-test                         ; runs the cljs tests in the browser via karma
-  {:target          :karma
-   :output-to       "out/browser-test/browser-tests.js"
-   :closure-defines {fluree.db.platform/BROWSER true
-                     cljs.core/*global*         "window"}
+  :browser-test ; runs the cljs tests in the browser via karma
+  {:target           :karma
+   :output-to        "out/browser-test/browser-tests.js"
+   :closure-defines  {fluree.db.platform/BROWSER true
+                      cljs.core/*global*         "window"}
    :compiler-options {:pretty-print true
                       :pseudo-names true}
-   :js-options      {:resolve {"fs"      false
-                               "path"    false
-                               "process" false
-                               "buffer"  false
-                               "crypto"  false}}}}}
+   :js-options       {:resolve {"fs"      false
+                                "path"    false
+                                "process" false
+                                "buffer"  false
+                                "crypto"  false}}}}}
