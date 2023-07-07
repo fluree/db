@@ -14,26 +14,30 @@ test("expect all flureenjs functions to be defined", () => {
     "query",
     "setLogging",
     "stage",
-    "status"
+    "status",
+    "defaultContext",
+    "defaultContextAtT"
   ]);
 });
 
-test("expect conn, ledger, stage, commit, and query to work", async () => {
+test("expect conn, ledger, stage, commit, defaultContext, and query to work", async () => {
+
+  const defaultCtx = {
+                       id: "@id",
+                       type: "@type",
+                       schema: "http://schema.org/",
+                       rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                       rdfs: "http://www.w3.org/2000/01/rdf-schema#",
+                       wiki: "https://www.wikidata.org/wiki/",
+                       skos: "http://www.w3.org/2008/05/skos#",
+                       f: "https://ns.flur.ee/ledger#",
+                       ex: "http://example.org/ns/"
+                     };
 
   const conn = await flureenjs.connect({
     method: "memory",
     defaults: {
-      context: {
-        id: "@id",
-        type: "@type",
-        schema: "http://schema.org/",
-        rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-        rdfs: "http://www.w3.org/2000/01/rdf-schema#",
-        wiki: "https://www.wikidata.org/wiki/",
-        skos: "http://www.w3.org/2008/05/skos#",
-        f: "https://ns.flur.ee/ledger#",
-        ex: "http://example.org/ns/"
-      },
+      context: defaultCtx,
       did: {
         id: "did:fluree:TfCzWTrXqF16hvKGjcYiLxRoYJ1B8a6UMH6",
         public:
@@ -54,6 +58,9 @@ test("expect conn, ledger, stage, commit, and query to work", async () => {
     "schema:name": "John"
   });
 
+  const dc = flureenjs.defaultContext(db1);
+
+  expect(dc).toStrictEqual(defaultCtx);
 
    const results = await flureenjs.query(
      db1,
