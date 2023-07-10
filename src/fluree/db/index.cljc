@@ -385,9 +385,9 @@
   and `xf` is an optional transducer that will transform the output stream if
   supplied."
   ([r root resolve? error-ch]
-   (tree-chan r root nil nil resolve? error-ch))
-  ([r root start-flake end-flake resolve? error-ch]
-   (tree-chan r root start-flake end-flake resolve? 1 identity error-ch))
+   (tree-chan r root resolve? 1 identity error-ch))
+  ([r root resolve? n xf error-ch]
+   (tree-chan r root nil nil resolve? n xf error-ch))
   ([r root start-flake end-flake resolve? n xf error-ch]
    (let [out (chan n xf)]
      (go

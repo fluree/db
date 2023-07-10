@@ -8,7 +8,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.json-ld.commit-data :as commit-data]))
 
 ;; default indexer
