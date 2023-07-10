@@ -355,10 +355,10 @@
           (let [sid (flake/s (first s-flakes))
                 {:keys [new? classes shacl]} (get subj-mods' sid)]
             (when shacl
-              (let [all-flakes (if new?
+              (let [s-flakes* (if new?
                                  s-flakes
                                  (<? (query-range/index-range root-db :spot = [sid])))]
-                (<? (shacl/validate-target shacl all-flakes))))
+                (<? (shacl/validate-target shacl root-db s-flakes*))))
             (recur r (into all-classes classes)))
           (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
                                (contains? all-classes const/$sh:PropertyShape))]

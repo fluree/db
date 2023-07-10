@@ -363,10 +363,18 @@
      "Same as case, but evaluates dispatch values, needed for referring to
      class and def'ed constants as well as java.util.Enum instances.
 
-     NB: Don't use this in CLJS if your dispatch values are :const.
-         CLJS (but not CLJ sadly) inlines these and they work fine
-         with regular old cljs.core/case. Or check out const-case if you want a
-         macro that does the best thing with :const values in both CLJ & CLJS."
+     NB: If you have all `:const` or literal dispatch values you can use either regular
+  old `cljs.core/case` if you are in cljs-only code, as those get inlined and work fine,
+  or `fluree.db.util.clj-const/case` and `fluree.db.util.cljs-const/case` if you are in
+  cljc.
+
+  calling context/dispatch value
+
+  |      | literal | :const                        | anything else |
+  |------+---------+-------------------------------+---------------|
+  | cljs | case    | case                          | case+         |
+  | clj  | case    | fluree.db.util.clj-const/case | case+         |
+  | cljc | case    | fluree.db.util.clj-const/case | case+         |"
      [value & clauses]
      (let [clauses       (partition 2 2 nil clauses)
            default       (when (-> clauses last count (= 1))
