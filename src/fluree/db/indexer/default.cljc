@@ -284,9 +284,9 @@
              (let [child (peek stack*)]
                (if (and child
                         (index/descendant? node child))     ; all of a resolved
-                 ; branch's children
-                 ; should be at the top
-                 ; of the stack
+                                                            ; branch's children
+                                                            ; should be at the top
+                                                            ; of the stack
                  (recur (conj child-nodes child)
                         (vswap! stack pop)
                         (xf result* child))
@@ -321,15 +321,16 @@
           (index/resolved? node) (assoc ::old-id id)))
 
 (defn update-branch-ids
-  "When using IPFS, we don't know what the leaf id will be until written, therefore
-  branches need to get updated with final leaf ids.
+  "When using IPFS, we don't know what the leaf id will be until written,
+  therefore branches need to get updated with final leaf ids.
 
-  Takes original node, and map of temp left ids to final leaf ids for updating children."
+  Takes original node, and map of temp left ids to final leaf ids for updating
+  children."
   [temp->final-ids {:keys [children] :as branch-node}]
   (let [children* (reduce
-                    (fn [acc v]
-                      (if-let [updated-id (get temp->final-ids (:id v))]
-                        (conj acc (assoc v :id updated-id))
+                    (fn [acc child]
+                      (if-let [updated-id (get temp->final-ids (:id child))]
+                        (conj acc (assoc child :id updated-id))
                         acc))
                     (empty children) children)]
     (assoc branch-node :children children*)))
@@ -368,15 +369,19 @@
 
 (defn write-resolved-nodes
   [db idx changes-ch error-ch index-ch]
-  (async/go-loop [stats {:idx idx, :novel 0, :unchanged 0, :garbage #{} :updated-ids {}}
+  (async/go-loop [stats     {:idx         idx
+                             :novel       0
+                             :unchanged   0
+                             :garbage     #{}
+                             :updated-ids {}}
                   last-node nil]
     (if-let [{::keys [old-id] :as node} (async/<! index-ch)]
       (if (index/resolved? node)
         (let [written-node (async/<! (write-node db idx node error-ch (:updated-ids stats)))
               stats*       (cond-> stats
-                                   (not= old-id :empty) (update :garbage conj old-id)
-                                   true (update :novel inc)
-                                   true (assoc-in [:updated-ids (:id node)] (:address written-node)))]
+                             (not= old-id :empty) (update :garbage conj old-id)
+                             true                 (update :novel inc)
+                             true                 (assoc-in [:updated-ids (:id node)] (:address written-node)))]
           (when changes-ch
             ;; when a stream of changes is requested (for consensus synchronization), send new file
             ;; note: this intentionally blocks in case channel is backed up and full it will push back on indexing process
