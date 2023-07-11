@@ -1046,7 +1046,7 @@
                                                                     {"@id" "https://example.com/Movie/534"}]
                                    "@type"                         "https://example.com/Actor"
                                    "https://example.com/name"      "Sam Worthington"})
-         db3    @(fluree/stage db1 {"@id"                           "https://example.com/Actor/1001"
+        db3    @(fluree/stage db1 {"@id"                           "https://example.com/Actor/1001"
                                    "https://example.com/country"   {"@id"                      "https://example.com/Country/Absurdistan"
                                                                     "@type"                    "https://example.com/FakeCountry"
                                                                     "https://example.com/name" "Absurdistan"}
@@ -1291,3 +1291,34 @@
                                                   "ex:friend" {"@id" "ex:Bob"}})]
           (is (util/exception? db-forbidden-friend))
           (is (str/includes? (ex-message db-forbidden-friend)  "data type"))))))
+
+(deftest shape-based-constraints
+  (let [conn   @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
+                                                                         {"ex" "http://example.com/"}]})
+        db0    (fluree/db ledger)
+
+        db1    @(fluree/stage db0 [{"id" "ex:AddressShape"
+                                    "type" "sh:NodeShape"
+                                    "sh:property" [{"sh:path" {"id" "ex:postalCode"}
+                                                    "sh:maxCount" 1}]}
+                                   {"id" "ex:PersonShape"
+                                    "type" "sh:NodeShape"
+                                    "sh:targetClass" {"id" "ex:Person"}
+                                    "sh:property" [{"sh:path" {"id" "ex:address"}
+                                                    "sh:node" {"id" "ex:AddressShape"}
+                                                    "sh:minCount" 1}]}])
+        valid-person @(fluree/stage db1 [{"id" "ex:Bob"
+                                          "type" "ex:Person"
+                                          "ex:address" {"ex:postalCode" "12345"}}])
+        invalid-person @(fluree/stage db1 [{"id" "ex:Reto"
+                                            "type" "ex:Person"
+                                            "ex:address" {"ex:postalCode" ["12345" "67890"]}}])]
+    (is (= [{"id" "ex:Bob",
+             "rdf:type" ["ex:Person"],
+             "ex:address" {"id" "_:f211106232532997", "ex:postalCode" "12345"}}]
+           @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["*"]}]}
+                                        "where" [["?s" "id" "ex:Bob"]]})))
+    (is (util/exception? invalid-person))
+    (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+           (ex-message invalid-person)))))

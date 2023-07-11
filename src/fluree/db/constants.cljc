@@ -136,6 +136,7 @@
 (def ^:const $sh:closed 216)
 (def ^:const $sh:ignoredProperties 217)
 (def ^:const $sh:property 218)
+(def ^:const $sh:node 261)
 (def ^:const $sh:path 219)
 (def ^:const $sh:minCount 220)
 (def ^:const $sh:maxCount 221)

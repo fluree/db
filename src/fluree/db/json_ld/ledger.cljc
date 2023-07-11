@@ -48,6 +48,7 @@
           "http://www.w3.org/ns/shacl#targetSubjectsOf"         const/$sh:targetSubjectsOf
           "http://www.w3.org/ns/shacl#closed"                   const/$sh:closed
           "http://www.w3.org/ns/shacl#ignoredProperties"        const/$sh:ignoredProperties
+          "http://www.w3.org/ns/shacl#node"                     const/$sh:node
           "http://www.w3.org/ns/shacl#property"                 const/$sh:property
           "http://www.w3.org/ns/shacl#path"                     const/$sh:path
           "http://www.w3.org/ns/shacl#inversePath"              const/$sh:inversePath
