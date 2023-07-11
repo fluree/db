@@ -80,17 +80,17 @@
   [db query-map]
   (go-try
    (let [{query-map :subject, did :did} (or (<? (cred/verify query-map))
-                                                  {:subject query-map})
+                                            {:subject query-map})
          coerced-query (try*
                          (history/coerce-history-query query-map)
                          (catch* e
-                                 (throw
-                                   (ex-info
-                                     (str "History query not properly formatted. Provided "
-                                          (pr-str query-map))
-                                     {:status  400
-                                      :message (history/humanize-error e)
-                                      :error   :db/invalid-query}))))
+                           (throw
+                             (ex-info
+                               (str "History query not properly formatted. Provided "
+                                    (pr-str query-map))
+                               {:status  400
+                                :message (history/humanize-error e)
+                                :error   :db/invalid-query}))))
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
      (<? (history* db history-query)))))
 
