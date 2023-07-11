@@ -3,7 +3,8 @@
   (:require [me.tonsky.persistent-sorted-set :as pss]
             [me.tonsky.persistent-sorted-set.arrays :as arrays]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util])
+            [fluree.db.util.core :as util]
+            #?(:clj [clojure.pprint :as pprint]))
   #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -164,6 +165,9 @@
           (.write w (str "#Flake "))
           (binding [*out* w]
             (pr [(.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)]))))
+
+#?(:clj (defmethod pprint/simple-dispatch Flake [^Flake f]
+          (pr f)))
 
 (defn s
   [^Flake f]
