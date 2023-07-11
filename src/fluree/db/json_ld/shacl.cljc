@@ -1,12 +1,15 @@
 (ns fluree.db.json-ld.shacl
   (:require [fluree.db.util.async :refer [<? go-try]]
+            #?(:clj  [fluree.db.util.clj-const :as uc]
+               :cljs [fluree.db.util.cljs-const :as uc])
+            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]
-            [fluree.db.util.log :as log]
             [clojure.string :as str]
-            [clojure.set :as set])
+            [clojure.set :as set]
+            [clojure.core.async :as async])
   #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
@@ -203,11 +206,12 @@
                     (coalesce-validation-results flake-results logical-constraint)))]
     (coalesce-validation-results results)))
 
-(defn validate-property
+(defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [datatype min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive min-length max-length pattern in] :as p-shape} p-flakes]
+           max-exclusive min-length max-length pattern in] :as p-shape}
+   p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
   ;;       Should embed results and error messages and short-circuit as appropriate
   (let [validation (if (or min-count max-count)
@@ -230,7 +234,7 @@
                      validation)]
     validation))
 
-(defn validate-pair-property
+(defn validate-pair-constraints
   "Validates a PropertyShape that compares values for a pair of predicates.
   Returns a tuple of [valid? error-msg]."
   [{:keys [pair-constraint logical-constraint] :as _p-shape} lhs-flakes rhs-flakes]
@@ -288,44 +292,71 @@
                                         r-flake-o)]))]
       (coalesce-validation-results results logical-constraint))))
 
+(defn resolve-path-flakes
+  "Return the relevant flakes that are associated with the property shape's path."
+  ([db sid path pid->p-flakes]
+   (go-try
+     (let [[[first-pid type] & r] path
+           path-flakes (case type
+                         :inverse (<? (query-range/index-range db :post = [first-pid sid]))
+                         :predicate (get pid->p-flakes first-pid)
+                         (throw (ex-info "Unsupported property path." {:path-type type :path path})))]
+       (<? (resolve-path-flakes db r path-flakes)))))
+  ([db path p-flakes]
+   (go-try
+     (loop [[[pid type] & r] path
+            path-flakes p-flakes]
+       (if pid
+         (let [path-flakes* (loop [[f & r] path-flakes
+                                   res []]
+                              (if f
+                                (let [path-flakes*
+                                      (case type
+                                        :inverse (<? (query-range/index-range db :post = [pid (flake/s f)]))
+                                        :predicate (<? (query-range/index-range db :spot = [(flake/o f) pid]))
+                                        (throw (ex-info "Unsupported property path." {:path-type type :path path})))]
+                                  (recur r (into res path-flakes*)))
+                                res))]
+           (recur r path-flakes*))
+         path-flakes)))))
+
 (defn validate-shape
-  [{:keys [property closed-props] :as shape}
-   flake-p-partitions all-flakes]
-  (log/trace "validate-shape shape:" shape)
-  (loop [[p-flakes & r] flake-p-partitions
-         required (:required shape)]
-    (if p-flakes
-      (let [pid      (flake/p (first p-flakes))
-            p-shapes (get property pid)
-            results  (map (fn [p-shape]
-                           (if-let [rhs-property (:rhs-property p-shape)]
-                             (let [rhs-flakes (filter #(= rhs-property (flake/p %)) all-flakes)]
-                               (validate-pair-property p-shape p-flakes rhs-flakes))
-                             (validate-property p-shape p-flakes)))
-                          p-shapes)
-            _ (log/debug "validate-shape results:" results)
-            [valid? err-msg] (coalesce-validation-results results)]
-        (when (not valid?)
-          (throw-property-shape-exception! err-msg))
-        (when closed-props
-          (when-not (closed-props pid)
-            (throw (ex-info (str "SHACL shape is closed, property: " pid
-                                 " is not an allowed.")
-                            {:status 400 :error :db/shacl-validation}))))
-        (recur r (disj required pid)))
-      (if (seq required)
-        (throw (ex-info (str "Required properties not present: " required)
-                        {:status 400 :error :db/shacl-validation}))
-        true))))
+  "Check to see if each property shape is valid, then check node shape constraints."
+  [db {:keys [property closed? ignored-properties] :as shape} pid->p-flakes s-flakes]
+  (log/debug "validate-shape" shape)
+  (go-try
+    (let [sid (flake/s (first s-flakes))]
+      (loop [[{:keys [path rhs-property] :as p-shape} & r] property
+             validated-properties #{}
+             results []]
+        (if p-shape
+          ;; check property shapes
+          (let [path-flakes (<? (resolve-path-flakes db sid path pid->p-flakes))
+
+                pid (when (first path-flakes) (flake/p (first path-flakes)))
+                res (if rhs-property
+                      (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
+                        (validate-pair-constraints p-shape path-flakes rhs-flakes))
+                      (validate-property-constraints p-shape path-flakes))]
+
+            (recur r (conj validated-properties pid) (conj results res)))
+          ;; check node shape
+          (let [[valid? err-msg] (coalesce-validation-results results)
+                unvalidated-properties (->> (keys pid->p-flakes)
+                                            (remove (set/union ignored-properties validated-properties)))]
+            (when (not valid?)
+              (throw-property-shape-exception! err-msg))
+            (when (and closed? (not-empty unvalidated-properties))
+              (throw (ex-info (str "SHACL shape is closed, extra properties not allowed: " unvalidated-properties)
+                              {:status 400 :error :db/shacl-validation})))))))))
 
 (defn validate-target
-  "Some new flakes don't need extra validation."
-  [{:keys [shapes] :as _shape-map} all-flakes]
+  "Validate the data graph (s-flakes) with the provided shapes."
+  [{:keys [shapes] :as _shape-map} db s-flakes]
   (go-try
-   (let [flake-p-partitions (partition-by flake/p all-flakes)]
-     (doseq [shape shapes]
-       (validate-shape shape flake-p-partitions all-flakes)))))
-
+    (let [pid->p-flakes (group-by flake/p s-flakes)]
+      (doseq [shape shapes]
+        (<? (validate-shape db shape pid->p-flakes s-flakes))))))
 
 (defn build-property-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
@@ -335,7 +366,7 @@
       (let [o (flake/o property-flake)]
         (condp = (flake/p property-flake)
           const/$sh:path
-          (assoc acc :path o)
+          (update acc :path (fnil conj []) o)
 
           ;; The datatype of all value nodes (e.g., xsd:integer).
           ;; A shape has at most one value for sh:datatype.
@@ -344,7 +375,7 @@
 
           const/$sh:minCount
           (cond-> (assoc acc :min-count o)
-                  (>= o 1) (assoc :required? true)) ; min-count >= 1 means property is required
+            (>= o 1) (assoc :required? true)) ; min-count >= 1 means property is required
 
           const/$sh:maxCount
           (assoc acc :max-count o)
@@ -359,7 +390,7 @@
           ;; Note that multiple values for sh:class are interpreted as a conjunction,
           ;; i.e. the values need to be SHACL instances of all of them.
           const/$sh:class
-          (assoc acc :class o)
+          (update acc :class (fnil conj []) o)
 
           const/$sh:pattern
           (assoc acc :pattern o)
@@ -477,6 +508,18 @@
                       {:status 400 :error :db/shacl-validation})))
     dt-map*))
 
+(defn register-class
+  [{:keys [dt] :as dt-map} class-iris]
+  (log/trace "register-class dt-map:" dt-map)
+  (log/trace "register-class class-iris:" class-iris)
+  {:dt          dt
+   :class       class-iris
+   :validate-fn (fn [{:keys [type]}]
+                  (log/trace "class validate-fn class-iris:" class-iris)
+                  (log/trace "class validate-fn type:" type)
+                  (let [types (if (coll? type) type [type])]
+                    (= (set class-iris) (set types))))})
+
 
 (defn- merge-datatype
   "Merging functions for use with 'merge-with'.
@@ -506,15 +549,6 @@
 
                   validate-latter
                   validate-latter)})
-
-(defn add-closed-props
-  "Given a Fluree formatted shape, returns list of predicate/property ids
-  that can only be included in the shape. Any properties outside of this shoudl error."
-  [{:keys [ignored-properties property] :as shape}]
-  (let [closed-props (-> ignored-properties
-                         (conj 0)                           ;; pid 0 holds the IRI and is always allowed
-                         (into (keys property)))]
-    (assoc shape :closed-props closed-props)))
 
 (defn get-regex-flag
   "Given an `sh:flag` value, returns the corresponding regex flag
@@ -546,6 +580,32 @@
         #?(:clj (Pattern/compile (or valid-flags 0))
            :cljs (js/RegExp. (or valid-flags ""))))))
 
+(defn resolve-path-type
+  "Associate each property path object with its path type in order to govern path flake resolution during validation."
+  [db path-pid]
+  (go-try
+    (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid] {:predicate-fn (complement #{const/$xsd:anyURI})
+                                                                                 :flake-limit 1}))
+                             (first))]
+      (let [o (flake/o path-flake)
+            p (flake/p path-flake)]
+        (uc/case p
+          const/$sh:inversePath     [o :inverse]
+          const/$sh:alternativePath [o :alternative]
+          const/$sh:zeroOrMorePath  [o :zero-plus]
+          const/$sh:oneOrMorePath   [o :one-plus]
+          const/$sh:zeroOrOnePath   [o :zero-one]
+          [path-pid :predicate]))
+      [path-pid :predicate])))
+
+(defn resolve-path-types
+  [db path]
+  (go-try
+    (loop [[path-pid & r] path
+           tagged-path []]
+      (if path-pid
+        (recur r (conj tagged-path (<? (resolve-path-type db path-pid))))
+        tagged-path))))
 
 (defn build-class-shapes
   "Given a class SID, returns class shape"
@@ -555,41 +615,61 @@
                           (map flake/s))]
       (when (seq shape-sids)
         (loop [[shape-sid & r] shape-sids
-               datatype nil
-               shapes   []]
+               datatype        nil
+               shapes          []]
           (if shape-sid
             (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))
                   shape        (loop [[flake & r'] shape-flakes
                                       shape    {}
-                                      p-shapes {}]
+                                      p-shapes []]
                                  (if flake
                                    (let [p (flake/p flake)
                                          o (flake/o flake)]
                                      (if (#{const/$sh:property const/$sh:not} p)
-                                       (let [flakes (<? (query-range/index-range db :spot = [o]))
+                                       (let [flakes                            (<? (query-range/index-range db :spot = [o]))
                                              {:keys [path] :as property-shape} (condp = p
                                                                                  const/$sh:property
                                                                                  (build-property-shape flakes)
                                                                                  const/$sh:not
                                                                                  (build-not-shape flakes))
-                                             ;; we key the property shapes map with the property subj id (sh:path)
-                                             property-shape* (if (:pattern property-shape)
-                                                               (assoc property-shape :pattern (build-pattern property-shape))
-                                                               property-shape)
-                                             p-shapes*      (update p-shapes path util/conjv property-shape*)
-                                             ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
-                                             shape*         (cond-> shape
-                                                                    (:required? property-shape)
-                                                                    (update :required util/conjs (:path property-shape))
 
-                                                                    (:datatype property-shape)
-                                                                    (update-in [:datatype (:path property-shape)]
-                                                                               register-datatype property-shape)
+                                             tagged-path (<? (resolve-path-types db path))
 
-                                                                    (:node-kind property-shape)
-                                                                    (update-in [:datatype (:path property-shape)]
-                                                                               register-nodetype property-shape))]
+                                             property-shape* (cond-> (assoc property-shape :path tagged-path)
+                                                               (:pattern property-shape) (assoc :pattern (build-pattern property-shape)))
 
+                                             p-shape-key (first (first tagged-path))
+                                             target-key  (first (peek tagged-path))
+                                             p-shapes*   (conj p-shapes property-shape*)
+                                             ;; elevate following conditions to top-level custom keys to optimize validations
+                                             ;; when processing txs
+
+                                             class-iris (when-let [class-sids (:class property-shape)]
+                                                          (loop [[csid & csids] class-sids
+                                                                 ciris          []]
+                                                            (let [ciri       (->> [csid const/iri-id]
+                                                                                  (query-range/index-range db :spot =)
+                                                                                  <?
+                                                                                  first
+                                                                                  flake/o)
+                                                                  next-ciris (conj ciris ciri)]
+                                                              (if (seq csids)
+                                                                (recur csids next-ciris)
+                                                                next-ciris))))
+
+                                             shape* (cond-> (update shape :properties
+                                                                    (fnil conj #{}) target-key)
+                                                      (:datatype property-shape)
+                                                      (update-in [:datatype target-key]
+                                                                 register-datatype property-shape)
+
+                                                      (:node-kind property-shape)
+                                                      (update-in [:datatype target-key]
+                                                                 register-nodetype property-shape)
+
+                                                      (:class property-shape)
+                                                      (update-in [:datatype (:path property-shape)]
+                                                                 register-class class-iris))]
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p
                                                       const/$xsd:anyURI
@@ -604,13 +684,13 @@
                                                         shape)
 
                                                       const/$sh:ignoredProperties
-                                                      (update shape :ignored-properties util/conjs o)
+                                                      (update shape :ignored-properties
+                                                              (fnil conj #{const/$xsd:anyURI}) o)
 
                                                       ;; else
                                                       shape)]
                                          (recur r' shape* p-shapes))))
-                                   (cond-> (assoc shape :property p-shapes)
-                                           (:closed? shape) add-closed-props)))]
+                                   (assoc shape :property p-shapes)))]
               (let [datatype* (merge-with merge-datatype datatype (:datatype shape))]
                 (recur r datatype* (conj shapes shape))))
             {:shapes   shapes
@@ -656,42 +736,61 @@
                           (map flake/s))]
       (when (seq shape-sids)
         (loop [[shape-sid & r] shape-sids
-               datatype nil
-               shapes   []]
+               datatype        nil
+               shapes          []]
           (if shape-sid
             (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))
                   shape        (loop [[flake & r'] shape-flakes
                                       shape    {}
-                                      p-shapes {}]
+                                      p-shapes []]
                                  (if flake
                                    (let [p (flake/p flake)
                                          o (flake/o flake)]
-                                     ;;WHAT DO HERE??
                                      (if (#{const/$sh:property const/$sh:not} p)
-                                       (let [flakes (<? (query-range/index-range db :spot = [o]))
+                                       (let [flakes                            (<? (query-range/index-range db :spot = [o]))
                                              {:keys [path] :as property-shape} (condp = p
                                                                                  const/$sh:property
                                                                                  (build-property-shape flakes)
                                                                                  const/$sh:not
                                                                                  (build-not-shape flakes))
-                                             ;; we key the property shapes map with the property subj id (sh:path)
-                                             property-shape* (if (:pattern property-shape)
-                                                               (assoc property-shape :pattern (build-pattern property-shape))
-                                                               property-shape)
-                                             p-shapes*      (update p-shapes path util/conjv property-shape*)
-                                             ;; elevate following conditions to top-level custom keys to optimize validations when processing txs
-                                             shape*         (cond-> shape
-                                                                    (:required? property-shape)
-                                                                    (update :required util/conjs (:path property-shape))
 
-                                                                    (:datatype property-shape)
-                                                                    (update-in [:datatype (:path property-shape)]
-                                                                               register-datatype property-shape)
+                                             tagged-path (<? (resolve-path-types db path))
 
-                                                                    (:node-kind property-shape)
-                                                                    (update-in [:datatype (:path property-shape)]
-                                                                               register-nodetype property-shape))]
+                                             property-shape* (cond-> (assoc property-shape :path tagged-path)
+                                                               (:pattern property-shape) (assoc :pattern (build-pattern property-shape)))
 
+                                             p-shape-key (first (first tagged-path))
+                                             target-key  (first (peek tagged-path))
+                                             p-shapes*   (conj p-shapes property-shape*)
+                                             ;; elevate following conditions to top-level custom keys to optimize validations
+                                             ;; when processing txs
+
+                                             class-iris (when-let [class-sids (:class property-shape)]
+                                                          (loop [[csid & csids] class-sids
+                                                                 ciris          []]
+                                                            (let [ciri       (->> [csid const/iri-id]
+                                                                                  (query-range/index-range db :spot =)
+                                                                                  <?
+                                                                                  first
+                                                                                  flake/o)
+                                                                  next-ciris (conj ciris ciri)]
+                                                              (if (seq csids)
+                                                                (recur csids next-ciris)
+                                                                next-ciris))))
+
+                                             shape* (cond-> (update shape :properties
+                                                                    (fnil conj #{}) target-key)
+                                                      (:datatype property-shape)
+                                                      (update-in [:datatype target-key]
+                                                                 register-datatype property-shape)
+
+                                                      (:node-kind property-shape)
+                                                      (update-in [:datatype target-key]
+                                                                 register-nodetype property-shape)
+
+                                                      (:class property-shape)
+                                                      (update-in [:datatype (:path property-shape)]
+                                                                 register-class class-iris))]
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p
                                                       const/$xsd:anyURI
@@ -700,22 +799,19 @@
                                                       const/$sh:targetClass
                                                       (assoc shape :target-class o)
 
-                                                      const/$sh:targetObjectsOf
-                                                      (assoc shape :target-objects-of o)
-
                                                       const/$sh:closed
                                                       (if (true? o)
                                                         (assoc shape :closed? true)
                                                         shape)
 
                                                       const/$sh:ignoredProperties
-                                                      (update shape :ignored-properties util/conjs o)
+                                                      (update shape :ignored-properties
+                                                              (fnil conj #{const/$xsd:anyURI}) o)
 
                                                       ;; else
                                                       shape)]
                                          (recur r' shape* p-shapes))))
-                                   (cond-> (assoc shape :property p-shapes)
-                                           (:closed? shape) add-closed-props)))]
+                                   (assoc shape :property p-shapes)))]
               (let [datatype* (merge-with merge-datatype datatype (:datatype shape))]
                 (recur r datatype* (conj shapes shape))))
             {:shapes   shapes

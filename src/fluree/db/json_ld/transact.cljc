@@ -88,8 +88,13 @@
           flakes      (cond
                         ;; a new node's data is contained, process as another node then link to this one
                         (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+                        (do
+                          (when validate-fn
+                            (or (validate-fn v-map)
+                                (throw (ex-info (str "Node did not pass SHACL validation: " v-map)
+                                                {:status 400, :error :db/shacl-validation}))))
+                          (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                            (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m))))
 
                         ;; a literal value
                         (and (some? value) (not= shacl-dt const/$xsd:anyURI))
@@ -366,10 +371,10 @@
           (let [sid (flake/s (first s-flakes))
                 {:keys [new? classes shacl]} (get subj-mods' sid)]
             (when shacl
-              (let [all-flakes (if new?
+              (let [s-flakes* (if new?
                                  s-flakes
                                  (<? (query-range/index-range root-db :spot = [sid])))]
-                (<? (shacl/validate-target shacl all-flakes))))
+                (<? (shacl/validate-target shacl root-db s-flakes*))))
             (recur r (into all-classes classes) (dissoc remaining-subj-mods sid)))
           ;;else
           (do
@@ -377,7 +382,7 @@
               (when sid
                 (let [{:keys [shacl]} mod
                       flakes (<? (query-range/index-range root-db :spot = [sid]))]
-                  (<? (shacl/validate-target shacl flakes))
+                  (<? (shacl/validate-target shacl root-db flakes))
                   (recur r))))
             (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
                                  (contains? all-classes const/$sh:PropertyShape))]

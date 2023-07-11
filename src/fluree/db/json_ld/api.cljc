@@ -169,6 +169,10 @@
   [db]
   (dbproto/-default-context db))
 
+(defn default-context-at-t
+  [ledger t]
+  (promise-wrap (ledger-proto/-default-context ledger t)))
+
 (defn update-default-context
   "Updates the default context on a given database.
   Currently, the updated default context will only be
