@@ -177,11 +177,15 @@
                          ;; TODO - this will check if subject is rdfs:Class, but we already have the new-type-sids above and know that - this can be a little faster, but reify.cljc also uses this logic and they need to align
                          (jld-ledger/generate-new-sid node referring-pid iris next-pid next-sid)
                          existing-sid)
+          object-of-preds (->> (<? (query-range/index-range db-before :opst = [sid]))
+                               (map flake/p))
+          all-the-pids (cond-> object-of-preds
+                         referring-pid (conj referring-pid))
           classes      (if new-subj?
                          new-type-sids
                          (<? (get-subject-types db-before sid new-type-sids)))
           class-shapes(<? (shacl/class-shapes db-before classes))
-          pred-shapes (<? (shacl/targetobject-shapes db-before [referring-pid]))
+          pred-shapes (<? (shacl/targetobject-shapes db-before all-the-pids))
           shacl-map   (merge-with into class-shapes pred-shapes)
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
@@ -356,7 +360,8 @@
         root-db    (dbproto/-rootdb db-after)]
     (go-try
       (loop [[s-flakes & r] (partition-by flake/s add)
-             all-classes #{}]
+             all-classes #{}
+             remaining-subj-mods subj-mods']
         (if s-flakes
           (let [sid (flake/s (first s-flakes))
                 {:keys [new? classes shacl]} (get subj-mods' sid)]
@@ -365,13 +370,21 @@
                                  s-flakes
                                  (<? (query-range/index-range root-db :spot = [sid])))]
                 (<? (shacl/validate-target shacl all-flakes))))
-            (recur r (into all-classes classes)))
-          (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
-                               (contains? all-classes const/$sh:PropertyShape))]
-            (when new-shacl?
-              ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
-              (vocab/reset-shapes (:schema db-after)))
-            staged-map))))))
+            (recur r (into all-classes classes) (dissoc remaining-subj-mods sid)))
+          ;;else
+          (do
+            (loop [[[sid mod] & r] remaining-subj-mods]
+              (when sid
+                (let [{:keys [shacl]} mod
+                      flakes (<? (query-range/index-range root-db :spot = [sid]))]
+                  (<? (shacl/validate-target shacl flakes))
+                  (recur r))))
+            (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
+                                 (contains? all-classes const/$sh:PropertyShape))]
+              (when new-shacl?
+                ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
+                (vocab/reset-shapes (:schema db-after)))
+              staged-map)))))))
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."

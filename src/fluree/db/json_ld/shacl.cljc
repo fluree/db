@@ -190,16 +190,33 @@
                     [false (str "sh:in: value " val " must be one of " in)]))]
     (coalesce-validation-results results logical-constraint)))
 
+;;sometimes the optimization of checking datatypes at triple-creation time
+;;does not apply, and we need to check the flakes.
+(defn validate-type-property
+  [{:keys [datatype logical-constraint] :as p-shape} p-flakes]
+  (let [results (for [flake p-flakes
+                      :let [[val dt] (flake-value flake)]]
+                  (let [flake-results
+                        [(if (and datatype (not= datatype dt))
+                           [false (str "Required data type " dt " does not match provided data type: " datatype "." )]
+                           [true (when datatype (str "Data type " dt " cannot match datatype " datatype "."))])]]
+                    (coalesce-validation-results flake-results logical-constraint)))]
+    (coalesce-validation-results results)))
+
 (defn validate-property
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
-  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
+  [{:keys [datatype min-count max-count min-inclusive min-exclusive max-inclusive
            max-exclusive min-length max-length pattern in] :as p-shape} p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
   ;;       Should embed results and error messages and short-circuit as appropriate
   (let [validation (if (or min-count max-count)
                      (validate-count-properties p-shape p-flakes)
                      [true])
+        validation (if (and (first validation)
+                            datatype)
+                     (validate-type-property p-shape p-flakes)
+                     validation)
         validation (if (and (first validation)
                             (or min-inclusive min-exclusive max-inclusive max-exclusive))
                      (validate-value-range-properties p-shape p-flakes)
@@ -716,7 +733,7 @@
           (let [shape-map (if (contains? (:target-objects-of @shapes-cache) pred-sid)
                             (get-in @shapes-cache [:target-objects-of pred-sid])
                             (let [shapes (<? (build-targetobject-shapes db pred-sid))]
-                              (swap! shapes-cache assoc-in [:targetObjectsOf pred-sid] shapes)
+                              (swap! shapes-cache assoc-in [:target-objects-of pred-sid] shapes)
                               shapes))]
             (recur r (if shape-map
                        (conj shape-maps shape-map)
