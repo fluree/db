@@ -386,17 +386,17 @@
 
 (defn modify
   [db fuel-tracker json-ld {:keys [t] :as _tx-state}]
-  (go
-    (let [mdfn      (-> json-ld
-                        syntax/coerce-modification
-                        (q-parse/parse-modification db))
-          error-ch  (async/chan)
-          update-ch (->> (where/search db mdfn fuel-tracker error-ch)
-                         (update/modify db mdfn t fuel-tracker error-ch)
-                         (into-flakeset fuel-tracker))]
-      (async/alt!
-       error-ch ([e] e)
-       update-ch ([flakes] flakes)))))
+  (let [mdfn (-> json-ld
+                 syntax/coerce-modification
+                 (q-parse/parse-modification db))]
+    (go
+      (let [error-ch  (async/chan)
+            update-ch (->> (where/search db mdfn fuel-tracker error-ch)
+                           (update/modify db mdfn t fuel-tracker error-ch)
+                           (into-flakeset fuel-tracker))]
+        (async/alt!
+          error-ch ([e] e)
+          update-ch ([flakes] flakes))))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value

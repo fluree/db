@@ -146,7 +146,7 @@
                   :where    [[?s :schema/age ?age]
                              {:bind {?decadesOld (quot ?age 10)}}
                              [?s :schema/name ?name]
-                             {:bind {?firstLetterOfName (subStr ?name 0 1)}}]
+                             {:bind {?firstLetterOfName (subStr ?name 1 1)}}]
                   :order-by ?firstLetterOfName}
             res @(fluree/query db q)]
         (is (= [["A" "Alice" 5]
@@ -159,7 +159,7 @@
       (let [q   '{:select   [?firstLetterOfName ?name ?canVote]
                   :where    [[?s :schema/age ?age]
                              [?s :schema/name ?name]
-                             {:bind {?firstLetterOfName (subStr ?name 0 1)
+                             {:bind {?firstLetterOfName (subStr ?name 1 1)
                                      ?canVote           (>= ?age 18)}}]
                   :order-by ?name}
             res @(fluree/query db q)]

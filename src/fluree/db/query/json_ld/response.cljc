@@ -139,7 +139,7 @@
                                      (not (#{:list :set} (-> context (get p-iri) :container))))
                               (first acc)
                               acc))))]
-            (if v
+            (if (some? v)
               (recur r (assoc acc p-iri v))
               (recur r acc)))
           (if reverse

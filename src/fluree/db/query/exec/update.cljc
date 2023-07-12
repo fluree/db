@@ -67,16 +67,13 @@
                 p                   (::where/val p-mch)
                 o                   (::where/val o-mch)
                 dt                  (::where/datatype o-mch)]
-            (when (and s p o dt)
+            (when (and (some? s) (some? p) (some? o) (some? dt))
               (let [s* (if-not (number? s)
                          (<? (dbproto/-subid db s true))
                          s)]
-                [(flake/create s* p o dt t true nil)]))) ; wrap created flake in
-                                                         ; a vector so the
-                                                         ; output of this
-                                                         ; function has the same
-                                                         ; shape as the retract
-                                                         ; functions
+                ;; wrap created flake in a vector so the output of this function has the
+                ;; same shape as the retract functions
+                [(flake/create s* p o dt t true nil)])))
           (catch* e
                   (log/error e "Error inserting new triple")
                   (>! error-ch e)))))
