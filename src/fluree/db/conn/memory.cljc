@@ -163,7 +163,7 @@
     [_ node]
     ;; all root index nodes will be empty
 
-    (storage/resolve-empty-leaf node))
+    (storage/resolve-empty-node node))
 
   #?@(:clj
       [full-text/IndexConnection

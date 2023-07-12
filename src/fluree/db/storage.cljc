@@ -251,3 +251,18 @@
         empty-node (assoc node :flakes empty-set)]
     (async/put! ch empty-node)
     ch))
+
+(defn resolve-empty-branch
+  [{:keys [comparator ledger-alias] :as node}]
+  (let [ch         (async/chan)
+        child      (index/empty-leaf ledger-alias comparator)
+        children   (index/sorted-node-set-by comparator [child])
+        empty-node (assoc node :children children)]
+    (async/put! ch empty-node)
+    ch))
+
+(defn resolve-empty-node
+  [node]
+  (if (index/leaf? node)
+    (resolve-empty-leaf node)
+    (resolve-empty-branch node)))
