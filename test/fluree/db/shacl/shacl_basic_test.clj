@@ -1045,8 +1045,17 @@
                                    "https://example.com/movie"     [{"@id" "https://example.com/Movie/19995"}
                                                                     {"@id" "https://example.com/Movie/534"}]
                                    "@type"                         "https://example.com/Actor"
-                                   "https://example.com/name"      "Sam Worthington"})]
-    (is (not (util/exception? db2)))))
+                                   "https://example.com/name"      "Sam Worthington"})
+         db3    @(fluree/stage db1 {"@id"                           "https://example.com/Actor/1001"
+                                   "https://example.com/country"   {"@id"                      "https://example.com/Country/Absurdistan"
+                                                                    "@type"                    "https://example.com/FakeCountry"
+                                                                    "https://example.com/name" "Absurdistan"}
+                                   "https://example.com/gender"    "Male"
+                                   "@type"                         "https://example.com/Actor"
+                                   "https://example.com/name"      "Not Real"})]
+    (is (not (util/exception? db2)))
+    (is (util/exception? db3))
+    (is (str/includes? (ex-message db3) "Node did not pass"))))
 
 (deftest shacl-in-test
   (testing "value nodes"

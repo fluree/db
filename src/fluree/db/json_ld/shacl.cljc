@@ -668,7 +668,7 @@
                                                                  register-nodetype property-shape)
 
                                                       (:class property-shape)
-                                                      (update-in [:datatype (:path property-shape)]
+                                                      (update-in [:datatype target-key]
                                                                  register-class class-iris))]
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p
@@ -789,7 +789,7 @@
                                                                  register-nodetype property-shape)
 
                                                       (:class property-shape)
-                                                      (update-in [:datatype (:path property-shape)]
+                                                      (update-in [:datatype target-key]
                                                                  register-class class-iris))]
                                          (recur r' shape* p-shapes*))
                                        (let [shape* (condp = p
