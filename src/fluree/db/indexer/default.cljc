@@ -317,7 +317,7 @@
   collection purposes"
   [{:keys [id] :as node}]
   (cond-> node
-          (index/resolved? node) (assoc ::old-id id)))
+    (index/resolved? node) (assoc ::old-id id)))
 
 (defn update-branch-ids
   "When using IPFS, we don't know what the leaf id will be until written,
