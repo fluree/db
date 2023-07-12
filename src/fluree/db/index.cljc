@@ -59,25 +59,21 @@
 
 (defn add-flakes
   [leaf flakes]
-  (let [new-leaf  (-> leaf
-                      (update :flakes flake/conj-all flakes)
-                      (update :size (fn [size]
-                                      (->> flakes
-                                           (map flake/size-flake)
-                                           (reduce + size)))))
-        new-first (some-> new-leaf :flakes first)]
-    (assoc new-leaf :first new-first)))
+  (-> leaf
+      (update :flakes flake/conj-all flakes)
+      (update :size (fn [size]
+                      (->> flakes
+                           (map flake/size-flake)
+                           (reduce + size))))))
 
 (defn rem-flakes
   [leaf flakes]
-  (let [new-leaf  (-> leaf
-                      (update :flakes flake/disj-all flakes)
-                      (update :size (fn [size]
-                                      (->> flakes
-                                           (map flake/size-flake)
-                                           (reduce - size)))))
-        new-first (some-> new-leaf :flakes first)]
-    (assoc new-leaf :first new-first)))
+  (-> leaf
+      (update :flakes flake/disj-all flakes)
+      (update :size (fn [size]
+                      (->> flakes
+                           (map flake/size-flake)
+                           (reduce - size))))))
 
 (defn ->node-comparator
   "Return an index node comparator that compares nodes by considering two nodes
