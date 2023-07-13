@@ -226,8 +226,8 @@
                                      (get jld-ledger/predefined-properties k)
                                      (jld-ledger/generate-new-pid k iris next-pid ref? refs))
                 ;;it's possible the shacl constraint was discovered via a different node,
-                ;; as in `sh:targetObjectsOf`. In that case, the relevant shape would already be
-                ;; in `subj-mods`.
+                ;; as in `sh:targetObjectsOf`. In that case, the relevant shape would be
+                ;; available in `subj-mods`, rather than in the currently-bound `shacl-map`.
                 shacl-map* (or shacl-map (get-in @subj-mods [sid :shacl]))
                 datatype-map     (get-in shacl-map* [:datatype pid])
                 property-flakes* (if existing-pid
