@@ -389,7 +389,7 @@
                  written-node))
         (recur (update stats :unchanged inc)
                node))
-      (assoc stats :root last-node))))
+      (assoc stats :root (index/unresolve last-node)))))
 
 
 (defn refresh-index
