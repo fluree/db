@@ -760,3 +760,14 @@
                        shape-maps)))
           (when shape-maps
             (merge-shapes shape-maps)))))))
+
+(defn has-target-objects-of-rule?
+  "Returns `true` if db currently has a rule that uses
+  `sh:targetObjectsOf`. Used to avoid unnecessary lookups
+  of shapes during transaction."
+  [db]
+  (-> db
+      :schema
+      :pred
+      (get const/$sh:targetObjectsOf)
+      boolean))

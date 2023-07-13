@@ -170,7 +170,8 @@
   If property-id is non-nil, it can be checked when assigning new subject id for the node
   if it meets certain criteria. It will only be non-nil for nested subjects in the json-ld."
   [{:keys [id type] :as node}
-   {:keys [t next-pid next-sid iris refs db-before subj-mods] :as tx-state}
+   {:keys [t next-pid next-sid iris refs db-before subj-mods
+           shacl-target-objects-of?] :as tx-state}
    referring-pid]
   (go-try
     (let [existing-sid (when id
@@ -182,15 +183,18 @@
                          ;; TODO - this will check if subject is rdfs:Class, but we already have the new-type-sids above and know that - this can be a little faster, but reify.cljc also uses this logic and they need to align
                          (jld-ledger/generate-new-sid node referring-pid iris next-pid next-sid)
                          existing-sid)
-          object-of-preds (->> (<? (query-range/index-range db-before :opst = [sid]))
-                               (map flake/p))
-          all-the-pids (cond-> object-of-preds
-                         referring-pid (conj referring-pid))
           classes      (if new-subj?
                          new-type-sids
+                         ;;note: use of `db-before` here (and below)
+                         ;; means we cannot transact shacl in same txn as
+                         ;;data and have it enforced.
                          (<? (get-subject-types db-before sid new-type-sids)))
-          class-shapes(<? (shacl/class-shapes db-before classes))
-          pred-shapes (<? (shacl/targetobject-shapes db-before all-the-pids))
+          class-shapes (<? (shacl/class-shapes db-before classes))
+          referring-pids (when shacl-target-objects-of?
+                           (cond-> (map flake/p (<? (query-range/index-range db-before :opst = [sid])))
+                             referring-pid (conj referring-pid)))
+          pred-shapes (when-not (empty? referring-pids)
+                        (<? (shacl/targetobject-shapes db-before referring-pids)))
           shacl-map   (merge-with into class-shapes pred-shapes)
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
@@ -249,9 +253,10 @@
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
-        t        (-> commit-t inc -)] ;; commit-t is always positive, need to make negative for internal indexing
+        t        (-> commit-t inc -)  ;; commit-t is always positive, need to make negative for internal indexing
+        db-before (dbproto/-rootdb db)]
     {:did           did
-     :db-before     (dbproto/-rootdb db)
+     :db-before     db-before
      :policy        policy
      :bootstrap?    bootstrap?
      :default-ctx   (if context-type
@@ -265,7 +270,8 @@
      :next-pid      (fn [] (vswap! last-pid inc))
      :next-sid      (fn [] (vswap! last-sid inc))
      :subj-mods     (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
-     :iris          (volatile! {})}))
+     :iris          (volatile! {})
+     :shacl-target-objects-of? (shacl/has-target-objects-of-rule? db-before)}))
 
 (defn final-ecount
   [tx-state]
