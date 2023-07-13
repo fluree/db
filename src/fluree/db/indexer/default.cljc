@@ -200,14 +200,14 @@
 (defn rebalance-leaf
   "Splits leaf nodes if the combined size of its flakes is greater than
   `*overflow-bytes*`."
-  [{:keys [comparator flakes rhs] :as leaf}]
+  [{:keys [comparator flakes rhs], first-flake :first, :as leaf}]
   (if (overflow-leaf? leaf)
     (let [target-size (/ *overflow-bytes* 2)]
       (log/debug "Rebalancing index leaf:"
                  (select-keys leaf [:id :ledger-alias]))
       (loop [[f & r] flakes
              cur-size  0
-             cur-first f
+             cur-first first-flake
              leaves    []]
         (if (empty? r)
           (let [subrange  (->> (flake/slice flakes cur-first nil)
