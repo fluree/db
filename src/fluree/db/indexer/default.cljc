@@ -286,7 +286,7 @@
                                                             ; branch's children
                                                             ; should be at the top
                                                             ; of the stack
-                 (recur (conj child-nodes child)
+                 (recur (conj child-nodes (index/unresolve child))
                         (vswap! stack pop)
                         (xf result* child))
                  (if (overflow-children? child-nodes)
