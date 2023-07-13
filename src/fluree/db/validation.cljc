@@ -1,7 +1,8 @@
 (ns fluree.db.validation
   (:require [fluree.db.util.core :refer [pred-ident?]]
             [fluree.db.constants :as const]
-            [malli.core :as m]))
+            [malli.core :as m]
+            [malli.error :as me]))
 
 (defn iri?
   [v]
@@ -53,6 +54,10 @@
 (defn query-fn?
   [x]
   (or (fn-string? x) (fn-list? x)))
+
+(defn humanize-error
+  [error]
+  (-> error ex-data :data :explain me/humanize))
 
 (def registry
   (merge
