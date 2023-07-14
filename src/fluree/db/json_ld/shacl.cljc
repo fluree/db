@@ -193,19 +193,6 @@
                     [false (str "sh:in: value " val " must be one of " in)]))]
     (coalesce-validation-results results logical-constraint)))
 
-;;sometimes the optimization of checking datatypes at triple-creation time
-;;does not apply, and we need to check the flakes.
-(defn validate-type-property
-  [{:keys [datatype logical-constraint] :as p-shape} p-flakes]
-  (let [results (for [flake p-flakes
-                      :let [[val dt] (flake-value flake)]]
-                  (let [flake-results
-                        [(if (and datatype (not= datatype dt))
-                           [false (str "Required data type " dt " does not match provided data type: " datatype "." )]
-                           [true (when datatype (str "Data type " dt " cannot match datatype " datatype "."))])]]
-                    (coalesce-validation-results flake-results logical-constraint)))]
-    (coalesce-validation-results results)))
-
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
@@ -217,10 +204,6 @@
   (let [validation (if (or min-count max-count)
                      (validate-count-properties p-shape p-flakes)
                      [true])
-        validation (if (and (first validation)
-                            datatype)
-                     (validate-type-property p-shape p-flakes)
-                     validation)
         validation (if (and (first validation)
                             (or min-inclusive min-exclusive max-inclusive max-exclusive))
                      (validate-value-range-properties p-shape p-flakes)
