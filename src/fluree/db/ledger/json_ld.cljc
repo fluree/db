@@ -94,7 +94,8 @@
     (jld-commit/commit ledger db* opts*)))
 
 (defn default-context
-  "Returns default context at t (must be internal negative value)"
+  "Returns default context at t (should be an ISO datetime string or an integer
+  t value)"
   [ledger t]
   (go-try
     (let [latest-db (db ledger nil)
