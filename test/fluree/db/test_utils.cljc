@@ -63,7 +63,20 @@
     "type"                      ["Movie"]
     "name"                      "Back to the Future Part III"
     "disambiguatingDescription" "1990 film by Robert Zemeckis"
-    "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}])
+    "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}
+   {"@context"                  "https://schema.org",
+    "id"                        "https://www.wikidata.org/wiki/Q2875",
+    "type"                      ["Movie"],
+    "name"                      "Gone with the Wind",
+    "disambiguatingDescription" "1939 film by Victor Fleming",
+    "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
+    "isBasedOn"                 {"id"     "https://www.wikidata.org/wiki/Q2870",
+                                 "type"   "Book",
+                                 "name"   "Gone with the Wind",
+                                 "isbn"   "0-582-41805-4",
+                                 "author" {"@id"   "https://www.wikidata.org/wiki/Q173540"
+                                           "@type" "Person"
+                                           "name"  "Margaret Mitchell"}}}])
 
 (def people
   [{:id           :ex/brian,

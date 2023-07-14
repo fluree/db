@@ -38,16 +38,14 @@
          [s-cmp p-cmp o-cmp]  components
          {s ::val, s-fn ::fn} s-cmp
          {p ::val, p-fn ::fn} p-cmp
-         {o    ::val
-          o-fn ::fn
-          o-dt ::datatype}    o-cmp]
+         o-fn                 (::fn o-cmp)]
      (go
        (try* (let [s*          (if (and s (not (number? s)))
                                  (<? (dbproto/-subid db s true))
                                  s)
-                   [o* o-dt*]  (if-let [o-iri (::iri o)]
+                   [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
                                  [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
-                                 [o o-dt])
+                                 [(::val o-cmp) (::datatype o-cmp)])
                    idx         (idx-for s* p o* o-dt*)
                    idx-root    (get db idx)
                    novelty     (get-in db [:novelty idx])
