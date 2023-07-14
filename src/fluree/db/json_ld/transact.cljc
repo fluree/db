@@ -151,11 +151,10 @@
 
                ;; if previously updated, but prior updates were only the IRI then it is OK
                (:iri-only? existing)
-               (if (and (:shacl existing)
-                        ;;shacl constraint may have been discovered on previous node.
-                        ;; in that case, we'd want to keep it and not override it.
-                        (nil? (:shacl node-meta-map)))
-                 (assoc node-meta-map :shacl (:shacl existing))
+               ;; shacl constraint may have been discovered on previous node.
+               ;; in that case, we'd want to keep it and not override it.
+               (if (:shacl existing)
+                 (update existing :shacl #(merge-with into % (:shacl node-meta-map)))
                  node-meta-map)
 
                :else

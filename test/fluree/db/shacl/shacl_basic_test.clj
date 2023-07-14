@@ -1192,7 +1192,34 @@
                                             "type"     "ex:User"
                                             "ex:friend" {"@id" "ex:Bob"}}])]
         (is (util/exception? db-just-alice))
-        (is (str/includes? (ex-message db-just-alice)  "sh:minCount")))))
+        (is (str/includes? (ex-message db-just-alice)  "sh:minCount"))))
+    (testing "combined with `sh:targetClass`"
+      (let [conn   @(fluree/connect {:method :memory
+                                     :defaults
+                                     {:context test-utils/default-str-context}})
+            ledger @(fluree/create conn "shacl-target-objects-of-test"
+                                   {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+            db1 @(fluree/stage (fluree/db ledger)
+                               [{"@id" "ex:UserShape"
+                                 "type"           ["sh:NodeShape"]
+                                 "sh:targetClass" {"@id" "ex:User"}
+                                 "sh:property"    [{"sh:path" {"@id" "ex:ssn"}
+                                                    "sh:maxCount" 1}]}
+                                {"@id" "ex:friendShape"
+                                 "type"           ["sh:NodeShape"]
+                                 "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                 "sh:property"    [{"sh:path" {"@id" "ex:name"}
+                                                    "sh:maxCount" 1}]}])
+            db-bad-friend  @(fluree/stage db1 [{"id"       "ex:Alice"
+                                                "ex:name"   "Alice"
+                                                "type"     "ex:User"
+                                                "ex:friend" {"@id" "ex:Bob"}}
+                                               {"id"       "ex:Bob"
+                                                "ex:name" ["Bob" "Robert"]
+                                                "ex:ssn" "111-11-1111"
+                                                "type"     "ex:User"}])]
+        (is (util/exception? db-bad-friend))
+        (is (str/includes? (ex-message db-bad-friend) "sh:maxCount")))))
   (testing "separate txns"
     (testing "maxCount"
       (let [conn   @(fluree/connect {:method :memory
