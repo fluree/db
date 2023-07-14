@@ -255,8 +255,8 @@
      ;; hash fns
      sha256 sha512
      ;; rdf term fns
-     uuid struuid isNumeric isBlank str
-     })
+     uuid struuid isNumeric isBlank str})
+
 
 (def allowed-symbols
   (set/union allowed-aggregate-fns allowed-scalar-fns))
@@ -307,8 +307,8 @@
     struuid     fluree.db.query.exec.eval/struuid
     isNumeric   fluree.db.query.exec.eval/isNumeric
     isBlank     fluree.db.query.exec.eval/isBlank
-    str         fluree.db.query.exec.eval/sparql-str
-    })
+    str         fluree.db.query.exec.eval/sparql-str})
+
 
 (defn variable?
   [sym]

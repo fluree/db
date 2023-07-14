@@ -167,7 +167,7 @@
      (throw (ex-info "Invalid Query"
                      {:status  400
                       :error   :db/invalid-query
-                      :reasons (-> e ex-data :data :explain me/humanize)})))))
+                      :reasons (v/humanize-error e)})))))
 
 (def coerce-modification*
   (m/coercer ::modification (mt/transformer {:name :fql}) {:registry registry}))
@@ -180,4 +180,4 @@
      (throw (ex-info "Invalid Ledger Modification"
                      {:status  400
                       :error   :db/invalid-query
-                      :reasons (-> e ex-data :data :explain me/humanize)})))))
+                      :reasons (v/humanize-error e)})))))
