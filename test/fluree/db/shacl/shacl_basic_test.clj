@@ -1150,7 +1150,7 @@
                                                "type"     "ex:User"}])]
       (is (util/exception? db-bad-friend-name))
       (is (str/includes? (ex-message db-bad-friend-name) "data type"))))
-  (testing "other constraint"
+  (testing "maxCount"
     (let [conn   @(fluree/connect {:method :memory
                                    :defaults
                                    {:context test-utils/default-str-context}})
@@ -1173,7 +1173,25 @@
                                           "type"     "ex:User"}])]
       (is (util/exception? db-excess-ssn))
       (is (str/includes? (ex-message db-excess-ssn)  "sh:maxCount")))
-
+    (testing "required properties"
+      (let [conn   @(fluree/connect {:method :memory
+                                     :defaults
+                                     {:context test-utils/default-str-context}})
+            ledger @(fluree/create conn "shacl-target-objects-of-test"
+                                   {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+            db1  @(fluree/stage (fluree/db ledger)
+                                [{"@id" "ex:friendShape"
+                                  "type"           ["sh:NodeShape"]
+                                  "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                  "sh:property"    [{"sh:path" {"@id" "ex:ssn"}
+                                                     "sh:minCount" 1}]}])
+            db-just-alice  @(fluree/stage db1
+                                          [{"id"       "ex:Alice"
+                                            "ex:name"   "Alice"
+                                            "type"     "ex:User"
+                                            "ex:friend" {"@id" "ex:Bob"}}])]
+        (is (util/exception? db-just-alice))
+        (is (str/includes? (ex-message db-just-alice)  "sh:minCount"))))
     (testing "separate txns"
       (testing "maxCount"
         (let [conn   @(fluree/connect {:method :memory
@@ -1244,23 +1262,4 @@
                                           "ex:ssn" ["111-11-1111"
                                                     "222-22-2222"]})]
         (is (util/exception? db-excess-ssn))
-        (is (str/includes? (ex-message db-excess-ssn)  "sh:maxCount"))))
-    (testing "required properties"
-      (let [conn   @(fluree/connect {:method :memory
-                                     :defaults
-                                     {:context test-utils/default-str-context}})
-            ledger @(fluree/create conn "shacl-target-objects-of-test"
-                                   {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
-            db1  @(fluree/stage (fluree/db ledger)
-                                [{"@id" "ex:friendShape"
-                                  "type"           ["sh:NodeShape"]
-                                  "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                  "sh:property"    [{"sh:path" {"@id" "ex:ssn"}
-                                                     "sh:minCount" 1}]}])
-            db-just-alice  @(fluree/stage db1
-                                          [{"id"       "ex:Alice"
-                                            "ex:name"   "Alice"
-                                            "type"     "ex:User"
-                                            "ex:friend" {"@id" "ex:Bob"}}])]
-        (is (util/exception? db-just-alice))
-        (is (str/includes? (ex-message db-just-alice)  "sh:minCount"))))))
+        (is (str/includes? (ex-message db-excess-ssn)  "sh:maxCount"))))))
