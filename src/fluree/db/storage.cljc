@@ -255,6 +255,9 @@
 
 (defn resolve-empty-node
   [node]
-  (if (index/leaf? node)
-    (resolve-empty-leaf node)
-    (resolve-empty-branch node)))
+  (if (index/resolved? node)
+    (doto (async/chan)
+      (async/put! node))
+    (if (index/leaf? node)
+      (resolve-empty-leaf node)
+      (resolve-empty-branch node))))
