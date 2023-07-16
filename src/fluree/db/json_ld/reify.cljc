@@ -401,7 +401,8 @@
                                  (= -1 t-new)
                                  (into commit-data/commit-schema-flakes)))
          ecount*            (assoc ecount const/$_predicate pid
-                                          const/$_default sid)]
+                                          const/$_default sid
+                                          const/$_shard @last-sid)]
      (when (empty? all-flakes)
        (commit-error "Commit has neither assertions or retractions!"
                      commit-metadata))

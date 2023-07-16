@@ -103,10 +103,6 @@
 (def explain-error
   (m/explainer ::history-query {:registry registry}))
 
-(defn humanize-error
-  [query-validation-error]
-  (-> query-validation-error Throwable->map :data :data :explain me/humanize))
-
 (def parse-history-query
   (m/parser ::history-query {:registry registry}))
 
