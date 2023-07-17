@@ -1,8 +1,7 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
-            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.core #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec])
@@ -16,11 +15,11 @@
 (defn cache-query
   "Returns already cached query from cache if available, else
   executes and stores query into cache."
-  [{:keys [network ledger-id block auth conn] :as db} query-map]
+  [{:keys [network ledger-id t auth conn] :as db} query-map]
   ;; TODO - if a cache value exists, should max-fuel still be checked and throw if not enough?
   (let [oc        (:object-cache conn)
         query*    (update query-map :opts dissoc :fuel :max-fuel)
-        cache-key [:query network ledger-id block auth query*]]
+        cache-key [:query network ledger-id t auth query*]]
     ;; object cache takes (a) key and (b) fn to retrieve value if null
     (oc cache-key
         (fn [_]
@@ -39,15 +38,17 @@
 
 (defn query
   "Returns core async channel with results or exception"
-  [db query-map]
-  (if (cache? query-map)
-    (cache-query db query-map)
-    (let [q   (try*
-                (parse/parse query-map db)
-                (catch* e e))
-          db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
-      (if (util/exception? q)
-        (async/to-chan! [q])
-        (if (= :simple-subject-crawl (:strategy q))
-          (simple-subject-crawl db* q)
-          (exec/query db* q))))))
+  ([db query-map]
+   (query db nil query-map))
+  ([db fuel-tracker query-map]
+   (if (cache? query-map)
+     (cache-query db query-map)
+     (let [q   (try*
+                 (parse/parse-query query-map db)
+                 (catch* e e))
+           db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
+       (if (util/exception? q)
+         (async/to-chan! [q])
+         (if (= :simple-subject-crawl (:strategy q))
+           (simple-subject-crawl db* q)
+           (exec/query db* fuel-tracker q)))))))

@@ -81,8 +81,17 @@
       (testing "basic analytical RFD type query"
         (let [query-res @(fluree/query db '{:select {?s [:* {:schema/isBasedOn [:*]}]}
                                             :where  [[?s :rdf/type :schema/Movie]]})]
-          (is (= query-res                                  ;; :id is a DID and will be unique per DB so exclude from comparison
-                 [{:id                               :wiki/Q230552,
+          (is (= [{:id :wiki/Q2875,
+                   :rdf/type [:schema/Movie],
+                   :schema/disambiguatingDescription "1939 film by Victor Fleming",
+                   :schema/isBasedOn {:id :wiki/Q2870,
+                                      :rdf/type [:schema/Book],
+                                      :schema/author {:id :wiki/Q173540},
+                                      :schema/isbn "0-582-41805-4",
+                                      :schema/name "Gone with the Wind"},
+                   :schema/name "Gone with the Wind",
+                   :schema/titleEIDR "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4"}
+                  {:id                               :wiki/Q230552,
                    :rdf/type                         [:schema/Movie],
                    :schema/name                      "Back to the Future Part III",
                    :schema/disambiguatingDescription "1990 film by Robert Zemeckis",
@@ -105,7 +114,8 @@
                                                       :rdf/type      [:schema/Book],
                                                       :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                       :schema/isbn   "0-330-25864-8",
-                                                      :schema/author {:id :wiki/Q42}}}])
+                                                      :schema/author {:id :wiki/Q42}}}]                                  ;; :id is a DID and will be unique per DB so exclude from comparison
+                 query-res)
               "Standard bootstrap data isn't matching."))))))
 
 
@@ -115,25 +125,27 @@
           movies (test-utils/load-movies conn)]
       (testing "define @list container in context"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {:context {:ex      "http://example.org/ns#"
+                                       {:context {:id      "@id"
+                                                  :ex      "http://example.org/ns#"
                                                   :ex/list {"@container" "@list"}}
                                         :id      "list-test"
                                         :ex/list [42 2 88 1]})
-              query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
+              query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}]
                                             :selectOne {?s [:*]},
-                                            :where [[?s :id "list-test"]]})]
+                                            :where     [[?s :id "list-test"]]})]
           (is (= query-res
                  {:id      "list-test"
                   :ex/list [42 2 88 1]})
               "Order of query result is different from transaction.")))
       (testing "define @list directly on subject"
         (let [db        @(fluree/stage (fluree/db movies)
-                                       {:context {:ex "http://example.org/ns#"}
+                                       {:context {:id      "@id"
+                                                  :ex      "http://example.org/ns#"}
                                         :id      "list-test2"
                                         :ex/list {"@list" [42 2 88 1]}})
-              query-res @(fluree/query db '{:context {:ex "http://example.org/ns#"},
+              query-res @(fluree/query db '{:context   ["" {:ex "http://example.org/ns#"}],
                                             :selectOne {?s [:*]},
-                                            :where [[?s :id "list-test2"]]})]
+                                            :where     [[?s :id "list-test2"]]})]
           (is (= query-res
                  {:id      "list-test2"
                   :ex/list [42 2 88 1]})
@@ -141,7 +153,7 @@
 
 (deftest ^:integration simple-subject-crawl-test
   (let [conn   (test-utils/create-conn)
-        ledger @(fluree/create conn "query/simple-subject-crawl" {:context {:ex "http://example.org/ns/"}})
+        ledger @(fluree/create conn "query/simple-subject-crawl" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/brian,

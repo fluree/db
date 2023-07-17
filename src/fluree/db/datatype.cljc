@@ -6,8 +6,7 @@
                :cljs [fluree.db.util.cljs-const :as uc]))
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
-                   (java.time.format DateTimeFormatter)
-                   (java.math BigDecimal))))
+                   (java.time.format DateTimeFormatter))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -190,16 +189,20 @@
   [value]
   (cond
     (string? value)
-    #?(:clj  (try (BigDecimal. ^String value) (catch Exception _ nil))
+    #?(:clj  (try (bigdec value) (catch Exception _ nil))
        :cljs (let [n (js/parseFloat value)] (if (js/Number.isNaN n) nil n)))
 
     (integer? value)
-    #?(:clj  (BigDecimal. ^int value)
+    #?(:clj  (bigdec value)
        :cljs value)
 
     (float? value)
     ;; convert to string first to keep float precision explosion at bay
-    #?(:clj  (BigDecimal. ^String (Float/toString value))
+    #?(:clj  (bigdec (Float/toString value))
+       :cljs value)
+
+    (number? value)
+    #?(:clj  (bigdec value)
        :cljs value)
 
     :else nil))
@@ -331,7 +334,7 @@
    - numbers in strings
    - the strings 'true' or 'false' to a boolean"
   [value required-type]
-  (log/debug "coerce value:" value "to type:" required-type)
+  (log/trace "coerce value:" value "to type:" required-type)
   (uc/case (int required-type)
     const/$xsd:string
     (when (string? value)
@@ -397,7 +400,7 @@
   (let [type-id (if type
                   (get default-data-types type)
                   (infer value))
-        _       (log/debug "from-expanded type:" type-id)
+        _       (log/trace "from-expanded type:" type-id)
         value*  (coerce value type-id)]
     (cond (and required-type (not= type-id required-type))
           (throw (ex-info (str "Required data type " required-type

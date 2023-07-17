@@ -9,7 +9,7 @@
 (deftest ^:integration policy-enforcement
   (testing "Testing basic policy enforcement."
     (let [conn      (test-utils/create-conn)
-          ledger    @(fluree/create conn "policy/tx-a" {:context {:ex "http://example.org/ns/"}})
+          ledger    @(fluree/create conn "policy/tx-a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db        @(fluree/stage
@@ -77,14 +77,13 @@
                                          {:f/path  :schema/name
                                           :f/allow [{:f/targetRole :ex/userRole
                                                      :f/action     [:f/view :f/modify]}]}]}])]
-
       (testing "Policy allowed modification"
         (testing "using role + id"
-          (let [update-name @(fluree/stage db+policy {:id          :ex/alice
-                                                      :schema/email "alice@foo.bar"}
+          (let [update-name @(fluree/stage db+policy
+                                           {:id          :ex/alice
+                                            :schema/email "alice@foo.bar"}
                                            {:did alice-did
                                             :role      :ex/userRole})]
-
             (is (= [{:id :ex/alice,
                      :rdf/type [:ex/User],
                      :schema/name "Alice",
@@ -94,33 +93,36 @@
                      :ex/location {:id nil}}]
                    @(fluree/query update-name
                                   {:select {'?s [:*]}
-                                   :where  [['?s :schema/name "Alice"]]}))
+                                   :where  [['?s :schema/name "Alice"]]
+                                   :opts {:did alice-did}}))
                 "Alice should be allowed to update her own name.")))
         (testing "using role only"
-          (let [update-price @(fluree/stage db+policy {:id          :ex/widget
-                                                       :schema/price 105.99}
-                                            {:role :ex/rootRole})]
+            (let [update-price @(fluree/stage db+policy
+                                              {:id          :ex/widget
+                                               :schema/price 105.99}
+                                              {:role :ex/rootRole})]
 
-            (is (= [{:id :ex/widget,
-                     :rdf/type [:ex/Product],
-                     :schema/name "Widget",
-                     :schema/price 105.99,
-                     :schema/priceCurrency "USD"}]
-                   @(fluree/query update-price
-                                  {:select {'?s [:*]}
-                                   :where  [['?s :rdf/type :ex/Product]]}))
-                "Updated :schema/price should have been allowed, and entire product is visible in query."))
-          (let [update-name @(fluree/stage db+policy {:id          :ex/widget
-                                                      :schema/name "Widget2"}
-                                           {:role :ex/userRole})]
+              (is (= [{:id :ex/widget,
+                       :rdf/type [:ex/Product],
+                       :schema/name "Widget",
+                       :schema/price 105.99,
+                       :schema/priceCurrency "USD"}]
+                     @(fluree/query update-price
+                                    {:select {'?s [:*]}
+                                     :where  [['?s :rdf/type :ex/Product]]}))
+                  "Updated :schema/price should have been allowed, and entire product is visible in query."))
+            (let [update-name @(fluree/stage db+policy
+                                             {:id          :ex/widget
+                                              :schema/name "Widget2"}
+                                             {:role :ex/userRole})]
 
-            (is (= [{:rdf/type    [:ex/Product]
-                     :schema/name "Widget2"}]
-                   @(fluree/query update-name
-                                  {:select {'?s [:*]}
-                                   :where  [['?s :rdf/type :ex/Product]]}))
-                "Updated :schema/name should have been allowed, and only name is visible in query."))))
-
+              (is (= [{:rdf/type    [:ex/Product]
+                       :schema/name "Widget2"}]
+                     @(fluree/query update-name
+                                    {:select {'?s [:*]}
+                                     :where  [['?s :rdf/type :ex/Product]]
+                                     :opts {:role :ex/userRole}}))
+                  "Updated :schema/name should have been allowed, and only name is visible in query."))))
       (testing "Policy doesn't allow a modification"
         (let [update-price @(fluree/stage db+policy {:id           :ex/widget
                                                      :schema/price 42.99}

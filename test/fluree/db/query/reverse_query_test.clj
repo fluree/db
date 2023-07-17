@@ -7,7 +7,7 @@
 (deftest ^:integration context-reverse-test
   (testing "Test that the @reverse context values pulls select values back correctly."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/reverse" {:context {:ex "http://example.org/ns/"}})
+          ledger @(fluree/create conn "query/reverse" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                     (fluree/db ledger)
                     [{:id           :ex/brian,
@@ -22,22 +22,22 @@
                       :schema/name  "Cam"
                       :ex/friend    [:ex/brian :ex/alice]}])]
 
-      (is (= @(fluree/query db '{:context {:friended {:reverse :ex/friend}}
+      (is (= @(fluree/query db '{:context   ["" {:friended {:reverse :ex/friend}}]
                                  :selectOne {?s [:schema/name :friended]}
-                                 :where [[?s :id :ex/brian]]})
+                                 :where     [[?s :id :ex/brian]]})
              {:schema/name "Brian"
               :friended    :ex/cam}))
 
-      (is (= @(fluree/query db '{:context {:friended {:reverse :ex/friend}},
+      (is (= @(fluree/query db '{:context   ["" {:friended {:reverse :ex/friend}}],
                                  :selectOne {?s [:schema/name :friended]},
-                                 :where [[?s :id :ex/alice]]})
+                                 :where     [[?s :id :ex/alice]]})
              {:schema/name "Alice"
               :friended    [:ex/cam :ex/brian]}))
 
 
-      (is (= @(fluree/query db '{:context {:friended {:reverse :ex/friend}},
+      (is (= @(fluree/query db '{:context   ["" {:friended {:reverse :ex/friend}}],
                                  :selectOne {?s [:schema/name {:friended [:*]}]},
-                                 :where [[?s :id :ex/brian]]})
+                                 :where     [[?s :id :ex/brian]]})
              {:schema/name "Brian",
               :friended    {:id           :ex/cam,
                             :rdf/type     [:ex/User],

@@ -3,73 +3,12 @@
             [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.json :as json]
-            [fluree.json-ld :as json-ld]
-            [fluree.db.util.schema :as schema-util]))
+            [fluree.db.util.schema :as schema-util]
+            [clojure.set :as set]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; generates vocabulary/schema pre-cached maps.
-
-(def property-sids #{const/$rdf:Property
-                     const/$owl:DatatypeProperty
-                     const/$owl:ObjectProperty})
-
-(defn is-property?
-  "Takes a list of flakes for a specific subject and returns
-  truthy if any of them are of rdf:type rdf:Property, or the
-  owl-specific versions of properties as defined by property-sids."
-  [s-flakes]
-  (some (fn [f]
-          (and (= const/$rdf:type (flake/p f))
-               (property-sids (flake/o f))))
-        s-flakes))
-
-
-(defn schema-details
-  [sid s-flakes]
-  (loop [[f & r] s-flakes
-         details (if (= sid const/$rdf:type)
-                   {:id    sid ;; rdf:type is predefined, so flakes to build map won't be present.
-                    :class false
-                    :idx?  true
-                    :ref?  true}
-                   {:id                 sid
-                    :class              true ;; default
-                    :idx?               true
-                    :ref?               false ;; could go from false->true if defined in vocab but hasn't been used yet
-                    :subclassOf         []
-                    :equivalentProperty []})]
-    (if f
-      (let [pid      (flake/p f)
-            details* (cond
-                       (= const/$iri pid)
-                       (assoc details :iri (flake/o f))
-
-                       (= const/$rdf:type pid)
-                       (if (property-sids (flake/o f))
-                         (if (= const/$owl:ObjectProperty (flake/o f))
-                           (assoc details :class false
-                                          :ref? true)
-                           (assoc details :class false))
-                         (if (= const/$iri (flake/o f))
-                           (assoc details :class false
-                                          :ref? true)
-                           ;; it is a class, but we already did :class true as a default
-                           details))
-
-                       (= const/$rdfs:subClassOf pid)
-                       (update details :subclassOf conj (flake/o f))
-
-                       (= const/$_predicate:equivalentProperty pid)
-                       (update details :equivalentProperty conj (flake/o f))
-
-                       :else details)]
-        (recur r details*))
-      details)))
-
 
 (defn map-pred-id+iri
   "In the schema map, we index properties by both integer :id and :iri for easy lookup of either."
@@ -118,8 +57,7 @@
 (defn calc-subclass
   "Calculates subclass map for use with queries for rdf:type."
   [property-maps]
-  (let [classes      (filter #(true? (:class %)) property-maps)
-        subclass-map (recur-sub-classes (vals property-maps))]
+  (let [subclass-map (recur-sub-classes (vals property-maps))]
     ;; map subclasses for both subject-id and iri
     (reduce-kv
       (fn [acc class-id subclasses]
@@ -132,32 +70,119 @@
   (into #{} (keep #(when (true? (:ref? %)) (:id %)) property-maps)))
 
 
-(defn update-with*
-  [{:keys [pred] :as schema} t vocab-flakes]
-  (loop [[s-flakes & r] (partition-by flake/s vocab-flakes)
-         pred* pred]
-    (if s-flakes
-      (let [sid      (flake/s (first s-flakes))
-            prop-map (schema-details sid s-flakes)]
-        (recur r
-               (assoc pred* (:id prop-map) prop-map
-                            (:iri prop-map) prop-map)))
-      (assoc schema :t t
-                    :pred pred*
-                    :subclasses (delay (calc-subclass pred*))))))
+(def property-sids #{const/$rdf:Property
+                     const/$owl:DatatypeProperty
+                     const/$owl:ObjectProperty})
 
+(defn initial-property-map
+  [sid]
+  (if (= sid const/$rdf:type)
+    {:id    sid ; rdf:type is predefined, so flakes to build map won't be present.
+     :class false
+     :idx?  true
+     :ref?  true}
+    {:id                 sid
+     :class              true ; default
+     :idx?               true
+     :ref?               false ; could go from false->true if defined in vocab but hasn't been used yet
+     :subclassOf         #{}
+     :equivalentProperty #{}}))
+
+(defn add-subclass
+  [prop-map subclass]
+  (update prop-map :subclassOf conj subclass))
+
+(defn add-equivalent-property
+  [prop-map prop]
+  (update prop-map :equivalentProperty conj prop))
+
+(defn update-equivalent-property
+  [prop-map sid prop]
+  (let [initial-map              (initial-property-map sid)
+        with-equivalent-property (fnil add-equivalent-property initial-map)]
+    (update prop-map sid with-equivalent-property prop)))
+
+(defn update-all-equivalent-properties
+  [prop-map sid o-props]
+  (reduce (fn [p-map o-prop]
+            (-> p-map
+                (update-equivalent-property sid o-prop)
+                (update-equivalent-property o-prop sid)))
+          prop-map o-props))
+
+(defn update-equivalent-properties
+  [pred-map sid obj]
+  (let [s-props (-> pred-map
+                    (get-in [sid :equivalentProperty])
+                    (conj sid))
+        o-props (-> pred-map
+                    (get-in [obj :equivalentProperty])
+                    (conj obj))]
+    (reduce (fn [p-map s-prop]
+              (update-all-equivalent-properties p-map s-prop o-props))
+            pred-map s-props)))
+
+(defn update-pred-map
+  [pred-map vocab-flake]
+  (let [[sid pid obj]   ((juxt flake/s flake/p flake/o) vocab-flake)
+        initial-map     (initial-property-map sid)
+        with-properties (fnil assoc initial-map)
+        with-subclass   (fnil add-subclass initial-map)]
+    (cond
+      (= const/$xsd:anyURI pid)
+      (update pred-map sid with-properties :iri obj)
+
+      (= const/$rdf:type pid)
+      (if (property-sids obj)
+        (if (= const/$owl:ObjectProperty obj)
+          (update pred-map sid with-properties :class false, :ref? true)
+          (update pred-map sid with-properties :class false))
+        (if (= const/$xsd:anyURI obj)
+          (update pred-map sid with-properties :class false, :ref? true)
+          ;; it is a class, but we already did :class true as a default
+          pred-map))
+
+      (= const/$rdfs:subClassOf pid)
+      (update pred-map sid with-subclass obj)
+
+      (= const/$_predicate:equivalentProperty pid)
+      (update-equivalent-properties pred-map sid obj)
+
+      :else pred-map)))
+
+(defn with-vocab-flakes
+  [pred-map vocab-flakes]
+  (let [new-pred-map  (reduce update-pred-map pred-map vocab-flakes)]
+    (reduce-kv (fn [preds k v]
+                 (if (number? k)
+                   (assoc preds k v, (:iri v) v)
+                   preds))
+               {"@type" {:iri  "@type"
+                         :ref? true
+                         :idx? true
+                         :id   const/$rdf:type}}
+               new-pred-map)))
+
+(defn refresh-subclasses
+  [{:keys [pred] :as schema}]
+  (assoc schema :subclasses (delay (calc-subclass pred))))
+
+(defn update-with*
+  [schema t vocab-flakes]
+  (-> schema
+      (assoc :t t)
+      (update :pred with-vocab-flakes vocab-flakes)
+      refresh-subclasses))
 
 (defn update-with
   "When creating a new db from a transaction, merge new schema changes
   into existing schema of previous db."
-  [{:keys [schema] :as _db-before} db-t new-refs vocab-flakes]
+  [schema db-t new-refs vocab-flakes]
   (if (empty? vocab-flakes)
     schema
-    (let [{:keys [refs]} schema
-          refs* (into refs new-refs)]
-      (-> (assoc schema :refs refs*)
-          (update-with* db-t vocab-flakes)
-          (assoc :refs refs*)))))
+    (-> schema
+        (update :refs into new-refs)
+        (update-with* db-t vocab-flakes))))
 
 (defn base-schema
   []
@@ -169,7 +194,7 @@
               "_default"   {:name "_default" :id 11 :sid nil}}
         pred (map-pred-id+iri [{:iri const/iri-id
                                 :idx? true
-                                :id   const/$iri}
+                                :id   const/$xsd:anyURI}
                                {:iri  "@type"
                                 :ref? true
                                 :idx? true
@@ -186,8 +211,6 @@
      :refs        #{}
      :coll        coll
      :pred        pred
-     :context     nil
-     :context-str nil
      :shapes      (atom {:class {} ; TODO: Does this need to be an atom?
                          :pred  {}})
      :prefix      {}
@@ -223,8 +246,5 @@
   "Updates the schema map of a db."
   [db]
   (go-try
-    (let [{{:keys [context context-str]} :schema} db
-          _       (log/debug "refresh-schema existing context:" context)
-          schema  (<? (vocab-map db))
-          schema* (assoc schema :context context :context-str context-str)]
-      (assoc db :schema schema*))))
+    (let [schema  (<? (vocab-map db))]
+      (assoc db :schema schema))))

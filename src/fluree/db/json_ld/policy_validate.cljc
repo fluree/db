@@ -47,7 +47,7 @@
             (when (> (count next-res) 1)
               (log/warn (str "f:equals used for identity " ident " and path: " equals-rule
                              " however the query produces more than one result, the first one "
-                             " is being used which can product unpredictable results. "
+                             " is being used which can produce unpredictable results. "
                              "Prefer f:contains when comparing with multiple results.")))
             (recur r next-val))
           (do
@@ -78,12 +78,17 @@
   All policy functions are evaluated for a truthy or falsey result which determines if the provided flake
   can be operated on/viewed."
   [rule property-path]
-  (if (= :f/$identity (first property-path))
-    ;; make certain first element of path is :f/$identity which following fn only considers. Will support other path constructs in the future
-    (let [path-no-identity (rest property-path)             ;; remove :f/$identity - following logic will "substitute" the user's actual identity in its place
+  (if (= const/iri-$identity (first property-path))
+    ;; make certain first element of path is :f/$identity which following fn only
+    ;; considers. Will support other path constructs in the future
+    ;; remove :f/$identity - following logic will "substitute" the user's actual identity in its place
+    (let [path-no-identity (rest property-path)
           f                (fn [db flake]
                              (go-try
-                               ;; because same 'path' is likely used in many flake evaluations, keep a local cache of results so expensive lookup only happens once per query/transaction.
+                               ;; because same 'path' is likely used in many flake
+                               ;; evaluations, keep a local cache of results so
+                               ;; expensive lookup only happens once per
+                               ;; query/transaction.
                                (let [path-val (or (cache-get-value db property-path)
                                                   (->> (async/<! (resolve-equals-rule db path-no-identity rule))
                                                        (cache-store-value db property-path)))]

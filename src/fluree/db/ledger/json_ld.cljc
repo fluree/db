@@ -1,6 +1,9 @@
 (ns fluree.db.ledger.json-ld
-  (:require [fluree.db.ledger.proto :as ledger-proto]
+  (:require [fluree.db.flake :as flake]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.time-travel :as time-travel]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.json-ld.bootstrap :as bootstrap]
             [fluree.db.json-ld.branch :as branch]
@@ -12,6 +15,7 @@
             [clojure.string :as str]
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.util.core :as util]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [load]))
 
@@ -19,27 +23,23 @@
 
 (defn branch-meta
   "Retrieves branch metadata from ledger state"
-  [{:keys [state context] :as _ledger} requested-branch]
-  (let [{:keys [branch branches]} @state
-        branch      (if requested-branch
-                      (get branches requested-branch)
-                      ;; default branch
-                      (get branches branch))
-        context-kw  (json-ld/parse-context context)
-        context-str (-> context util/stringify-keys json-ld/parse-context)]
-    (-> branch
-        (assoc-in [:latest-db :schema :context] context-kw)
-        (assoc-in [:latest-db :schema :context-str] context-str))))
+  [{:keys [state] :as _ledger} requested-branch]
+  (let [{:keys [branch branches]} @state]
+    (if requested-branch
+      (get branches requested-branch)
+      ;; default branch
+      (get branches branch))))
 
 ;; TODO - no time travel, only latest db on a branch thus far
 (defn db
-  [ledger {:keys [branch]}]
+  [ledger {:keys [branch context-type]}]
   (let [branch-meta (ledger-proto/-branch ledger branch)]
     ;; if branch is nil, will return default
     (when-not branch-meta
       (throw (ex-info (str "Invalid branch: " branch ". Branch must exist before transacting.")
                       {:status 400 :error :db/invalid-branch})))
-    (branch/latest-db branch-meta)))
+    (cond-> (branch/latest-db branch-meta)
+            context-type (assoc :context-type context-type))))
 
 (defn db-update
   "Updates db, will throw if not next 't' from current db.
@@ -93,6 +93,33 @@
         db*   (or db (ledger-proto/-db ledger (:branch opts*)))]
     (jld-commit/commit ledger db* opts*)))
 
+(defn default-context
+  "Returns default context at t (should be an ISO datetime string or an integer
+  t value)"
+  [ledger t]
+  (go-try
+    (let [latest-db (db ledger nil)
+          t*        (cond
+                      (string? t) (<? (time-travel/datetime->t latest-db t))
+                      (pos-int? t) (- t)
+                      (neg-int? t) t)
+          dc-sid    (-> latest-db
+                        (query-range/index-range :spot =
+                                                 [t* const/$_ledger:context]
+                                                 {:flake-limit 1})
+                        <?
+                        first
+                        flake/o)
+          dc-addr   (-> latest-db
+                        (query-range/index-range :spot =
+                                                 [dc-sid const/$_address]
+                                                 {:flake-limit 1})
+                        <?
+                        first
+                        flake/o)
+          db-conn   (:conn latest-db)]
+      (<? (jld-reify/load-default-context db-conn dc-addr)))))
+
 (defn close-ledger
   "Shuts down ledger and resources."
   [{:keys [indexer cache state] :as _ledger}]
@@ -100,7 +127,7 @@
   (reset! state {:closed? true})
   (reset! cache {}))
 
-(defrecord JsonLDLedger [id address alias context did indexer
+(defrecord JsonLDLedger [id address alias did indexer
                          state cache conn method]
   ledger-proto/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
@@ -119,6 +146,7 @@
   (-did [_] did)
   (-alias [_] alias)
   (-address [_] address)
+  (-default-context [ledger t] (default-context ledger t))
   (-close [ledger] (close-ledger ledger)))
 
 
@@ -150,56 +178,62 @@
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
-    (let [{:keys [context-type context did branch pub-fn ipns indexer include
-                  reindex-min-bytes reindex-max-bytes initial-tx]
-           :or   {branch :main}} opts
-          did*          (if did
-                          (if (map? did)
-                            did
-                            {:id did})
-                          (conn-proto/-did conn))
-          indexer       (cond
-                          (satisfies? idx-proto/iIndex indexer)
-                          indexer
+    (let [{:keys [defaultContext context-type did branch pub-fn ipns indexer include
+                  reindex-min-bytes reindex-max-bytes initial-tx new-context?]
+           :or   {branch       :main
+                  new-context? true}} opts
+          default-context (if defaultContext
+                            (-> defaultContext
+                                (ctx-util/mapify-context (conn-proto/-default-context conn))
+                                (ctx-util/stringify-context))
+                            (conn-proto/-default-context conn))
+          context-type*   (or context-type (-> conn :ledger-defaults :context-type))
+          did*            (if did
+                            (if (map? did)
+                              did
+                              {:id did})
+                            (conn-proto/-did conn))
+          indexer         (cond
+                            (satisfies? idx-proto/iIndex indexer)
+                            indexer
 
-                          indexer
-                          (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
-                                               "Provided: " indexer)
-                                          {:status 400 :error :db/invalid-indexer}))
+                            indexer
+                            (throw (ex-info (str "Ledger indexer provided, but doesn't implement iIndex protocol. "
+                                                 "Provided: " indexer)
+                                            {:status 400 :error :db/invalid-indexer}))
 
-                          :else
-                          (conn-proto/-new-indexer
-                            conn (util/without-nils
+                            :else
+                            (conn-proto/-new-indexer
+                             conn (util/without-nils
                                    {:reindex-min-bytes reindex-min-bytes
                                     :reindex-max-bytes reindex-max-bytes})))
-          ledger-alias* (normalize-alias ledger-alias)
-          address       (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
-          method-type   (conn-proto/-method conn)
+          ledger-alias*   (normalize-alias ledger-alias)
+          address         (<? (conn-proto/-address conn ledger-alias* (assoc opts :branch branch)))
+          method-type     (conn-proto/-method conn)
           ;; map of all branches and where they are branched from
-          branches      {branch (branch/new-branch-map nil ledger-alias* branch)}
-          ledger        (map->JsonLDLedger
-                          {:id      (random-uuid)
-                           :context context
-                           :did     did*
-                           :state   (atom {:closed?  false
-                                           :branches branches
-                                           :branch   branch
-                                           :graphs   {}
-                                           :push     {:complete {:t   0
-                                                                 :dag nil}
-                                                      :pending  {:t   0
-                                                                 :dag nil}}})
-                           :alias   ledger-alias
-                           :address address
-                           :method  method-type
-                           :cache   (atom {})
-                           :indexer indexer
-                           :conn    conn})
-          blank-db      (jld-db/create ledger)
-          bootstrap?    (boolean initial-tx)
-          db            (if bootstrap?
-                          (<? (bootstrap/bootstrap blank-db initial-tx))
-                          (bootstrap/blank-db blank-db))]
+          branches        {branch (branch/new-branch-map nil ledger-alias* branch)}
+          ledger          (map->JsonLDLedger
+                           {:id      (random-uuid)
+                            :did     did*
+                            :state   (atom {:closed?  false
+                                            :branches branches
+                                            :branch   branch
+                                            :graphs   {}
+                                            :push     {:complete {:t   0
+                                                                  :dag nil}
+                                                       :pending  {:t   0
+                                                                  :dag nil}}})
+                            :alias   ledger-alias
+                            :address address
+                            :method  method-type
+                            :cache   (atom {})
+                            :indexer indexer
+                            :conn    conn})
+          blank-db        (jld-db/create ledger default-context context-type* new-context?)
+          bootstrap?      (boolean initial-tx)
+          db              (if bootstrap?
+                            (<? (bootstrap/bootstrap blank-db initial-tx))
+                            (bootstrap/blank-db blank-db))]
       ;; place initial 'blank' DB into ledger.
       (ledger-proto/-db-update ledger db)
       (when include
@@ -209,41 +243,38 @@
       ledger)))
 
 (defn load
-  [conn commit-address]
+  [conn db-alias]
   (go-try
-    (let [base-context {:base commit-address}
-          last-commit  (<? (conn-proto/-lookup conn commit-address))
-          _            (when-not last-commit
-                         (throw (ex-info (str "Unable to load. No commit exists for: " commit-address)
+    (let [commit-addr  (<? (conn-proto/-lookup conn db-alias))
+          _            (when-not commit-addr
+                         (throw (ex-info (str "Unable to load. No commit exists for: " db-alias)
                                          {:status 400 :error :db/invalid-commit-address})))
-          commit-data  (<? (conn-proto/-c-read conn last-commit))
+          commit-data  (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit-data
-                         (throw (ex-info (str "Unable to load. No commit exists for: " last-commit)
+                         (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))
-          commit-data* (json-ld/expand commit-data base-context)
-          [commit proof] (jld-reify/parse-commit commit-data*)
-          _            (when proof
-                         (jld-reify/validate-commit db commit proof))
+          [commit proof] (jld-reify/parse-commit commit-data)
           _            (log/debug "load commit:" commit)
-          alias        (or (get-in commit [const/iri-alias :value])
-                           (conn-proto/-alias conn commit-address))
+          ledger-alias (or (get-in commit [const/iri-alias :value])
+                           (conn-proto/-alias conn db-alias))
           branch       (keyword (get-in commit [const/iri-branch :value]))
           default-ctx  (-> commit
-                           (get const/iri-default-context)
-                           :value
+                           (get-in [const/iri-default-context const/iri-address
+                                    :value])
                            (->> (jld-reify/load-default-context conn))
                            <?)
-          ledger       (<? (create conn alias {:branch  branch
-                                               :id      last-commit
-                                               :context default-ctx}))
+          ledger       (<? (create conn ledger-alias {:branch         branch
+                                                      :id             commit-addr
+                                                      :defaultContext default-ctx
+                                                      :new-context?   false}))
           db           (ledger-proto/-db ledger)
-          db*          (<? (jld-reify/load-db-idx db commit last-commit false))]
-      (ledger-proto/-commit-update ledger branch db*)
-      ledger)))
-
-
-(defn is-ledger?
-  "Returns true if map is a ledger object.
-  Used to differentiate in cases where ledger or DB could be used."
-  [x]
-  (satisfies? ledger-proto/iLedger x))
+          db*          (<? (jld-reify/load-db-idx db commit commit-addr false))
+          valid?       (if proof
+                         (jld-reify/validate-commit db* commit proof)
+                         true)]
+      (if valid?
+        (do
+          (ledger-proto/-commit-update ledger branch db*)
+          ledger)
+        (throw (ex-info "Invalid commit proof"
+                        {:status 400, :error :db/invalid-commit}))))))

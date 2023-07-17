@@ -1,20 +1,14 @@
 <!-- Logback configuration. See http://logback.qos.ch/manual/index.html -->
-<configuration scan="true" scanPeriod="10 seconds">
-
+<configuration>
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
         <encoder>
             <pattern>%highlight(%-5level) %cyan(%logger{24}) - %msg%n</pattern>
         </encoder>
     </appender>
 
-    <root level="INFO">
+    <root level="ERROR">
         <appender-ref ref="STDOUT"/>
     </root>
 
-    <logger name="user" level="ALL"/>
-    <logger name="ch.qos.logback" level="WARN"/>
     <logger name="fluree.db" level="TRACE"/>
-    <logger name="fluree.db.consensus" level="INFO"/>
-    <logger name="fluree.db.messaging" level="INFO"/>
-
 </configuration>

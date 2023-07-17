@@ -2,6 +2,7 @@
   (:require [fluree.db.query.range :as query-range]
             [clojure.core.async :as async :refer [>! go]]
             [fluree.db.flake :as flake]
+            [fluree.db.fuel :as fuel]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -13,58 +14,68 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 (defn reference?
-  [match]
-  (= (::datatype match)
-     const/$xsd:anyURI))
+  [dt]
+  (= dt const/$xsd:anyURI))
 
 (defn idx-for
-  [s p o]
+  [s p o o-dt]
   (cond
-    s :spot
+    s         :spot
     (and p o) :post
     p         :psot
-    o         (if (reference? o)
+    o         (if (reference? o-dt)
                 :opst
                 (throw (ex-info (str "Illegal reference object value" (::var o))
                                 {:status 400 :error :db/invalid-query})))
     :else     :spot))
 
 (defn resolve-flake-range
-  [{:keys [conn t] :as db} error-ch components]
-  (let [out-ch (async/chan)
-        [s-cmp p-cmp o-cmp] components
-        {s ::val, s-fn ::fn} s-cmp
-        {p ::val, p-fn ::fn} p-cmp
-        {o    ::val, o-fn ::fn
-         o-dt ::datatype} o-cmp]
-    (go
-      (try* (let [s*          (if (and s (not (number? s)))
-                                (<? (dbproto/-subid db s true))
-                                s)
-                  idx         (idx-for s* p o)
-                  idx-root    (get db idx)
-                  novelty     (get-in db [:novelty idx])
-                  start-flake (flake/create s* p o o-dt nil nil util/min-integer)
-                  end-flake   (flake/create s* p o o-dt nil nil util/max-integer)
-                  opts        (cond-> {:idx         idx
-                                       :from-t      t
-                                       :to-t        t
-                                       :start-test  >=
-                                       :start-flake start-flake
-                                       :end-test    <=
-                                       :end-flake   end-flake}
-                                      s-fn (assoc :subject-fn s-fn)
-                                      p-fn (assoc :predicate-fn p-fn)
-                                      o-fn (assoc :object-fn o-fn))]
-              (-> (query-range/resolve-flake-slices conn idx-root novelty
-                                                    error-ch opts)
-                  (->> (query-range/filter-authorized db start-flake end-flake
-                                                      error-ch))
-                  (async/pipe out-ch)))
-            (catch* e
-              (log/error e "Error resolving flake range")
-              (>! error-ch e))))
-    out-ch))
+  ([db fuel-tracker error-ch components]
+   (resolve-flake-range db fuel-tracker nil error-ch components))
+
+  ([{:keys [conn t] :as db} fuel-tracker flake-xf error-ch components]
+   (let [out-ch               (async/chan)
+         [s-cmp p-cmp o-cmp]  components
+         {s ::val, s-fn ::fn} s-cmp
+         {p ::val, p-fn ::fn} p-cmp
+         o-fn                 (::fn o-cmp)]
+     (go
+       (try* (let [s*          (if (and s (not (number? s)))
+                                 (<? (dbproto/-subid db s true))
+                                 s)
+                   [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
+                                 [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
+                                 [(::val o-cmp) (::datatype o-cmp)])
+                   idx         (idx-for s* p o* o-dt*)
+                   idx-root    (get db idx)
+                   novelty     (get-in db [:novelty idx])
+                   start-flake (flake/create s* p o* o-dt* nil nil util/min-integer)
+                   end-flake   (flake/create s* p o* o-dt* nil nil util/max-integer)
+                   track-fuel  (when fuel-tracker
+                                 (fuel/track fuel-tracker))
+                   flake-xf*   (->> [flake-xf track-fuel]
+                                    (remove nil?)
+                                    (apply comp))
+                   opts        (cond-> {:idx         idx
+                                        :from-t      t
+                                        :to-t        t
+                                        :start-test  >=
+                                        :start-flake start-flake
+                                        :end-test    <=
+                                        :end-flake   end-flake
+                                        :flake-xf    flake-xf*}
+                                 s-fn (assoc :subject-fn s-fn)
+                                 p-fn (assoc :predicate-fn p-fn)
+                                 o-fn (assoc :object-fn o-fn))]
+               (-> (query-range/resolve-flake-slices conn idx-root novelty
+                                                     error-ch opts)
+                   (->> (query-range/filter-authorized db start-flake end-flake
+                                                       error-ch))
+                   (async/pipe out-ch)))
+             (catch* e
+                     (log/error e "Error resolving flake range")
+                     (>! error-ch e))))
+     out-ch)))
 
 (defn unmatched
   ([] {})
@@ -105,6 +116,10 @@
   "Build a pattern that already matches the two-tuple database identifier `x`"
   [x]
   {::ident x})
+
+(defn ->iri-ref
+  [x]
+  {::iri x})
 
 (defn ->function
   "Build a query function specification for the variable `var` out of the
@@ -149,7 +164,7 @@
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the
    additional where-clause pattern `pattern`."
-  (fn [_db _solution pattern _filters _error-ch]
+  (fn [_db _fuel-tracker _solution pattern _filters _error-ch]
     (pattern-type pattern)))
 
 (defn assign-matched-values
@@ -161,12 +176,9 @@
   to the value associated with that variable from the `filter` specification
   map."
   [triple-pattern solution filters]
-  (log/debug "assign-matched-values triple-pattern:" triple-pattern)
-  (log/debug "assign-matched-values solution:" solution)
   (mapv (fn [component]
           (if-let [variable (::var component)]
             (let [match (get solution variable)]
-              (log/debug "assign-matched-values variable:" variable)
               (if-let [value (::val match)]
                 (let [dt (::datatype match)]
                   (match-value component value dt))
@@ -175,7 +187,6 @@
                                          (map (fn [f]
                                                 (partial f solution)))
                                          (apply every-pred))]
-                  (log/debug "assign-matched-values filter-fn:" filter-fn)
                   (assoc component ::fn filter-fn))))
             component))
         triple-pattern))
@@ -210,26 +221,36 @@
             (unmatched? p) (assoc (::var p) (match-predicate p flake))
             (unmatched? o) (assoc (::var o) (match-object o flake)))))
 
-(defmethod match-pattern :tuple
-  [db solution pattern filters error-ch]
-  (let [cur-vals (assign-matched-values pattern solution filters)
-        _        (log/debug "assign-matched-values returned:" cur-vals)
-        flake-ch (resolve-flake-range db error-ch cur-vals)
-        match-ch (async/chan 2 (comp cat
-                                     (map (fn [flake]
-                                            (match-flake solution pattern flake)))))]
-    (async/pipe flake-ch match-ch)))
+(defn get-equivalent-properties
+  [db prop]
+  (-> db
+      (get-in [:schema :pred prop :equivalentProperty])
+      not-empty))
 
-(defmethod match-pattern :iri
-  [db solution pattern filters error-ch]
-  (let [triple   (val pattern)
-        cur-vals (assign-matched-values triple solution filters)
-        _        (log/debug "assign-matched-values returned:" cur-vals)
-        flake-ch (resolve-flake-range db error-ch cur-vals)
+(defmethod match-pattern :tuple
+  [db fuel-tracker solution pattern filters error-ch]
+  (let [[s p o]  (assign-matched-values pattern solution filters)
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
-                                            (match-flake solution triple flake)))))]
-    (async/pipe flake-ch match-ch)))
+                                            (match-flake solution pattern flake)))))
+        p-val    (::val p)]
+
+    (if-let [props (and p-val (get-equivalent-properties db p-val))]
+      (let [prop-ch (async/to-chan! (conj props p-val))]
+        (async/pipeline-async 2
+                              match-ch
+                              (fn [prop ch]
+                                (let [p* (assoc p ::val prop)]
+                                  (-> db
+                                      (resolve-flake-range fuel-tracker error-ch [s p* o])
+                                      (async/pipe ch))))
+                              prop-ch))
+
+      (-> db
+          (resolve-flake-range fuel-tracker error-ch [s p o])
+          (async/pipe match-ch)))
+
+    match-ch))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -256,10 +277,9 @@
          (rf result))))))
 
 (defmethod match-pattern :class
-  [db solution pattern filters error-ch]
+  [db fuel-tracker solution pattern filters error-ch]
   (let [triple   (val pattern)
         [s p o] (assign-matched-values triple solution filters)
-        _        (log/debug "assign-matched-values returned:" s p o)
         cls      (::val o)
         classes  (into [cls] (dbproto/-class-prop db :subclasses cls))
         class-ch (async/to-chan! classes)
@@ -270,8 +290,7 @@
     (async/pipeline-async 2
                           match-ch
                           (fn [cls ch]
-                            (-> (resolve-flake-range db error-ch [s p (assoc o ::val cls)])
-                                (log/debug->val "match-pattern :class pipeline fn flake range:")
+                            (-> (resolve-flake-range db fuel-tracker error-ch [s p (assoc o ::val cls)])
                                 (async/pipe ch)))
                           class-ch)
     match-ch))
@@ -279,12 +298,12 @@
 (defn with-constraint
   "Return a channel of all solutions from `db` that extend from the solutions in
   `solution-ch` and also match the where-clause pattern `pattern`."
-  [db pattern filters error-ch solution-ch]
+  [db fuel-tracker pattern filters error-ch solution-ch]
   (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-pattern db solution pattern filters error-ch)
+                            (-> (match-pattern db fuel-tracker solution pattern filters error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
@@ -293,24 +312,23 @@
   "Returns a channel that will eventually contain all match solutions in `db`
   extending from `solution` that also match all the patterns in the parsed where
   clause collection `clause`."
-  [db solution clause error-ch]
+  [db fuel-tracker solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
         filters    (::filters clause)
         patterns   (::patterns clause)]
     (reduce (fn [solution-ch pattern]
-              (log/debug "calling with-constraint w/ pattern:" pattern)
-              (with-constraint db pattern filters error-ch solution-ch))
+              (with-constraint db fuel-tracker pattern filters error-ch solution-ch))
             initial-ch patterns)))
 
 (defmethod match-pattern :union
-  [db solution pattern _ error-ch]
+  [db fuel-tracker solution pattern _ error-ch]
   (let [clauses   (val pattern)
         clause-ch (async/to-chan! clauses)
         out-ch    (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [clause ch]
-                            (-> (match-clause db solution clause error-ch)
+                            (-> (match-clause db fuel-tracker solution clause error-ch)
                                 (async/pipe ch)))
                           clause-ch)
     out-ch))
@@ -346,10 +364,10 @@
                    rf))))))))
 
 (defmethod match-pattern :optional
-  [db solution pattern _ error-ch]
+  [db fuel-tracker solution pattern _ error-ch]
   (let [clause (val pattern)
         opt-ch (async/chan 2 (with-default solution))]
-    (-> (match-clause db solution clause error-ch)
+    (-> (match-clause db fuel-tracker solution clause error-ch)
         (async/pipe opt-ch))))
 
 (defn add-fn-result-to-solution
@@ -358,25 +376,26 @@
     (assoc solution var-name {::var var-name ::val result ::datatype dt})))
 
 (defmethod match-pattern :bind
-  [_db solution pattern _ error-ch]
+  [_db fuel-tracker solution pattern _ error-ch]
   (let [bind (val pattern)]
-    (log/debug "match-pattern :bind bind:" bind)
-    (log/debug "match-pattern :bind solution:" solution)
     (go
-      (reduce (fn [solution* b]
-                (let [f        (::fn b)
-                      var-name (::var b)]
-                  (try*
-                    (->> (f solution)
-                         (log/debug->>val "bind fn result:")
-                         (add-fn-result-to-solution solution* var-name))
-                    (catch* e (>! error-ch e)))))
-              solution (vals bind)))))
+      (let [result
+            (reduce (fn [solution* b]
+                      (let [f        (::fn b)
+                            var-name (::var b)]
+                        (try*
+                         (->> (f solution)
+                              (add-fn-result-to-solution solution* var-name))
+                         (catch* e (update solution* ::errors conj e)))))
+                    solution (vals bind))]
+        (when-let [errors (::errors result)]
+          (async/onto-chan! error-ch errors))
+        result))))
 
 (def blank-solution {})
 
 (defn search
-  [db q error-ch]
+  [db q fuel-tracker error-ch]
   (let [where-clause      (:where q)
         initial-solutions (-> q
                               :values
@@ -386,9 +405,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [initial-solution ch]
-                            (log/debug "search calling match-clause w/ where-clause:" where-clause)
-                            (-> (match-clause db initial-solution where-clause error-ch)
-                                #_(log/debug-async->vals "match-clause results:")
+                            (-> (match-clause db fuel-tracker initial-solution where-clause error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! initial-solutions))
     out-ch))

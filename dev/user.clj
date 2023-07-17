@@ -1,13 +1,13 @@
 (ns user
   (:require [fluree.db.json-ld.api :as fluree]
+            [fluree.db.test-utils :as test-utils]
+            [clojure.java.io :as io]
             [clojure.tools.namespace.repl :as tn :refer [refresh refresh-all]]
             [clojure.core.async :as async]
+
             [fluree.db.did :as did]
-            [fluree.db.json-ld.api :as fluree]
-            [fluree.db.util.async :refer [<? go-try merge-into?]]
+            [fluree.db.util.async :refer [<? <?? go-try merge-into?]]
             [fluree.db.flake :as flake]
-            [fluree.db.dbfunctions.fns :as dbfunctions]
-            [fluree.db.constants :as constants]
             [fluree.db.util.json :as json]
             [fluree.db.serde.json :as serdejson]
             [fluree.db.storage.core :as storage]
@@ -15,19 +15,10 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
-            [fluree.db.query.schema :as schema]
             [clojure.string :as str]
             [criterium.core :refer [bench]]
             ;; cljs
             [figwheel-sidecar.repl-api :as ra]))
-
-
-;; async/query todo
-;; fluree.db.query.fql/query
-;; dbproto/-query
-;; api/query
-;; fluree.db.dbfunctions.internal/query
-
 
 ;; make sure all of following response are async
 ;; http-api/db-handler* (transator)

@@ -17,7 +17,7 @@
 (deftest test-parse-query
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/parse"
-                               {:context {:ex "http://example.org/ns/"}})
+                               {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
                   [{:id           :ex/brian,
@@ -78,8 +78,7 @@
                   ::where/datatype 8}
                  {::where/var '?name}]]
                patterns)))
-      (let [query {:context {:ex "http://example.org/ns/"}
-                   :select  ['?name '?age '?email]
+      (let [query {:select  ['?name '?age '?email]
                    :where   [['?s :schema/name "Cam"]
                              ['?s :ex/friend '?f]
                              ['?f :schema/name '?name]

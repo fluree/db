@@ -1,5 +1,6 @@
 (ns fluree.db.test-utils
-  (:require [fluree.db.did :as did]
+  (:require [clojure.set :as set]
+            [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
             #?@(:cljs [[clojure.core.async :refer [go go-loop]]
@@ -16,6 +17,18 @@
    :skos   "http://www.w3.org/2008/05/skos#"
    :wiki   "https://www.wikidata.org/wiki/"
    :f      "https://ns.flur.ee/ledger#"})
+
+(def default-str-context
+  {"id"     "@id"
+   "type"   "@type"
+   "xsd"    "http://www.w3.org/2001/XMLSchema#"
+   "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"
+   "sh"     "http://www.w3.org/ns/shacl#"
+   "schema" "http://schema.org/"
+   "skos"   "http://www.w3.org/2008/05/skos#"
+   "wiki"   "https://www.wikidata.org/wiki/"
+   "f"      "https://ns.flur.ee/ledger#"})
 
 (def default-private-key
   "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c")
@@ -50,33 +63,42 @@
     "type"                      ["Movie"]
     "name"                      "Back to the Future Part III"
     "disambiguatingDescription" "1990 film by Robert Zemeckis"
-    "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}])
+    "titleEIDR"                 "10.5240/15F9-F913-FF25-8041-E798-O"}
+   {"@context"                  "https://schema.org",
+    "id"                        "https://www.wikidata.org/wiki/Q2875",
+    "type"                      ["Movie"],
+    "name"                      "Gone with the Wind",
+    "disambiguatingDescription" "1939 film by Victor Fleming",
+    "titleEIDR"                 "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4",
+    "isBasedOn"                 {"id"     "https://www.wikidata.org/wiki/Q2870",
+                                 "type"   "Book",
+                                 "name"   "Gone with the Wind",
+                                 "isbn"   "0-582-41805-4",
+                                 "author" {"@id"   "https://www.wikidata.org/wiki/Q173540"
+                                           "@type" "Person"
+                                           "name"  "Margaret Mitchell"}}}])
 
 (def people
-  [{:context      {:ex "http://example.org/ns/"}
-    :id           :ex/brian,
+  [{:id           :ex/brian,
     :type         :ex/User,
     :schema/name  "Brian"
     :schema/email "brian@example.org"
     :schema/age   50
     :ex/favNums   7}
-   {:context      {:ex "http://example.org/ns/"}
-    :id           :ex/alice,
+   {:id           :ex/alice,
     :type         :ex/User,
     :schema/name  "Alice"
     :schema/email "alice@example.org"
     :schema/age   50
     :ex/favNums   [42, 76, 9]}
-   {:context      {:ex "http://example.org/ns/"}
-    :id           :ex/cam,
+   {:id           :ex/cam,
     :type         :ex/User,
     :schema/name  "Cam"
     :schema/email "cam@example.org"
     :schema/age   34
     :ex/favNums   [5, 10]
     :ex/friend    [:ex/brian :ex/alice]}
-   {:context      {:ex "http://example.org/ns/"}
-    :id           :ex/liam
+   {:id           :ex/liam
     :type         :ex/User
     :schema/name  "Liam"
     :schema/email "liam@example.org"
@@ -87,11 +109,13 @@
 (defn create-conn
   ([]
    (create-conn {}))
-  ([{:keys [context did]
-     :or   {context default-context
-            did     (did/private->did-map default-private-key)}}]
-   (let [conn-p (fluree/connect-memory {:defaults {:context context
-                                                   :did     did}})]
+  ([{:keys [context did context-type]
+     :or   {context      default-context
+            context-type :keyword
+            did          (did/private->did-map default-private-key)}}]
+   (let [conn-p (fluree/connect-memory {:defaults {:context      context
+                                                   :context-type context-type
+                                                   :did          did}})]
      #?(:clj @conn-p :cljs (go (<p! conn-p))))))
 
 (defn load-movies
@@ -101,12 +125,12 @@
       (let [staged @(fluree/stage (fluree/db ledger) movie)]
         @(fluree/commit! ledger staged
                          {:message (str "Commit " (get movie "name"))
-                          :push? true})))
+                          :push?   true})))
     ledger))
 
 (defn load-people
   [conn]
-  (let [ledger @(fluree/create conn "test/people")
+  (let [ledger @(fluree/create conn "test/people" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         staged @(fluree/stage (fluree/db ledger) people)]
     @(fluree/commit! ledger staged {:message "Adding people", :push? true})
     ledger))
@@ -125,11 +149,11 @@
   [pwrapped max-attempts & [retry-on-false?]]
   (#?(:clj loop :cljs go-loop) [attempt 0]
     (let [res' (try*
-                 (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
-                   (if (util/exception? res)
-                     (throw res)
-                     res))
-                 (catch* e e))]
+                (let [res (#?(:clj deref :cljs <p!) (pwrapped))]
+                  (if (util/exception? res)
+                    (throw res)
+                    res))
+                (catch* e e))]
       (if (= (inc attempt) max-attempts)
         (if (util/exception? res')
           (throw res')
@@ -147,7 +171,83 @@
   [conn ledger-alias max-attempts]
   (retry-promise-wrapped #(fluree/load conn ledger-alias) max-attempts))
 
+(defn load-to-t
+  "Retries loading a ledger until it gets a db whose t value is equal to or
+  greater than the given t arg or max-attempts is reached."
+  [conn ledger-alias t max-attempts]
+  (let [attempts-per-batch (/ max-attempts 10)]
+    (loop [attempts-left (- max-attempts attempts-per-batch)]
+      (let [ledger (retry-load conn ledger-alias attempts-per-batch)
+            db-t   (-> ledger fluree/db :t)]
+        (if (and (< db-t t) (pos-int? attempts-left))
+          (recur (- attempts-left attempts-per-batch))
+          ledger)))))
+
 (defn retry-exists?
   "Retry calling exists? until it returns true or max-attempts."
   [conn ledger-alias max-atttemts]
   (retry-promise-wrapped #(fluree/exists? conn ledger-alias) max-atttemts true))
+
+(def base32-pattern
+  "[a-z2-7]")
+
+(def base58-pattern
+  "[123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz]")
+
+(def base64-pattern
+  "[0-9a-fA-F]")
+
+(def did-regex
+  (re-pattern (str "did:fluree:" base58-pattern "{35}")))
+
+(defn did?
+  [s]
+  (and (string? s) (re-matches did-regex s)))
+
+(def addr-regex
+  (re-pattern (str "fluree:(memory|file|ipfs)://.+")))
+
+(defn address?
+  [s]
+  (and (string? s) (re-matches addr-regex s)))
+
+(def context-id-regex
+  (re-pattern (str "fluree:context:" base64-pattern "{64}")))
+
+(defn context-id?
+  [s]
+  (and (string? s) (re-matches context-id-regex s)))
+
+(def db-id-regex
+  (re-pattern (str "fluree:db:sha256:" base32-pattern "{52,53}")))
+
+(defn db-id?
+  [s]
+  (and (string? s) (re-matches db-id-regex s)))
+
+(def commit-id-regex
+  (re-pattern (str "fluree:commit:sha256:" base32-pattern "{52,53}")))
+
+(defn commit-id?
+  [s]
+  (and (string? s) (re-matches commit-id-regex s)))
+
+(defn pred-match?
+  "Does a deep compare of expected and actual map values but any predicate fns
+  in expected are run with the equivalent value from actual and the result is
+  used to determine whether there is a match. Returns true if all pred fns
+  return true and all literal values match or false otherwise."
+  [expected actual]
+  (or (= expected actual)
+      (cond
+        (fn? expected)
+        (expected actual)
+
+        (and (map? expected) (map? actual))
+        (every? (fn [k] (pred-match? (get expected k) (get actual k)))
+                (set/union (keys actual) (keys expected)))
+
+        (and (coll? expected) (coll? actual))
+        (every? (fn [[e a]] (pred-match? e a)) (zipmap expected actual))
+
+        :else false)))

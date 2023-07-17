@@ -3,13 +3,12 @@
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
+            [fluree.db.util.context :as ctx-util]
             [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.state-machine :as state-machine]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.storage.core :as storage]
             [fluree.db.indexer.default :as idx-default]
@@ -22,6 +21,8 @@
             [fluree.db.ledger.proto :as ledger-proto])
   #?(:clj
      (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
+
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn file-address
   "Turn a path or a protocol-relative URL into a fluree file address."
@@ -192,11 +193,6 @@
                p)
        :cljs (js/Promise. (fn [resolve reject] (work resolve))))))
 
-(defn store-key->local-path
-  [store k]
-  (let [[_ ledger & r] (str/split k #"_")]
-    (str (local-path store) "/" ledger "/" "indexes" "/" (str/join "/" r))))
-
 (defn read-context
   [conn context-key]
   (json/parse (read-address conn context-key) true))
@@ -243,14 +239,14 @@
   (-method [_] :file)
   (-parallelism [_] parallelism)
   (-id [_] id)
-  (-context [_] (:context ledger-defaults))
+  (-default-context [_] (:context ledger-defaults))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
   ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
-  (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection msg-in: pull" {})))
-  (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection msg-out: pull" {})))
+  (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-in" {})))
+  (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-out" {})))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
@@ -280,21 +276,22 @@
     s))
 
 (defn ledger-defaults
-  [{:keys [context-type context did indexer]}]
-  {:context (util/normalize-context context-type context)
-   :did     did
-   :indexer (cond
-              (fn? indexer)
-              indexer
+  [{:keys [context context-type did indexer]}]
+  {:context      (ctx-util/stringify-context context)
+   :context-type context-type
+   :did          did
+   :indexer      (cond
+                   (fn? indexer)
+                   indexer
 
-              (or (map? indexer) (nil? indexer))
-              (fn [opts]
-                (idx-default/create (merge indexer opts)))
+                   (or (map? indexer) (nil? indexer))
+                   (fn [opts]
+                     (idx-default/create (merge indexer opts)))
 
-              :else
-              (throw (ex-info (str "Expected an indexer constructor fn or "
-                                   "default indexer options map. Provided: " indexer)
-                              {:status 400 :error :db/invalid-file-connection})))})
+                   :else
+                   (throw (ex-info (str "Expected an indexer constructor fn or "
+                                        "default indexer options map. Provided: " indexer)
+                                   {:status 400 :error :db/invalid-file-connection})))})
 
 (defn connect
   "Create a new file system connection."

@@ -190,7 +190,7 @@
      flake-slices ; Note this bypasses all permissions in CLJS for now!
 
      :clj
-     (if (true? (get-in policy [:f/view :root?]))
+     (if (true? (get-in policy [const/iri-view :root?]))
        flake-slices
        (let [auth-fn (fn [flakes ch]
                        (-> (authorize-flakes db error-ch flakes)
@@ -226,12 +226,12 @@
 (defn index-range*
   "Return a channel that will eventually hold a sorted vector of the range of
   flakes from `db` that meet the criteria specified in the `opts` map."
-  [{:keys [conn] :as db}
+  [{:keys [ledger] :as db}
    error-ch
    {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
-  (let [idx-root (get db idx)
-        idx-cmp  (get-in db [:comparators idx])
-        novelty  (get-in db [:novelty idx])]
+  (let [{:keys [conn]} ledger
+        idx-root       (get db idx)
+        novelty        (get-in db [:novelty idx])]
     (->> (resolve-flake-slices conn idx-root novelty error-ch opts)
          (filter-authorized db start-flake end-flake error-ch)
          (into-page limit offset flake-limit))))
@@ -397,57 +397,6 @@
               o* (<? (dbproto/-tag db o p))]
           (recur r (conj acc (flake/create s p o* const/$xsd:anyURI t op m))))
         (recur r (conj acc flake))) acc)))
-
-(defn search
-  ([db fparts]
-   (search db fparts {}))
-  ([db fparts opts]
-   (go-try
-     (let [[s p o t] fparts
-           idx-predicate? (dbproto/-p-prop db :idx? p)
-           tag-predicate? (if p (= :tag (dbproto/-p-prop db :type p)) false)
-           o-coerce?      (and tag-predicate? (string? o))
-           o              (cond (not o-coerce?)
-                                o
-
-                                (tag-string? o)
-                                (<? (dbproto/-tag-id db o))
-                                ;; Returns tag-id
-
-                                ;; if string, but not tag string, we have a string
-                                ;; like "query" with no namespace, we need to ns.
-                                (string? o)
-                                (let [tag-name (str (dbproto/-p-prop db :name p) ":" o)]
-                                  (<? (dbproto/-tag-id db tag-name))))
-
-           res            (cond
-                            s
-                            (if (= "_id" p)
-                              (<? (index-range db :spot = [s nil nil t] opts))
-                              (<? (index-range db :spot = [s p o t] opts)))
-
-                            (and p (non-nil-non-boolean? o) idx-predicate? (not (fn? o)))
-                            (<? (index-range db :post = [p o s t] opts))
-
-                            (and p (not idx-predicate?) o)
-                            (let [obj-fn (if-let [obj-fn (:object-fn opts)]
-                                           (fn [x] (and (obj-fn x) (= x o)))
-                                           (fn [x] (= x o)))]
-                              ;; check for special case where search specifies _id and an integer, i.e. [nil _id 12345]
-                              (if (and (= "_id" p) (int? o))
-                                ;; TODO - below should not need a `take 1` - `:limit 1` does not work properly - likely fixed in tsop branch, remove take 1 once :limit works
-                                (take 1 (<? (index-range db :spot = [o] (assoc opts :limit 1))))
-                                (<? (index-range db :psot = [p s nil t] (assoc opts :object-fn obj-fn)))))
-
-                            p
-                            (<? (index-range db :psot = [p s o t] opts))
-
-                            o
-                            (<? (index-range db :opst = [o p s t] opts)))]
-       (log/debug "search res:" res)
-       (if tag-predicate?
-         (<? (coerce-tag-flakes db res))
-         res)))))
 
 (defn collection
   "Returns spot index range for only the requested collection."

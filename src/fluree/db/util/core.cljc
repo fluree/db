@@ -187,7 +187,7 @@
                           {:status 500 :error :db/unexpected-error}))))
 
 (defn keywordize-keys
-  "Does simple (top-level keys only) keyworize-keys if the key is a string."
+  "Does simple (top-level keys only) keywordize-keys if the key is a string."
   [m]
   (reduce-kv
     (fn [acc k v]
@@ -209,13 +209,6 @@
         (assoc acc k v)))
     {} m))
 
-(defn normalize-context
-  "Keywordizes string contexts so they merge correctly with other keyword
-  contexts."
-  [context-type context]
-  (if (= :keyword context-type)
-    context
-    (keywordize-keys context)))
 
 (defn str->epoch-ms
   "Takes time as a string and returns epoch millis."
@@ -370,10 +363,18 @@
      "Same as case, but evaluates dispatch values, needed for referring to
      class and def'ed constants as well as java.util.Enum instances.
 
-     NB: Don't use this in CLJS if your dispatch values are :const.
-         CLJS (but not CLJ sadly) inlines these and they work fine
-         with regular old cljs.core/case. Or check out const-case if you want a
-         macro that does the best thing with :const values in both CLJ & CLJS."
+     NB: If you have all `:const` or literal dispatch values you can use either regular
+  old `cljs.core/case` if you are in cljs-only code, as those get inlined and work fine,
+  or `fluree.db.util.clj-const/case` and `fluree.db.util.cljs-const/case` if you are in
+  cljc.
+
+  calling context/dispatch value
+
+  |      | literal | :const                        | anything else |
+  |------+---------+-------------------------------+---------------|
+  | cljs | case    | case                          | case+         |
+  | clj  | case    | fluree.db.util.clj-const/case | case+         |
+  | cljc | case    | fluree.db.util.clj-const/case | case+         |"
      [value & clauses]
      (let [clauses       (partition 2 2 nil clauses)
            default       (when (-> clauses last count (= 1))

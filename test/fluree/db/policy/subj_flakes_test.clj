@@ -13,7 +13,7 @@
 (deftest ^:integration subject-flakes-policy
   (testing "Policy enforcement for groups of flakes by subject."
     (let [conn            (test-utils/create-conn)
-          ledger          @(fluree/create conn "policy/a" {:context {:ex "http://example.org/ns/"}})
+          ledger          @(fluree/create conn "policy/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           root-did        (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
           alice-did       (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
           db              @(fluree/stage
@@ -108,3 +108,42 @@
       (is (= []
              alice-db-widget)
           "Alice wasn't given any permissions for class :ex/Product, so should see nothing for widget."))))
+
+
+(deftest ^:integration no-subject-flakes-test
+  (testing "If no subject flakes return from a select, policy code should not be run to avoid error."
+    (let [conn      (test-utils/create-conn)
+          ledger    @(fluree/create conn "policy/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+          alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
+          db        @(fluree/stage
+                       (fluree/db ledger)
+                       [{:id          :ex/alice,
+                         :type        :ex/User,
+                         :schema/name "alice"}
+                        {:id          :ex/john,
+                         :type        :ex/User,
+                         :schema/name "john"}
+                        {:id           :ex/widget,
+                         :type         :ex/Product,
+                         :schema/price 99.99}
+                        {:id      alice-did
+                         :ex/user :ex/alice
+                         :f/role  :ex/userRole}])
+
+          db+policy @(fluree/stage
+                       db
+                       ;; add policy targeting :ex/rootRole that can view and modify everything
+                       [{:id            :ex/userPolicy,
+                         :type          [:f/Policy],
+                         :f/targetClass :ex/User
+                         :f/allow       [{:id           :ex/globalViewAllow
+                                          :f/targetRole :ex/userRole
+                                          :f/action     [:f/view]}]}])
+
+          alice-db  @(fluree/wrap-policy db+policy {:did  alice-did
+                                                    :role :ex/userRole})]
+
+      (is (= []
+             @(fluree/query alice-db '{:select {?s [:*]}
+                                       :where  [[?s :schema/price 99.99]]}))
+          "There shouldn't be an exception, just empty vector."))))

@@ -1,11 +1,9 @@
 (ns fluree.db.permissions-validate
-  (:require [fluree.db.dbproto :as dbproto]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
-            [clojure.core.async :refer [go <!] :as async]
-            [fluree.db.util.async :refer [<? go-try channel?]]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.schema :as schema-util]))
+            [fluree.db.util.async :refer [<? go-try]]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -27,8 +25,9 @@
                           ;; note, classes will return empty list if none found ()
                           (swap! (:cache policy) assoc s classes)
                           classes))
-          fns       (keep #(or (get-in policy [:f/view :class % p :function])
-                               (get-in policy [:f/view :class % :default :function])) class-ids)]
+          fns       (keep #(or (get-in policy [const/iri-view :class % p :function])
+                               (get-in policy [const/iri-view :class % :default
+                                               :function])) class-ids)]
       (loop [[[async? f] & r] fns]
         ;; return first truthy response, else false
         (if f
@@ -101,8 +100,8 @@
   [db flake default-allow-policies]
   (go-try
     (loop [[[async? f] & r] (eduction
-                              (map second) (map :function)
-                              default-allow-policies)]
+                             (map second) (map :function)
+                             default-allow-policies)]
       ;; return first truthy response, else false
       (if f
         (let [f-res (if async?
@@ -126,12 +125,13 @@
   the subject can be done and each flake does not need to be checked."
   [{:keys [policy] :as db} flakes]
   (go-try
-    (let [fflake         (first flakes)
-          class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
-          {defaults :default props :property} (group-policies-by-default policy :f/view class-ids)
-          ;; default-allow? will be the default for all flakes that don't have a property-specific policy
-          default-allow? (<? (default-allow? db fflake defaults))]
-      (cond
-        props (<? (evaluate-subject-properties db props default-allow? flakes))
-        default-allow? flakes
-        :else []))))
+    (when-let [fflake (first flakes)]
+      (let [class-ids      (<? (dbproto/-class-ids db (flake/s fflake)))
+            {defaults :default props :property} (group-policies-by-default
+                                                 policy const/iri-view class-ids)
+            ;; default-allow? will be the default for all flakes that don't have a property-specific policy
+            default-allow? (<? (default-allow? db fflake defaults))]
+        (cond
+          props (<? (evaluate-subject-properties db props default-allow? flakes))
+          default-allow? flakes
+          :else [])))))

@@ -66,12 +66,12 @@
       (if where-smt
         (when (and (= :tuple type)
                    (= first-s (clause-subject-var where-smt)))
-          (let [{::where/keys [val var]} o 
+          (let [{::where/keys [val var]} o
                 f (cond
                     val
                     (fn [flake _] (= val (flake/o flake)))
 
-                    ;;TODO: filters are not yet supported 
+                    ;;TODO: filters are not yet supported
                     #_#_filter
                     (let [{:keys [params variable function]} filter]
                       (if (= 1 (count params))
@@ -101,7 +101,7 @@
         [s p o] (if (= :tuple type)
                   pattern
                   (let [[_type-kw tuple] pattern]
-                    tuple)) 
+                    tuple))
         reparse-component (fn [component]
                             (let [{::where/keys [var val]} component]
                               (cond
@@ -130,10 +130,17 @@
           (assoc parsed-query :where [reparsed-first-clause
                                       {:s-filter subj-filter-map}]
                               :strategy :simple-subject-crawl))))))
+
+(defn has-equivalent-properties?
+  [db pattern]
+  (if-let [p-val (get-in pattern [1 ::where/val])]
+    (some? (where/get-equivalent-properties db p-val))
+    false))
+
 (defn simple-subject-crawl?
   "Simple subject crawl is where the same variable is used in the leading
   position of each where statement."
-  [{:keys [where select vars] :as _parsed-query}]
+  [{:keys [where select vars] :as _parsed-query} db]
   (and (instance? SubgraphSelector select)
        ;;TODO, filtering not supported yet
        (empty? (::where/filters where))
@@ -145,6 +152,7 @@
                      (and (mergeable-where-clause? pattern)
                           (let [pred (second pattern)]
                             (and (= select-var (clause-subject-var pattern))
+                                 (not (has-equivalent-properties? db pattern))
                                  (not (::where/recur pred))
                                  (not (::where/fullText pred)))))) patterns)))))
 
@@ -153,9 +161,9 @@
   e.g.
   {:select {?subjects ['*']}
    :where [...]}"
-  [{:keys [order-by group-by] :as parsed-query}]
+  [{:keys [order-by group-by] :as parsed-query} db]
   (when (and (not group-by)
              (not order-by)
-             (simple-subject-crawl? parsed-query))
+             (simple-subject-crawl? parsed-query db))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
     (simple-subject-merge-where parsed-query)))

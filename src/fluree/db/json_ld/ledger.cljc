@@ -3,8 +3,8 @@
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
-            [clojure.string :as str]
-            [fluree.db.util.core :as util]))
+            [fluree.db.util.core :as util]
+            [clojure.set :as set]))
 
 ;; methods to link/trace back a ledger and return flakes
 #?(:clj (set! *warn-on-reflection* true))
@@ -17,7 +17,7 @@
 
 
 (defn class-or-property?
-  [{:keys [type] :as node}]
+  [{:keys [type] :as _node}]
   (some class+property-iris (util/sequential type)))
 
 (def ^:const predefined-properties
@@ -32,6 +32,7 @@
           "http://www.w3.org/2002/07/owl#Class"                 const/$owl:Class
           "http://www.w3.org/2002/07/owl#ObjectProperty"        const/$owl:ObjectProperty
           "http://www.w3.org/2002/07/owl#DatatypeProperty"      const/$owl:DatatypeProperty
+          "http://www.w3.org/2002/07/owl#equivalentProperty"    const/$_predicate:equivalentProperty
           ;; shacl
           "http://www.w3.org/ns/shacl#NodeShape"                const/$sh:NodeShape
           "http://www.w3.org/ns/shacl#PropertyShape"            const/$sh:PropertyShape
@@ -49,6 +50,11 @@
           "http://www.w3.org/ns/shacl#ignoredProperties"        const/$sh:ignoredProperties
           "http://www.w3.org/ns/shacl#property"                 const/$sh:property
           "http://www.w3.org/ns/shacl#path"                     const/$sh:path
+          "http://www.w3.org/ns/shacl#inversePath"              const/$sh:inversePath
+          "http://www.w3.org/ns/shacl#alternativePath"          const/$sh:alternativePath
+          "http://www.w3.org/ns/shacl#zeroOrMorePath"           const/$sh:zeroOrMorePath
+          "http://www.w3.org/ns/shacl#oneOrMorePath"            const/$sh:oneOrMorePath
+          "http://www.w3.org/ns/shacl#zeroOrOnePath"            const/$sh:zeroOrOnePath
           "http://www.w3.org/ns/shacl#minCount"                 const/$sh:minCount
           "http://www.w3.org/ns/shacl#maxCount"                 const/$sh:maxCount
           "http://www.w3.org/ns/shacl#datatype"                 const/$sh:datatype
@@ -60,6 +66,7 @@
           "http://www.w3.org/ns/shacl#lessThanOrEquals"         const/$sh:lessThanOrEquals
           "http://www.w3.org/ns/shacl#disjoint"                 const/$sh:disjoint
           "http://www.w3.org/ns/shacl#pattern"                  const/$sh:pattern
+          "http://www.w3.org/ns/shacl#flags"                    const/$sh:flags
           "http://www.w3.org/ns/shacl#languageIn"               const/$sh:languageIn
           "http://www.w3.org/ns/shacl#uniqueLang"               const/$sh:uniqueLang
           "http://www.w3.org/ns/shacl#class"                    const/$sh:class
@@ -69,18 +76,19 @@
           "http://www.w3.org/ns/shacl#minInclusive"             const/$sh:minInclusive
           "http://www.w3.org/ns/shacl#maxExclusive"             const/$sh:maxExclusive
           "http://www.w3.org/ns/shacl#maxInclusive"             const/$sh:maxInclusive
+          "http://www.w3.org/ns/shacl#not"                      const/$sh:not
+          "http://www.w3.org/ns/shacl#and"                      const/$sh:and
+          "http://www.w3.org/ns/shacl#or"                       const/$sh:or
+          "http://www.w3.org/ns/shacl#xone"                     const/$sh:xone
           ;; fluree
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context
+          const/iri-role                                        const/$_role
+          const/iri-target-class                                const/$fluree:targetClass
           const/iri-default-context                             const/$fluree:default-context}))
-
-
-(defn flip-key-vals
-  [map]
-  (reduce #(assoc %1 (val %2) (key %2)) {} map))
 
 (def predefined-sids
   (-> predefined-properties
-      flip-key-vals
+      set/map-invert
       ;; use @type json-ld shorthand instead of rdf:type full URL
       (assoc const/$rdf:type "@type")))
 
@@ -121,13 +129,21 @@
                   (get predefined-properties id)
                   (if (or (class-or-property? node)
                           (#{const/$rdfs:subClassOf
-                             const/$sh:path const/$sh:ignoredProperties
+                             const/$sh:path
+                             const/$sh:ignoredProperties
                              const/$sh:targetClass
-                             const/$sh:targetSubjectsOf const/$sh:targetObjectsOf
+                             const/$fluree:targetClass
+                             const/$sh:targetSubjectsOf
+                             const/$sh:targetObjectsOf
                              const/$sh:equals
                              const/$sh:disjoint
                              const/$sh:lessThan
-                             const/$sh:lessThanOrEquals}
+                             const/$sh:lessThanOrEquals
+                             const/$sh:inversePath
+                             const/$sh:alternativePath
+                             const/$sh:zeroOrMorePath
+                             const/$sh:oneOrMorePath
+                             const/$sh:zeroOrOnePath}
                            referring-pid))
                     (next-pid)
                     (next-sid)))]
@@ -145,41 +161,3 @@
     (when ref?
       (vswap! refs-v conj new-pid))
     new-pid))
-
-(defn get-iri-sid
-  "Gets the IRI for any existing subject ID."
-  [iri db iris]
-  (if-let [cached (get @iris iri)]
-    cached
-    ;; TODO following, if a retract was made there could be 2 matching flakes and want to make sure we take the latest add:true
-    (when-let [sid (some-> (flake/match-post (get-in db [:novelty :post]) const/$iri iri const/$xsd:string)
-                           first
-                           :s)]
-      (vswap! iris assoc iri sid)
-      sid)))
-
-
-
-(defn ledger-root
-  "Returns a full ledger-root JSON-LD document for persistent storage."
-  [{:keys [conn context state name reindex-min reindex-max] :as ledger}]
-  (let [{:keys [branches branch]} @state
-        {:keys [t dbs commit idx latest-db from]} (get branches branch)
-        idx-map   {"reindexMin" reindex-min
-                   "reindexMax" reindex-max
-                   "t"          t
-                   "idx"        idx
-                   "schema"     nil
-                   "context"    nil}
-
-        branches* (not-empty
-                    (->> (dissoc branches branch)
-                         (map #(select-keys % [t commit idx]))))]
-    {"@context" "https://ns.flur.ee/ledger/v1"
-     "name"     name
-     "branch"   branch
-     "branches" branches*
-     "t"        t
-     "commit"   commit
-     "idx"      idx-map
-     "from"     from}))

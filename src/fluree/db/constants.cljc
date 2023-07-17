@@ -26,25 +26,35 @@
 (def ^:const iri-ledger "https://ns.flur.ee/ledger#ledger")
 (def ^:const iri-branch "https://ns.flur.ee/ledger#branch")
 (def ^:const iri-issuer "https://www.w3.org/2018/credentials#issuer")
+(def ^:const iri-cred-subj "https://www.w3.org/2018/credentials#credentialSubject")
 (def ^:const iri-index "https://ns.flur.ee/ledger#index")
 (def ^:const iri-ns "https://ns.flur.ee/ledger#ns")
 (def ^:const iri-time "https://ns.flur.ee/ledger#time")
 (def ^:const iri-message "https://ns.flur.ee/ledger#message")
 (def ^:const iri-tag "https://ns.flur.ee/ledger#tag")
 (def ^:const iri-updates "https://ns.flur.ee/ledger#updates")
-(def ^:const iri-context "https://ns.flur.ee/ledger#context")
+(def ^:const iri-default-context "https://ns.flur.ee/ledger#defaultContext")
+(def ^:const iri-Context "https://ns.flur.ee/ledger#Context")
+(def ^:const iri-allow "https://ns.flur.ee/ledger#allow")
+(def ^:const iri-equals "https://ns.flur.ee/ledger#equals")
+(def ^:const iri-contains "https://ns.flur.ee/ledger#contains")
+(def ^:const iri-$identity "https://ns.flur.ee/ledger#$identity")
+(def ^:const iri-target-role "https://ns.flur.ee/ledger#targetRole")
+(def ^:const iri-target-class "https://ns.flur.ee/ledger#targetClass")
+(def ^:const iri-target-node "https://ns.flur.ee/ledger#targetNode")
+(def ^:const iri-property "https://ns.flur.ee/ledger#property")
+(def ^:const iri-policy "https://ns.flur.ee/ledger#Policy")
+(def ^:const iri-path "https://ns.flur.ee/ledger#path")
+(def ^:const iri-action "https://ns.flur.ee/ledger#action")
+(def ^:const iri-all-nodes "https://ns.flur.ee/ledger#allNodes")
+(def ^:const iri-view "https://ns.flur.ee/ledger#view")
+(def ^:const iri-modify "https://ns.flur.ee/ledger#modify")
+(def ^:const iri-role "https://ns.flur.ee/ledger#role")
 
 (def ^:const iri-id "@id")
 (def ^:const iri-type "@type")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
-;; TODO, replace usage with iri-context
-(def ^:const iri-default-context "fluree-default-context")  ;; @id for default context setting
-
-;; system constants
-
-;; @id (unique subject identifier) in the form of IRI
-(def ^:const $iri 0)
 
 ;; system collection ids
 (def ^:const $_tx -1) ; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
@@ -106,7 +116,7 @@
 (def ^:const $_predicate:txSpecDoc 25)
 (def ^:const $_predicate:restrictTag 26)
 (def ^:const $_predicate:fullText 27)
-(def ^:const $_predicate:equivalentProperty 28)                          ;; any unique alias for predicate
+(def ^:const $_predicate:equivalentProperty 35)                          ;; any unique alias for predicate
 (def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
 ;; TODO - jumping predicate ids - rethink ordering a bit
 (def ^:const $rdf:type 200)
@@ -138,6 +148,7 @@
 (def ^:const $sh:BlankNodeOrLiteral 228)
 (def ^:const $sh:Literal 229)
 ;; string validation
+(def ^:const $sh:flags 249)
 (def ^:const $sh:minLength 230)
 (def ^:const $sh:maxLength 231)
 (def ^:const $sh:pattern 232)
@@ -160,8 +171,22 @@
 (def ^:const $sh:lessThan 244)
 (def ^:const $sh:lessThanOrEquals 248)
 
+;; logical constraints
+(def ^:const $sh:not 251)
+(def ^:const $sh:and 252)
+(def ^:const $sh:or 253)
+(def ^:const $sh:xone 254)
+
+;; path types
+(def ^:const $sh:alternativePath 256)
+(def ^:const $sh:zeroOrMorePath 257)
+(def ^:const $sh:oneOrMorePath 258)
+(def ^:const $sh:zeroOrOnePath 259)
+(def ^:const $sh:inversePath 260)
+
 ;; fluree-specific
 (def ^:const $fluree:context 250)
+(def ^:const $fluree:targetClass 255)
 
 ;; owl
 (def ^:const $owl:Class 245)
@@ -176,11 +201,11 @@
 (def ^:const $xsd:boolean 2)
 (def ^:const $xsd:date 3)
 (def ^:const $xsd:dateTime 4)
+;; xsd number types
 (def ^:const $xsd:decimal 5)
 (def ^:const $xsd:double 6)
 (def ^:const $xsd:integer 7)
 (def ^:const $xsd:long 8)
-;; xsd number types
 (def ^:const $xsd:int 10)
 (def ^:const $xsd:short 11)
 (def ^:const $xsd:float 12)

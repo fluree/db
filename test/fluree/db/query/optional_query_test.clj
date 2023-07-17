@@ -9,7 +9,7 @@
 (deftest ^:integration optional-queries
   (testing "Testing various 'optional' query clauses."
     (let [conn   (test-utils/create-conn)
-          ledger @(fluree/create conn "query/optional" {:context {:ex "http://example.org/ns/"}})
+          ledger @(fluree/create conn "query/optional" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           db     @(fluree/stage
                     (fluree/db ledger)
                     [{:id          :ex/brian,
@@ -36,6 +36,15 @@
               ["Alice" "Green"]
               ["Brian" nil]])
           "Cam, Alice and Brian should all return, but only Alica has a favColor")
+
+      (is (= @(fluree/query db '{:select [?name ?favColor]
+                                 :where  [[?s :rdf/type :ex/User]
+                                          [?s :schema/name ?name]
+                                          {"optional" [?s :ex/favColor ?favColor]}]})
+             [["Cam" nil]
+              ["Alice" "Green"]
+              ["Brian" nil]])
+          "Cam, Alice and Brian should all return, but only Alice has a favColor, even with string 'optional' key")
 
       ;; including another pass-through variable - note Brian doesn't have an email
       (is (= @(fluree/query db '{:select [?name ?favColor ?email]

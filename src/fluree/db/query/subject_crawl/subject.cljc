@@ -25,8 +25,8 @@
                       (when-let [variable (:variable o)]
                         (get vars variable)))
         p*          (:value p)
-        idx*        (where/idx-for nil p* o*)
         o-dt        (:datatype o)
+        idx*        (where/idx-for nil p* o* o-dt)
         [fflake lflake] (case idx*
                           :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
                                  (flake/create nil p* o* o-dt nil nil util/max-integer)]

@@ -3,14 +3,16 @@
             [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
+            #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
             [fluree.db.api.query :as query-api]
+            [fluree.db.api.transact :as transact-api]
             [fluree.db.util.core :as util]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
-            [fluree.db.dbproto :as db-proto]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.json-ld.policy :as perm])
@@ -65,7 +67,10 @@
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
                 (file-conn/connect opts*))
-        :memory (memory-conn/connect opts*)))))
+        :memory (memory-conn/connect opts*)
+        :s3     #?(:clj  (s3-conn/connect opts*)
+                   :cljs (throw (ex-info "S3 connections not yet supported in ClojureScript"
+                                         {:status 400, :error :db/unsupported-operation})))))))
 
 (defn connect-ipfs
   "Forms an ipfs connection using default settings.
@@ -111,13 +116,9 @@
     "
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
-  ([conn ledger-alias {:keys [context context-type] :as opts}]
-   (let [conn-context (conn-proto/-context conn)
-         ledger-context (->> context
-                             (util/normalize-context context-type)
-                             (clojure.core/merge conn-context))
-         res-ch       (jld-ledger/create conn ledger-alias (assoc opts :context ledger-context))]
-     (promise-wrap res-ch))))
+  ([conn ledger-alias opts]
+   (promise-wrap
+     (jld-ledger/create conn ledger-alias opts))))
 
 (defn load-from-address
   "Loads a ledger defined with a Fluree address, e.g.:
@@ -163,6 +164,26 @@
         (log/debug "exists? - ledger address:" address)
         (<! (conn-proto/-exists? conn address))))))
 
+(defn default-context
+  "Returns the current default context set on the db."
+  [db]
+  (dbproto/-default-context db))
+
+(defn default-context-at-t
+  [ledger t]
+  (promise-wrap (ledger-proto/-default-context ledger t)))
+
+(defn update-default-context
+  "Updates the default context on a given database.
+  Currently, the updated default context will only be
+  written with a new commit, which requires staging
+  changed data.
+
+  Returns an updated db."
+  [db default-context]
+  (dbproto/-default-context-update db default-context))
+
+
 (defn index
   "Performs indexing operation on the specified ledger"
   [ledger])
@@ -192,7 +213,7 @@
   "Performs a transaction and queues change if valid (does not commit)"
   ([db json-ld] (stage db json-ld nil))
   ([db json-ld opts]
-   (let [result-ch (db-proto/-stage db json-ld opts)]
+   (let [result-ch (transact-api/stage db json-ld opts)]
      (promise-wrap result-ch))))
 
 
@@ -210,6 +231,11 @@
    (promise-wrap
      (ledger-proto/-commit! ledger db opts))))
 
+(defn transact!
+  "Stages and commits the transaction `json-ld` to the specified `ledger`"
+  [ledger json-ld opts]
+  (promise-wrap
+    (transact-api/transact! ledger json-ld opts)))
 
 (defn status
   "Returns current status of ledger branch."
@@ -304,9 +330,9 @@
 (defn expand-iri
   "Expands given IRI with the default database context, or provided context."
   ([db compact-iri]
-   (db-proto/-expand-iri db compact-iri))
+   (dbproto/-expand-iri db compact-iri))
   ([db compact-iri context]
-   (db-proto/-expand-iri db compact-iri context)))
+   (dbproto/-expand-iri db compact-iri context)))
 
 (defn internal-id
   "Returns the internal Fluree integer id for a given IRI.
@@ -317,4 +343,4 @@
   [db iri]
   (promise-wrap
     (->> (expand-iri db iri)
-         (db-proto/-subid db))))
+         (dbproto/-subid db))))

@@ -9,12 +9,13 @@
     (let [conn   (test-utils/create-conn)
           ledger (test-utils/load-movies conn)
           db     (fluree/db ledger)
-          movies @(fluree/query db {:select '{?s [:*]}
-                                    :where  '[[?s :rdf/type :schema/Movie]]
-                                    :t      2})]
+          movies @(fluree/query db '{:select {?s [:*]}
+                                     :where  [[?s :rdf/type :schema/Movie]]
+                                     :t      2})]
       (is (= 3 (count movies)))
       (is (every? #{"The Hitchhiker's Guide to the Galaxy"
-                    "Back to the Future" "Back to the Future Part II"}
+                    "Back to the Future"
+                    "Back to the Future Part II"}
                   (map :schema/name movies))))))
 
 (deftest query-with-iso8601-string-t-value-test
@@ -22,8 +23,8 @@
     (let [;conn         (test-utils/create-conn) ; doesn't work see comment below
           conn                   @(fluree/connect {:method :memory
                                                    :defaults
-                                                   {:context
-                                                    test-utils/default-context}})
+                                                   {:context      test-utils/default-context
+                                                    :context-type :keyword}})
           ;; if the :did default below is present on the conn
           ;; (as it is w/ test-utils/create-conn)
           ;; then the tests below fail at the last check

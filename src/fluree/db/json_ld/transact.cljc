@@ -1,30 +1,55 @@
 (ns fluree.db.json-ld.transact
-  (:require [fluree.json-ld :as json-ld]
+  (:refer-clojure :exclude [vswap!])
+  (:require [clojure.core.async :as async :refer [go]]
             [fluree.db.constants :as const]
-            [fluree.db.flake :as flake]
-            [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.json-ld.ledger :as jld-ledger]
-            [fluree.db.json-ld.reify :as jld-reify]
-            [fluree.db.util.async :refer [<? go-try]]
-            [fluree.db.query.range :as query-range]
-            [fluree.db.util.core :as util :refer [vswap!]]
-            [fluree.db.json-ld.branch :as branch]
-            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.datatype :as datatype]
-            [fluree.db.json-ld.shacl :as shacl]
-            [fluree.db.query.fql.syntax :as syntax]
-            [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.exec.where :as where]
-            [clojure.core.async :as async]
-            [fluree.db.json-ld.credential :as cred]
-            [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.json-ld.policy :as perm]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.fuel :as fuel]
+            [fluree.db.json-ld.branch :as branch]
+            [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as cred]
-            [fluree.db.util.log :as log])
-  (:refer-clojure :exclude [vswap!]))
+            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.json-ld.policy :as perm]
+            [fluree.db.json-ld.reify :as jld-reify]
+            [fluree.db.json-ld.shacl :as shacl]
+            [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.ledger.proto :as ledger-proto]
+            [fluree.db.policy.enforce-tx :as policy]
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [vswap!]]
+            [fluree.db.util.log :as log]
+            [fluree.db.validation :as v]
+            [fluree.json-ld :as json-ld]
+            [malli.core :as m]))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(def registry
+  (merge
+   (m/base-schemas)
+   (m/type-schemas)
+   v/registry
+   {::triple       ::v/triple
+    ::txn-leaf-map [:map-of
+                    [:orn [:string :string] [:keyword :keyword]]
+                    :any]
+    ::retract      [:and
+                    [:map-of :keyword :any]
+                    [:map [:retract ::txn-leaf-map]]]
+    ::modification ::v/modification-txn
+    ::txn-map      [:orn
+                    [:retract ::retract]
+                    [:modification ::modification]
+                    [:assert ::txn-leaf-map]]
+    ::txn          [:orn
+                    [:single-map ::txn-map]
+                    [:sequence-of-maps [:sequential ::txn-map]]]}))
 
 (declare json-ld-node->flakes)
 
@@ -47,17 +72,8 @@
             (recur r
                    (conj class-sids type-sid)
                    (conj class-flakes
-                         (flake/create type-sid const/$iri class-iri const/$xsd:string t true nil)
-                         (flake/create type-sid const/$rdf:type const/$rdfs:Class const/$xsd:anyURI t true nil)))))
+                         (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)))))
         [class-sids class-flakes]))))
-
-
-(defn- new-pid
-  "Generates a new property id (pid)"
-  [property ref? {:keys [iris next-pid refs] :as _tx-state}]
-  (let [new-id (jld-ledger/generate-new-pid property iris next-pid ref? refs)]
-    new-id))
-
 
 (defn add-property
   "Adds property. Parameters"
@@ -72,13 +88,18 @@
           flakes      (cond
                         ;; a new node's data is contained, process as another node then link to this one
                         (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+                        (do
+                          (when validate-fn
+                            (or (validate-fn v-map)
+                                (throw (ex-info (str "Node did not pass SHACL validation: " v-map)
+                                                {:status 400, :error :db/shacl-validation}))))
+                          (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                            (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m))))
 
                         ;; a literal value
                         (and (some? value) (not= shacl-dt const/$xsd:anyURI))
                         (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                          (if validate-fn
+                          (when validate-fn
                             (or (validate-fn value*)
                                 (throw (ex-info (str "Value did not pass SHACL validation: " value)
                                                 {:status 400 :error :db/shacl-validation}))))
@@ -144,7 +165,7 @@
   If property-id is non-nil, it can be checked when assigning new subject id for the node
   if it meets certain criteria. It will only be non-nil for nested subjects in the json-ld."
   [{:keys [id type] :as node}
-   {:keys [t next-pid next-sid iris db-before subj-mods] :as tx-state}
+   {:keys [t next-pid next-sid iris refs db-before subj-mods] :as tx-state}
    referring-pid]
   (go-try
     (let [existing-sid (when id
@@ -164,7 +185,7 @@
                          (str "_:f" sid) ;; create a blank node id
                          id)
           base-flakes  (cond-> []
-                               new-subj? (conj (flake/create sid const/$iri id* const/$xsd:string t true nil))
+                               new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
                                new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
       ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
       (register-node subj-mods node sid {:iri-only? (iri-only? node)
@@ -188,11 +209,11 @@
                 existing-pid     (<? (jld-reify/get-iri-sid k db-before iris))
                 pid              (or existing-pid
                                      (get jld-ledger/predefined-properties k)
-                                     (new-pid k ref? tx-state))
+                                     (jld-ledger/generate-new-pid k iris next-pid ref? refs))
                 datatype-map     (get-in shacl-map [:datatype pid])
                 property-flakes* (if existing-pid
                                    property-flakes
-                                   (conj property-flakes (flake/create pid const/$iri k const/$xsd:string t true nil)))
+                                   (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts?  (or (not new-subj?) existing-pid)
                 flakes*          (if retract?
@@ -202,30 +223,28 @@
                                           flakes* subj-flakes]
                                      (if v'
                                        (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
-                                       (cond-> flakes*
-                                               property-flakes (into property-flakes)))))]
+                                       flakes*)))]
             (recur r property-flakes* flakes*))
           ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap? issuer context-type] :as _opts}]
-  (let [{:keys [block ecount schema branch ledger policy], db-t :t} db
+  [db {:keys [bootstrap? did context-type] :as _opts}]
+  (let [{:keys [schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t        (-> commit-t inc -)] ;; commit-t is always positive, need to make negative for internal indexing
-    {:issuer        issuer
+    {:did           did
      :db-before     (dbproto/-rootdb db)
      :policy        policy
      :bootstrap?    bootstrap?
-     :default-ctx   (if (= :string context-type)
-                      (:context-str schema)
-                      (:context schema))
+     :default-ctx   (if context-type
+                      (dbproto/-context db ::dbproto/default-context context-type)
+                      (dbproto/-context db))
      :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
      :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
      :t             t
-     :block         block
      :last-pid      last-pid
      :last-sid      last-sid
      :next-pid      (fn [] (vswap! last-pid inc))
@@ -240,58 +259,12 @@
     (assoc ecount const/$_predicate @last-pid
                   const/$_default @last-sid)))
 
-(defn add-tt-id
-  "Associates a unique tt-id for any in-memory staged db in their index roots.
-  tt-id is used as part of the caching key, by having this in place it means
-  that even though the 't' value hasn't changed it will cache each stage db
-  data as its own entity."
-  [db]
-  (let [tt-id   (random-uuid)
-        indexes [:spot :psot :post :opst :tspo]]
-    (-> (reduce
-          (fn [db* idx]
-            (let [{:keys [children] :as node} (get db* idx)
-                  children* (reduce-kv
-                              (fn [children* k v]
-                                (assoc children* k (assoc v :tt-id tt-id)))
-                              {} children)]
-              (assoc db* idx (assoc node :tt-id tt-id
-                                         :children children*))))
-          db indexes)
-        (assoc :tt-id tt-id))))
-
-(defn remove-tt-id
-  "Removes a tt-id placed on indexes (opposite of add-tt-id)."
-  [db]
-  (let [indexes [:spot :psot :post :opst :tspo]]
-    (reduce
-      (fn [db* idx]
-        (let [{:keys [children] :as node} (get db* idx)
-              children* (reduce-kv
-                          (fn [children* k v]
-                            (assoc children* k (dissoc v :tt-id)))
-                          {} children)]
-          (assoc db* idx (-> node
-                             (dissoc :tt-id)
-                             (assoc :children children*)))))
-      (dissoc db :tt-id) indexes)))
-
-(defn update-novelty-idx
-  [novelty-idx add remove]
-  (-> (reduce disj novelty-idx remove)
-      (into add)))
-
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
-  [(flake/create const/$rdf:type const/$iri const/iri-rdf-type const/$xsd:string t true nil)
-   (flake/create const/$rdfs:Class const/$iri const/iri-class const/$xsd:string t true nil)
-   (flake/create const/$iri const/$iri "@id" const/$xsd:string t true nil)])
-
-(defn ref-flakes
-  "Returns ref flakes from set of all flakes. Uses Flake datatype to know if a ref."
-  [flakes]
-  (filter #(= (flake/dt %) const/$xsd:anyURI) flakes))
+  [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-rdf-type const/$xsd:string t true nil)
+   (flake/create const/$rdfs:Class const/$xsd:anyURI const/iri-class const/$xsd:string t true nil)
+   (flake/create const/$xsd:anyURI const/$xsd:anyURI "@id" const/$xsd:string t true nil)])
 
 ;; TODO - can use transient! below
 (defn stage-update-novelty
@@ -312,64 +285,64 @@
       [(not-empty adds) (not-empty removes)])))
 
 (defn db-after
-  [{:keys [add remove ref-add ref-remove size count] :as staged} {:keys [db-before policy bootstrap? t block] :as tx-state}]
-  (let [{:keys [novelty]} db-before
-        {:keys [spot psot post opst tspo]} novelty
-        new-db (assoc db-before :ecount (final-ecount tx-state)
-                                :policy policy ;; re-apply policy to db-after
-                                :t t
-                                :block block
-                                :novelty {:spot (update-novelty-idx spot add remove)
-                                          :psot (update-novelty-idx psot add remove)
-                                          :post (update-novelty-idx post add remove)
-                                          :opst (update-novelty-idx opst ref-add ref-remove)
-                                          :tspo (update-novelty-idx tspo add remove)
-                                          :size (+ (:size novelty) size)}
-                                :stats (-> (:stats db-before)
-                                           (update :size + size)
-                                           (update :flakes + count)))]
+  [{:keys [add remove] :as _staged} {:keys [db-before policy bootstrap? t] :as tx-state}]
+  (let [new-db (-> db-before
+                   (assoc :ecount (final-ecount tx-state)
+                          :policy policy ;; re-apply policy to db-after
+                          :t t)
+                   (commit-data/update-novelty add remove))]
     (if bootstrap?
       new-db
       ;; TODO - we used to add tt-id to break the cache, so multiple 'staged' dbs with same t value don't get cached as the same
       ;; TODO - now that each db should have its own unique hash, we can use the db's hash id instead of 't' or 'tt-id' for caching
-      (add-tt-id new-db))))
+      (commit-data/add-tt-id new-db))))
 
 (defn final-db
-  "Returns map of all elements for a stage transaction required to create an updated db."
-  [new-flakes {:keys [t stage-update? db-before refs class-mods] :as _tx-state}]
+  "Returns map of all elements for a stage transaction required to create an
+  updated db."
+  [new-flakes {:keys [stage-update? db-before] :as tx-state}]
   (go-try
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
           vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
-          staged-map   {:add        add
-                        :remove     remove
-                        :ref-add    (ref-flakes add)
-                        :ref-remove (ref-flakes remove)
-                        :count      (cond-> (if add (count add) 0)
-                                            remove (- (count remove)))
-                        :size       (cond-> (flake/size-bytes add)
-                                            remove (- (flake/size-bytes remove)))}
-          db-after     (cond-> (db-after staged-map _tx-state)
+          staged-map   {:add    add
+                        :remove remove}
+          db-after     (cond-> (db-after staged-map tx-state)
                                vocab-flakes vocab/refresh-schema
                                vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
 
+(defn track-into
+  [flakes track-fuel additions]
+  (if track-fuel
+    (into flakes track-fuel additions)
+    (into flakes additions)))
+
+(defn init-db?
+  [db]
+  (-> db :t zero?))
+
 (defn stage-flakes
-  [flakeset tx-state nodes]
+  [{:keys [t] :as db} fuel-tracker tx-state nodes]
   (go-try
-    (loop [[node & r] nodes
-           flakes* flakeset]
-      (if node
-        (if (empty? (dissoc node :idx :id))
-          (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
-                               (some->> (:id node)
-                                        (str " for @id: ") )
-                               ".")
-                          {:status 400 :error :db/invalid-transaction}))
-          (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))]
-            (recur r (into flakes* node-flakes))))
-        flakes*))))
+    (let [track-fuel (when fuel-tracker
+                       (fuel/track fuel-tracker))
+          flakeset   (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
+                             (init-db? db) (track-into track-fuel (base-flakes t)))]
+      (loop [[node & r] nodes
+             flakes flakeset]
+        (if node
+          (if (empty? (dissoc node :idx :id))
+            (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
+                                 (some->> (:id node)
+                                          (str " for @id: "))
+                                 ".")
+                            {:status 400 :error :db/invalid-transaction}))
+            (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))
+                  flakes* (track-into flakes track-fuel node-flakes)]
+              (recur r flakes*)))
+          flakes)))))
 
 (defn validate-rules
   [{:keys [db-after add] :as staged-map} {:keys [subj-mods] :as _tx-state}]
@@ -382,10 +355,10 @@
           (let [sid (flake/s (first s-flakes))
                 {:keys [new? classes shacl]} (get subj-mods' sid)]
             (when shacl
-              (let [all-flakes (if new?
+              (let [s-flakes* (if new?
                                  s-flakes
                                  (<? (query-range/index-range root-db :spot = [sid])))]
-                (<? (shacl/validate-target root-db shacl all-flakes))))
+                (<? (shacl/validate-target shacl root-db s-flakes*))))
             (recur r (into all-classes classes)))
           (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
                                (contains? all-classes const/$sh:PropertyShape))]
@@ -394,64 +367,36 @@
               (vocab/reset-shapes (:schema db-after)))
             staged-map))))))
 
-(defn init-db?
-  [db]
-  (-> db :t zero?))
-
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
-  [{:keys [schema t] :as db} json-ld {:keys [default-ctx] :as tx-state}]
-  (log/debug "insert default-ctx:" default-ctx)
-  (let [nodes    (-> json-ld
-                     (json-ld/expand default-ctx)
-                     util/sequential)
-        flakeset (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                         (init-db? db) (into (base-flakes t)))]
-    (stage-flakes flakeset tx-state nodes)))
+  [db fuel-tracker json-ld {:keys [default-ctx] :as tx-state}]
+  (log/trace "insert default-ctx:" default-ctx)
+  (let [nodes (-> json-ld
+                  (json-ld/expand default-ctx)
+                  util/sequential)]
+    (stage-flakes db fuel-tracker tx-state nodes)))
 
-;; TODO - delete passes the error-ch but doesn't monitor for it at the top level here to properly throw exceptions
-(defn delete
-  "Executes a delete statement"
-  [db max-fuel json-ld {:keys [t] :as _tx-state}]
-  (go-try
-    (let [{:keys [delete] :as parsed-query}
-          (-> json-ld
-              syntax/validate
-              (q-parse/parse-delete db))
+(defn into-flakeset
+  [fuel-tracker flake-ch]
+  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
+    (if fuel-tracker
+      (let [track-fuel (fuel/track fuel-tracker)]
+        (async/transduce track-fuel into flakeset flake-ch))
+      (async/reduce into flakeset flake-ch))))
 
-          [s p o] delete
-          parsed-query (assoc parsed-query :delete [s p o])
-          error-ch     (async/chan)
-          flake-ch     (async/chan)
-          where-ch     (where/search db parsed-query error-ch)]
-      (async/pipeline-async 1
-                            flake-ch
-                            (fn [solution ch]
-                              (let [s* (if (::where/val s)
-                                         s
-                                         (get solution (::where/var s)))
-                                    p* (if (::where/val p)
-                                         p
-                                         (get solution (::where/var p)))
-                                    o* (if (::where/val o)
-                                         o
-                                         (get solution (::where/var o)))]
-                                (async/pipe
-                                  (where/resolve-flake-range db error-ch [s* p* o*])
-                                  ch)))
-                            where-ch)
-      (let [delete-ch (async/transduce (comp cat
-                                             (map (fn [f]
-                                                    (flake/flip-flake f t))))
-                                       (completing conj)
-                                       (flake/sorted-set-by flake/cmp-flakes-spot)
-                                       flake-ch)
-            flakes    (async/alt!
-                        error-ch ([e]
-                                  (throw e))
-                        delete-ch ([flakes]
-                                   flakes))]
-        flakes))))
+(defn modify
+  [db fuel-tracker json-ld {:keys [t] :as _tx-state}]
+  (let [mdfn (-> json-ld
+                 syntax/coerce-modification
+                 (q-parse/parse-modification db))]
+    (go
+      (let [error-ch  (async/chan)
+            update-ch (->> (where/search db mdfn fuel-tracker error-ch)
+                           (update/modify db mdfn t fuel-tracker error-ch)
+                           (into-flakeset fuel-tracker))]
+        (async/alt!
+          error-ch ([e] e)
+          update-ch ([flakes] flakes))))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -464,21 +409,41 @@
         (validate-rules tx-state)
         <?
         (policy/allowed? tx-state)
-        <?)))
+        <?
+        ;; unwrap the policy
+        dbproto/-rootdb)))
 
 (defn stage
   "Stages changes, but does not commit.
   Returns async channel that will contain updated db or exception."
-  [db json-ld opts]
-  (go-try
-    (let [{tx :subject issuer :issuer} (or (<? (cred/verify json-ld))
-                                           {:subject json-ld})
-          db* (if-let [policy-opts (perm/policy-opts opts)]
-                (<? (perm/wrap-policy db policy-opts))
-                db)
-          tx-state (->tx-state db* (assoc opts :issuer issuer))
-          flakes   (if (and (contains? tx :delete)
-                            (contains? tx :where))
-                     (<? (delete db util/max-integer tx tx-state))
-                     (<? (insert db tx tx-state)))]
-      (<? (flakes->final-db tx-state flakes)))))
+  ([db json-ld opts]
+   (stage db nil json-ld opts))
+  ([db fuel-tracker json-ld opts]
+   (go-try
+     (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
+                                      {:subject json-ld})
+           opts*    (cond-> opts did (assoc :did did))
+           db*      (if-let [policy-opts (perm/policy-opts opts*)]
+                      (<? (perm/wrap-policy db policy-opts))
+                      db)
+           tx-state (->tx-state db* opts*)
+           flakes   (if (q-parse/update? tx)
+                      (<? (modify db fuel-tracker tx tx-state))
+                      (<? (insert db fuel-tracker tx tx-state)))]
+       (<? (flakes->final-db tx-state flakes))))))
+
+(defn stage-ledger
+  ([ledger json-ld opts]
+   (stage-ledger ledger nil json-ld opts))
+  ([ledger fuel-tracker json-ld opts]
+   (-> ledger
+       ledger-proto/-db
+       (stage fuel-tracker json-ld opts))))
+
+(defn transact!
+  ([ledger json-ld opts]
+   (transact! ledger nil json-ld opts))
+  ([ledger fuel-tracker json-ld opts]
+   (go-try
+     (let [staged (<? (stage-ledger ledger fuel-tracker json-ld opts))]
+       (<? (ledger-proto/-commit! ledger staged))))))
