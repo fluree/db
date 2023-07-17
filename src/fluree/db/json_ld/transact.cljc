@@ -192,7 +192,7 @@
           referring-pids (when shacl-target-objects-of?
                            (cond-> (map flake/p (<? (query-range/index-range db-before :opst = [sid])))
                              referring-pid (conj referring-pid)))
-          pred-shapes (when-not (empty? referring-pids)
+          pred-shapes (when (seq referring-pids)
                         (<? (shacl/targetobject-shapes db-before referring-pids)))
           shacl-map   (merge-with into class-shapes pred-shapes)
           id*          (if (and new-subj? (nil? id))
