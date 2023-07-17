@@ -99,6 +99,12 @@
             0))))))
 
 (defn sorted-node-set-by
+  "Returns a sorted set for organizing index nodes based on the supplied flake
+  comparator `cmp`. The returned set does not use `cmp` directly as its
+  comparator, but it instead uses a comparator derived from `cmp` that considers
+  two nodes equal if the flake intervals defined by their `:first-flake` and
+  `:rhs` attributes overlap, otherwise it compares the nodes based on their
+  flake intervals if those intervals are disjoint."
   ([cmp]
    (let [node-cmp (->node-comparator cmp)]
      (flake/sorted-set-by node-cmp)))
@@ -121,10 +127,14 @@
    :t            0})
 
 (defn leftmost?
+  "Returns true if the flake interval of the supplied index node `node` is less
+  than the flake intervals of all of its sibling nodes."
   [node]
   (-> node :first nil?))
 
 (defn rightmost?
+  "Returns true if the flake interval of the supplied index node `node` is greater
+  than the flake intervals of all of its sibling nodes."
   [node]
   (-> node :rhs nil?))
 
@@ -314,6 +324,9 @@
       false)))
 
 (defn trim-branch
+  "Returns a branch node derived from the supplied branch node `branch` containing
+  only child nodes that have flakes between the supplied `start-flake` and
+  `end-flake`"
   [branch new-first new-rhs]
   (let [start-node {:first new-first, :rhs new-first}
         end-node   {:first new-rhs, :rhs new-rhs}]
@@ -323,10 +336,14 @@
     (update branch :children flake/rslice end-node start-node)))
 
 (defn trim-leaf
+  "Returns a leaf node derived from the supplied leaf node `leaf` that
+  contains only the flakes from `leaf` between `start-flake` and `end-flake`."
   [leaf new-first new-rhs]
   (update leaf :flakes flake/slice new-first new-rhs))
 
 (defn trim-node
+  "Returns a index node derived from the supplied index node `node` that is bound
+  by `start-flake` and `end-flake`."
   [node start-flake end-flake]
   (let [cmp         (:comparator node)
         first-flake (:first node)
