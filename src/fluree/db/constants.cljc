@@ -42,7 +42,6 @@
 (def ^:const iri-target-role "https://ns.flur.ee/ledger#targetRole")
 (def ^:const iri-target-class "https://ns.flur.ee/ledger#targetClass")
 (def ^:const iri-target-node "https://ns.flur.ee/ledger#targetNode")
-
 (def ^:const iri-target-objects-of "https://ns.flur.ee/ledger#targetObjectsOf")
 (def ^:const iri-property "https://ns.flur.ee/ledger#property")
 (def ^:const iri-policy "https://ns.flur.ee/ledger#Policy")
