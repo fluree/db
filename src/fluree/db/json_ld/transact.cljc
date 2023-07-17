@@ -381,7 +381,11 @@
                                  (<? (query-range/index-range root-db :spot = [sid])))]
                 (<? (shacl/validate-target shacl root-db s-flakes*))))
             (recur r (into all-classes classes) (dissoc remaining-subj-mods sid)))
-          ;;else
+          ;; There may be subjects who need to have rules checked due to the addition
+          ;; of a reference, but the subjects themselves were not modified in this txn.
+          ;; These will appear in `subj-mods` but not among the `add` flakes.
+          ;; We process validation for these remaining subjects here,
+          ;; after we have looped through all the `add` flakes.
           (do
             (loop [[[sid mod] & r] remaining-subj-mods]
               (when sid
