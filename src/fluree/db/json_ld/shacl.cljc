@@ -196,7 +196,7 @@
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
-  [{:keys [datatype min-count max-count min-inclusive min-exclusive max-inclusive
+  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
            max-exclusive min-length max-length pattern in] :as p-shape}
    p-flakes]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
