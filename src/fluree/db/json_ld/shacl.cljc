@@ -752,5 +752,4 @@
   (-> db
       :schema
       :pred
-      (get const/$sh:targetObjectsOf)
-      boolean))
+      (contains? const/$sh:targetObjectsOf)))
