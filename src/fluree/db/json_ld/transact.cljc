@@ -151,7 +151,11 @@
 
                ;; if previously updated, but prior updates were only the IRI then it is OK
                (:iri-only? existing)
-               node-meta-map
+               ;; shacl constraint may have been discovered on previous node.
+               ;; in that case, we'd want to keep it and not override it.
+               (if (:shacl existing)
+                 (update existing :shacl #(merge-with into % (:shacl node-meta-map)))
+                 node-meta-map)
 
                :else
                (throw (ex-info (str "Subject " (:id node) " is being updated in more than one JSON-LD map. "
@@ -165,7 +169,8 @@
   If property-id is non-nil, it can be checked when assigning new subject id for the node
   if it meets certain criteria. It will only be non-nil for nested subjects in the json-ld."
   [{:keys [id type] :as node}
-   {:keys [t next-pid next-sid iris refs db-before subj-mods] :as tx-state}
+   {:keys [t next-pid next-sid iris refs db-before subj-mods
+           shacl-target-objects-of?] :as tx-state}
    referring-pid]
   (go-try
     (let [existing-sid (when id
@@ -179,8 +184,17 @@
                          existing-sid)
           classes      (if new-subj?
                          new-type-sids
+                         ;;note: use of `db-before` here (and below)
+                         ;; means we cannot transact shacl in same txn as
+                         ;;data and have it enforced.
                          (<? (get-subject-types db-before sid new-type-sids)))
-          shacl-map    (<? (shacl/class-shapes db-before classes))
+          class-shapes (<? (shacl/class-shapes db-before classes))
+          referring-pids (when shacl-target-objects-of?
+                           (cond-> (map flake/p (<? (query-range/index-range db-before :opst = [sid])))
+                             referring-pid (conj referring-pid)))
+          pred-shapes (when (seq referring-pids)
+                        (<? (shacl/targetobject-shapes db-before referring-pids)))
+          shacl-map   (merge-with into class-shapes pred-shapes)
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
                          id)
@@ -210,7 +224,11 @@
                 pid              (or existing-pid
                                      (get jld-ledger/predefined-properties k)
                                      (jld-ledger/generate-new-pid k iris next-pid ref? refs))
-                datatype-map     (get-in shacl-map [:datatype pid])
+                ;;it's possible the shacl constraint was discovered via a different node,
+                ;; as in `sh:targetObjectsOf`. In that case, the relevant shape would be
+                ;; available in `subj-mods`, rather than in the currently-bound `shacl-map`.
+                shacl-map* (or shacl-map (get-in @subj-mods [sid :shacl]))
+                datatype-map     (get-in shacl-map* [:datatype pid])
                 property-flakes* (if existing-pid
                                    property-flakes
                                    (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))
@@ -234,9 +252,10 @@
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
-        t        (-> commit-t inc -)] ;; commit-t is always positive, need to make negative for internal indexing
+        t        (-> commit-t inc -)  ;; commit-t is always positive, need to make negative for internal indexing
+        db-before (dbproto/-rootdb db)]
     {:did           did
-     :db-before     (dbproto/-rootdb db)
+     :db-before     db-before
      :policy        policy
      :bootstrap?    bootstrap?
      :default-ctx   (if context-type
@@ -250,7 +269,8 @@
      :next-pid      (fn [] (vswap! last-pid inc))
      :next-sid      (fn [] (vswap! last-sid inc))
      :subj-mods     (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
-     :iris          (volatile! {})}))
+     :iris          (volatile! {})
+     :shacl-target-objects-of? (shacl/has-target-objects-of-rule? db-before)}))
 
 (defn final-ecount
   [tx-state]
@@ -350,7 +370,8 @@
         root-db    (dbproto/-rootdb db-after)]
     (go-try
       (loop [[s-flakes & r] (partition-by flake/s add)
-             all-classes #{}]
+             all-classes #{}
+             remaining-subj-mods subj-mods']
         (if s-flakes
           (let [sid (flake/s (first s-flakes))
                 {:keys [new? classes shacl]} (get subj-mods' sid)]
@@ -359,13 +380,25 @@
                                  s-flakes
                                  (<? (query-range/index-range root-db :spot = [sid])))]
                 (<? (shacl/validate-target shacl root-db s-flakes*))))
-            (recur r (into all-classes classes)))
-          (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
-                               (contains? all-classes const/$sh:PropertyShape))]
-            (when new-shacl?
-              ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
-              (vocab/reset-shapes (:schema db-after)))
-            staged-map))))))
+            (recur r (into all-classes classes) (dissoc remaining-subj-mods sid)))
+          ;; There may be subjects who need to have rules checked due to the addition
+          ;; of a reference, but the subjects themselves were not modified in this txn.
+          ;; These will appear in `subj-mods` but not among the `add` flakes.
+          ;; We process validation for these remaining subjects here,
+          ;; after we have looped through all the `add` flakes.
+          (do
+            (loop [[[sid mod] & r] remaining-subj-mods]
+              (when sid
+                (let [{:keys [shacl]} mod
+                      flakes (<? (query-range/index-range root-db :spot = [sid]))]
+                  (<? (shacl/validate-target shacl root-db flakes))
+                  (recur r))))
+            (let [new-shacl? (or (contains? all-classes const/$sh:NodeShape)
+                                 (contains? all-classes const/$sh:PropertyShape))]
+              (when new-shacl?
+                ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
+                (vocab/reset-shapes (:schema db-after)))
+              staged-map)))))))
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
