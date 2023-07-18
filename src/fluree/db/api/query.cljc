@@ -1,7 +1,7 @@
 (ns fluree.db.api.query
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
-  (:require [clojure.core.async :as async :refer [<! go]]
+  (:require [clojure.core.async :as async]
             [fluree.db.fuel :as fuel]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
@@ -11,7 +11,8 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.policy :as perm]
-            [fluree.db.json-ld.credential :as cred]))
+            [fluree.db.json-ld.credential :as cred]
+            [fluree.db.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -80,17 +81,17 @@
   [db query-map]
   (go-try
    (let [{query-map :subject, did :did} (or (<? (cred/verify query-map))
-                                                  {:subject query-map})
+                                            {:subject query-map})
          coerced-query (try*
                          (history/coerce-history-query query-map)
                          (catch* e
-                                 (throw
-                                   (ex-info
-                                     (str "History query not properly formatted. Provided "
-                                          (pr-str query-map))
-                                     {:status  400
-                                      :message (history/humanize-error e)
-                                      :error   :db/invalid-query}))))
+                           (throw
+                             (ex-info
+                               (str "History query not properly formatted. Provided "
+                                    (pr-str query-map))
+                               {:status  400
+                                :message (v/humanize-error e)
+                                :error   :db/invalid-query}))))
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
      (<? (history* db history-query)))))
 
@@ -148,7 +149,7 @@
   [source flureeQL]
   (go-try
    (let [{flureeQL :subject, did :did} (or (<? (cred/verify flureeQL))
-                                              {:subject flureeQL})
+                                           {:subject flureeQL})
          global-opts         (cond-> (:opts flureeQL) did (assoc :did did))
          db                  (if-let [policy-opts (perm/policy-opts global-opts)]
                                (<? (perm/wrap-policy source policy-opts))

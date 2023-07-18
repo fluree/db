@@ -286,14 +286,17 @@
 
 (defn commit-error
   [message commit-data]
-  (throw (ex-info message {:status 400, :error :db/invalid-commit, :commit commit-data})))
+  (throw
+   (ex-info message
+            {:status 400, :error :db/invalid-commit, :commit commit-data})))
 
 (defn db-t
   "Returns 't' value from commit data."
   [db-data]
   (let [db-t (get-in db-data [const/iri-t :value])]
     (when-not (pos-int? db-t)
-      (commit-error (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
+      (commit-error
+       (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
     db-t))
 
 (defn db-assert
@@ -318,20 +321,20 @@
 (defn read-commit
   [conn commit-address]
   (go-try
-   (let [file-data (<? (conn-proto/-c-read conn commit-address))
-         addr-key-path (if (contains? file-data "credentialSubject")
-                         ["credentialSubject" "address"]
-                         ["address"])
-         commit    (assoc-in file-data addr-key-path commit-address)]
-     (log/debug "read-commit commit:" commit)
-     (json-ld/expand commit))))
+    (let [file-data (<? (conn-proto/-c-read conn commit-address))
+          addr-key-path (if (contains? file-data "credentialSubject")
+                          ["credentialSubject" "address"]
+                          ["address"])
+          commit    (assoc-in file-data addr-key-path commit-address)]
+      (log/trace "read-commit commit:" commit)
+      (json-ld/expand commit))))
 
 (defn read-db
   [conn db-address]
   (go-try
-   (let [file-data (<? (conn-proto/-c-read conn db-address))
-         db        (assoc file-data "f:address" db-address)]
-     (json-ld/expand db))))
+    (let [file-data (<? (conn-proto/-c-read conn db-address))
+          db        (assoc file-data "f:address" db-address)]
+      (json-ld/expand db))))
 
 (defn merge-commit
   [conn {:keys [ecount t] :as db} commit merged-db?]
@@ -397,7 +400,8 @@
                                  (= -1 t-new)
                                  (into commit-data/commit-schema-flakes)))
          ecount*            (assoc ecount const/$_predicate pid
-                                          const/$_default sid)]
+                                          const/$_default sid
+                                          const/$_shard @last-sid)]
      (when (empty? all-flakes)
        (commit-error "Commit has neither assertions or retractions!"
                      commit-metadata))
@@ -414,8 +418,8 @@
 
 (defn trace-commits
   "Returns a list of two-tuples each containing [commit proof] as applicable.
-  First commit will be t value of '1' and increment from there."
-  [conn latest-commit]
+  First commit will be t value of `from-t` and increment from there."
+  [conn latest-commit from-t]
   (go-try
     (loop [commit  latest-commit
            last-t  nil
@@ -442,7 +446,7 @@
                            :commit-data (if (> (count (str commit)) 500)
                                           (str (subs (str commit) 0 500) "...")
                                           (str commit))})))
-        (if (= 1 commit-t)
+        (if (= from-t commit-t)
           commits*
           (let [commit-data (<? (read-commit conn prev-commit-addr))
                 [commit proof] (parse-commit commit-data)]
@@ -455,7 +459,7 @@
   [{:keys [ledger] :as db} latest-commit merged-db?]
   (go-try
     (let [{:keys [conn]} ledger
-          commits (<? (trace-commits conn latest-commit))]
+          commits (<? (trace-commits conn latest-commit 1))]
       (loop [[commit & r] commits
              db* db]
         (if commit
@@ -481,7 +485,10 @@
           commit-t   (commit-data/t commit-map)]
       (if (= commit-t index-t)
         db-base* ;; if index-t is same as latest commit, no additional commits to load
-        (loop [[commit & r] (<? (trace-commits conn latest-commit)) ;; TODO - can load in parallel
+        ;; trace to the first unindexed commit TODO - load in parallel
+        (loop [[commit & r] (<? (trace-commits conn latest-commit (if index-t
+                                                                    (inc index-t)
+                                                                    1)))
                db* db-base*]
           (if commit
             (let [new-db (<? (merge-commit conn db* commit merged-db?))]

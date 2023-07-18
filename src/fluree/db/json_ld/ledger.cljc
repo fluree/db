@@ -50,6 +50,11 @@
           "http://www.w3.org/ns/shacl#ignoredProperties"        const/$sh:ignoredProperties
           "http://www.w3.org/ns/shacl#property"                 const/$sh:property
           "http://www.w3.org/ns/shacl#path"                     const/$sh:path
+          "http://www.w3.org/ns/shacl#inversePath"              const/$sh:inversePath
+          "http://www.w3.org/ns/shacl#alternativePath"          const/$sh:alternativePath
+          "http://www.w3.org/ns/shacl#zeroOrMorePath"           const/$sh:zeroOrMorePath
+          "http://www.w3.org/ns/shacl#oneOrMorePath"            const/$sh:oneOrMorePath
+          "http://www.w3.org/ns/shacl#zeroOrOnePath"            const/$sh:zeroOrOnePath
           "http://www.w3.org/ns/shacl#minCount"                 const/$sh:minCount
           "http://www.w3.org/ns/shacl#maxCount"                 const/$sh:maxCount
           "http://www.w3.org/ns/shacl#datatype"                 const/$sh:datatype
@@ -124,14 +129,21 @@
                   (get predefined-properties id)
                   (if (or (class-or-property? node)
                           (#{const/$rdfs:subClassOf
-                             const/$sh:path const/$sh:ignoredProperties
+                             const/$sh:path
+                             const/$sh:ignoredProperties
                              const/$sh:targetClass
                              const/$fluree:targetClass
-                             const/$sh:targetSubjectsOf const/$sh:targetObjectsOf
+                             const/$sh:targetSubjectsOf
+                             const/$sh:targetObjectsOf
                              const/$sh:equals
                              const/$sh:disjoint
                              const/$sh:lessThan
-                             const/$sh:lessThanOrEquals}
+                             const/$sh:lessThanOrEquals
+                             const/$sh:inversePath
+                             const/$sh:alternativePath
+                             const/$sh:zeroOrMorePath
+                             const/$sh:oneOrMorePath
+                             const/$sh:zeroOrOnePath}
                            referring-pid))
                     (next-pid)
                     (next-sid)))]

@@ -8,10 +8,6 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
-  (-serialize-block [_ block-data]
-    block-data)
-  (-deserialize-block [_ block-key]
-    block-key)
   (-serialize-db-root [_ db-root]
     db-root)
   (-deserialize-db-root [_ db-root]
@@ -28,4 +24,3 @@
     garbage)
   (-deserialize-garbage [_ garbage]
     garbage))
-

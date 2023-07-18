@@ -8,7 +8,6 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.json-ld.commit-data :as commit-data]))
 
 ;; default indexer
@@ -292,10 +291,10 @@
              (let [child (peek stack*)]
                (if (and child
                         (index/descendant? node child))     ; all of a resolved
-                 ; branch's children
-                 ; should be at the top
-                 ; of the stack
-                 (recur (conj child-nodes child)
+                                                            ; branch's children
+                                                            ; should be at the top
+                                                            ; of the stack
+                 (recur (conj child-nodes (index/unresolve child))
                         (vswap! stack pop)
                         (xf result* child))
                  (if (overflow-children? child-nodes)
@@ -393,7 +392,7 @@
                  written-node))
         (recur (update stats :unchanged inc)
                node))
-      (assoc stats :root last-node))))
+      (assoc stats :root (index/unresolve last-node)))))
 
 
 (defn refresh-index
@@ -452,7 +451,7 @@
 
 (defn refresh
   [indexer
-   {:keys [ecount novelty block t network ledger-id] :as db}
+   {:keys [ecount novelty t network ledger-id] :as db}
    {:keys [remove-preds changes-ch]}]
   (go-try
     (let [start-time-ms (util/current-time-millis)

@@ -81,8 +81,17 @@
       (testing "basic analytical RFD type query"
         (let [query-res @(fluree/query db '{:select {?s [:* {:schema/isBasedOn [:*]}]}
                                             :where  [[?s :rdf/type :schema/Movie]]})]
-          (is (= query-res                                  ;; :id is a DID and will be unique per DB so exclude from comparison
-                 [{:id                               :wiki/Q230552,
+          (is (= [{:id :wiki/Q2875,
+                   :rdf/type [:schema/Movie],
+                   :schema/disambiguatingDescription "1939 film by Victor Fleming",
+                   :schema/isBasedOn {:id :wiki/Q2870,
+                                      :rdf/type [:schema/Book],
+                                      :schema/author {:id :wiki/Q173540},
+                                      :schema/isbn "0-582-41805-4",
+                                      :schema/name "Gone with the Wind"},
+                   :schema/name "Gone with the Wind",
+                   :schema/titleEIDR "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4"}
+                  {:id                               :wiki/Q230552,
                    :rdf/type                         [:schema/Movie],
                    :schema/name                      "Back to the Future Part III",
                    :schema/disambiguatingDescription "1990 film by Robert Zemeckis",
@@ -105,7 +114,8 @@
                                                       :rdf/type      [:schema/Book],
                                                       :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                       :schema/isbn   "0-330-25864-8",
-                                                      :schema/author {:id :wiki/Q42}}}])
+                                                      :schema/author {:id :wiki/Q42}}}]                                  ;; :id is a DID and will be unique per DB so exclude from comparison
+                 query-res)
               "Standard bootstrap data isn't matching."))))))
 
 

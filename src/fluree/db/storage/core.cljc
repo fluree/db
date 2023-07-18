@@ -7,7 +7,6 @@
             [clojure.core.async :refer [go <!] :as async]
             [fluree.db.util.async #?(:clj :refer :cljs :refer-macros) [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.query.schema :as schema]
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.conn.proto :as conn-proto]))
 
@@ -163,7 +162,7 @@
 
 
 (defn read-db-root
-  "Returns all data for a db index root of a given block."
+  "Returns all data for a db index root of a given t."
   ([conn idx-address]
    (go-try
      (let [data (<? (conn-proto/-index-file-read conn idx-address))]
@@ -193,28 +192,14 @@
                schema (<? (vocab/vocab-map db))
                db*    (assoc db :schema schema)]
            ;(assoc db* :settings settings-map)
-           db*)))))
-  ([conn network ledger-id blank-db index]
-   (go-try
-     (let [db-root (read-db-root conn network ledger-id index)]
-       (if-not db-root
-         (throw (ex-info (str "Database " network "/" ledger-id
-                              " could not be loaded at index point: "
-                              index ".")
-                         {:status 400
-                          :error  :db/unavailable}))
-         (let [db           (reify-db-root conn blank-db (<? db-root))
-               schema-map   (<? (schema/schema-map db))
-               db*          (assoc db :schema schema-map)
-               settings-map (<? (schema/setting-map db*))]
-           (assoc db* :settings settings-map)))))))
+           db*))))))
 
 (defn fetch-child-attributes
   [conn {:keys [id comparator leftmost?] :as branch}]
   (go-try
     (if-let [{:keys [children]} (<? (read-branch conn id))]
-      (let [branch-metadata (select-keys branch [:comparator :network :ledger-id :t
-                                                 :tt-id :tempid])
+      (let [branch-metadata (select-keys branch [:comparator :network :ledger-id
+                                                 :t :tt-id :tempid])
             child-attrs     (map-indexed (fn [i child]
                                            (-> branch-metadata
                                                (assoc :leftmost? (and leftmost?
