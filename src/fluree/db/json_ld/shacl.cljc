@@ -446,6 +446,16 @@
 
           const/$sh:node
           (assoc acc :node o)
+
+          const/$sh:qualifiedValueShape
+          (assoc acc :qualified-value-shape o)
+          const/$sh:qualifiedMinCount
+          (assoc acc :qualified-min-count o)
+          const/$sh:qualifiedMaxCount
+          (assoc acc :qualified-max-count o)
+          const/$sh:qualifiedValueShapesDisjoint
+          (assoc acc :qualified-value-shapes-disjoint o)
+
           ;; else
           acc)))
     {}
