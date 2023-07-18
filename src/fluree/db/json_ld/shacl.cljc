@@ -587,6 +587,16 @@
         #?(:clj (Pattern/compile (or valid-flags 0))
            :cljs (js/RegExp. (or valid-flags ""))))))
 
+(defn build-pattern2
+  "Builds regex pattern out of input string
+  and any flags that were provided."
+  [{:keys [:pattern :flags] :as p-shape}]
+  (let [valid-flags (->> (map get-regex-flag flags)
+                         #?(:clj (apply +)
+                            :cljs (apply str)))]
+    (assoc p-shape :pattern #?(:clj (Pattern/compile pattern (or valid-flags 0))
+                               :cljs (js/RegExp. pattern (or valid-flags ""))))))
+
 (defn resolve-path-type
   "Associate each property path object with its path type in order to govern path flake resolution during validation."
   [db path-pid]
@@ -614,6 +624,25 @@
         (recur r (conj tagged-path (<? (resolve-path-type db path-pid))))
         tagged-path))))
 
+(defn resolve-path-types2
+  [{:keys [path] :as p-shape} db]
+  (go-try
+    (loop [[path-pid & r] path
+           tagged-path []]
+      (if path-pid
+        (recur r (conj tagged-path (<? (resolve-path-type db path-pid))))
+        (assoc p-shape :path tagged-path)))))
+
+(defn build-p-shape
+  [db p shape-sid]
+  (go-try
+    (let [p-flakes (<? (query-range/index-range db :spot = [shape-sid]))
+          base (build-property-shape p-flakes)
+          base* (<? (resolve-path-types2 base db))]
+      (cond-> base*
+        (:pattern base)     (build-pattern2)
+        (= p const/$sh:not) (assoc :logical-constraint :not, :required? false)))))
+
 (defn build-node-shape
   [db shape-sid]
   (go-try
@@ -636,6 +665,8 @@
 
                     property-shape* (cond-> (assoc property-shape :path tagged-path)
                                       (:pattern property-shape) (assoc :pattern (build-pattern property-shape)))
+
+                    property-shape* (<? (build-p-shape db p o))
 
                     p-shape-key (first (first tagged-path))
                     target-key  (first (peek tagged-path))
