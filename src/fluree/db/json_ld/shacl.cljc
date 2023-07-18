@@ -362,7 +362,7 @@
       (doseq [shape shapes]
         (<? (validate-shape db shape s-flakes pid->p-flakes))))))
 
-(defn build-property-shape
+(defn build-property-base-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
   [property-flakes]
   (reduce
@@ -450,12 +450,6 @@
           acc)))
     {}
     property-flakes))
-
-(defn build-not-shape
-  [property-flakes]
-  (-> property-flakes
-      build-property-shape
-      (assoc :logical-constraint :not, :required? false)))
 
 ;; TODO - pass along additional shape metadata to provided better error message.
 (defn register-datatype
@@ -579,17 +573,6 @@
 (defn build-pattern
   "Builds regex pattern out of input string
   and any flags that were provided."
-  [{:keys [:pattern :flags] :as _shape}]
-  (let [valid-flags (->> (map get-regex-flag flags)
-                         #?(:clj (apply +)
-                            :cljs (apply str)))]
-    (-> pattern
-        #?(:clj (Pattern/compile (or valid-flags 0))
-           :cljs (js/RegExp. (or valid-flags ""))))))
-
-(defn build-pattern2
-  "Builds regex pattern out of input string
-  and any flags that were provided."
   [{:keys [:pattern :flags] :as p-shape}]
   (let [valid-flags (->> (map get-regex-flag flags)
                          #?(:clj (apply +)
@@ -616,15 +599,6 @@
       [path-pid :predicate])))
 
 (defn resolve-path-types
-  [db path]
-  (go-try
-    (loop [[path-pid & r] path
-           tagged-path []]
-      (if path-pid
-        (recur r (conj tagged-path (<? (resolve-path-type db path-pid))))
-        tagged-path))))
-
-(defn resolve-path-types2
   [{:keys [path] :as p-shape} db]
   (go-try
     (loop [[path-pid & r] path
@@ -633,14 +607,14 @@
         (recur r (conj tagged-path (<? (resolve-path-type db path-pid))))
         (assoc p-shape :path tagged-path)))))
 
-(defn build-p-shape
+(defn build-property-shape
   [db p shape-sid]
   (go-try
     (let [p-flakes (<? (query-range/index-range db :spot = [shape-sid]))
-          base (build-property-shape p-flakes)
-          base* (<? (resolve-path-types2 base db))]
+          base     (build-property-base-shape p-flakes)
+          base*    (<? (resolve-path-types base db))]
       (cond-> base*
-        (:pattern base)     (build-pattern2)
+        (:pattern base)     (build-pattern)
         (= p const/$sh:not) (assoc :logical-constraint :not, :required? false)))))
 
 (defn build-node-shape
@@ -654,23 +628,12 @@
           (let [p (flake/p flake)
                 o (flake/o flake)]
             (if (#{const/$sh:property const/$sh:not} p)
-              (let [flakes                            (<? (query-range/index-range db :spot = [o]))
-                    {:keys [path] :as property-shape} (condp = p
-                                                        const/$sh:property
-                                                        (build-property-shape flakes)
-                                                        const/$sh:not
-                                                        (build-not-shape flakes))
-
-                    tagged-path (<? (resolve-path-types db path))
-
-                    property-shape* (cond-> (assoc property-shape :path tagged-path)
-                                      (:pattern property-shape) (assoc :pattern (build-pattern property-shape)))
-
-                    property-shape* (<? (build-p-shape db p o))
+              (let [property-shape (<? (build-property-shape db p o))
+                    tagged-path    (:path property-shape)
 
                     p-shape-key (first (first tagged-path))
                     target-key  (first (peek tagged-path))
-                    p-shapes*   (conj p-shapes property-shape*)
+                    p-shapes*   (conj p-shapes property-shape)
                     ;; elevate following conditions to top-level custom keys to optimize validations
                     ;; when processing txs
 
