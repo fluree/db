@@ -195,6 +195,19 @@
 
 (declare build-node-shape)
 (declare validate-shape)
+(defn validate-node-contraint
+  [db {:keys [node] :as _p-shape} p-flakes]
+  (go-try
+    (let [shape (<? (build-node-shape db node))]
+      (loop [[f & r] p-flakes
+             res     []]
+        (if f
+          (let [s-flakes      (<? (query-range/index-range db :spot = [(flake/o f)]))
+                pid->p-flakes (group-by flake/p s-flakes)
+                validation    (<? (validate-shape db shape s-flakes pid->p-flakes))]
+            (recur r (conj res validation)))
+          (coalesce-validation-results res))))))
+
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
@@ -219,11 +232,8 @@
           validation (if (and (first validation) in)
                        (validate-value-properties p-shape p-flakes)
                        validation)
-          validation (if node
-                       (let [shape         (<? (build-node-shape db node))
-                             s-flakes      (<? (query-range/index-range db :spot = [(flake/o (first p-flakes))]))
-                             pid->p-flakes (group-by flake/p s-flakes)]
-                         (coalesce-validation-results (<? (validate-shape db shape s-flakes pid->p-flakes))))
+          validation (if (and (first validation) node)
+                       (<? (validate-node-contraint db p-shape p-flakes))
                        validation)]
       validation)))
 
