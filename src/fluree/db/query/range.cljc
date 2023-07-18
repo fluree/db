@@ -92,11 +92,6 @@
         m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
     (flake/create s p o' dt t op m')))
 
-(defn resolved-leaf?
-  [node]
-  (and (index/leaf? node)
-       (index/resolved? node)))
-
 (defn intersects-range?
   "Returns true if the supplied `node` contains flakes between the `lower` and
   `upper` flakes, according to the `node`'s comparator."
@@ -129,7 +124,8 @@
   (let [flake-xfs (cond-> [(query-filter opts)]
                     flake-xf (conj flake-xf))
         flake-xf* (apply comp flake-xfs)
-        query-xf  (comp (map :flakes)
+        query-xf  (comp (filter index/resolved-leaf?)
+                        (map :flakes)
                         (map (fn [flakes]
                                (flake/subrange flakes
                                                start-test start-flake
@@ -150,7 +146,7 @@
         in-range? (fn [node]
                     (intersects-range? node range-set))
         query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
+    (index/tree-chan resolver root in-range? 1 query-xf error-ch)))
 
 (defn unauthorized?
   [f]
@@ -292,7 +288,7 @@
                                           :end-test    end-test
                                           :end-flake   end-flake})]
      (go-try
-       (let [history-ch (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
+       (let [history-ch (->> (index/tree-chan resolver idx-root in-range? 1 query-xf error-ch)
                              (filter-authorized db start-flake end-flake error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!

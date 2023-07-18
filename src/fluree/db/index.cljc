@@ -54,6 +54,11 @@
     (leaf? node)   (not (nil? (:flakes node)))
     (branch? node) (not (nil? (:children node)))))
 
+(defn resolved-leaf?
+  [node]
+  (and (leaf? node)
+       (resolved? node)))
+
 (defn unresolve
   "Clear the populated child node attributes from the supplied `node` map if it
   represents a branch, or the populated flakes if `node` represents a leaf."
@@ -336,9 +341,9 @@
   is an optional parameter specifying the number of nodes to load concurrently,
   and `xf` is an optional transducer that will transform the output stream if
   supplied."
-  ([r root resolve? include? error-ch]
-   (tree-chan r root resolve? include? 1 identity error-ch))
-  ([r root resolve? include? n xf error-ch]
+  ([r root resolve? error-ch]
+   (tree-chan r root resolve? 1 identity error-ch))
+  ([r root resolve? n xf error-ch]
    (let [out (chan n xf)]
      (go
        (let [root-node (<! (resolve-when r resolve? error-ch root))]
@@ -347,8 +352,7 @@
              (let [stack* (pop stack)]
                (if (or (leaf? node)
                        (expanded? node))
-                 (do (when (include? node)
-                       (>! out (unmark-expanded node)))
+                 (do (>! out (unmark-expanded node))
                      (recur stack*))
                  (let [children (<! (resolve-children-when r resolve? error-ch node))
                        stack**  (-> stack*
