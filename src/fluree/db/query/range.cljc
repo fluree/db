@@ -47,12 +47,12 @@
       :tspo [p2 (coerce-predicate db p3) p4 p1 op m])))
 
 
-(def ^{:private true :const true} subject-min-match [util/max-long])
-(def ^{:private true :const true} subject-max-match [util/min-long])
-(def ^{:private true :const true} pred-min-match [0])
-(def ^{:private true :const true} pred-max-match [flake/MAX-PREDICATE-ID])
-(def ^{:private true :const true} txn-max-match [util/min-long])
-(def ^{:private true :const true} txn-min-match [0])
+(def ^{:private true :const true} subject-min-match [flake/min-s])
+(def ^{:private true :const true} subject-max-match [flake/max-s])
+(def ^{:private true :const true} pred-min-match [flake/min-p])
+(def ^{:private true :const true} pred-max-match [flake/max-p])
+(def ^{:private true :const true} txn-max-match [flake/min-t])
+(def ^{:private true :const true} txn-min-match [flake/max-t])
 
 
 (defn- min-match

@@ -61,6 +61,18 @@
 (def ^:const MIN-PREDICATE-ID (min-subject-id const/$_predicate))
 (def ^:const MAX-PREDICATE-ID (max-subject-id const/$_predicate))
 
+(def ^:const min-s util/max-long)
+(def ^:const max-s util/min-long)
+(def ^:const min-p 0)
+(def ^:const max-p MAX-PREDICATE-ID)
+(def ^:const min-dt util/min-integer)
+(def ^:const max-dt util/max-integer)
+(def ^:const min-t 0)
+(def ^:const max-t util/min-long)
+(def ^:const min-op false)
+(def ^:const max-op true)
+(def ^:const min-meta util/min-integer)
+(def ^:const max-meta util/max-integer)
 
 (defn sid->cid
   "Will return a collection id from a subject-id."
@@ -228,8 +240,7 @@
   [(s flake) (p flake) (o flake) (dt flake) (t flake) (op flake) (m flake)])
 
 (def maximum
-  "The largest flake possible"
-  (->Flake util/max-long 0 util/max-long const/$xsd:decimal 0 true nil))
+  (->Flake max-s max-p max-s max-dt max-t max-op max-meta))
 
 (defn- assoc-flake
   "Assoc for Flakes"
