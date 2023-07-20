@@ -208,11 +208,41 @@
             (recur r (conj res validation)))
           (coalesce-validation-results res))))))
 
+(declare resolve-path-flakes)
+(declare validate-property-constraints)
+(defn validate-qualified-shape-constraints
+  [db {:keys [path qualified-value-shape qualified-min-count qualified-max-count] :as _p-shape} p-flakes]
+  (go-try
+    (let [qualified-shape (<? (build-property-shape db const/$sh:qualifiedValueShape qualified-value-shape))]
+      (loop [[f & r] p-flakes
+             res     []]
+        (if f
+          (let [sid           (flake/o f)
+                s-flakes      (<? (query-range/index-range db :spot = [sid]))
+                pid->p-flakes (group-by flake/p s-flakes)
+                path-flakes   (<? (resolve-path-flakes db sid (:path qualified-shape) pid->p-flakes))
+                validation    (<? (validate-property-constraints qualified-shape path-flakes db))]
+            (recur r (conj res validation)))
+          (let [conforming (-> (group-by first res)
+                               (get true)
+                               (count))]
+            (cond (and qualified-min-count
+                       (< conforming qualified-min-count))
+                  [false (str "path " path " conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times")]
+
+                  (and qualified-max-count
+                       (> conforming qualified-max-count))
+                  [false (str "path " path " conformed to sh:qualifiedValueShape more than sh:qualifiedMaxCount times")]
+
+                  :else
+                  [true])))))))
+
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive min-length max-length pattern in node path] :as p-shape}
+           max-exclusive min-length max-length pattern in node path
+           qualified-value-shape qualified-min-count qualified-max-count] :as p-shape}
    p-flakes
    db]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
@@ -234,6 +264,9 @@
                        validation)
           validation (if (and (first validation) node)
                        (<? (validate-node-contraint db p-shape p-flakes))
+                       validation)
+          validation (if (and qualified-value-shape (or qualified-min-count qualified-max-count))
+                       (<? (validate-qualified-shape-constraints db p-shape p-flakes))
                        validation)]
       validation)))
 
@@ -725,7 +758,6 @@
                        :shapes (into shapes (:shapes shape))))
           shape-maps))
 
-
 (defn class-shapes
   "Takes a list of target classes and returns shapes that must pass validation,
   or nil if none exist."
@@ -745,8 +777,6 @@
                        shape-maps)))
           (when shape-maps
             (merge-shapes shape-maps)))))))
-
-
 
 (defn build-targetobject-shapes
   "Given a pred SID, returns shape"

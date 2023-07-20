@@ -1293,32 +1293,72 @@
           (is (str/includes? (ex-message db-forbidden-friend)  "data type"))))))
 
 (deftest shape-based-constraints
-  (let [conn   @(fluree/connect {:method :memory})
-        ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
-                                                                         {"ex" "http://example.com/"}]})
-        db0    (fluree/db ledger)
+  (testing "sh:node"
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
+                                                                           {"ex" "http://example.com/"}]})
+          db0    (fluree/db ledger)
 
-        db1    @(fluree/stage db0 [{"id" "ex:AddressShape"
-                                    "type" "sh:NodeShape"
-                                    "sh:property" [{"sh:path" {"id" "ex:postalCode"}
-                                                    "sh:maxCount" 1}]}
-                                   {"id" "ex:PersonShape"
-                                    "type" "sh:NodeShape"
-                                    "sh:targetClass" {"id" "ex:Person"}
-                                    "sh:property" [{"sh:path" {"id" "ex:address"}
-                                                    "sh:node" {"id" "ex:AddressShape"}
-                                                    "sh:minCount" 1}]}])
-        valid-person @(fluree/stage db1 [{"id" "ex:Bob"
-                                          "type" "ex:Person"
-                                          "ex:address" {"ex:postalCode" "12345"}}])
-        invalid-person @(fluree/stage db1 [{"id" "ex:Reto"
+          db1    @(fluree/stage db0 [{"id" "ex:AddressShape"
+                                      "type" "sh:NodeShape"
+                                      "sh:property" [{"sh:path" {"id" "ex:postalCode"}
+                                                      "sh:maxCount" 1}]}
+                                     {"id" "ex:PersonShape"
+                                      "type" "sh:NodeShape"
+                                      "sh:targetClass" {"id" "ex:Person"}
+                                      "sh:property" [{"sh:path" {"id" "ex:address"}
+                                                      "sh:node" {"id" "ex:AddressShape"}
+                                                      "sh:minCount" 1}]}])
+          valid-person @(fluree/stage db1 [{"id" "ex:Bob"
                                             "type" "ex:Person"
-                                            "ex:address" {"ex:postalCode" ["12345" "67890"]}}])]
-    (is (= [{"id" "ex:Bob",
-             "rdf:type" ["ex:Person"],
-             "ex:address" {"id" "_:f211106232532997", "ex:postalCode" "12345"}}]
-           @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["*"]}]}
-                                        "where" [["?s" "id" "ex:Bob"]]})))
-    (is (util/exception? invalid-person))
-    (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
-           (ex-message invalid-person)))))
+                                            "ex:address" {"ex:postalCode" "12345"}}])
+          invalid-person @(fluree/stage db1 [{"id" "ex:Reto"
+                                              "type" "ex:Person"
+                                              "ex:address" {"ex:postalCode" ["12345" "45678"]}}])]
+      (is (= [{"id" "ex:Bob",
+               "rdf:type" ["ex:Person"],
+               "ex:address" {"id" "_:f211106232532997", "ex:postalCode" "12345"}}]
+             @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["*"]}]}
+                                          "where" [["?s" "id" "ex:Bob"]]})))
+      (is (util/exception? invalid-person))
+      (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+             (ex-message invalid-person)))))
+  (testing "sh:qualifiedValueShape"
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
+                                                                           {"ex" "http://example.com/"}]})
+          db0    (fluree/db ledger)
+
+          db1    @(fluree/stage db0 [{"id" "ex:KidShape"
+                                      "type" "sh:NodeShape"
+                                      "sh:targetClass" {"id" "ex:Kid"}
+                                      "sh:property" [{"sh:path" {"id" "ex:parent"}
+                                                      "sh:minCount" 2
+                                                      "sh:maxCount" 2
+                                                      "sh:qualifiedValueShape"
+                                                      {"sh:path" {"id" "ex:gender"}
+                                                       ;; "sh:hasValue" "ex:female"
+                                                       "sh:pattern" "ex:female"}
+                                                      "sh:qualifiedMinCount" 1}]}
+                                     {"id" "ex:Bob"
+                                      "ex:gender" "ex:male"}
+                                     {"id" "ex:Jane"
+                                      "ex:gender" "ex:female"}])
+          valid-kid @(fluree/stage db1 [{"id" "ex:ValidKid"
+                                         "type" "ex:Kid"
+                                         "ex:parent" [{"id" "ex:Bob"} {"id" "ex:Jane"}]}])
+          invalid-kid @(fluree/stage db1 [{"id" "ex:InvalidKid"
+                                           "type" "ex:Kid"
+                                           "ex:parent" [{"id" "ex:Bob"}
+                                                        {"id" "ex:Zorba"
+                                                         "ex:gender" "ex:alien"}]}])
+          ]
+      (is (= [{"id" "ex:ValidKid"
+               "rdf:type" ["ex:Kid"]
+               "ex:parent" [{"id" "ex:Bob"}
+                            {"id" "ex:Jane"}]}]
+             @(fluree/query valid-kid {"select" {"?s" ["*"]}
+                                       "where" [["?s" "id" "ex:ValidKid"]]})))
+      (is (util/exception? invalid-kid))
+      (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
+             (ex-message invalid-kid))))))
