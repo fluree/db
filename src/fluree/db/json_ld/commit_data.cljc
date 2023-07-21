@@ -424,7 +424,7 @@
                   children* (reduce-kv
                               (fn [children* k v]
                                 (assoc children* k (assoc v :tt-id tt-id)))
-                              {} children)]
+                              (empty children) children)]
               (assoc db* idx (assoc node :tt-id tt-id
                                          :children children*))))
           db indexes)
