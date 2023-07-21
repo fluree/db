@@ -119,16 +119,12 @@
   map. The result of the transformation will be a stream of collections of
   flakes from the leaf nodes in the input stream, with one flake collection for
   each input leaf."
-  [{:keys [start-flake start-test end-flake end-test flake-xf] :as opts}]
+  [{:keys [flake-xf] :as opts}]
   (let [flake-xfs (cond-> [(query-filter opts)]
                     flake-xf (conj flake-xf))
         flake-xf* (apply comp flake-xfs)
         query-xf  (comp (filter index/resolved-leaf?)
                         (map :flakes)
-                        (map (fn [flakes]
-                               (flake/subrange flakes
-                                               start-test start-flake
-                                               end-test end-flake)))
                         (map (fn [flakes]
                                (into [] flake-xf* flakes))))]
     query-xf))
@@ -140,12 +136,8 @@
   [{:keys [lru-cache-atom] :as conn} root novelty error-ch
    {:keys [from-t to-t start-flake end-flake] :as opts}]
   (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
-        cmp       (:comparator root)
-        range-set (flake/sorted-set-by cmp start-flake end-flake)
-        in-range? (fn [node]
-                    (intersects-range? node range-set))
         query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root in-range? 1 query-xf error-ch)))
+    (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)))
 
 (defn unauthorized?
   [f]
@@ -287,7 +279,8 @@
                                           :end-test    end-test
                                           :end-flake   end-flake})]
      (go-try
-       (let [history-ch (->> (index/tree-chan resolver idx-root in-range? 1 query-xf error-ch)
+       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
+                                              in-range? 1 query-xf error-ch)
                              (filter-authorized db start-flake end-flake error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
