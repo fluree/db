@@ -242,6 +242,9 @@
 (def maximum
   (->Flake max-s max-p max-s max-dt max-t max-op max-meta))
 
+(def minimum
+  (->Flake min-s min-p min-s min-dt min-t min-op min-meta))
+
 (defn- assoc-flake
   "Assoc for Flakes"
   [flake k v]
@@ -505,6 +508,10 @@
   ([ss start-test start-flake end-test end-flake]
    (avl/subrange ss start-test start-flake end-test end-flake)))
 
+
+(defn nearest
+  [ss test f]
+  (avl/nearest ss test f))
 
 (defn split-at
   [n ss]
