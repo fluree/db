@@ -560,6 +560,13 @@
   [ss to-remove]
   (transient-reduce disj! ss to-remove))
 
+(defn revise
+  [ss to-add to-remove]
+  (as-> (transient ss) trans
+    (reduce disj! trans to-remove)
+    (reduce conj! trans to-add)
+    (persistent! trans)))
+
 (defn assoc-all
   [sm entries]
   (transient-reduce (fn [m [k v]]

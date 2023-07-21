@@ -364,11 +364,6 @@
   [flakes]
   (filter ref? flakes))
 
-(defn update-novelty-idx
-  [novelty-idx add remove]
-  (-> (reduce disj novelty-idx remove)
-      (into add)))
-
 (defn update-novelty
   ([db add]
    (update-novelty db add []))
@@ -383,11 +378,11 @@
                        add (+ (flake/size-bytes add))
                        rem (- (flake/size-bytes rem)))]
      (-> db
-         (update-in [:novelty :spot] update-novelty-idx add rem)
-         (update-in [:novelty :psot] update-novelty-idx add rem)
-         (update-in [:novelty :post] update-novelty-idx add rem)
-         (update-in [:novelty :opst] update-novelty-idx ref-add ref-rem)
-         (update-in [:novelty :tspo] update-novelty-idx add rem)
+         (update-in [:novelty :spot] flake/revise add rem)
+         (update-in [:novelty :psot] flake/revise add rem)
+         (update-in [:novelty :post] flake/revise add rem)
+         (update-in [:novelty :opst] flake/revise ref-add ref-rem)
+         (update-in [:novelty :tspo] flake/revise add rem)
          (update-in [:novelty :size] + flake-size)
          (update-in [:stats :size] + flake-size)
          (update-in [:stats :flakes] + flake-count)))))
