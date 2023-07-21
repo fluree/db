@@ -36,16 +36,6 @@
     "Populate the supplied index branch or leaf node maps with either the child
      node attributes or the flakes they store, respectively."))
 
-(defn try-resolve
-  [r error-ch node]
-  (go
-    (try* (<? (resolve r node))
-          (catch* e
-                  (log/error e
-                             "Error resolving index node:"
-                             (select-keys node [:id :ledger-alias]))
-                  (>! error-ch e)))))
-
 (defn resolved?
   "Returns `true` if the data associated with the index node map `node` is fully
   resolved from storage"
@@ -314,20 +304,69 @@
   [node]
   (-> node ::expanded true?))
 
+(defn trim-leaf
+  [leaf start-flake end-flake]
+  (cond
+    (and start-flake end-flake)
+    (update leaf :flakes flake/subrange >= start-flake <= end-flake)
+
+    start-flake
+    (update leaf :flakes flake/subrange >= start-flake)
+
+    end-flake
+    (update leaf :flakes flake/subrange <= end-flake)
+
+    :else
+    leaf))
+
+(defn trim-branch
+  [{:keys [children] :as branch} start-flake end-flake]
+  (let [start-key (some->> start-flake (flake/nearest children <=) key)
+        end-key   (some->> end-flake (flake/nearest children <=) key)]
+    (cond
+      (and start-key end-key)
+      (update branch :children flake/subrange >= start-key <= end-key)
+
+      start-key
+      (update branch :children flake/subrange >= start-key)
+
+      end-key
+      (update branch :children flake/subrange <= end-key)
+
+      :else
+      branch)))
+
+(defn trim-node
+  [node start-flake end-flake]
+  (if (leaf? node)
+    (trim-leaf node start-flake end-flake)
+    (trim-branch node start-flake end-flake)))
+
+(defn try-resolve
+  [r start-flake end-flake error-ch node]
+  (go
+    (try* (let [resolved (<? (resolve r node))]
+            (trim-node resolved start-flake end-flake))
+          (catch* e
+                  (log/error e
+                             "Error resolving index node:"
+                             (select-keys node [:id :ledger-alias]))
+                  (>! error-ch e)))))
+
 (defn resolve-when
-  [r resolve? error-ch node]
+  [r start-flake end-flake resolve? error-ch node]
   (if (resolve? node)
-    (try-resolve r error-ch node)
+    (try-resolve r start-flake end-flake error-ch node)
     (doto (chan)
       (async/put! node))))
 
 (defn resolve-children-when
-  [r resolve? error-ch branch]
+  [r start-flake end-flake resolve? error-ch branch]
   (if (resolved? branch)
     (->> branch
          :children
          (map (fn [[_ child]]
-                (resolve-when r resolve? error-ch child)))
+                (resolve-when r start-flake end-flake resolve? error-ch child)))
          (async/map vector))
     (go [])))
 
@@ -344,9 +383,12 @@
   ([r root resolve? error-ch]
    (tree-chan r root resolve? 1 identity error-ch))
   ([r root resolve? n xf error-ch]
+   (tree-chan r root nil nil resolve? n xf error-ch))
+  ([r root start-flake end-flake resolve? n xf error-ch]
    (let [out (chan n xf)]
      (go
-       (let [root-node (<! (resolve-when r resolve? error-ch root))]
+       (let [root-node (<! (resolve-when r start-flake end-flake
+                                         resolve? error-ch root))]
          (loop [stack [root-node]]
            (when-let [node (peek stack)]
              (let [stack* (pop stack)]
@@ -354,10 +396,14 @@
                        (expanded? node))
                  (do (>! out (unmark-expanded node))
                      (recur stack*))
-                 (let [children (<! (resolve-children-when r resolve? error-ch node))
+                 (let [children (<! (resolve-children-when r start-flake end-flake
+                                                           resolve? error-ch node))
                        stack**  (-> stack*
                                     (conj (mark-expanded node))
-                                    (into (rseq children)))]
+                                    (into (rseq children)))] ; reverse children
+                                                             ; to ensure final
+                                                             ; nodes are in
+                                                             ; depth-first order
                    (recur stack**))))))
          (async/close! out)))
      out)))
