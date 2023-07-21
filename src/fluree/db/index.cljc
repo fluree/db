@@ -305,6 +305,9 @@
   (-> node ::expanded true?))
 
 (defn trim-leaf
+  "Remove flakes from the index leaf node `leaf` that are outside of the interval
+  defined by `start-flake` and `end-flake`. nil values for either `start-flake`
+  or `end-flake` makes that side of the interval unlimited."
   [leaf start-flake end-flake]
   (cond
     (and start-flake end-flake)
@@ -320,6 +323,10 @@
     leaf))
 
 (defn trim-branch
+  "Remove child nodes from the index branch node `branch` that do not contain
+  flakes in the interval defined by `start-flake` and `end-flake`. nil values
+  for either `start-flake` or `end-flake` makes that side of the interval
+  unlimited."
   [{:keys [children] :as branch} start-flake end-flake]
   (let [start-key (some->> start-flake (flake/nearest children <=) key)
         end-key   (some->> end-flake (flake/nearest children <=) key)]
@@ -337,6 +344,10 @@
       branch)))
 
 (defn trim-node
+  "Remove flakes or children from the index leaf or branch node `node` that are
+  outside of the interval defined by `start-flake` and `end-flake`. nil values
+  for either `start-flake` or `end-flake` makes that side of the interval
+  unlimited."
   [node start-flake end-flake]
   (if (leaf? node)
     (trim-leaf node start-flake end-flake)
@@ -375,11 +386,11 @@
   descended from `root` in depth-first order. `resolve?` is a boolean function
   that will be applied to each node to determine whether or not the data
   associated with that node will be resolved from disk using the supplied
-  `Resolver` `r`. `include?` is a boolean function that will be applied to each
-  node to determine if it will be included in the final output node stream, `n`
-  is an optional parameter specifying the number of nodes to load concurrently,
-  and `xf` is an optional transducer that will transform the output stream if
-  supplied."
+  `Resolver` `r`. `start-flake` and `end-flake` are flakes for which only nodes
+  that contain flakes within the interval defined by them will be considered,
+  `n` is an optional parameter specifying the number of nodes to load
+  concurrently, and `xf` is an optional transducer that will transform the
+  output stream if supplied."
   ([r root resolve? error-ch]
    (tree-chan r root resolve? 1 identity error-ch))
   ([r root resolve? n xf error-ch]

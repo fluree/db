@@ -568,6 +568,8 @@
   (transient-reduce disj! ss to-remove))
 
 (defn revise
+  "Changes the composition of the sorted set `ss` by adding all the flakes in the
+  `to-add` collection and removing all flakes in the `to-remove` collection."
   [ss to-add to-remove]
   (as-> (transient ss) trans
     (reduce disj! trans to-remove)
