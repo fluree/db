@@ -1,6 +1,7 @@
 (ns fluree.db.index
   (:refer-clojure :exclude [resolve])
-  (:require [fluree.db.flake :as flake]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
                :cljs [cljs.core.async :refer [chan go <! >!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
@@ -20,6 +21,21 @@
   "The five possible index orderings based on the subject, predicate, object,
   and transaction flake attributes"
   (-> default-comparators keys set))
+
+(defn reference?
+  [dt]
+  (= dt const/$xsd:anyURI))
+
+(defn idx-for
+  [s p o o-dt]
+  (cond
+    s         :spot
+    p         :post
+    o         (if (reference? o-dt)
+                :opst
+                (throw (ex-info (str "Illegal reference object value" (::var o))
+                                {:status 400 :error :db/invalid-query})))
+    :else     :spot))
 
 (defn leaf?
   "Returns `true` if `node` is a map for a leaf node"

@@ -67,7 +67,7 @@
       (is (= @(fluree/query db-subj-delete
                             '{:select ?name
                               :where  [[?s :schema/name ?name]]})
-             ["Jane" "Bob"])
+             ["Bob" "Jane"])
           "Only Jane and Bob should be left in the db.")
 
       (is (= @(fluree/query db-subj-pred-del
@@ -87,7 +87,7 @@
       (is (= @(fluree/query db-age-delete
                             '{:select ?name
                               :where  [[?s :schema/name ?name]]})
-             ["Bob" "Alice"])
+             ["Alice" "Bob"])
           "Only Bob and Alice should be left in the db.")
 
       (testing "Updating property value only if it's current value is a match."

@@ -87,12 +87,12 @@
              (dbproto/-default-context db-update-ctx))))
 
     (testing "Updated context commit db has all data expected"
-      (is (= [{:ex-new/x "foo-2"
-               :ex-new/y "bar-2"
-               :id       :ex-new/foo2}
-              {:ex-new/x "foo-1"
+      (is (= [{:ex-new/x "foo-1"
                :ex-new/y "bar-1"
-               :id       :ex-new/foo}]
+               :id       :ex-new/foo}
+              {:ex-new/x "foo-2"
+               :ex-new/y "bar-2"
+               :id       :ex-new/foo2}]
              @(fluree/query (fluree/db ledger-updated-load)
                             '{:select {?s [:*]}
                               :where  [[?s :ex-new/x nil]]}))))

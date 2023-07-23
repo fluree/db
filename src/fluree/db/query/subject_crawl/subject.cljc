@@ -8,7 +8,6 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.query.exec :refer [drop-offset take-limit]]
-            [fluree.db.query.exec.where :as where]
             [fluree.db.query.subject-crawl.common :refer [where-subj-xf result-af
                                                           resolve-ident-vars filter-subject]]
             [fluree.db.permissions-validate :refer [filter-subject-flakes]]
@@ -26,7 +25,7 @@
                         (get vars variable)))
         p*          (:value p)
         o-dt        (:datatype o)
-        idx*        (where/idx-for nil p* o* o-dt)
+        idx*        (index/idx-for nil p* o* o-dt)
         [fflake lflake] (case idx*
                           :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
                                  (flake/create nil p* o* o-dt nil nil util/max-integer)]

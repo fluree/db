@@ -172,7 +172,7 @@
           "Both users should show, but only SSN for Alice")
 
       ;; Alice can only see her allowed data in a non-graph-crawl query too
-      (is (= [["John" nil] ["Alice" "111-11-1111"]]
+      (is (= [["Alice" "111-11-1111"] ["John" nil]]
              @(fluree/query db+policy {:select '[?name ?ssn]
                                        :where  '[[?p :schema/name ?name]
                                                  {:optional [?p :schema/ssn ?ssn]}]

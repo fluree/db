@@ -343,10 +343,10 @@
       (is (= [[:ex/User]]
              @(fluree/query db '{:select [?class]
                                  :where  [[:ex/jane :rdf/type ?class]]})))
-      (is (= [[:ex/dave :ex/nonUser]
-              [:ex/jane :ex/User]
+      (is (= [[:ex/jane :ex/User]
               [:ex/bob :ex/User]
-              [:ex/alice :ex/User]]
+              [:ex/alice :ex/User]
+              [:ex/dave :ex/nonUser]]
              @(fluree/query db '{:select [?s ?class]
                                  :where  [[?s :rdf/type ?class]]}))))
     (testing "shacl targetClass"

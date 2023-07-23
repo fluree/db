@@ -1,21 +1,22 @@
 (ns fluree.db.query.history
-  (:require
-   [clojure.core.async :as async :refer [go >! <!]]
-   [malli.core :as m]
-   [fluree.json-ld :as json-ld]
-   [fluree.db.constants :as const]
-   [fluree.db.datatype :as datatype]
-   [fluree.db.dbproto :as dbproto]
-   [fluree.db.flake :as flake]
-   [fluree.db.query.json-ld.response :as json-ld-resp]
-   [fluree.db.util.async :refer [<? go-try]]
-   [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-   [fluree.db.util.log :as log]
-   [fluree.db.query.range :as query-range]
-   [fluree.db.db.json-ld :as jld-db]
-   [fluree.db.validation :as v]
-   [malli.error :as me]
-   [malli.transform :as mt]))
+  (:require [clojure.core.async :as async :refer [go >! <!]]
+            [malli.core :as m]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]
+            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.validation :as v]
+            [malli.error :as me]
+            [malli.transform :as mt]
+            [fluree.db.index :as index]))
 
 (def registry
   (merge
@@ -213,20 +214,15 @@
                             {:s parsed-query}
                             parsed-query)
 
-          ids [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
-               (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
-               (when o (jld-db/expand-iri db o context))]
+          [s p o] [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
+                   (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
+                   (when o (jld-db/expand-iri db o context))]
 
-          [s p o] ids
-          [pattern idx] (cond
-                          (not (nil? s))
-                          [ids :spot]
-
-                          (and (nil? s) (not (nil? p)) (nil? o))
-                          [[p s o] :psot]
-
-                          (and (nil? s) (not (nil? p)) (not (nil? o)))
-                          [[p o s] :post])]
+          idx     (index/idx-for s p o nil)
+          pattern (case idx
+                    :spot [s p o]
+                    :post [p o s]
+                    :opst [o p s])]
       [pattern idx])))
 
 (defn commit-wrapper-flake?
