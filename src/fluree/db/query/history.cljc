@@ -15,8 +15,7 @@
             [fluree.db.db.json-ld :as jld-db]
             [fluree.db.validation :as v]
             [malli.error :as me]
-            [malli.transform :as mt]
-            [fluree.db.index :as index]))
+            [malli.transform :as mt]))
 
 (def registry
   (merge
