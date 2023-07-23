@@ -25,7 +25,7 @@
                         (get vars variable)))
         p*          (:value p)
         o-dt        (:datatype o)
-        idx*        (index/idx-for nil p* o* o-dt)
+        idx*        (index/for-components nil p* o* o-dt)
         [fflake lflake] (case idx*
                           :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
                                  (flake/create nil p* o* o-dt nil nil util/max-integer)])

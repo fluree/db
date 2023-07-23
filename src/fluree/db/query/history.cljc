@@ -218,7 +218,7 @@
                    (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
                    (when o (jld-db/expand-iri db o context))]
 
-          idx     (index/idx-for s p o nil)
+          idx     (index/for-components s p o nil)
           pattern (case idx
                     :spot [s p o]
                     :post [p o s]

@@ -55,7 +55,7 @@
                    [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
                                  [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
                                  [(::val o-cmp) (::datatype o-cmp)])
-                   idx         (index/idx-for s* p o* o-dt*)
+                   idx         (index/for-components s* p o* o-dt*)
                    idx-root    (get db idx)
                    novelty     (get-in db [:novelty idx])
                    [o** o-fn*] (augment-object-fn idx s* p o* o-fn)
