@@ -21,8 +21,7 @@
   [s p o o-dt]
   (cond
     s         :spot
-    (and p o) :post
-    p         :psot
+    p         :post
     o         (if (reference? o-dt)
                 :opst
                 (throw (ex-info (str "Illegal reference object value" (::var o))
