@@ -28,14 +28,8 @@
         idx*        (index/idx-for nil p* o* o-dt)
         [fflake lflake] (case idx*
                           :post [(flake/create nil p* o* o-dt nil nil util/min-integer)
-                                 (flake/create nil p* o* o-dt nil nil util/max-integer)]
-                          :psot [(flake/create nil p* nil nil nil nil util/min-integer)
-                                 (flake/create nil p* nil nil nil nil util/max-integer)])
-        filter-fn   (cond
-                      (and o* (= :psot idx*))
-                      #(= o* (flake/o %))
-
-                      (:filter o)
+                                 (flake/create nil p* o* o-dt nil nil util/max-integer)])
+        filter-fn   (when (:filter o)
                       (let [f (filter/extract-combined-filter (:filter o))]
                         #(-> % flake/o f)))
         return-chan (async/chan 10 (comp (map flake/s)
@@ -49,7 +43,6 @@
                                     :start-flake fflake
                                     :end-test    <=
                                     :end-flake   lflake
-                                    ;; if looking for pred + obj, but pred is not indexed, then need to use :psot and filter for 'o' values
                                     :xf          (when filter-fn
                                                    (map (fn [flakes]
                                                           (filter filter-fn flakes))))})

@@ -29,11 +29,10 @@
   :ecount will have string keys converted to keywords. Need to re-convert
   them to integer keys."
   [db-root]
-  (let [{:keys [spot psot post opst tspo ecount]} db-root]
+  (let [{:keys [spot post opst tspo ecount]} db-root]
     (assoc db-root
            :ecount (deserialize-ecount ecount)
            :spot   (deserialize-child-node spot)
-           :psot   (deserialize-child-node psot)
            :post   (deserialize-child-node post)
            :opst   (deserialize-child-node opst)
            :tspo   (deserialize-child-node tspo))))
@@ -82,7 +81,7 @@
         (assoc acc (name k)
                    (case k
                      :stats (util/stringify-keys v)
-                     (:spot :psot :post :opst :tspo) (stringify-child v)
+                     (:spot :post :opst :tspo) (stringify-child v)
                      ;; else
                      v)))
       {} db-root))

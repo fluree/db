@@ -50,7 +50,6 @@
                         :flakes  4240000
                         :size    120000}
               :spot    "fluree:ipfs://spot" ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
-              :psot    "fluree:ipfs://psot"
               :post    "fluree:ipfs://post"
               :opst    "fluree:ipfs://opst"
               :tspo    "fluree:ipfs://tspo"}})
@@ -166,7 +165,7 @@
 
 (defn json-ld->map
   "Turns json-ld commit meta into the clojure map structure."
-  [commit-json-ld {:keys [commit-address spot psot post opst tspo]}]
+  [commit-json-ld {:keys [commit-address spot post opst tspo]}]
   (let [{id          :id,
          address     const/iri-address,
          v           const/iri-v,
@@ -218,7 +217,6 @@
                   :address (get-in index [const/iri-address :value]) ;; address to get to index 'root'
                   :data    (db-object (get index const/iri-data))
                   :spot    spot ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
-                  :psot    psot
                   :post    post
                   :opst    opst
                   :tspo    tspo})
@@ -379,7 +377,6 @@
                        rem (- (flake/size-bytes rem)))]
      (-> db
          (update-in [:novelty :spot] flake/revise add rem)
-         (update-in [:novelty :psot] flake/revise add rem)
          (update-in [:novelty :post] flake/revise add rem)
          (update-in [:novelty :opst] flake/revise ref-add ref-rem)
          (update-in [:novelty :tspo] flake/revise add rem)
@@ -412,7 +409,7 @@
   data as its own entity."
   [db]
   (let [tt-id   (random-uuid)
-        indexes [:spot :psot :post :opst :tspo]]
+        indexes [:spot :post :opst :tspo]]
     (-> (reduce
           (fn [db* idx]
             (let [{:keys [children] :as node} (get db* idx)

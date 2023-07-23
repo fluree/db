@@ -12,7 +12,6 @@
 (def default-comparators
   "Map of default index comparators for the five index types"
   {:spot flake/cmp-flakes-spot
-   :psot flake/cmp-flakes-psot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
    :tspo flake/cmp-flakes-block})

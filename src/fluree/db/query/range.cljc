@@ -40,7 +40,6 @@
   (let [[p1 p2 p3 p4 op m] match]
     (case idx
       :spot [p1 (coerce-predicate db p2) p3 p4 op m]
-      :psot [p2 (coerce-predicate db p1) p3 p4 op m]
       :post [p3 (coerce-predicate db p1) p2 p4 op m]
       :opst [p3 (coerce-predicate db p2) p1 p4 op m]
       :tspo [p2 (coerce-predicate db p3) p4 p1 op m])))
@@ -59,7 +58,6 @@
   [idx]
   (case idx
     :spot subject-min-match
-    :psot pred-min-match
     :post pred-min-match
     :opst subject-min-match
     :tspo txn-min-match))
@@ -70,7 +68,6 @@
   [idx]
   (case idx
     :spot subject-max-match
-    :psot pred-max-match
     :post pred-max-match
     :opst subject-max-match
     :tspo txn-max-match))
