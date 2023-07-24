@@ -21,7 +21,7 @@
   in an object pattern under the `::fn` key (if any) by also checking if a
   prospective flake object is equal to the supplied `o` value if and only if the
   `:spot` index is used, the `p` value is `nil`, and the `s` and `o` values are
-  not `nil`b. In this case, the new object value returned by this function will
+  not `nil`. In this case, the new object value returned by this function will
   be changed to `nil`. This ensures that all necessary flakes are considered
   from the spot index when scanned, and this is necessary because the `p` value
   is `nil`."

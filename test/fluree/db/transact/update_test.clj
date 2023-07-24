@@ -388,3 +388,52 @@
                    Throwable->map
                    :cause))
             "query parse error")))))
+
+(deftest ^:integration subject-object-scan-deletions
+  (let [conn (test-utils/create-conn {:defaults {:context-type :string
+                                                 :context      {"id"     "@id",
+                                                                "type"   "@type",
+                                                                "ex"     "http://example.org/",
+                                                                "f"      "https://ns.flur.ee/ledger#",
+                                                                "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                                                "schema" "http://schema.org/",
+                                                                "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+        love (let [ledger @(fluree/create conn "test/love")]
+               @(fluree/transact! ledger
+                                  [{"@id"                "ex:fluree",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Data"}
+                                   {"@id"                "ex:w3c",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Internet"}
+                                   {"@id"                "ex:mosquitos",
+                                    "@type"              "ex:Monster",
+                                    "schema:description" "We ❤️ Human Blood"}]
+                                  {})
+               ledger)
+        db1  (fluree/db love)]
+    (testing "before deletion"
+      (let [q       '{:select [?s ?p ?o]
+                      :where  [[?s "schema:description" ?o]
+                               [?s ?p ?o]]}
+            subject @(fluree/query db1 q)]
+        (is (= [["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
+                ["ex:w3c" "schema:description" "We ❤️ Internet"]
+                ["ex:fluree" "schema:description" "We ❤️ Data"]]
+               subject)
+            "returns all results")))
+    (testing "after deletion"
+      @(fluree/transact! love
+                         '{:delete [?s ?p ?o]
+                           :where  [[?s "schema:description" ?o]
+                                    [?s ?p ?o]]}
+                         {})
+      (let [db2     (fluree/db love)
+            q       '{:select [?s ?p ?o]
+                      :where  [[?s "schema:description" ?o]
+                               [?s ?p ?o]]}
+            subject @(fluree/query db2 q)]
+        (is (= []
+               subject)
+            "returns no results")))))
