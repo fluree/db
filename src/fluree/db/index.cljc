@@ -359,10 +359,10 @@
     (try* (let [resolved (<? (resolve r node))]
             (trim-node resolved start-flake end-flake))
           (catch* e
-                  (log/error e
-                             "Error resolving index node:"
-                             (select-keys node [:id :ledger-alias]))
-                  (>! error-ch e)))))
+            (log/error e
+                       "Error resolving index node:"
+                       (select-keys node [:id :ledger-alias]))
+            (>! error-ch e)))))
 
 (defn resolve-when
   [r start-flake end-flake resolve? error-ch node]

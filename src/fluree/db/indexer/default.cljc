@@ -402,7 +402,7 @@
         novel?     (fn [node]
                      (or (seq remove-preds)
                          (seq (index/novelty-subrange node t novelty))))]
-    (->> (index/tree-chan conn root novel? 4 refresh-xf error-ch)
+    (->> (index/tree-chan conn root novel? 1 refresh-xf error-ch)
          (write-resolved-nodes db idx changes-ch error-ch))))
 
 (defn extract-root
