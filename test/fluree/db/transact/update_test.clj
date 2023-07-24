@@ -418,9 +418,9 @@
                       :where  [[?s "schema:description" ?o]
                                [?s ?p ?o]]}
             subject @(fluree/query db1 q)]
-        (is (= [["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
-                ["ex:w3c" "schema:description" "We ❤️ Internet"]
-                ["ex:fluree" "schema:description" "We ❤️ Data"]]
+        (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
+                ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
+                ["ex:w3c" "schema:description" "We ❤️ Internet"]]
                subject)
             "returns all results")))
     (testing "after deletion"
