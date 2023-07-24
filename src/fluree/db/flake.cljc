@@ -503,16 +503,18 @@
   "Changes the composition of the sorted set `ss` by adding all the flakes in the
   `to-add` collection and removing all flakes in the `to-remove` collection."
   [ss to-add to-remove]
-  (let [trans (transient ss)]
-    (loop [[f & r] to-remove]
-      (when f
-        (disj! trans f)
-        (recur r)))
-    (loop [[f & r] to-add]
-      (when f
-        (conj! trans f)
-        (recur r)))
-    (persistent! trans)))
+  (let [trans   (transient ss)
+        removed (loop [[f & r] to-remove
+                       t-set   trans]
+                  (if f
+                    (recur r (disj! t-set f))
+                    t-set))
+        added   (loop [[f & r] to-add
+                       t-set   removed]
+                  (if f
+                    (recur r (conj! t-set f))
+                    t-set))]
+    (persistent! added)))
 
 (defn assoc-all
   [sm entries]
