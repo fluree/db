@@ -17,7 +17,7 @@
         str-vec      (if (index/leaf? index)
                        (let [node-count (count (:flakes index))]
                          (swap! count-atom + node-count)
-                         (conj str-vec (str ":" node-count)))
+                         (conj str-vec (str ":" (:t index) "-" node-count)))
                        str-vec)
         first-flake  (:first index)
         main-str     (apply str str-vec)

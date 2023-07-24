@@ -1,9 +1,6 @@
 (ns fluree.db.serde.json
   (:require [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.util.json :as json]
             [fluree.db.flake :as flake]
-            [fluree.db.util.log :as log :include-macros true]
-            [clojure.string :as str]
             [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -79,9 +76,7 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
-  (-serialize-db-root [_ {:keys [t block prevIndex timestamp stats
-                                 ledger-id ecount fork forkBlock
-                                 spot psot post opst tspo] :as db-root}]
+  (-serialize-db-root [_ db-root]
     (reduce-kv
       (fn [acc k v]
         (assoc acc (name k)

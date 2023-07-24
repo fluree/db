@@ -1,7 +1,7 @@
 (ns fluree.db.indexer.default
   (:require [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.index :as index]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [clojure.core.async :as async]
@@ -213,7 +213,7 @@
   (if (overflow-leaf? leaf)
     (let [target-size (/ *overflow-bytes* 2)]
       (log/debug "Rebalancing index leaf:"
-                 (select-keys leaf [:id :network :ledger-id]))
+                 (select-keys leaf [:id :ledger-alias]))
       (loop [[f & r] flakes
              cur-size  0
              cur-first f
@@ -325,7 +325,7 @@
   collection purposes"
   [{:keys [id] :as node}]
   (cond-> node
-          (index/resolved? node) (assoc ::old-id id)))
+    (index/resolved? node) (assoc ::old-id id)))
 
 (defn update-branch-ids
   "When using IPFS, we don't know what the leaf id will be until written, therefore
@@ -345,7 +345,7 @@
   "Writes `node` to storage, and puts any errors onto the `error-ch`"
   [db idx node error-ch updated-ids]
   (let [node         (dissoc node ::old-id)
-        display-node (select-keys node [:id :ledger-id])]
+        display-node (select-keys node [:id :ledger-alias])]
     (async/go
       (try*
         (if (index/leaf? node)
@@ -402,7 +402,7 @@
         novel?     (fn [node]
                      (or (seq remove-preds)
                          (seq (index/novelty-subrange node t novelty))))]
-    (->> (index/tree-chan conn root novel? (constantly true) 1 refresh-xf error-ch)
+    (->> (index/tree-chan conn root novel? 1 refresh-xf error-ch)
          (write-resolved-nodes db idx changes-ch error-ch))))
 
 (defn extract-root
@@ -451,13 +451,12 @@
 
 (defn refresh
   [indexer
-   {:keys [ecount novelty t network ledger-id] :as db}
+   {:keys [ecount novelty t ledger-alias] :as db}
    {:keys [remove-preds changes-ch]}]
   (go-try
     (let [start-time-ms (util/current-time-millis)
           novelty-size  (:size novelty)
-          init-stats    {:network      network
-                         :ledger-id    ledger-id
+          init-stats    {:ledger-alias ledger-alias
                          :t            t
                          :novelty-size novelty-size
                          :start-time   (util/current-time-iso)}]

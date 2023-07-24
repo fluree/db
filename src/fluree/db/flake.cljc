@@ -61,6 +61,18 @@
 (def ^:const MIN-PREDICATE-ID (min-subject-id const/$_predicate))
 (def ^:const MAX-PREDICATE-ID (max-subject-id const/$_predicate))
 
+(def ^:const min-s util/max-long)
+(def ^:const max-s util/min-long)
+(def ^:const min-p 0)
+(def ^:const max-p MAX-PREDICATE-ID)
+(def ^:const min-dt util/min-integer)
+(def ^:const max-dt util/max-integer)
+(def ^:const min-t 0)
+(def ^:const max-t util/min-long)
+(def ^:const min-op false)
+(def ^:const max-op true)
+(def ^:const min-meta util/min-integer)
+(def ^:const max-meta util/max-integer)
 
 (defn sid->cid
   "Will return a collection id from a subject-id."
@@ -228,8 +240,10 @@
   [(s flake) (p flake) (o flake) (dt flake) (t flake) (op flake) (m flake)])
 
 (def maximum
-  "The largest flake possible"
-  (->Flake util/max-long 0 util/max-long const/$xsd:decimal 0 true nil))
+  (->Flake max-s max-p max-s max-dt max-t max-op max-meta))
+
+(def minimum
+  (->Flake min-s min-p min-s min-dt min-t min-op min-meta))
 
 (defn- assoc-flake
   "Assoc for Flakes"
@@ -417,28 +431,6 @@
     (cmp-bool (op f1) (op f2))
     (cmp-meta (m f1) (m f2))))
 
-
-(defn cmp-flakes-history
-  "Note this is not suitable for a set, only a vector/list."
-  [f1 f2]
-  (combine-cmp
-    (cmp-long (t f1) (t f2))
-    #?(:clj  (Boolean/compare (op f2) (op f1))
-       :cljs (compare (op f2) (op f1)))))
-
-
-(defn cmp-history-quick-reverse-sort
-  "Sorts by transaction time in ascending order (newest first), then by
-  the boolean operation descending so assertions (true) come before retractions (false)
-  so that we can 're-play' the log in reverse order to come up with historical states.
-  Suitable only for sorting a vector, not a sorted set."
-  [f1 f2]
-  (combine-cmp
-    (cmp-long (t f1) (t f2))
-    #?(:clj  (Boolean/compare (op f2) (op f1))
-       :cljs (compare (op f2) (op f1)))))
-
-
 (defn flip-flake
   "Takes a flake and returns one with the provided block and op flipped from true/false.
   Don't over-ride no-history, even if no-history for this predicate has changed. New inserts
@@ -448,35 +440,6 @@
   ([flake t]
    (->Flake (s flake) (p flake) (o flake) (dt flake) t (not (op flake)) (m flake))))
 
-(defn slice
-  "From and to are Flakes"
-  [ss from to]
-  (cond
-    (and from to) (avl/subrange ss >= from <= to)
-    (nil? from) (avl/subrange ss <= to)
-    (nil? to) (avl/subrange ss >= from)
-    :else (throw (ex-info "Unexpected error performing slice, both from and to conditions are nil. Please report."
-                          {:status 500
-                           :error  :db/unexpected-error}))))
-
-(defn match-spot
-  "Returns all matching flakes to a specific subject, and optionaly also a predicate if provided
-  Must be provided with subject/predicate integer ids, no lookups are performed."
-  [ss sid pid]
-  (if pid
-    (avl/subrange ss >= (->Flake sid pid nil -1 nil nil nil)
-                  <= (->Flake sid (inc pid) nil util/max-long nil nil nil))
-    (avl/subrange ss > (->Flake (inc sid) MAX-COLL-SUBJECTS nil nil nil nil nil)
-                  < (->Flake (dec sid) -1 nil nil nil nil nil))))
-
-
-(defn match-post
-  "Returns all matching flakes to a predicate + object match."
-  [ss pid o dt]
-  (avl/subrange ss
-                >= (->Flake util/max-long pid o dt nil nil nil)
-                <= (->Flake 0 pid o dt nil nil nil)))
-
 (defn match-tspo
   "Returns all matching flakes to a specific 't' value."
   [ss t]
@@ -484,20 +447,15 @@
                 >= (->Flake util/max-long nil nil nil t nil nil)
                 <= (->Flake util/min-long nil nil nil t nil nil)))
 
-(defn lookup
-  [ss start-flake end-flake]
-  (avl/subrange ss >= start-flake <= end-flake))
-
 (defn subrange
   ([ss test flake]
    (avl/subrange ss test flake))
   ([ss start-test start-flake end-test end-flake]
    (avl/subrange ss start-test start-flake end-test end-flake)))
 
-
-(defn split-at
-  [n ss]
-  (avl/split-at n ss))
+(defn nearest
+  [ss test f]
+  (avl/nearest ss test f))
 
 (defn lower-than-all?
   [f ss]
@@ -510,14 +468,6 @@
   (let [[_ e upper] (avl/split-key f ss)]
     (and (nil? e)
          (empty? upper))))
-
-(defn split-by-flake
-  "Splits a sorted set at a given flake. If there is an exact match for flake,
-  puts it in the left-side. Primarily for use with last-flake."
-  [f ss]
-  (let [[l e r] (avl/split-key f ss)]
-    [(if e (conj l e) l) r]))
-
 
 (defn sorted-set-by
   [comparator & flakes]
@@ -548,6 +498,23 @@
   of AVL-backed sorted sets."
   [ss to-remove]
   (transient-reduce disj! ss to-remove))
+
+(defn revise
+  "Changes the composition of the sorted set `ss` by adding all the flakes in the
+  `to-add` collection and removing all flakes in the `to-remove` collection."
+  [ss to-add to-remove]
+  (let [trans   (transient ss)
+        removed (loop [[f & r] to-remove
+                       t-set   trans]
+                  (if f
+                    (recur r (disj! t-set f))
+                    t-set))
+        added   (loop [[f & r] to-add
+                       t-set   removed]
+                  (if f
+                    (recur r (conj! t-set f))
+                    t-set))]
+    (persistent! added)))
 
 (defn assoc-all
   [sm entries]
@@ -607,22 +574,3 @@
   "Returns approx number of bytes in a collection of flakes."
   [flakes]
   (reduce (fn [size f] (+ size (size-flake f))) 0 flakes))
-
-
-(defn size-kb
-  "Like size-bytes, but kb.
-  Rounds down for simplicity, as bytes is just an estimate anyhow."
-  [flakes]
-  (-> (size-bytes flakes)
-      (/ 1000)
-      (double)
-      (Math/round)))
-
-
-(defn take
-  "Takes n flakes from a sorted flake set, retaining the set itself."
-  [n flake-set]
-  (if (>= n (count flake-set))
-    flake-set
-    (let [k (nth flake-set n)]
-      (first (avl/split-key k flake-set)))))

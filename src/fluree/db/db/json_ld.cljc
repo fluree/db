@@ -313,11 +313,11 @@
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot          (index/empty-branch method alias spot-cmp)
-        psot          (index/empty-branch method alias psot-cmp)
-        post          (index/empty-branch method alias post-cmp)
-        opst          (index/empty-branch method alias opst-cmp)
-        tspo          (index/empty-branch method alias tspo-cmp)
+        spot          (index/empty-branch alias spot-cmp)
+        psot          (index/empty-branch alias psot-cmp)
+        post          (index/empty-branch alias post-cmp)
+        opst          (index/empty-branch alias opst-cmp)
+        tspo          (index/empty-branch alias tspo-cmp)
         stats         {:flakes 0, :size 0, :indexed 0}
         schema        (vocab/base-schema)
         branch        (branch/branch-meta ledger)
@@ -327,7 +327,7 @@
     (map->JsonLdDb {:ledger          ledger
                     :conn            conn
                     :method          method
-                    :alias           alias
+                    :ledger-alias    alias
                     :branch          (:name branch)
                     :commit          (:commit branch)
                     :t               0

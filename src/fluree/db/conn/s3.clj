@@ -12,7 +12,7 @@
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.serde.json :refer [json-serde]]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
@@ -224,7 +224,7 @@
   (resolve [conn {:keys [id leaf tempid] :as node}]
     (let [cache-key [::resolve id tempid]]
       (if (= :empty id)
-        (storage/resolve-empty-leaf node)
+        (storage/resolve-empty-node node)
         (conn-cache/lru-lookup lru-cache-atom cache-key
                                (fn [_]
                                  (storage/resolve-index-node
