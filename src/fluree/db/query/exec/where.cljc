@@ -29,6 +29,30 @@
                                 {:status 400 :error :db/invalid-query})))
     :else     :spot))
 
+(defn augment-object-fn
+  "Returns a pair consisting of an object value and boolean function that will
+  return false when applied to object values whose flake should be filtered out
+  of query results. This function augments the original object function supplied
+  in an object pattern under the `::fn` key (if any) by also checking if a
+  prospective flake object is equal to the supplied `o` value if and only if the
+  `:spot` index is used, the `p` value is `nil`, and the `s` and `o` values are
+  not `nil`. In this case, the new object value returned by this function will
+  be changed to `nil`. This ensures that all necessary flakes are considered
+  from the spot index when scanned, and this is necessary because the `p` value
+  is `nil`."
+  [idx s p o o-fn]
+  (if (and (#{:spot} idx)
+           (nil? p)
+           (and s o))
+    (let [f (if o-fn
+              (fn [obj]
+                (and (#{o} obj)
+                     (o-fn obj)))
+              (fn [obj]
+                (#{o} obj)))]
+      [nil f])
+    [o o-fn]))
+
 (defn resolve-flake-range
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
@@ -49,8 +73,9 @@
                    idx         (idx-for s* p o* o-dt*)
                    idx-root    (get db idx)
                    novelty     (get-in db [:novelty idx])
-                   start-flake (flake/create s* p o* o-dt* nil nil util/min-integer)
-                   end-flake   (flake/create s* p o* o-dt* nil nil util/max-integer)
+                   [o** o-fn*] (augment-object-fn idx s* p o* o-fn)
+                   start-flake (flake/create s* p o** o-dt* nil nil util/min-integer)
+                   end-flake   (flake/create s* p o** o-dt* nil nil util/max-integer)
                    track-fuel  (when fuel-tracker
                                  (fuel/track fuel-tracker))
                    flake-xf*   (->> [flake-xf track-fuel]
@@ -64,9 +89,9 @@
                                         :end-test    <=
                                         :end-flake   end-flake
                                         :flake-xf    flake-xf*}
-                                 s-fn (assoc :subject-fn s-fn)
-                                 p-fn (assoc :predicate-fn p-fn)
-                                 o-fn (assoc :object-fn o-fn))]
+                                 s-fn  (assoc :subject-fn s-fn)
+                                 p-fn  (assoc :predicate-fn p-fn)
+                                 o-fn* (assoc :object-fn o-fn*))]
                (-> (query-range/resolve-flake-slices conn idx-root novelty
                                                      error-ch opts)
                    (->> (query-range/filter-authorized db start-flake end-flake

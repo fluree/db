@@ -222,3 +222,38 @@
                           :schema/name  "Brian"}]}
                subject)
             "returns all results in a map keyed by alias.")))))
+
+(deftest ^:integration subject-object-test
+  (let [conn (test-utils/create-conn {:defaults {:context-type :string
+                                                 :context      {"id"     "@id",
+                                                                "type"   "@type",
+                                                                "ex"     "http://example.org/",
+                                                                "f"      "https://ns.flur.ee/ledger#",
+                                                                "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                                                "schema" "http://schema.org/",
+                                                                "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+        love (let [ledger @(fluree/create conn "test/love")]
+               @(fluree/transact! ledger
+                                  [{"@id"                "ex:fluree",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Data"}
+                                   {"@id"                "ex:w3c",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Internet"}
+                                   {"@id"                "ex:mosquitos",
+                                    "@type"              "ex:Monster",
+                                    "schema:description" "We ❤️ Human Blood"}]
+                                  {})
+               ledger)
+        db   (fluree/db love)]
+    (testing "subject-object scans"
+      (let [q '{:select [?s ?p ?o]
+                :where [[?s "schema:description" ?o]
+                        [?s ?p ?o]]}
+            subject @(fluree/query db q)]
+        (is (= [["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
+                ["ex:w3c" "schema:description" "We ❤️ Internet"]
+                ["ex:fluree" "schema:description" "We ❤️ Data"]]
+               subject)
+            "returns all results")))))
