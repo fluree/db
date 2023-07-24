@@ -67,7 +67,7 @@
       (is (= @(fluree/query db-subj-delete
                             '{:select ?name
                               :where  [[?s :schema/name ?name]]})
-             ["Jane" "Bob"])
+             ["Bob" "Jane"])
           "Only Jane and Bob should be left in the db.")
 
       (is (= @(fluree/query db-subj-pred-del
@@ -87,7 +87,7 @@
       (is (= @(fluree/query db-age-delete
                             '{:select ?name
                               :where  [[?s :schema/name ?name]]})
-             ["Bob" "Alice"])
+             ["Alice" "Bob"])
           "Only Bob and Alice should be left in the db.")
 
       (testing "Updating property value only if it's current value is a match."
@@ -418,9 +418,9 @@
                       :where  [[?s "schema:description" ?o]
                                [?s ?p ?o]]}
             subject @(fluree/query db1 q)]
-        (is (= [["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
-                ["ex:w3c" "schema:description" "We ❤️ Internet"]
-                ["ex:fluree" "schema:description" "We ❤️ Data"]]
+        (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
+                ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
+                ["ex:w3c" "schema:description" "We ❤️ Internet"]]
                subject)
             "returns all results")))
     (testing "after deletion"

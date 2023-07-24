@@ -3,6 +3,7 @@
             [clojure.core.async :as async :refer [>! go]]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
+            [fluree.db.index :as index]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
@@ -12,22 +13,6 @@
   #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn reference?
-  [dt]
-  (= dt const/$xsd:anyURI))
-
-(defn idx-for
-  [s p o o-dt]
-  (cond
-    s         :spot
-    (and p o) :post
-    p         :psot
-    o         (if (reference? o-dt)
-                :opst
-                (throw (ex-info (str "Illegal reference object value" (::var o))
-                                {:status 400 :error :db/invalid-query})))
-    :else     :spot))
 
 (defn augment-object-fn
   "Returns a pair consisting of an object value and boolean function that will
@@ -70,7 +55,7 @@
                    [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
                                  [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
                                  [(::val o-cmp) (::datatype o-cmp)])
-                   idx         (idx-for s* p o* o-dt*)
+                   idx         (index/for-components s* p o* o-dt*)
                    idx-root    (get db idx)
                    novelty     (get-in db [:novelty idx])
                    [o** o-fn*] (augment-object-fn idx s* p o* o-fn)

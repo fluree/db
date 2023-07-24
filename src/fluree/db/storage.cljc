@@ -87,8 +87,8 @@
    (write-db-root db nil))
   ([db custom-ecount]
    (go-try
-     (let [{:keys [conn ledger commit t ecount stats spot psot post opst
-                   tspo fork fork-block]} db
+     (let [{:keys [conn ledger commit t ecount stats spot post opst tspo
+                   fork fork-block]} db
            t'          (- t)
            ledger-alias   (:id commit)
            data        {:ledger-alias ledger-alias
@@ -96,7 +96,6 @@
                         :ecount    (or custom-ecount ecount)
                         :stats     (select-keys stats [:flakes :size])
                         :spot      (child-data spot)
-                        :psot      (child-data psot)
                         :post      (child-data post)
                         :opst      (child-data opst)
                         :tspo      (child-data tspo)

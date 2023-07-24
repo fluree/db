@@ -1,6 +1,7 @@
 (ns fluree.db.index
   (:refer-clojure :exclude [resolve])
-  (:require [fluree.db.flake :as flake]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
                :cljs [cljs.core.async :refer [chan go <! >!] :as async])
             [fluree.db.util.async :refer [<? go-try]]
@@ -11,15 +12,32 @@
 (def default-comparators
   "Map of default index comparators for the five index types"
   {:spot flake/cmp-flakes-spot
-   :psot flake/cmp-flakes-psot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
    :tspo flake/cmp-flakes-block})
 
 (def types
-  "The five possible index orderings based on the subject, predicate, object,
+  "The four possible index orderings based on the subject, predicate, object,
   and transaction flake attributes"
   (-> default-comparators keys set))
+
+(defn reference?
+  [dt]
+  (= dt const/$xsd:anyURI))
+
+(defn for-components
+  "Returns the index that should be used to scan for flakes that match the
+  supplied flake components `s` `p` `o` and `o-dt` given when of these supplied
+  components are non-nil."
+  [s p o o-dt]
+  (cond
+    s     :spot
+    p     :post
+    o     (if (reference? o-dt)
+            :opst
+            (throw (ex-info (str "Illegal reference object value" (::var o))
+                            {:status 400 :error :db/invalid-query})))
+    :else :spot))
 
 (defn leaf?
   "Returns `true` if `node` is a map for a leaf node"

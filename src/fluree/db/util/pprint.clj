@@ -71,14 +71,10 @@
 
 
 (defn pprint-db
-  [{:keys [conn spot psot post opst tspo]}]
+  [{:keys [conn spot post opst tspo]}]
   (println "spot:")
   (println "-----------")
   (pprint-index conn spot)
-  (println "")
-  (println "psot:")
-  (println "-----------")
-  (pprint-index conn psot)
   (println "")
   (println "post:")
   (println "-----------")

@@ -44,7 +44,7 @@
               "returns grouped results"))
 
         (testing "with having clauses"
-          (is (= [["Liam" [11 42]] ["Cam" [5 10]] ["Alice" [9 42 76]]]
+          (is (= [["Alice" [9 42 76]] ["Cam" [5 10]] ["Liam" [11 42]]]
                  @(fluree/query db '{:select   [?name ?favNums]
                                      :where    [[?s :schema/name ?name]
                                                 [?s :ex/favNums ?favNums]]
@@ -52,7 +52,7 @@
                                      :having   (>= (count ?favNums) 2)}))
               "filters results according to the supplied having function code")
 
-          (is (= [["Liam" [11 42]] ["Alice" [9 42 76]]]
+          (is (= [["Alice" [9 42 76]] ["Liam" [11 42]]]
                  @(fluree/query db '{:select   [?name ?favNums]
                                      :where    [[?s :schema/name ?name]
                                                 [?s :ex/favNums ?favNums]]
@@ -252,8 +252,8 @@
                 :where [[?s "schema:description" ?o]
                         [?s ?p ?o]]}
             subject @(fluree/query db q)]
-        (is (= [["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
-                ["ex:w3c" "schema:description" "We ❤️ Internet"]
-                ["ex:fluree" "schema:description" "We ❤️ Data"]]
+        (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
+                ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
+                ["ex:w3c" "schema:description" "We ❤️ Internet"]]
                subject)
             "returns all results")))))
