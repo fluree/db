@@ -1335,15 +1335,14 @@
                                       "sh:property" [{"sh:path" {"id" "ex:parent"}
                                                       "sh:minCount" 2
                                                       "sh:maxCount" 2
-                                                      "sh:qualifiedValueShape"
-                                                      {"sh:path" {"id" "ex:gender"}
-                                                       ;; "sh:hasValue" "ex:female"
-                                                       "sh:pattern" "ex:female"}
+                                                      "sh:qualifiedValueShape" {"sh:path" {"id" "ex:gender"}
+                                                                                ;; "sh:hasValue" "ex:female"
+                                                                                "sh:pattern" "female"}
                                                       "sh:qualifiedMinCount" 1}]}
                                      {"id" "ex:Bob"
-                                      "ex:gender" "ex:male"}
+                                      "ex:gender" "male"}
                                      {"id" "ex:Jane"
-                                      "ex:gender" "ex:female"}])
+                                      "ex:gender" "female"}])
           valid-kid @(fluree/stage db1 [{"id" "ex:ValidKid"
                                          "type" "ex:Kid"
                                          "ex:parent" [{"id" "ex:Bob"} {"id" "ex:Jane"}]}])
@@ -1351,8 +1350,7 @@
                                            "type" "ex:Kid"
                                            "ex:parent" [{"id" "ex:Bob"}
                                                         {"id" "ex:Zorba"
-                                                         "ex:gender" "ex:alien"}]}])
-          ]
+                                                         "ex:gender" "alien"}]}])]
       (is (= [{"id" "ex:ValidKid"
                "rdf:type" ["ex:Kid"]
                "ex:parent" [{"id" "ex:Bob"}
@@ -1361,4 +1359,57 @@
                                        "where" [["?s" "id" "ex:ValidKid"]]})))
       (is (util/exception? invalid-kid))
       (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
-             (ex-message invalid-kid))))))
+             (ex-message invalid-kid)))))
+  (testing "sh:qualifiedValueShapesDisjoint"
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
+                                                                           {"ex" "http://example.com/"}]})
+          db0    (fluree/db ledger)
+
+          db1    @(fluree/stage db0 [{"id" "ex:Digit"
+                                      "ex:name" "Toe"}
+                                     {"id" "ex:HandShape"
+                                      "type" "sh:NodeShape"
+                                      "sh:targetClass" {"id" "ex:Hand"}
+                                      "sh:property" [{"sh:path" {"id" "ex:digit"}
+                                                      "sh:maxCount" 5}
+                                                     {"sh:path" {"id" "ex:digit"}
+                                                      "sh:qualifiedValueShape" {"sh:path" {"id" "ex:name"}
+                                                                                "sh:pattern" "Thumb"}
+                                                      "sh:qualifiedMinCount" 1
+                                                      "sh:qualifiedMaxCount" 1
+                                                      "sh:qualifiedValueShapesDisjoint" true}
+                                                     {"sh:path" {"id" "ex:digit"}
+                                                      "sh:qualifiedValueShape" {"sh:path" {"id" "ex:name"}
+                                                                                "sh:pattern" "Finger"}
+                                                      "sh:qualifiedMinCount" 4
+                                                      "sh:qualifiedMaxCount" 4
+                                                      "sh:qualifiedValueShapesDisjoint" true}]}])
+
+          valid-hand @(fluree/stage db1 [{"id" "ex:ValidHand"
+                                          "type" "ex:Hand"
+                                          "ex:digit" [{"ex:name" "Thumb"}
+                                                      {"ex:name" "Finger"}
+                                                      {"ex:name" "Finger"}
+                                                      {"ex:name" "Finger"}
+                                                      {"ex:name" "Finger"}]}])
+          invalid-hand @(fluree/stage db1 [{"id" "ex:ValidHand"
+                                            "type" "ex:Hand"
+                                            "ex:digit" [{"ex:name" "Thumb"}
+                                                        {"ex:name" "Finger"}
+                                                        {"ex:name" "Finger"}
+                                                        {"ex:name" "Finger"}
+                                                        {"ex:name" ["Finger" "Thumb"]}]}])]
+      (is (= [{"id" "ex:ValidHand",
+               "rdf:type" ["ex:Hand"],
+               "ex:digit"
+               [{"ex:name" "Thumb"}
+                {"ex:name" "Finger"}
+                {"ex:name" "Finger"}
+                {"ex:name" "Finger"}
+                {"ex:name" "Finger"}]}]
+             @(fluree/query valid-hand {"select" {"?s" ["*" {"ex:digit" ["ex:name"]}]}
+                                       "where" [["?s" "id" "ex:ValidHand"]]})))
+      (is (util/exception? invalid-hand))
+      (is (= "SHACL PropertyShape exception - path [[1003 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
+             (ex-message invalid-hand))))))

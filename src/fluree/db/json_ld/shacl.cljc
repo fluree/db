@@ -208,41 +208,11 @@
             (recur r (conj res validation)))
           (coalesce-validation-results res))))))
 
-(declare resolve-path-flakes)
-(declare validate-property-constraints)
-(defn validate-qualified-shape-constraints
-  [db {:keys [path qualified-value-shape qualified-min-count qualified-max-count] :as _p-shape} p-flakes]
-  (go-try
-    (let [qualified-shape (<? (build-property-shape db const/$sh:qualifiedValueShape qualified-value-shape))]
-      (loop [[f & r] p-flakes
-             res     []]
-        (if f
-          (let [sid           (flake/o f)
-                s-flakes      (<? (query-range/index-range db :spot = [sid]))
-                pid->p-flakes (group-by flake/p s-flakes)
-                path-flakes   (<? (resolve-path-flakes db sid (:path qualified-shape) pid->p-flakes))
-                validation    (<? (validate-property-constraints qualified-shape path-flakes db))]
-            (recur r (conj res validation)))
-          (let [conforming (-> (group-by first res)
-                               (get true)
-                               (count))]
-            (cond (and qualified-min-count
-                       (< conforming qualified-min-count))
-                  [false (str "path " path " conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times")]
-
-                  (and qualified-max-count
-                       (> conforming qualified-max-count))
-                  [false (str "path " path " conformed to sh:qualifiedValueShape more than sh:qualifiedMaxCount times")]
-
-                  :else
-                  [true])))))))
-
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive min-length max-length pattern in node path
-           qualified-value-shape qualified-min-count qualified-max-count] :as p-shape}
+           max-exclusive min-length max-length pattern in node path] :as p-shape}
    p-flakes
    db]
   ;; TODO: Refactor this to thread a value through via e.g. cond->
@@ -264,9 +234,6 @@
                        validation)
           validation (if (and (first validation) node)
                        (<? (validate-node-contraint db p-shape p-flakes))
-                       validation)
-          validation (if (and qualified-value-shape (or qualified-min-count qualified-max-count))
-                       (<? (validate-qualified-shape-constraints db p-shape p-flakes))
                        validation)]
       validation)))
 
@@ -356,13 +323,74 @@
            (recur r path-flakes*))
          path-flakes)))))
 
+(declare build-property-shape)
+(defn validate-qualified-shape-constraints
+  "Takes a property shape with a qualifiedValueShape constraint, builds the shape,
+  validates it, and returns the shape with all conforming sids."
+  [db {:keys [path qualified-value-shape qualified-min-count qualified-max-count qualified-value-shapes-disjoint] :as p-shape}
+   p-flakes]
+  (go-try
+    (let [qualified-shape (<? (build-property-shape db const/$sh:qualifiedValueShape qualified-value-shape))]
+      (loop [[f & r] p-flakes
+             conforming    #{}]
+        (if f
+          (let [sid           (flake/o f)
+                s-flakes      (<? (query-range/index-range db :spot = [sid]))
+                pid->p-flakes (group-by flake/p s-flakes)
+                path-flakes   (<? (resolve-path-flakes db sid (:path qualified-shape) pid->p-flakes))
+                [valid? :as res] (<? (validate-property-constraints qualified-shape path-flakes db))]
+            (recur r (if valid?
+                       (conj conforming sid)
+                       conforming)))
+          (assoc p-shape :conforming conforming))))))
+
+(defn validate-qualified-cardinality-constraints
+  [{:keys [path conforming qualified-min-count qualified-max-count]}]
+  (let [conforming-count (count conforming)]
+    (cond (and qualified-min-count (< conforming-count qualified-min-count))
+          [false (str "path " path " conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times")]
+
+          (and qualified-max-count (> conforming-count qualified-max-count))
+          [false (str "path " path " conformed to sh:qualifiedValueShape more than sh:qualifiedMaxCount times")]
+
+          :else
+          [true nil])))
+
+(defn remove-disjoint-conformers
+  "Remove any conforming :disjoint sids from disjoint from supplied sibling q-shape."
+  [disjoint-shape q-shape]
+  (if (= q-shape disjoint-shape)
+    q-shape
+    (update q-shape :conforming set/difference (:conforming disjoint-shape))))
+
+(defn validate-q-shapes
+  [db q-shapes sid pid->p-flakes]
+  (go-try
+    (loop [[{:keys [path] :as p-shape} & r] q-shapes
+           conforming-q-shapes []]
+      (if p-shape
+        (let [path-flakes (<? (resolve-path-flakes db sid path pid->p-flakes))
+              conforming  (<? (validate-qualified-shape-constraints db p-shape path-flakes))]
+          (recur r (conj conforming-q-shapes conforming)))
+
+        (loop [[disjoint-shape & r] (filter :qualified-value-shapes-disjoint conforming-q-shapes)
+               results conforming-q-shapes]
+          (if disjoint-shape
+            ;; remove any conforming :disjoint sids from all the other conforming sibling shapes
+            (recur r (map (partial remove-disjoint-conformers disjoint-shape) conforming-q-shapes))
+            ;; finally, validate the qualified cardinality constraints
+            (->> results
+                 (map validate-qualified-cardinality-constraints)
+                 (coalesce-validation-results))))))))
+
 (defn validate-shape
   "Check to see if each property shape is valid, then check node shape constraints."
   [db {:keys [property closed? ignored-properties] :as shape} s-flakes pid->p-flakes]
   (log/debug "validate-shape" shape)
   (go-try
     (let [sid (flake/s (first s-flakes))]
-      (loop [[{:keys [path rhs-property] :as p-shape} & r] property
+      (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
+             q-shapes []
              validated-properties #{}
              results []]
         (if p-shape
@@ -375,11 +403,19 @@
                         (validate-pair-constraints p-shape path-flakes rhs-flakes))
                       (<? (validate-property-constraints p-shape path-flakes db)))]
 
-            (recur r (conj validated-properties pid) (conj results res)))
-          ;; check node shape
-          (let [[valid? err-msg :as res] (coalesce-validation-results results)
+            (recur r
+                   (if qualified-value-shape ; build up collection of q-shapes for further processing
+                     (conj q-shapes p-shape)
+                     q-shapes)
+                   (conj validated-properties pid)
+                   (conj results res)))
+
+          (let [ ;; check qualifed shape constraints
+                results* (conj results (<? (validate-q-shapes db q-shapes sid pid->p-flakes)))
+                [valid? err-msg :as res] (coalesce-validation-results results*)
                 unvalidated-properties (->> (keys pid->p-flakes)
                                             (remove (set/union ignored-properties validated-properties)))]
+            ;; check node shape
             (when (not valid?)
               (throw-property-shape-exception! err-msg))
             (when (and closed? (not-empty unvalidated-properties))
