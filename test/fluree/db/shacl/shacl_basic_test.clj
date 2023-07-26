@@ -1393,7 +1393,7 @@
                                                       {"ex:name" "Finger"}
                                                       {"ex:name" "Finger"}
                                                       {"ex:name" "Finger"}]}])
-          invalid-hand @(fluree/stage db1 [{"id" "ex:ValidHand"
+          invalid-hand @(fluree/stage db1 [{"id" "ex:InvalidHand"
                                             "type" "ex:Hand"
                                             "ex:digit" [{"ex:name" "Thumb"}
                                                         {"ex:name" "Finger"}

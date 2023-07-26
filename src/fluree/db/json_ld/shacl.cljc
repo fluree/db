@@ -354,7 +354,8 @@
           [false (str "path " path " conformed to sh:qualifiedValueShape more than sh:qualifiedMaxCount times")]
 
           :else
-          [true nil])))
+          [true (str "sh:not conformed to sh:qualifiedValueShape between sh:qualifiedMinCount " qualified-min-count
+                     " and sh:qualifiedMaxCount" qualified-max-count " times")])))
 
 (defn remove-disjoint-conformers
   "Remove any conforming :disjoint sids from disjoint from supplied sibling q-shape."
