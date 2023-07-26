@@ -195,7 +195,7 @@
 
 (declare build-node-shape)
 (declare validate-shape)
-(defn validate-node-contraint
+(defn validate-node-constraint
   [db {:keys [node] :as _p-shape} p-flakes]
   (go-try
     (let [shape (<? (build-node-shape db node))]
@@ -233,7 +233,7 @@
                        (validate-value-properties p-shape p-flakes)
                        validation)
           validation (if (and (first validation) node)
-                       (<? (validate-node-contraint db p-shape p-flakes))
+                       (<? (validate-node-constraint db p-shape p-flakes))
                        validation)]
       validation)))
 
