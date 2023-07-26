@@ -1036,6 +1036,7 @@
                                       "sh:minCount" 1
                                       "sh:maxCount" 1
                                       "sh:datatype" {"@id" "xsd:string"}}]}])
+        ;; valid inline type
         db2    @(fluree/stage db1 {"@id"                           "https://example.com/Actor/65731"
                                    "https://example.com/country"   {"@id"                      "https://example.com/Country/AU"
                                                                     "@type"                    "https://example.com/Country"
@@ -1046,7 +1047,17 @@
                                                                     {"@id" "https://example.com/Movie/534"}]
                                    "@type"                         "https://example.com/Actor"
                                    "https://example.com/name"      "Sam Worthington"})
-        db3    @(fluree/stage db1 {"@id"                         "https://example.com/Actor/1001"
+        ;; valid node ref
+        db3    @(fluree/stage db1 [{"@id"                      "https://example.com/Country/US"
+                                    "@type"                    "https://example.com/Country"
+                                    "https://example.com/name" "United States of America"}
+                                   {"@id"                         "https://example.com/Actor/4242"
+                                    "https://example.com/country" {"@id" "https://example.com/Country/US"}
+                                    "https://example.com/gender"  "Female"
+                                    "@type"                       "https://example.com/Actor"
+                                    "https://example.com/name"    "Rindsey Rohan"}])
+        ;; invalid type
+        db4    @(fluree/stage db1 {"@id"                         "https://example.com/Actor/1001"
                                    "https://example.com/country" {"@id"                      "https://example.com/Country/Absurdistan"
                                                                   "@type"                    "https://example.com/FakeCountry"
                                                                   "https://example.com/name" "Absurdistan"}
@@ -1054,8 +1065,9 @@
                                    "@type"                       "https://example.com/Actor"
                                    "https://example.com/name"    "Not Real"})]
     (is (not (util/exception? db2)))
-    (is (util/exception? db3))
-    (is (str/includes? (ex-message db3) "Node did not pass"))))
+    (is (not (util/exception? db3)))
+    (is (util/exception? db4))
+    (is (str/includes? (ex-message db4) "Node did not pass"))))
 
 (deftest shacl-in-test
   (testing "value nodes"
