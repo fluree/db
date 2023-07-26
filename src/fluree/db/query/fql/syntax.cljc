@@ -28,13 +28,6 @@
   [x]
   (boolean (#{'desc "desc" :desc} x)))
 
-(defn decode-multi-query-opts
-  [mq]
-  (if (and (map? mq) (contains? mq "opts"))
-    (let [opts (get mq "opts")]
-      (-> mq (assoc :opts opts) (dissoc "opts")))
-    mq))
-
 (defn one-select-key-present?
   [q]
   (log/trace "one-select-key-present? q:" q)
@@ -165,9 +158,6 @@
     ::context         ::v/context
     ::json-ld-keyword ::v/json-ld-keyword
     ::query           (query-schema [])
-    ::multi-query     [:map {:decode/json decode-multi-query-opts}
-                       [:opts {:optional true} ::opts]
-                       [::m/default [:map-of [:or :string :keyword] ::query]]]
     ::modification    ::v/modification-txn}))
 
 (def triple-validator
@@ -179,9 +169,6 @@
 
 (def coerce-query*
   (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
-
-(def multi-query?
-  (m/validator ::multi-query {:registry registry}))
 
 (defn humanize-error
   [error]

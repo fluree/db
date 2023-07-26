@@ -174,24 +174,6 @@
        (is (= []
               @(fluree/query db2 (async/<!! (cred/generate query (:private other-auth)))))
            "query credential w/ no roles")
-
-       (is (= {"nums" [2 3 4 5 6],
-               "root" [{"id"      (:id auth)
-                        "name"    "D",
-                        "favnums" [2 3 4 5 6]
-                        "f:role"  {"id" "role:cool"}}]}
-              @(fluree/multi-query db2
-                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
-                                                              "root" query}
-                                                             (:private auth)))))
-           "multiquery credential - allowing access")
-       (is (= {"nums" [],
-               "root" []}
-              @(fluree/multi-query db2
-                                   (async/<!! (cred/generate {"nums" {"select" "?nums" "where" [["?s" "favnums" "?nums"]]}
-                                                              "root" query}
-                                                             (:private pleb-auth)))))
-           "multiquery credential - forbidding access")
        (is (= [{"f:t"       2,
                 "f:assert"  [{"id" (:id auth) "name" "Daniel", "favnums" [1 2 3], :id (:id auth) "f:role" {"id" "role:cool"}}],
                 "f:retract" []}
