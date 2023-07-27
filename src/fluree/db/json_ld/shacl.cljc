@@ -410,9 +410,17 @@
                  (map validate-qualified-cardinality-constraints)
                  (coalesce-validation-results))))))))
 
+(defn validate-closed-constraint
+  [{:keys [closed? ignored-properties] :as _shape} pid->p-flakes validated-properties]
+  (let [unvalidated-properties (->> (keys pid->p-flakes)
+                                    (remove (set/union ignored-properties validated-properties)))]
+    (if (and closed? (not-empty unvalidated-properties))
+      [false (str "SHACL shape is closed, extra properties not allowed: " (into [] unvalidated-properties))]
+      [true])))
+
 (defn validate-shape
   "Check to see if each property shape is valid, then check node shape constraints."
-  [db {:keys [property closed? ignored-properties] :as shape} s-flakes pid->p-flakes]
+  [db {:keys [property] :as shape} s-flakes pid->p-flakes]
   (log/debug "validate-shape" shape)
   (go-try
     (let [sid (flake/s (first s-flakes))]
@@ -437,18 +445,11 @@
                    (conj validated-properties pid)
                    (conj results res)))
 
-          (let [;; check qualifed shape constraints
-                results*               (conj results (<? (validate-q-shapes db q-shapes sid pid->p-flakes)))
-                [valid? err-msg :as res] (coalesce-validation-results results*)
-                unvalidated-properties (->> (keys pid->p-flakes)
-                                            (remove (set/union ignored-properties validated-properties)))]
-            ;; check node shape
-            (when (not valid?)
-              (throw-property-shape-exception! err-msg))
-            (when (and closed? (not-empty unvalidated-properties))
-              (throw (ex-info (str "SHACL shape is closed, extra properties not allowed: " (vec unvalidated-properties))
-                              {:status 400 :error :db/shacl-validation})))
-            [res]))))))
+          (let [ ;; check qualifed shape constraints
+                q-results (<? (validate-q-shapes db q-shapes sid pid->p-flakes))
+                ;; check node shape
+                closed-results (validate-closed-constraint shape pid->p-flakes validated-properties)]
+            (coalesce-validation-results (conj results q-results closed-results))))))))
 
 (defn validate-target
   "Validate the data graph (s-flakes) with the provided shapes."
@@ -456,7 +457,10 @@
   (go-try
     (let [pid->p-flakes (group-by flake/p s-flakes)]
       (doseq [shape shapes]
-        (<? (validate-shape db shape s-flakes pid->p-flakes))))))
+        (let [[valid? err-msg] (<? (validate-shape db shape s-flakes pid->p-flakes))]
+          (when (not valid?)
+            (throw (ex-info err-msg
+                            {:status 400 :error :db/shacl-validation}))))))))
 
 (defn build-property-base-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
