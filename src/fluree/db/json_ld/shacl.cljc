@@ -13,20 +13,20 @@
   #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
-  ;; a raw SHACL shape looks something like this:
-  {:id             :ex/UserShape,
-   :rdf/type       [:sh/NodeShape],
-   :sh/targetClass {:id :ex/User},
-   :sh/property    [{:id          "_:f211106232533000",
-                     :sh/path     {:id :schema/name},
-                     :sh/minCount 1,
-                     :sh/maxCount 1,
-                     :sh/datatype {:id :xsd/string}}
-                    {:id          "_:f211106232533002",
-                     :sh/path     {:id :schema/email},
-                     :sh/minCount 1,
-                     :sh/maxCount 1,
-                     :sh/nodeKind {:id :sh/IRI}}]})
+ ;; a raw SHACL shape looks something like this:
+ {:id             :ex/UserShape,
+  :rdf/type       [:sh/NodeShape],
+  :sh/targetClass {:id :ex/User},
+  :sh/property    [{:id          "_:f211106232533000",
+                    :sh/path     {:id :schema/name},
+                    :sh/minCount 1,
+                    :sh/maxCount 1,
+                    :sh/datatype {:id :xsd/string}}
+                   {:id          "_:f211106232533002",
+                    :sh/path     {:id :schema/email},
+                    :sh/minCount 1,
+                    :sh/maxCount 1,
+                    :sh/nodeKind {:id :sh/IRI}}]})
 
 
 
@@ -114,12 +114,12 @@
   before performing validation."
   [{:keys [min-length max-length pattern flags logical-constraint] :as _p-shape} p-flakes]
   (let [results (for [flake p-flakes
-                      :let  [[val dt] (flake-value flake)
-                             ref?     (and (number? val)
-                                           (= const/$xsd:anyURI dt))
-                             str-val  (if (string? val)
-                                        val
-                                        (str val))]]
+                      :let [[val dt] (flake-value flake)
+                            ref?    (and (number? val)
+                                         (= const/$xsd:anyURI dt))
+                            str-val (if (string? val)
+                                      val
+                                      (str val))]]
                   (let [str-length        (count str-val)
                         min-length-result (if (and min-length (or ref? (> min-length str-length)))
                                             [false (str "sh:minLength: value " str-val
@@ -200,7 +200,7 @@
   (go-try
     (let [shape (<? (build-node-shape db node))]
       (loop [[f & r] p-flakes
-             res     []]
+             res []]
         (if f
           (let [s-flakes      (<? (query-range/index-range db :spot = [(flake/o f)]))
                 pid->p-flakes (group-by flake/p s-flakes)
@@ -274,7 +274,7 @@
 
     (:lessThan :lessThanOrEquals)
     (let [allowed-cmp-results (cond-> #{-1}
-                                      (= pair-constraint :lessThanOrEquals) (conj 0))
+                                (= pair-constraint :lessThanOrEquals) (conj 0))
           valid-cmp-types     (into numeric-types time-types)
           results             (for [l-flake lhs-flakes
                                     r-flake rhs-flakes
@@ -332,7 +332,7 @@
   (go-try
     (let [qualified-shape (<? (build-property-shape db const/$sh:qualifiedValueShape qualified-value-shape))]
       (loop [[f & r] p-flakes
-             conforming    #{}]
+             conforming #{}]
         (if f
           (let [sid           (flake/o f)
                 s-flakes      (<? (query-range/index-range db :spot = [sid]))
@@ -391,18 +391,18 @@
   (go-try
     (let [sid (flake/s (first s-flakes))]
       (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
-             q-shapes []
+             q-shapes             []
              validated-properties #{}
-             results []]
+             results              []]
         (if p-shape
           ;; check property shape
           (let [path-flakes (<? (resolve-path-flakes db sid path pid->p-flakes))
 
-                pid (when (first path-flakes) (flake/p (first path-flakes)))
-                res (if rhs-property
-                      (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
-                        (validate-pair-constraints p-shape path-flakes rhs-flakes))
-                      (<? (validate-property-constraints p-shape path-flakes db)))]
+                pid         (when (first path-flakes) (flake/p (first path-flakes)))
+                res         (if rhs-property
+                              (let [rhs-flakes (filter #(= rhs-property (flake/p %)) s-flakes)]
+                                (validate-pair-constraints p-shape path-flakes rhs-flakes))
+                              (<? (validate-property-constraints p-shape path-flakes db)))]
 
             (recur r
                    (if qualified-value-shape ; build up collection of q-shapes for further processing
@@ -411,8 +411,8 @@
                    (conj validated-properties pid)
                    (conj results res)))
 
-          (let [ ;; check qualifed shape constraints
-                results* (conj results (<? (validate-q-shapes db q-shapes sid pid->p-flakes)))
+          (let [;; check qualifed shape constraints
+                results*               (conj results (<? (validate-q-shapes db q-shapes sid pid->p-flakes)))
                 [valid? err-msg :as res] (coalesce-validation-results results*)
                 unvalidated-properties (->> (keys pid->p-flakes)
                                             (remove (set/union ignored-properties validated-properties)))]
@@ -436,100 +436,100 @@
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
   [property-flakes]
   (reduce
-    (fn [acc property-flake]
-      (let [o (flake/o property-flake)]
-        (condp = (flake/p property-flake)
-          const/$sh:path
-          (update acc :path (fnil conj []) o)
+   (fn [acc property-flake]
+     (let [o (flake/o property-flake)]
+       (condp = (flake/p property-flake)
+         const/$sh:path
+         (update acc :path (fnil conj []) o)
 
-          ;; The datatype of all value nodes (e.g., xsd:integer).
-          ;; A shape has at most one value for sh:datatype.
-          const/$sh:datatype
-          (assoc acc :datatype o)
+         ;; The datatype of all value nodes (e.g., xsd:integer).
+         ;; A shape has at most one value for sh:datatype.
+         const/$sh:datatype
+         (assoc acc :datatype o)
 
-          const/$sh:minCount
-          (cond-> (assoc acc :min-count o)
-            (>= o 1) (assoc :required? true)) ; min-count >= 1 means property is required
+         const/$sh:minCount
+         (cond-> (assoc acc :min-count o)
+           (>= o 1) (assoc :required? true)) ; min-count >= 1 means property is required
 
-          const/$sh:maxCount
-          (assoc acc :max-count o)
+         const/$sh:maxCount
+         (assoc acc :max-count o)
 
-          ;; values of sh:nodeKind in a shape are one of the following six instances of the
-          ;; class sh:NodeKind: sh:BlankNode, sh:IRI, sh:Literal sh:BlankNodeOrIRI,
-          ;; sh:BlankNodeOrLiteral and sh:IRIOrLiteral.
-          ;; A shape has at most one value for sh:nodeKind.
-          const/$sh:nodeKind
-          (assoc acc :node-kind o)
+         ;; values of sh:nodeKind in a shape are one of the following six instances of the
+         ;; class sh:NodeKind: sh:BlankNode, sh:IRI, sh:Literal sh:BlankNodeOrIRI,
+         ;; sh:BlankNodeOrLiteral and sh:IRIOrLiteral.
+         ;; A shape has at most one value for sh:nodeKind.
+         const/$sh:nodeKind
+         (assoc acc :node-kind o)
 
-          ;; Note that multiple values for sh:class are interpreted as a conjunction,
-          ;; i.e. the values need to be SHACL instances of all of them.
-          const/$sh:class
-          (update acc :class (fnil conj []) o)
+         ;; Note that multiple values for sh:class are interpreted as a conjunction,
+         ;; i.e. the values need to be SHACL instances of all of them.
+         const/$sh:class
+         (update acc :class (fnil conj []) o)
 
-          const/$sh:pattern
-          (assoc acc :pattern o)
+         const/$sh:pattern
+         (assoc acc :pattern o)
 
-          const/$sh:minLength
-          (assoc acc :min-length o)
+         const/$sh:minLength
+         (assoc acc :min-length o)
 
-          const/$sh:maxLength
-          (assoc acc :max-length o)
+         const/$sh:maxLength
+         (assoc acc :max-length o)
 
-          const/$sh:flags
-          (update acc :flags (fnil conj []) o)
+         const/$sh:flags
+         (update acc :flags (fnil conj []) o)
 
-          const/$sh:languageIn
-          (assoc acc :language-in o)
+         const/$sh:languageIn
+         (assoc acc :language-in o)
 
-          const/$sh:uniqueLang
-          (assoc acc :unique-lang o)
+         const/$sh:uniqueLang
+         (assoc acc :unique-lang o)
 
-          const/$sh:hasValue
-          (assoc acc :has-value o)
+         const/$sh:hasValue
+         (assoc acc :has-value o)
 
-          const/$sh:in
-          (update acc :in (fnil conj []) o)
+         const/$sh:in
+         (update acc :in (fnil conj []) o)
 
-          const/$sh:minExclusive
-          (assoc acc :min-exclusive o)
+         const/$sh:minExclusive
+         (assoc acc :min-exclusive o)
 
-          const/$sh:minInclusive
-          (assoc acc :min-inclusive o)
+         const/$sh:minInclusive
+         (assoc acc :min-inclusive o)
 
-          const/$sh:maxExclusive
-          (assoc acc :max-exclusive o)
+         const/$sh:maxExclusive
+         (assoc acc :max-exclusive o)
 
-          const/$sh:maxInclusive
-          (assoc acc :max-inclusive o)
+         const/$sh:maxInclusive
+         (assoc acc :max-inclusive o)
 
-          const/$sh:equals
-          (assoc acc :pair-constraint :equals :rhs-property o)
+         const/$sh:equals
+         (assoc acc :pair-constraint :equals :rhs-property o)
 
-          const/$sh:disjoint
-          (assoc acc :pair-constraint :disjoint  :rhs-property o)
+         const/$sh:disjoint
+         (assoc acc :pair-constraint :disjoint :rhs-property o)
 
-          const/$sh:lessThan
-          (assoc acc :pair-constraint :lessThan  :rhs-property o)
+         const/$sh:lessThan
+         (assoc acc :pair-constraint :lessThan :rhs-property o)
 
-          const/$sh:lessThanOrEquals
-          (assoc acc :pair-constraint :lessThanOrEquals  :rhs-property o)
+         const/$sh:lessThanOrEquals
+         (assoc acc :pair-constraint :lessThanOrEquals :rhs-property o)
 
-          const/$sh:node
-          (assoc acc :node o)
+         const/$sh:node
+         (assoc acc :node o)
 
-          const/$sh:qualifiedValueShape
-          (assoc acc :qualified-value-shape o)
-          const/$sh:qualifiedMinCount
-          (assoc acc :qualified-min-count o)
-          const/$sh:qualifiedMaxCount
-          (assoc acc :qualified-max-count o)
-          const/$sh:qualifiedValueShapesDisjoint
-          (assoc acc :qualified-value-shapes-disjoint o)
+         const/$sh:qualifiedValueShape
+         (assoc acc :qualified-value-shape o)
+         const/$sh:qualifiedMinCount
+         (assoc acc :qualified-min-count o)
+         const/$sh:qualifiedMaxCount
+         (assoc acc :qualified-max-count o)
+         const/$sh:qualifiedValueShapesDisjoint
+         (assoc acc :qualified-value-shapes-disjoint o)
 
-          ;; else
-          acc)))
-    {}
-    property-flakes))
+         ;; else
+         acc)))
+   {}
+   property-flakes))
 
 ;; TODO - pass along additional shape metadata to provided better error message.
 (defn register-datatype
@@ -638,13 +638,13 @@
 
   Note that js does not have support for `x` or `q` flag behavior."
   [flag]
-  #?(:clj (case flag
-            "i" Pattern/CASE_INSENSITIVE
-            "m" Pattern/MULTILINE
-            "s" Pattern/DOTALL
-            "q" Pattern/LITERAL
-            "x" Pattern/COMMENTS
-            0)
+  #?(:clj  (case flag
+             "i" Pattern/CASE_INSENSITIVE
+             "m" Pattern/MULTILINE
+             "s" Pattern/DOTALL
+             "q" Pattern/LITERAL
+             "x" Pattern/COMMENTS
+             0)
      :cljs (if (#{"i" "m" "s"} flag)
              flag
              "")))
@@ -655,9 +655,9 @@
   and any flags that were provided."
   [{:keys [:pattern :flags] :as p-shape}]
   (let [valid-flags (->> (map get-regex-flag flags)
-                         #?(:clj (apply +)
+                         #?(:clj  (apply +)
                             :cljs (apply str)))]
-    (assoc p-shape :pattern #?(:clj (Pattern/compile pattern (or valid-flags 0))
+    (assoc p-shape :pattern #?(:clj  (Pattern/compile pattern (or valid-flags 0))
                                :cljs (js/RegExp. pattern (or valid-flags ""))))))
 
 (defn resolve-path-type
@@ -665,16 +665,16 @@
   [db path-pid]
   (go-try
     (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid] {:predicate-fn (complement #{const/$xsd:anyURI})
-                                                                                 :flake-limit 1}))
+                                                                                 :flake-limit  1}))
                              (first))]
       (let [o (flake/o path-flake)
             p (flake/p path-flake)]
         (uc/case p
-          const/$sh:inversePath     [o :inverse]
+          const/$sh:inversePath [o :inverse]
           const/$sh:alternativePath [o :alternative]
-          const/$sh:zeroOrMorePath  [o :zero-plus]
-          const/$sh:oneOrMorePath   [o :one-plus]
-          const/$sh:zeroOrOnePath   [o :zero-one]
+          const/$sh:zeroOrMorePath [o :zero-plus]
+          const/$sh:oneOrMorePath [o :one-plus]
+          const/$sh:zeroOrOnePath [o :zero-one]
           [path-pid :predicate]))
       [path-pid :predicate])))
 
@@ -694,7 +694,7 @@
           base     (build-property-base-shape p-flakes)
           base*    (<? (resolve-path-types base db))]
       (cond-> base*
-        (:pattern base)     (build-pattern)
+        (:pattern base) (build-pattern)
         (= p const/$sh:not) (assoc :logical-constraint :not, :required? false)))))
 
 (defn build-node-shape
@@ -702,8 +702,8 @@
   (go-try
     (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))]
       (loop [[flake & r'] shape-flakes
-             shape        {}
-             p-shapes     []]
+             shape    {}
+             p-shapes []]
         (if flake
           (let [p (flake/p flake)
                 o (flake/o flake)]
@@ -769,10 +769,10 @@
   (go-try
     (when (seq shape-sids)
       (loop [[shape-sid & r] shape-sids
-             datatype        nil
-             shapes          []]
+             datatype nil
+             shapes   []]
         (if shape-sid
-          (let [shape (<? (build-node-shape db shape-sid))
+          (let [shape     (<? (build-node-shape db shape-sid))
                 datatype* (merge-with merge-datatype datatype (:datatype shape))]
             (recur r datatype* (conj shapes shape)))
           {:shapes   shapes
