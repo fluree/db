@@ -715,7 +715,7 @@
              _                 @(fluree/commit! ledger db2)
              loaded2           (test-utils/retry-load conn ledger-alias 100)
              loaded-db2        (fluree/db loaded2)]
-         (is (= [{:id :ex/kittens} {:id :ex/w3c} {:id :ex/fluree}]
+         (is (= [{:id :ex/fluree} {:id :ex/w3c} {:id :ex/kittens}]
                 @(fluree/query loaded-db2 description-query))
              "The id :ex/mosquitos should be removed")
          (let [db3        @(fluree/stage

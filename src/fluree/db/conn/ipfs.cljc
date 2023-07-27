@@ -1,5 +1,5 @@
 (ns fluree.db.conn.ipfs
-  (:require [fluree.db.storage.core :as storage]
+  (:require [fluree.db.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util :refer [exception?]]
@@ -131,7 +131,7 @@
     [conn {:keys [id leaf tempid] :as node}]
     (let [cache-key [::resolve id tempid]]
       (if (= :empty id)
-        (storage/resolve-empty-leaf node)
+        (storage/resolve-empty-node node)
         (conn-cache/lru-lookup
           lru-cache-atom
           cache-key

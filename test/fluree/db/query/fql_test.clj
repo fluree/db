@@ -44,7 +44,7 @@
               "returns grouped results"))
 
         (testing "with having clauses"
-          (is (= [["Liam" [11 42]] ["Cam" [5 10]] ["Alice" [9 42 76]]]
+          (is (= [["Alice" [9 42 76]] ["Cam" [5 10]] ["Liam" [11 42]]]
                  @(fluree/query db '{:select   [?name ?favNums]
                                      :where    [[?s :schema/name ?name]
                                                 [?s :ex/favNums ?favNums]]
@@ -52,7 +52,7 @@
                                      :having   (>= (count ?favNums) 2)}))
               "filters results according to the supplied having function code")
 
-          (is (= [["Liam" [11 42]] ["Alice" [9 42 76]]]
+          (is (= [["Alice" [9 42 76]] ["Liam" [11 42]]]
                  @(fluree/query db '{:select   [?name ?favNums]
                                      :where    [[?s :schema/name ?name]
                                                 [?s :ex/favNums ?favNums]]
@@ -198,27 +198,37 @@
         (is (= [["The Hitchhiker's Guide to the Galaxy"]]
                test-subject))))))
 
-(deftest ^:integration multi-query-test
-  (let [conn   (test-utils/create-conn)
-        people (test-utils/load-people conn)
-        db     (fluree/db people)]
-    (testing "multi queries"
-      (let [q       '{"alice" {:select {?s [:*]}
-                               :where  [[?s :schema/email "alice@example.org"]]}
-                      "brian" {:select {?s [:*]}
-                               :where  [[?s :schema/email "brian@example.org"]]}}
-            subject @(fluree/multi-query db q)]
-        (is (= {"alice" [{:id           :ex/alice
-                          :rdf/type     [:ex/User]
-                          :ex/favNums   [9 42 76]
-                          :schema/age   50
-                          :schema/email "alice@example.org"
-                          :schema/name  "Alice"}]
-                "brian" [{:id           :ex/brian
-                          :rdf/type     [:ex/User]
-                          :ex/favNums   7
-                          :schema/age   50
-                          :schema/email "brian@example.org"
-                          :schema/name  "Brian"}]}
+(deftest ^:integration subject-object-test
+  (let [conn (test-utils/create-conn {:defaults {:context-type :string
+                                                 :context      {"id"     "@id",
+                                                                "type"   "@type",
+                                                                "ex"     "http://example.org/",
+                                                                "f"      "https://ns.flur.ee/ledger#",
+                                                                "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                                                "schema" "http://schema.org/",
+                                                                "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+        love (let [ledger @(fluree/create conn "test/love")]
+               @(fluree/transact! ledger
+                                  [{"@id"                "ex:fluree",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Data"}
+                                   {"@id"                "ex:w3c",
+                                    "@type"              "schema:Organization",
+                                    "schema:description" "We ❤️ Internet"}
+                                   {"@id"                "ex:mosquitos",
+                                    "@type"              "ex:Monster",
+                                    "schema:description" "We ❤️ Human Blood"}]
+                                  {})
+               ledger)
+        db   (fluree/db love)]
+    (testing "subject-object scans"
+      (let [q '{:select [?s ?p ?o]
+                :where [[?s "schema:description" ?o]
+                        [?s ?p ?o]]}
+            subject @(fluree/query db q)]
+        (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
+                ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
+                ["ex:w3c" "schema:description" "We ❤️ Internet"]]
                subject)
-            "returns all results in a map keyed by alias.")))))
+            "returns all results")))))

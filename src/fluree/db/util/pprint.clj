@@ -17,7 +17,7 @@
         str-vec      (if (index/leaf? index)
                        (let [node-count (count (:flakes index))]
                          (swap! count-atom + node-count)
-                         (conj str-vec (str ":" node-count)))
+                         (conj str-vec (str ":" (:t index) "-" node-count)))
                        str-vec)
         first-flake  (:first index)
         main-str     (apply str str-vec)
@@ -71,14 +71,10 @@
 
 
 (defn pprint-db
-  [{:keys [conn spot psot post opst tspo]}]
+  [{:keys [conn spot post opst tspo]}]
   (println "spot:")
   (println "-----------")
   (pprint-index conn spot)
-  (println "")
-  (println "psot:")
-  (println "-----------")
-  (pprint-index conn psot)
   (println "")
   (println "post:")
   (println "-----------")

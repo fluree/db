@@ -176,7 +176,7 @@
 (defn index-update
   "If provided commit-index is newer than db's commit index, updates db by cleaning novelty.
   If it is not newer, returns original db."
-  [{:keys [ledger commit] :as db} {data-map :data, :keys [spot psot post opst tspo] :as commit-index}]
+  [{:keys [ledger commit] :as db} {data-map :data, :keys [spot post opst tspo] :as commit-index}]
   (let [index-t      (:t data-map)
         newer-index? (and data-map
                           (or (nil? (commit-data/index-t commit))
@@ -186,7 +186,6 @@
           (assoc :commit (assoc commit :index commit-index)
                  :novelty* (idx-proto/-empty-novelty (:indexer ledger) db (- index-t))
                  :spot spot
-                 :psot psot
                  :post post
                  :opst opst
                  :tspo tspo)
@@ -233,7 +232,7 @@
 
 ;; ================ end GraphDB record support fns ============================
 
-(defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot psot post
+(defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post
                      opst tspo schema comparators novelty policy ecount
                      default-context context-type context-cache new-context?]
   dbproto/IFlureeDb
@@ -308,16 +307,14 @@
   [{:keys [method alias conn] :as ledger} default-context context-type new-context?]
   (let [novelty       (new-novelty-map index/default-comparators)
         {spot-cmp :spot
-         psot-cmp :psot
          post-cmp :post
          opst-cmp :opst
          tspo-cmp :tspo} index/default-comparators
 
-        spot          (index/empty-branch method alias spot-cmp)
-        psot          (index/empty-branch method alias psot-cmp)
-        post          (index/empty-branch method alias post-cmp)
-        opst          (index/empty-branch method alias opst-cmp)
-        tspo          (index/empty-branch method alias tspo-cmp)
+        spot          (index/empty-branch alias spot-cmp)
+        post          (index/empty-branch alias post-cmp)
+        opst          (index/empty-branch alias opst-cmp)
+        tspo          (index/empty-branch alias tspo-cmp)
         stats         {:flakes 0, :size 0, :indexed 0}
         schema        (vocab/base-schema)
         branch        (branch/branch-meta ledger)
@@ -327,14 +324,13 @@
     (map->JsonLdDb {:ledger          ledger
                     :conn            conn
                     :method          method
-                    :alias           alias
+                    :ledger-alias    alias
                     :branch          (:name branch)
                     :commit          (:commit branch)
                     :t               0
                     :tt-id           nil
                     :stats           stats
                     :spot            spot
-                    :psot            psot
                     :post            post
                     :opst            opst
                     :tspo            tspo

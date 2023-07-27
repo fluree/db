@@ -91,8 +91,8 @@
                :f/assert  [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
               {:f/t       4
-               :f/assert  [{:ex/x "foo-dog" :id :ex/dog}
-                           {:ex/x "foo-cat" :id :ex/cat}]
+               :f/assert  [{:ex/x "foo-cat" :id :ex/cat}
+                           {:ex/x "foo-dog" :id :ex/dog}]
                :f/retract [{:ex/x "foo-1" :id :ex/dog}
                            {:ex/x "foo-1" :id :ex/cat}]}
               {:f/t       5
@@ -148,7 +148,7 @@
                :f/assert  [{:ex/x "foo-3" :id :ex/dan}]
                :f/retract [{:ex/x "foo-2" :id :ex/dan}]}
               {:f/t       4
-               :f/assert  [{:ex/x "foo-dog" :id :ex/dog} {:ex/x "foo-cat" :id :ex/cat}]
+               :f/assert  [{:ex/x "foo-cat" :id :ex/cat} {:ex/x "foo-dog" :id :ex/dog}]
                :f/retract [{:ex/x "foo-1" :id :ex/dog} {:ex/x "foo-1" :id :ex/cat}]}]
              @(fluree/history ledger {:history [nil :ex/x] :t {:from 2 :to 4}}))))
     (testing "datetime-t"

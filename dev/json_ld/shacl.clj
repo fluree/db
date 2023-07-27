@@ -18,7 +18,6 @@
             [fluree.db.util.log :as log]
             [fluree.db.index :as index]
             [criterium.core :as criterium]
-            [clojure.data.avl :as avl]
             [clojure.tools.reader.edn :as edn]))
 
 

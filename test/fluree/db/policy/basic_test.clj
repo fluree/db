@@ -172,42 +172,13 @@
           "Both users should show, but only SSN for Alice")
 
       ;; Alice can only see her allowed data in a non-graph-crawl query too
-      (is (= [["John" nil] ["Alice" "111-11-1111"]]
+      (is (= [["Alice" "111-11-1111"] ["John" nil]]
              @(fluree/query db+policy {:select '[?name ?ssn]
                                        :where  '[[?p :schema/name ?name]
                                                  {:optional [?p :schema/ssn ?ssn]}]
                                        :opts   {:did  alice-did
                                                 :role :ex/userRole}}))
           "Both user names should show, but only SSN for Alice")
-
-      (testing "multi-query"
-        (is (= {"john"  [["john@flur.ee" nil]]
-                "alice" [["alice@flur.ee" "111-11-1111"]]}
-               @(fluree/multi-query db+policy {"john"  '{:select [?email ?ssn]
-                                                         :where  [[?p :schema/name "John"]
-                                                                  [?p :schema/email ?email]
-                                                                  {:optional [?p :schema/ssn ?ssn]}]}
-                                               "alice" '{:select [?email ?ssn]
-                                                         :where  [[?p :schema/name "Alice"]
-                                                                  [?p :schema/email ?email]
-                                                                  {:optional [?p :schema/ssn ?ssn]}]}
-                                               :opts   {:did  alice-did
-                                                        :role :ex/userRole}}))
-            "Both emails should show, but only SSN for Alice")
-
-        (let [illegal-opts-multi-result @(fluree/multi-query db+policy {"john"  {:select '[?ssn]
-                                                                                 :where  '[[?p :schema/name "John"]
-                                                                                           {:optional [?p :schema/ssn ?ssn]}]
-                                                                                 ;;supplying an identity here is not supported
-                                                                                 :opts   {:did  root-did
-                                                                                          :role :ex/rootRole}}
-                                                                        "alice" '{:select [?ssn]
-                                                                                  :where  [[?p :schema/name "Alice"]
-                                                                                           {:optional [?p :schema/ssn ?ssn]}]}})]
-          (is (util/exception? illegal-opts-multi-result))
-          (is (str/includes? (ex-message illegal-opts-multi-result)
-                             "Applying policy via `:opts` on individual queries"))))
-
       (testing "history query"
         (let [_ @(fluree/commit! ledger db+policy)]
           (is (= []

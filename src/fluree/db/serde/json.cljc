@@ -1,9 +1,6 @@
 (ns fluree.db.serde.json
   (:require [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.util.json :as json]
             [fluree.db.flake :as flake]
-            [fluree.db.util.log :as log :include-macros true]
-            [clojure.string :as str]
             [fluree.db.util.core :as util]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -32,11 +29,10 @@
   :ecount will have string keys converted to keywords. Need to re-convert
   them to integer keys."
   [db-root]
-  (let [{:keys [spot psot post opst tspo ecount]} db-root]
+  (let [{:keys [spot post opst tspo ecount]} db-root]
     (assoc db-root
            :ecount (deserialize-ecount ecount)
            :spot   (deserialize-child-node spot)
-           :psot   (deserialize-child-node psot)
            :post   (deserialize-child-node post)
            :opst   (deserialize-child-node opst)
            :tspo   (deserialize-child-node tspo))))
@@ -79,15 +75,13 @@
 
 (defrecord Serializer []
   serdeproto/StorageSerializer
-  (-serialize-db-root [_ {:keys [t block prevIndex timestamp stats
-                                 ledger-id ecount fork forkBlock
-                                 spot psot post opst tspo] :as db-root}]
+  (-serialize-db-root [_ db-root]
     (reduce-kv
       (fn [acc k v]
         (assoc acc (name k)
                    (case k
                      :stats (util/stringify-keys v)
-                     (:spot :psot :post :opst :tspo) (stringify-child v)
+                     (:spot :post :opst :tspo) (stringify-child v)
                      ;; else
                      v)))
       {} db-root))

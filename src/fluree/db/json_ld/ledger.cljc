@@ -48,6 +48,7 @@
           "http://www.w3.org/ns/shacl#targetSubjectsOf"         const/$sh:targetSubjectsOf
           "http://www.w3.org/ns/shacl#closed"                   const/$sh:closed
           "http://www.w3.org/ns/shacl#ignoredProperties"        const/$sh:ignoredProperties
+          "http://www.w3.org/ns/shacl#node"                     const/$sh:node
           "http://www.w3.org/ns/shacl#property"                 const/$sh:property
           "http://www.w3.org/ns/shacl#path"                     const/$sh:path
           "http://www.w3.org/ns/shacl#inversePath"              const/$sh:inversePath
@@ -80,6 +81,10 @@
           "http://www.w3.org/ns/shacl#and"                      const/$sh:and
           "http://www.w3.org/ns/shacl#or"                       const/$sh:or
           "http://www.w3.org/ns/shacl#xone"                     const/$sh:xone
+          "http://www.w3.org/ns/shacl#qualifiedValueShape"      const/$sh:qualifiedValueShape
+          "http://www.w3.org/ns/shacl#qualifiedMinCount"        const/$sh:qualifiedMinCount
+          "http://www.w3.org/ns/shacl#qualifiedMaxCount"        const/$sh:qualifiedMaxCount
+          "http://www.w3.org/ns/shacl#qualifiedValueShapesDisjoint" const/$sh:qualifiedValueShapesDisjoint
           ;; fluree
           "https://ns.flur.ee/ledger#context"                   const/$fluree:context
           const/iri-role                                        const/$_role

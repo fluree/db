@@ -4,11 +4,10 @@
             [fluree.db.index :as index]
             [fluree.db.util.schema :as schema-util]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-            [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.flake :as flake]
-            #?(:clj  [clojure.core.async :refer [chan go go-loop <! >!] :as async]
-               :cljs [cljs.core.async :refer [chan <! >!] :refer-macros [go go-loop] :as async])
+            #?(:clj  [clojure.core.async :refer [chan go >!] :as async]
+               :cljs [cljs.core.async :refer [chan  >!] :refer-macros [go] :as async])
             [fluree.db.permissions-validate :as perm-validate]
             [fluree.db.util.async :refer [<? go-try]]))
 
@@ -41,18 +40,17 @@
   (let [[p1 p2 p3 p4 op m] match]
     (case idx
       :spot [p1 (coerce-predicate db p2) p3 p4 op m]
-      :psot [p2 (coerce-predicate db p1) p3 p4 op m]
       :post [p3 (coerce-predicate db p1) p2 p4 op m]
       :opst [p3 (coerce-predicate db p2) p1 p4 op m]
       :tspo [p2 (coerce-predicate db p3) p4 p1 op m])))
 
 
-(def ^{:private true :const true} subject-min-match [util/max-long])
-(def ^{:private true :const true} subject-max-match [util/min-long])
-(def ^{:private true :const true} pred-min-match [0])
-(def ^{:private true :const true} pred-max-match [flake/MAX-PREDICATE-ID])
-(def ^{:private true :const true} txn-max-match [util/min-long])
-(def ^{:private true :const true} txn-min-match [0])
+(def ^{:private true :const true} subject-min-match [flake/min-s])
+(def ^{:private true :const true} subject-max-match [flake/max-s])
+(def ^{:private true :const true} pred-min-match [flake/min-p])
+(def ^{:private true :const true} pred-max-match [flake/max-p])
+(def ^{:private true :const true} txn-max-match [flake/min-t])
+(def ^{:private true :const true} txn-min-match [flake/max-t])
 
 
 (defn- min-match
@@ -60,7 +58,6 @@
   [idx]
   (case idx
     :spot subject-min-match
-    :psot pred-min-match
     :post pred-min-match
     :opst subject-min-match
     :tspo txn-min-match))
@@ -71,7 +68,6 @@
   [idx]
   (case idx
     :spot subject-max-match
-    :psot pred-max-match
     :post pred-max-match
     :opst subject-max-match
     :tspo txn-max-match))
@@ -91,11 +87,6 @@
                   [o nil])
         m' (or m (if (identical? >= test) util/min-integer util/max-integer))]
     (flake/create s p o' dt t op m')))
-
-(defn resolved-leaf?
-  [node]
-  (and (index/leaf? node)
-       (index/resolved? node)))
 
 (defn intersects-range?
   "Returns true if the supplied `node` contains flakes between the `lower` and
@@ -125,19 +116,15 @@
   map. The result of the transformation will be a stream of collections of
   flakes from the leaf nodes in the input stream, with one flake collection for
   each input leaf."
-  [{:keys [start-flake start-test end-flake end-test flake-xf] :as opts}]
-  (let [query-xf (comp (map :flakes)
-                       (map (fn [flakes]
-                              (flake/subrange flakes
-                                              start-test start-flake
-                                              end-test end-flake)))
-                       (map (fn [flakes]
-                              (into [] (query-filter opts) flakes))))]
-    (if flake-xf
-      (let [slice-xf (map (fn [flakes]
-                            (sequence flake-xf flakes)))]
-        (comp query-xf slice-xf))
-      query-xf)))
+  [{:keys [flake-xf] :as opts}]
+  (let [flake-xfs (cond-> [(query-filter opts)]
+                    flake-xf (conj flake-xf))
+        flake-xf* (apply comp flake-xfs)
+        query-xf  (comp (filter index/resolved-leaf?)
+                        (map :flakes)
+                        (map (fn [flakes]
+                               (into [] flake-xf* flakes))))]
+    query-xf))
 
 (defn resolve-flake-slices
   "Returns a channel that will contain a stream of chunked flake collections that
@@ -146,12 +133,8 @@
   [{:keys [lru-cache-atom] :as conn} root novelty error-ch
    {:keys [from-t to-t start-flake end-flake] :as opts}]
   (let [resolver  (index/->CachedTRangeResolver conn novelty from-t to-t lru-cache-atom)
-        cmp       (:comparator root)
-        range-set (flake/sorted-set-by cmp start-flake end-flake)
-        in-range? (fn [node]
-                    (intersects-range? node range-set))
         query-xf  (extract-query-flakes opts)]
-    (index/tree-chan resolver root in-range? resolved-leaf? 1 query-xf error-ch)))
+    (index/tree-chan resolver root start-flake end-flake any? 1 query-xf error-ch)))
 
 (defn unauthorized?
   [f]
@@ -293,7 +276,8 @@
                                           :end-test    end-test
                                           :end-flake   end-flake})]
      (go-try
-       (let [history-ch (->> (index/tree-chan resolver idx-root in-range? resolved-leaf? 1 query-xf error-ch)
+       (let [history-ch (->> (index/tree-chan resolver idx-root start-flake end-flake
+                                              in-range? 1 query-xf error-ch)
                              (filter-authorized db start-flake end-flake error-ch)
                              (into-page limit offset flake-limit))]
          (async/alt!
@@ -368,75 +352,3 @@
                      (throw e))
            range-ch ([idx-range]
                      idx-range)))))))
-
-(defn non-nil-non-boolean?
-  [o]
-  (and (not (nil? o))
-       (not (boolean? o))))
-
-(defn tag-string?
-  [possible-tag]
-  (re-find #"^[a-zA-Z0-9-_]*/[a-zA-Z0-9-_]*:[a-zA-Z0-9-]*$" possible-tag))
-
-(def ^:const tag-sid-start (flake/min-subject-id const/$_tag))
-(def ^:const tag-sid-end (flake/max-subject-id const/$_tag))
-
-(defn is-tag-flake?
-  "Returns true if flake is a root setting flake."
-  [f]
-  (<= tag-sid-start (flake/o f) tag-sid-end))
-
-
-(defn coerce-tag-flakes
-  [db flakes]
-  (async/go-loop [[flake & r] flakes
-                  acc []]
-    (if flake
-      (if (is-tag-flake? flake)
-        (let [[s p o _ t op m] (flake/Flake->parts flake)
-              o* (<? (dbproto/-tag db o p))]
-          (recur r (conj acc (flake/create s p o* const/$xsd:anyURI t op m))))
-        (recur r (conj acc flake))) acc)))
-
-(defn collection
-  "Returns spot index range for only the requested collection."
-  ([db name] (collection db name nil))
-  ([db name opts]
-   (go
-     (try*
-      (if-let [id (dbproto/-c-prop db :id name)]
-        (<? (index-range db :spot
-                         >= [(flake/max-subject-id id)]
-                         <= [(flake/min-subject-id id)]
-                         opts))
-        (throw (ex-info (str "Invalid collection name: " (pr-str name))
-                        {:status 400
-                         :error  :db/invalid-collection})))
-      (catch* e e)))))
-
-(defn _block-or_tx-collection
-  "Returns spot index range for only the requested collection."
-  [db opts]
-  (index-range db :spot > [0] <= [util/min-long] opts))
-
-(defn txn-from-flakes
-  "Returns vector of transactions from a set of flakes.
-   Each transaction is a map with the following keys:
-   1. db - the associated ledger
-   2. tx - a map containing all transaction data in the original cmd
-   3. nonce - the nonce
-   4. auth - the authority that submitted the transaction
-   5. expire - expiration"
-  [flakes]
-  (loop [[flake' & r] flakes result* []]
-    (if (nil? flake')
-      result*
-      (let [obj     (flake/o flake')
-            cmd-map (try*
-                     (json/parse obj)
-                     (catch* e nil))                       ; log an error if transaction is not parsable?
-            {:keys [type db tx nonce auth expire]} cmd-map]
-        (recur r
-               (if (= type "tx")
-                 (conj result* {:db db :tx tx :nonce nonce :auth auth :expire expire})
-                 result*))))))

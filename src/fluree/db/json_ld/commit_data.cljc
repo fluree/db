@@ -50,7 +50,6 @@
                         :flakes  4240000
                         :size    120000}
               :spot    "fluree:ipfs://spot" ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
-              :psot    "fluree:ipfs://psot"
               :post    "fluree:ipfs://post"
               :opst    "fluree:ipfs://opst"
               :tspo    "fluree:ipfs://tspo"}})
@@ -166,7 +165,7 @@
 
 (defn json-ld->map
   "Turns json-ld commit meta into the clojure map structure."
-  [commit-json-ld {:keys [commit-address spot psot post opst tspo]}]
+  [commit-json-ld {:keys [commit-address spot post opst tspo]}]
   (let [{id          :id,
          address     const/iri-address,
          v           const/iri-v,
@@ -218,7 +217,6 @@
                   :address (get-in index [const/iri-address :value]) ;; address to get to index 'root'
                   :data    (db-object (get index const/iri-data))
                   :spot    spot ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
-                  :psot    psot
                   :post    post
                   :opst    opst
                   :tspo    tspo})
@@ -364,11 +362,6 @@
   [flakes]
   (filter ref? flakes))
 
-(defn update-novelty-idx
-  [novelty-idx add remove]
-  (-> (reduce disj novelty-idx remove)
-      (into add)))
-
 (defn update-novelty
   ([db add]
    (update-novelty db add []))
@@ -383,11 +376,10 @@
                        add (+ (flake/size-bytes add))
                        rem (- (flake/size-bytes rem)))]
      (-> db
-         (update-in [:novelty :spot] update-novelty-idx add rem)
-         (update-in [:novelty :psot] update-novelty-idx add rem)
-         (update-in [:novelty :post] update-novelty-idx add rem)
-         (update-in [:novelty :opst] update-novelty-idx ref-add ref-rem)
-         (update-in [:novelty :tspo] update-novelty-idx add rem)
+         (update-in [:novelty :spot] flake/revise add rem)
+         (update-in [:novelty :post] flake/revise add rem)
+         (update-in [:novelty :opst] flake/revise ref-add ref-rem)
+         (update-in [:novelty :tspo] flake/revise add rem)
          (update-in [:novelty :size] + flake-size)
          (update-in [:stats :size] + flake-size)
          (update-in [:stats :flakes] + flake-count)))))
@@ -417,14 +409,14 @@
   data as its own entity."
   [db]
   (let [tt-id   (random-uuid)
-        indexes [:spot :psot :post :opst :tspo]]
+        indexes [:spot :post :opst :tspo]]
     (-> (reduce
           (fn [db* idx]
             (let [{:keys [children] :as node} (get db* idx)
                   children* (reduce-kv
                               (fn [children* k v]
                                 (assoc children* k (assoc v :tt-id tt-id)))
-                              {} children)]
+                              (empty children) children)]
               (assoc db* idx (assoc node :tt-id tt-id
                                          :children children*))))
           db indexes)

@@ -47,12 +47,12 @@
              (dbproto/-default-context db1))))
 
     (testing "Query after the 3rd load is using original default context"
-      (is (= [{:id      :blah/three
+      (is (= [{:id      :blah/one
+               :ex/name "One"}
+              {:id      :blah/three
                :ex/name "Three"}
               {:id      :blah/two
-               :ex/name "Two"}
-              {:id      :blah/one
-               :ex/name "One"}]
+               :ex/name "Two"}]
              @(fluree/query db3-load '{:select {?s [:*]}
                                        :where  [[?s :ex/name nil]]}))))))
 
@@ -86,12 +86,12 @@
              (dbproto/-default-context db1))))
 
     (testing "Query after the 3rd load is using original default context"
-      (is (= [{:id      :blah/three
+      (is (= [{:id      :blah/one
+               :ex/name "One"}
+              {:id      :blah/three
                :ex/name "Three"}
               {:id      :blah/two
-               :ex/name "Two"}
-              {:id      :blah/one
-               :ex/name "One"}]
+               :ex/name "Two"}]
              @(fluree/query db3-load '{:select {?s [:*]}
                                        :where  [[?s :ex/name nil]]}))))))
 
@@ -130,11 +130,11 @@
                (dbproto/-default-context db1))))
 
       (testing "Query after the 3rd load is using original default context"
-        (is (= [{:id      :blah/three
+        (is (= [{:id      :blah/one
+                 :ex/name "One"}
+                {:id      :blah/three
                  :ex/name "Three"}
                 {:id      :blah/two
-                 :ex/name "Two"}
-                {:id      :blah/one
-                 :ex/name "One"}]
+                 :ex/name "Two"}]
                @(fluree/query db3-load '{:select {?s [:*]}
                                          :where  [[?s :ex/name nil]]})))))))

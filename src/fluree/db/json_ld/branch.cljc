@@ -46,7 +46,6 @@
      ;            :db               {}                       ;; db commit-map object of indexed db
      ;            :update-commit-fn nil                      ;; function to call when index is updated to create a new commit with updated index address
      ;            :spot             nil                      ;; top level branch of each index , eliminates file lookup of index root
-     ;            :psot             nil
      ;            :post             nil
      ;            :opst             nil
      ;            :tspo             nil}

@@ -4,9 +4,10 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
+            [fluree.db.util.core :as util]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
@@ -197,7 +198,7 @@
         (if (keyword? k)
           (recur r acc)
           (let [existing-pid (<? (get-iri-sid k db iri-cache))
-                v-maps*      (if (sequential? v-maps) v-maps [v-maps])
+                v-maps*      (util/sequential v-maps)
                 pid          (or existing-pid
                                  (get jld-ledger/predefined-properties k)
                                  (jld-ledger/generate-new-pid

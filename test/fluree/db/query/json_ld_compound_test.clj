@@ -87,14 +87,14 @@
       ;; if mixing multi-cardinality results along with single cardinality, there
       ;; should be a result output for every multi-cardinality value and the single
       ;; cardinality values should duplicate
-      (is (= @(fluree/query db {:context {:schema "http://schema.org/"
+      (is (= [["Alice" 9] ["Alice" 42] ["Alice" 76]
+              ["Brian" 7]
+              ["Cam" 5] ["Cam" 10]]
+             @(fluree/query db {:context {:schema "http://schema.org/"
                                           :ex "http://example.org/ns/"}
                                 :select  ['?name '?favNums]
                                 :where   [['?s :schema/name '?name]
-                                          ['?s :ex/favNums '?favNums]]})
-             [["Cam" 5] ["Cam" 10]
-              ["Alice" 9] ["Alice" 42] ["Alice" 76]
-              ["Brian" 7]])
+                                          ['?s :ex/favNums '?favNums]]}))
           "Multi-cardinality values should duplicate non-multicardinality values ")
 
       ;; ordering by a single variable

@@ -1,36 +1,31 @@
 (ns fluree.db.query.history
-  (:require
-   [clojure.core.async :as async :refer [go >! <!]]
-   [malli.core :as m]
-   [fluree.json-ld :as json-ld]
-   [fluree.db.constants :as const]
-   [fluree.db.datatype :as datatype]
-   [fluree.db.dbproto :as dbproto]
-   [fluree.db.flake :as flake]
-   [fluree.db.query.json-ld.response :as json-ld-resp]
-   [fluree.db.util.async :refer [<? go-try]]
-   [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
-   [fluree.db.util.log :as log]
-   [fluree.db.query.range :as query-range]
-   [fluree.db.db.json-ld :as jld-db]
-   [fluree.db.validation :as v]
-   [malli.error :as me]
-   [malli.transform :as mt]))
+  (:require [clojure.core.async :as async :refer [go >! <!]]
+            [malli.core :as m]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.constants :as const]
+            [fluree.db.datatype :as datatype]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.flake :as flake]
+            [fluree.db.index :as index]
+            [fluree.db.query.json-ld.response :as json-ld-resp]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.log :as log]
+            [fluree.db.query.range :as query-range]
+            [fluree.db.db.json-ld :as jld-db]
+            [fluree.db.validation :as v]
+            [malli.error :as me]
+            [malli.transform :as mt]))
 
-(def registry
-  (merge
-   (m/base-schemas)
-   (m/type-schemas)
-   (m/predicate-schemas)
-   (m/comparator-schemas)
-   (m/sequence-schemas)
-   v/registry
-   {::iri             ::v/iri
-    ::json-ld-keyword ::v/json-ld-keyword
-    ::context         ::v/context
-    ::history-query
-    [:and
+(defn history-query-schema
+  "Returns schema for history queries, with any extra key/value pairs `extra-kvs`
+  added to the query map.
+  This allows eg http-api-gateway to amend the schema with required key/value pairs
+  it wants to require, which are not required/supported here in the db library."
+  [extra-kvs]
+  [:and
      [:map-of ::json-ld-keyword :any]
+   (into
      [:map
       [:history {:optional true}
        [:orn
@@ -75,9 +70,23 @@
          (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                    (<= from to)
                                    true))]]]]
+     extra-kvs)
      [:fn {:error/message "Must supply either a :history or :commit-details key."}
       (fn [{:keys [history commit-details t]}]
-        (or history commit-details))]]}))
+        (or history commit-details))]])
+
+(def registry
+  (merge
+   (m/base-schemas)
+   (m/type-schemas)
+   (m/predicate-schemas)
+   (m/comparator-schemas)
+   (m/sequence-schemas)
+   v/registry
+   {::iri             ::v/iri
+    ::json-ld-keyword ::v/json-ld-keyword
+    ::context         ::v/context
+    ::history-query   (history-query-schema [])}))
 
 (def coerce-history-query
   "Provide a time range :t and either :history or :commit-details, or both.
@@ -213,20 +222,15 @@
                             {:s parsed-query}
                             parsed-query)
 
-          ids [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
-               (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
-               (when o (jld-db/expand-iri db o context))]
+          [s p o] [(when s (<? (dbproto/-subid db (jld-db/expand-iri db s context) true)))
+                   (when p (<? (dbproto/-subid db (jld-db/expand-iri db p context) true)))
+                   (when o (jld-db/expand-iri db o context))]
 
-          [s p o] ids
-          [pattern idx] (cond
-                          (not (nil? s))
-                          [ids :spot]
-
-                          (and (nil? s) (not (nil? p)) (nil? o))
-                          [[p s o] :psot]
-
-                          (and (nil? s) (not (nil? p)) (not (nil? o)))
-                          [[p o s] :post])]
+          idx     (index/for-components s p o nil)
+          pattern (case idx
+                    :spot [s p o]
+                    :post [p o s]
+                    :opst [o p s])]
       [pattern idx])))
 
 (defn commit-wrapper-flake?

@@ -1,6 +1,6 @@
 (ns fluree.db.index
   (:refer-clojure :exclude [resolve])
-  (:require [clojure.data.avl :as avl]
+  (:require [fluree.db.constants :as const]
             [fluree.db.flake :as flake]
             #?(:clj  [clojure.core.async :refer [chan go <! >!] :as async]
                :cljs [cljs.core.async :refer [chan go <! >!] :as async])
@@ -12,15 +12,32 @@
 (def default-comparators
   "Map of default index comparators for the five index types"
   {:spot flake/cmp-flakes-spot
-   :psot flake/cmp-flakes-psot
    :post flake/cmp-flakes-post
    :opst flake/cmp-flakes-opst
    :tspo flake/cmp-flakes-block})
 
 (def types
-  "The five possible index orderings based on the subject, predicate, object,
+  "The four possible index orderings based on the subject, predicate, object,
   and transaction flake attributes"
   (-> default-comparators keys set))
+
+(defn reference?
+  [dt]
+  (= dt const/$xsd:anyURI))
+
+(defn for-components
+  "Returns the index that should be used to scan for flakes that match the
+  supplied flake components `s` `p` `o` and `o-dt` given when of these supplied
+  components are non-nil."
+  [s p o o-dt]
+  (cond
+    s     :spot
+    p     :post
+    o     (if (reference? o-dt)
+            :opst
+            (throw (ex-info (str "Illegal reference object value" (::var o))
+                            {:status 400 :error :db/invalid-query})))
+    :else :spot))
 
 (defn leaf?
   "Returns `true` if `node` is a map for a leaf node"
@@ -37,16 +54,6 @@
     "Populate the supplied index branch or leaf node maps with either the child
      node attributes or the flakes they store, respectively."))
 
-(defn try-resolve
-  [r error-ch node]
-  (go
-    (try* (<? (resolve r node))
-          (catch* e
-                  (log/error e
-                             "Error resolving index node:"
-                             (select-keys node [:id :network :ledger-id]))
-                  (>! error-ch e)))))
-
 (defn resolved?
   "Returns `true` if the data associated with the index node map `node` is fully
   resolved from storage"
@@ -55,6 +62,11 @@
     (leaf? node)   (not (nil? (:flakes node)))
     (branch? node) (not (nil? (:children node)))))
 
+(defn resolved-leaf?
+  [node]
+  (and (leaf? node)
+       (resolved? node)))
+
 (defn unresolve
   "Clear the populated child node attributes from the supplied `node` map if it
   represents a branch, or the populated flakes if `node` represents a leaf."
@@ -62,27 +74,6 @@
   (cond
     (leaf? node)   (dissoc node :flakes)
     (branch? node) (dissoc node :children)))
-
-(defn lookup
-  [branch flake]
-  (when (and (branch? branch)
-             (resolved? branch))
-    (let [{:keys [children]} branch]
-      (-> children
-          (avl/nearest <= flake)
-          (or (first children))
-          val))))
-
-(defn lookup-leaf
-  [r branch flake]
-  (go-try
-   (when (and (branch? branch)
-              (resolved? branch))
-     (loop [child (lookup branch flake)]
-       (if (leaf? child)
-         child
-         (recur (<? (resolve r child))))))))
-
 
 (defn add-flakes
   [leaf flakes]
@@ -109,33 +100,25 @@
     (assoc new-leaf :first new-first)))
 
 (defn empty-leaf
-  "Returns a blank leaf node map for the provided `network`, `ledger-id`, and index
+  "Returns a blank leaf node map for the provided `ledger-alias` and index
   comparator `cmp`."
-  [network ledger-id cmp]
-  {:comparator cmp
-   :network network
-   :ledger-id ledger-id
-   :id :empty
-   :tempid (random-uuid)
-   :leaf true
-   :first flake/maximum
-   :rhs nil
-   :size 0
-   :t 0
-   :leftmost? true})
-
-(defn new-leaf
-  [network ledger-id cmp flakes]
-  (let [empty-set (flake/sorted-set-by cmp)]
-    (-> (empty-leaf network ledger-id cmp)
-        (assoc :flakes empty-set)
-        (add-flakes flakes))))
+  [ledger-alias cmp]
+  {:comparator   cmp
+   :ledger-alias ledger-alias
+   :id           :empty
+   :tempid       (random-uuid)
+   :leaf         true
+   :first        flake/maximum
+   :rhs          nil
+   :size         0
+   :t            0
+   :leftmost?    true})
 
 (defn descendant?
   "Checks if the `node` passed in the second argument is a descendant of the
   `branch` passed in the first argument"
   [{:keys [rhs leftmost?], cmp :comparator, first-flake :first, :as branch}
-   {node-first :first, node-rhs :rhs, :as node}]
+   {node-first :first, node-rhs :rhs, :as _node}]
   (if-not (branch? branch)
     false
     (and (or leftmost?
@@ -160,37 +143,21 @@
 
 (defn empty-branch
   "Returns a blank branch node which contains a single empty leaf node for the
-  provided `network`, `ledger-id`, and index comparator `cmp`."
-  [network ledger-id cmp]
-  (let [child-node (empty-leaf network ledger-id cmp)
+  provided `ledger-alias` and index comparator `cmp`."
+  [ledger-alias cmp]
+  (let [child-node (empty-leaf ledger-alias cmp)
         children   (child-map cmp child-node)]
-    {:comparator cmp
-     :network network
-     :ledger-id ledger-id
-     :id :empty
-     :tempid (random-uuid)
-     :leaf false
-     :first flake/maximum
-     :rhs nil
-     :children children
-     :size 0
-     :t 0
-     :leftmost? true}))
-
-(defn reset-children
-  [{:keys [comparator size] :as branch} new-child-nodes]
-  (let [new-kids  (apply child-map comparator new-child-nodes)
-        new-first (or (some-> new-kids first key)
-                      flake/maximum)
-        new-size  (->> new-child-nodes
-                       (map :size)
-                       (reduce + size))]
-    (assoc branch :first new-first, :size new-size, :children new-kids)))
-
-(defn new-branch
-  [network ledger-id cmp child-nodes]
-  (-> (empty-branch network ledger-id cmp)
-      (reset-children child-nodes)))
+    {:comparator   cmp
+     :ledger-alias ledger-alias
+     :id           :empty
+     :tempid       (random-uuid)
+     :leaf         false
+     :first        flake/maximum
+     :rhs          nil
+     :children     children
+     :size         0
+     :t            0
+     :leftmost?    true}))
 
 (defn after-t?
   "Returns `true` if `flake` has a transaction value after the provided `t`"
@@ -217,20 +184,20 @@
        (flake/disj-all flakes)))
 
 (defn novelty-subrange
-  [{:keys [rhs leftmost?], first-flake :first, :as node} through-t novelty]
+  [{:keys [rhs leftmost?], first-flake :first, :as _node} through-t novelty]
   (log/trace "novelty-subrange: first-flake:" first-flake "\nrhs:" rhs "\nleftmost?" leftmost?)
   (let [subrange (cond
                    ;; standard case: both left and right boundaries
                    (and rhs (not leftmost?))
-                   (avl/subrange novelty > first-flake <= rhs)
+                   (flake/subrange novelty > first-flake <= rhs)
 
                    ;; right only boundary
                    (and rhs leftmost?)
-                   (avl/subrange novelty <= rhs)
+                   (flake/subrange novelty <= rhs)
 
                    ;; left only boundary
                    (and (nil? rhs) (not leftmost?))
-                   (avl/subrange novelty > first-flake)
+                   (flake/subrange novelty > first-flake)
 
                    ;; no boundary
                    (and (nil? rhs) leftmost?)
@@ -279,7 +246,7 @@
 
 (defrecord TRangeResolver [node-resolver novelty from-t to-t]
   Resolver
-  (resolve [_ {:keys [id tempid tt-id] :as node}]
+  (resolve [_ node]
     (if (branch? node)
       (resolve node-resolver node)
       (resolve-t-range node-resolver node novelty from-t to-t))))
@@ -355,20 +322,80 @@
   [node]
   (-> node ::expanded true?))
 
+(defn trim-leaf
+  "Remove flakes from the index leaf node `leaf` that are outside of the interval
+  defined by `start-flake` and `end-flake`. nil values for either `start-flake`
+  or `end-flake` makes that side of the interval unlimited."
+  [leaf start-flake end-flake]
+  (cond
+    (and start-flake end-flake)
+    (update leaf :flakes flake/subrange >= start-flake <= end-flake)
+
+    start-flake
+    (update leaf :flakes flake/subrange >= start-flake)
+
+    end-flake
+    (update leaf :flakes flake/subrange <= end-flake)
+
+    :else
+    leaf))
+
+(defn trim-branch
+  "Remove child nodes from the index branch node `branch` that do not contain
+  flakes in the interval defined by `start-flake` and `end-flake`. nil values
+  for either `start-flake` or `end-flake` makes that side of the interval
+  unlimited."
+  [{:keys [children] :as branch} start-flake end-flake]
+  (let [start-key (some->> start-flake (flake/nearest children <=) key)
+        end-key   (some->> end-flake (flake/nearest children <=) key)]
+    (cond
+      (and start-key end-key)
+      (update branch :children flake/subrange >= start-key <= end-key)
+
+      start-key
+      (update branch :children flake/subrange >= start-key)
+
+      end-key
+      (update branch :children flake/subrange <= end-key)
+
+      :else
+      branch)))
+
+(defn trim-node
+  "Remove flakes or children from the index leaf or branch node `node` that are
+  outside of the interval defined by `start-flake` and `end-flake`. nil values
+  for either `start-flake` or `end-flake` makes that side of the interval
+  unlimited."
+  [node start-flake end-flake]
+  (if (leaf? node)
+    (trim-leaf node start-flake end-flake)
+    (trim-branch node start-flake end-flake)))
+
+(defn try-resolve
+  [r start-flake end-flake error-ch node]
+  (go
+    (try* (let [resolved (<? (resolve r node))]
+            (trim-node resolved start-flake end-flake))
+          (catch* e
+            (log/error e
+                       "Error resolving index node:"
+                       (select-keys node [:id :ledger-alias]))
+            (>! error-ch e)))))
+
 (defn resolve-when
-  [r resolve? error-ch node]
+  [r start-flake end-flake resolve? error-ch node]
   (if (resolve? node)
-    (try-resolve r error-ch node)
+    (try-resolve r start-flake end-flake error-ch node)
     (doto (chan)
       (async/put! node))))
 
 (defn resolve-children-when
-  [r resolve? error-ch branch]
+  [r start-flake end-flake resolve? error-ch branch]
   (if (resolved? branch)
     (->> branch
          :children
          (map (fn [[_ child]]
-                (resolve-when r resolve? error-ch child)))
+                (resolve-when r start-flake end-flake resolve? error-ch child)))
          (async/map vector))
     (go [])))
 
@@ -377,29 +404,35 @@
   descended from `root` in depth-first order. `resolve?` is a boolean function
   that will be applied to each node to determine whether or not the data
   associated with that node will be resolved from disk using the supplied
-  `Resolver` `r`. `include?` is a boolean function that will be applied to each
-  node to determine if it will be included in the final output node stream, `n`
-  is an optional parameter specifying the number of nodes to load concurrently,
-  and `xf` is an optional transducer that will transform the output stream if
-  supplied."
-  ([r root resolve? include? error-ch]
-   (tree-chan r root resolve? include? 1 identity error-ch))
-  ([r root resolve? include? n xf error-ch]
+  `Resolver` `r`. `start-flake` and `end-flake` are flakes for which only nodes
+  that contain flakes within the interval defined by them will be considered,
+  `n` is an optional parameter specifying the number of nodes to load
+  concurrently, and `xf` is an optional transducer that will transform the
+  output stream if supplied."
+  ([r root resolve? error-ch]
+   (tree-chan r root resolve? 1 identity error-ch))
+  ([r root resolve? n xf error-ch]
+   (tree-chan r root nil nil resolve? n xf error-ch))
+  ([r root start-flake end-flake resolve? n xf error-ch]
    (let [out (chan n xf)]
      (go
-       (let [root-node (<! (resolve-when r resolve? error-ch root))]
+       (let [root-node (<! (resolve-when r start-flake end-flake
+                                         resolve? error-ch root))]
          (loop [stack [root-node]]
            (when-let [node (peek stack)]
              (let [stack* (pop stack)]
                (if (or (leaf? node)
                        (expanded? node))
-                 (do (when (include? node)
-                       (>! out (unmark-expanded node)))
+                 (do (>! out (unmark-expanded node))
                      (recur stack*))
-                 (let [children (<! (resolve-children-when r resolve? error-ch node))
+                 (let [children (<! (resolve-children-when r start-flake end-flake
+                                                           resolve? error-ch node))
                        stack**  (-> stack*
                                     (conj (mark-expanded node))
-                                    (into (rseq children)))]
+                                    (into (rseq children)))] ; reverse children
+                                                             ; to ensure final
+                                                             ; nodes are in
+                                                             ; depth-first order
                    (recur stack**))))))
          (async/close! out)))
      out)))

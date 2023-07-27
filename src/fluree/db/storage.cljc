@@ -1,4 +1,4 @@
-(ns fluree.db.storage.core
+(ns fluree.db.storage
   (:require [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.flake :as flake]
             [clojure.string :as str]
@@ -18,16 +18,16 @@
   (:serializer conn))
 
 (defn ledger-root-key
-  [network ledger-id t]
-  (str network "_" ledger-id "_root_" (util/zero-pad t 15)))
+  [ledger-alias t]
+  (str ledger-alias "_root_" (util/zero-pad t 15)))
 
 (defn ledger-garbage-prefix
-  [network ldgr-id]
-  (str/join "_" [network ldgr-id "garbage"]))
+  [ledger-alias]
+  (str/join "_" [ledger-alias "garbage"]))
 
 (defn ledger-garbage-key
-  [network ldgr-id t]
-  (let [pre (ledger-garbage-prefix network ldgr-id)]
+  [ledger-alias t]
+  (let [pre (ledger-garbage-prefix ledger-alias)]
     (str/join "_" [pre t])))
 
 (defn child-data
@@ -94,9 +94,9 @@
   "Writes garbage record out for latest index."
   [db changes-ch garbage]
   (go-try
-    (let [{:keys [conn ledger ledger-id t]} db
+    (let [{:keys [conn ledger ledger-alias t]} db
           t'       (- t) ;; use positive t integer
-          data     {:ledger-id ledger-id
+          data     {:ledger-alias ledger-alias
                     :block     t'
                     :garbage   garbage}
           ser      (serdeproto/-serialize-garbage (serde conn) data)
@@ -111,8 +111,8 @@
     (let [{:keys [conn ledger commit t ecount stats spot psot post opst
                   tspo fork fork-block]} db
           t'        (- t)
-          ledger-id (:id commit)
-          data      {:ledger-id ledger-id
+          ledger-alias (:id commit)
+          data      {:ledger-alias ledger-alias
                      :t         t'
                      :ecount    (or custom-ecount ecount)
                      :stats     (select-keys stats [:flakes :size])
@@ -130,6 +130,7 @@
       (notify-new-index-file changes-ch data res)
       res)))
 
+
 (defn read-branch
   [{:keys [serializer] :as conn} key]
   (go-try
@@ -144,7 +145,7 @@
 
 (defn reify-index-root
   "Turns each index root node into an unresolved node."
-  [_conn {:keys [network ledger-id comparators t]} index index-data]
+  [_conn {:keys [ledger-alias comparators t]} index index-data]
   (let [cmp (or (get comparators index)
                 (throw (ex-info (str "Internal error reifying db index root: "
                                      (pr-str index))
@@ -154,8 +155,7 @@
             (:rhs index-data) (update :rhs flake/parts->Flake)
             (:first index-data) (update :first flake/parts->Flake)
             true (assoc :comparator cmp
-                        :network network
-                        :ledger-id ledger-id
+                        :ledger-alias ledger-alias
                         :t t
                         :leftmost? true))))
 
@@ -176,9 +176,9 @@
 
 (defn read-garbage
   "Returns garbage file data for a given index t."
-  [conn network ledger-id t]
+  [conn ledger-alias t]
   (go-try
-    (let [key  (ledger-garbage-key network ledger-id t)
+    (let [key  (ledger-garbage-key ledger-alias t)
           data (<? (conn-proto/-index-file-read conn key))]
       (when data
         (serdeproto/-deserialize-garbage (serde conn) data)))))
@@ -191,9 +191,9 @@
      (let [data (<? (conn-proto/-index-file-read conn idx-address))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data)))))
-  ([conn network ledger-id block]
+  ([conn ledger-alias block]
    (go-try
-     (let [key  (ledger-root-key network ledger-id block)
+     (let [key  (ledger-root-key ledger-alias block)
            data (<? (conn-proto/-index-file-read conn key))]
        (when data
          (serdeproto/-deserialize-db-root (serde conn) data))))))
@@ -221,7 +221,7 @@
   [conn {:keys [id comparator leftmost?] :as branch}]
   (go-try
     (if-let [{:keys [children]} (<? (read-branch conn id))]
-      (let [branch-metadata (select-keys branch [:comparator :network :ledger-id
+      (let [branch-metadata (select-keys branch [:comparator :ledger-alias
                                                  :t :tt-id :tempid])
             child-attrs     (map-indexed (fn [i child]
                                            (-> branch-metadata
@@ -247,7 +247,7 @@
 
 (defn resolve-index-node
   ([conn node]
-   (resolve-index-node node nil))
+   (resolve-index-node conn node nil))
   ([conn {:keys [comparator leaf] :as node} error-fn]
    (assert comparator "Cannot resolve index node; configuration does not have a comparator.")
    (let [return-ch (async/chan)]
@@ -275,3 +275,21 @@
         empty-node (assoc node :flakes empty-set)]
     (async/put! ch empty-node)
     ch))
+
+(defn resolve-empty-branch
+  [{:keys [comparator ledger-alias] :as node}]
+  (let [ch         (async/chan)
+        child      (index/empty-leaf ledger-alias comparator)
+        children   (flake/sorted-map-by comparator child)
+        empty-node (assoc node :children children)]
+    (async/put! ch empty-node)
+    ch))
+
+(defn resolve-empty-node
+  [node]
+  (if (index/resolved? node)
+    (doto (async/chan)
+      (async/put! node))
+    (if (index/leaf? node)
+      (resolve-empty-leaf node)
+      (resolve-empty-branch node))))

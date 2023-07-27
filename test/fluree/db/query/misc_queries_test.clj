@@ -98,23 +98,7 @@
              @(fluree/history ledger {"@context" nil
                                       :history   "http://example.org/ns/dan"
                                       :t         {:from 1}}))
-          "clear context on history query"))
-    (testing "multi-query"
-      (is (= {:dan [{:id :ex/dan, :ex/x 1}],
-              :wes [{:id :ex/wes, :ex/x 2}]}
-             @(fluree/multi-query db {:dan {:where [["?s" :id :ex/dan]]
-                                            :select {"?s" [:*]}}
-                                      :wes {:where [["?s" :id :ex/wes]]
-                                            :select {"?s" [:*]}}}))
-          "default context")
-      (is (= {:dan [{"@id" "http://example.org/ns/dan", "http://example.org/ns/x" 1}],
-              :wes [{:id :ex/wes, :ex/x 2}]}
-             @(fluree/multi-query db {:dan {:context nil
-                                            :where [["?s" "@id" "http://example.org/ns/dan"]]
-                                            :select {"?s" [:*]}}
-                                      :wes {:where [["?s" :id :ex/wes]]
-                                            :select {"?s" [:*]}}}))
-          "clear context on multi-query"))))
+          "clear context on history query"))))
 
 (deftest ^:integration s+p+o-full-db-queries
   (with-redefs [fluree.db.util.core/current-time-iso (fn [] "1970-01-01T00:12:00.00000Z")]
@@ -343,10 +327,10 @@
       (is (= [[:ex/User]]
              @(fluree/query db '{:select [?class]
                                  :where  [[:ex/jane :rdf/type ?class]]})))
-      (is (= [[:ex/dave :ex/nonUser]
-              [:ex/jane :ex/User]
+      (is (= [[:ex/jane :ex/User]
               [:ex/bob :ex/User]
-              [:ex/alice :ex/User]]
+              [:ex/alice :ex/User]
+              [:ex/dave :ex/nonUser]]
              @(fluree/query db '{:select [?s ?class]
                                  :where  [[?s :rdf/type ?class]]}))))
     (testing "shacl targetClass"

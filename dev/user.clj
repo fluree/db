@@ -10,7 +10,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.util.json :as json]
             [fluree.db.serde.json :as serdejson]
-            [fluree.db.storage.core :as storage]
+            [fluree.db.storage :as storage]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
             [fluree.db.dbproto :as dbproto]
