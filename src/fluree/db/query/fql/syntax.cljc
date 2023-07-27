@@ -28,13 +28,6 @@
   [x]
   (boolean (#{'desc "desc" :desc} x)))
 
-(defn decode-multi-query-opts
-  [mq]
-  (if (and (map? mq) (contains? mq "opts"))
-    (let [opts (get mq "opts")]
-      (-> mq (assoc :opts opts) (dissoc "opts")))
-    mq))
-
 (defn one-select-key-present?
   [q]
   (log/trace "one-select-key-present? q:" q)
@@ -46,6 +39,48 @@
       (log/trace "one-select-key-present? skeys:" skeys)
       (= 1 (count skeys)))
     true))
+
+(defn query-schema
+  "Returns schema for queries, with any extra key/value pairs `extra-kvs`
+  added to the query map.
+  This allows eg http-api-gateway to amend the schema with required key/value pairs
+  it wants to require, which are not required/supported here in the db library."
+  [extra-kvs]
+  [:and
+   [:map-of ::json-ld-keyword :any]
+   [:fn
+    {:error/fn
+     (fn [{:keys [value]} _]
+       (str "Query: " (pr-str value) " does not have exactly one select clause. "
+            "One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. "
+            "See documentation here for more details: "
+            error-codes-page "#query-missing-select"))}
+    one-select-key-present?]
+   (into [:map {:closed true}
+          [:where ::where]
+          [:t {:optional true} ::t]
+          [:context {:optional true} ::context]
+          [:select {:optional true} ::select]
+          [:selectOne {:optional true} ::select]
+          [:select-one {:optional true} ::select]
+          [:selectDistinct {:optional true} ::select]
+          [:select-distinct {:optional true} ::select]
+          [:orderBy {:optional true} ::order-by]
+          [:order-by {:optional true} ::order-by]
+          [:groupBy {:optional true} ::group-by]
+          [:group-by {:optional true} ::group-by]
+          [:filter {:optional true} ::filter]
+          [:having {:optional true} ::function]
+          [:values {:optional true} ::values]
+          [:limit {:optional true} ::limit]
+          [:offset {:optional true} ::offset]
+          [:maxFuel {:optional true} ::max-fuel]
+          [:max-fuel {:optional true} ::max-fuel]
+          [:depth {:optional true} ::depth]
+          [:opts {:optional true} ::opts]
+          [:prettyPrint {:optional true} ::pretty-print]
+          [:pretty-print {:optional true} ::pretty-print]]
+         extra-kvs)])
 
 (def registry
   (merge
@@ -122,43 +157,7 @@
     ::t               [:or :int :string]
     ::context         ::v/context
     ::json-ld-keyword ::v/json-ld-keyword
-    ::query           [:and
-                       [:map-of ::json-ld-keyword :any]
-                       [:fn
-                        {:error/fn
-                         (fn [{:keys [value]} _]
-                           (str "Query: " (pr-str value) " does not have exactly one select clause. "
-                                "One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. "
-                                "See documentation here for more details: "
-                                error-codes-page "#query-missing-select"))}
-                        one-select-key-present?]
-                       [:map {:closed true}
-                        [:where ::where]
-                        [:t {:optional true} ::t]
-                        [:context {:optional true} ::context]
-                        [:select {:optional true} ::select]
-                        [:selectOne {:optional true} ::select]
-                        [:select-one {:optional true} ::select]
-                        [:selectDistinct {:optional true} ::select]
-                        [:select-distinct {:optional true} ::select]
-                        [:orderBy {:optional true} ::order-by]
-                        [:order-by {:optional true} ::order-by]
-                        [:groupBy {:optional true} ::group-by]
-                        [:group-by {:optional true} ::group-by]
-                        [:filter {:optional true} ::filter]
-                        [:having {:optional true} ::function]
-                        [:values {:optional true} ::values]
-                        [:limit {:optional true} ::limit]
-                        [:offset {:optional true} ::offset]
-                        [:maxFuel {:optional true} ::max-fuel]
-                        [:max-fuel {:optional true} ::max-fuel]
-                        [:depth {:optional true} ::depth]
-                        [:opts {:optional true} ::opts]
-                        [:prettyPrint {:optional true} ::pretty-print]
-                        [:pretty-print {:optional true} ::pretty-print]]]
-    ::multi-query     [:map {:decode/json decode-multi-query-opts}
-                       [:opts {:optional true} ::opts]
-                       [::m/default [:map-of [:or :string :keyword] ::query]]]
+    ::query           (query-schema [])
     ::modification    ::v/modification-txn}))
 
 (def triple-validator
@@ -170,9 +169,6 @@
 
 (def coerce-query*
   (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
-
-(def multi-query?
-  (m/validator ::multi-query {:registry registry}))
 
 (defn humanize-error
   [error]

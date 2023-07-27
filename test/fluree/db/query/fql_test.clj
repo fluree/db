@@ -198,31 +198,6 @@
         (is (= [["The Hitchhiker's Guide to the Galaxy"]]
                test-subject))))))
 
-(deftest ^:integration multi-query-test
-  (let [conn   (test-utils/create-conn)
-        people (test-utils/load-people conn)
-        db     (fluree/db people)]
-    (testing "multi queries"
-      (let [q       '{"alice" {:select {?s [:*]}
-                               :where  [[?s :schema/email "alice@example.org"]]}
-                      "brian" {:select {?s [:*]}
-                               :where  [[?s :schema/email "brian@example.org"]]}}
-            subject @(fluree/multi-query db q)]
-        (is (= {"alice" [{:id           :ex/alice
-                          :rdf/type     [:ex/User]
-                          :ex/favNums   [9 42 76]
-                          :schema/age   50
-                          :schema/email "alice@example.org"
-                          :schema/name  "Alice"}]
-                "brian" [{:id           :ex/brian
-                          :rdf/type     [:ex/User]
-                          :ex/favNums   7
-                          :schema/age   50
-                          :schema/email "brian@example.org"
-                          :schema/name  "Brian"}]}
-               subject)
-            "returns all results in a map keyed by alias.")))))
-
 (deftest ^:integration subject-object-test
   (let [conn (test-utils/create-conn {:defaults {:context-type :string
                                                  :context      {"id"     "@id",

@@ -296,12 +296,6 @@
   [db query]
   (promise-wrap (query-api/query db query)))
 
-(defn multi-query
-  [db multi-query]
-  (-> db
-      (query-api/multi-query multi-query)
-      promise-wrap))
-
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
   that produced the changes."

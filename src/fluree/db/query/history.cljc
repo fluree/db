@@ -17,20 +17,15 @@
             [malli.error :as me]
             [malli.transform :as mt]))
 
-(def registry
-  (merge
-   (m/base-schemas)
-   (m/type-schemas)
-   (m/predicate-schemas)
-   (m/comparator-schemas)
-   (m/sequence-schemas)
-   v/registry
-   {::iri             ::v/iri
-    ::json-ld-keyword ::v/json-ld-keyword
-    ::context         ::v/context
-    ::history-query
-    [:and
+(defn history-query-schema
+  "Returns schema for history queries, with any extra key/value pairs `extra-kvs`
+  added to the query map.
+  This allows eg http-api-gateway to amend the schema with required key/value pairs
+  it wants to require, which are not required/supported here in the db library."
+  [extra-kvs]
+  [:and
      [:map-of ::json-ld-keyword :any]
+   (into
      [:map
       [:history {:optional true}
        [:orn
@@ -75,9 +70,23 @@
          (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                    (<= from to)
                                    true))]]]]
+     extra-kvs)
      [:fn {:error/message "Must supply either a :history or :commit-details key."}
       (fn [{:keys [history commit-details t]}]
-        (or history commit-details))]]}))
+        (or history commit-details))]])
+
+(def registry
+  (merge
+   (m/base-schemas)
+   (m/type-schemas)
+   (m/predicate-schemas)
+   (m/comparator-schemas)
+   (m/sequence-schemas)
+   v/registry
+   {::iri             ::v/iri
+    ::json-ld-keyword ::v/json-ld-keyword
+    ::context         ::v/context
+    ::history-query   (history-query-schema [])}))
 
 (def coerce-history-query
   "Provide a time range :t and either :history or :commit-details, or both.
