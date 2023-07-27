@@ -459,7 +459,9 @@
       (doseq [shape shapes]
         (let [[valid? err-msg] (<? (validate-shape db shape s-flakes pid->p-flakes))]
           (when (not valid?)
-            (throw (ex-info err-msg
+            (throw (ex-info (if (str/starts-with? err-msg "SHACL shape is closed")
+                              err-msg
+                              (str "SHACL PropertyShape exception - " err-msg "."))
                             {:status 400 :error :db/shacl-validation}))))))))
 
 (defn build-property-base-shape
