@@ -36,75 +36,100 @@
   [child]
   (select-keys child [:id :leaf :first :rhs :size]))
 
+(defn notify-new-index-file
+  "Sends new file update into the changes notification async channel
+  if it exists. This is used to synchronize files across consensus, otherwise
+  a changes-ch won't be present and this won't be used."
+  [changes-ch written-node write-response]
+  (when changes-ch
+    (async/go
+      (let [file-type (cond
+                        (contains? written-node :children) :branch
+                        (contains? written-node :flakes) :leaf
+                        (contains? written-node :garbage) :garbage
+                        (contains? written-node :ecount) :root)]
+        (async/>! changes-ch {:event     :new-index-file
+                              :file-type file-type
+                              :data      write-response
+                              :address   (:address write-response)
+                              :t         (:t written-node)})))))
+
 (defn write-leaf
   "Writes `leaf` to storage under the provided `leaf-id`, computing a new id if
   one isn't provided. Returns the leaf map with the id used attached uner the
   `:id` key"
-  [{:keys [conn ledger] :as db} idx-type leaf]
+  [{:keys [conn ledger] :as _db} idx-type changes-ch leaf]
   (go-try
-    (let [ser (serdeproto/-serialize-leaf (serde conn) leaf)
-          res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
-      (log/warn "WRITE-LEAF COMPLETE WITH: " res)
-      res)))
+    (let [ser   (serdeproto/-serialize-leaf (serde conn) leaf)
+          res   (<? (conn-proto/-index-file-write conn ledger idx-type ser))
+          leaf' (assoc leaf :id (:address res))]
+      (notify-new-index-file changes-ch leaf' res)
+      leaf')))
 
 (defn write-branch-data
   "Serializes final data for branch and writes it to provided key.
   Returns two-tuple of response output and raw bytes written."
-  [{:keys [conn ledger] :as db} idx-type data]
+  [{:keys [conn ledger] :as _db} idx-type data]
   (go-try
     (let [ser (serdeproto/-serialize-branch (serde conn) data)
           res (<? (conn-proto/-index-file-write conn ledger idx-type ser))]
-      (log/warn "WRITE-BRANCH COMPLETE WITH: " res)
       res)))
 
 (defn write-branch
   "Writes `branch` to storage under the provided `branch-id`, computing a new id
   if one isn't provided. Returns the branch map with the id used attached uner
   the `:id` key"
-  [db idx-type  {:keys [children] :as branch}]
+  [db idx-type changes-ch {:keys [children] :as branch}]
   (go-try
-    (let [child-vals  (->> children
-                           (map val)
-                           (mapv child-data))
-          data        {:children child-vals}
-          res         (<? (write-branch-data db idx-type data))]
-      (assoc branch :id (:address res)))))
+    (let [child-vals (->> children
+                          (map val)
+                          (mapv child-data))
+          data       {:children child-vals}
+          res        (<? (write-branch-data db idx-type data))
+          branch'    (assoc branch :id (:address res))]
+      (notify-new-index-file changes-ch branch' res)
+      branch')))
 
 (defn write-garbage
   "Writes garbage record out for latest index."
-  [db garbage]
+  [db changes-ch garbage]
   (go-try
     (let [{:keys [conn ledger ledger-alias t]} db
-          t'          (- t) ;; use positive t integer
-          data        {:ledger-alias ledger-alias
-                       :t         t'
-                       :garbage   garbage}
-          ser         (serdeproto/-serialize-garbage (serde conn) data)]
-      (<? (conn-proto/-index-file-write conn ledger :garbage ser)))))
+          t'       (- t) ;; use positive t integer
+          data     {:ledger-alias ledger-alias
+                    :block     t'
+                    :garbage   garbage}
+          ser      (serdeproto/-serialize-garbage (serde conn) data)
+          res      (<? (conn-proto/-index-file-write conn ledger :garbage ser))
+          garbage' (assoc data :address (:address res))]
+      (notify-new-index-file changes-ch garbage' res)
+      garbage')))
 
 (defn write-db-root
-  ([db]
-   (write-db-root db nil))
-  ([db custom-ecount]
-   (go-try
-     (let [{:keys [conn ledger commit t ecount stats spot post opst tspo
-                   fork fork-block]} db
-           t'          (- t)
-           ledger-alias   (:id commit)
-           data        {:ledger-alias ledger-alias
-                        :t         t'
-                        :ecount    (or custom-ecount ecount)
-                        :stats     (select-keys stats [:flakes :size])
-                        :spot      (child-data spot)
-                        :post      (child-data post)
-                        :opst      (child-data opst)
-                        :tspo      (child-data tspo)
-                        :timestamp (util/current-time-millis)
-                        :prevIndex (or (:indexed stats) 0)
-                        :fork      fork
-                        :forkBlock fork-block}
-           ser         (serdeproto/-serialize-db-root (serde conn) data)]
-       (<? (conn-proto/-index-file-write conn ledger :root ser))))))
+  [db changes-ch custom-ecount]
+  (go-try
+    (let [{:keys [conn ledger commit t ecount stats spot psot post opst
+                  tspo fork fork-block]} db
+          t'        (- t)
+          ledger-alias (:id commit)
+          data      {:ledger-alias ledger-alias
+                     :t         t'
+                     :ecount    (or custom-ecount ecount)
+                     :stats     (select-keys stats [:flakes :size])
+                     :spot      (child-data spot)
+                     :psot      (child-data psot)
+                     :post      (child-data post)
+                     :opst      (child-data opst)
+                     :tspo      (child-data tspo)
+                     :timestamp (util/current-time-millis)
+                     :prevIndex (or (:indexed stats) 0)
+                     :fork      fork
+                     :forkBlock fork-block}
+          ser       (serdeproto/-serialize-db-root (serde conn) data)
+          res       (<? (conn-proto/-index-file-write conn ledger :root ser))]
+      (notify-new-index-file changes-ch data res)
+      res)))
+
 
 (defn read-branch
   [{:keys [serializer] :as conn} key]
