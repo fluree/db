@@ -208,15 +208,34 @@
             (recur r (conj res validation)))
           (coalesce-validation-results res))))))
 
+(defn validate-class-properties
+  [db {:keys [class] :as _p-shape} p-flakes]
+  (go-try
+    (loop [[f & r] p-flakes
+           res []]
+      (if f
+        (let [type-flakes  (<? (query-range/index-range
+                                db :spot = [(flake/o f) const/$rdf:type]))
+              expected-set (set class)
+              actual-set   (->> type-flakes (map flake/o) set)
+              validation   (if (= expected-set actual-set)
+                             [true (str "sh:not sh:class: class(es) "
+                                        expected-set
+                                        " must not be same set as "
+                                        actual-set)]
+                             [false (str "sh:class: class(es) " expected-set
+                                         " must be same set as "
+                                         actual-set)])]
+          (recur r (conj res validation)))
+        (coalesce-validation-results res)))))
+
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
   [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive min-length max-length pattern in node path] :as p-shape}
+           max-exclusive min-length max-length pattern in node class] :as p-shape}
    p-flakes
    db]
-  ;; TODO: Refactor this to thread a value through via e.g. cond->
-  ;;       Should embed results and error messages and short-circuit as appropriate
   (go-try
     (let [validation (if (or min-count max-count)
                        (validate-count-properties p-shape p-flakes)
@@ -234,6 +253,9 @@
                        validation)
           validation (if (and (first validation) node)
                        (<? (validate-node-constraint db p-shape p-flakes))
+                       validation)
+          validation (if (and (first validation) class)
+                       (<? (validate-class-properties db p-shape p-flakes))
                        validation)]
       validation)))
 
@@ -589,19 +611,6 @@
                       {:status 400 :error :db/shacl-validation})))
     dt-map*))
 
-(defn register-class
-  [{:keys [dt] :as dt-map} class-iris]
-  (log/trace "register-class dt-map:" dt-map)
-  (log/trace "register-class class-iris:" class-iris)
-  {:dt          dt
-   :class       class-iris
-   :validate-fn (fn [{:keys [type]}]
-                  (log/trace "class validate-fn class-iris:" class-iris)
-                  (log/trace "class validate-fn type:" type)
-                  (let [types (if (coll? type) type [type])]
-                    (= (set class-iris) (set types))))})
-
-
 (defn- merge-datatype
   "Merging functions for use with 'merge-with'.
   Ensures datatype merging values for each predicate are identical else throws."
@@ -711,37 +720,19 @@
               (let [property-shape (<? (build-property-shape db p o))
                     tagged-path    (:path property-shape)
 
-                    p-shape-key (first (first tagged-path))
-                    target-key  (first (peek tagged-path))
-                    p-shapes*   (conj p-shapes property-shape)
+                    target-key     (first (peek tagged-path))
+                    p-shapes*      (conj p-shapes property-shape)
                     ;; elevate following conditions to top-level custom keys to optimize validations
                     ;; when processing txs
 
-                    class-iris (when-let [class-sids (:class property-shape)]
-                                 (loop [[csid & csids] class-sids
-                                        ciris          []]
-                                   (let [ciri       (->> [csid const/iri-id]
-                                                         (query-range/index-range db :spot =)
-                                                         <?
-                                                         first
-                                                         flake/o)
-                                         next-ciris (conj ciris ciri)]
-                                     (if (seq csids)
-                                       (recur csids next-ciris)
-                                       next-ciris))))
+                    shape*         (cond-> shape
+                                     (:datatype property-shape)
+                                     (update-in [:datatype target-key]
+                                                register-datatype property-shape)
 
-                    shape* (cond-> shape
-                             (:datatype property-shape)
-                             (update-in [:datatype target-key]
-                                        register-datatype property-shape)
-
-                             (:node-kind property-shape)
-                             (update-in [:datatype target-key]
-                                        register-nodetype property-shape)
-
-                             (:class property-shape)
-                             (update-in [:datatype target-key]
-                                        register-class class-iris))]
+                                     (:node-kind property-shape)
+                                     (update-in [:datatype target-key]
+                                                register-nodetype property-shape))]
                 (recur r' shape* p-shapes*))
               (let [shape* (condp = p
                              const/$xsd:anyURI
