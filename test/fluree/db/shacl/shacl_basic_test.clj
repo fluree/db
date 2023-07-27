@@ -1056,18 +1056,29 @@
                                     "https://example.com/gender"  "Female"
                                     "@type"                       "https://example.com/Actor"
                                     "https://example.com/name"    "Rindsey Rohan"}])
-        ;; invalid type
+        ;; invalid inline type
         db4    @(fluree/stage db1 {"@id"                         "https://example.com/Actor/1001"
                                    "https://example.com/country" {"@id"                      "https://example.com/Country/Absurdistan"
                                                                   "@type"                    "https://example.com/FakeCountry"
                                                                   "https://example.com/name" "Absurdistan"}
                                    "https://example.com/gender"  "Male"
                                    "@type"                       "https://example.com/Actor"
-                                   "https://example.com/name"    "Not Real"})]
+                                   "https://example.com/name"    "Not Real"})
+        ;; invalid node ref type
+        db5    @(fluree/stage db1 [{"@id"                      "https://example.com/Country/Absurdistan"
+                                    "@type"                    "https://example.com/FakeCountry"
+                                    "https://example.com/name" "Absurdistan"}
+                                   {"@id"                         "https://example.com/Actor/8675309"
+                                    "https://example.com/country" {"@id" "https://example.com/Country/Absurdistan"}
+                                    "https://example.com/gender"  "Female"
+                                    "@type"                       "https://example.com/Actor"
+                                    "https://example.com/name"    "Jenny Tutone"}])]
     (is (not (util/exception? db2)))
     (is (not (util/exception? db3)))
     (is (util/exception? db4))
-    (is (str/includes? (ex-message db4) "Node did not pass"))))
+    (is (str/starts-with? (ex-message db4) "SHACL PropertyShape exception - sh:class"))
+    (is (util/exception? db5))
+    (is (str/starts-with? (ex-message db5) "SHACL PropertyShape exception - sh:class"))))
 
 (deftest shacl-in-test
   (testing "value nodes"
