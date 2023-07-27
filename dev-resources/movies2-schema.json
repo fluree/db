@@ -1,0 +1,156 @@
+[
+  {
+    "@type": ["sh:NodeShape"],
+    "sh:targetClass": { "@id": "https://example.com/Company" },
+    "sh:property": [
+      {
+        "sh:path": { "@id": "https://example.com/name" },
+        "sh:datatype": { "@id": "xsd:string" },
+        "sh:minCount": 1,
+        "sh:maxCount": 1
+      }
+    ]
+  },
+
+  {
+    "@type": ["sh:NodeShape"],
+    "sh:targetClass": { "@id": "https://example.com/Genre" },
+    "sh:property": [
+      {
+        "sh:path": { "@id": "https://example.com/name" },
+        "sh:datatype": { "@id": "xsd:string" },
+        "sh:minCount": 1,
+        "sh:maxCount": 1
+
+      }
+    ]
+  },
+  {
+    "@type": ["sh:NodeShape"],
+    "sh:targetClass": { "@id": "https://example.com/Country" },
+    "sh:property": [
+      {
+        "sh:path": { "@id": "https://example.com/population" },
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:float" }
+      },
+      {
+        "sh:path": { "@id": "https://example.com/area" },
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:float" },
+        "sh:description": "Area size in square miles"
+
+      },
+      {
+        "sh:path": { "@id": "https://example.com/region" },
+        "sh:datatype": { "@id": "xsd:string" },
+        "sh:maxCount": 1
+      },
+      {
+        "sh:path": { "@id": "https://example.com/isoCode" },
+        "sh:datatype": { "@id": "xsd:string" },
+        "sh:maxCount": 1,
+        "sh:description": "A standard for defining codes for the names of countries, dependent territories, and special areas of geographical interest (ISO 3166)"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/name" },
+        "sh:datatype": { "@id": "xsd:string" },
+        "sh:minCount": 1,
+        "sh:maxCount": 1
+      }
+    ]
+  },
+  {
+    "@type": ["sh:NodeShape"],
+    "sh:targetClass": { "@id": "https://example.com/Movie" },
+    "sh:property": [
+      {
+        "sh:path": { "@id": "https://example.com/genre" },
+        "sh:class": { "@id": "https://example.com/Genre" },
+        "sh:minCount": 1
+      },
+      {
+        "sh:path": { "@id": "https://example.com/company" },
+        "sh:class": { "@id": "https://example.com/Company" },
+        "sh:description": "Company of production"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/country" },
+        "sh:class": { "@id": "https://example.com/Country" },
+        "sh:description": "Country of production"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/budget" },
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:float" },
+        "sh:description": "Budget in United States dollars ($)"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/revenue" },
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:float" },
+        "sh:description": "Revenue in United States dollars ($)"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/runtime" },
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:float" },
+        "sh:description": "Length of movie in minutes"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/rating" },
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:float" },
+        "sh:description": "Rating out of 10"
+      },
+
+      {
+        "sh:path": { "@id": "https://example.com/overview" },
+        "sh:minCount": 1,
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:string" }
+      },
+      {
+        "sh:path": { "@id": "https://example.com/title" },
+        "sh:minCount": 1,
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:string" }
+      }
+    ]
+  },
+  {
+    "@type": ["sh:NodeShape"],
+    "sh:targetClass": { "@id": "https://example.com/Actor" },
+    "sh:property": [
+      {
+        "sh:path": { "@id": "https://example.com/movie" },
+        "sh:class": { "@id": "https://example.com/Movie" },
+        "sh:description": "Movies actor has starred in"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/country" },
+        "sh:class": { "@id": "https://example.com/Country" },
+        "sh:maxCount": 1,
+        "sh:description": "Birth country"
+      },
+      {
+        "sh:path": { "@id": "https://example.com/character" },
+        "sh:datatype": { "@id": "xsd:string" },
+        "sh:description": "Characters this actor has played"
+
+      },
+      {
+        "sh:path": { "@id": "https://example.com/gender" },
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:string" }
+      },
+      {
+        "sh:path": { "@id": "https://example.com/name" },
+        "sh:minCount": 1,
+        "sh:maxCount": 1,
+        "sh:datatype": { "@id": "xsd:string" }
+      }
+    ]
+  }
+]
+
