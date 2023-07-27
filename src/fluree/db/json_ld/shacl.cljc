@@ -198,7 +198,8 @@
 (defn validate-node-constraint
   [db {:keys [node] :as _p-shape} p-flakes]
   (go-try
-    (let [shape (<? (build-node-shape db node))]
+    (let [shape-flakes (<? (query-range/index-range db :spot = [node]))
+          shape        (<? (build-node-shape db shape-flakes))]
       (loop [[f & r] p-flakes
              res []]
         (if f
@@ -354,15 +355,16 @@
   [db {:keys [path qualified-value-shape qualified-min-count qualified-max-count qualified-value-shapes-disjoint] :as p-shape}
    p-flakes]
   (go-try
-    (let [qualified-shape (<? (build-property-shape db const/$sh:qualifiedValueShape qualified-value-shape))]
-      (loop [[f & r] p-flakes
+    (let [q-shape-flakes (<? (query-range/index-range db :spot = [qualified-value-shape]))
+          q-shape        (<? (build-property-shape db const/$sh:qualifiedValueShape q-shape-flakes))]
+      (loop [[f & r]    p-flakes
              conforming #{}]
         (if f
           (let [sid           (flake/o f)
                 s-flakes      (<? (query-range/index-range db :spot = [sid]))
                 pid->p-flakes (group-by flake/p s-flakes)
-                path-flakes   (<? (resolve-path-flakes db sid (:path qualified-shape) pid->p-flakes))
-                [valid? :as res] (<? (validate-property-constraints qualified-shape path-flakes db))]
+                path-flakes   (<? (resolve-path-flakes db sid (:path q-shape) pid->p-flakes))
+                [valid?]      (<? (validate-property-constraints q-shape path-flakes db))]
             (recur r (if valid?
                        (conj conforming sid)
                        conforming)))
@@ -391,11 +393,11 @@
 (defn validate-q-shapes
   [db q-shapes sid pid->p-flakes]
   (go-try
-    (loop [[{:keys [path] :as p-shape} & r] q-shapes
+    (loop [[{:keys [path] :as q-shape} & r] q-shapes
            conforming-q-shapes []]
-      (if p-shape
+      (if q-shape
         (let [path-flakes (<? (resolve-path-flakes db sid path pid->p-flakes))
-              conforming  (<? (validate-qualified-shape-constraints db p-shape path-flakes))]
+              conforming  (<? (validate-qualified-shape-constraints db q-shape path-flakes))]
           (recur r (conj conforming-q-shapes conforming)))
 
         (loop [[disjoint-shape & r] (filter :qualified-value-shapes-disjoint conforming-q-shapes)
@@ -699,63 +701,62 @@
         (assoc p-shape :path tagged-path)))))
 
 (defn build-property-shape
-  [db p shape-sid]
+  [db p p-shape-flakes]
   (go-try
-    (let [p-flakes (<? (query-range/index-range db :spot = [shape-sid]))
-          base     (build-property-base-shape p-flakes)
+    (let [base     (build-property-base-shape p-shape-flakes)
           base*    (<? (resolve-path-types base db))]
       (cond-> base*
         (:pattern base) (build-pattern)
         (= p const/$sh:not) (assoc :logical-constraint :not, :required? false)))))
 
 (defn build-node-shape
-  [db shape-sid]
+  [db shape-flakes]
   (go-try
-    (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))]
-      (loop [[flake & r'] shape-flakes
-             shape    {}
-             p-shapes []]
-        (if flake
-          (let [p (flake/p flake)
-                o (flake/o flake)]
-            (if (#{const/$sh:property const/$sh:not} p)
-              (let [property-shape (<? (build-property-shape db p o))
-                    tagged-path    (:path property-shape)
+    (loop [[flake & r'] shape-flakes
+           shape    {}
+           p-shapes []]
+      (if flake
+        (let [p (flake/p flake)
+              o (flake/o flake)]
+          (if (#{const/$sh:property const/$sh:not} p)
+            (let [p-shape-flakes (<? (query-range/index-range db :spot = [o]))
+                  property-shape (<? (build-property-shape db p p-shape-flakes))
+                  tagged-path    (:path property-shape)
 
-                    target-key     (first (peek tagged-path))
-                    p-shapes*      (conj p-shapes property-shape)
-                    ;; elevate following conditions to top-level custom keys to optimize validations
-                    ;; when processing txs
+                  target-key     (first (peek tagged-path))
+                  p-shapes*      (conj p-shapes property-shape)
+                  ;; elevate following conditions to top-level custom keys to optimize validations
+                  ;; when processing txs
 
-                    shape*         (cond-> shape
-                                     (:datatype property-shape)
-                                     (update-in [:datatype target-key]
-                                                register-datatype property-shape)
+                  shape*         (cond-> shape
+                                   (:datatype property-shape)
+                                   (update-in [:datatype target-key]
+                                              register-datatype property-shape)
 
-                                     (:node-kind property-shape)
-                                     (update-in [:datatype target-key]
-                                                register-nodetype property-shape))]
-                (recur r' shape* p-shapes*))
-              (let [shape* (condp = p
-                             const/$xsd:anyURI
-                             (assoc shape :id o)
+                                   (:node-kind property-shape)
+                                   (update-in [:datatype target-key]
+                                              register-nodetype property-shape))]
+              (recur r' shape* p-shapes*))
+            (let [shape* (condp = p
+                           const/$xsd:anyURI
+                           (assoc shape :id o)
 
-                             const/$sh:targetClass
-                             (assoc shape :target-class o)
+                           const/$sh:targetClass
+                           (assoc shape :target-class o)
 
-                             const/$sh:closed
-                             (if (true? o)
-                               (assoc shape :closed? true)
-                               shape)
+                           const/$sh:closed
+                           (if (true? o)
+                             (assoc shape :closed? true)
+                             shape)
 
-                             const/$sh:ignoredProperties
-                             (update shape :ignored-properties
-                                     (fnil conj #{const/$xsd:anyURI}) o)
+                           const/$sh:ignoredProperties
+                           (update shape :ignored-properties
+                                   (fnil conj #{const/$xsd:anyURI}) o)
 
-                             ;; else
-                             shape)]
-                (recur r' shape* p-shapes))))
-          (assoc shape :property p-shapes))))))
+                           ;; else
+                           shape)]
+              (recur r' shape* p-shapes))))
+        (assoc shape :property p-shapes)))))
 
 (defn build-shapes
   [db shape-sids]
@@ -765,7 +766,8 @@
              datatype nil
              shapes   []]
         (if shape-sid
-          (let [shape     (<? (build-node-shape db shape-sid))
+          (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))
+                shape (<? (build-node-shape db shape-flakes))
                 datatype* (merge-with merge-datatype datatype (:datatype shape))]
             (recur r datatype* (conj shapes shape)))
           {:shapes   shapes
