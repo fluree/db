@@ -498,7 +498,8 @@
 
 (defn update?
   [x]
-  (and (or (update/insert? x)
+  (and (map? x)
+       (or (update/insert? x)
            (update/retract? x))
        (or (contains? x :where)
            (contains? x "where"))))
