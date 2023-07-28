@@ -211,21 +211,23 @@
 (defn validate-class-properties
   [db {:keys [class] :as _p-shape} p-flakes]
   (go-try
+    (log/trace "validate-class-properties class:" class)
+    (log/trace "validate-class-properties p-flakes:" p-flakes)
     (loop [[f & r] p-flakes
            res []]
       (if f
-        (let [type-flakes  (<? (query-range/index-range
-                                db :spot = [(flake/o f) const/$rdf:type]))
-              expected-set (set class)
-              actual-set   (->> type-flakes (map flake/o) set)
-              validation   (if (= expected-set actual-set)
-                             [true (str "sh:not sh:class: class(es) "
-                                        expected-set
-                                        " must not be same set as "
-                                        actual-set)]
-                             [false (str "sh:class: class(es) " expected-set
-                                         " must be same set as "
-                                         actual-set)])]
+        (let [type-flakes (<? (query-range/index-range
+                               db :spot = [(flake/o f) const/$rdf:type]))
+              type-set    (->> type-flakes (map flake/o) set)
+              _           (log/trace "validate-class-properties type-set:"
+                                     type-set)
+              validation  (if (= class type-set)
+                            [true (str "sh:not sh:class: class(es) "
+                                       class " must not be same set as "
+                                       type-set)]
+                            [false (str "sh:class: class(es) "
+                                        class " must be same set as "
+                                        type-set)])]
           (recur r (conj res validation)))
         (coalesce-validation-results res)))))
 
@@ -486,7 +488,7 @@
          ;; Note that multiple values for sh:class are interpreted as a conjunction,
          ;; i.e. the values need to be SHACL instances of all of them.
          const/$sh:class
-         (update acc :class (fnil conj []) o)
+         (update acc :class (fnil conj #{}) o)
 
          const/$sh:pattern
          (assoc acc :pattern o)

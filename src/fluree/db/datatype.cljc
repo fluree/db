@@ -83,9 +83,9 @@
   "Infers a default data type if not otherwise provided."
   [x]
   (cond
-    (string? x)  const/$xsd:string
+    (string? x) const/$xsd:string
     (integer? x) const/$xsd:long ; infer to long to prevent overflow
-    (number? x)  const/$xsd:decimal
+    (number? x) const/$xsd:decimal
     (boolean? x) const/$xsd:boolean))
 
 #?(:cljs
@@ -128,18 +128,18 @@
         local timezone according to your device."
   [s]
   (when-let [matches (re-matches iso8601-time-re s)]
-    #?(:clj (let [time-parts (->> matches rest butlast)
-                  offset     (last matches)
+    #?(:clj  (let [time-parts (->> matches rest butlast)
+                   offset     (last matches)
 
-                  [hours minutes seconds second-fraction]
-                  (->> time-parts
-                       (map #(or % "0"))
-                       (map #(Integer/parseInt %)))
+                   [hours minutes seconds second-fraction]
+                   (->> time-parts
+                        (map #(or % "0"))
+                        (map #(Integer/parseInt %)))
 
-                  nanos (* second-fraction 1000000)]
-              (if offset
-                (OffsetTime/of hours minutes seconds nanos (ZoneOffset/of ^String offset))
-                (LocalTime/of hours minutes seconds nanos)))
+                   nanos      (* second-fraction 1000000)]
+               (if offset
+                 (OffsetTime/of hours minutes seconds nanos (ZoneOffset/of ^String offset))
+                 (LocalTime/of hours minutes seconds nanos)))
        :cljs (js/Date. (str "1970-01-01T" s)))))
 
 (defn- parse-iso8601-datetime
@@ -152,13 +152,13 @@
   (when-let [matches (re-matches iso8601-datetime-re s)]
     #?(:clj
        (let [datetime-parts (->> matches rest (take 7))
-             offset   (last matches)
+             offset         (last matches)
              [years months days hours minutes seconds second-fraction]
              (->> datetime-parts
                   (map #(or % "0"))
                   (map #(Integer/parseInt %)))
 
-             nanos (* second-fraction 1000000)]
+             nanos          (* second-fraction 1000000)]
          (if offset
            (OffsetDateTime/of years months days hours minutes seconds nanos
                               (ZoneOffset/of ^String offset))
@@ -397,20 +397,13 @@
   return nil prompting downstream process to look up (or create) a custom data
   type. Value coercion is only attempted when a required-type is supplied."
   [{:keys [type value] :as _value-map} required-type]
-  (let [type-id (if type
-                  (get default-data-types type)
-                  (infer value))
-        _       (log/trace "from-expanded type:" type-id)
-        value*  (coerce value type-id)]
-    (cond (and required-type (not= type-id required-type))
-          (throw (ex-info (str "Required data type " required-type
-                               " does not match provided data type: " type ".")
-                          {:status 400 :error :db/shacl-required}))
+  (let [type-id (if type (get default-data-types type) (infer value))
+        to-type (if required-type required-type type-id)
+        value*  (coerce value to-type)]
+    (cond
+      (nil? value*)
+      (throw (ex-info (str "Data type " to-type
+                           " cannot be coerced from provided value: " value ".")
+                      {:status 400 :error, :db/shacl-value-coercion}))
 
-          (nil? value*)
-          (throw (ex-info (str "Data type " type-id
-                               " cannot be coerced from provided value: " value ".")
-                          {:status 400 :error :db/shacl-value-coercion}))
-
-          :else
-          [value type-id])))
+      :else [value to-type])))

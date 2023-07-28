@@ -463,6 +463,7 @@
            flakes   (if (q-parse/update? tx)
                       (<? (modify db fuel-tracker tx tx-state))
                       (<? (insert db fuel-tracker tx tx-state)))]
+       (log/trace "stage flakes:" flakes)
        (<? (flakes->final-db tx-state flakes))))))
 
 (defn stage-ledger

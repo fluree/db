@@ -1,10 +1,13 @@
 (ns fluree.db.transact.transact-test
-  (:require [clojure.test :refer :all]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.test :refer :all]
             [fluree.db.did :as did]
-            [fluree.db.util.core :as util]
-            [fluree.db.test-utils :as test-utils]
             [fluree.db.json-ld.api :as fluree]
-            [clojure.string :as str]))
+            [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.core :as util]
+            [jsonista.core :as json]
+            [test-with-files.tools :refer [with-tmp-dir]]))
 
 (deftest ^:integration staging-data
   (testing "Disallow staging invalid transactions"
@@ -159,11 +162,11 @@
                                              :f/targetRole :ex/userRole
                                              :f/action     [:f/view]}]}]
           db-data-first   @(fluree/stage
-                             (fluree/db ledger)
-                             (into data policy))
+                            (fluree/db ledger)
+                            (into data policy))
           db-policy-first @(fluree/stage
-                             (fluree/db ledger)
-                             (into policy data))
+                            (fluree/db ledger)
+                            (into policy data))
           user-query      '{:select {?s [:*]}
                             :where  [[?s :rdf/type :ex/User]]}]
       (let [users [{:id :ex/john, :rdf/type [:ex/User], :schema/name "John"}
@@ -172,3 +175,31 @@
                @(fluree/query db-data-first user-query)))
         (is (= users
                @(fluree/query db-policy-first user-query)))))))
+
+(deftest ^:integration transact-large-dataset-test
+  (with-tmp-dir storage-path
+    (testing "can transact a big movies dataset w/ SHACL constraints"
+      (let [shacl   (-> "movies2-schema.json" io/resource json/read-value)
+            movies  (-> "movies2.json" io/resource json/read-value)
+            ;; TODO: Once :method :memory supports indexing, switch to that.
+            conn    @(fluree/connect {:method       :file
+                                      :storage-path storage-path
+                                      :defaults
+                                      {:context test-utils/default-str-context}})
+            ledger  @(fluree/create conn "movies2"
+                                    {:defaultContext
+                                     ["" {"ex" "https://example.com/"}]})
+            db0     @(fluree/stage (fluree/db ledger) shacl)
+            _       (assert (not (util/exception? db0)))
+            db1     @(fluree/commit! ledger db0)
+            _       (assert (not (util/exception? db1)))
+            db2     @(fluree/stage db0 movies)
+            _       (assert (not (util/exception? db2)))
+            query   {"select" "?title"
+                     "where"  [["?m" "rdf:type" "ex:Movie"]
+                               ["?m" "ex:title" "?title"]]}
+            results @(fluree/query db2 query)]
+        (is (= 100 (count results)))
+        (is (every? (set results)
+                    ["Interstellar" "Wreck-It Ralph" "The Jungle Book" "WALL·E"
+                     "Iron Man" "Avatar"]))))))

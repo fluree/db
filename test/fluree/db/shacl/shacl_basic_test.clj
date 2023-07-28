@@ -115,12 +115,10 @@
                          (catch Exception e e))]
       (is (util/exception? db-int-name)
           "Exception, because :schema/name is an integer and not a string.")
-      (is (str/starts-with? (ex-message db-int-name)
-                            "Required data type"))
+      (is (str/starts-with? (ex-message db-int-name) "Data type"))
       (is (util/exception? db-bool-name)
           "Exception, because :schema/name is a boolean and not a string.")
-      (is (str/starts-with? (ex-message db-bool-name)
-                            "Required data type"))
+      (is (str/starts-with? (ex-message db-bool-name) "Data type"))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
                :rdf/type    [:ex/User]
@@ -920,8 +918,7 @@
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
-      (is (str/starts-with? (ex-message db-num-email)
-                            "Required data type"))
+      (is (str/starts-with? (ex-message db-num-email) "Data type"))
       (is (= [{:id           :ex/john
                :rdf/type     [:ex/User]
                :schema/age   40
@@ -1173,7 +1170,7 @@
                                                 "ex:name" 123
                                                 "type"    "ex:User"}])]
         (is (util/exception? db-bad-friend-name))
-        (is (str/includes? (ex-message db-bad-friend-name) "data type"))))
+        (is (str/includes? (ex-message db-bad-friend-name) "Data type"))))
     (testing "maxCount"
       (let [conn          @(fluree/connect {:method :memory
                                             :defaults
