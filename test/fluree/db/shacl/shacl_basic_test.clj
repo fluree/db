@@ -1343,12 +1343,12 @@
       (is (util/exception? invalid-person))
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message invalid-person)))))
-  (testing "sh:qualifiedValueShape"
+
+  (testing "sh:qualifiedValueShape property shape"
     (let [conn        @(fluree/connect {:method :memory})
           ledger      @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
                                                                                 {"ex" "http://example.com/"}]})
           db0         (fluree/db ledger)
-
           db1         @(fluree/stage db0 [{"id"             "ex:KidShape"
                                            "type"           "sh:NodeShape"
                                            "sh:targetClass" {"id" "ex:Kid"}
@@ -1380,6 +1380,52 @@
       (is (util/exception? invalid-kid))
       (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
              (ex-message invalid-kid)))))
+  #_(testing "sh:qualifiedValueShape node shape"
+    (let [conn   @(fluree/connect {:method :memory})
+          ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
+                                                                           {"ex" "http://example.com/"}]})
+          db0    (fluree/db ledger)
+
+          db1    @(fluree/stage db0 [{"id" "ex:KidShape"
+                                      "type" "sh:NodeShape"
+                                      "sh:targetClass" {"id" "ex:Kid"}
+                                      "sh:property"
+                                      [{"sh:path" {"id" "ex:parent"}
+                                        "sh:minCount" 2
+                                        "sh:maxCount" 2
+                                        "sh:qualifiedValueShape" {"id" "ex:ParentShape"
+                                                                  "type" "sh:NodeShape"
+                                                                  "sh:targetClass" {"id" "ex:Parent"}
+                                                                  "sh:property" {"sh:path" {"id" "ex:gender"}
+                                                                                 "sh:pattern" "female"}}
+                                        "sh:qualifiedMinCount" 1}]}
+                                     {"id" "ex:Mom"
+                                      "type" "ex:Parent"
+                                      "ex:gender" "female"}
+                                     {"id" "ex:Dad"
+                                      "type" "ex:Parent"
+                                      "ex:gender" "male"}])
+          valid-kid @(fluree/stage db1 [{"id" "ex:ValidKid"
+                                         "type" "ex:Kid"
+                                         "ex:parent" [{"id" "ex:Mom"} {"id" "ex:Dad"}]}])
+          invalid-kid @(fluree/stage db1 [{"id" "ex:InvalidKid"
+                                           "type" "ex:Kid"
+                                           "ex:parent" [{"id" "ex:Bob"}
+                                                        {"id" "ex:Zorba"
+                                                         "type" "ex:Parent"
+                                                         "ex:gender" "alien"}]}])
+          ]
+      (def valid-kid valid-kid)
+
+      (is (= [{"id" "ex:ValidKid"
+               "rdf:type" ["ex:Kid"]
+               "ex:parent" [{"id" "ex:Mom"}
+                            {"id" "ex:Dad"}]}]
+             @(fluree/query valid-kid {"select" {"?s" ["*"]}
+                                       "where" [["?s" "id" "ex:ValidKid"]]})))
+      (is (util/exception? invalid-kid))
+      (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
+               (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn         @(fluree/connect {:method :memory})
           ledger       @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context

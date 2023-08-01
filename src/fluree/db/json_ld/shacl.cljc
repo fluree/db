@@ -356,15 +356,24 @@
    p-flakes]
   (go-try
     (let [q-shape-flakes (<? (query-range/index-range db :spot = [qualified-value-shape]))
-          q-shape        (<? (build-property-shape db const/$sh:qualifiedValueShape q-shape-flakes))]
+          node-shape?    (->> q-shape-flakes
+                              (filter #(and (= (flake/p %) const/$rdf:type)
+                                            (= (flake/o %) const/$sh:NodeShape)))
+                              (first))
+          q-shape        (if node-shape?
+                           (<? (build-node-shape db q-shape-flakes))
+                           (<? (build-property-shape db const/$sh:qualifiedValueShape q-shape-flakes)))]
       (loop [[f & r]    p-flakes
              conforming #{}]
         (if f
           (let [sid           (flake/o f)
                 s-flakes      (<? (query-range/index-range db :spot = [sid]))
                 pid->p-flakes (group-by flake/p s-flakes)
-                path-flakes   (<? (resolve-path-flakes db sid (:path q-shape) pid->p-flakes))
-                [valid?]      (<? (validate-property-constraints q-shape path-flakes db))]
+
+                [valid?] (if node-shape?
+                           (<? (validate-shape db q-shape s-flakes pid->p-flakes))
+                           (let [path-flakes (<? (resolve-path-flakes db sid (:path q-shape) pid->p-flakes))]
+                             (<? (validate-property-constraints q-shape path-flakes db))))]
             (recur r (if valid?
                        (conj conforming sid)
                        conforming)))
@@ -421,9 +430,9 @@
 (defn validate-shape
   "Check to see if each property shape is valid, then check node shape constraints."
   [db {:keys [property] :as shape} s-flakes pid->p-flakes]
-  (log/debug "validate-shape" shape)
   (go-try
     (let [sid (flake/s (first s-flakes))]
+      (log/debug "validate-shape" sid shape )
       (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
              q-shapes             []
              validated-properties #{}
@@ -442,7 +451,9 @@
                    (if qualified-value-shape ; build up collection of q-shapes for further processing
                      (conj q-shapes p-shape)
                      q-shapes)
-                   (conj validated-properties pid)
+                   (if pid
+                     (conj validated-properties pid)
+                     validated-properties)
                    (conj results res)))
 
           (let [ ;; check qualifed shape constraints
