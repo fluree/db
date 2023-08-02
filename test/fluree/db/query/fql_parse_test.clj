@@ -115,14 +115,14 @@
       (testing "not a `:class` pattern if obj is a var"
         (let [query {:context {:ex "http://example.org/ns/"}
                      :select  ['?class]
-                     :where   [[:ex/cam :rdf/type '?class]]}
+                     :where   [[:ex/cam :type '?class]]}
               {:keys [where]} (parse/parse-analytical-query query db)
               {::where/keys [patterns]} where]
           (is (= :tuple
                 (where/pattern-type (first patterns))))))
       (testing "class, optional"
         (let [optional-q {:select ['?name '?favColor]
-                          :where  [['?s :rdf/type :ex/User]
+                          :where  [['?s :type :ex/User]
                                    ['?s :schema/name '?name]
                                    {:optional ['?s :ex/favColor '?favColor]}]}
               {:keys [select where] :as parsed} (parse/parse-analytical-query optional-q db)
@@ -148,7 +148,7 @@
                  patterns))))
       (testing "class, union"
         (let [union-q {:select ['?s '?email1 '?email2]
-                       :where  [['?s :rdf/type :ex/User]
+                       :where  [['?s :type :ex/User]
                                 {:union [[['?s :ex/email '?email1]]
                                          [['?s :schema/email '?email2]]]}]}
               {:keys [select where] :as parsed} (parse/parse-analytical-query union-q db)
@@ -175,7 +175,7 @@
                  patterns))))
       (testing "class, filters"
         (let [filter-q {:select ['?name '?age]
-                        :where  [['?s :rdf/type :ex/User]
+                        :where  [['?s :type :ex/User]
                                  ['?s :schema/age '?age]
                                  ['?s :schema/name '?name]
                                  {:filter ["(> ?age 45)", "(< ?age 50)"]}]}

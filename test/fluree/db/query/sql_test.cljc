@@ -45,7 +45,7 @@
                    (:select subject))
                 "correctly constructs the select clause")
 
-            (is (= [["?person" "rdf:type" "person"]]
+            (is (= [["?person" "type" "person"]]
                    (:where subject))
                 "correctly constructs the where clause"))))
 
@@ -186,7 +186,7 @@
                    (:select subject))
                 "correctly constructs the select clause")
 
-            (is (= [["?person" "rdf:type" "person"]
+            (is (= [["?person" "type" "person"]
                     {:optional [["?person" "person/email" "?personEmail"]]}
                     {:filter ["(nil? ?personEmail)"]}
                     ["?person" "person/name" "?personName"]
@@ -204,7 +204,7 @@
                      (:select subject))
                   "correctly constructs the select clause")
 
-              (is (= [["?person" "rdf:type" "person"]
+              (is (= [["?person" "type" "person"]
                       ["?person" "person/middleName" "?personMiddleName"]]
                      (:where subject))
                   "correctly constructs the where clause"))
@@ -217,7 +217,7 @@
                      (:select subject))
                     "correctly constructs the select clause")
 
-                (is (= [["?person" "rdf:type" "person"]
+                (is (= [["?person" "type" "person"]
                         ["?person" "person/middleName" "?personMiddleName"]]
                        (:where subject))
                     "correctly constructs the where clause")))))))

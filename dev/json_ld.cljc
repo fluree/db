@@ -37,7 +37,7 @@
                             (println "ledger" (pr-str ledger))
                             (-> (fluree/query (fluree/db ledger)
                                               {:select {'?s [:* {:f/role [:*]}]}
-                                               :where [['?s :rdf/type :f/DID]]})
+                                               :where [['?s :type :f/DID]]})
                                 (.then (fn [q0] (println "q0" q0))))
 
 
@@ -95,7 +95,7 @@
 
   @(fluree/query (fluree/db ledger)
                  {:select {'?s [:* {:f/role [:*]}]}
-                  :where  [['?s :rdf/type :f/DID]]})
+                  :where  [['?s :type :f/DID]]})
 
   (def newdb
     @(fluree/stage
@@ -176,7 +176,7 @@
                             :from   :f/Rule})
 
   @(fluree/query latest-db {:select {'?s [:* {:f/role [:*]}]}
-                            :where  [['?s :rdf/type :f/DID]]})
+                            :where  [['?s :type :f/DID]]})
 
 
 

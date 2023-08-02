@@ -117,7 +117,7 @@
        (= :list (-> v first key))))
 
 (defn get-subject-types
-  "Returns a set of all :rdf/type Class subject ids for the provided subject.
+  "Returns a set of all :type Class subject ids for the provided subject.
   new-types are a set of newly created types in the transaction."
   [db sid added-classes]
   (go-try

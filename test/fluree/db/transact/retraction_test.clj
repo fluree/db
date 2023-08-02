@@ -33,6 +33,6 @@
                               :select {?s [:*]},
                               :where [[?s :id :ex/alice]]})
              [{:id           :ex/alice,
-               :rdf/type     [:ex/User],
+               :type     [:ex/User],
                :schema/name  "Alice"}])
           "Alice should no longer have an age property"))))

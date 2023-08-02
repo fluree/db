@@ -46,21 +46,21 @@
       (is (= [["David" 46]
               ["Brian" 50]]
              @(fluree/query db {:select ['?name '?age]
-                                :where  [['?s :rdf/type :ex/User]
+                                :where  [['?s :type :ex/User]
                                          ['?s :schema/age '?age]
                                          ['?s :schema/name '?name]
                                          {:filter ["(> ?age 45)"]}]}))))
     (testing "multiple filters on same var"
       (is (= [["David" 46]]
              @(fluree/query db {:select ['?name '?age]
-                                :where  [['?s :rdf/type :ex/User]
+                                :where  [['?s :type :ex/User]
                                          ['?s :schema/age '?age]
                                          ['?s :schema/name '?name]
                                          {:filter ["(> ?age 45)", "(< ?age 50)"]}]}))))
     (testing "multiple filters, different vars"
       (is (= [["Brian" "Smith"]]
              @(fluree/query db {:select ['?name '?last]
-                                :where  [['?s :rdf/type :ex/User]
+                                :where  [['?s :type :ex/User]
                                          ['?s :schema/age '?age]
                                          ['?s :schema/name '?name]
                                          ['?s :ex/last '?last]
@@ -69,7 +69,7 @@
     (testing "nested filters"
       (is (= [["Brian" 50]]
              @(fluree/query db '{:select [?name ?age]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/age ?age]
                                           [?s :schema/name ?name]
                                           {:filter ["(> ?age (/ (+ ?age 47) 2))"]}]}))))
@@ -78,7 +78,7 @@
     ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
       (is (= [{:id :ex/david,
-               :rdf/type [:ex/User],
+               :type [:ex/User],
                :schema/name "David",
                :ex/last "Jones",
                :schema/email "david@example.org",
@@ -86,7 +86,7 @@
                :ex/favNums [15 70],
                :ex/friend {:id :ex/cam}}
               {:id :ex/brian,
-               :rdf/type [:ex/User],
+               :type [:ex/User],
                :schema/name "Brian",
                :ex/last "Smith",
                :schema/email "brian@example.org",
@@ -96,7 +96,7 @@
                                 :where  [["?s" :schema/age "?age"]
                                          {:filter ["(> ?age 45)"]}]})))
       (is (= [{:id :ex/david,
-               :rdf/type [:ex/User],
+               :type [:ex/User],
                :schema/name "David",
                :ex/last "Jones",
                :schema/email "david@example.org",
@@ -106,7 +106,7 @@
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  [["?s" :schema/age "?age"]
                                          {:filter ["(> ?age 45)", "(< ?age 50)"]}]})))
-      (is (= [{:rdf/type [:ex/User]
+      (is (= [{:type [:ex/User]
                :schema/email "cam@example.org"
                :ex/favNums [5 10]
                :schema/age 34

@@ -23,7 +23,7 @@
                                          :where  [[?s :id :ex/myClassInstance]]})]
       (is (= query-res
              [{:id                 :ex/myClassInstance
-               :rdf/type           [:ex/MyClass]
+               :type           [:ex/MyClass]
                :schema/description "Now a new subject uses MyClass as a Class"}])))))
 
 
@@ -32,7 +32,7 @@
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :rdf/type :ex/User]]}
+                        :where  [['?s :type :ex/User]]}
           db           @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/UserShape
@@ -73,7 +73,7 @@
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-names)))
       (is (= [{:id              :ex/john,
-               :rdf/type        [:ex/User],
+               :type        [:ex/User],
                :schema/name     "John",
                :schema/callSign "j-rock"}]
              @(fluree/query db-ok user-query))
@@ -85,7 +85,7 @@
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :rdf/type :ex/User]]}
+                        :where  [['?s :type :ex/User]]}
           db           @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/UserShape
@@ -121,17 +121,16 @@
       (is (str/starts-with? (ex-message db-bool-name) "Data type"))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
-               :rdf/type    [:ex/User]
+               :type    [:ex/User]
                :schema/name "John"}])
           "basic rdf:type query response not correct"))))
-
 
 (deftest ^:integration shacl-closed-shape
   (testing "shacl closed shape"
     (let [conn          (test-utils/create-conn)
           ledger        @(fluree/create conn "shacl/c" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query    {:select {'?s [:*]}
-                         :where  [['?s :rdf/type :ex/User]]}
+                         :where  [['?s :type :ex/User]]}
           db            @(fluree/stage
                           (fluree/db ledger)
                           {:id                   :ex/UserShape
@@ -139,8 +138,9 @@
                            :sh/targetClass       :ex/User
                            :sh/property          [{:sh/path     :schema/name
                                                    :sh/datatype :xsd/string}]
-                           :sh/ignoredProperties [:rdf/type]
-                           :sh/closed            true})
+                           :sh/closed            true
+                           :sh/ignoredProperties [:type]})
+
           db-ok         @(fluree/stage
                           db
                           {:id          :ex/john
@@ -159,18 +159,18 @@
       (is (str/starts-with? (ex-message db-extra-prop)
                             "SHACL shape is closed"))
 
-      (is (= @(fluree/query db-ok user-query)
-             [{:id          :ex/john
-               :rdf/type    [:ex/User]
-               :schema/name "John"}])
-          "basic rdf:type query response not correct"))))
+      (is (= [{:id          :ex/john
+               :type    [:ex/User]
+               :schema/name "John"}]
+             @(fluree/query db-ok user-query))
+          "basic type query response not correct"))))
 
 (deftest ^:integration shacl-property-pairs
   (testing "shacl property pairs"
     (let [conn       (test-utils/create-conn)
           ledger     @(fluree/create conn "shacl/pairs" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
-                      :where  [['?s :rdf/type :ex/User]]}]
+                      :where  [['?s :type :ex/User]]}]
       (testing "single-cardinality equals"
         (let [db           @(fluree/stage
                              (fluree/db ledger)
@@ -200,7 +200,7 @@
                                 "SHACL PropertyShape exception - sh:equals"))
 
           (is (= [{:id           :ex/alice
-                   :rdf/type     [:ex/User]
+                   :type     [:ex/User]
                    :schema/name  "Alice"
                    :ex/firstName "Alice"}]
                  @(fluree/query db-ok user-query)))))
@@ -281,13 +281,13 @@
           (is (str/starts-with? (ex-message db-not-equal4)
                                 "SHACL PropertyShape exception - sh:equals"))
           (is (= [{:id           :ex/alice
-                   :rdf/type     [:ex/User]
+                   :type     [:ex/User]
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums [11 17]}]
                  @(fluree/query db-ok user-query)))
           (is (= [{:id           :ex/alice
-                   :rdf/type     [:ex/User]
+                   :type     [:ex/User]
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums [11 17]}]
@@ -353,7 +353,7 @@
                                 "SHACL PropertyShape exception - sh:disjoint"))
 
           (is (= [{:id           :ex/alice
-                   :rdf/type     [:ex/User]
+                   :type     [:ex/User]
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums 1}]
@@ -458,13 +458,13 @@
                                 "SHACL PropertyShape exception - sh:lessThan"))
 
           (is (= [{:id          :ex/alice
-                   :rdf/type    [:ex/User]
+                   :type    [:ex/User]
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       [18 19]}]
                  @(fluree/query db-ok1 user-query)))
           (is (= [{:id          :ex/alice
-                   :rdf/type    [:ex/User]
+                   :type    [:ex/User]
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       18}]
@@ -555,13 +555,13 @@
           (is (str/starts-with? (ex-message db-fail4)
                                 "SHACL PropertyShape exception - sh:lessThanOrEquals"))
           (is (= [{:id          :ex/alice
-                   :rdf/type    [:ex/User]
+                   :type    [:ex/User]
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       [17 19]}]
                  @(fluree/query db-ok1 user-query)))
           (is (= [{:id          :ex/alice
-                   :rdf/type    [:ex/User]
+                   :type    [:ex/User]
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       17}]
@@ -572,7 +572,7 @@
     (let [conn       (test-utils/create-conn)
           ledger     @(fluree/create conn "shacl/value-range" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
-                      :where  [['?s :rdf/type :ex/User]]}]
+                      :where  [['?s :type :ex/User]]}]
       (testing "exclusive constraints"
         (let [db          @(fluree/stage
                             (fluree/db ledger)
@@ -611,7 +611,7 @@
 
           (is (= @(fluree/query db-ok user-query)
                  [{:id         :ex/john
-                   :rdf/type   [:ex/User]
+                   :type   [:ex/User]
                    :schema/age 2}]))))
       (testing "inclusive constraints"
         (let [db          @(fluree/stage
@@ -653,10 +653,10 @@
                                 "SHACL PropertyShape exception - sh:maxInclusive: value 101"))
           (is (= @(fluree/query db-ok2 user-query)
                  [{:id         :ex/alice
-                   :rdf/type   [:ex/User]
+                   :type   [:ex/User]
                    :schema/age 100}
                   {:id         :ex/brian
-                   :rdf/type   [:ex/User]
+                   :type   [:ex/User]
                    :schema/age 1}]))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage
@@ -695,7 +695,7 @@
                                               {:defaultContext
                                                ["" {:ex "http://example.org/ns/"}]})
           user-query          {:select {'?s [:*]}
-                               :where  [['?s :rdf/type :ex/User]]}
+                               :where  [['?s :type :ex/User]]}
           db                  @(fluree/stage
                                 (fluree/db ledger)
                                 {:id             :ex/UserShape
@@ -761,11 +761,11 @@
       (is (str/starts-with? (ex-message db-ref-value)
                             "SHACL PropertyShape exception - sh:maxLength:"))
       (is (= [{:id          :ex/john
-               :rdf/type    [:ex/User]
+               :type    [:ex/User]
                :schema/name "John"}]
              @(fluree/query db-ok-str user-query)))
       (is (= [{:id          :ex/john
-               :rdf/type    [:ex/User]
+               :type    [:ex/User]
                :schema/name 12345}]
              @(fluree/query db-ok-non-str user-query))))))
 
@@ -776,7 +776,7 @@
                                                  {:defaultContext
                                                   ["" {:ex "http://example.org/ns/"}]})
           user-query             {:select {'?s [:*]}
-                                  :where  [['?s :rdf/type :ex/User]]}
+                                  :where  [['?s :type :ex/User]]}
           db                     @(fluree/stage
                                    (fluree/db ledger)
                                    {:id             :ex/UserShape
@@ -834,11 +834,11 @@
       (is (str/starts-with? (ex-message db-ref-value)
                             "SHACL PropertyShape exception - sh:pattern:"))
       (is (= [{:id          :ex/brian
-               :rdf/type    [:ex/User]
+               :type    [:ex/User]
                :ex/greeting "hello\nworld!"}]
              @(fluree/query db-ok-greeting user-query)))
       (is (= [{:id           :ex/john
-               :rdf/type     [:ex/User]
+               :type     [:ex/User]
                :ex/birthYear 1984}]
              @(fluree/query db-ok-birthyear user-query))))))
 
@@ -847,7 +847,7 @@
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :rdf/type :ex/User]]}
+                        :where  [['?s :type :ex/User]]}
           db           @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/UserShape
@@ -920,7 +920,7 @@
       (is (util/exception? db-num-email))
       (is (str/starts-with? (ex-message db-num-email) "Data type"))
       (is (= [{:id           :ex/john
-               :rdf/type     [:ex/User]
+               :type     [:ex/User]
                :schema/age   40
                :schema/email "john@example.org"
                :schema/name  "John"}]
@@ -948,7 +948,7 @@
         (is (= [{"id"          "ex:Luke",
                  "schema:name" "Luke",
                  "ex:parent"   {"id"          "ex:Anakin"
-                                "rdf:type"    ["ex:Parent"]
+                                "type"    ["ex:Parent"]
                                 "schema:name" "Anakin"}}]
                @(fluree/query valid-parent {"select" {"?s" ["*" {"ex:parent" ["*"]}]}
                                             "where"  [["?s" "id" "ex:Luke"]]})))
@@ -974,7 +974,7 @@
                                             "schema:name" "Darth Vader"
                                             "ex:pal"      {"ex:evil" "has no name"}})]
         (is (= [{"id"          "ex:good-pal",
-                 "rdf:type"    ["ex:Pal"]
+                 "type"    ["ex:Pal"]
                  "schema:name" "J.D.",
                  "ex:pal"      [{"schema:name" "Turk"}
                                 {"schema:name" "Rowdy"}]}]
@@ -1003,7 +1003,7 @@
                                                  "ex:child"    {"id"          "ex:Gerb"
                                                                 "type"        "ex:Princess"
                                                                 "schema:name" "Gerb"}})]
-        (is (= [{"id" "ex:Mork", "rdf:type" ["ex:Princess"], "schema:name" "Mork"}]
+        (is (= [{"id" "ex:Mork", "type" ["ex:Princess"], "schema:name" "Mork"}]
                @(fluree/query valid-princess {"select" {"?s" ["*"]}
                                               "where"  [["?s" "id" "ex:Mork"]]})))
 
@@ -1124,7 +1124,7 @@
 
       (is (not (util/exception? db3)))
       (is (= [{"id"       "ex:PastelPony"
-               "rdf:type" ["ex:Pony"]
+               "type" ["ex:Pony"]
                "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}]
              @(fluree/query db3 '{"select" {"?p" ["*"]}
                                   "where"  [["?p" "type" "ex:Pony"]]})))))
@@ -1336,7 +1336,7 @@
                                               "type"       "ex:Person"
                                               "ex:address" {"ex:postalCode" ["12345" "45678"]}}])]
       (is (= [{"id"         "ex:Bob",
-               "rdf:type"   ["ex:Person"],
+               "type"   ["ex:Person"],
                "ex:address" {"id" "_:f211106232532997", "ex:postalCode" "12345"}}]
              @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["*"]}]}
                                           "where"  [["?s" "id" "ex:Bob"]]})))
@@ -1372,7 +1372,7 @@
                                                         {"id"        "ex:Zorba"
                                                          "ex:gender" "alien"}]}])]
       (is (= [{"id"        "ex:ValidKid"
-               "rdf:type"  ["ex:Kid"]
+               "type"  ["ex:Kid"]
                "ex:parent" [{"id" "ex:Bob"}
                             {"id" "ex:Jane"}]}]
              @(fluree/query valid-kid {"select" {"?s" ["*"]}
@@ -1421,7 +1421,7 @@
                                                         {"ex:name" "Finger"}
                                                         {"ex:name" ["Finger" "Thumb"]}]}])]
       (is (= [{"id"       "ex:ValidHand",
-               "rdf:type" ["ex:Hand"],
+               "type" ["ex:Hand"],
                "ex:digit"
                [{"ex:name" "Thumb"}
                 {"ex:name" "Finger"}

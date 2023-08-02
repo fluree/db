@@ -12,7 +12,7 @@
         (let [query-res @(fluree/query db '{:select {?s [:*]}
                                             :where [[?s :id :wiki/Q836821]]})]
           (is (= query-res [{:id                               :wiki/Q836821,
-                             :rdf/type                         [:schema/Movie],
+                             :type                         [:schema/Movie],
                              :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                              :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                              :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
@@ -30,12 +30,12 @@
         (let [query-res @(fluree/query db '{:selectOne {?s [:* {:schema/isBasedOn [:*]}]}
                                             :where [[?s :id :wiki/Q836821]]})]
           (is (= query-res {:id                               :wiki/Q836821,
-                            :rdf/type                         [:schema/Movie],
+                            :type                         [:schema/Movie],
                             :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                             :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                             :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
                             :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                               :rdf/type      [:schema/Book],
+                                                               :type      [:schema/Book],
                                                                :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                                :schema/isbn   "0-330-25864-8",
                                                                :schema/author {:id :wiki/Q42}}}))))
@@ -45,32 +45,32 @@
                                               :where [[?s :id :wiki/Q836821]]
                                               :depth 3})]
             (is (= query-res {:id                               :wiki/Q836821,
-                              :rdf/type                         [:schema/Movie],
+                              :type                         [:schema/Movie],
                               :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                               :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                               :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
                               :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                                 :rdf/type      [:schema/Book],
+                                                                 :type      [:schema/Book],
                                                                  :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                                  :schema/isbn   "0-330-25864-8",
                                                                  :schema/author {:id          :wiki/Q42,
-                                                                                 :rdf/type    [:schema/Person],
+                                                                                 :type    [:schema/Person],
                                                                                  :schema/name "Douglas Adams"}}}))))
         (testing "using graph sub-selection"
           (let [query-res @(fluree/query db '{:selectOne {?s [:* {:schema/isBasedOn [:*]}]}
                                               :where [[?s :id :wiki/Q836821]]
                                               :depth 3})]
             (is (= query-res {:id                               :wiki/Q836821,
-                              :rdf/type                         [:schema/Movie],
+                              :type                         [:schema/Movie],
                               :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                               :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                               :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
                               :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                                 :rdf/type      [:schema/Book],
+                                                                 :type      [:schema/Book],
                                                                  :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                                  :schema/isbn   "0-330-25864-8",
                                                                  :schema/author {:id          :wiki/Q42,
-                                                                                 :rdf/type    [:schema/Person],
+                                                                                 :type    [:schema/Person],
                                                                                  :schema/name "Douglas Adams"}}}))))))))
 
 (deftest ^:integration json-ld-rdf-type-query
@@ -80,38 +80,38 @@
           db     (fluree/db movies)]
       (testing "basic analytical RFD type query"
         (let [query-res @(fluree/query db '{:select {?s [:* {:schema/isBasedOn [:*]}]}
-                                            :where  [[?s :rdf/type :schema/Movie]]})]
+                                            :where  [[?s :type :schema/Movie]]})]
           (is (= [{:id :wiki/Q2875,
-                   :rdf/type [:schema/Movie],
+                   :type [:schema/Movie],
                    :schema/disambiguatingDescription "1939 film by Victor Fleming",
                    :schema/isBasedOn {:id :wiki/Q2870,
-                                      :rdf/type [:schema/Book],
+                                      :type [:schema/Book],
                                       :schema/author {:id :wiki/Q173540},
                                       :schema/isbn "0-582-41805-4",
                                       :schema/name "Gone with the Wind"},
                    :schema/name "Gone with the Wind",
                    :schema/titleEIDR "10.5240/FB0D-0A93-CAD6-8E8D-80C2-4"}
                   {:id                               :wiki/Q230552,
-                   :rdf/type                         [:schema/Movie],
+                   :type                         [:schema/Movie],
                    :schema/name                      "Back to the Future Part III",
                    :schema/disambiguatingDescription "1990 film by Robert Zemeckis",
                    :schema/titleEIDR                 "10.5240/15F9-F913-FF25-8041-E798-O"}
-                  {:id                :wiki/Q109331, :rdf/type [:schema/Movie],
+                  {:id                :wiki/Q109331, :type [:schema/Movie],
                    :schema/name       "Back to the Future Part II",
                    :schema/titleEIDR  "10.5240/5DA5-C386-2911-7E2B-1782-L",
                    :schema/followedBy {:id :wiki/Q230552}}
                   {:id                               :wiki/Q91540,
-                   :rdf/type                         [:schema/Movie],
+                   :type                         [:schema/Movie],
                    :schema/name                      "Back to the Future",
                    :schema/disambiguatingDescription "1985 film by Robert Zemeckis",
                    :schema/titleEIDR                 "10.5240/09A3-1F6E-3538-DF46-5C6F-I",
                    :schema/followedBy                {:id :wiki/Q109331}}
-                  {:id                               :wiki/Q836821, :rdf/type [:schema/Movie],
+                  {:id                               :wiki/Q836821, :type [:schema/Movie],
                    :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                    :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                    :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
                    :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                      :rdf/type      [:schema/Book],
+                                                      :type      [:schema/Book],
                                                       :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                       :schema/isbn   "0-330-25864-8",
                                                       :schema/author {:id :wiki/Q42}}}]                                  ;; :id is a DID and will be unique per DB so exclude from comparison
@@ -193,7 +193,7 @@
       (testing "id"
         ;;TODO not getting reparsed as ssc
         (is (= [{:id           :ex/brian,
-                 :rdf/type     [:ex/User]
+                 :type     [:ex/User]
                  :schema/name  "Brian"
                  :ex/last      "Smith"
                  :schema/email "brian@example.org"
@@ -205,14 +205,14 @@
       ;;TODO not getting reparsed as ssc
       (testing "iri"
         (is (= [{:id           :ex/david
-                 :rdf/type     [:ex/User]
+                 :type     [:ex/User]
                  :schema/name  "David"
                  :ex/last      "Jones"
                  :schema/email "david@example.org"
                  :schema/age   46
                  :ex/favNums   [15 70]
                  :ex/friend    {:id :ex/cam}}
-                {:rdf/type     [:ex/User]
+                {:type     [:ex/User]
                  :schema/email "cam@example.org"
                  :ex/favNums   [5 10]
                  :schema/age   34
@@ -222,7 +222,7 @@
                  :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
                  :ex/favColor  "Blue"}
                 {:id           :ex/alice
-                 :rdf/type     [:ex/User]
+                 :type     [:ex/User]
                  :schema/name  "Alice"
                  :ex/last      "Smith"
                  :schema/email "alice@example.org"
@@ -230,7 +230,7 @@
                  :ex/favNums   [9 42 76]
                  :ex/favColor  "Green"}
                 {:id           :ex/brian
-                 :rdf/type     [:ex/User]
+                 :type     [:ex/User]
                  :schema/name  "Brian"
                  :ex/last      "Smith"
                  :schema/email "brian@example.org"
@@ -241,7 +241,7 @@
                                   :where  [["?s" :type :ex/User]]}))))
       (testing "tuple"
         (is (= [{:id           :ex/alice
-                 :rdf/type     [:ex/User]
+                 :type     [:ex/User]
                  :schema/name  "Alice"
                  :ex/last      "Smith"
                  :schema/email "alice@example.org"
@@ -250,7 +250,7 @@
                  :ex/favColor  "Green"}]
                @(fluree/query db {:select {"?s" ["*"]}
                                   :where  [["?s" :schema/name "Alice"]]})))
-        (is (= [{:rdf/type     [:ex/User]
+        (is (= [{:type     [:ex/User]
                  :schema/email "cam@example.org"
                  :ex/favNums   [5 10]
                  :schema/age   34
@@ -260,7 +260,7 @@
                  :ex/friend    [{:id :ex/brian} {:id :ex/alice}]
                  :ex/favColor  "Blue"}
                 {:id           :ex/alice
-                 :rdf/type     [:ex/User]
+                 :type     [:ex/User]
                  :schema/name  "Alice"
                  :ex/last      "Smith"
                  :schema/email "alice@example.org"
@@ -268,7 +268,7 @@
                  :ex/favNums   [9 42 76]
                  :ex/favColor  "Green"}
                 {:id           :ex/brian,
-                 :rdf/type     [:ex/User],
+                 :type     [:ex/User],
                  :ex/favNums   7,
                  :ex/favColor  "Green",
                  :schema/age   50,
@@ -278,7 +278,7 @@
                @(fluree/query db {:select {"?s" ["*"]}
                                   :where  [["?s" :ex/favColor "?color"]]})))
         (is (= [{:id           :ex/alice
-                 :rdf/type     [:ex/User]
+                 :type     [:ex/User]
                  :schema/name  "Alice"
                  :ex/last      "Smith"
                  :schema/email "alice@example.org"
@@ -288,7 +288,7 @@
                @(fluree/query db {:select {"?s" ["*"]}
                                   :where  [["?s" :schema/age 42]]})))
         (is (= [{:id           :ex/alice,
-                 :rdf/type     [:ex/User],
+                 :type     [:ex/User],
                  :ex/favNums   [9 42 76],
                  :ex/favColor  "Green",
                  :schema/age   42,

@@ -48,7 +48,7 @@
               [:ex/alice :schema/age 42]
               [:schema/age :id "http://schema.org/age"]
               [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
-              [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
+              [:type :id "@type"]
               [:id :id "@id"]]
              @(fluree/query db-ok '{:select [?s ?p ?o]
                                     :where  [[?s ?p ?o]]})))))
@@ -64,7 +64,7 @@
               [:ex/alice :ex/isCool false]
               [:ex/isCool :id "http://example.org/ns/isCool"]
               [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
-              [:rdf/type :id "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
+              [:type :id "@type"]
               [:id :id "@id"]]
              @(fluree/query db-bool '{:select [?s ?p ?o]
                                       :where  [[?s ?p ?o]]})))))
@@ -168,9 +168,9 @@
                             (fluree/db ledger)
                             (into policy data))
           user-query      '{:select {?s [:*]}
-                            :where  [[?s :rdf/type :ex/User]]}]
-      (let [users [{:id :ex/john, :rdf/type [:ex/User], :schema/name "John"}
-                   {:id :ex/alice, :rdf/type [:ex/User], :schema/name "Alice"}]]
+                            :where  [[?s :type :ex/User]]}]
+      (let [users [{:id :ex/john, :type [:ex/User], :schema/name "John"}
+                   {:id :ex/alice, :type [:ex/User], :schema/name "Alice"}]]
         (is (= users
                @(fluree/query db-data-first user-query)))
         (is (= users
@@ -196,7 +196,7 @@
             db2     @(fluree/stage db0 movies)
             _       (assert (not (util/exception? db2)))
             query   {"select" "?title"
-                     "where"  [["?m" "rdf:type" "ex:Movie"]
+                     "where"  [["?m" "type" "ex:Movie"]
                                ["?m" "ex:title" "?title"]]}
             results @(fluree/query db2 query)]
         (is (= 100 (count results)))

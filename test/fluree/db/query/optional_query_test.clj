@@ -29,7 +29,7 @@
 
       ;; basic single optional statement
       (is (= @(fluree/query db '{:select [?name ?favColor]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/name ?name]
                                           {:optional [?s :ex/favColor ?favColor]}]})
              [["Cam" nil]
@@ -38,7 +38,7 @@
           "Cam, Alice and Brian should all return, but only Alica has a favColor")
 
       (is (= @(fluree/query db '{:select [?name ?favColor]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/name ?name]
                                           {"optional" [?s :ex/favColor ?favColor]}]})
              [["Cam" nil]
@@ -48,7 +48,7 @@
 
       ;; including another pass-through variable - note Brian doesn't have an email
       (is (= @(fluree/query db '{:select [?name ?favColor ?email]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/name ?name]
                                           [?s :schema/email ?email]
                                           {:optional [?s :ex/favColor ?favColor]}]})
@@ -57,7 +57,7 @@
 
       ;; including another pass-through variable, but with 'optional' sandwiched
       (is (= @(fluree/query db '{:select [?name ?favColor ?email]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/name ?name]
                                           {:optional [?s :ex/favColor ?favColor]}
                                           [?s :schema/email ?email]]})
@@ -66,7 +66,7 @@
 
       ;; query with two optionals!
       (is (= @(fluree/query db '{:select [?name ?favColor ?email]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/name ?name]
                                           {:optional [?s :ex/favColor ?favColor]}
                                           {:optional [?s :schema/email ?email]}]})
@@ -76,7 +76,7 @@
 
       ;; optional with unnecessary embedded vector statement
       (is (= @(fluree/query db '{:select [?name ?favColor]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/name ?name]
                                           {:optional [[?s :ex/favColor ?favColor]]}]})
              [["Cam" nil]
@@ -89,7 +89,7 @@
               ["Alice" "Green" "alice@flur.ee"]
               ["Brian" nil nil]]
              @(fluree/query db '{:select [?name ?favColor ?email]
-                                 :where  [[?s :rdf/type :ex/User]
+                                 :where  [[?s :type :ex/User]
                                           [?s :schema/name ?name]
                                           {:optional [[?s :ex/favColor ?favColor]
                                                       [?s :schema/email ?email]]}]}))

@@ -15,7 +15,7 @@
 (comment
  ;; a raw SHACL shape looks something like this:
  {:id             :ex/UserShape,
-  :rdf/type       [:sh/NodeShape],
+  :type       [:sh/NodeShape],
   :sh/targetClass {:id :ex/User},
   :sh/property    [{:id          "_:f211106232533000",
                     :sh/path     {:id :schema/name},

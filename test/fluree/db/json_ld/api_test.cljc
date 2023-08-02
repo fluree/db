@@ -190,11 +190,10 @@
                                      (ctx-util/stringify-context ledger-context))
                query          {:where  '[[?p :schema/email "wes@example.org"]]
                                :select '{?p [:*]}}
-               results        @(fluree/query loaded-db query)
-               full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
+               results        @(fluree/query loaded-db query)]
            (is (= target-t (:t loaded-db)))
            (is (= merged-ctx (dbproto/-default-context loaded-db)))
-           (is (= [{full-type-url   [:ex/User]
+           (is (= [{:type   [:ex/User]
                     :id             :ex/wes
                     :schema/age     42
                     :schema/email   "wes@example.org"
@@ -305,14 +304,14 @@
            (is (= target-t (:t loaded-db)))
            (testing "query returns expected `list` values"
              (is (= [{:id         :ex/cam,
-                      :rdf/type   [:ex/User],
+                      :type   [:ex/User],
                       :ex/numList [7 8 9 10]}
-                     {:id :ex/john, :rdf/type [:ex/User]}
+                     {:id :ex/john, :type [:ex/User]}
                      {:id         :ex/alice,
-                      :rdf/type   [:ex/User],
+                      :type   [:ex/User],
                       :ex/friends [{:id :ex/john} {:id :ex/cam}]}]
                     @(fluree/query loaded-db '{:select {?s [:*]}
-                                               :where  [[?s :rdf/type :ex/User]]}))))))
+                                               :where  [[?s :type :ex/User]]}))))))
 
        (testing "can load with policies"
          (with-tmp-dir storage-path
@@ -364,7 +363,7 @@
              (is (= target-t (:t loaded-db)))
              (testing "query returns expected policy"
                (is (= [{:id            :ex/UserPolicy,
-                        :rdf/type      [:f/Policy],
+                        :type      [:f/Policy],
                         :f/allow
                         {:id           :ex/globalViewAllow,
                          :f/action     {:id :f/view},
@@ -381,12 +380,12 @@
                       @(fluree/query loaded-db
                                      '{:select
                                        {?s [:*
-                                            {:rdf/type [:_id]}
+                                            {:type [:_id]}
                                             {:f/allow [:* {:f/targetRole [:_id]}]}
                                             {:f/property
                                              [:* {:f/allow
                                                   [:* {:f/targetRole [:_id]}]}]}]}
-                                       :where  [[?s :rdf/type :f/Policy]]}))))))))))
+                                       :where  [[?s :type :f/Policy]]}))))))))))
 
 #?(:clj
    (deftest load-from-memory-test
@@ -503,11 +502,10 @@
              merged-ctx     (merge (ctx-util/stringify-context conn-context) (ctx-util/stringify-context ledger-context))
              query          {:where  '[[?p :schema/email "wes@example.org"]]
                              :select '{?p [:*]}}
-             results        @(fluree/query loaded-db query)
-             full-type-url  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"]
+             results        @(fluree/query loaded-db query)]
          (is (= target-t (:t loaded-db)))
          (is (= merged-ctx (dbproto/-default-context loaded-db)))
-         (is (= [{full-type-url   [:ex/User]
+         (is (= [{:type   [:ex/User]
                   :id             :ex/wes
                   :schema/age     42
                   :schema/email   "wes@example.org"
@@ -570,14 +568,14 @@
          (is (= target-t (:t loaded-db)))
          (testing "query returns expected `list` values"
            (is (= [{:id         :ex/cam,
-                    :rdf/type   [:ex/User],
+                    :type   [:ex/User],
                     :ex/numList [7 8 9 10]}
-                   {:id :ex/john, :rdf/type [:ex/User]}
+                   {:id :ex/john, :type [:ex/User]}
                    {:id         :ex/alice,
-                    :rdf/type   [:ex/User],
+                    :type   [:ex/User],
                     :ex/friends [{:id :ex/john} {:id :ex/cam}]}]
                   @(fluree/query loaded-db '{:select {?s [:*]}
-                                             :where  [[?s :rdf/type :ex/User]]})))))
+                                             :where  [[?s :type :ex/User]]})))))
 
        (testing "can load with policies"
          (let [conn         @(fluree/connect
@@ -622,7 +620,7 @@
            (is (= target-t (:t loaded-db)))
            (testing "query returns expected policy"
              (is (= [{:id            :ex/UserPolicy,
-                      :rdf/type      [:f/Policy],
+                      :type      [:f/Policy],
                       :f/allow
                       {:id           :ex/globalViewAllow,
                        :f/action     {:id :f/view},
@@ -637,10 +635,10 @@
                        :f/path {:id :schema/ssn}},
                       :f/targetClass {:id :ex/User}}]
                     @(fluree/query loaded-db '{:select {?s [:*
-                                                            {:rdf/type [:_id]}
+                                                            {:type [:_id]}
                                                             {:f/allow [:* {:f/targetRole [:_id]}]}
                                                             {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                                               :where  [[?s :rdf/type :f/Policy]]})))))))
+                                               :where  [[?s :type :f/Policy]]})))))))
      (testing "loading predefined properties"
        (let [conn (test-utils/create-conn {:context test-utils/default-str-context
                                            :context-type :string})
@@ -659,12 +657,12 @@
                           (get "id"))
              loaded1 (test-utils/retry-load conn ledger-alias 100)]
          (is (= [{"id" shape-id
-                  "rdf:type" ["sh:NodeShape"],
+                  "type" ["sh:NodeShape"],
                   "sh:targetClass" {"id" "schema:Person"},
                   "sh:property" {"id" "_:f211106232532993"}}]
                 @(fluree/query db1 property-query)))
          (is (= [{"id" shape-id
-                  "rdf:type" ["sh:NodeShape"],
+                  "type" ["sh:NodeShape"],
                   "sh:targetClass" {"id" "schema:Person"},
                   "sh:property" {"id" "_:f211106232532993"}}]
                 @(fluree/query (fluree/db loaded1) property-query)))
@@ -676,7 +674,7 @@
                                               "sh:datatype" {"id" "xsd:string"}}]})
                  loaded2 (test-utils/retry-load conn ledger-alias 100)]
              (is (= [{"id" shape-id
-                      "rdf:type" ["sh:NodeShape"],
+                      "type" ["sh:NodeShape"],
                       "sh:targetClass" {"id" "schema:Person"},
                       "sh:property" {"id" "_:f211106232532994"}}]
                     @(fluree/query (fluree/db loaded2) property-query)))))))
@@ -721,7 +719,7 @@
          (let [db3        @(fluree/stage
                              loaded-db2
                              '{:delete [?s ?p ?o]
-                               :where  [[?s :rdf/type :schema/Organization]
+                               :where  [[?s :type :schema/Organization]
                                         [?s ?p ?o]]})
                _          @(fluree/commit! ledger db3)
                loaded3  (test-utils/retry-load conn ledger-alias 100)

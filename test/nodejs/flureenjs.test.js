@@ -66,7 +66,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
      db1,
      {
        select: { "?s": ["*"] },
-       where: [["?s", "rdf:type", "ex:User"]]
+       where: [["?s", "type", "ex:User"]]
      }
    );
 
@@ -86,7 +86,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
      db1,
      { "@context": ["", {"flhubee": "http://schema.org/name"}],
        select: { "?s": ["*"] },
-       where: [["?s", "rdf:type", "ex:User"]]
+       where: [["?s", "type", "ex:User"]]
      }
    );
 

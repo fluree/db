@@ -73,7 +73,7 @@
 
   ;; Note that already, one can query for everything unpermissioned - but either role hasn't been given any permissions so nothing will return
   @(fluree/query db3 {:select {'?s [:* {:ex/location [:*]}]}
-                      :where  [['?s :rdf/type :ex/User]]})
+                      :where  [['?s :type :ex/User]]})
 
   ;; try to get a permissioned DB - but not rules exist yet!
   @(fluree/wrap-policy db3 {:f/$identity (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
@@ -94,7 +94,7 @@
 
   ;; try some queries... default uses no permissions
   @(fluree/query db4 {:select {'?s [:* {:ex/location [:*]}]}
-                      :where  [['?s :rdf/type :ex/User]]})
+                      :where  [['?s :type :ex/User]]})
 
   ;; try with the non-root role
   (def perm-db @(fluree/wrap-policy db4 {:f/$identity (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
@@ -102,7 +102,7 @@
 
   ;; no permissions to :ex/User data
   @(fluree/query perm-db {:select {'?s [:* {:ex/location [:*]}]}
-                          :where  [['?s :rdf/type :ex/User]]})
+                          :where  [['?s :type :ex/User]]})
 
   ;; try with root role
   (def perm-db @(fluree/wrap-policy db4 {:f/$identity (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
@@ -110,7 +110,7 @@
 
   ;; root can see all
   @(fluree/query perm-db {:select {'?s [:* {:ex/location [:*]}]}
-                          :where  [['?s :rdf/type :ex/User]]})
+                          :where  [['?s :type :ex/User]]})
 
   (-> perm-db :permissions)
 
@@ -137,11 +137,11 @@
 
   ;; should see users, but only own SSN - and not location in crawl
   @(fluree/query perm-db {:select {'?s [:* {:ex/location [:*]}]}
-                          :where  [['?s :rdf/type :ex/User]]})
+                          :where  [['?s :type :ex/User]]})
 
   ;; no product permissions
   @(fluree/query perm-db {:select {'?s [:* {:ex/location [:*]}]}
-                          :where  [['?s :rdf/type :ex/Product]]})
+                          :where  [['?s :type :ex/Product]]})
 
   )
 
