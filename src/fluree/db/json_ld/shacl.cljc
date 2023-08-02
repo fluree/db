@@ -444,7 +444,7 @@
             (when (not valid?)
               (throw-property-shape-exception! err-msg))
             (when (and closed? (not-empty unvalidated-properties))
-              (throw (ex-info (str "SHACL shape is closed, extra properties not allowed: " unvalidated-properties)
+              (throw (ex-info (str "SHACL shape is closed, extra properties not allowed: " (vec unvalidated-properties))
                               {:status 400 :error :db/shacl-validation})))
             [res]))))))
 
