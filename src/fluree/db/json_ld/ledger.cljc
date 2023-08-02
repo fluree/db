@@ -23,7 +23,7 @@
 (def ^:const predefined-properties
   (merge datatype/default-data-types
          {"http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
-          "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"     const/$rdf:type
+          const/iri-type                                        const/$rdf:type
           ;; rdfs
           "http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
           "http://www.w3.org/2000/01/rdf-schema#subClassOf"     const/$rdfs:subClassOf

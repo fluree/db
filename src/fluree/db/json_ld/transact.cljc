@@ -282,7 +282,7 @@
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
-  [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-rdf-type const/$xsd:string t true nil)
+  [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-type const/$xsd:string t true nil)
    (flake/create const/$rdfs:Class const/$xsd:anyURI const/iri-class const/$xsd:string t true nil)
    (flake/create const/$xsd:anyURI const/$xsd:anyURI "@id" const/$xsd:string t true nil)])
 

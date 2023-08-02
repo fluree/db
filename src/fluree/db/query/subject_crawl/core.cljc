@@ -66,7 +66,7 @@
   (log/trace "Running simple subject crawl query:" parsed-query)
   (let [error-ch    (async/chan)
         f-where     (first where)
-        rdf-type?   (= :rdf/type (:type f-where))
+        rdf-type?   (= :type (:type f-where))
         filter-map  (:s-filter (second where))
         cache       (volatile! {})
         fuel-vol    (volatile! 0)

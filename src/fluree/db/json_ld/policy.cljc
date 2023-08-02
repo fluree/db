@@ -38,13 +38,13 @@
     ;; TODO - once supported, use context to always return :f/allow and :f/property as vectors so we don't need to coerce downstream
     (<? (fql/query db {:context nil
                        :select {'?s [:*
-                                     {const/iri-rdf-type [:_id]}
+                                     {const/iri-type [:_id]}
                                      {const/iri-allow [:* {const/iri-target-role
                                                            [:_id]}]}
                                      {const/iri-property
                                       [:* {const/iri-allow
                                            [:* {const/iri-target-role [:_id]}]}]}]}
-                       :where [['?s const/iri-rdf-type const/iri-policy]]}))))
+                       :where [['?s const/iri-type const/iri-policy]]}))))
 
 (defn policies-for-roles*
   "Filters all rules into only those that apply to the given roles."
