@@ -117,7 +117,7 @@
        (= :list (-> v first key))))
 
 (defn get-subject-types
-  "Returns a set of all :rdf/type Class subject ids for the provided subject.
+  "Returns a set of all :type Class subject ids for the provided subject.
   new-types are a set of newly created types in the transaction."
   [db sid added-classes]
   (go-try
@@ -210,7 +210,11 @@
              property-flakes type-flakes ;; only used if generating new Class and Property flakes
              subj-flakes     base-flakes]
         (if k
-          (let [list?            (list-value? v)
+          (let [_ (when (= k const/iri-rdf-type)
+                    (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
+                                         " Please use the JSON-LD \"@type\" keyword instead.")
+                                    {:status 400 :error :db/invalid-predicate})))
+                list?            (list-value? v)
                 retract?         (nil? v)
                 v*               (if list?
                                    (let [list-vals (:list v)]
@@ -282,7 +286,7 @@
 (defn base-flakes
   "Returns base set of flakes needed in any new ledger."
   [t]
-  [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-rdf-type const/$xsd:string t true nil)
+  [(flake/create const/$rdf:type const/$xsd:anyURI const/iri-type const/$xsd:string t true nil)
    (flake/create const/$rdfs:Class const/$xsd:anyURI const/iri-class const/$xsd:string t true nil)
    (flake/create const/$xsd:anyURI const/$xsd:anyURI "@id" const/$xsd:string t true nil)])
 

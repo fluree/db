@@ -75,36 +75,36 @@
 
 
   @(fluree/query db {:select ['?name '?email1 '?email2]
-                     :where  [['?s :rdf/type :ex/User]
+                     :where  [['?s :type :ex/User]
                               ['?s :schema/name '?name]
                               {:union [[['?s :ex/email '?email1]]
                                        [['?s :schema/email '?email2]]]}]})
 
   @(fluree/query db {:select ['?s '?email1 '?email2]
-                     :where  [['?s :rdf/type :ex/User]
+                     :where  [['?s :type :ex/User]
                               {:union [[['?s :ex/email '?email1]]
                                        [['?s :schema/email '?email2]]]}]})
 
 
   @(fluree/query db {:select ['?s '?email1 '?email2]
-                     :where  [['?s :rdf/type :ex/User]
+                     :where  [['?s :type :ex/User]
                               {:optional ['?s :ex/email '?email1]}
                               {:optional ['?s :schema/email '?email2]}]})
 
 
   @(fluree/query db {:select ['?email]
-                     :where  [['?s :rdf/type :ex/User]
+                     :where  [['?s :type :ex/User]
                               ;['?s :schema/name '?name]
                               {:union [[['?s :ex/email '?email]]
                                        [['?s :schema/email '?email]]]}]})
 
   @(fluree/query db {:select ['?name '?email]
-                     :where  [['?s :rdf/type :ex/User]
+                     :where  [['?s :type :ex/User]
                               ['?s :schema/name '?name]
                               ['?s :ex/email '?email]]})
 
   @(fluree/query db {:select ['?name '?favColor '?age]
-                     :where  [['?s :rdf/type :ex/User]
+                     :where  [['?s :type :ex/User]
                               ['?s :schema/name '?name]
                               {:optional ['?s :ex/favColor '?favColor]}
                               ['?s :schema/age '?age]]})
@@ -189,5 +189,5 @@
                      :from   :ex/brian})
 
   @(fluree/query db {:select {'?s [:* {:ex/friend [:*]}]}
-                     :where  [['?s :rdf/type :ex/User]]}))
+                     :where  [['?s :type :ex/User]]}))
 

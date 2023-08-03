@@ -34,7 +34,7 @@
                                       :sh/minCount 1
                                       :sh/maxCount 1
                                       :sh/datatype :xsd/string}]
-              :sh/ignoredProperties [:rdf/type]
+              :sh/ignoredProperties [:type]
               :sh/closed            true}))
 
   (def db2 @(fluree/stage
@@ -100,16 +100,16 @@
                                 :sh/minCount 1
                                 :sh/maxCount 1
                                 :sh/nodeKind :sh/IRI}]
-        :sh/ignoredProperties [:rdf/type :schema/author]
+        :sh/ignoredProperties [:type :schema/author]
         :sh/closed            true}))
 
 
   @(fluree/query newdb2 {:select {'?s [:* {:sh/property [:*]}]}
-                         :where  [['?s :rdf/type :sh/NodeShape]]})
+                         :where  [['?s :type :sh/NodeShape]]})
 
 
   @(fluree/query newdb2 {:select {'?s [:*]}
-                         :where  [['?s :rdf/type :ex/User]]})
+                         :where  [['?s :type :ex/User]]})
 
   ;; should error - no email
   (def db2
@@ -149,7 +149,7 @@
 
 
   @(fluree/query db2 {:select {'?s [:* {:sh/property [:*]}]}
-                      :where  [['?s :rdf/type :ex/User]]})
+                      :where  [['?s :type :ex/User]]})
 
 
   (-> newdb2 :schema :shapes deref)

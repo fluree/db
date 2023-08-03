@@ -226,7 +226,7 @@
         (handle-iri (second path-primary))
 
         (= path-primary "a")
-        ["$fdb" "rdf:type"]
+        ["$fdb" "type"]
 
         (= path-primary "!")
         (throw (ex-info (str "! not currently supported as SPARQL predicate.")

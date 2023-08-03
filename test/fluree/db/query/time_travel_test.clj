@@ -10,7 +10,7 @@
           ledger (test-utils/load-movies conn)
           db     (fluree/db ledger)
           movies @(fluree/query db '{:select {?s [:*]}
-                                     :where  [[?s :rdf/type :schema/Movie]]
+                                     :where  [[?s :type :schema/Movie]]
                                      :t      2})]
       (is (= 3 (count movies)))
       (is (every? #{"The Hitchhiker's Guide to the Galaxy"
@@ -75,7 +75,7 @@
                                        @(fluree/commit! ledger db3))))
           db                     (fluree/db ledger)
           base-query             {:select '{?s [:*]}
-                                  :where  '[[?s :rdf/type :schema/Movie]]}
+                                  :where  '[[?s :type :schema/Movie]]}
           one-movie              @(fluree/query db (assoc base-query
                                                      :t after-one-loaded-iso))
           three-movies           @(fluree/query db (assoc base-query

@@ -311,7 +311,7 @@
         field-var (template/build-var pred)]
     (if (some #{"NOT"} parsed)
       (bounce [[template/collection-var pred field-var]])
-      (bounce [[template/collection-var "rdf:type" template/collection]
+      (bounce [[template/collection-var "type" template/collection]
                {:optional [[template/collection-var pred field-var]]}
                {:filter [(template/build-fn-call ["nil?" field-var])]}]))))
 
@@ -369,7 +369,7 @@
   (let [parse-map    (parse-into-map rst)
         from-clause  (->> parse-map :from-clause first)
         where-clause (or (some->> parse-map :where-clause first)
-                         {::where [[template/collection-var  "rdf:type" template/collection]]})
+                         {::where [[template/collection-var  "type" template/collection]]})
         grouping     (->> parse-map :group-by-clause vec)
         from         (-> from-clause ::coll first)]
     (-> (merge-parsed from-clause where-clause)

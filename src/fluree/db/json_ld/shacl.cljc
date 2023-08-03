@@ -15,7 +15,7 @@
 (comment
  ;; a raw SHACL shape looks something like this:
  {:id             :ex/UserShape,
-  :rdf/type       [:sh/NodeShape],
+  :type       [:sh/NodeShape],
   :sh/targetClass {:id :ex/User},
   :sh/property    [{:id          "_:f211106232533000",
                     :sh/path     {:id :schema/name},
@@ -444,7 +444,7 @@
             (when (not valid?)
               (throw-property-shape-exception! err-msg))
             (when (and closed? (not-empty unvalidated-properties))
-              (throw (ex-info (str "SHACL shape is closed, extra properties not allowed: " unvalidated-properties)
+              (throw (ex-info (str "SHACL shape is closed, extra properties not allowed: " (vec unvalidated-properties))
                               {:status 400 :error :db/shacl-validation})))
             [res]))))))
 

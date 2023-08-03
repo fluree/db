@@ -70,7 +70,7 @@
             double-policy-query-result @(fluree/query
                                          root-wrapped-db
                                          {:select {'?s [:* {:ex/location [:*]}]}
-                                          :where  [['?s :rdf/type :ex/User]]
+                                          :where  [['?s :type :ex/User]]
                                           :opts   {:did  root-did
                                                    :role :ex/rootRole}})]
         (is (util/exception? double-policy-query-result)
@@ -80,13 +80,13 @@
 
       ;; root can see all user data
       (is (= [{:id               :ex/john,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17",
                :schema/ssn       "888-88-8888"}
               {:id               :ex/alice,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
@@ -95,19 +95,19 @@
                                   :ex/state   "NC",
                                   :ex/country "USA"}}]
              @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
-                                       :where  [['?s :rdf/type :ex/User]]
+                                       :where  [['?s :type :ex/User]]
                                        :opts   {:did  root-did
                                                 :role :ex/rootRole}}))
           "Both user records + all attributes should show")
 
       (is (= [{:id               :ex/john,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17",
                :schema/ssn       "888-88-8888"}
               {:id               :ex/alice,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
@@ -116,57 +116,57 @@
                                   :ex/state   "NC",
                                   :ex/country "USA"}}]
              @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
-                                       :where  [['?s :rdf/type :ex/User]]
+                                       :where  [['?s :type :ex/User]]
                                        :opts   {:did  root-did
                                                 :role :ex/rootRole}}))
           "Both user records + all attributes should show")
 
       ;; root role can see all product data, without identity
       (is (= [{:id                   :ex/widget,
-               :rdf/type             [:ex/Product],
+               :type             [:ex/Product],
                :schema/name          "Widget",
                :schema/price         99.99,
                :schema/priceCurrency "USD"}]
              @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
-                                       :where  [['?s :rdf/type :ex/Product]]
+                                       :where  [['?s :type :ex/Product]]
                                        :opts   {:role :ex/rootRole}}))
           "The product record should show with all attributes")
       (is (= [{:id               :ex/john,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17"}
               {:id               :ex/alice,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17"}]
              @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
-                                       :where  [['?s :rdf/type :ex/User]]
+                                       :where  [['?s :type :ex/User]]
                                        :opts   {:role :ex/userRole}}))
           "Both users should show, but no SSNs because no identity was provided")
 
       ;; Alice cannot see product data as it was not explicitly allowed
       (is (= []
              @(fluree/query db+policy {:select {'?s [:*]}
-                                       :where  [['?s :rdf/type :ex/Product]]
+                                       :where  [['?s :type :ex/Product]]
                                        :opts   {:did  alice-did
                                                 :role :ex/userRole}})))
 
       ;; Alice can see all users, but can only see SSN for herself, and can't see the nested location
       (is (= [{:id               :ex/john,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17"}
               {:id               :ex/alice,
-               :rdf/type         [:ex/User],
+               :type         [:ex/User],
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
                :schema/ssn       "111-11-1111"}]
              @(fluree/query db+policy {:select {'?s [:* {:ex/location [:*]}]}
-                                       :where  [['?s :rdf/type :ex/User]]
+                                       :where  [['?s :type :ex/User]]
                                        :opts   {:did  alice-did
                                                 :role :ex/userRole}}))
           "Both users should show, but only SSN for Alice")
@@ -199,12 +199,12 @@
                                                           :opts           {:did  alice-did
                                                                            :role :ex/userRole}})
                 commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
-            (is (= [{:rdf/type         [:ex/User],
+            (is (= [{:type         [:ex/User],
                      :schema/name      "John",
                      :schema/email     "john@flur.ee",
                      :schema/birthDate "2021-08-17",
                      :id               :ex/john}
-                    {:rdf/type         [:ex/User],
+                    {:type         [:ex/User],
                      :schema/name      "Alice",
                      :schema/email     "alice@flur.ee",
                      :schema/birthDate "2022-08-17",
@@ -219,7 +219,7 @@
                                                                            :role :ex/rootRole}})
                 commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
             (is (contains? (into #{} commit-details-asserts)
-                           {:rdf/type         [:ex/User],
+                           {:type         [:ex/User],
                             :schema/name      "John",
                             :schema/email     "john@flur.ee",
                             :schema/birthDate "2021-08-17",
@@ -291,10 +291,10 @@
                               [{:id "https://ns.flur.ee/ledger#view"}]
                               "https://ns.flur.ee/ledger#equals"
                               {:list [{:id "https://ns.flur.ee/ledger#$identity"} :ex/user]}}]}]}])]
-      (is (= [{:id :ex/bob, :rdf/type [:ex/User], :schema/name "Bob"}
-              {:id          :ex/alice, :rdf/type [:ex/User], :ex/secret "alice's secret"
+      (is (= [{:id :ex/bob, :type [:ex/User], :schema/name "Bob"}
+              {:id          :ex/alice, :type [:ex/User], :ex/secret "alice's secret"
                :schema/name "Alice"}]
-             @(fluree/query db {:where  '[[?s :rdf/type :ex/User]]
+             @(fluree/query db {:where  '[[?s :type :ex/User]]
                                 :select '{?s [:*]}
                                 :opts   {:role :ex/userRole
                                          :did  alice-did}}))))))

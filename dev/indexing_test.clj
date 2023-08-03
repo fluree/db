@@ -68,7 +68,7 @@
 
   @(fluree/query (fluree/db ledger)
                  {:select {'?s [:* {:schema/isBasedOn [:*]}]}
-                  :where  [['?s :rdf/type :schema/Movie]]})
+                  :where  [['?s :type :schema/Movie]]})
 
   (def db2 @(fluree/stage
               ledger
@@ -92,7 +92,7 @@
 
   @(fluree/query (fluree/db loaded-ledger)
                  {:select {'?s [:* {:schema/isBasedOn [:*]}]}
-                  :where  [['?s :rdf/type :schema/Movie]]})
+                  :where  [['?s :type :schema/Movie]]})
 
   (-> (fluree/db loaded-ledger)
       :commit)
@@ -105,7 +105,7 @@
 
   @(fluree/query db3
                  {:select {'?s [:* {:schema/isBasedOn [:*]}]}
-                  :where  [['?s :rdf/type :schema/Movie]]})
+                  :where  [['?s :type :schema/Movie]]})
 
   (-> @(fluree/commit! db3 {:message "Third commit, from loaded ledger"
                             :push?   true})

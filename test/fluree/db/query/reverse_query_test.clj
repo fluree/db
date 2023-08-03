@@ -40,6 +40,6 @@
                                  :where     [[?s :id :ex/brian]]})
              {:schema/name "Brian",
               :friended    {:id           :ex/cam,
-                            :rdf/type     [:ex/User],
+                            :type     [:ex/User],
                             :schema/name  "Cam",
                             :ex/friend    [{:id :ex/brian} {:id :ex/alice}]}})))))

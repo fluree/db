@@ -12,7 +12,7 @@
                                            {:defaultContext
                                             ["" {:ex "http://example.org/ns/"}]})
           user-query       {:select {'?s [:*]}
-                            :where  [['?s :rdf/type :ex/User]]}
+                            :where  [['?s :type :ex/User]]}
           db               @(fluree/stage
                              (fluree/db ledger)
                              {:id             :ex/UserShape
@@ -67,7 +67,7 @@
       (is (str/starts-with? (ex-message db-callsign-name)
                             "SHACL PropertyShape exception - sh:not sh:equals: [\"Johnny Boy\"] is required to be not equal to [\"Johnny Boy\"]"))
       (is (= [{:id              :ex/john,
-               :rdf/type        [:ex/User],
+               :type        [:ex/User],
                :schema/name     "John",
                :schema/callSign "j-rock"}]
              ok-results)
@@ -79,7 +79,7 @@
                                        {:defaultContext
                                         ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :rdf/type :ex/User]]}
+                        :where  [['?s :type :ex/User]]}
           db           @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/UserShape
@@ -136,7 +136,7 @@
                             ;; could be either problem so just match common prefix
                             "SHACL PropertyShape exception - sh:not "))
       (is (= [{:id              :ex/john,
-               :rdf/type        [:ex/User],
+               :type        [:ex/User],
                :schema/name     "John",
                :schema/callSign "j-rock"
                :schema/age      42
@@ -150,7 +150,7 @@
                                        {:defaultContext
                                         ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :rdf/type :ex/User]]}
+                        :where  [['?s :type :ex/User]]}
           db           @(fluree/stage
                           (fluree/db ledger)
                           {:id             :ex/UserShape
@@ -206,14 +206,14 @@
       (is (str/starts-with? (ex-message db-greeting-incorrect)
                             "SHACL PropertyShape exception - sh:not sh:pattern: value hello! must not match pattern"))
       (is (= [{:id          :ex/jean-claude
-               :rdf/type    [:ex/User],
+               :type    [:ex/User],
                :schema/name "Jean-Claude"}]
              @(fluree/query db-ok-name user-query)))
       (is (= [{:id       :ex/al,
-               :rdf/type [:ex/User],
+               :type [:ex/User],
                :ex/tag   1}]
              @(fluree/query db-ok-tag user-query)))
       (is (= [{:id       :ex/al,
-               :rdf/type [:ex/User],
+               :type [:ex/User],
                :ex/greeting   "HOWDY"}]
              @(fluree/query db-ok-greeting user-query))))))

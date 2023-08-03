@@ -66,12 +66,13 @@
                              values)
                         {:status 400 :error :db/invalid-query}))))))
 
-(def rdf-type-preds #{"http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                      "a"
+(def rdf-type-preds #{"a"
                       :a
+                      :type
+                      const/iri-type
                       "rdf:type"
                       :rdf/type
-                      "@type"})
+                      const/iri-rdf-type})
 
 (defn rdf-type?
   [p]

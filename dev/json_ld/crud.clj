@@ -51,7 +51,7 @@
                      :from   :ex/alice})
 
   @(fluree/query db {:select {'?s [:*]}
-                     :where  [['?s :rdf/type :ex/User]]})
+                     :where  [['?s :type :ex/User]]})
 
   @(fluree/query db {:select ['?p '?o]
                      :where  [[:ex/alice '?p '?o]]})
@@ -83,7 +83,7 @@
 
   @(fluree/query db-subj-pred-del
                  {:select {'?s [:*]}
-                  :where  [['?s :rdf/type :ex/User]]})
+                  :where  [['?s :type :ex/User]]})
 
   ;;;;;;;;;;;;;;;;
   ;; delete all subjects with a :schema/email predicate

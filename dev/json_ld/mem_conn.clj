@@ -23,7 +23,7 @@
 
   @(fluree/query (fluree/db ledger)
                  {:select {'?s [:* {:f/role [:*]}]}
-                  :where  [['?s :rdf/type :f/DID]]})
+                  :where  [['?s :type :f/DID]]})
 
   (def newdb
     @(fluree/stage

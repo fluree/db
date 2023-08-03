@@ -199,10 +199,6 @@
                                 :ref? true
                                 :idx? true
                                 :id   const/$rdf:type}
-                               {:iri  "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
-                                :ref? true
-                                :idx? true
-                                :id   const/$rdf:type}
                                {:iri  "http://www.w3.org/2000/01/rdf-schema#Class"
                                 :ref? true
                                 :idx? true

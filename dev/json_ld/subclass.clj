@@ -57,7 +57,7 @@
 
   @(fluree/query newdb
                  {:select {'?s [:*]}
-                  :where  [['?s :rdf/type :schema/Book]]})
+                  :where  [['?s :type :schema/Book]]})
 
 
   ;; add CreativeWork class
@@ -87,6 +87,6 @@
   ;; Query for CreativeWork
   @(fluree/query db3
                  {:select {'?s [:*]}
-                  :where  [['?s :rdf/type :schema/CreativeWork]]})
+                  :where  [['?s :type :schema/CreativeWork]]})
 
   )

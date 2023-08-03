@@ -39,7 +39,7 @@
 
       ;; basic combine :schema/email and :ex/email into same result variable
       (is (= @(fluree/query db {:select ['?name '?email]
-                                :where  [['?s :rdf/type :ex/User]
+                                :where  [['?s :type :ex/User]
                                          ['?s :schema/name '?name]
                                          {:union [[['?s :ex/email '?email]]
                                                   [['?s :schema/email '?email]]]}]})
@@ -50,7 +50,7 @@
 
       ;; basic union that uses different variables for output
       (is (= @(fluree/query db {:select ['?s '?email1 '?email2]
-                                :where  [['?s :rdf/type :ex/User]
+                                :where  [['?s :type :ex/User]
                                          {:union [[['?s :ex/email '?email1]]
                                                   [['?s :schema/email '?email2]]]}]})
              [[:ex/cam "cam@example.org" nil]
@@ -60,7 +60,7 @@
 
       ;; basic union that uses different variables for output and has a passthrough variable
       (is (= @(fluree/query db {:select ['?name '?email1 '?email2]
-                                :where  [['?s :rdf/type :ex/User]
+                                :where  [['?s :type :ex/User]
                                          ['?s :schema/name '?name]
                                          {:union [[['?s :ex/email '?email1]]
                                                   [['?s :schema/email '?email2]]]}]})
