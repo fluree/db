@@ -75,7 +75,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
        [
          {
            id: 'ex:john',
-           'rdf:type': [ 'ex:User' ],
+           type: [ 'ex:User' ],
            'schema:name': "John"
          }
        ]
@@ -94,7 +94,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
     [
       {
         id: 'ex:john',
-        'rdf:type': [ 'ex:User' ],
+        type: [ 'ex:User' ],
         flhubee: 'John'
       }
     ]
