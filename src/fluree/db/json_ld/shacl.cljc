@@ -357,9 +357,11 @@
   (go-try
     (let [q-shape-flakes (<? (query-range/index-range db :spot = [qualified-value-shape]))
           node-shape?    (->> q-shape-flakes
-                              (filter #(and (= (flake/p %) const/$rdf:type)
-                                            (= (flake/o %) const/$sh:NodeShape)))
-                              (first))
+                              (reduce (fn [node-shape? f]
+                                        (if (and (= (flake/p f) const/$rdf:type)
+                                                 (= (flake/o f) const/$sh:NodeShape))
+                                          (reduced true)
+                                          false))))
           q-shape        (if node-shape?
                            (<? (build-node-shape db q-shape-flakes))
                            (<? (build-property-shape db const/$sh:qualifiedValueShape q-shape-flakes)))]
