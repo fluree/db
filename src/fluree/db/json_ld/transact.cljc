@@ -210,7 +210,11 @@
              property-flakes type-flakes ;; only used if generating new Class and Property flakes
              subj-flakes     base-flakes]
         (if k
-          (let [list?            (list-value? v)
+          (let [_ (when (= k const/iri-rdf-type)
+                    (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
+                                         " Please use the JSON-LD \"@type\" keyword instead.")
+                                    {:status 400 :error :db/invalid-predicate})))
+                list?            (list-value? v)
                 retract?         (nil? v)
                 v*               (if list?
                                    (let [list-vals (:list v)]

@@ -345,3 +345,41 @@
         (is (= [[:ex/User]]
                @(fluree/query shacl-db '{:select [?class]
                                          :where  [[:ex/UserShape :sh/targetClass ?class]]})))))))
+
+(deftest ^:integration type-handling
+  (let [conn @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "type-handling" {:defaultContext [test-utils/default-str-context {"ex" "http://example.org/ns/"}]})
+        db0 (fluree/db ledger)
+        db1 @(fluree/stage db0 [{"id" "ex:ace"
+                                 "type" "ex:Spade"}
+                                {"id" "ex:king"
+                                 "type" "ex:Heart"}
+                                {"id" "ex:queen"
+                                 "type" "ex:Heart"}
+                                {"id" "ex:jack"
+                                 "type" "ex:Club"}])
+        db2 @(fluree/stage db1 [{"id" "ex:two"
+                                 "rdf:type" "ex:Diamond"}])
+        db3 @(fluree/stage db1 {"@context" ["" {"rdf:type" "@type"}]
+                                "id" "ex:two"
+                                "rdf:type" "ex:Diamond"})]
+    (is (= [{"id" "ex:queen" "type" ["ex:Heart"]}
+            {"id" "ex:king" "type" ["ex:Heart"]}]
+           @(fluree/query db1 {"select" {"?s" ["*"]}
+                               "where" [["?s" "type" "ex:Heart"]]}))
+        "Query with type and type in results")
+    (is (= [{"id" "ex:queen" "type" ["ex:Heart"]}
+            {"id" "ex:king" "type" ["ex:Heart"]}]
+           @(fluree/query db1 {"select" {"?s" ["*"]}
+                               "where" [["?s" "rdf:type" "ex:Heart"]]}))
+        "Query with rdf:type and type in results")
+
+    (is (util/exception? db2)
+        "Cannot transact with rdf:type predicate")
+    (is (= "\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\" is not a valid predicate IRI. Please use the JSON-LD \"@type\" keyword instead."
+           (-> db2 Throwable->map :cause)))
+
+    (is (= [{"id" "ex:two" "type" ["ex:Diamond"]}]
+           @(fluree/query db3 {"select" {"?s" ["*"]}
+                               "where" [["?s" "type" "ex:Diamond"]]}))
+        "Can transact with rdf:type aliased to type.")))

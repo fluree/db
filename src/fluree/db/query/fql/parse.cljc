@@ -69,7 +69,10 @@
 (def rdf-type-preds #{"a"
                       :a
                       :type
-                      const/iri-type})
+                      const/iri-type
+                      "rdf:type"
+                      :rdf/type
+                      const/iri-rdf-type})
 
 (defn rdf-type?
   [p]
