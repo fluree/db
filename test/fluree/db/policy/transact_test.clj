@@ -85,7 +85,7 @@
                                            {:did alice-did
                                             :role      :ex/userRole})]
             (is (= [{:id :ex/alice,
-                     :type [:ex/User],
+                     :type :ex/User,
                      :schema/name "Alice",
                      :schema/email "alice@foo.bar",
                      :schema/birthDate "2022-08-17",
@@ -103,7 +103,7 @@
                                               {:role :ex/rootRole})]
 
               (is (= [{:id :ex/widget,
-                       :type [:ex/Product],
+                       :type :ex/Product,
                        :schema/name "Widget",
                        :schema/price 105.99,
                        :schema/priceCurrency "USD"}]
@@ -116,7 +116,7 @@
                                               :schema/name "Widget2"}
                                              {:role :ex/userRole})]
 
-              (is (= [{:type    [:ex/Product]
+              (is (= [{:type    :ex/Product
                        :schema/name "Widget2"}]
                      @(fluree/query update-name
                                     {:select {'?s [:*]}

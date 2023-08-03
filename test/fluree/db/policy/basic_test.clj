@@ -80,13 +80,13 @@
 
       ;; root can see all user data
       (is (= [{:id               :ex/john,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17",
                :schema/ssn       "888-88-8888"}
               {:id               :ex/alice,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
@@ -101,13 +101,13 @@
           "Both user records + all attributes should show")
 
       (is (= [{:id               :ex/john,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17",
                :schema/ssn       "888-88-8888"}
               {:id               :ex/alice,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
@@ -123,7 +123,7 @@
 
       ;; root role can see all product data, without identity
       (is (= [{:id                   :ex/widget,
-               :type             [:ex/Product],
+               :type             :ex/Product,
                :schema/name          "Widget",
                :schema/price         99.99,
                :schema/priceCurrency "USD"}]
@@ -132,12 +132,12 @@
                                        :opts   {:role :ex/rootRole}}))
           "The product record should show with all attributes")
       (is (= [{:id               :ex/john,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17"}
               {:id               :ex/alice,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17"}]
@@ -155,12 +155,12 @@
 
       ;; Alice can see all users, but can only see SSN for herself, and can't see the nested location
       (is (= [{:id               :ex/john,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "John",
                :schema/email     "john@flur.ee",
                :schema/birthDate "2021-08-17"}
               {:id               :ex/alice,
-               :type         [:ex/User],
+               :type         :ex/User,
                :schema/name      "Alice",
                :schema/email     "alice@flur.ee",
                :schema/birthDate "2022-08-17",
@@ -199,12 +199,12 @@
                                                           :opts           {:did  alice-did
                                                                            :role :ex/userRole}})
                 commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
-            (is (= [{:type         [:ex/User],
+            (is (= [{:type         :ex/User,
                      :schema/name      "John",
                      :schema/email     "john@flur.ee",
                      :schema/birthDate "2021-08-17",
                      :id               :ex/john}
-                    {:type         [:ex/User],
+                    {:type         :ex/User,
                      :schema/name      "Alice",
                      :schema/email     "alice@flur.ee",
                      :schema/birthDate "2022-08-17",
@@ -219,7 +219,7 @@
                                                                            :role :ex/rootRole}})
                 commit-details-asserts (get-in history-result [:f/commit :f/data :f/assert])]
             (is (contains? (into #{} commit-details-asserts)
-                           {:type         [:ex/User],
+                           {:type         :ex/User,
                             :schema/name      "John",
                             :schema/email     "john@flur.ee",
                             :schema/birthDate "2021-08-17",
@@ -291,8 +291,8 @@
                               [{:id "https://ns.flur.ee/ledger#view"}]
                               "https://ns.flur.ee/ledger#equals"
                               {:list [{:id "https://ns.flur.ee/ledger#$identity"} :ex/user]}}]}]}])]
-      (is (= [{:id :ex/bob, :type [:ex/User], :schema/name "Bob"}
-              {:id          :ex/alice, :type [:ex/User], :ex/secret "alice's secret"
+      (is (= [{:id :ex/bob, :type :ex/User, :schema/name "Bob"}
+              {:id          :ex/alice, :type :ex/User, :ex/secret "alice's secret"
                :schema/name "Alice"}]
              @(fluree/query db {:where  '[[?s :type :ex/User]]
                                 :select '{?s [:*]}

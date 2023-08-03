@@ -20,13 +20,13 @@
                                              :schema/name "Picasso"}}]})]
       (is (= [{:_id          211106232532993,
                :id           :ex/bob,
-               :type     [:ex/User],
+               :type     :ex/User,
                :schema/name  "Bob",
                :ex/favArtist {:_id         211106232532994
                               :schema/name "Picasso"}}
               {:_id         211106232532992,
                :id          :ex/alice,
-               :type    [:ex/User],
+               :type    :ex/User,
                :schema/name "Alice"}]
              @(fluree/query db {:select {'?s [:_id :* {:ex/favArtist [:_id :schema/name]}]}
                                 :where  [['?s :type :ex/User]]}))))))
@@ -146,68 +146,68 @@
                                   :where  [['?s '?p '?o]]}))
             "Entire database should be pulled.")
         (is (= [{:id :ex/jane,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Jane",
                  :schema/email "jane@flur.ee",
                  :schema/age 30}
                 {:id :ex/jane,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Jane",
                  :schema/email "jane@flur.ee",
                  :schema/age 30}
                 {:id :ex/jane,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Jane",
                  :schema/email "jane@flur.ee",
                  :schema/age 30}
                 {:id :ex/jane,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Jane",
                  :schema/email "jane@flur.ee",
                  :schema/age 30}
                 {:id :ex/jane,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Jane",
                  :schema/email "jane@flur.ee",
                  :schema/age 30}
                 {:id :ex/bob,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Bob",
                  :schema/age 22}
                 {:id :ex/bob,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Bob",
                  :schema/age 22}
                 {:id :ex/bob,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Bob",
                  :schema/age 22}
                 {:id :ex/bob,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Bob",
                  :schema/age 22}
                 {:id :ex/alice,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@flur.ee",
                  :schema/age 42}
                 {:id :ex/alice,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@flur.ee",
                  :schema/age 42}
                 {:id :ex/alice,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@flur.ee",
                  :schema/age 42}
                 {:id :ex/alice,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@flur.ee",
                  :schema/age 42}
                 {:id :ex/alice,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@flur.ee",
                  :schema/age 42}
@@ -363,13 +363,13 @@
         db3 @(fluree/stage db1 {"@context" ["" {"rdf:type" "@type"}]
                                 "id" "ex:two"
                                 "rdf:type" "ex:Diamond"})]
-    (is (= [{"id" "ex:queen" "type" ["ex:Heart"]}
-            {"id" "ex:king" "type" ["ex:Heart"]}]
+    (is (= [{"id" "ex:queen" "type" "ex:Heart"}
+            {"id" "ex:king" "type" "ex:Heart"}]
            @(fluree/query db1 {"select" {"?s" ["*"]}
                                "where" [["?s" "type" "ex:Heart"]]}))
         "Query with type and type in results")
-    (is (= [{"id" "ex:queen" "type" ["ex:Heart"]}
-            {"id" "ex:king" "type" ["ex:Heart"]}]
+    (is (= [{"id" "ex:queen" "type" "ex:Heart"}
+            {"id" "ex:king" "type" "ex:Heart"}]
            @(fluree/query db1 {"select" {"?s" ["*"]}
                                "where" [["?s" "rdf:type" "ex:Heart"]]}))
         "Query with rdf:type and type in results")
@@ -379,7 +379,7 @@
     (is (= "\"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\" is not a valid predicate IRI. Please use the JSON-LD \"@type\" keyword instead."
            (-> db2 Throwable->map :cause)))
 
-    (is (= [{"id" "ex:two" "type" ["ex:Diamond"]}]
+    (is (= [{"id" "ex:two" "type" "ex:Diamond"}]
            @(fluree/query db3 {"select" {"?s" ["*"]}
                                "where" [["?s" "type" "ex:Diamond"]]}))
         "Can transact with rdf:type aliased to type.")))

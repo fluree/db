@@ -17,13 +17,13 @@
           db2       @(fluree/stage
                       db1
                       {:id                 :ex/myClassInstance
-                       :type               [:ex/MyClass]
+                       :type               :ex/MyClass
                        :schema/description "Now a new subject uses MyClass as a Class"})
           query-res @(fluree/query db2 '{:select {?s [:*]}
                                          :where  [[?s :id :ex/myClassInstance]]})]
       (is (= query-res
              [{:id                 :ex/myClassInstance
-               :type           [:ex/MyClass]
+               :type           :ex/MyClass
                :schema/description "Now a new subject uses MyClass as a Class"}])))))
 
 
@@ -45,7 +45,7 @@
           db-ok        @(fluree/stage
                          db
                          {:id              :ex/john
-                          :type            [:ex/User]
+                          :type            :ex/User
                           :schema/name     "John"
                           :schema/callSign "j-rock"})
           ; no :schema/name
@@ -53,14 +53,14 @@
                          @(fluree/stage
                            db
                            {:id              :ex/john
-                            :type            [:ex/User]
+                            :type            :ex/User
                             :schema/callSign "j-rock"})
                          (catch Exception e e))
           db-two-names (try
                          @(fluree/stage
                            db
                            {:id              :ex/john
-                            :type            [:ex/User]
+                            :type            :ex/User
                             :schema/name     ["John", "Johnny"]
                             :schema/callSign "j-rock"})
                          (catch Exception e e))]
@@ -73,7 +73,7 @@
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-names)))
       (is (= [{:id              :ex/john,
-               :type        [:ex/User],
+               :type        :ex/User,
                :schema/name     "John",
                :schema/callSign "j-rock"}]
              @(fluree/query db-ok user-query))
@@ -89,28 +89,28 @@
           db           @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/UserShape
-                          :type           [:sh/NodeShape]
+                          :type           :sh/NodeShape
                           :sh/targetClass :ex/User
                           :sh/property    [{:sh/path     :schema/name
                                             :sh/datatype :xsd/string}]})
           db-ok        @(fluree/stage
                          db
                          {:id          :ex/john
-                          :type        [:ex/User]
+                          :type        :ex/User
                           :schema/name "John"})
           ; no :schema/name
           db-int-name  (try
                          @(fluree/stage
                            db
                            {:id          :ex/john
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name 42})
                          (catch Exception e e))
           db-bool-name (try
                          @(fluree/stage
                            db
                            {:id          :ex/john
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name true})
                          (catch Exception e e))]
       (is (util/exception? db-int-name)
@@ -121,7 +121,7 @@
       (is (str/starts-with? (ex-message db-bool-name) "Data type"))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
-               :type    [:ex/User]
+               :type    :ex/User
                :schema/name "John"}])
           "basic rdf:type query response not correct"))))
 
@@ -134,7 +134,7 @@
           db            @(fluree/stage
                           (fluree/db ledger)
                           {:id                   :ex/UserShape
-                           :type                 [:sh/NodeShape]
+                           :type                 :sh/NodeShape
                            :sh/targetClass       :ex/User
                            :sh/property          [{:sh/path     :schema/name
                                                    :sh/datatype :xsd/string}]
@@ -144,14 +144,14 @@
           db-ok         @(fluree/stage
                           db
                           {:id          :ex/john
-                           :type        [:ex/User]
+                           :type        :ex/User
                            :schema/name "John"})
           ; no :schema/name
           db-extra-prop (try
                           @(fluree/stage
                             db
                             {:id           :ex/john
-                             :type         [:ex/User]
+                             :type         :ex/User
                              :schema/name  "John"
                              :schema/email "john@flur.ee"})
                           (catch Exception e e))]
@@ -160,7 +160,7 @@
                             "SHACL shape is closed"))
 
       (is (= [{:id          :ex/john
-               :type    [:ex/User]
+               :type    :ex/User
                :schema/name "John"}]
              @(fluree/query db-ok user-query))
           "basic type query response not correct"))))
@@ -175,14 +175,14 @@
         (let [db           @(fluree/stage
                              (fluree/db ledger)
                              {:id             :ex/EqualNamesShape
-                              :type           [:sh/NodeShape]
+                              :type           :sh/NodeShape
                               :sh/targetClass :ex/User
                               :sh/property    [{:sh/path   :schema/name
                                                 :sh/equals :ex/firstName}]})
               db-ok        @(fluree/stage
                              db
                              {:id           :ex/alice
-                              :type         [:ex/User]
+                              :type         :ex/User
                               :schema/name  "Alice"
                               :ex/firstName "Alice"})
 
@@ -190,7 +190,7 @@
                              @(fluree/stage
                                db
                                {:id           :ex/john
-                                :type         [:ex/User]
+                                :type         :ex/User
                                 :schema/name  "John"
                                 :ex/firstName "Jack"})
                              (catch Exception e e))]
@@ -200,7 +200,7 @@
                                 "SHACL PropertyShape exception - sh:equals"))
 
           (is (= [{:id           :ex/alice
-                   :type     [:ex/User]
+                   :type     :ex/User
                    :schema/name  "Alice"
                    :ex/firstName "Alice"}]
                  @(fluree/query db-ok user-query)))))
@@ -208,14 +208,14 @@
         (let [db            @(fluree/stage
                               (fluree/db ledger)
                               {:id             :ex/EqualNamesShape
-                               :type           [:sh/NodeShape]
+                               :type           :sh/NodeShape
                                :sh/targetClass :ex/User
                                :sh/property    [{:sh/path   :ex/favNums
                                                  :sh/equals :ex/luckyNums}]})
               db-ok         @(fluree/stage
                               db
                               {:id           :ex/alice
-                               :type         [:ex/User]
+                               :type         :ex/User
                                :schema/name  "Alice"
                                :ex/favNums   [11 17]
                                :ex/luckyNums [11 17]})
@@ -223,7 +223,7 @@
               db-ok2        @(fluree/stage
                               db
                               {:id           :ex/alice
-                               :type         [:ex/User]
+                               :type         :ex/User
                                :schema/name  "Alice"
                                :ex/favNums   [11 17]
                                :ex/luckyNums [17 11]})
@@ -232,7 +232,7 @@
                               @(fluree/stage
                                 db
                                 {:id           :ex/brian
-                                 :type         [:ex/User]
+                                 :type         :ex/User
                                  :schema/name  "Brian"
                                  :ex/favNums   [11 17]
                                  :ex/luckyNums [13 18]})
@@ -241,7 +241,7 @@
                               @(fluree/stage
                                 db
                                 {:id           :ex/brian
-                                 :type         [:ex/User]
+                                 :type         :ex/User
                                  :schema/name  "Brian"
                                  :ex/favNums   [11 17]
                                  :ex/luckyNums [11]})
@@ -250,7 +250,7 @@
                               @(fluree/stage
                                 db
                                 {:id           :ex/brian
-                                 :type         [:ex/User]
+                                 :type         :ex/User
                                  :schema/name  "Brian"
                                  :ex/favNums   [11 17]
                                  :ex/luckyNums [11 17 18]})
@@ -259,7 +259,7 @@
                               @(fluree/stage
                                 db
                                 {:id           :ex/brian
-                                 :type         [:ex/User]
+                                 :type         :ex/User
                                  :schema/name  "Brian"
                                  :ex/favNums   [11 17]
                                  :ex/luckyNums ["11" "17"]})
@@ -281,13 +281,13 @@
           (is (str/starts-with? (ex-message db-not-equal4)
                                 "SHACL PropertyShape exception - sh:equals"))
           (is (= [{:id           :ex/alice
-                   :type     [:ex/User]
+                   :type     :ex/User
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums [11 17]}]
                  @(fluree/query db-ok user-query)))
           (is (= [{:id           :ex/alice
-                   :type     [:ex/User]
+                   :type     :ex/User
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums [11 17]}]
@@ -296,14 +296,14 @@
         (let [db               @(fluree/stage
                                  (fluree/db ledger)
                                  {:id             :ex/DisjointShape
-                                  :type           [:sh/NodeShape]
+                                  :type           :sh/NodeShape
                                   :sh/targetClass :ex/User
                                   :sh/property    [{:sh/path     :ex/favNums
                                                     :sh/disjoint :ex/luckyNums}]})
               db-ok            @(fluree/stage
                                  db
                                  {:id           :ex/alice
-                                  :type         [:ex/User]
+                                  :type         :ex/User
                                   :schema/name  "Alice"
                                   :ex/favNums   [11 17]
                                   :ex/luckyNums 1})
@@ -312,7 +312,7 @@
                                  @(fluree/stage
                                    db
                                    {:id           :ex/brian
-                                    :type         [:ex/User]
+                                    :type         :ex/User
                                     :schema/name  "Brian"
                                     :ex/favNums   11
                                     :ex/luckyNums 11})
@@ -321,7 +321,7 @@
                                  @(fluree/stage
                                    db
                                    {:id           :ex/brian
-                                    :type         [:ex/User]
+                                    :type         :ex/User
                                     :schema/name  "Brian"
                                     :ex/favNums   [11 17 31]
                                     :ex/luckyNums 11})
@@ -331,7 +331,7 @@
                                  @(fluree/stage
                                    db
                                    {:id           :ex/brian
-                                    :type         [:ex/User]
+                                    :type         :ex/User
                                     :schema/name  "Brian"
                                     :ex/favNums   [11 17 31]
                                     :ex/luckyNums [13 18 11]})
@@ -353,7 +353,7 @@
                                 "SHACL PropertyShape exception - sh:disjoint"))
 
           (is (= [{:id           :ex/alice
-                   :type     [:ex/User]
+                   :type     :ex/User
                    :schema/name  "Alice"
                    :ex/favNums   [11 17]
                    :ex/luckyNums 1}]
@@ -362,14 +362,14 @@
         (let [db       @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/LessThanShape
-                          :type           [:sh/NodeShape]
+                          :type           :sh/NodeShape
                           :sh/targetClass :ex/User
                           :sh/property    [{:sh/path     :ex/p1
                                             :sh/lessThan :ex/p2}]})
               db-ok1   @(fluree/stage
                          db
                          {:id          :ex/alice
-                          :type        [:ex/User]
+                          :type        :ex/User
                           :schema/name "Alice"
                           :ex/p1       [11 17]
                           :ex/p2       [18 19]})
@@ -378,7 +378,7 @@
               db-ok2   @(fluree/stage
                          db
                          {:id          :ex/alice
-                          :type        [:ex/User]
+                          :type        :ex/User
                           :schema/name "Alice"
                           :ex/p1       [11 17]
                           :ex/p2       [18]})
@@ -387,7 +387,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [11 17]
                             :ex/p2       17})
@@ -397,7 +397,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [11 17]
                             :ex/p2       ["18" "19"]})
@@ -408,7 +408,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [12 17]
                             :ex/p2       [10 18]})
@@ -418,7 +418,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [11 17]
                             :ex/p2       [12 16]})
@@ -426,7 +426,7 @@
               db-iris  (try @(fluree/stage
                               db
                               {:id          :ex/alice
-                               :type        [:ex/User]
+                               :type        :ex/User
                                :schema/name "Alice"
                                :ex/p1       :ex/brian
                                :ex/p2       :ex/john})
@@ -458,13 +458,13 @@
                                 "SHACL PropertyShape exception - sh:lessThan"))
 
           (is (= [{:id          :ex/alice
-                   :type    [:ex/User]
+                   :type    :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       [18 19]}]
                  @(fluree/query db-ok1 user-query)))
           (is (= [{:id          :ex/alice
-                   :type    [:ex/User]
+                   :type    :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       18}]
@@ -473,14 +473,14 @@
         (let [db       @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/LessThanOrEqualsShape
-                          :type           [:sh/NodeShape]
+                          :type           :sh/NodeShape
                           :sh/targetClass :ex/User
                           :sh/property    [{:sh/path             :ex/p1
                                             :sh/lessThanOrEquals :ex/p2}]})
               db-ok1   @(fluree/stage
                          db
                          {:id          :ex/alice
-                          :type        [:ex/User]
+                          :type        :ex/User
                           :schema/name "Alice"
                           :ex/p1       [11 17]
                           :ex/p2       [17 19]})
@@ -489,7 +489,7 @@
               db-ok2   @(fluree/stage
                          db
                          {:id          :ex/alice
-                          :type        [:ex/User]
+                          :type        :ex/User
                           :schema/name "Alice"
                           :ex/p1       [11 17]
                           :ex/p2       17})
@@ -498,7 +498,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [11 17]
                             :ex/p2       10})
@@ -508,7 +508,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [11 17]
                             :ex/p2       ["17" "19"]})
@@ -518,7 +518,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [12 17]
                             :ex/p2       [10 17]})
@@ -528,7 +528,7 @@
                          @(fluree/stage
                            db
                            {:id          :ex/alice
-                            :type        [:ex/User]
+                            :type        :ex/User
                             :schema/name "Alice"
                             :ex/p1       [11 17]
                             :ex/p2       [12 16]})
@@ -555,13 +555,13 @@
           (is (str/starts-with? (ex-message db-fail4)
                                 "SHACL PropertyShape exception - sh:lessThanOrEquals"))
           (is (= [{:id          :ex/alice
-                   :type    [:ex/User]
+                   :type    :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       [17 19]}]
                  @(fluree/query db-ok1 user-query)))
           (is (= [{:id          :ex/alice
-                   :type    [:ex/User]
+                   :type    :ex/User
                    :schema/name "Alice"
                    :ex/p1       [11 17]
                    :ex/p2       17}]
@@ -577,7 +577,7 @@
         (let [db          @(fluree/stage
                             (fluree/db ledger)
                             {:id             :ex/ExclusiveNumRangeShape
-                             :type           [:sh/NodeShape]
+                             :type           :sh/NodeShape
                              :sh/targetClass :ex/User
                              :sh/property    [{:sh/path         :schema/age
                                                :sh/minExclusive 1
@@ -585,18 +585,18 @@
               db-ok       @(fluree/stage
                             db
                             {:id         :ex/john
-                             :type       [:ex/User]
+                             :type       :ex/User
                              :schema/age 2})
               db-too-low  (try @(fluree/stage
                                  db
                                  {:id         :ex/john
-                                  :type       [:ex/User]
+                                  :type       :ex/User
                                   :schema/age 1})
                                (catch Exception e e))
               db-too-high (try @(fluree/stage
                                  db
                                  {:id         :ex/john
-                                  :type       [:ex/User]
+                                  :type       :ex/User
                                   :schema/age 100})
                                (catch Exception e e))]
           (is (util/exception? db-too-low)
@@ -611,13 +611,13 @@
 
           (is (= @(fluree/query db-ok user-query)
                  [{:id         :ex/john
-                   :type   [:ex/User]
+                   :type   :ex/User
                    :schema/age 2}]))))
       (testing "inclusive constraints"
         (let [db          @(fluree/stage
                             (fluree/db ledger)
                             {:id             :ex/InclusiveNumRangeShape
-                             :type           [:sh/NodeShape]
+                             :type           :sh/NodeShape
                              :sh/targetClass :ex/User
                              :sh/property    [{:sh/path         :schema/age
                                                :sh/minInclusive 1
@@ -625,22 +625,22 @@
               db-ok       @(fluree/stage
                             db
                             {:id         :ex/brian
-                             :type       [:ex/User]
+                             :type       :ex/User
                              :schema/age 1})
               db-ok2      @(fluree/stage
                             db-ok
                             {:id         :ex/alice
-                             :type       [:ex/User]
+                             :type       :ex/User
                              :schema/age 100})
               db-too-low  @(fluree/stage
                             db
                             {:id         :ex/alice
-                             :type       [:ex/User]
+                             :type       :ex/User
                              :schema/age 0})
               db-too-high @(fluree/stage
                             db
                             {:id         :ex/alice
-                             :type       [:ex/User]
+                             :type       :ex/User
                              :schema/age 101})]
           (is (util/exception? db-too-low)
               "Exception, because :schema/age is below the minimum")
@@ -653,29 +653,29 @@
                                 "SHACL PropertyShape exception - sh:maxInclusive: value 101"))
           (is (= @(fluree/query db-ok2 user-query)
                  [{:id         :ex/alice
-                   :type   [:ex/User]
+                   :type   :ex/User
                    :schema/age 100}
                   {:id         :ex/brian
-                   :type   [:ex/User]
+                   :type   :ex/User
                    :schema/age 1}]))))
       (testing "non-numeric values"
         (let [db         @(fluree/stage
                            (fluree/db ledger)
                            {:id             :ex/NumRangeShape
-                            :type           [:sh/NodeShape]
+                            :type           :sh/NodeShape
                             :sh/targetClass :ex/User
                             :sh/property    [{:sh/path         :schema/age
                                               :sh/minExclusive 0}]})
               db-subj-id (try @(fluree/stage
                                 db
                                 {:id         :ex/alice
-                                 :type       [:ex/User]
+                                 :type       :ex/User
                                  :schema/age :ex/brian})
                               (catch Exception e e))
               db-string  (try @(fluree/stage
                                 db
                                 {:id         :ex/alice
-                                 :type       [:ex/User]
+                                 :type       :ex/User
                                  :schema/age "10"})
                               (catch Exception e e))]
           (is (util/exception? db-subj-id)
@@ -699,7 +699,7 @@
           db                  @(fluree/stage
                                 (fluree/db ledger)
                                 {:id             :ex/UserShape
-                                 :type           [:sh/NodeShape]
+                                 :type           :sh/NodeShape
                                  :sh/targetClass :ex/User
                                  :sh/property    [{:sh/path      :schema/name
                                                    :sh/minLength 4
@@ -707,13 +707,13 @@
           db-ok-str           @(fluree/stage
                                 db
                                 {:id          :ex/john
-                                 :type        [:ex/User]
+                                 :type        :ex/User
                                  :schema/name "John"})
 
           db-ok-non-str       @(fluree/stage
                                 db
                                 {:id          :ex/john
-                                 :type        [:ex/User]
+                                 :type        :ex/User
                                  :schema/name 12345})
 
           db-too-short-str    (try
@@ -761,11 +761,11 @@
       (is (str/starts-with? (ex-message db-ref-value)
                             "SHACL PropertyShape exception - sh:maxLength:"))
       (is (= [{:id          :ex/john
-               :type    [:ex/User]
+               :type    :ex/User
                :schema/name "John"}]
              @(fluree/query db-ok-str user-query)))
       (is (= [{:id          :ex/john
-               :type    [:ex/User]
+               :type    :ex/User
                :schema/name 12345}]
              @(fluree/query db-ok-non-str user-query))))))
 
@@ -834,11 +834,11 @@
       (is (str/starts-with? (ex-message db-ref-value)
                             "SHACL PropertyShape exception - sh:pattern:"))
       (is (= [{:id          :ex/brian
-               :type    [:ex/User]
+               :type    :ex/User
                :ex/greeting "hello\nworld!"}]
              @(fluree/query db-ok-greeting user-query)))
       (is (= [{:id           :ex/john
-               :type     [:ex/User]
+               :type     :ex/User
                :ex/birthYear 1984}]
              @(fluree/query db-ok-birthyear user-query))))))
 
@@ -851,7 +851,7 @@
           db           @(fluree/stage
                          (fluree/db ledger)
                          {:id             :ex/UserShape
-                          :type           [:sh/NodeShape]
+                          :type           :sh/NodeShape
                           :sh/targetClass :ex/User
                           :sh/property    [{:sh/path     :schema/name
                                             :sh/datatype :xsd/string
@@ -867,41 +867,41 @@
           db-ok        @(fluree/stage
                          db
                          {:id           :ex/john
-                          :type         [:ex/User]
+                          :type         :ex/User
                           :schema/name  "John"
                           :schema/age   40
                           :schema/email "john@example.org"})
           db-no-name   @(fluree/stage
                          db
                          {:id           :ex/john
-                          :type         [:ex/User]
+                          :type         :ex/User
                           :schema/age   40
                           :schema/email "john@example.org"})
           db-two-names @(fluree/stage
                          db
                          {:id           :ex/john
-                          :type         [:ex/User]
+                          :type         :ex/User
                           :schema/name  ["John" "Billy"]
                           :schema/age   40
                           :schema/email "john@example.org"})
           db-too-old   @(fluree/stage
                          db
                          {:id           :ex/john
-                          :type         [:ex/User]
+                          :type         :ex/User
                           :schema/name  "John"
                           :schema/age   140
                           :schema/email "john@example.org"})
           db-two-ages  @(fluree/stage
                          db
                          {:id           :ex/john
-                          :type         [:ex/User]
+                          :type         :ex/User
                           :schema/name  "John"
                           :schema/age   [40 21]
                           :schema/email "john@example.org"})
           db-num-email @(fluree/stage
                          db
                          {:id           :ex/john
-                          :type         [:ex/User]
+                          :type         :ex/User
                           :schema/name  "John"
                           :schema/age   40
                           :schema/email 42})]
@@ -920,7 +920,7 @@
       (is (util/exception? db-num-email))
       (is (str/starts-with? (ex-message db-num-email) "Data type"))
       (is (= [{:id           :ex/john
-               :type     [:ex/User]
+               :type     :ex/User
                :schema/age   40
                :schema/email "john@example.org"
                :schema/name  "John"}]
@@ -948,7 +948,7 @@
         (is (= [{"id"          "ex:Luke",
                  "schema:name" "Luke",
                  "ex:parent"   {"id"          "ex:Anakin"
-                                "type"    ["ex:Parent"]
+                                "type" "ex:Parent"
                                 "schema:name" "Anakin"}}]
                @(fluree/query valid-parent {"select" {"?s" ["*" {"ex:parent" ["*"]}]}
                                             "where"  [["?s" "id" "ex:Luke"]]})))
@@ -974,7 +974,7 @@
                                             "schema:name" "Darth Vader"
                                             "ex:pal"      {"ex:evil" "has no name"}})]
         (is (= [{"id"          "ex:good-pal",
-                 "type"    ["ex:Pal"]
+                 "type" "ex:Pal"
                  "schema:name" "J.D.",
                  "ex:pal"      [{"schema:name" "Turk"}
                                 {"schema:name" "Rowdy"}]}]
@@ -1003,7 +1003,7 @@
                                                  "ex:child"    {"id"          "ex:Gerb"
                                                                 "type"        "ex:Princess"
                                                                 "schema:name" "Gerb"}})]
-        (is (= [{"id" "ex:Mork", "type" ["ex:Princess"], "schema:name" "Mork"}]
+        (is (= [{"id" "ex:Mork", "type" "ex:Princess", "schema:name" "Mork"}]
                @(fluree/query valid-princess {"select" {"?s" ["*"]}
                                               "where"  [["?s" "id" "ex:Mork"]]})))
 
@@ -1015,14 +1015,14 @@
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "classtest" {:defaultContext test-utils/default-str-context})
         db0    (fluree/db ledger)
-        db1    @(fluree/stage db0 [{"@type"          ["sh:NodeShape"]
+        db1    @(fluree/stage db0 [{"@type" "sh:NodeShape"
                                     "sh:targetClass" {"@id" "https://example.com/Country"}
                                     "sh:property"
                                     [{"sh:path"     {"@id" "https://example.com/name"}
                                       "sh:datatype" {"@id" "xsd:string"}
                                       "sh:minCount" 1
                                       "sh:maxCount" 1}]}
-                                   {"@type"          ["sh:NodeShape"]
+                                   {"@type" "sh:NodeShape"
                                     "sh:targetClass" {"@id" "https://example.com/Actor"}
                                     "sh:property"
                                     [{"sh:path"        {"@id" "https://example.com/country"}
@@ -1124,7 +1124,7 @@
 
       (is (not (util/exception? db3)))
       (is (= [{"id"       "ex:PastelPony"
-               "type" ["ex:Pony"]
+               "type" "ex:Pony"
                "ex:color" [{"id" "ex:Pink"} {"id" "ex:Purple"}]}]
              @(fluree/query db3 '{"select" {"?p" ["*"]}
                                   "where"  [["?p" "type" "ex:Pony"]]})))))
@@ -1336,7 +1336,7 @@
                                               "type"       "ex:Person"
                                               "ex:address" {"ex:postalCode" ["12345" "45678"]}}])]
       (is (= [{"id"         "ex:Bob",
-               "type"   ["ex:Person"],
+               "type" "ex:Person",
                "ex:address" {"id" "_:f211106232532997", "ex:postalCode" "12345"}}]
              @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["*"]}]}
                                           "where"  [["?s" "id" "ex:Bob"]]})))
@@ -1372,7 +1372,7 @@
                                                         {"id"        "ex:Zorba"
                                                          "ex:gender" "alien"}]}])]
       (is (= [{"id"        "ex:ValidKid"
-               "type"  ["ex:Kid"]
+               "type" "ex:Kid"
                "ex:parent" [{"id" "ex:Bob"}
                             {"id" "ex:Jane"}]}]
              @(fluree/query valid-kid {"select" {"?s" ["*"]}
@@ -1421,7 +1421,7 @@
                                                         {"ex:name" "Finger"}
                                                         {"ex:name" ["Finger" "Thumb"]}]}])]
       (is (= [{"id"       "ex:ValidHand",
-               "type" ["ex:Hand"],
+               "type" "ex:Hand",
                "ex:digit"
                [{"ex:name" "Thumb"}
                 {"ex:name" "Finger"}

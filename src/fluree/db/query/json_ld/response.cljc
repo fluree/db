@@ -109,7 +109,9 @@
                             (recur rest-types
                                    (conj acc (or (get @cache type-id)
                                                  (<? (cache-sid->iri db cache compact-fn type-id)))))
-                            acc))
+                            (if (= 1 (count acc))
+                              (first acc)
+                              acc)))
 
                         :else                               ;; display all values
                         (loop [[f & r] (if list?

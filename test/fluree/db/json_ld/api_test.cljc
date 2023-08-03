@@ -193,7 +193,7 @@
                results        @(fluree/query loaded-db query)]
            (is (= target-t (:t loaded-db)))
            (is (= merged-ctx (dbproto/-default-context loaded-db)))
-           (is (= [{:type   [:ex/User]
+           (is (= [{:type   :ex/User
                     :id             :ex/wes
                     :schema/age     42
                     :schema/email   "wes@example.org"
@@ -304,11 +304,11 @@
            (is (= target-t (:t loaded-db)))
            (testing "query returns expected `list` values"
              (is (= [{:id         :ex/cam,
-                      :type   [:ex/User],
+                      :type   :ex/User,
                       :ex/numList [7 8 9 10]}
-                     {:id :ex/john, :type [:ex/User]}
+                     {:id :ex/john, :type :ex/User}
                      {:id         :ex/alice,
-                      :type   [:ex/User],
+                      :type   :ex/User,
                       :ex/friends [{:id :ex/john} {:id :ex/cam}]}]
                     @(fluree/query loaded-db '{:select {?s [:*]}
                                                :where  [[?s :type :ex/User]]}))))))
@@ -341,7 +341,7 @@
                  db+policy    @(fluree/stage
                                 db
                                 [{:id            :ex/UserPolicy,
-                                  :type          [:f/Policy],
+                                  :type          :f/Policy,
                                   :f/targetClass :ex/User
                                   :f/allow
                                   [{:id           :ex/globalViewAllow
@@ -363,7 +363,7 @@
              (is (= target-t (:t loaded-db)))
              (testing "query returns expected policy"
                (is (= [{:id            :ex/UserPolicy,
-                        :type      [:f/Policy],
+                        :type      :f/Policy,
                         :f/allow
                         {:id           :ex/globalViewAllow,
                          :f/action     {:id :f/view},
@@ -505,7 +505,7 @@
              results        @(fluree/query loaded-db query)]
          (is (= target-t (:t loaded-db)))
          (is (= merged-ctx (dbproto/-default-context loaded-db)))
-         (is (= [{:type   [:ex/User]
+         (is (= [{:type   :ex/User
                   :id             :ex/wes
                   :schema/age     42
                   :schema/email   "wes@example.org"
@@ -568,11 +568,11 @@
          (is (= target-t (:t loaded-db)))
          (testing "query returns expected `list` values"
            (is (= [{:id         :ex/cam,
-                    :type   [:ex/User],
+                    :type   :ex/User,
                     :ex/numList [7 8 9 10]}
-                   {:id :ex/john, :type [:ex/User]}
+                   {:id :ex/john, :type :ex/User}
                    {:id         :ex/alice,
-                    :type   [:ex/User],
+                    :type   :ex/User,
                     :ex/friends [{:id :ex/john} {:id :ex/cam}]}]
                   @(fluree/query loaded-db '{:select {?s [:*]}
                                              :where  [[?s :type :ex/User]]})))))
@@ -620,7 +620,7 @@
            (is (= target-t (:t loaded-db)))
            (testing "query returns expected policy"
              (is (= [{:id            :ex/UserPolicy,
-                      :type      [:f/Policy],
+                      :type      :f/Policy,
                       :f/allow
                       {:id           :ex/globalViewAllow,
                        :f/action     {:id :f/view},
@@ -657,12 +657,12 @@
                           (get "id"))
              loaded1 (test-utils/retry-load conn ledger-alias 100)]
          (is (= [{"id" shape-id
-                  "type" ["sh:NodeShape"],
+                  "type" "sh:NodeShape",
                   "sh:targetClass" {"id" "schema:Person"},
                   "sh:property" {"id" "_:f211106232532993"}}]
                 @(fluree/query db1 property-query)))
          (is (= [{"id" shape-id
-                  "type" ["sh:NodeShape"],
+                  "type" "sh:NodeShape",
                   "sh:targetClass" {"id" "schema:Person"},
                   "sh:property" {"id" "_:f211106232532993"}}]
                 @(fluree/query (fluree/db loaded1) property-query)))
@@ -674,7 +674,7 @@
                                               "sh:datatype" {"id" "xsd:string"}}]})
                  loaded2 (test-utils/retry-load conn ledger-alias 100)]
              (is (= [{"id" shape-id
-                      "type" ["sh:NodeShape"],
+                      "type" "sh:NodeShape",
                       "sh:targetClass" {"id" "schema:Person"},
                       "sh:property" {"id" "_:f211106232532994"}}]
                     @(fluree/query (fluree/db loaded2) property-query)))))))

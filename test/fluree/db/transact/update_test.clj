@@ -74,7 +74,7 @@
                             '{:selectOne {?s [:*]}
                               :where     [[?s :id :ex/bob]]})
              {:id          :ex/bob,
-              :type    [:ex/User],
+              :type    :ex/User,
               :schema/name "Bob"})
           "Bob should no longer have an age property.")
 
@@ -92,7 +92,7 @@
 
       (testing "Updating property value only if it's current value is a match."
         (is (= [{:id          :ex/bob,
-                 :type    [:ex/User],
+                 :type    :ex/User,
                  :schema/name "Bob"
                  :schema/age  23}]
                @(fluree/query db-update-bob
@@ -102,7 +102,7 @@
 
       (testing "No update should happen if there is no match."
         (is (= [{:id          :ex/bob,
-                 :type    [:ex/User],
+                 :type    :ex/User,
                  :schema/name "Bob"
                  :schema/age  22}]
                @(fluree/query db-update-bob2
@@ -112,7 +112,7 @@
 
       (testing "Replacing existing property value with new property value."
         (is (= [{:id           :ex/jane,
-                 :type     [:ex/User],
+                 :type     :ex/User,
                  :schema/name  "Jane"
                  :schema/email "jane@flur.ee"
                  :schema/age   31}]

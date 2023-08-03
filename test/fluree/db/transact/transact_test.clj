@@ -169,8 +169,8 @@
                             (into policy data))
           user-query      '{:select {?s [:*]}
                             :where  [[?s :type :ex/User]]}]
-      (let [users [{:id :ex/john, :type [:ex/User], :schema/name "John"}
-                   {:id :ex/alice, :type [:ex/User], :schema/name "Alice"}]]
+      (let [users [{:id :ex/john, :type :ex/User, :schema/name "John"}
+                   {:id :ex/alice, :type :ex/User, :schema/name "Alice"}]]
         (is (= users
                @(fluree/query db-data-first user-query)))
         (is (= users
