@@ -1413,9 +1413,7 @@
                                            "ex:parent" [{"id" "ex:Bob"}
                                                         {"id" "ex:Zorba"
                                                          "type" "ex:Parent"
-                                                         "ex:gender" "alien"}]}])
-          ]
-      (def valid-kid valid-kid)
+                                                         "ex:gender" "alien"}]}])]
 
       (is (= [{"id" "ex:ValidKid"
                "rdf:type" ["ex:Kid"]
