@@ -78,7 +78,7 @@
     ;;these are being run as regular analytial queries
     (testing "simple-subject-crawl"
       (is (= [{:id :ex/david,
-               :type [:ex/User],
+               :type :ex/User,
                :schema/name "David",
                :ex/last "Jones",
                :schema/email "david@example.org",
@@ -86,7 +86,7 @@
                :ex/favNums [15 70],
                :ex/friend {:id :ex/cam}}
               {:id :ex/brian,
-               :type [:ex/User],
+               :type :ex/User,
                :schema/name "Brian",
                :ex/last "Smith",
                :schema/email "brian@example.org",
@@ -96,7 +96,7 @@
                                 :where  [["?s" :schema/age "?age"]
                                          {:filter ["(> ?age 45)"]}]})))
       (is (= [{:id :ex/david,
-               :type [:ex/User],
+               :type :ex/User,
                :schema/name "David",
                :ex/last "Jones",
                :schema/email "david@example.org",
@@ -106,7 +106,7 @@
              @(fluree/query db {:select {"?s" ["*"]}
                                 :where  [["?s" :schema/age "?age"]
                                          {:filter ["(> ?age 45)", "(< ?age 50)"]}]})))
-      (is (= [{:type [:ex/User]
+      (is (= [{:type :ex/User
                :schema/email "cam@example.org"
                :ex/favNums [5 10]
                :schema/age 34

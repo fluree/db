@@ -46,13 +46,13 @@
       (is (= two-tuple-select-with-crawl
              two-tuple-select-with-crawl+var
              [[50 {:id           :ex/brian,
-                   :type     [:ex/User],
+                   :type     :ex/User,
                    :schema/name  "Brian",
                    :schema/email "brian@example.org",
                    :schema/age   50,
                    :ex/favNums   7}]
               [50 {:id           :ex/alice,
-                   :type     [:ex/User],
+                   :type     :ex/User,
                    :schema/name  "Alice",
                    :schema/email "alice@example.org",
                    :schema/age   50,
@@ -173,20 +173,20 @@
                               :where   [[?s :ex/friend ?o]
                                         [?o :schema/name "Alice"]]})
              [{:id :ex/cam,
-               :type [:ex/User],
+               :type :ex/User,
                :schema/name "Cam",
                :schema/email "cam@example.org",
                :schema/age 34,
                :ex/favNums [5 10],
                :ex/friend
                [{:id :ex/brian,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Brian",
                  :schema/email "brian@example.org",
                  :schema/age 50,
                  :ex/favNums 7}
                 {:id :ex/alice,
-                 :type [:ex/User],
+                 :type :ex/User,
                  :schema/name "Alice",
                  :schema/email "alice@example.org",
                  :schema/age 50,
