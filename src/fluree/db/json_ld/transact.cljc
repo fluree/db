@@ -476,9 +476,11 @@
   ([ledger json-ld opts]
    (stage-ledger ledger nil json-ld opts))
   ([ledger fuel-tracker json-ld opts]
-   (-> ledger
-       ledger-proto/-db
-       (stage fuel-tracker json-ld opts))))
+   (let [{:keys [:defaultContext]} opts
+         db (cond-> (ledger-proto/-db ledger)
+              defaultContext  (dbproto/-default-context-update
+                                defaultContext))]
+     (stage db fuel-tracker json-ld opts))))
 
 (defn transact!
   ([ledger json-ld opts]
