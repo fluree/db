@@ -204,6 +204,13 @@
                    novelty)]
     (flakes-through through-t subrange)))
 
+(def meta-hash
+  (comp flake/hash-meta flake/m))
+
+(def fact-content
+  "Function to extract the content being asserted or retracted by a flake."
+  (juxt flake/s flake/p flake/o flake/dt meta-hash))
+
 (defn stale-by
   "Returns a sequence of flakes from the sorted set `flakes` that are out of date
   by the transaction `from-t` because `flakes` contains another flake with the same
@@ -211,7 +218,7 @@
   [from-t flakes]
   (->> flakes
        (remove (partial after-t? from-t))
-       (partition-by (juxt flake/s flake/p flake/o))
+       (partition-by fact-content)
        (mapcat (fn [flakes]
                  ;; if the last flake for a subject/predicate/object combo is an assert,
                  ;; then everything before that is stale (object is necessary for
