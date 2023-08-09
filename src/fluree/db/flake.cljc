@@ -1,5 +1,5 @@
 (ns fluree.db.flake
-  (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take last])
+  (:refer-clojure :exclude [partition-by remove split-at sorted-set-by sorted-map-by take last])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
@@ -308,13 +308,19 @@
     #?(:clj (Boolean/compare b1 b2) :cljs (compare b1 b2))
     0))
 
+(defn hash-meta
+  [m]
+  (if (int? m)
+    m
+    (hash m)))
+
 (defn cmp-meta
   "Meta will always be a map or nil, but can be searched using an integer to
   perform effective range scans if needed. i.e. (Integer/MIN_VALUE)
   to (Integer/MAX_VALUE) will always include all meta values."
   [m1 m2]
-  (let [m1h (if (int? m1) m1 (hash m1))
-        m2h (if (int? m2) m2 (hash m2))]
+  (let [m1h (hash-meta m1)
+        m2h (hash-meta m2)]
     #?(:clj (Integer/compare m1h m2h) :cljs (- m1h m2h))))
 
 
@@ -467,19 +473,18 @@
   [comparator & entries]
   (apply avl/sorted-map-by comparator entries))
 
-(defn transient-reduce
-  [reducer ss coll]
-  (->> coll
-       (reduce reducer (transient ss))
-       persistent!))
-
 (defn conj-all
   "Adds all flakes in the `to-add` collection from the AVL-backed sorted flake set
   `sorted-set`. This function uses transients for intermediate set values for
   better performance because of the slower batched update performance of
   AVL-backed sorted sets."
   [ss to-add]
-  (transient-reduce conj! ss to-add))
+  (loop [trans (transient ss)
+         add   to-add]
+    (if-let [f (first add)]
+      (recur (conj! trans f)
+             (rest add))
+      (persistent! trans))))
 
 (defn disj-all
   "Removes all flakes in the `to-remove` collection from the AVL-backed sorted
@@ -487,7 +492,12 @@
   values for better performance because of the slower batched update performance
   of AVL-backed sorted sets."
   [ss to-remove]
-  (transient-reduce disj! ss to-remove))
+  (loop [trans (transient ss)
+         rem   to-remove]
+    (if-let [f (first rem)]
+      (recur (disj! trans f)
+             (rest rem))
+      (persistent! trans))))
 
 (defn revise
   "Changes the composition of the sorted set `ss` by adding all the flakes in the
@@ -506,15 +516,41 @@
                     t-set))]
     (persistent! added)))
 
-(defn assoc-all
-  [sm entries]
-  (transient-reduce (fn [m [k v]]
-                      (assoc! m k v))
-                    sm entries))
+(defn remove
+  [f ss]
+  (loop [trans (transient ss)
+         items (seq ss)]
+    (if-let [item (first items)]
+      (if (f item)
+        (recur (disj! trans item)
+               (rest items))
+        (recur trans
+               (rest items)))
+      (persistent! trans))))
 
-(defn dissoc-all
-  [sm ks]
-  (transient-reduce dissoc! sm ks))
+(defn partition-by
+  [f ss]
+  (if-let [items (seq ss)]
+    (let [first-item  (first items)
+          other-items (rest items)
+          empty-set   (empty ss)]
+      (loop [cur-set (-> empty-set transient (conj! first-item))
+             cur-val (f first-item)
+             items   other-items
+             out     []]
+        (if-let [item (first items)]
+          (let [v (f item)]
+            (if (= v cur-val)
+              (recur (conj! cur-set item)
+                     cur-val
+                     (rest items)
+                     out)
+              (recur (-> empty-set transient (conj! item))
+                     v
+                     (rest items)
+                     (conj out (persistent! cur-set)))))
+          (conj out (persistent! cur-set)))))
+    []))
 
 (defn last
   "Returns the last item in `ss` in constant time as long as `ss` is a sorted

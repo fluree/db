@@ -121,8 +121,9 @@
   new-types are a set of newly created types in the transaction."
   [db sid added-classes]
   (go-try
-    (let [type-sids (->> (<? (query-range/index-range db :spot = [sid const/$rdf:type]))
-                         (map flake/o))]
+    (let [type-sids (<? (query-range/index-range db
+                                                 :spot = [sid const/$rdf:type]
+                                                 {:flake-xf (map flake/o)}))]
       (if (seq type-sids)
         (into added-classes type-sids)
         added-classes))))
@@ -239,8 +240,9 @@
                 ;; check-retracts? - a new subject or property don't require checking for flake retractions
                 check-retracts?  (or (not new-subj?) existing-pid)
                 flakes*          (if retract?
-                                   (->> (<? (query-range/index-range db-before :spot = [sid pid]))
-                                        (map #(flake/flip-flake % t)))
+                                   (<? (query-range/index-range db-before
+                                                                :spot = [sid pid]
+                                                                {:flake-xf (map #(flake/flip-flake % t))}))
                                    (loop [[v' & r] v*
                                           flakes* subj-flakes]
                                      (if v'
