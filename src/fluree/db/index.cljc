@@ -217,18 +217,18 @@
   subject and predicate and a t-value later than that flake but on or before
   `from-t`."
   [from-t flakes]
-  (let [stale-xf (comp (remove (partial after-t? from-t))
-                       (partition-by fact-content)
-                       (mapcat (fn [flakes]
-                                 ;; if the last flake pertaining to a unique
-                                 ;; fact is an assert, then every flake before
-                                 ;; that is stale. If that item is a retract,
-                                 ;; then all the flakes are stale.
-                                 (let [last-flake (last flakes)]
-                                   (if (flake/op last-flake)
-                                     (butlast flakes)
-                                     flakes)))))]
-    (into [] stale-xf flakes)))
+  (->> flakes
+       (flake/remove (partial after-t? from-t))
+       (flake/partition-by fact-content)
+       (mapcat (fn [flakes]
+                 ;; if the last flake pertaining to a unique
+                 ;; fact is an assert, then every flake before
+                 ;; that is stale. If that item is a retract,
+                 ;; then all the flakes are stale.
+                 (let [last-flake (flake/last flakes)]
+                   (if (flake/op last-flake)
+                     (disj flakes last-flake)
+                     flakes))))))
 
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
