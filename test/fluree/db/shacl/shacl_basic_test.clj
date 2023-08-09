@@ -842,7 +842,7 @@
                :ex/birthYear 1984}]
              @(fluree/query db-ok-birthyear user-query))))))
 
-(deftest shacl-multiple-properties-test
+(deftest ^:integration shacl-multiple-properties-test
   (testing "multiple properties works"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
@@ -926,7 +926,7 @@
                :schema/name  "John"}]
              @(fluree/query db-ok user-query))))))
 
-(deftest property-paths
+(deftest ^:integration property-paths
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "propertypathstest" {:defaultContext [test-utils/default-str-context {"ex" "http://example.com/"}]})
         db0    (fluree/db ledger)]
@@ -1011,7 +1011,7 @@
         (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
                (ex-message invalid-princess)))))))
 
-(deftest shacl-class-test
+(deftest ^:integration shacl-class-test
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "classtest" {:defaultContext test-utils/default-str-context})
         db0    (fluree/db ledger)
@@ -1077,7 +1077,7 @@
     (is (util/exception? db5))
     (is (str/starts-with? (ex-message db5) "SHACL PropertyShape exception - sh:class"))))
 
-(deftest shacl-in-test
+(deftest ^:integration shacl-in-test
   (testing "value nodes"
     (let [conn   @(fluree/connect {:method :memory
                                    :defaults
@@ -1147,7 +1147,7 @@
       (is (util/exception? db2))
       (is (str/includes? (ex-message db2) "sh:in")))))
 
-(deftest shacl-targetobjectsof-test
+(deftest ^:integration shacl-targetobjectsof-test
   (testing "subject and object of constrained predicate in the same txn"
     (testing "datatype constraint"
       (let [conn               @(fluree/connect {:method :memory
@@ -1312,7 +1312,7 @@
           (is (util/exception? db-forbidden-friend))
           (is (str/includes? (ex-message db-forbidden-friend) "data type"))))))
 
-(deftest shape-based-constraints
+(deftest ^:integration shape-based-constraints
   (testing "sh:node"
     (let [conn           @(fluree/connect {:method :memory})
           ledger         @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
