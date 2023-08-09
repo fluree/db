@@ -212,21 +212,23 @@
   (juxt flake/s flake/p flake/o flake/dt meta-hash))
 
 (defn stale-by
-  "Returns a sequence of flakes from the sorted set `flakes` that are out of date
-  by the transaction `from-t` because `flakes` contains another flake with the same
-  subject and predicate and a t-value later than that flake but on or before `from-t`."
+  "Returns a vector of flakes from the sorted set `flakes` that are out of date by
+  the transaction `from-t` because `flakes` contains another flake with the same
+  subject and predicate and a t-value later than that flake but on or before
+  `from-t`."
   [from-t flakes]
-  (->> flakes
-       (remove (partial after-t? from-t))
-       (partition-by fact-content)
-       (mapcat (fn [flakes]
-                 ;; if the last flake for a subject/predicate/object combo is an assert,
-                 ;; then everything before that is stale (object is necessary for
-                 ;; multicardinality flakes)
-                 (let [last-flake (last flakes)]
-                   (if (flake/op last-flake)
-                     (butlast flakes)
-                     flakes))))))
+  (let [stale-xf (comp (remove (partial after-t? from-t))
+                       (partition-by fact-content)
+                       (mapcat (fn [flakes]
+                                 ;; if the last flake pertaining to a unique
+                                 ;; fact is an assert, then every flake before
+                                 ;; that is stale. If that item is a retract,
+                                 ;; then all the flakes are stale.
+                                 (let [last-flake (last flakes)]
+                                   (if (flake/op last-flake)
+                                     (butlast flakes)
+                                     flakes)))))]
+    (into [] stale-xf flakes)))
 
 (defn t-range
   "Returns a sorted set of flakes that are not out of date between the
