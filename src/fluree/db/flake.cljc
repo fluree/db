@@ -1,5 +1,5 @@
 (ns fluree.db.flake
-  (:refer-clojure :exclude [split-at sorted-set-by sorted-map-by take last])
+  (:refer-clojure :exclude [partition-by remove split-at sorted-set-by sorted-map-by take last])
   (:require [clojure.data.avl :as avl]
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
@@ -521,6 +521,42 @@
 (defn dissoc-all
   [sm ks]
   (transient-reduce dissoc! sm ks))
+
+(defn remove
+  [f ss]
+  (loop [out   (transient ss)
+         items (seq ss)]
+    (if-let [item (first items)]
+      (if (f item)
+        (recur (disj! out item)
+               (rest items))
+        (recur out
+               (rest items)))
+      (persistent! out))))
+
+(defn partition-by
+  [f ss]
+  (if-let [items (seq ss)]
+    (let [first-item  (first items)
+          other-items (rest items)
+          empty-set   (empty ss)]
+      (loop [cur-set (-> empty-set transient (conj! first-item))
+             cur-val (f first-item)
+             items   other-items
+             out     []]
+        (if-let [item (first items)]
+          (let [v (f item)]
+            (if (= v cur-val)
+              (recur (conj! cur-set item)
+                     cur-val
+                     (rest items)
+                     out)
+              (recur (-> empty-set transient (conj! item))
+                     v
+                     (rest items)
+                     (conj out (persistent! cur-set)))))
+          (conj out (persistent! cur-set)))))
+    []))
 
 (defn last
   "Returns the last item in `ss` in constant time as long as `ss` is a sorted
