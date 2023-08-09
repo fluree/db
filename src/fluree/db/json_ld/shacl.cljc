@@ -644,10 +644,11 @@
   {:dt          datatype
    :validate-fn validate-fn})
 
-(defn register-nodetype
+(defn register-nodekind
   "Optimization to elevate node type designations"
   [{:keys [dt validate-fn] :as dt-map} {:keys [class node-kind path] :as property-shape}]
   (let [dt-map* (condp = node-kind
+
                   const/$sh:BlankNode
                   {:dt          const/$xsd:anyURI
                    :class       class
@@ -808,7 +809,7 @@
 
                                    (:node-kind property-shape)
                                    (update-in [:datatype target-key]
-                                              register-nodetype property-shape))]
+                                              register-nodekind property-shape))]
               (recur r' shape* p-shapes*))
             (let [shape* (condp = p
                            const/$xsd:anyURI
