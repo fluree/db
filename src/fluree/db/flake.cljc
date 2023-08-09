@@ -473,19 +473,18 @@
   [comparator & entries]
   (apply avl/sorted-map-by comparator entries))
 
-(defn transient-reduce
-  [reducer ss coll]
-  (->> coll
-       (reduce reducer (transient ss))
-       persistent!))
-
 (defn conj-all
   "Adds all flakes in the `to-add` collection from the AVL-backed sorted flake set
   `sorted-set`. This function uses transients for intermediate set values for
   better performance because of the slower batched update performance of
   AVL-backed sorted sets."
   [ss to-add]
-  (transient-reduce conj! ss to-add))
+  (loop [trans (transient ss)
+         add   to-add]
+    (if-let [f (first add)]
+      (recur (conj! trans f)
+             (rest add))
+      (persistent! trans))))
 
 (defn disj-all
   "Removes all flakes in the `to-remove` collection from the AVL-backed sorted
@@ -493,7 +492,12 @@
   values for better performance because of the slower batched update performance
   of AVL-backed sorted sets."
   [ss to-remove]
-  (transient-reduce disj! ss to-remove))
+  (loop [trans (transient ss)
+         rem   to-remove]
+    (if-let [f (first rem)]
+      (recur (disj! trans f)
+             (rest rem))
+      (persistent! trans))))
 
 (defn revise
   "Changes the composition of the sorted set `ss` by adding all the flakes in the
@@ -512,27 +516,17 @@
                     t-set))]
     (persistent! added)))
 
-(defn assoc-all
-  [sm entries]
-  (transient-reduce (fn [m [k v]]
-                      (assoc! m k v))
-                    sm entries))
-
-(defn dissoc-all
-  [sm ks]
-  (transient-reduce dissoc! sm ks))
-
 (defn remove
   [f ss]
-  (loop [out   (transient ss)
+  (loop [trans (transient ss)
          items (seq ss)]
     (if-let [item (first items)]
       (if (f item)
-        (recur (disj! out item)
+        (recur (disj! trans item)
                (rest items))
-        (recur out
+        (recur trans
                (rest items)))
-      (persistent! out))))
+      (persistent! trans))))
 
 (defn partition-by
   [f ss]
