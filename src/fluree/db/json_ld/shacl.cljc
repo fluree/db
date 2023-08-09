@@ -183,15 +183,65 @@
     (coalesce-validation-results results)))
 
 (defn validate-value-properties
-  ;; TODO: Only supports 'in' so far. Add the others.
-  [{:keys [in logical-constraint] :as _p-shape} p-flakes]
-  (let [results (for [flake p-flakes
-                      :let [[val] (flake-value flake)
-                            in-set (set in)]]
-                  (if (in-set val)
-                    [true (str "sh:not sh:in: value " val " must not be one of " in)]
-                    [false (str "sh:in: value " val " must be one of " in)]))]
-    (coalesce-validation-results results logical-constraint)))
+  [{:keys [in has-value datatype nodekind logical-constraint] :as _p-shape} p-flakes]
+  (let [in-results (when in
+                     (if (every? #(contains? (set in) (flake/o %)) p-flakes)
+                       [true (str "sh:not sh:in: value " val " must not be one of " in)]
+                       [false (str "sh:in: value " val " must be one of " in)]))
+        has-value-results (when has-value
+                            (if (some #(= (flake/o %) has-value) p-flakes)
+                              [true (str "sh:not sh:hasValue: at least one value must not be " has-value)]
+                              [false (str "sh:hasValue: at least one value must be " has-value)]))
+        datatype-results (when datatype
+                           (if (every? #(= (flake/dt %) datatype) p-flakes)
+                             [true (str "sh:not sh:datatype: every datatype must not be " datatype)]
+                             [false (str "sh:datatype: every datatype must be " datatype)]))]
+    (coalesce-validation-results [in-results has-value-results datatype-results] logical-constraint)))
+
+
+(defn validate-nodekind-constraint
+  [db {:keys [node-kind logical-constraint] :as _p-shape} p-flakes]
+  (go-try
+    (if (= node-kind const/$sh:Literal)
+      ;; don't need to do a lookup to check for literals
+      (if (every? #(not= (flake/dt %) const/$xsd:anyURI) p-flakes)
+        [true "sh:not sh:nodekind: every value must not be a literal"]
+        [false "sh:nodekind: every value must be a literal"])
+
+      (loop [[f & r] p-flakes
+             res     []]
+        (if f
+          (let [[id-flake] (<? (query-range/index-range db :spot = [(flake/o f) const/$xsd:anyURI]))
+                literal?   (not= (flake/dt f) const/$xsd:anyURI)
+                bnode?     (str/starts-with? (flake/o id-flake) "_:")
+                iri?       (not (or literal? bnode?))
+                [valid? :as result]
+                (condp = node-kind
+                  const/$sh:BlankNode
+                  (if bnode?
+                    [true "sh:not sh:nodekind: every value must not be a blank node identifier"]
+                    [false "sh:nodekind: every value must be a blank node identifier"])
+                  const/$sh:IRI
+                  (if bnode?
+                    [true "sh:not sh:nodekind: every value must not be an IRI"]
+                    [false "sh:nodekind: every value must be an IRI"])
+                  const/$sh:BlankNodeOrIRI
+                  (if (or bnode? iri?)
+                    [true "sh:not sh:nodekind: every value must not be a blank node identifier or an IRI"]
+                    [false "sh:nodekind: every value must be a blank node identifier or an IRI"])
+                  const/$sh:IRIOrLiteral
+                  (if (or iri? literal?)
+                    [true "sh:not sh:nodekind: every value must not be an IRI or a literal"]
+                    [false "sh:nodekind: every value must be an IRI or a literal"])
+                  const/$sh:BlankNodeOrLiteral
+                  (if (or bnode? literal?)
+                    [true "sh:not sh:nodekind: every value must not be a blank node identifier or a literal"]
+                    [false "sh:nodekind: every value must be a blank node identifier or a literal"]))]
+            (if valid?
+              (recur r result)
+              ;; short circuit if invalid
+              result))
+          res)))))
 
 (declare build-node-shape)
 (declare validate-shape)
@@ -235,8 +285,8 @@
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
-  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive
-           max-exclusive min-length max-length pattern in node class] :as p-shape}
+  [{:keys [min-count max-count min-inclusive min-exclusive max-inclusive node-kind
+           max-exclusive min-length max-length pattern in has-value datatype node class] :as p-shape}
    p-flakes
    db]
   (go-try
@@ -251,7 +301,8 @@
                               (or min-length max-length pattern))
                        (validate-string-properties p-shape p-flakes)
                        validation)
-          validation (if (and (first validation) in)
+          validation (if (and (first validation)
+                              (or in has-value datatype))
                        (validate-value-properties p-shape p-flakes)
                        validation)
           validation (if (and (first validation) node)
@@ -259,6 +310,9 @@
                        validation)
           validation (if (and (first validation) class)
                        (<? (validate-class-properties db p-shape p-flakes))
+                       validation)
+          validation (if (and (first validation) node-kind)
+                       (<? (validate-nodekind-constraint db p-shape p-flakes))
                        validation)]
       validation)))
 
