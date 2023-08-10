@@ -1527,7 +1527,7 @@
         (is (util/exception? invalid-person))
         (is (= "SHACL PropertyShape exception - sh:hasValue: at least one value must be true."
                (ex-message invalid-person)))))
-    (testing "extended path contstraints"
+    (testing "extended path constraints"
       (let [db1 @(fluree/stage db0 [{"id" "ex:PersonShape"
                                      "type" "sh:NodeShape"
                                      "sh:targetClass" {"id" "ex:Person"}

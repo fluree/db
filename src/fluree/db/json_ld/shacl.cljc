@@ -190,7 +190,7 @@
                        [false (str "sh:in: value " val " must be one of " in)]))
         has-value-results (when has-value
                             (if (some #(= (flake/o %) has-value) p-flakes)
-                              [true (str "sh:not sh:hasValue: at least one value must not be " has-value)]
+                              [true (str "sh:not sh:hasValue: none of the values can be " has-value)]
                               [false (str "sh:hasValue: at least one value must be " has-value)]))
         datatype-results (when datatype
                            (if (every? #(= (flake/dt %) datatype) p-flakes)
