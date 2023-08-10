@@ -203,3 +203,106 @@
         (is (every? (set results)
                     ["Interstellar" "Wreck-It Ralph" "The Jungle Book" "WALL·E"
                      "Iron Man" "Avatar"]))))))
+
+(deftest ^:integration transact-api-test
+  (let [conn        (test-utils/create-conn)
+        ledger-name "example-ledger"
+        ledger      @(fluree/create conn ledger-name {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+        db          @(fluree/stage (fluree/db ledger)
+                                   {:id   :ex/firstTransaction
+                                    :type :ex/Nothing})
+        _           @(fluree/commit! ledger db)
+        user-query  '{:select {?s [:*]}
+                      :where  [[?s :type :ex/User]]}]
+    (testing "Top-level context is used for transaction nodes"
+      (let [txn {:id      ledger-name
+                 :context {:foo "http://foo.com/"}
+                 :graph   [{:id          :ex/alice
+                            :type        :ex/User
+                            :foo/bar     "baz"
+                            :schema/name "Alice"}
+                           {:id          :ex/bob
+                            :type        :ex/User
+                            :schema/name "Bob"}]}
+            db  @(fluree/transact! conn txn {})]
+        (is (= [{:id          :ex/bob
+                 :type        :ex/User
+                 :schema/name "Bob"}
+                {:id                  :ex/alice
+                 :type                :ex/User
+                 "http://foo.com/bar" "baz"
+                 :schema/name         "Alice"}]
+               @(fluree/query db user-query)))))
+    (testing "Aliased @id, @graph are correctly identified"
+      (let [txn {:context     {:foo         "http://foo.com/"
+                               :id-alias    "@id"
+                               :graph-alias "@graph"}
+                 :id-alias    ledger-name
+                 :graph-alias [{:id-alias    :ex/alice
+                                :type        :ex/User
+                                :foo/bar     "baz"
+                                :schema/name "Alice"}
+                               {:id-alias    :ex/bob
+                                :type        :ex/User
+                                :schema/name "Bob"}]}
+            db  @(fluree/transact! conn txn {})]
+        (is (= [{:id          :ex/bob
+                 :type        :ex/User
+                 :schema/name "Bob"}
+                {:id                  :ex/alice
+                 :type                :ex/User
+                 "http://foo.com/bar" "baz"
+                 :schema/name         "Alice"}]
+               @(fluree/query db user-query)))))
+    (testing "@context inside node is correctly handled"
+      (let [txn        {:id    ledger-name
+                        :graph [{:context     {:foo "http://foo.com/"}
+                                 :id          :ex/alice
+                                 :type        :ex/User
+                                 :foo/bar     "baz"
+                                 :schema/name "Alice"}
+                                {:id          :ex/bob
+                                 :type        :ex/User
+                                 :schema/name "Bob"}]}
+            db @(fluree/transact! conn txn {})]
+        (is (= [{:id :ex/bob,
+                 :type :ex/User,
+                 :schema/name "Bob"}
+                {:id :ex/alice,
+                 :type :ex/User,
+                 :schema/name "Alice",
+                 :foo/bar "baz"}]
+               @(fluree/query db (assoc user-query
+                                        :context ["" {:foo "http://foo.com/"}]))))))
+      (let [txn1        {:id    ledger-name
+                         :graph [{:graph
+                                  [{:id          :ex/alice
+                                    :type        :ex/User
+                                    :schema/name "Alice"}]}
+                                 {:id          :ex/bob
+                                  :type        :ex/User
+                                  :schema/name "Bob"}]}
+            invalid-db1 (try
+                          @(fluree/transact! conn txn1 {})
+                          (catch Exception e e))
+
+            txn2        {:context     {:graph-alias "@graph"}
+                         :id          ledger-name
+                         :graph-alias [{:graph-alias
+                                        [{:id          :ex/alice
+                                          :type        :ex/User
+                                          :schema/name "Alice"}]}
+                                       {:id          :ex/bob
+                                        :type        :ex/User
+                                        :schema/name "Bob"}]}
+            invalid-db2 (try
+                          @(fluree/transact! conn txn2 {})
+                          (catch Exception e e))]
+        (is (util/exception? invalid-db1))
+        (is (= "Invalid transaction, node contains unsupported keys: (:graph)"
+               (ex-message invalid-db1)))
+        (is (util/exception? invalid-db2))
+        (is (= "Invalid transaction, node contains unsupported keys: (:graph)"
+              (ex-message invalid-db2)))))))
+
+

@@ -16,6 +16,7 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
+            [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
@@ -237,11 +238,34 @@
    (promise-wrap
      (ledger-proto/-commit! ledger db opts))))
 
+(defn- prepare-json-ld-txn
+  [json-ld]
+  (let [context-key (cond
+                      (contains? json-ld "@context") "@context"
+                      (contains? json-ld :context) :context)
+        context (get json-ld context-key)]
+    (let [parsed-context (json-ld/parse-context context)]
+      (into {}
+            (map (fn [[k v]]
+                   (let [k* (cond
+                              (contains? #{"@id" "@graph" :id :graph} k) k
+                              (= k context-key) :context
+                              :else (json-ld/expand-iri k parsed-context))]
+                     (condp = k*
+                       "@id" [:id v]
+                       "@graph" [:graph v]
+                       [k* v]))))
+            json-ld))))
+
+
+
 (defn transact!
   "Stages and commits the transaction `json-ld` to the specified `ledger`"
-  [ledger json-ld opts]
-  (promise-wrap
-    (transact-api/transact! ledger json-ld opts)))
+  [conn json-ld opts]
+  (let [{ledger-id :id json-ld :graph top-level-ctx :context :as prepped} (prepare-json-ld-txn json-ld)
+        ledger @(load conn ledger-id)]
+       (promise-wrap
+         (transact-api/transact! ledger json-ld (assoc opts :top-ctx top-level-ctx)))))
 
 (defn status
   "Returns current status of ledger branch."
