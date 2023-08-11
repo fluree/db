@@ -282,6 +282,28 @@
           (recur r (conj res validation)))
         (coalesce-validation-results res)))))
 
+(defn validate-simple-property-constraints
+  [{:keys [min-count max-count
+           min-inclusive min-exclusive max-inclusive max-exclusive
+           min-length max-length pattern
+           in has-value datatype] :as p-shape} p-flakes]
+  (let [validation (if (or min-count max-count)
+                     (validate-count-properties p-shape p-flakes)
+                     [true])
+        validation (if (and (first validation)
+                            (or min-inclusive min-exclusive max-inclusive max-exclusive))
+                     (validate-value-range-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation)
+                            (or min-length max-length pattern))
+                     (validate-string-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation)
+                            (or in has-value datatype))
+                     (validate-value-properties p-shape p-flakes)
+                     validation)]
+    validation))
+
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
@@ -290,21 +312,7 @@
    p-flakes
    db]
   (go-try
-    (let [validation (if (or min-count max-count)
-                       (validate-count-properties p-shape p-flakes)
-                       [true])
-          validation (if (and (first validation)
-                              (or min-inclusive min-exclusive max-inclusive max-exclusive))
-                       (validate-value-range-properties p-shape p-flakes)
-                       validation)
-          validation (if (and (first validation)
-                              (or min-length max-length pattern))
-                       (validate-string-properties p-shape p-flakes)
-                       validation)
-          validation (if (and (first validation)
-                              (or in has-value datatype))
-                       (validate-value-properties p-shape p-flakes)
-                       validation)
+    (let [validation (validate-simple-property-constraints p-shape p-flakes)
           validation (if (and (first validation) node)
                        (<? (validate-node-constraint db p-shape p-flakes))
                        validation)
@@ -783,6 +791,40 @@
         (:pattern base) (build-pattern)
         (= p const/$sh:not) (assoc :logical-constraint :not, :required? false)))))
 
+(def optimzable-property-constraints
+  #{:min-length
+    :max-length
+    :pattern
+    :flags
+
+    :datatype
+    :in
+    :has-value
+
+    :min-count
+    :max-count
+
+    :min-exclusive
+    :min-inclusive
+    :max-exclusive
+    :max-inclusive})
+
+(defn optimizable-property-shape?
+  [p-shape]
+  (let [[[_ path-type] :as tagged-path] (:path p-shape)
+        constraints (-> p-shape
+                        (dissoc :path :required?)
+                        (keys)
+                        (set))]
+    (boolean
+      (and (= 1 (count tagged-path))
+           (= :predicate path-type)
+           (set/subset? constraints optimzable-property-constraints)))))
+
+(defn optimizable-node-shape?
+  [shape]
+  (boolean (:target-class shape)))
+
 (defn build-node-shape
   [db shape-flakes]
   (go-try
@@ -831,6 +873,7 @@
                            shape)]
               (recur r' shape* p-shapes))))
         (assoc shape :property p-shapes)))))
+
 
 (defn build-shapes
   [db shape-sids]
