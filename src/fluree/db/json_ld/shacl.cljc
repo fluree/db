@@ -186,8 +186,8 @@
   [{:keys [in has-value datatype nodekind logical-constraint] :as _p-shape} p-flakes]
   (let [in-results (when in
                      (if (every? #(contains? (set in) (flake/o %)) p-flakes)
-                       [true (str "sh:not sh:in: value " val " must not be one of " in)]
-                       [false (str "sh:in: value " val " must be one of " in)]))
+                       [true (str "sh:not sh:in: value must not be one of " in)]
+                       [false (str "sh:in: value must be one of " in)]))
         has-value-results (when has-value
                             (if (some #(= (flake/o %) has-value) p-flakes)
                               [true (str "sh:not sh:hasValue: none of the values can be " has-value)]

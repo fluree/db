@@ -1100,7 +1100,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                      "type"     "ex:Pony"
                                      "ex:color" "yellow"})]
       (is (util/exception? db2))
-      (is (= "SHACL PropertyShape exception - sh:in: value clojure.core$val@54162b6a must be one of [\"cyan\" \"magenta\"]."
+      (is (= "SHACL PropertyShape exception - sh:in: value must be one of [\"cyan\" \"magenta\"]."
              (ex-message db2)))))
   (testing "node refs"
     (let [conn   @(fluree/connect {:method :memory
@@ -1128,7 +1128,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                       "ex:color" [{"id" "ex:Pink"}
                                                   {"id" "ex:Purple"}]}])]
       (is (util/exception? db2))
-      (is (= "SHACL PropertyShape exception - sh:in: value clojure.core$val@54162b6a must be one of [211106232532994 211106232532995]."
+      (is (= "SHACL PropertyShape exception - sh:in: value must be one of [211106232532994 211106232532995]."
              (ex-message db2)))
 
       (is (not (util/exception? db3)))
@@ -1154,7 +1154,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                       "ex:color" [{"id" "ex:Pink"}
                                                   {"id" "ex:Green"}]}])]
       (is (util/exception? db2))
-      (is (= "SHACL PropertyShape exception - sh:in: value clojure.core$val@54162b6a must be one of [211106232532994 211106232532995 \"green\"]."
+      (is (= "SHACL PropertyShape exception - sh:in: value must be one of [211106232532994 211106232532995 \"green\"]."
              (ex-message db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
