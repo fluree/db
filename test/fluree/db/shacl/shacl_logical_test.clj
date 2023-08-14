@@ -58,14 +58,14 @@
                              (catch Exception e e))
           ok-results       @(fluree/query db-ok user-query)]
       (is (util/exception? db-company-name))
-      (is (str/starts-with? (ex-message db-company-name)
-                            "SHACL PropertyShape exception - sh:not sh:minCount of 1 requires lower count but actual count was 1"))
+      (is (= "SHACL PropertyShape exception - sh:not sh:minCount of 1 requires lower count but actual count was 1."
+             (ex-message db-company-name)))
       (is (util/exception? db-two-names))
-      (is (str/starts-with? (ex-message db-two-names)
-                            "SHACL PropertyShape exception - sh:not sh:minCount of 1 requires lower count but actual count was 2"))
+      (is (= "SHACL PropertyShape exception - sh:not sh:minCount of 1 requires lower count but actual count was 2."
+             (ex-message db-two-names)))
       (is (util/exception? db-callsign-name))
-      (is (str/starts-with? (ex-message db-callsign-name)
-                            "SHACL PropertyShape exception - sh:not sh:equals: [\"Johnny Boy\"] is required to be not equal to [\"Johnny Boy\"]"))
+      (is (= "SHACL PropertyShape exception - sh:not sh:equals: [\"Johnny Boy\"] is required to be not equal to [\"Johnny Boy\"]."
+             (ex-message db-callsign-name)))
       (is (= [{:id              :ex/john,
                :type        :ex/User,
                :schema/name     "John",
@@ -126,11 +126,11 @@
                            :schema/favNums  [4 8 15 16 23 42]})
           ok-results   @(fluree/query db-ok user-query)]
       (is (util/exception? db-too-old))
-      (is (str/starts-with? (ex-message db-too-old)
-                            "SHACL PropertyShape exception - sh:not sh:minInclusive: value 131 must be less than 130"))
+      (is (= "SHACL PropertyShape exception - sh:not sh:minInclusive: value 131 must be less than 130."
+             (ex-message db-too-old)))
       (is (util/exception? db-too-low))
-      (is (str/starts-with? (ex-message db-too-low)
-                            "SHACL PropertyShape exception - sh:not sh:maxExclusive: value 42 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 23 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 16 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 15 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 8 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 4 must be greater than or equal to 9000"))
+      (is (= "SHACL PropertyShape exception - sh:not sh:maxExclusive: value 42 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 23 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 16 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 15 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 8 must be greater than or equal to 9000; sh:not sh:maxExclusive: value 4 must be greater than or equal to 9000."
+             (ex-message db-too-low)))
       (is (util/exception? db-two-probs))
       (is (str/starts-with? (ex-message db-two-probs)
                             ;; could be either problem so just match common prefix
@@ -203,8 +203,8 @@
       (is (= "SHACL PropertyShape exception - sh:not sh:minLength: value 12345 must have string length less than 4."
              (ex-message db-tag-too-long)))
       (is (util/exception? db-greeting-incorrect))
-      (is (str/starts-with? (ex-message db-greeting-incorrect)
-                            "SHACL PropertyShape exception - sh:not sh:pattern: value hello! must not match pattern"))
+      (is (= "SHACL PropertyShape exception - sh:not sh:pattern: value hello! must not match pattern \"hello.*\"."
+             (ex-message db-greeting-incorrect)))
       (is (= [{:id          :ex/jean-claude
                :type    :ex/User,
                :schema/name "Jean-Claude"}]
