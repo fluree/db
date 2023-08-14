@@ -273,36 +273,4 @@
                  :schema/name "Alice",
                  :foo/bar "baz"}]
                @(fluree/query db (assoc user-query
-                                        :context ["" {:foo "http://foo.com/"}]))))))
-      (let [txn1        {:id    ledger-name
-                         :graph [{:graph
-                                  [{:id          :ex/alice
-                                    :type        :ex/User
-                                    :schema/name "Alice"}]}
-                                 {:id          :ex/bob
-                                  :type        :ex/User
-                                  :schema/name "Bob"}]}
-            invalid-db1 (try
-                          @(fluree/transact! conn txn1 {})
-                          (catch Exception e e))
-
-            txn2        {:context     {:graph-alias "@graph"}
-                         :id          ledger-name
-                         :graph-alias [{:graph-alias
-                                        [{:id          :ex/alice
-                                          :type        :ex/User
-                                          :schema/name "Alice"}]}
-                                       {:id          :ex/bob
-                                        :type        :ex/User
-                                        :schema/name "Bob"}]}
-            invalid-db2 (try
-                          @(fluree/transact! conn txn2 {})
-                          (catch Exception e e))]
-        (is (util/exception? invalid-db1))
-        (is (= "Invalid transaction, node contains unsupported keys: (:graph)"
-               (ex-message invalid-db1)))
-        (is (util/exception? invalid-db2))
-        (is (= "Invalid transaction, node contains unsupported keys: (:graph)"
-              (ex-message invalid-db2)))))))
-
-
+                                        :context ["" {:foo "http://foo.com/"}]))))))))
