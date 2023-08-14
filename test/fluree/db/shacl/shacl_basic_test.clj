@@ -115,11 +115,11 @@
                          (catch Exception e e))]
       (is (util/exception? db-int-name)
           "Exception, because :schema/name is an integer and not a string.")
-      (is (= "Data type 1 cannot be coerced from provided value: 42."
+      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
              (ex-message db-int-name)))
       (is (util/exception? db-bool-name)
           "Exception, because :schema/name is a boolean and not a string.")
-      (is (= "Data type 1 cannot be coerced from provided value: true."
+      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
              (ex-message db-bool-name)))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
@@ -922,7 +922,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
-      (is (= "Data type 1 cannot be coerced from provided value: 42."
+      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
              (ex-message db-num-email)))
       (is (= [{:id           :ex/john
                :type     :ex/User
@@ -1180,7 +1180,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                 "ex:name" 123
                                                 "type"    "ex:User"}])]
         (is (util/exception? db-bad-friend-name))
-        (is (= "Data type 1 cannot be coerced from provided value: 123."
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
                (ex-message db-bad-friend-name)))))
     (testing "maxCount"
       (let [conn          @(fluree/connect {:method :memory

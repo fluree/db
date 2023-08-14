@@ -874,6 +874,45 @@
               (recur r' shape* p-shapes))))
         (assoc shape :property p-shapes)))))
 
+(defn build-node-shape2
+  [db shape-flakes]
+  (go-try
+    (loop [[flake & r'] shape-flakes
+           shape    {}
+           p-shapes []]
+      (if flake
+        (let [p (flake/p flake)
+              o (flake/o flake)]
+          (if (#{const/$sh:property const/$sh:not} p)
+            (let [p-shape-flakes (<? (query-range/index-range db :spot = [o]))
+                  p-shape (<? (build-property-shape db p p-shape-flakes))]
+              (recur r' shape (conj p-shapes p-shape)))
+            (let [shape* (condp = p
+                           const/$xsd:anyURI
+                           (assoc shape :id o)
+
+                           const/$sh:targetClass
+                           (assoc shape :target-class o)
+
+                           const/$sh:closed
+                           (if (true? o)
+                             (assoc shape :closed? true)
+                             shape)
+
+                           const/$sh:ignoredProperties
+                           (update shape :ignored-properties
+                                   (fnil conj #{const/$xsd:anyURI}) o)
+
+                           ;; else
+                           shape)]
+              (recur r' shape* p-shapes))))
+        (let [{optimizable-p-shapes true p-shapes* false} (if (optimizable-node-shape? shape)
+                                                            (group-by optimizable-property-shape? p-shapes)
+                                                            {false p-shapes})]
+          (cond-> (assoc shape :property p-shapes*)
+            optimizable-p-shapes (assoc :advanced-validation
+                                       ;; group by :path pid
+                                        (group-by (comp ffirst :path) optimizable-p-shapes))))))))
 
 (defn build-shapes
   [db shape-sids]
@@ -890,12 +929,31 @@
           {:shapes   shapes
            :datatype datatype})))))
 
+(defn build-shapes2
+  [db shape-sids]
+  (go-try
+    (when (seq shape-sids)
+      (loop [[shape-sid & r] shape-sids
+             shapes   []]
+        (if shape-sid
+          (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))
+                shape (<? (build-node-shape db shape-flakes))]
+            (recur r (conj shapes shape)))
+          shapes)))))
+
 (defn build-class-shapes
   "Given a class SID, returns class shape"
   [db type-sid]
   (go-try
     (let [shape-sids (->> (<? (query-range/index-range db :post = [const/$sh:targetClass type-sid]))
                           (map flake/s))]
+      (<? (build-shapes db shape-sids)))))
+
+(defn build-class-shapes2
+  "Given a class SID, returns class shape"
+  [db type-sid]
+  (go-try
+    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass type-sid] {:flake-xf (map flake/s)}))]
       (<? (build-shapes db shape-sids)))))
 
 (defn merge-shapes
@@ -927,12 +985,36 @@
           (when shape-maps
             (merge-shapes shape-maps)))))))
 
+(defn class-shapes2
+  "Takes a list of target classes and returns shapes that must pass validation,
+  or nil if none exist."
+  [{:keys [schema] :as db} type-sids]
+  (go-try
+    (let [shapes-cache (:shapes schema)]
+      (loop [[type-sid & r] type-sids
+             shapes []]
+        (if type-sid
+          (let [class-shapes (if #_(contains? (:class @shapes-cache) type-sid) false
+                            (get-in @shapes-cache [:class type-sid])
+                            (let [shapes (<? (build-class-shapes2 db type-sid))]
+                              (swap! shapes-cache assoc-in [:class type-sid] shapes)
+                              shapes))]
+            (recur r (into shapes class-shapes)))
+          shapes)))))
+
 (defn build-targetobject-shapes
   "Given a pred SID, returns shape"
   [db pred-sid]
   (go-try
     (let [shape-sids (->> (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf pred-sid]))
                           (map flake/s))]
+      (<? (build-shapes db shape-sids)))))
+
+(defn build-targetobject-shapes2
+  "Given a pred SID, returns shape"
+  [db pred-sid]
+  (go-try
+    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf pred-sid] {:flake-xf (map flake/s)}))]
       (<? (build-shapes db shape-sids)))))
 
 (defn targetobject-shapes
@@ -954,6 +1036,23 @@
                        shape-maps)))
           (when shape-maps
             (merge-shapes shape-maps)))))))
+
+(defn targetobject-shapes2
+  "Takes a list of predicates and returns shapes that must pass validation,
+  or nil if none exist."
+  [{:keys [schema] :as db} pred-sids]
+  (go-try
+    (let [shapes-cache (:shapes schema)]
+      (loop [[pred-sid & r] pred-sids
+             shapes []]
+        (if pred-sid
+          (let [object-shapes (if #_ (contains? (:target-objects-of @shapes-cache) pred-sid) false
+                                  (get-in @shapes-cache [:target-objects-of pred-sid])
+                                  (let [shapes (<? (build-targetobject-shapes2 db pred-sid))]
+                                    (swap! shapes-cache assoc-in [:target-objects-of pred-sid] shapes)
+                                    shapes))]
+            (recur r (into shapes object-shapes)))
+          shapes)))))
 
 (defn has-target-objects-of-rule?
   "Returns `true` if db currently has a rule that uses

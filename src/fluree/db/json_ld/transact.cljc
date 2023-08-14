@@ -110,6 +110,43 @@
                                         {:status 400 :error :db/invalid-transaction})))]
       (into flakes retractions))))
 
+(defn add-property2
+  "Adds property. Parameters"
+  [sid pid p-shapes check-retracts? list? {:keys [value] :as v-map}
+   {:keys [t db-before] :as tx-state}]
+  (go-try
+    (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
+                        (->> (<? (query-range/index-range db-before :spot = [sid pid]))
+                             (map #(flake/flip-flake % t))))
+          m           (when list?
+                        {:i (-> v-map :idx last)})
+
+          shacl-dt    (->> (filter :datatype p-shapes)
+                           (map :datatype)
+                           (first))
+          flakes      (cond
+                        ;; a new node's data is contained, process as another node then link to this one
+                        (jld-reify/node? v-map)
+                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+
+                        ;; a literal value
+                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
+                        (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
+                          [(flake/create sid pid value* dt t true m)])
+
+                        :else
+                        (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
+                                        {:status 400 :error :db/invalid-transaction})))
+          [valid? err] (shacl/coalesce-validation-results
+                         (mapv (fn [p-shape]
+                                 (shacl/validate-simple-property-constraints p-shape flakes))
+                               p-shapes))]
+      (when (not valid?)
+        (throw (ex-info (str "Node did not pass SHACL validation: " v-map)
+                        {:status 400, :error :db/shacl-validation :message err})))
+      (into flakes retractions))))
+
 (defn list-value?
   "returns true if json-ld value is a list object."
   [v]
@@ -189,18 +226,28 @@
                          ;;data and have it enforced.
                          (<? (get-subject-types db-before sid new-type-sids)))
           class-shapes (<? (shacl/class-shapes db-before classes))
+          class-shapes2 (<? (shacl/class-shapes2 db-before classes))
           referring-pids (when shacl-target-objects-of?
-                           (cond-> (map flake/p (<? (query-range/index-range db-before :opst = [sid])))
+                           (cond-> (<? (query-range/index-range db-before :opst = [sid] {:flake-xf (map flake/p)}))
                              referring-pid (conj referring-pid)))
           pred-shapes (when (seq referring-pids)
                         (<? (shacl/targetobject-shapes db-before referring-pids)))
+          pred-shapes2 (when (seq referring-pids)
+                         (<? (shacl/targetobject-shapes2 db-before referring-pids)))
           shacl-map   (merge-with into class-shapes pred-shapes)
+          shacl-shapes (into class-shapes2 pred-shapes2)
+          pid->p-shapes (reduce (fn [pid->p-shapes {:keys [advanced-validation] :as shape}]
+                                        (if advanced-validation
+                                          (merge-with into pid->p-shapes advanced-validation)
+                                          pid->p-shapes))
+                                      {}
+                                      shacl-shapes)
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
                          id)
           base-flakes  (cond-> []
-                               new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
-                               new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
+                         new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
+                         new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
       ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
       (register-node subj-mods node sid {:iri-only? (iri-only? node)
                                          :shacl     shacl-map
@@ -228,6 +275,7 @@
                 pid              (or existing-pid
                                      (get jld-ledger/predefined-properties k)
                                      (jld-ledger/generate-new-pid k iris next-pid ref? refs))
+                p-shapes (get pid->p-shapes pid)
                 ;;it's possible the shacl constraint was discovered via a different node,
                 ;; as in `sh:targetObjectsOf`. In that case, the relevant shape would be
                 ;; available in `subj-mods`, rather than in the currently-bound `shacl-map`.
@@ -244,7 +292,8 @@
                                    (loop [[v' & r] v*
                                           flakes* subj-flakes]
                                      (if v'
-                                       (recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
+                                       #_(recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
+                                       (recur r (into flakes* (<? (add-property2 sid pid p-shapes check-retracts? list? v' tx-state))))
                                        flakes*)))]
             (recur r property-flakes* flakes*))
           ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
