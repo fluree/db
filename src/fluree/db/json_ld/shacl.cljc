@@ -546,6 +546,8 @@
    (fn [acc property-flake]
      (let [o (flake/o property-flake)]
        (condp = (flake/p property-flake)
+         const/$xsd:anyURI
+         (assoc acc :id o)
          const/$sh:path
          (update acc :path (fnil conj []) o)
 
@@ -808,7 +810,7 @@
   [p-shape]
   (let [[[_ path-type] :as tagged-path] (:path p-shape)
         constraints (-> p-shape
-                        (dissoc :path :required?)
+                        (dissoc :path :required? :id)
                         (keys)
                         (set))]
     (boolean
