@@ -208,6 +208,7 @@
   (let [conn        (test-utils/create-conn)
         ledger-name "example-ledger"
         ledger      @(fluree/create conn ledger-name {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+        ;; can't `transact!` until ledger can be loaded (ie has at least one commit)
         db          @(fluree/stage (fluree/db ledger)
                                    {:id   :ex/firstTransaction
                                     :type :ex/Nothing})
@@ -219,58 +220,59 @@
                  :context {:foo "http://foo.com/"}
                  :graph   [{:id          :ex/alice
                             :type        :ex/User
-                            :foo/bar     "baz"
+                            :foo/bar     "foo"
                             :schema/name "Alice"}
                            {:id          :ex/bob
                             :type        :ex/User
+                            :foo/baz     "baz"
                             :schema/name "Bob"}]}
             db  @(fluree/transact! conn txn {})]
-        (is (= [{:id          :ex/bob
-                 :type        :ex/User
-                 :schema/name "Bob"}
-                {:id                  :ex/alice
-                 :type                :ex/User
-                 "http://foo.com/bar" "baz"
-                 :schema/name         "Alice"}]
-               @(fluree/query db user-query)))))
+        (is (= [{:id          :ex/bob,
+                 :type        :ex/User,
+                 :schema/name "Bob",
+                 :foo/baz     "baz"}
+                {:id          :ex/alice,
+                 :type        :ex/User,
+                 :foo/bar     "foo",
+                 :schema/name "Alice"}]
+               @(fluree/query db (assoc user-query
+                                        :context ["" {:foo "http://foo.com/"}]))))))
     (testing "Aliased @id, @graph are correctly identified"
-      (let [txn {:context     {:foo         "http://foo.com/"
-                               :id-alias    "@id"
+      (let [txn {:context     {:id-alias    "@id"
                                :graph-alias "@graph"}
                  :id-alias    ledger-name
-                 :graph-alias [{:id-alias    :ex/alice
-                                :type        :ex/User
-                                :foo/bar     "baz"
-                                :schema/name "Alice"}
-                               {:id-alias    :ex/bob
-                                :type        :ex/User
-                                :schema/name "Bob"}]}
+                 :graph-alias {:id-alias    :ex/alice
+                               :schema/givenName "Alicia"}}
             db  @(fluree/transact! conn txn {})]
-        (is (= [{:id          :ex/bob
-                 :type        :ex/User
-                 :schema/name "Bob"}
-                {:id                  :ex/alice
-                 :type                :ex/User
-                 "http://foo.com/bar" "baz"
-                 :schema/name         "Alice"}]
-               @(fluree/query db user-query)))))
+        (is (= [{:id          :ex/bob,
+                 :type        :ex/User,
+                 :schema/name "Bob",
+                 :foo/baz     "baz"}
+                {:id          :ex/alice,
+                 :type        :ex/User,
+                 :schema/name "Alice",
+                 :foo/bar     "foo",
+                 :schema/givenName "Alicia"}]
+               @(fluree/query db (assoc user-query
+                                        :context ["" {:foo "http://foo.com/"
+                                                      :bar "http://bar.com/"}]))))))
     (testing "@context inside node is correctly handled"
       (let [txn        {:id    ledger-name
-                        :graph [{:context     {:foo "http://foo.com/"}
-                                 :id          :ex/alice
-                                 :type        :ex/User
-                                 :foo/bar     "baz"
-                                 :schema/name "Alice"}
-                                {:id          :ex/bob
-                                 :type        :ex/User
-                                 :schema/name "Bob"}]}
+                        :graph [{:context    {:quux "http://quux.com/"}
+                                 :id         :ex/alice
+                                 :quux/corge "grault"}]}
             db @(fluree/transact! conn txn {})]
-        (is (= [{:id :ex/bob,
-                 :type :ex/User,
-                 :schema/name "Bob"}
-                {:id :ex/alice,
-                 :type :ex/User,
+        (is (= [{:id          :ex/bob,
+                 :type        :ex/User,
+                 :schema/name "Bob",
+                 :foo/baz     "baz"}
+                {:id          :ex/alice,
+                 :type        :ex/User,
                  :schema/name "Alice",
-                 :foo/bar "baz"}]
+                 :schema/givenName "Alicia"
+                 :quux/corge  "grault"
+                 :foo/bar     "foo",}]
                @(fluree/query db (assoc user-query
-                                        :context ["" {:foo "http://foo.com/"}]))))))))
+                                        :context ["" {:foo "http://foo.com/"
+                                                      :bar "http://bar.com/"
+                                                      :quux "http://quux.com/"}]))))))))
