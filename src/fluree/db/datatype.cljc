@@ -406,4 +406,4 @@
                            " cannot be coerced from provided value: " value ".")
                       {:status 400 :error, :db/shacl-value-coercion}))
 
-      :else [value to-type])))
+      :else [value* to-type])))
