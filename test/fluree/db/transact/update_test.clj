@@ -399,20 +399,20 @@
                                                                 "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
                                                                 "schema" "http://schema.org/",
                                                                 "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
-        love (let [ledger @(fluree/create conn "test/love")]
-               @(fluree/transact! ledger
-                                  [{"@id"                "ex:fluree",
-                                    "@type"              "schema:Organization",
-                                    "schema:description" "We ❤️ Data"}
-                                   {"@id"                "ex:w3c",
-                                    "@type"              "schema:Organization",
-                                    "schema:description" "We ❤️ Internet"}
-                                   {"@id"                "ex:mosquitos",
-                                    "@type"              "ex:Monster",
-                                    "schema:description" "We ❤️ Human Blood"}]
-                                  {})
-               ledger)
-        db1  (fluree/db love)]
+        ledger-id  "test/love"
+        ledger @(fluree/create conn ledger-id)
+        love @(fluree/stage (fluree/db ledger)
+                            [{"@id"                "ex:fluree",
+                              "@type"              "schema:Organization",
+                              "schema:description" "We ❤️ Data"}
+                             {"@id"                "ex:w3c",
+                              "@type"              "schema:Organization",
+                              "schema:description" "We ❤️ Internet"}
+                             {"@id"                "ex:mosquitos",
+                              "@type"              "ex:Monster",
+                              "schema:description" "We ❤️ Human Blood"}]
+                            {})
+        db1 @(fluree/commit! ledger love)]
     (testing "before deletion"
       (let [q       '{:select [?s ?p ?o]
                       :where  [[?s "schema:description" ?o]
@@ -424,12 +424,13 @@
                subject)
             "returns all results")))
     (testing "after deletion"
-      @(fluree/transact! love
-                         '{:delete [?s ?p ?o]
-                           :where  [[?s "schema:description" ?o]
-                                    [?s ?p ?o]]}
-                         {})
-      (let [db2     (fluree/db love)
+      @(fluree/transact!  conn
+                          {:id ledger-id
+                           :graph {:delete '[?s ?p ?o]
+                                   :where  '[[?s "schema:description" ?o]
+                                             [?s ?p ?o]]}}
+                          {})
+      (let [db2   (fluree/db ledger)
             q       '{:select [?s ?p ?o]
                       :where  [[?s "schema:description" ?o]
                                [?s ?p ?o]]}
