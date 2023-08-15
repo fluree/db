@@ -798,11 +798,6 @@
     :flags
 
     :datatype
-    :in
-    :has-value
-
-    :min-count
-    :max-count
 
     :min-exclusive
     :min-inclusive
