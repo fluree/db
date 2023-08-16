@@ -390,15 +390,16 @@
             "query parse error")))))
 
 (deftest ^:integration subject-object-scan-deletions
-  (let [conn (test-utils/create-conn {:defaults {:context-type :string
-                                                 :context      {"id"     "@id",
-                                                                "type"   "@type",
-                                                                "ex"     "http://example.org/",
-                                                                "f"      "https://ns.flur.ee/ledger#",
-                                                                "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                                                "schema" "http://schema.org/",
-                                                                "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+  (let [conn @(fluree/connect {:method :memory
+                               :defaults {:context-type :string
+                                          :context      {"id"     "@id",
+                                                         "type"   "@type",
+                                                         "ex"     "http://example.org/",
+                                                         "f"      "https://ns.flur.ee/ledger#",
+                                                         "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                         "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                                         "schema" "http://schema.org/",
+                                                         "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
         ledger-id  "test/love"
         ledger @(fluree/create conn ledger-id)
         love @(fluree/stage (fluree/db ledger)
@@ -430,7 +431,7 @@
                                    :where  '[[?s "schema:description" ?o]
                                              [?s ?p ?o]]}}
                           {})
-      (let [db2   (fluree/db ledger)
+      (let [db2   (fluree/db @(fluree/load conn ledger-id))
             q       '{:select [?s ?p ?o]
                       :where  [[?s "schema:description" ?o]
                                [?s ?p ?o]]}
