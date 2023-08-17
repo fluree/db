@@ -171,7 +171,7 @@
 
 (defn- enrich-commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
-  [{:keys [ledger branch schema t commit stats] :as _db}
+  [ledger {:keys [branch schema t commit stats] :as _db}
    {:keys [context did private push? message tag file-data? index-files-ch] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
@@ -231,7 +231,7 @@
 
 (defn commit-opts->data
   "Convert the novelty flakes into the json-ld shape."
-  [{:keys [ledger branch t] :as db} opts]
+  [ledger {:keys [branch t] :as db} opts]
   (go-try
     (let [committed-t (-> ledger
                           (ledger-proto/-status branch)
@@ -247,10 +247,10 @@
 
 (defn ledger-update-jsonld
   "Creates the JSON-LD map containing a new ledger update"
-  [{:keys [commit] :as db} {:keys [type-key compact ctx-used-atom t v id-key stats] :as commit-opts}]
+  [ledger {:keys [commit] :as db} {:keys [type-key compact ctx-used-atom t v id-key stats] :as commit-opts}]
   (go-try
     (let [prev-dbid   (commit-data/data-id commit)
-          {:keys [assert retract refs-ctx]} (<? (commit-opts->data db commit-opts))
+          {:keys [assert retract refs-ctx]} (<? (commit-opts->data ledger db commit-opts))
           prev-db-key (compact const/iri-previous)
           assert-key  (compact const/iri-assert)
           retract-key (compact const/iri-retract)
@@ -279,7 +279,7 @@
   (content addressed), and updates the commit w/ a new :defaultContext node.
 
   Returns a two-tuple of [updated-commit context-file-write-response]"
-  [{:keys [conn ledger default-context] :as _db} commit]
+  [ledger {:keys [conn default-context] :as _db} commit]
   (go-try
     (let [{:keys [hash address] :as context-res} (<? (conn-proto/-ctx-write
                                                       conn ledger default-context))
@@ -291,7 +291,7 @@
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [ledger commit new-context?] :as db} {:keys [branch push? did private] :as _opts}]
+  [ledger {:keys [commit new-context?] :as db} {:keys [branch push? did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
           ledger-commit (:commit (ledger-proto/-status ledger branch))
@@ -300,7 +300,7 @@
           new-commit    (commit-data/use-latest-index commit ledger-commit)
           _             (log/debug "do-commit+push new-commit:" new-commit)
           [new-commit* context-res] (if new-context?
-                                      (<? (link-context-to-commit db new-commit))
+                                      (<? (link-context-to-commit ledger db new-commit))
                                       [new-commit nil])
           _             (log/debug "do-commit+push new-commit w/ linked context:"
                                    new-commit*)
@@ -330,7 +330,7 @@
   "Returns a fn that receives a newly indexed db as its only argument.
   Will updated the provided committed-db with the new index, then create
   a new commit and push to the name service(s) if configured to do so."
-  [committed-db commit-opts]
+  [ledger committed-db commit-opts]
   (fn [indexed-db]
     (let [indexed-commit (:commit indexed-db)
           commit-newer?  (> (commit-data/t (:commit committed-db))
@@ -338,7 +338,7 @@
           new-db         (if commit-newer?
                            (dbproto/-index-update committed-db (:index indexed-commit))
                            indexed-db)]
-      (do-commit+push new-db commit-opts))))
+      (do-commit+push ledger new-db commit-opts))))
 
 (defn run-index
   "Runs indexer. Will update the latest commit file with new index point
@@ -346,9 +346,9 @@
 
   If optional changes-ch is provided, will stream indexing updates to it
   so it can be replicated via consensus to other servers as needed."
-  [{:keys [ledger] :as db} commit-opts changes-ch]
+  [ledger db commit-opts changes-ch]
   (let [{:keys [indexer]} ledger
-        update-fn (update-commit-fn db commit-opts)]
+        update-fn (update-commit-fn ledger db commit-opts)]
     ;; call indexing process with update-commit-fn to push out an updated commit once complete
     (idx-proto/-index indexer db {:update-commit update-fn
                                   :changes-ch    changes-ch})))
@@ -360,8 +360,8 @@
   returns a db with an updated :commit."
   [{:keys [conn indexer context] :as ledger} {:keys [t stats commit] :as db} opts]
   (go-try
-    (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*} (enrich-commit-opts db opts)
-          ledger-update     (<? (ledger-update-jsonld db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
+    (let [{:keys [id-key did message tag file-data? index-files-ch] :as opts*} (enrich-commit-opts ledger db opts)
+          ledger-update     (<? (ledger-update-jsonld ledger db opts*)) ;; writes :dbid as meta on return object for -c-write to leverage
           dbid              (get ledger-update id-key) ;; sha address of latest "db" point in ledger
           ledger-update-res (<? (conn-proto/-c-write conn ledger ledger-update)) ;; write commit data
           db-address        (:address ledger-update-res) ;; may not have address (e.g. IPFS) until after writing file
@@ -378,10 +378,10 @@
                               :prev-commit commit)
           {db**              :db
            commit-file-meta  :commit-res
-           context-file-meta :context-res} (<? (do-commit+push db* opts*))
+           context-file-meta :context-res} (<? (do-commit+push ledger db* opts*))
           ;; if an indexing process is kicked off, returns a channel that contains a stream of updates for consensus
           indexing-ch       (if (idx-proto/-index? indexer db**)
-                              (run-index db** opts* index-files-ch)
+                              (run-index ledger db** opts* index-files-ch)
                               (when index-files-ch (async/close! index-files-ch)))]
       (if file-data?
         {:data-file-meta    ledger-update-res
