@@ -457,10 +457,9 @@
 
 
 (defn load-db
-  [{:keys [ledger] :as db} latest-commit merged-db?]
+  [{:keys [conn] :as db} latest-commit merged-db?]
   (go-try
-    (let [{:keys [conn]} ledger
-          commits (<? (trace-commits conn latest-commit 1))]
+    (let [commits (<? (trace-commits conn latest-commit 1))]
       (loop [[commit & r] commits
              db* db]
         (if commit
@@ -470,10 +469,9 @@
 
 
 (defn load-db-idx
-  [{:keys [ledger] :as db} latest-commit commit-address merged-db?]
+  [{:keys [conn] :as db} latest-commit commit-address merged-db?]
   (go-try
-    (let [{:keys [conn]} ledger
-          idx-meta   (get latest-commit const/iri-index) ;; get persistent index meta if ledger has indexes
+    (let [idx-meta   (get latest-commit const/iri-index) ;; get persistent index meta if ledger has indexes
           db-base    (if-let [idx-address (get-in idx-meta [const/iri-address :value])]
                        (<? (storage/reify-db conn db idx-address))
                        db)

@@ -209,11 +209,10 @@
 (defn index-range*
   "Return a channel that will eventually hold a sorted vector of the range of
   flakes from `db` that meet the criteria specified in the `opts` map."
-  [{:keys [ledger] :as db}
+  [{:keys [conn] :as db}
    error-ch
    {:keys [idx start-flake end-flake limit offset flake-limit] :as opts}]
-  (let [{:keys [conn]} ledger
-        idx-root       (get db idx)
+  (let [idx-root       (get db idx)
         novelty        (get-in db [:novelty idx])]
     (->> (resolve-flake-slices conn idx-root novelty error-ch opts)
          (filter-authorized db start-flake end-flake error-ch)
