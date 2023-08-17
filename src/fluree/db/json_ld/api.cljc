@@ -3,6 +3,7 @@
             [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
+            [fluree.db.conn.remote :as remote-conn]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
@@ -57,12 +58,17 @@
     - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
     - push - (optional) Function(s) in a vector that will attempt to push the commit to naming service(s)
     "
-  [{:keys [method parallelism] :as opts}]
+  [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
   (promise-wrap
     (let [opts*   (assoc opts :parallelism (or parallelism 4))
-          method* (keyword method)]
+          method* (cond
+                    method (keyword method)
+                    remote-servers :remote
+                    :else (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
+                                          {:status 500 :error :db/invalid-configuration})))]
       (case method*
+        :remote (remote-conn/connect opts*)
         :ipfs (ipfs-conn/connect opts*)
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
