@@ -56,6 +56,7 @@
 (def ^:const iri-type "@type")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
 (def ^:const iri-class "http://www.w3.org/2000/01/rdf-schema#Class")
+(def ^:const iri-lang-string "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
 
 ;; system collection ids
 (def ^:const $_tx -1) ; Note unlike other collection ids, this is never used to generate _tx values, as _tx has the full negative range
@@ -99,26 +100,8 @@
 (def ^:const $_commitdata:size 183)
 (def ^:const $_commitdata:t 184)
 
-(def ^:const $_predicate:name 10)
-(def ^:const $_predicate:doc 11)
-(def ^:const $_predicate:type 12)
-(def ^:const $_predicate:unique 13)
-(def ^:const $_predicate:multi 14)
-(def ^:const $_predicate:index 15)
-(def ^:const $_predicate:upsert 16)
-(def ^:const $_predicate:component 17)
-(def ^:const $_predicate:noHistory 18)
-(def ^:const $_predicate:restrictCollection 19)
-(def ^:const $_predicate:spec 20)
-(def ^:const $_predicate:encrypted 21)
-(def ^:const $_predicate:deprecated 22)
-(def ^:const $_predicate:specDoc 23)
-(def ^:const $_predicate:txSpec 24)
-(def ^:const $_predicate:txSpecDoc 25)
-(def ^:const $_predicate:restrictTag 26)
 (def ^:const $_predicate:fullText 27)
 (def ^:const $_predicate:equivalentProperty 35)                          ;; any unique alias for predicate
-(def ^:const $_predicate:retractDuplicates 29)             ;; if transaction flake duplicates existing flake, always retract/insert (default behavior ignores new flake)
 ;; TODO - jumping predicate ids - rethink ordering a bit
 (def ^:const $rdf:type 200)
 (def ^:const $rdfs:subClassOf 201)
