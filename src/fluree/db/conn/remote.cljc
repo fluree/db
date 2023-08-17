@@ -85,7 +85,7 @@
 
   conn-proto/iConnection
   (-close [_]
-    (log/info "Closing memory connection" id)
+    (log/info "Closing remote connection" id)
     (swap! state assoc :closed? true))
   (-closed? [_] (boolean (:closed? @state)))
   (-method [_] :remote)
@@ -115,13 +115,7 @@
           cache-key
           (fn [_]
             (storage/resolve-index-node conn node
-                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key))))))))
-
-  #?@(:clj
-      [full-text/IndexConnection
-       (open-storage [conn network dbid lang]
-         (throw (ex-info "Memory connection does not support full text operations."
-                         {:status 500 :error :db/unexpected-error})))]))
+                                        (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
