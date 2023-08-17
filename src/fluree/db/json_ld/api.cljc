@@ -238,34 +238,20 @@
    (promise-wrap
      (ledger-proto/-commit! ledger db opts))))
 
-(defn- prepare-json-ld-txn
-  [json-ld]
-  (let [context-key (cond
-                      (contains? json-ld "@context") "@context"
-                      (contains? json-ld :context) :context)
-        context (get json-ld context-key)]
-    (let [parsed-context (json-ld/parse-context context)]
-      (into {}
-            (map (fn [[k v]]
-                   (let [k* (cond
-                              (contains? #{"@id" "@graph" :id :graph} k) k
-                              (= k context-key) :context
-                              :else (json-ld/expand-iri k parsed-context))]
-                     (condp = k*
-                       "@id" [:id v]
-                       "@graph" [:graph v]
-                       [k* v]))))
-            json-ld))))
-
-
-
 (defn transact!
-  "Stages and commits the transaction `json-ld` to the specified `ledger`"
+  "Expects a conn and json-ld document containing at least the following keys:
+  `@id`: the id of the ledger to transact to
+  `@graph`: the data to be transacted
+
+  Loads the specified ledger and peforms stage and commit! operations.
+  Returns the new db.
+
+  Note: Loading the ledger results in a new ledger object, so references to existing
+  ledger objects will be rendered stale. To obtain a ledger with the new changes,
+  call `load` on the ledger alias."
   [conn json-ld opts]
-  (let [{ledger-id :id json-ld :graph top-level-ctx :context :as prepped} (prepare-json-ld-txn json-ld)
-        ledger @(load conn ledger-id)]
-       (promise-wrap
-         (transact-api/transact! ledger json-ld (assoc opts :top-ctx top-level-ctx)))))
+  (promise-wrap
+    (transact-api/transact! conn json-ld opts)))
 
 (defn status
   "Returns current status of ledger branch."
