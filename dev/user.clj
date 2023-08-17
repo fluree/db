@@ -15,6 +15,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
+            [fluree.json-ld :as json-ld]
             [clojure.string :as str]
             [criterium.core :refer [bench]]
             ;; cljs
