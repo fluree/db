@@ -1,5 +1,6 @@
 (ns fluree.db.api.transact
-  (:require [fluree.db.fuel :as fuel]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.fuel :as fuel]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.transact :as tx]
@@ -30,17 +31,24 @@
 (defn transact!
   [conn json-ld opts]
   (go-try
-    (let [{ledger-id :id json-ld :graph top-level-ctx :context} (tx/parse-json-ld-txn json-ld)
+    (let [{txn-context "@context"
+           txn "@graph"
+           ledger-id "@id"
+           txn-opts const/iri-opts
+           default-context const/iri-default-context :as parsed} (tx/parse-json-ld-txn json-ld)
           address  (<? (conn-proto/-address conn ledger-id nil))]
       (if-not (<? (conn-proto/-exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger (<? (jld-ledger/load conn address))
-              opts* (assoc opts :top-ctx top-level-ctx)]
+              opts* (cond-> opts
+                      txn-opts        (merge txn-opts)
+                      txn-context     (assoc :top-ctx txn-context)
+                      default-context (assoc :defaultContext default-context))]
           (if (:meta opts*)
             (let [start-time   #?(:clj  (System/nanoTime)
                                   :cljs (util/current-time-millis))
                   fuel-tracker (fuel/tracker)]
-              (try* (let [tx-result (<? (tx/transact! ledger fuel-tracker json-ld opts*))]
+              (try* (let [tx-result (<? (tx/transact! ledger fuel-tracker txn opts*))]
                       {:status 200
                        :result tx-result
                        :time   (util/response-time-formatted start-time)
@@ -51,4 +59,4 @@
                                                 ex-data
                                                 (assoc :time (util/response-time-formatted start-time)
                                                        :fuel (fuel/tally fuel-tracker))))))))
-            (<? (tx/transact! ledger json-ld opts*))))))))
+            (<? (tx/transact! ledger txn opts*))))))))

@@ -1,6 +1,7 @@
 (ns fluree.db.json-ld.transact
   (:refer-clojure :exclude [vswap!])
   (:require [clojure.core.async :as async :refer [go]]
+            [clojure.walk :refer [keywordize-keys]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
@@ -490,14 +491,13 @@
     (let [parsed-context (json-ld/parse-context context)]
       (into {}
             (map (fn [[k v]]
-                   (let [k* (cond
-                              (contains? #{"@id" "@graph" :id :graph} k) k
-                              (= k context-key) :context
-                              :else (json-ld/expand-iri k parsed-context))]
-                     (condp = k*
-                       "@id" [:id v]
-                       "@graph" [:graph v]
-                       [k* v]))))
+                   (let [k* (if (= context-key k)
+                              "@context"
+                              (json-ld/expand-iri k parsed-context))
+                         v* (if (= const/iri-opts k*)
+                              (keywordize-keys v)
+                              v)]
+                     [k* v*])))
             json-ld))))
 
 

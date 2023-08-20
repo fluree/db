@@ -426,7 +426,9 @@
             "returns all results")))
     (testing "after deletion"
       @(fluree/transact!  conn
-                          {:id ledger-id
+                          {:context {:id "@id"
+                                     :graph "@graph"}
+                           :id ledger-id
                            :graph {:delete '[?s ?p ?o]
                                    :where  '[[?s "schema:description" ?o]
                                              [?s ?p ?o]]}}

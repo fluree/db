@@ -217,7 +217,9 @@
                       :where  [[?s :type :ex/User]]}]
     (testing "Top-level context is used for transaction nodes"
       (let [txn {:id      ledger-name
-                 :context {:foo "http://foo.com/"}
+                 :context {:foo "http://foo.com/"
+                           :id  "@id"
+                           :graph "@graph"}
                  :graph   [{:id          :ex/alice
                             :type        :ex/User
                             :foo/bar     "foo"
@@ -257,8 +259,8 @@
                                         :context ["" {:foo "http://foo.com/"
                                                       :bar "http://bar.com/"}]))))))
     (testing "@context inside node is correctly handled"
-      (let [txn        {:id    ledger-name
-                        :graph [{:context    {:quux "http://quux.com/"}
+      (let [txn        {"@id"    ledger-name
+                        "@graph" [{:context    {:quux "http://quux.com/"}
                                  :id         :ex/alice
                                  :quux/corge "grault"}]}
             db @(fluree/transact! conn txn {})]
