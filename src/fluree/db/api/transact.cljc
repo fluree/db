@@ -1,12 +1,14 @@
 (ns fluree.db.api.transact
-  (:require [fluree.db.constants :as const]
+  (:require [clojure.walk :refer [keywordize-keys]]
+            [fluree.db.constants :as const]
             [fluree.db.fuel :as fuel]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.dbproto :as dbproto]))
+            [fluree.db.dbproto :as dbproto]
+            [fluree.json-ld :as json-ld]))
 
 (defn stage
   [db json-ld opts]
@@ -28,6 +30,38 @@
                                                  :fuel (fuel/tally fuel-tracker))))))))
       (<? (dbproto/-stage db json-ld opts)))))
 
+(defn- parse-json-ld-txn
+  "Expands top-level keys and parses any opts in json-ld transaction document,
+  for use by `transact!`.
+
+  Throws if required keys @id or @graph are absent."
+  [json-ld]
+  (let [context-key (cond
+                      (contains? json-ld "@context") "@context"
+                      (contains? json-ld :context) :context)
+        context (get json-ld context-key)]
+    (let [parsed-context (json-ld/parse-context context)
+          {id "@id" graph "@graph" :as parsed-txn}
+          (into {}
+                (map (fn [[k v]]
+                       (let [k* (if (= context-key k)
+                                  "@context"
+                                  (json-ld/expand-iri k parsed-context))
+                             v* (if (= const/iri-opts k*)
+                                  (keywordize-keys v)
+                                  v)]
+                         [k* v*])))
+                json-ld)]
+      (if-not (and id graph)
+        (throw (ex-info (str "Invalid transaction, missing required keys:"
+                             (when (nil? id)
+                               " @id")
+                             (when (nil? graph)
+                               " @graph")
+                             ".")
+                        {:status 400 :error :db/invalid-transaction}))
+        parsed-txn))))
+
 (defn transact!
   [conn json-ld opts]
   (go-try
@@ -35,7 +69,7 @@
            txn "@graph"
            ledger-id "@id"
            txn-opts const/iri-opts
-           default-context const/iri-default-context :as parsed} (tx/parse-json-ld-txn json-ld)
+           default-context const/iri-default-context} (parse-json-ld-txn json-ld)
           address  (<? (conn-proto/-address conn ledger-id nil))]
       (if-not (<? (conn-proto/-exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))

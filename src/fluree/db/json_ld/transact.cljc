@@ -1,7 +1,6 @@
 (ns fluree.db.json-ld.transact
   (:refer-clojure :exclude [vswap!])
   (:require [clojure.core.async :as async :refer [go]]
-            [clojure.walk :refer [keywordize-keys]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
@@ -482,23 +481,7 @@
        (log/trace "stage flakes:" flakes)
        (<? (flakes->final-db tx-state flakes))))))
 
-(defn parse-json-ld-txn
-  [json-ld]
-  (let [context-key (cond
-                      (contains? json-ld "@context") "@context"
-                      (contains? json-ld :context) :context)
-        context (get json-ld context-key)]
-    (let [parsed-context (json-ld/parse-context context)]
-      (into {}
-            (map (fn [[k v]]
-                   (let [k* (if (= context-key k)
-                              "@context"
-                              (json-ld/expand-iri k parsed-context))
-                         v* (if (= const/iri-opts k*)
-                              (keywordize-keys v)
-                              v)]
-                     [k* v*])))
-            json-ld))))
+
 
 
 (defn stage-ledger

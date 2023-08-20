@@ -277,4 +277,13 @@
                @(fluree/query db (assoc user-query
                                         :context ["" {:foo "http://foo.com/"
                                                       :bar "http://bar.com/"
-                                                      :quux "http://quux.com/"}]))))))))
+                                                      :quux "http://quux.com/"}]))))))
+    (testing "Throws on invalid txn"
+      (let [txn        {"@graph" [{:context    {:quux "http://quux.com/"}
+                                   :id         :ex/cam
+                                   :quux/corge "grault"}]}
+            db (try @(fluree/transact! conn txn {})
+                    (catch Exception e e))]
+        (is (util/exception? db))
+        (is (str/starts-with? (ex-message db)
+                              "Invalid transaction, missing required keys: @id"))))))
