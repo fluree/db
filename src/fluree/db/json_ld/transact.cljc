@@ -381,7 +381,7 @@
                 flakes* (if (map? node*)
                           (<? (process-node node* flakes track-fuel tx-state))
                           (loop [[n* & r*] node*
-                                 flakes* flakeset]
+                                 flakes* flakes]
                             (if n*
                               (recur r* (into flakes* (<? (process-node n* flakes track-fuel tx-state))))
                               flakes*)))]
