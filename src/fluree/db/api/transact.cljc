@@ -76,7 +76,7 @@
         (let [ledger (<? (jld-ledger/load conn address))
               opts* (cond-> opts
                       txn-opts        (merge txn-opts)
-                      txn-context     (assoc :top-ctx txn-context)
+                      txn-context     (assoc :txn-context txn-context)
                       default-context (assoc :defaultContext default-context))]
           (if (:meta opts*)
             (let [start-time   #?(:clj  (System/nanoTime)

@@ -253,7 +253,7 @@
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap? did context-type top-ctx] :as _opts}]
+  [db {:keys [bootstrap? did context-type txn-context] :as _opts}]
   (let [{:keys [schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
@@ -276,7 +276,7 @@
      :next-sid      (fn [] (vswap! last-sid inc))
      :subj-mods     (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
      :iris          (volatile! {})
-     :top-ctx       top-ctx
+     :txn-context       txn-context
      :shacl-target-objects-of? (shacl/has-target-objects-of-rule? db-before)}))
 
 (defn final-ecount
@@ -363,7 +363,7 @@
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
-  [{:keys [t] :as db} fuel-tracker json-ld {:keys [default-ctx top-ctx] :as tx-state}]
+  [{:keys [t] :as db} fuel-tracker json-ld {:keys [default-ctx txn-context] :as tx-state}]
   (go-try
     (let [track-fuel (when fuel-tracker
                        (fuel/track fuel-tracker))
@@ -372,7 +372,7 @@
       (loop [[node & r] (util/sequential json-ld)
              flakes flakeset]
         (if node
-          (let [node*  {"@context" top-ctx
+          (let [node*  {"@context" txn-context
                         "@graph" [node]}
                 [expanded] (json-ld/expand node* default-ctx)
                 flakes* (if (map? expanded)
