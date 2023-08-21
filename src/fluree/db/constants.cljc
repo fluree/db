@@ -108,6 +108,7 @@
 (def ^:const $rdfs:subPropertyOf 202)
 (def ^:const $rdfs:Class 203)
 (def ^:const $rdf:Property 204)
+(def ^:const $rdf:langString 205)
 
 ;; shacl
 (def ^:const $sh:NodeShape 210)
