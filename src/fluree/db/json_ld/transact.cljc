@@ -350,19 +350,16 @@
   [db]
   (-> db :t zero?))
 
-(defn process-node
-  "returns flakes for node"
-  [node* flakes track-fuel tx-state]
-  (go-try
-    (if (empty? (dissoc node* :idx :id))
-      (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
-                           (some->> (:id node*)
-                                    (str " for @id: "))
-                           ".")
-                      {:status 400 :error :db/invalid-transaction}))
-      (let [[_node*-sid node*-flakes] (<? (json-ld-node->flakes node* tx-state nil))
-            flakes* (track-into flakes track-fuel node*-flakes)]
-        flakes*))) )
+(defn validate-node
+  "Throws if node is invalid, otherwise returns node."
+  [node]
+  (if (empty? (dissoc node :idx :id))
+    (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
+                         (some->> (:id node)
+                                  (str " for @id: "))
+                         ".")
+                    {:status 400 :error :db/invalid-transaction}))
+    node))
 
 (defn insert
   "Performs insert transaction. Returns async chan with resulting flakes."
@@ -375,16 +372,19 @@
       (loop [[node & r] (util/sequential json-ld)
              flakes flakeset]
         (if node
-          (let [node1  {"@context" top-ctx
+          (let [node*  {"@context" top-ctx
                         "@graph" [node]}
-                [node*] (json-ld/expand node1 default-ctx)
-                flakes* (if (map? node*)
-                          (<? (process-node node* flakes track-fuel tx-state))
-                          (loop [[n* & r*] node*
-                                 flakes* flakes]
-                            (if n*
-                              (recur r* (into flakes* (<? (process-node n* flakes track-fuel tx-state))))
-                              flakes*)))]
+                [expanded] (json-ld/expand node* default-ctx)
+                flakes* (if (map? expanded)
+                          (let [[_sid node-flakes] (<? (json-ld-node->flakes (validate-node expanded) tx-state nil))]
+                            (track-into flakes track-fuel node-flakes))
+                          ;;node expanded to a list of child nodes
+                          (loop [[child & children] expanded
+                                 all-flakes flakes]
+                            (if child
+                              (let [[_sid child-flakes] (<? (json-ld-node->flakes (validate-node child) tx-state nil))]
+                                (recur children (track-into all-flakes track-fuel child-flakes)))
+                              all-flakes)))]
             (recur r flakes*))
           flakes)))))
 
