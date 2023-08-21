@@ -3,18 +3,12 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
+            [fluree.db.util.docs :as docs]
             [malli.core :as m]
             [malli.error :as me]
             [malli.transform :as mt]))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-;; TODO: Move these to a shared location once other namespaces need to reference
-(def docs-site
-  "https://next.developers.flur.ee/docs")
-
-(def error-codes-page
-  (str docs-site "/reference/errorcodes"))
 
 (defn wildcard?
   [x]
@@ -54,7 +48,7 @@
        (str "Query: " (pr-str value) " does not have exactly one select clause. "
             "One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. "
             "See documentation here for more details: "
-            error-codes-page "#query-missing-select"))}
+            docs/error-codes-page "#query-missing-select"))}
     one-select-key-present?]
    (into [:map {:closed true}
           [:where ::where]
@@ -188,14 +182,14 @@
                      (str "Query is missing a '" k "' clause. "
                           "'" k "' is required in queries. "
                           "See documentation here for details: "
-                          error-codes-page "#query-missing-" k)))}
+                          docs/error-codes-page "#query-missing-" k)))}
                 ::m/extra-key
                 {:error/fn
                  (fn [{:keys [in]} _]
                    (let [k (-> in last name)]
                      (str "Query contains an unknown key: '" k "'. "
                           "See documentation here for more information on allowed query keys: "
-                          error-codes-page "#query-unknown-key")))}))}))))
+                          docs/error-codes-page "#query-unknown-key")))}))}))))
 
 (defn coalesce-query-errors
   [humanized-errors qry]

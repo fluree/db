@@ -2,16 +2,18 @@
   "Format and display solutions consisting of pattern matches found in where
   searches."
   (:refer-clojure :exclude [format])
-  (:require [fluree.json-ld :as json-ld]
+  (:require [clojure.core.async :as async :refer [<! >! chan go go-loop]]
+            [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
+            [fluree.db.query.exec.eval :as-alias eval]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [<! >! chan go go-loop]]
             [fluree.db.util.async :refer [<?]]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const]))
+            [fluree.db.validation :as v]
+            [fluree.json-ld :as json-ld]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -35,18 +37,24 @@
                 (vswap! iri-cache assoc v {:as iri})
                 iri)
               (catch* e
-                      (log/error e "Error displaying iri:" v)
-                      (>! error-ch e)))))))
+                (log/error e "Error displaying iri:" v)
+                (>! error-ch e)))))))
 
 (defprotocol ValueSelector
-  "Format a where search solution (map of pattern matches) by extracting and
-  displaying relevant pattern matches."
-  (format-value [fmt db iri-cache context compact error-ch solution]))
+  (implicit-grouping? [this]
+   "Returns true if this selector should have its values grouped together.")
+  (format-value [fmt db iri-cache context compact error-ch solution]
+   "Formats a where search solution (map of pattern matches) by extracting and displaying relevant pattern matches."))
+
+(defprotocol SolutionModifier
+  (update-solution [this solution]))
 
 (defrecord VariableSelector [var]
   ValueSelector
+  (implicit-grouping? [_] false)
   (format-value
     [_ db iri-cache context compact error-ch solution]
+    (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (-> solution
         (get var)
         (display db iri-cache compact error-ch))))
@@ -59,12 +67,13 @@
 
 (defrecord AggregateSelector [agg-fn]
   ValueSelector
+  (implicit-grouping? [_] true)
   (format-value
-    [_ db iri-cache context compact error-ch solution]
+    [_ _ _ _ _ error-ch solution]
     (go (try* (agg-fn solution)
               (catch* e
-                      (log/error e "Error applying aggregate selector")
-                      (>! error-ch e))))))
+                (log/error e "Error applying aggregate selector")
+                (>! error-ch e))))))
 
 (defn aggregate-selector
   "Returns a selector that extracts the grouped values bound to the specified
@@ -74,8 +83,29 @@
   [agg-function]
   (->AggregateSelector agg-function))
 
+(defrecord AsSelector [as-fn aggregate?]
+  SolutionModifier
+  (update-solution
+    [_ solution]
+    (log/trace "AsSelector update-solution solution:" solution)
+    (let [{:keys [::eval/var ::eval/val] :as result} (as-fn solution)]
+      (log/trace "AsSelector update-solution result:" result)
+      (assoc solution var {::where/var var, ::where/val val})
+      val))
+  ValueSelector
+  (implicit-grouping? [_] aggregate?)
+  (format-value
+    [_ _ _ _ _ _ solution]
+    (log/trace "AsSelector format-value solution:" solution)
+    (go solution)))
+
+(defn as-selector
+  [as-fn aggregate?]
+  (->AsSelector as-fn aggregate?))
+
 (defrecord SubgraphSelector [var selection depth spec]
   ValueSelector
+  (implicit-grouping? [_] false)
   (format-value
     [_ db iri-cache context compact error-ch solution]
     (go
@@ -87,8 +117,8 @@
            ;; TODO: Replace these nils with fuel values when we turn fuel back on
            (<? (json-ld-resp/flakes->res db iri-cache context compact nil nil spec 0 flakes)))
          (catch* e
-                 (log/error e "Error formatting subgraph for subject:" sid)
-                 (>! error-ch e)))))))
+           (log/error e "Error formatting subgraph for subject:" sid)
+           (>! error-ch e)))))))
 
 (defn subgraph-selector
   "Returns a selector that extracts the subject id bound to the supplied
@@ -103,8 +133,8 @@
   according to the selector or collection of selectors specified by `selectors`"
   [selectors db iri-cache context compact error-ch solution]
   (if (sequential? selectors)
-    (go-loop [selectors  selectors
-              values     []]
+    (go-loop [selectors selectors
+              values []]
       (if-let [selector (first selectors)]
         (let [value (<! (format-value selector db iri-cache context compact error-ch solution))]
           (recur (rest selectors)
@@ -116,25 +146,31 @@
   "Formats each solution within the stream of solutions in `solution-ch` according
   to the selectors within the select clause of the supplied parsed query `q`."
   [db q error-ch solution-ch]
-  (let [context   (:context q)
-        compact   (json-ld/compact-fn context)
-        selectors (or (:select q)
-                      (:select-one q)
-                      (:select-distinct q))
-        iri-cache (volatile! {})
-        format-ch (if (contains? q :select-distinct)
-                    (chan 1 (distinct))
-                    (chan))]
+  (let [context             (:context q)
+        compact             (json-ld/compact-fn context)
+        selectors           (or (:select q)
+                                (:select-one q)
+                                (:select-distinct q))
+        iri-cache           (volatile! {})
+        format-ch           (if (contains? q :select-distinct)
+                              (chan 1 (distinct))
+                              (chan))
+        modifying-selectors (filter #(satisfies? SolutionModifier %) selectors)
+        ;; TODO: Figure out the order of operations among parsing into a
+        ;;       selector, this, & format-value
+        mods-xf             (map (fn [solution]
+                                   (reduce
+                                    (fn [sol sel]
+                                      (log/trace "Updating solution:" sol)
+                                      (update-solution sel sol))
+                                    solution modifying-selectors)))
+        in-ch               (chan 1 mods-xf)]
+    (async/pipe solution-ch in-ch)
     (async/pipeline-async 1
                           format-ch
                           (fn [solution ch]
                             (log/trace "select/format solution:" solution)
                             (-> (format-values selectors db iri-cache context compact error-ch solution)
                                 (async/pipe ch)))
-                          solution-ch)
+                          in-ch)
     format-ch))
-
-(defn implicit-grouping?
-  "Returns true if the provided `selector` can only operate on grouped elements."
-  [selector]
-  (instance? AggregateSelector selector))

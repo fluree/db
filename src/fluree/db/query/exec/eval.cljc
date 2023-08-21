@@ -244,7 +244,7 @@
   (str x))
 
 (def allowed-scalar-fns
-  '#{ && || ! > < >= <= = + - * / quot and bound coalesce if nil?
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if nil? as
      not not= or re-find re-pattern
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
@@ -267,6 +267,7 @@
     ||          fluree.db.query.exec.eval/||
     &&          fluree.db.query.exec.eval/&&
     abs         clojure.core/abs
+    as          fluree.db.query.exec.eval/as
     avg         fluree.db.query.exec.eval/avg
     bound       fluree.db.query.exec.eval/bound
     ceil        fluree.db.query.exec.eval/ceil
@@ -317,6 +318,21 @@
            name
            first
            (= \?))))
+
+(defn as*
+  [val var]
+  (log/trace "as binding value:" val "to variable:" var)
+  (if (variable? var)
+    {::var var, ::val val}
+    (throw
+     (ex-info
+      (str "second arg to `as` must be a query variable (e.g. ?foo); provided:"
+           (pr-str var))
+      {:status 400, :error :db/invalid-query}))))
+
+(defmacro as
+  [val var]
+  `(as* ~val '~var))
 
 (defn symbols
   [code]
@@ -381,7 +397,8 @@
          soln-sym       'solution
          bdg            (bind-variables soln-sym vars)
          fn-code        `(fn [~soln-sym]
-                           (log/debug "fn solution:" ~soln-sym)
+                           (log/trace "fn solution:" ~soln-sym)
+                           (log/trace "fn bindings:" (quote ~bdg))
                            (let ~bdg
                              ~qualified-code))]
      (log/debug "compiled fn:" fn-code)

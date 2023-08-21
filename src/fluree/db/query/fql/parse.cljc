@@ -53,9 +53,9 @@
   [q]
   (when-let [values (:values q)]
     (let [[vars vals] values
-          vars*       (keep parse-var-name (util/sequential vars))
-          vals*       (mapv util/sequential vals)
-          var-count   (count vars*)]
+          vars*     (keep parse-var-name (util/sequential vars))
+          vals*     (mapv util/sequential vals)
+          var-count (count vars*)]
       (if (every? (fn [binding]
                     (= (count binding) var-count))
                   vals*)
@@ -85,15 +85,15 @@
 (defn safe-read
   [code-str]
   (try*
-    (let [code (read-string code-str)]
-      (when-not (list? code)
-        (throw (ex-info (code-str "Invalid function: " code-str)
-                        {:status 400 :error :db/invalid-query})))
-      code)
-    (catch* e
-      (log/warn e "Invalid query function attempted: " code-str)
-      (throw (ex-info (str "Invalid query function: " code-str)
-                      {:status 400 :error :db/invalid-query})))))
+   (let [code (read-string code-str)]
+     (when-not (list? code)
+       (throw (ex-info (code-str "Invalid function: " code-str)
+                       {:status 400 :error :db/invalid-query})))
+     code)
+   (catch* e
+     (log/warn e "Invalid query function attempted: " code-str)
+     (throw (ex-info (str "Invalid query function: " code-str)
+                     {:status 400 :error :db/invalid-query})))))
 
 (defn variables
   "Returns the set of items within the arbitrary data structure `data` that
@@ -336,7 +336,7 @@
   (reduce-kv (fn [m k v]
                (let [parsed-k (parse-var-name k)]
                  (assoc m parsed-k (parse-bind-function parsed-k v))))
-           {} bind))
+             {} bind))
 
 (defn parse-where-clause
   [clause vars db context]
@@ -384,7 +384,7 @@
 
 (defmethod parse-pattern :bind
   [{:keys [bind]} _vars _db _context]
-  (let [parsed (parse-bind-map bind)
+  (let [parsed  (parse-bind-map bind)
         pattern (where/->pattern :bind parsed)]
     pattern))
 
@@ -401,6 +401,11 @@
   [db context depth s]
   (cond
     (v/variable? s) (-> s parse-var-name select/variable-selector)
+    (v/as-fn? s) (let [parsed-fn  (parse-code s)
+                       fn-name    (some-> parsed-fn second first)
+                       aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+                   (-> parsed-fn (log/debug->val "parsed as code:")
+                       eval/compile (select/as-selector aggregate?)))
     (v/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
     (select-map? s) (let [{:keys [variable selection depth spec]}
                           (parse-subselection db context s depth)]
@@ -493,6 +498,7 @@
 
 (defn parse-query
   [q db]
+  (log/trace "parse-query" q)
   (-> q
       syntax/coerce-query
       (parse-analytical-query db)))
@@ -525,13 +531,13 @@
                  :where where)
           (cond-> (seq values) (assoc :values values))
           (as-> mod
-              (if (update/retract? mod)
-                (update mod :delete parse-update-clause db context)
-                mod))
+                (if (update/retract? mod)
+                  (update mod :delete parse-update-clause db context)
+                  mod))
           (as-> mod
-              (if (update/insert? mod)
-                (update mod :insert parse-update-clause db context)
-                mod))))))
+                (if (update/insert? mod)
+                  (update mod :insert parse-update-clause db context)
+                  mod))))))
 
 (defn parse-modification
   [mdfn db]

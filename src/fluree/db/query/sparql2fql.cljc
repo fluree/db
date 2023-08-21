@@ -1,6 +1,7 @@
-(ns fluree.db.query.sparql-parser
+(ns fluree.db.query.sparql2fql
   (:require #?(:clj [clojure.java.io :as io])
-            #?(:clj  [instaparse.core :as insta]
+            #?(:clj [fluree.db.util.docs :as docs]
+               [instaparse.core :as insta]
                :cljs [instaparse.core :as insta :refer-macros [defparser]])
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
             [clojure.string :as str]
@@ -10,43 +11,6 @@
             #?(:cljs [cljs.tools.reader :refer [read-string]])))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-#?(:cljs (def inline-content (inline-resource "sparql-js.bnf")))
-
-#?(:clj  (def sparql (insta/parser (io/resource "sparql.bnf")))
-   :cljs (defparser sparql inline-content))
-
-
-(def wikidata-prefixes
-  ["<http://www.wikidata.org/entity/>"
-   "<http://www.w3.org/2002/07/owl#>"
-   "<http://www.w3.org/ns/prov#>"
-   "<http://www.bigdata.com/queryHints#>"
-   "<http://www.wikidata.org/prop/novalue/>"
-   "<http://www.wikidata.org/prop/statement/value/>"
-   "<http://www.wikidata.org/prop/qualifier/value/>"
-   "<http://www.w3.org/1999/02/22-rdf-syntax-ns#>"
-   "<http://www.wikidata.org/prop/>"
-   "<http://www.wikidata.org/reference/>"
-   "<http://www.wikidata.org/prop/statement/>"
-   "<http://www.bigdata.com/rdf/search#>"
-   "<http://schema.org/>"
-   "<http://www.wikidata.org/prop/direct/>"
-   "<http://www.wikidata.org/value/>"
-   "<http://www.wikidata.org/wiki/Special:EntityData/>"
-   "<http://www.bigdata.com/rdf/gas#>"
-   "<http://www.wikidata.org/entity/statement/>"
-   "<http://www.bigdata.com/rdf#>"
-   "<http://www.wikidata.org/prop/qualifier/value-normalized/>"
-   "<http://wikiba.se/ontology#>"
-   "<http://www.wikidata.org/prop/reference/value-normalized/>"
-   "<http://www.w3.org/2000/01/rdf-schema#>"
-   "<http://www.wikidata.org/prop/qualifier/>"
-   "<http://www.wikidata.org/prop/statement/value-normalized/>"
-   "<http://www.wikidata.org/prop/reference/value/>"
-   "<http://www.w3.org/2004/02/skos/core#>"
-   "<http://www.wikidata.org/prop/reference/>"
-   "<http://www.w3.org/2001/XMLSchema#>"])
 
 (defn handle-var
   [var-clause]
@@ -75,12 +39,18 @@
         iriref (-> prefix-dec last second handle-iri-ref)]
     {name iriref}))
 
-(defn handle-prefixed-name
+(defn handle-base-dec1
+  "BNF -- IRIREF"
+  [base-dec]
+  (let [iriref (-> base-dec second handle-iri-ref)]
+    {"@base" iriref}))
+
+(defn handle-prefixed-name-v2
   "Returns a source and predicate"
   [prefixed-name]
   (let [name   (str/join prefixed-name)
         [source predicate] (str/split name #":")
-        ;; This is in order to accomodate ISO-8601 formatted clock times in SPARQL.
+        ;; This is in order to accommodate ISO-8601 formatted clock times in SPARQL.
         source (str/replace source ";" ":")]
     (cond (or (= source "fdb") (= source "fd"))
           ["$fdb" predicate]
@@ -103,13 +73,19 @@
           :else
           [source predicate])))
 
+(defn handle-prefixed-name
+  [prefixed-name]
+  (let [prefixed-name-str (str/join prefixed-name)]
+    (log/trace "handling prefixed name:" prefixed-name-str)
+    prefixed-name-str))
+
 (defn handle-iri
-  "Returns a source and predicate.
+  "Returns a predicate.
   BNF -- IRIREF | PrefixedName
 
   IRIREF not currently supported."
   [iri]
-  (condp = (first iri)
+  (case (first iri)
     :PrefixedName (handle-prefixed-name (rest iri))
 
     :IRIREF
@@ -120,6 +96,7 @@
 (defn handle-rdf-literal
   "BNF -- String ( LANGTAG | ( '^^' iri ) )?"
   [rdf-literal]
+  (log/trace "handle-rdf-literal:" rdf-literal)
   (str/join rdf-literal))
 
 (defn handle-numeric-literal
@@ -133,7 +110,7 @@
 
 (defn handle-data-block-value-or-graph-term
   [data-block-value]
-  (condp = (first data-block-value)
+  (case (first data-block-value)
     :NumericLiteral
     (-> data-block-value second handle-boolean-literal)
 
@@ -165,27 +142,20 @@
 
 (defn handle-values
   [values]
-  (condp = (first values)
+  (case (first values)
     :InlineDataOneVar
-    (handle-inline-data-one-var (rest values))
-
-    :else))
-    ;; TODO
-
-
+    (handle-inline-data-one-var (rest values))))
 
 (defn handle-modifiers
   [query modifiers]
   (reduce (fn [q modifier]
-            (condp = (first modifier)
-
+            (case (first modifier)
               :PrettyPrint
               (assoc q :prettyPrint true)
 
               :ValuesClause
               (update q :vars merge (handle-values (second modifier)))
 
-              :else
               (throw (ex-info (str "Unknown modifier. Note: FlureeDB does not support all SPARQL features. Trouble parsing query modifiers: " modifier)
                               {:status 400
                                :error  :db/invalid-query}))))
@@ -194,7 +164,7 @@
 (defn handle-object
   "BNF -- VarOrTerm | TriplesNode"
   [object]
-  (condp = (first object)
+  (case (first object)
     :Var (handle-var (rest object))
 
     :GraphTerm (let [res (handle-data-block-value-or-graph-term (second object))] (if (vector? res) (second res) res))))
@@ -204,7 +174,7 @@
   ([subject predicate object]
    (handle-object-in-property-list-path subject predicate object nil))
   ([subject predicate object source]
-   (condp = (first object)
+   (case (first object)
      ;; Single clause in [ ]
      :ObjectPath (if source
                    [[source subject predicate (handle-object (second object))]]
@@ -218,7 +188,7 @@
                         (rest object))))))
 
 (defn handle-path-primary
-  "Return source and predicate.
+  "Returns a predicate.
   BNF -- iri | 'a' | '!'
   a becomes rdf:type, and ! is not currently supported. "
   [path-primary]
@@ -226,14 +196,14 @@
         (handle-iri (second path-primary))
 
         (= path-primary "a")
-        ["$fdb" "type"]
+        "type"
 
         (= path-primary "!")
         (throw (ex-info (str "! not currently supported as SPARQL predicate.")
                         {:status 400
                          :error  :db/invalid-query}))))
 
-(def supported-path-mod #{"+","*"})
+(def supported-path-mod #{"+" "*"})
 
 (defn handle-path-mod
   [mod]
@@ -246,17 +216,16 @@
       mod-type)))
 
 (defn handle-path-sequence
-  "Returns a predicate name and source.
+  "Returns a predicate name.
   BNF -- PathPrimary PathMod?
   PathMod being - ?, *, +, the only one which we currently support is +
   "
   [path-sequence]
-  (let [[source predicate] (handle-path-primary (-> path-sequence first second))
+  (let [predicate (handle-path-primary (-> path-sequence first second))
         predicate (if-let [mod (second path-sequence)]
-
                     (str predicate (handle-path-mod (rest mod)))
                     predicate)]
-    [source predicate]))
+    predicate))
 
 (defn handle-property-list-path-not-empty
   "Returns an array of where clauses, i.e. [[?s ?p ?o] [?s ?p1 ?o1]]
@@ -264,25 +233,25 @@
   [subject prop-path]
   (loop [[path-item & r] prop-path
          most-recent-pred   nil
-         most-recent-source nil
          clauses            []]
     (if path-item
-      (condp = (first path-item)
+      (case (first path-item)
         :Var (let [predicate   (handle-var (rest path-item))
                    ;; Immediately after a Var, is either an ObjectPath or ObjectList
                    object      (first r)
                    new-r       (rest r)
                    new-clauses (handle-object-in-property-list-path subject predicate object)]
-               (recur new-r predicate most-recent-source (concat clauses new-clauses)))
+               (recur new-r predicate (concat clauses new-clauses)))
 
-        :PathSequence (let [[source predicate] (handle-path-sequence (rest path-item))
+        :PathSequence (let [predicate   (handle-path-sequence (rest path-item))
                             object      (first r)
                             new-r       (rest r)
-                            new-clauses (handle-object-in-property-list-path subject predicate object source)] (recur new-r predicate source (concat clauses new-clauses)))
+                            new-clauses (handle-object-in-property-list-path subject predicate object)]
+                        (recur new-r predicate (concat clauses new-clauses)))
 
         :ObjectPath
-        (recur r most-recent-pred most-recent-source
-               (concat clauses (handle-object-in-property-list-path subject most-recent-pred path-item most-recent-source))))
+        (recur r most-recent-pred
+               (concat clauses (handle-object-in-property-list-path subject most-recent-pred path-item))))
       clauses)))
 
 (defn handle-triples-same-subject-path
@@ -291,7 +260,7 @@
   [same-subject-path]
   (let [subject (handle-var (-> same-subject-path first rest))]
     (reduce (fn [where-arr where-item]
-              (condp = (first where-item)
+              (case (first where-item)
                 :PropertyListPathNotEmpty
                 (concat where-arr (handle-property-list-path-not-empty subject (rest where-item)))))
             [] (drop 1 same-subject-path))))
@@ -300,7 +269,7 @@
   "TriplesSameSubjectPath ( <'.'> TriplesBlock? )?"
   [triples-block]
   (->> (map (fn [triple-item]
-              (condp = (first triple-item)
+              (case (first triple-item)
                 :TriplesBlock
                 (handle-triples-block (rest triple-item))
 
@@ -314,7 +283,7 @@
 (defn handle-iri-or-function
   "BNF -- iri ArgList?"
   [iri-or-function]
-  (map #(condp = (first %)
+  (map #(case (first %)
           :iri (handle-iri (rest %))
           :ArgList (handle-arg-list (rest %)))
        iri-or-function))
@@ -342,7 +311,7 @@
         expressions (map #(-> (handle-expression (rest %)) first) expressions)]
     (str "(" (str/lower-case function) " " (str/join " " expressions) ")")))
 
-;; Listed here so we can easily function we need to support to get to SPARQL 1.1 spec
+;; Listed here so we can easily add functions we need to support to get to SPARQL 1.1 spec
 (def all-functions #{"STR" "LANG" "LANGMATCHES" "DATATYPE" "BOUND"
                      "IRI" "URI" "BNODE" "RAND" "ABS" "CEIL" "FLOOR" "ROUND"
                      "CONCAT" "STRLEN" "UCASE" "LCASE" "ENCODE_FOR_URI" "CONTAINS"
@@ -358,39 +327,47 @@
                           "ABS"       "abs"
                           "CEIL"      "ceil"
                           "FLOOR"     "floor"
-                          "CONCAT"    "groupconcat"
+                          "CONCAT"    "concat"
                           "STRLEN"    "count"
                           "STRSTARTS" "strStarts"
                           "STRENDS"   "strEnds"
-                          "IF"        "if"})
+                          "IF"        "if"
+                          "SHA256"    "sha256"
+                          "SHA512"    "sha512"})
 
 (defn handle-built-in-call
   "BNF is Aggregate or {FUN}( Expression ). Where FUN could be one of 50+ functions.
   There's some other variation possible here, including  functions take a var instead of an expression and other functions can take more than one expression."
   [built-in]
-  (cond (string? (first built-in))
-        (let [function (get supported-functions (first built-in))
-              _        (when-not function
-                         (throw (ex-info "This function is not yet implemented in SPARQL"
-                                         {:status 400
-                                          :error  :db/invalid-query})))
-              args     (-> (handle-arg-list (-> built-in second rest)) flatten)]
-          (str "(" function " " (str/join " " args) ")"))
+  (log/trace "handle-built-in-call:" built-in)
+  (let [fn-name (first built-in)]
+    (cond (string? fn-name)
+          (let [function (get supported-functions fn-name)
+                _        (when-not function
+                           (throw (ex-info (str "The function " fn-name
+                                                " is not yet implemented in SPARQL")
+                                           {:status 400
+                                            :error  :db/invalid-query})))
+                args     (-> built-in second handle-arg-list flatten)]
+            (str "(" function " " (str/join " " args) ")"))
 
-        (= (-> built-in first first) :Aggregate)
-        (handle-aggregate (-> built-in first rest))))
+          (= (-> built-in first first) :Aggregate)
+          (handle-aggregate (-> built-in first rest)))))
 
 (defn handle-multiplicative-expression
   "BNF -- UnaryExpression ( '*' UnaryExpression | '/' UnaryExpression )*"
   [mult-exp]
-  (condp = (first mult-exp)
+  (log/trace "handle-multiplicative-expression:" mult-exp)
+  (case (first mult-exp)
     :BrackettedExpresion (handle-expression (rest mult-exp))
 
     :BuiltInCall (handle-built-in-call (rest mult-exp))
 
     :iriOrFunction (handle-iri-or-function (rest mult-exp))
 
-    :RDFLiteral (handle-rdf-literal (rest mult-exp))
+    ;; TODO: Wrapping this in double quotes works for simple literals.
+    ;;       But we should also support @lang & ^^datatype-iri.
+    :RDFLiteral (str \" (handle-rdf-literal (rest mult-exp)) \")
 
     :NumericLiteral (handle-numeric-literal (second mult-exp))
 
@@ -403,12 +380,14 @@
 (defn handle-numeric-expression
   "BNF -- MultiplicativeExpression ( '+' MultiplicativeExpression | '-' MultiplicativeExpression | ( NumericLiteralPositive | NumericLiteralPositive ) ( ( '*' UnaryExpression ) | ( '/' UnaryExpression ) )* )"
   [num-exp]
+  (log/trace "handle-numeric-expression:" num-exp)
   (loop [exp-group (take 3 num-exp)
          r         (drop 3 num-exp)
          acc       []]
+    (log/trace "handle-numeric-expression exp-group:" exp-group)
     ;; Could be :MultiplicativeExpression, :NumericLiteralPositive,
-    ;; ;NumericLiteralPositive, :UnaryExpression, :UnaryExpression
-    (condp = (count exp-group)
+    ;; :NumericLiteralPositive, :UnaryExpression, :UnaryExpression
+    (case (count exp-group)
       1 (handle-multiplicative-expression (-> exp-group first second))
 
       2 (let [operator (let [op (first exp-group)]
@@ -437,31 +416,38 @@
 
   BNF -- NumericExpression ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' ExpressionList | 'NOT' 'IN' ExpressionList )?"
   [rel-exp]
+  (log/trace "handling relational expression:" rel-exp)
   (let [first-exp  (handle-numeric-expression (-> rel-exp first rest))
+        _          (log/trace "first-exp:" first-exp)
         operator   (when-let [op (second rel-exp)]
                      (if (and op (comparators op))
                        op
                        (throw (ex-info (str "Unrecognized or unsupported opertator. Provided: " op)
                                        {:status 400
                                         :error  :db/invalid-query}))))
+        _          (log/trace "operator:" operator)
         second-exp (when-let [second-exp (and (> (count rel-exp) 1) (nth rel-exp 2))]
                      (handle-numeric-expression (rest second-exp)))]
+    (log/trace "second-exp:" second-exp)
     (if (or operator second-exp)
       (str "(" operator " " first-exp " " second-exp ")")
       first-exp)))
 
-
 (defn handle-expression
   "BNF -- RelationalExpression*"
   [exp]
-  (map (fn [exp]
-         (condp = (first exp)
+  (log/trace "handle-expresion:" exp)
+  (map (fn [exp']
+         (log/trace "handle-expression exp':" exp')
+         (case (first exp')
            :RelationalExpression
-           (handle-relational-expression (rest exp)))) exp))
+           (handle-relational-expression (rest exp'))))
+       exp))
 
 (defn handle-bind
   "Returns bind statement inside [ ], i.e. [{\"bind\": {\"?handle\": \"dsanchez\"}}]"
   [bind]
+  (log/trace "handle-bind:" bind)
   (let [var       (handle-var (-> bind second rest))
         bindValue (-> (handle-expression (-> bind first rest)) first)
         bindValue (if (str/starts-with? bindValue "(") (str "#" bindValue)
@@ -471,16 +457,20 @@
 (defn handle-arg-list
   "BNF -- NIL | 'DISTINCT'? Expression ( Expression )* "
   [arg-list]
-  (map (fn [arg]
-         (cond (= "NIL" arg)
-               nil
+  (log/trace "handle-arg-list:" arg-list)
+  (let [arg-list' (case (first arg-list)
+                    :ExpressionList (rest arg-list)
+                    :Expression [arg-list])]
+    (map (fn [arg]
+           (cond (= "NIL" arg)
+                 nil
 
-               (= "DISTINCT" arg)
-               "DISTINCT"
+                 (= "DISTINCT" arg)
+                 "DISTINCT"
 
-               (= :Expression (first arg))
-               (handle-expression (rest arg))))
-       arg-list))
+                 (= :Expression (first arg))
+                 (handle-expression (rest arg))))
+         arg-list')))
 
 (declare handle-graph-pattern-not-triples)
 
@@ -488,7 +478,7 @@
   "TriplesBlock? ( GraphPatternNotTriples <'.'?> TriplesBlock? )* "
   [where-val]
   (->> (mapv (fn [where-item]
-               (condp = (first where-item)
+               (case (first where-item)
                  :TriplesBlock
                  (handle-triples-block (rest where-item))
 
@@ -500,7 +490,7 @@
 (defn handle-where-clause
   "( SubSelect | GroupGraphPatternSub )"
   [where-clause]
-  (condp = (first where-clause)
+  (case (first where-clause)
     :GroupGraphPatternSub
     (handle-group-graph-pattern-sub (rest where-clause))
 
@@ -512,7 +502,7 @@
 (defn handle-constraint
   "BNF- BrackettedExpression | BuiltInCall | FunctionCall"
   [filter-exp]
-  (condp = (first filter-exp)
+  (case (first filter-exp)
     :BrackettedExpression (-> (handle-expression (-> filter-exp second second vector)) vec)
 
     :BuiltInCall (handle-built-in-call (rest filter-exp))
@@ -533,7 +523,7 @@
 (defn handle-graph-pattern-not-triples
   "BNF -- GroupOrUnionGraphPattern | OptionalGraphPattern | MinusGraphPattern | GraphGraphPattern | ServiceGraphPattern | Filter | Bind | InlineData"
   [not-triples]
-  (condp = (first not-triples)
+  (case (first not-triples)
     :GroupOrUnionGraphPattern
     (handle-group-or-union (rest not-triples))
 
@@ -561,22 +551,22 @@
 (defn handle-group-condition
   "BNF -- BuiltInCall | FunctionCall | Expression ( 'AS' Var )? | Var"
   [group-condition]
-  (condp = (first group-condition)
+  (case (first group-condition)
     :Var (handle-var (rest group-condition))
     :BuiltInCall (throw
+                  (ex-info (str "This format of GroupBy is not currently supported. Provided: "
+                                group-condition)
+                           {:status 400 :error :db/invalid-query}))
+
+    :FunctionCall (throw
                    (ex-info (str "This format of GroupBy is not currently supported. Provided: "
                                  group-condition)
                             {:status 400 :error :db/invalid-query}))
 
-    :FunctionCall (throw
-                    (ex-info (str "This format of GroupBy is not currently supported. Provided: "
-                                  group-condition)
-                             {:status 400 :error :db/invalid-query}))
-
     :Expression (throw
-                  (ex-info (str "This format of GroupBy is not currently supported. Provided: "
-                                group-condition)
-                           {:status 400 :error :db/invalid-query}))))
+                 (ex-info (str "This format of GroupBy is not currently supported. Provided: "
+                               group-condition)
+                          {:status 400 :error :db/invalid-query}))))
 
 (defn handle-order-condition
   "BNF -- ( ( 'ASC' | 'DESC' ) BrackettedExpression ) | ( Constraint | Var )"
@@ -597,9 +587,9 @@
 (defn handle-having-condition
   [having-condition]
   (let [expressions (-> having-condition
-                        second                              ;; skip :Constraint
-                        second                              ;; skip :BrackettedExpression
-                        rest)                               ;; get all :Expression (s)
+                        second ;; skip :Constraint
+                        second ;; skip :BrackettedExpression
+                        rest) ;; get all :Expression (s)
         _           (when (> (count expressions) 1)
                       (throw (ex-info (str "Multiple 'HAVING' expressions in SPARQL not currently supported, please let us know you'd like this supported!")
                                       {:status 400 :error :db/invalid-query})))
@@ -609,7 +599,7 @@
 (defn handle-solution-modifier
   [solution-modifier]
   (reduce (fn [acc modifier]
-            (condp = (first modifier)
+            (case (first modifier)
               :LimitClause (assoc acc :limit (-> modifier second read-string))
               :OffsetClause (assoc acc :offset (-> modifier second read-string))
               :GroupClause (let [group-conditions (-> modifier rest)
@@ -625,6 +615,20 @@
 
 (def supported-select-options #{"DISTINCT" "REDUCED"})
 
+(defn handle-dataset-clause
+  [dataset-clause]
+  (log/trace "handling dataset clause:" dataset-clause)
+  (case (first dataset-clause)
+    :DefaultGraphClause
+    (-> dataset-clause rest str/join)
+
+    :NamedGraphClause
+    (throw (ex-info (str "SPARQL named graphs are not yet supported in Fluree. "
+                         "See here for additional details: "
+                         docs/error-codes-page "#query-sparql-no-named-graphs")
+                    {:status 400
+                     :error  :db/invalid-query}))))
+
 (defn handle-select
   [query select]
   (loop [query query
@@ -638,13 +642,16 @@
       (let [[q r] (if (string? item)
                     [(assoc query :selectKey (keyword (str "select" (str/capitalize item)))) r]
 
-                    (condp = (first item)
+                    (case (first item)
                       :Var
                       [(update query :select concat [(handle-var (rest item))]) r]
 
                       :Expression
-                      (let [exp      (-> (handle-expression (rest item)) first)
+                      (let [_        (log/trace "handle-select expression:" item)
+                            exp      (-> item rest handle-expression first)
+                            _        (log/trace "handle-select exp:" exp)
                             next-as? (= "AS" (first r))
+                            _        (log/trace "handle-select r:" r)
                             [exp r] (if next-as?
                                       [(str "(as " exp " " (handle-var (-> r second rest)) ")") (drop 2 r)]
                                       [exp r])]
@@ -654,26 +661,40 @@
                       [(assoc query :where (vec (handle-where-clause (second item)))) r]
 
                       :SolutionModifier
-                      [(merge query (handle-solution-modifier (rest item))) r]))]
+                      [(merge query (handle-solution-modifier (rest item))) r]
+
+                      :DatasetClause
+                      [(assoc query :from (handle-dataset-clause (rest item))) r]))]
         (recur q r)))))
 
 (defn handle-prologue
   "BNF -- ( BaseDec1 | PrefixDec1 )*"
   [prologue]
   (reduce (fn [acc pro]
-            (condp = (first pro)
-              :BaseDec1 (throw (ex-info (str "Base URIs not currently supported in SPARQL implementation. Provided: " (rest pro))
-                                        {:status 400 :error :db/invalid-query}))
+            (case (first pro)
+              :BaseDec1
+              (merge acc (handle-base-dec1 (rest pro)))
+              #_(throw (ex-info (str "Base URIs not currently supported in SPARQL implementation. Provided: " (rest pro))
+                                {:status 400 :error :db/invalid-query}))
 
-              :PrefixDec1 (merge acc (handle-prefix-dec1 (rest pro)))))
+              :PrefixDec1
+              (merge acc (handle-prefix-dec1 (rest pro)))))
           {} prologue))
 
-(defn sparql-parsed->analytical
+(defn assoc-if
+  [pred m & kvs]
+  (if pred
+    (apply assoc m kvs)
+    m))
+
+(defn parsed->fql
   [parsed]
   (reduce (fn [query top-level]
-            (condp = (first top-level)
-
-              :Prologue (assoc query :prefixes (handle-prologue (rest top-level)))
+            (case (first top-level)
+              :Prologue
+              (let [prologue (rest top-level)]
+                (assoc-if (seq prologue)
+                  query :context (handle-prologue prologue)))
 
               :Modifiers
               (when valid-modifiers?
@@ -682,17 +703,7 @@
               :SelectQuery
               (handle-select query (rest top-level))
 
-              :else
               (throw (ex-info (str "Improperly formatted SPARQL query. Note: FlureeDB does not support all SPARQL features. Trouble parsing: " (first top-level))
                               {:status 400
-                               :error  :db/invalid-query})))) {} parsed))
-
-
-(defn sparql-to-ad-hoc
-  [sparql-query]
-  (let [sparql-parsed (sparql sparql-query)
-        _             (if (= instaparse.gll.Failure (type sparql-parsed))
-                        (throw (ex-info (str "Improperly formatted SPARQL query. Note: FlureeDB does not support all SPARQL features. Provided: " sparql-query)
-                                        {:status 400
-                                         :error  :db/invalid-query})))]
-    (sparql-parsed->analytical sparql-parsed)))
+                               :error  :db/invalid-query}))))
+          {} parsed))

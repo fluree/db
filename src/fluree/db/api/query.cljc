@@ -8,6 +8,7 @@
             [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
+            [fluree.db.query.sparql :as sparql]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.policy :as perm]
@@ -95,7 +96,7 @@
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
      (<? (history* db history-query)))))
 
-(defn query
+(defn query-fql
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
   [db query]
@@ -130,3 +131,15 @@
                                    :fuel   (fuel/tally fuel-tracker)}
                                   e)))))
         (<? (fql/query db** query*))))))
+
+(defn query-sparql
+  [db query]
+  (go-try
+    (let [fql (sparql/->fql query)]
+      (<? (query-fql db fql)))))
+
+(defn query
+  [db query {:keys [format] :as _opts}]
+  (case format
+    :fql (query-fql db query)
+    :sparql (query-sparql db query)))
