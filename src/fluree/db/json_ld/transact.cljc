@@ -112,8 +112,8 @@
 
 (defn add-property2
   "Adds property. Parameters"
-  [sid pid p-shapes check-retracts? list? {:keys [value] :as v-map}
-   {:keys [t db-before] :as tx-state}]
+  [sid pid shape->p-shapes check-retracts? list? {:keys [value] :as v-map}
+   {:keys [t db-before subj-mods] :as tx-state}]
   (go-try
     (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
                         (->> (<? (query-range/index-range db-before :spot = [sid pid]))
@@ -121,8 +121,9 @@
           m           (when list?
                         {:i (-> v-map :idx last)})
 
-          shacl-dt    (->> (filter :datatype p-shapes)
-                           (map :datatype)
+          shacl-dt    (->> (vals shape->p-shapes)
+                           (mapcat identity)
+                           (keep :datatype)
                            (first))
           flakes      (cond
                         ;; a new node's data is contained, process as another node then link to this one
@@ -138,13 +139,18 @@
                         :else
                         (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
                                         {:status 400 :error :db/invalid-transaction})))
-          [valid? err] (shacl/coalesce-validation-results
-                         (mapv (fn [p-shape]
-                                 (shacl/validate-simple-property-constraints p-shape flakes))
-                               p-shapes))]
+          [valid? err-msg] (shacl/coalesce-validation-results
+                             (mapcat (fn [[shape-id p-shapes]]
+                                       ;; register the validated pid so we can enforce the sh:closed constraint later
+                                       (swap! subj-mods update-in [:shape->validated-properties shape-id]
+                                              (fnil conj #{}) pid)
+                                       ;; do the actual validation
+                                       (mapv (fn [p-shape]
+                                               (shacl/validate-simple-property-constraints p-shape flakes))
+                                             p-shapes))
+                                     shape->p-shapes))]
       (when (not valid?)
-        (throw (ex-info (str "Node did not pass SHACL validation: " v-map)
-                        {:status 400, :error :db/shacl-validation :message err})))
+        (shacl/throw-shacl-exception err-msg))
       (into flakes retractions))))
 
 (defn list-value?
@@ -236,12 +242,13 @@
                          (<? (shacl/targetobject-shapes2 db-before referring-pids)))
           shacl-map   (merge-with into class-shapes pred-shapes)
           shacl-shapes (into class-shapes2 pred-shapes2)
-          pid->p-shapes (reduce (fn [pid->p-shapes {:keys [advanced-validation] :as shape}]
-                                        (if advanced-validation
-                                          (merge-with into pid->p-shapes advanced-validation)
-                                          pid->p-shapes))
-                                      {}
-                                      shacl-shapes)
+
+          pid->shape->p-shapes (reduce (fn [pid->shape->p-shapes {:keys [advanced-validation] :as shape}]
+                                         (if advanced-validation
+                                           (merge-with merge pid->shape->p-shapes advanced-validation)
+                                           pid->shape->p-shapes))
+                                       {}
+                                       shacl-shapes)
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
                          id)
@@ -251,6 +258,7 @@
       ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
       (register-node subj-mods node sid {:iri-only? (iri-only? node)
                                          :shacl     shacl-map
+                                         :shacl2    shacl-shapes
                                          :new?      new-subj?
                                          :classes   classes})
       (loop [[[k v] & r] (dissoc node :id :idx :type)
@@ -275,7 +283,7 @@
                 pid              (or existing-pid
                                      (get jld-ledger/predefined-properties k)
                                      (jld-ledger/generate-new-pid k iris next-pid ref? refs))
-                p-shapes (get pid->p-shapes pid)
+                shape->p-shapes (get pid->shape->p-shapes pid)
                 ;;it's possible the shacl constraint was discovered via a different node,
                 ;; as in `sh:targetObjectsOf`. In that case, the relevant shape would be
                 ;; available in `subj-mods`, rather than in the currently-bound `shacl-map`.
@@ -293,7 +301,7 @@
                                           flakes* subj-flakes]
                                      (if v'
                                        #_(recur r (into flakes* (<? (add-property sid pid datatype-map check-retracts? list? v' tx-state))))
-                                       (recur r (into flakes* (<? (add-property2 sid pid p-shapes check-retracts? list? v' tx-state))))
+                                       (recur r (into flakes* (<? (add-property2 sid pid shape->p-shapes check-retracts? list? v' tx-state))))
                                        flakes*)))]
             (recur r property-flakes* flakes*))
           ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
@@ -420,19 +428,29 @@
 (defn validate-rules
   [{:keys [db-after add] :as staged-map} {:keys [subj-mods] :as _tx-state}]
   (let [subj-mods' @subj-mods
-        root-db    (dbproto/-rootdb db-after)]
+        root-db    (dbproto/-rootdb db-after)
+        {:keys [shape->validated-properties]} subj-mods']
     (go-try
       (loop [[s-flakes & r] (partition-by flake/s add)
              all-classes #{}
              remaining-subj-mods subj-mods']
         (if s-flakes
           (let [sid (flake/s (first s-flakes))
-                {:keys [new? classes shacl]} (get subj-mods' sid)]
-            (when shacl
+                {:keys [new? classes shacl shacl2]} (get subj-mods' sid)]
+            #_(when shacl
               (let [s-flakes* (if new?
                                  s-flakes
                                  (<? (query-range/index-range root-db :spot = [sid])))]
                 (<? (shacl/validate-target shacl root-db s-flakes*))))
+            (when shacl2
+              (let [shacl2* (mapv (fn [shape]
+                                    (update shape :validated-properties (fnil into #{})
+                                            (get shape->validated-properties (:id shape)) ))
+                                  shacl2)
+                    s-flakes* (if new?
+                                s-flakes
+                                (<? (query-range/index-range root-db :spot = [sid])))]
+                (<? (shacl/validate-target2 shacl2* root-db s-flakes*))))
             (recur r (into all-classes classes) (dissoc remaining-subj-mods sid)))
           ;; There may be subjects who need to have rules checked due to the addition
           ;; of a reference, but the subjects themselves were not modified in this txn.
@@ -440,7 +458,7 @@
           ;; We process validation for these remaining subjects here,
           ;; after we have looped through all the `add` flakes.
           (do
-            (loop [[[sid mod] & r] remaining-subj-mods]
+            (loop [[[sid mod] & r] (dissoc remaining-subj-mods :shape->validated-properties)]
               (when sid
                 (let [{:keys [shacl]} mod
                       flakes (<? (query-range/index-range root-db :spot = [sid]))]

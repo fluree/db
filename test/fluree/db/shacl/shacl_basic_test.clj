@@ -87,39 +87,36 @@
           user-query   {:select {'?s [:*]}
                         :where  [['?s :type :ex/User]]}
           db           @(fluree/stage
-                         (fluree/db ledger)
-                         {:id             :ex/UserShape
-                          :type           :sh/NodeShape
-                          :sh/targetClass :ex/User
-                          :sh/property    [{:sh/path     :schema/name
-                                            :sh/datatype :xsd/string}]})
+                          (fluree/db ledger)
+                          {:id             :ex/UserShape
+                           :type           :sh/NodeShape
+                           :sh/targetClass :ex/User
+                           :sh/property    [{:sh/path     :schema/name
+                                             :sh/datatype :xsd/string}]})
           db-ok        @(fluree/stage
-                         db
-                         {:id          :ex/john
-                          :type        :ex/User
-                          :schema/name "John"})
-          ; no :schema/name
-          db-int-name  (try
-                         @(fluree/stage
-                           db
-                           {:id          :ex/john
-                            :type        :ex/User
-                            :schema/name 42})
-                         (catch Exception e e))
-          db-bool-name (try
-                         @(fluree/stage
-                           db
-                           {:id          :ex/john
-                            :type        :ex/User
-                            :schema/name true})
-                         (catch Exception e e))]
+                          db
+                          {:id          :ex/john
+                           :type        :ex/User
+                           :schema/name "John"})
+          ;; no :schema/name
+          db-int-name  @(fluree/stage
+                          db
+                          {:id          :ex/john
+                           :type        :ex/User
+                           :schema/name 42})
+          db-bool-name @(fluree/stage
+                          db
+                          {:id          :ex/john
+                           :type        :ex/User
+                           :schema/name true})
+          ]
       (is (util/exception? db-int-name)
           "Exception, because :schema/name is an integer and not a string.")
-      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+      (is (= "Data type 1 cannot be coerced from provided value: 42."
              (ex-message db-int-name)))
       (is (util/exception? db-bool-name)
           "Exception, because :schema/name is a boolean and not a string.")
-      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+      (is (= "Data type 1 cannot be coerced from provided value: true."
              (ex-message db-bool-name)))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
@@ -752,15 +749,15 @@
              (ex-message db-too-short-str)))
       (is (util/exception? db-too-long-str)
           "Exception, because :schema/name is longer than maximum string length")
-      (is (= "SHACL PropertyShape exception - sh:maxLength: value Jean-Claudehas string length larger than 10 or it is not a literal value."
+      (is (= "SHACL PropertyShape exception - sh:maxLength: value Jean-Claude has string length larger than 10 or it is not a literal value."
              (ex-message db-too-long-str)))
       (is (util/exception? db-too-long-non-str)
           "Exception, because :schema/name is longer than maximum string length")
-      (is (= "SHACL PropertyShape exception - sh:maxLength: value 12345678910has string length larger than 10 or it is not a literal value."
+      (is (= "SHACL PropertyShape exception - sh:maxLength: value 12345678910 has string length larger than 10 or it is not a literal value."
              (ex-message db-too-long-non-str)))
       (is (util/exception? db-ref-value)
           "Exception, because :schema/name is not a literal value")
-      (is (= "SHACL PropertyShape exception - sh:maxLength: value 211106232532995has string length larger than 10 or it is not a literal value; sh:minLength: value 211106232532995 has string length smaller than minimum: 4 or it is not a literal value."
+      (is (= "SHACL PropertyShape exception - sh:maxLength: value 211106232532995 has string length larger than 10 or it is not a literal value; sh:minLength: value 211106232532995 has string length smaller than minimum: 4 or it is not a literal value; sh:maxLength: value http://example.org/ns/ref has string length larger than 10 or it is not a literal value."
              (ex-message db-ref-value)))
       (is (= [{:id          :ex/john
                :type    :ex/User
@@ -835,7 +832,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
              (ex-message db-wrong-birth-year)))
       (is (util/exception? db-ref-value)
           "Exception, because :schema/name is not a literal value")
-      (is (= "SHACL PropertyShape exception - sh:pattern: value 211106232532996 does not match pattern \"(19|20)[0-9][0-9]\" or it is not a literal value."
+      (is (= "SHACL PropertyShape exception - sh:pattern: value 211106232532996 does not match pattern \"(19|20)[0-9][0-9]\" or it is not a literal value; sh:pattern: value http://example.org/ns/ref does not match pattern \"(19|20)[0-9][0-9]\" or it is not a literal value."
              (ex-message db-ref-value)))
       (is (= [{:id          :ex/brian
                :type    :ex/User
@@ -922,7 +919,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
-      (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+      (is (= "Data type 1 cannot be coerced from provided value: 42."
              (ex-message db-num-email)))
       (is (= [{:id           :ex/john
                :type     :ex/User
@@ -1306,28 +1303,28 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                (ex-message db-excess-ssn)))))
     ;;TODO: this will not pass until we can enforce datatype constraints
     ;;on triples that have already been created.
-    #_(testing "datatype"
-        (let [conn                @(fluree/connect {:method :memory
-                                                    :defaults
-                                                    {:context test-utils/default-str-context}})
-              ledger              @(fluree/create conn "shacl-target-objects-of-test"
-                                                  {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
-              db1                 @(fluree/stage (fluree/db ledger)
-                                                 [{"@id"                "ex:friendShape"
-                                                   "type"               ["sh:NodeShape"]
-                                                   "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                   "sh:property"        [{"sh:path"     {"@id" "ex:name"}
-                                                                          "sh:datatype" {"@id" "xsd:string"}}]}])
-              db2                 @(fluree/stage db1 [{"id"      "ex:Bob"
-                                                       "ex:name" 123
-                                                       "type"    "ex:User"}])
-              db-forbidden-friend @(fluree/stage db2
-                                                 {"id"        "ex:Alice"
-                                                  "type"      "ex:User"
-                                                  "ex:friend" {"@id" "ex:Bob"}})]
-          (is (util/exception? db-forbidden-friend))
-          (is (= "data type"
-                 (ex-message db-forbidden-friend)))))))
+    (testing "datatype"
+      (let [conn @(fluree/connect {:method :memory
+                                   :defaults
+                                   {:context test-utils/default-str-context}})
+            ledger @(fluree/create conn "shacl-target-objects-of-test"
+                                   {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+            db1 @(fluree/stage (fluree/db ledger)
+                               [{"@id" "ex:friendShape"
+                                 "type" ["sh:NodeShape"]
+                                 "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                 "sh:property" [{"sh:path" {"@id" "ex:name"}
+                                                 "sh:datatype" {"@id" "xsd:string"}}]}])
+            db2 @(fluree/stage db1 [{"id" "ex:Bob"
+                                     "ex:name" 123
+                                     "type" "ex:User"}])
+            db-forbidden-friend @(fluree/stage db2
+                                               {"id" "ex:Alice"
+                                                "type" "ex:User"
+                                                "ex:friend" {"@id" "ex:Bob"}})]
+        (is (util/exception? db-forbidden-friend))
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+               (ex-message db-forbidden-friend)))))))
 
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
@@ -1440,7 +1437,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                        "where" [["?s" "id" "ex:ValidKid"]]})))
       (is (util/exception? invalid-kid))
       (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
-               (ex-message invalid-kid)))))
+             (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn         @(fluree/connect {:method :memory})
           ledger       @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
