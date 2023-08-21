@@ -1394,7 +1394,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
       (is (util/exception? invalid-kid))
       (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
              (ex-message invalid-kid)))))
-  #_(testing "sh:qualifiedValueShape node shape"
+  (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect {:method :memory})
           ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
                                                                            {"ex" "http://example.com/"}]})
@@ -1430,13 +1430,13 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                          "ex:gender" "alien"}]}])]
 
       (is (= [{"id" "ex:ValidKid"
-               "rdf:type" ["ex:Kid"]
+               "type" "ex:Kid"
                "ex:parent" [{"id" "ex:Mom"}
                             {"id" "ex:Dad"}]}]
              @(fluree/query valid-kid {"select" {"?s" ["*"]}
                                        "where" [["?s" "id" "ex:ValidKid"]]})))
       (is (util/exception? invalid-kid))
-      (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
+      (is (= "SHACL PropertyShape exception - sh:pattern: value alien does not match pattern \"female\" or it is not a literal value."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn         @(fluree/connect {:method :memory})
