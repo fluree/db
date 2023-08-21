@@ -20,26 +20,35 @@
 
 (defn avg
   [coll]
-  (/ (sum coll)
-     (count coll)))
+  (let [res (/ (sum coll)
+               (count coll))]
+    (if (ratio? res)
+      (double res)
+      res)))
 
 (defn median
   [coll]
   (let [terms (sort coll)
         size  (count coll)
-        med   (bit-shift-right size 1)]
-    (cond-> (nth terms med)
-      (even? size)
-      (-> (+ (nth terms (dec med)))
-          (/ 2)))))
+        med   (bit-shift-right size 1)
+        res   (cond-> (nth terms med)
+                      (even? size)
+                      (-> (+ (nth terms (dec med)))
+                          (/ 2)))]
+    (if (ratio? res)
+      (double res)
+      res)))
 
 (defn variance
   [coll]
   (let [mean (avg coll)
         sum  (sum (for [x coll
                         :let [delta (- x mean)]]
-                    (* delta delta)))]
-    (/ sum (count coll))))
+                    (* delta delta)))
+        res  (/ sum (count coll))]
+    (if (ratio? res)
+      (double res)
+      res)))
 
 (defn stddev
   [coll]
@@ -106,7 +115,7 @@
 
 (defn now
   []
-  #?(:clj (str (Instant/now))
+  #?(:clj  (str (Instant/now))
      :cljs (.toISOString (js/Date.))))
 
 (defn strStarts
@@ -175,43 +184,43 @@
 (defn year
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getYear ^LocalDateTime datetime)
+    #?(:clj  (.getYear ^LocalDateTime datetime)
        :cljs (.getFullYear datetime))))
 
 (defn month
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getMonthValue ^LocalDateTime datetime)
+    #?(:clj  (.getMonthValue ^LocalDateTime datetime)
        :cljs (.getMonth datetime))))
 
 (defn day
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getDayOfMonth ^LocalDateTime datetime)
+    #?(:clj  (.getDayOfMonth ^LocalDateTime datetime)
        :cljs (.getDate datetime))))
 
 (defn hours
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getHour ^LocalDateTime datetime)
+    #?(:clj  (.getHour ^LocalDateTime datetime)
        :cljs (.getHours datetime))))
 
 (defn minutes
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getMinute ^LocalDateTime datetime)
+    #?(:clj  (.getMinute ^LocalDateTime datetime)
        :cljs (.getMinutes datetime))))
 
 (defn seconds
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getSecond ^LocalDateTime datetime)
+    #?(:clj  (.getSecond ^LocalDateTime datetime)
        :cljs (.getSeconds datetime))))
 
 (defn tz
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.toString (.getOffset ^OffsetDateTime datetime))
+    #?(:clj  (.toString (.getOffset ^OffsetDateTime datetime))
        :cljs (.getTimeZoneOffset datetime))))
 
 (defn sha256
