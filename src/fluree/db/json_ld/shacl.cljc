@@ -554,8 +554,7 @@
          (assoc acc :datatype o)
 
          const/$sh:minCount
-         (cond-> (assoc acc :min-count o)
-           (>= o 1) (assoc :required? true)) ; min-count >= 1 means property is required
+         (assoc acc :min-count o)
 
          const/$sh:maxCount
          (assoc acc :max-count o)
@@ -788,7 +787,7 @@
           base*    (<? (resolve-path-types base db))]
       (cond-> base*
         (:pattern base) (build-pattern)
-        (= p const/$sh:not) (assoc :logical-constraint :not, :required? false)))))
+        (= p const/$sh:not) (assoc :logical-constraint :not)))))
 
 (def optimzable-property-constraints
   #{:min-length
@@ -807,7 +806,7 @@
   [p-shape]
   (let [[[_ path-type] :as tagged-path] (:path p-shape)
         constraints (-> p-shape
-                        (dissoc :path :required? :id)
+                        (dissoc :path :id)
                         (keys)
                         (set))]
     (boolean
