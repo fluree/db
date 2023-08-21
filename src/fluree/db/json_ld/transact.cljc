@@ -481,9 +481,6 @@
        (log/trace "stage flakes:" flakes)
        (<? (flakes->final-db tx-state flakes))))))
 
-
-
-
 (defn stage-ledger
   ([ledger json-ld opts]
    (stage-ledger ledger nil json-ld opts))
