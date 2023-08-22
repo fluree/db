@@ -253,7 +253,7 @@
           [sid (into subj-flakes property-flakes)])))))
 
 (defn ->tx-state
-  [db {:keys [bootstrap? did context-type] :as _opts}]
+  [db {:keys [bootstrap? did context-type txn-context] :as _opts}]
   (let [{:keys [schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
@@ -276,6 +276,7 @@
      :next-sid      (fn [] (vswap! last-sid inc))
      :subj-mods     (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
      :iris          (volatile! {})
+     :txn-context       txn-context
      :shacl-target-objects-of? (shacl/has-target-objects-of-rule? db-before)}))
 
 (defn final-ecount
@@ -349,25 +350,42 @@
   [db]
   (-> db :t zero?))
 
-(defn stage-flakes
-  [{:keys [t] :as db} fuel-tracker tx-state nodes]
+(defn validate-node
+  "Throws if node is invalid, otherwise returns node."
+  [node]
+  (if (empty? (dissoc node :idx :id))
+    (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
+                         (some->> (:id node)
+                                  (str " for @id: "))
+                         ".")
+                    {:status 400 :error :db/invalid-transaction}))
+    node))
+
+(defn insert
+  "Performs insert transaction. Returns async chan with resulting flakes."
+  [{:keys [t] :as db} fuel-tracker json-ld {:keys [default-ctx txn-context] :as tx-state}]
   (go-try
     (let [track-fuel (when fuel-tracker
                        (fuel/track fuel-tracker))
           flakeset   (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
                              (init-db? db) (track-into track-fuel (base-flakes t)))]
-      (loop [[node & r] nodes
+      (loop [[node & r] (util/sequential json-ld)
              flakes flakeset]
         (if node
-          (if (empty? (dissoc node :idx :id))
-            (throw (ex-info (str "Invalid transaction, transaction node contains no properties"
-                                 (some->> (:id node)
-                                          (str " for @id: "))
-                                 ".")
-                            {:status 400 :error :db/invalid-transaction}))
-            (let [[_node-sid node-flakes] (<? (json-ld-node->flakes node tx-state nil))
-                  flakes* (track-into flakes track-fuel node-flakes)]
-              (recur r flakes*)))
+          (let [node*  {"@context" txn-context
+                        "@graph" [node]}
+                [expanded] (json-ld/expand node* default-ctx)
+                flakes* (if (map? expanded)
+                          (let [[_sid node-flakes] (<? (json-ld-node->flakes (validate-node expanded) tx-state nil))]
+                            (track-into flakes track-fuel node-flakes))
+                          ;;node expanded to a list of child nodes
+                          (loop [[child & children] expanded
+                                 all-flakes flakes]
+                            (if child
+                              (let [[_sid child-flakes] (<? (json-ld-node->flakes (validate-node child) tx-state nil))]
+                                (recur children (track-into all-flakes track-fuel child-flakes)))
+                              all-flakes)))]
+            (recur r flakes*))
           flakes)))))
 
 (defn validate-rules
@@ -405,15 +423,6 @@
                 ;; TODO - PropertyShape class is often not specified for sh:property nodes - direct changes to those would not be caught here!
                 (vocab/reset-shapes (:schema db-after)))
               staged-map)))))))
-
-(defn insert
-  "Performs insert transaction. Returns async chan with resulting flakes."
-  [db fuel-tracker json-ld {:keys [default-ctx] :as tx-state}]
-  (log/trace "insert default-ctx:" default-ctx)
-  (let [nodes (-> json-ld
-                  (json-ld/expand default-ctx)
-                  util/sequential)]
-    (stage-flakes db fuel-tracker tx-state nodes)))
 
 (defn into-flakeset
   [fuel-tracker flake-ch]
@@ -476,9 +485,11 @@
   ([ledger json-ld opts]
    (stage-ledger ledger nil json-ld opts))
   ([ledger fuel-tracker json-ld opts]
-   (-> ledger
-       ledger-proto/-db
-       (stage fuel-tracker json-ld opts))))
+   (let [{:keys [defaultContext]} opts
+         db (cond-> (ledger-proto/-db ledger)
+              defaultContext  (dbproto/-default-context-update
+                                defaultContext))]
+     (stage db fuel-tracker json-ld opts))))
 
 (defn transact!
   ([ledger json-ld opts]

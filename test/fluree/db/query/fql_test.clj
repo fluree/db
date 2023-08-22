@@ -208,20 +208,18 @@
                                                                 "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
                                                                 "schema" "http://schema.org/",
                                                                 "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
-        love (let [ledger @(fluree/create conn "test/love")]
-               @(fluree/transact! ledger
-                                  [{"@id"                "ex:fluree",
-                                    "@type"              "schema:Organization",
-                                    "schema:description" "We ❤️ Data"}
-                                   {"@id"                "ex:w3c",
-                                    "@type"              "schema:Organization",
-                                    "schema:description" "We ❤️ Internet"}
-                                   {"@id"                "ex:mosquitos",
-                                    "@type"              "ex:Monster",
-                                    "schema:description" "We ❤️ Human Blood"}]
-                                  {})
-               ledger)
-        db   (fluree/db love)]
+        ledger @(fluree/create conn "test/love")
+        db @(fluree/stage     (fluree/db ledger)
+                              [{"@id"                "ex:fluree",
+                                "@type"              "schema:Organization",
+                                "schema:description" "We ❤️ Data"}
+                               {"@id"                "ex:w3c",
+                                "@type"              "schema:Organization",
+                                "schema:description" "We ❤️ Internet"}
+                               {"@id"                "ex:mosquitos",
+                                "@type"              "ex:Monster",
+                                "schema:description" "We ❤️ Human Blood"}]
+                              {})]
     (testing "subject-object scans"
       (let [q '{:select [?s ?p ?o]
                 :where [[?s "schema:description" ?o]

@@ -16,6 +16,7 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
+            [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
@@ -238,10 +239,19 @@
      (ledger-proto/-commit! ledger db opts))))
 
 (defn transact!
-  "Stages and commits the transaction `json-ld` to the specified `ledger`"
-  [ledger json-ld opts]
+  "Expects a conn and json-ld document containing at least the following keys:
+  `@id`: the id of the ledger to transact to
+  `@graph`: the data to be transacted
+
+  Loads the specified ledger and peforms stage and commit! operations.
+  Returns the new db.
+
+  Note: Loading the ledger results in a new ledger object, so references to existing
+  ledger objects will be rendered stale. To obtain a ledger with the new changes,
+  call `load` on the ledger alias."
+  [conn json-ld opts]
   (promise-wrap
-    (transact-api/transact! ledger json-ld opts)))
+    (transact-api/transact! conn json-ld opts)))
 
 (defn status
   "Returns current status of ledger branch."
