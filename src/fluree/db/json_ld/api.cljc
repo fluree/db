@@ -309,9 +309,9 @@
 
 
 (defn query
-  ([db query] (query db query {:format :fql}))
-  ([db query opts]
-   (promise-wrap (query-api/query db query opts))))
+  ([db q] (query db q {:format :fql}))
+  ([db q opts]
+   (promise-wrap (query-api/query db q opts))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
