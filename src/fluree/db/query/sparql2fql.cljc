@@ -288,7 +288,7 @@
                      "DAY" "HOURS" "MINUTES" "SECONDS" "TIMEZONE" "TZ" "NOW"
                      "UUID" "STRUUID" "MD5" "SHA1" "SHA256" "SHA384" "SHA512"
                      "COALESCE" "IF" "STRLANG" "STRDT" "sameTerm" "isIRI" "isURI"
-                     "isBLANK" "isLITERAL" "isNUMERIC"})
+                     "isBLANK" "isLITERAL" "isNUMERIC" "MAX" "MIN"})
 
 (def supported-functions {"COALESCE"  "coalesce"
                           "STR"       "str"
@@ -302,7 +302,9 @@
                           "STRENDS"   "strEnds"
                           "IF"        "if"
                           "SHA256"    "sha256"
-                          "SHA512"    "sha512"})
+                          "SHA512"    "sha512"
+                          "MAX"       "max"
+                          "MIN"       "min"})
 
 (defn handle-built-in-call
   "BNF is Aggregate or {FUN}( Expression ). Where FUN could be one of 50+ functions.
@@ -608,7 +610,13 @@
               (dissoc :selectKey))
           q))
       (let [[q r] (if (string? item)
-                    [(assoc query :selectKey (keyword (str "select" (str/capitalize item)))) r]
+                    (if (= "*" item)
+                      [(-> query
+                           (assoc :selectKey :select)
+                           (update :select conj "*")) r]
+                      [(assoc query
+                         :selectKey
+                         (keyword (str "select" (str/capitalize item)))) r])
 
                     (case (first item)
                       :Var
@@ -639,8 +647,6 @@
             (case (first pro)
               :BaseDec1
               (merge acc (handle-base-dec1 (rest pro)))
-              #_(throw (ex-info (str "Base URIs not currently supported in SPARQL implementation. Provided: " (rest pro))
-                                {:status 400 :error :db/invalid-query}))
 
               :PrefixDec1
               (merge acc (handle-prefix-dec1 (rest pro)))))
