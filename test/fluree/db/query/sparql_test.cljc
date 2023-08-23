@@ -129,43 +129,11 @@
     (let [query "SELECT ?person ?handle\nWHERE {\n BIND (\"dsanchez\" AS ?handle)\n  ?person person:handle ?handle.\n}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{:bind {"?handle" "dsanchez"}}
-              ["?person" "person/handle" "?handle"]]
-             where)))
-    (let [query "SELECT ?hash\nWHERE {\n  ?s fdb:_block/number ?bNum.\n  BIND (MAX(?bNum) AS ?maxBlock)\n  ?s fdb:_block/number ?maxBlock.\n  ?s fdb:_block/hash ?hash.\n}"
-          {:keys [where]} (sparql/->fql query)]
-      (is (= [["?s" "_block/number" "?bNum"]
-              {:bind {"?maxBlock" "#(max ?bNum)"}}
-              ["?s" "_block/number" "?maxBlock"]
-              ["?s" "_block/hash" "?hash"]]
+              ["?person" "person:handle" "?handle"]]
              where))))
 
   ;;TODO: not yet supported
   #_(testing "language labels"))
-
-
-;; TODO: Probably delete; likely no longer relevant in v3
-#_(deftest parse-sources
-    (testing "wikidata, current fluree"
-      (let [query "SELECT ?movie ?title\nWHERE {\n  ?user  fdb:person/favMovies ?movie.\n ?movie fdb:movie/title ?title.\n ?wdMovie wd:?label ?title;\n wdt:P840 ?narrative_location;\n wdt:P31 wd:Q11424.\n ?user fdb:person/handle ?handle.\n \n}\n" {:keys [where]} (sparql/->fql query)]
-        (is (= ["$fdb" "$fdb" "$wd" "$wd" "$wd" "$fdb"]
-               (mapv first where)))))
-    (testing "fullText"
-      (let [query "SELECT ?person\nWHERE {\n  ?person fullText:person/handle \"jdoe\".\n}"
-            {:keys [where]} (sparql/->fql query)]
-        (is (= ["$fdb"]
-               (mapv first where)))))
-    (testing "fluree blocks"
-      (let [query "SELECT ?nums\nWHERE {\n ?person fd4:person/handle \"zsmith\";\n fd4:person/favNums ?nums;\n fd5:person/favNums  ?nums.\n}"
-            {:keys [where]} (sparql/->fql query)]
-        (is (= ["$fdb4" "$fdb4" "$fdb5"]
-               (mapv first where)))))
-    (testing "external"
-      (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>\nSELECT ?name ?mbox\n WHERE {\n ?x foaf:name ?name.\n?x foaf:mbox ?mbox\n}"
-            {:keys [prefixes where]} (sparql/->fql query)]
-        (is (= {:foaf "http://xmlns.com/foaf/0.1/"}
-               prefixes))
-        (is (= ["foaf" "foaf"]
-               (mapv first where))))))
 
 (deftest parse-modifiers
   (testing "LIMIT"
