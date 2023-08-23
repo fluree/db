@@ -258,13 +258,37 @@
        iri-or-function))
 
 ;; Not part of analytical queries, but part of SPARQL spec: GROUP_CONCAT
-(def supported-aggregates #{"COUNT" "SUM" "MIN" "MAX" "AVG" "SAMPLE"})
+(def supported-scalar-functions {"COALESCE"  "coalesce"
+                                 "STR"       "str"
+                                 "RAND"      "rand"
+                                 "ABS"       "abs"
+                                 "CEIL"      "ceil"
+                                 "FLOOR"     "floor"
+                                 "CONCAT"    "concat"
+                                 "STRLEN"    "count"
+                                 "STRSTARTS" "strStarts"
+                                 "STRENDS"   "strEnds"
+                                 "IF"        "if"
+                                 "SHA256"    "sha256"
+                                 "SHA512"    "sha512"})
+
+(def supported-aggregate-functions {"MAX"       "max"
+                                    "MIN"       "min"
+                                    "SAMPLE"    "sample1"
+                                    "COUNT"     "count"
+                                    "SUM"       "sum"
+                                    "AVG"       "avg"})
 
 (defn handle-aggregate
   [aggregate]
-  (let [function    (supported-aggregates (first aggregate))
+  (let [function    (get supported-aggregate-functions (first aggregate))
+        _           (when-not function
+                      (throw (ex-info (str "The function " function
+                                           " is not yet implemented in SPARQL")
+                                      {:status 400
+                                       :error  :db/invalid-query})))
         distinct?   (and (string? (second aggregate)) (= "DISTINCT" (second aggregate)))
-        function    (cond (and distinct? (= function "COUNT"))
+        function    (cond (and distinct? (= function "count"))
                           "count-distinct"
 
                           ;; TODO
@@ -278,33 +302,7 @@
                       (drop 2 aggregate)
                       (drop 1 aggregate))
         expressions (map #(-> (handle-expression (rest %)) first) expressions)]
-    (str "(" (str/lower-case function) " " (str/join " " expressions) ")")))
-
-;; Listed here so we can easily add functions we need to support to get to SPARQL 1.1 spec
-(def all-functions #{"STR" "LANG" "LANGMATCHES" "DATATYPE" "BOUND"
-                     "IRI" "URI" "BNODE" "RAND" "ABS" "CEIL" "FLOOR" "ROUND"
-                     "CONCAT" "STRLEN" "UCASE" "LCASE" "ENCODE_FOR_URI" "CONTAINS"
-                     "STRSTARTS" "STRENDS" "STRBEFORE" "STRAFTER" "YEAR" "MONTH"
-                     "DAY" "HOURS" "MINUTES" "SECONDS" "TIMEZONE" "TZ" "NOW"
-                     "UUID" "STRUUID" "MD5" "SHA1" "SHA256" "SHA384" "SHA512"
-                     "COALESCE" "IF" "STRLANG" "STRDT" "sameTerm" "isIRI" "isURI"
-                     "isBLANK" "isLITERAL" "isNUMERIC" "MAX" "MIN"})
-
-(def supported-functions {"COALESCE"  "coalesce"
-                          "STR"       "str"
-                          "RAND"      "rand"
-                          "ABS"       "abs"
-                          "CEIL"      "ceil"
-                          "FLOOR"     "floor"
-                          "CONCAT"    "concat"
-                          "STRLEN"    "count"
-                          "STRSTARTS" "strStarts"
-                          "STRENDS"   "strEnds"
-                          "IF"        "if"
-                          "SHA256"    "sha256"
-                          "SHA512"    "sha512"
-                          "MAX"       "max"
-                          "MIN"       "min"})
+    (str "(" function " " (str/join " " expressions) ")")))
 
 (defn handle-built-in-call
   "BNF is Aggregate or {FUN}( Expression ). Where FUN could be one of 50+ functions.
@@ -313,7 +311,7 @@
   (log/trace "handle-built-in-call:" built-in)
   (let [fn-name (first built-in)]
     (cond (string? fn-name)
-          (let [function (get supported-functions fn-name)
+          (let [function (get supported-scalar-functions fn-name)
                 _        (when-not function
                            (throw (ex-info (str "The function " fn-name
                                                 " is not yet implemented in SPARQL")

@@ -92,9 +92,13 @@
        (take n)
        vec))
 
+(defn sample1
+  [coll]
+  (->> coll (sample 1) first))
+
 (def allowed-aggregate-fns
   '#{avg ceil count count-distinct distinct floor groupconcat
-     median max min rand sample stddev str sum variance})
+     median max min rand sample sample1 stddev str sum variance})
 
 (defmacro coalesce
   "Evaluates args in order. The result of the first arg not to return error gets returned."
@@ -307,6 +311,7 @@
     replace     fluree.db.query.exec.eval/replace
     round       clojure.math/round
     sample      fluree.db.query.exec.eval/sample
+    sample1     fluree.db.query.exec.eval/sample1
     stddev      fluree.db.query.exec.eval/stddev
     strAfter    fluree.db.query.exec.eval/strAfter
     strBefore   fluree.db.query.exec.eval/strBefore

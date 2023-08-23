@@ -405,6 +405,19 @@
                    [[0 3 5 6 7 8 9] 5.428571428571429 "ex:jbob" "jbob" 9]
                    [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
                   results))))
+       (testing "COUNT query works"
+         (let [query   "SELECT (COUNT(?favNums) AS ?numFavs)
+                        WHERE {?person person:favNums ?favNums.}
+                        GROUP BY ?person"
+               results @(fluree/query db query {:format :sparql})]
+           (is (= [[7] [4] [1]]
+                  results))))
+       (testing "SAMPLE query works"
+         (let [query   "SELECT (SAMPLE(?favNums) AS ?favNum)
+                        WHERE {?person person:favNums ?favNums.}
+                        GROUP BY ?person"
+               results @(fluree/query db query {:format :sparql})]
+           (is (every? #(-> % first integer?) results))))
 
        ;; TODO: Make these tests pass
 
