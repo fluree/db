@@ -1,12 +1,9 @@
 (ns fluree.db.query.sparql2fql
-  (:require #?(:clj [clojure.java.io :as io])
-            #?(:clj [fluree.db.util.docs :as docs]
-               [instaparse.core :as insta]
-               :cljs [instaparse.core :as insta :refer-macros [defparser]])
+  (:require [fluree.db.util.docs :as docs]
             #?(:cljs [fluree.db.util.cljs-shim :refer-macros [inline-resource]])
             [clojure.string :as str]
+            [#?(:clj clojure.edn :cljs cljs.reader) :as edn]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.util.core :as util]
             [clojure.set :as set]
             #?(:cljs [cljs.tools.reader :refer [read-string]])))
 
@@ -48,7 +45,7 @@
 (defn handle-prefixed-name
   [prefixed-name]
   (let [prefixed-name-str (str/join prefixed-name)]
-    (log/trace "handling prefixed name:" prefixed-name-str)
+    (log/trace "handle-prefixed-name:" prefixed-name-str)
     prefixed-name-str))
 
 (defn handle-iri
@@ -204,8 +201,8 @@
   BNF -- ( Path | Var ) ObjectPath ( ( ( Path | Simple ) ObjectList )? )* "
   [subject prop-path]
   (loop [[path-item & r] prop-path
-         most-recent-pred   nil
-         clauses            []]
+         most-recent-pred nil
+         clauses          []]
     (if path-item
       (case (first path-item)
         :Var (let [predicate   (handle-var (rest path-item))
@@ -356,7 +353,6 @@
   (loop [exp-group (take 3 num-exp)
          r         (drop 3 num-exp)
          acc       []]
-    (log/trace "handle-numeric-expression exp-group:" exp-group)
     ;; Could be :MultiplicativeExpression, :NumericLiteralPositive,
     ;; :NumericLiteralPositive, :UnaryExpression, :UnaryExpression
     (case (count exp-group)
@@ -388,19 +384,16 @@
 
   BNF -- NumericExpression ( '=' NumericExpression | '!=' NumericExpression | '<' NumericExpression | '>' NumericExpression | '<=' NumericExpression | '>=' NumericExpression | 'IN' ExpressionList | 'NOT' 'IN' ExpressionList )?"
   [rel-exp]
-  (log/trace "handling relational expression:" rel-exp)
+  (log/trace "handle-relational-expression:" rel-exp)
   (let [first-exp  (handle-numeric-expression (-> rel-exp first rest))
-        _          (log/trace "first-exp:" first-exp)
         operator   (when-let [op (second rel-exp)]
                      (if (and op (comparators op))
                        op
                        (throw (ex-info (str "Unrecognized or unsupported opertator. Provided: " op)
                                        {:status 400
                                         :error  :db/invalid-query}))))
-        _          (log/trace "operator:" operator)
         second-exp (when-let [second-exp (and (> (count rel-exp) 1) (nth rel-exp 2))]
                      (handle-numeric-expression (rest second-exp)))]
-    (log/trace "second-exp:" second-exp)
     (if (or operator second-exp)
       (str "(" operator " " first-exp " " second-exp ")")
       first-exp)))
@@ -408,9 +401,8 @@
 (defn handle-expression
   "BNF -- RelationalExpression*"
   [exp]
-  (log/trace "handle-expresion:" exp)
+  (log/trace "handle-expression:" exp)
   (map (fn [exp']
-         (log/trace "handle-expression exp':" exp')
          (case (first exp')
            :RelationalExpression
            (handle-relational-expression (rest exp'))))
@@ -589,7 +581,7 @@
 
 (defn handle-dataset-clause
   [dataset-clause]
-  (log/trace "handling dataset clause:" dataset-clause)
+  (log/trace "handle-dataset-clause:" dataset-clause)
   (case (first dataset-clause)
     :DefaultGraphClause
     (-> dataset-clause rest str/join)
@@ -619,11 +611,8 @@
                       [(update query :select concat [(handle-var (rest item))]) r]
 
                       :Expression
-                      (let [_        (log/trace "handle-select expression:" item)
-                            exp      (-> item rest handle-expression first)
-                            _        (log/trace "handle-select exp:" exp)
+                      (let [exp      (-> item rest handle-expression first)
                             next-as? (= "AS" (first r))
-                            _        (log/trace "handle-select r:" r)
                             [exp r] (if next-as?
                                       [(str "(as " exp " " (handle-var (-> r second rest)) ")") (drop 2 r)]
                                       [exp r])]
