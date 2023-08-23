@@ -303,15 +303,15 @@
                     deref)]
        (testing "basic query works"
          (let [query   "SELECT ?person ?fullName
-                     WHERE {?person person:handle \"jdoe\".
-                            ?person person:fullName ?fullName.}"
+                        WHERE {?person person:handle \"jdoe\".
+                               ?person person:fullName ?fullName.}"
                results @(fluree/query db query {:format :sparql})]
            (is (= [["ex:jdoe" "Jane Doe"]]
                   results))))
        (testing "basic query w/ OPTIONAL works"
          (let [query   "SELECT ?person ?favNums
-                     WHERE {?person person:handle ?handle.
-                            OPTIONAL{?person person:favNums ?favNums.}}"
+                        WHERE {?person person:handle ?handle.
+                               OPTIONAL{?person person:favNums ?favNums.}}"
                results @(fluree/query db query {:format :sparql})]
            (is (= [["ex:bbob" 23]
                    ["ex:fbueller" nil]
@@ -329,9 +329,9 @@
                   results))))
        (testing "basic query w/ GROUP BY & OPTIONAL works"
          (let [query   "SELECT ?person ?favNums
-                     WHERE {?person person:handle ?handle.
-                            OPTIONAL{?person person:favNums ?favNums.}}
-                     GROUP BY ?person"
+                        WHERE {?person person:handle ?handle.
+                               OPTIONAL{?person person:favNums ?favNums.}}
+                        GROUP BY ?person"
                results @(fluree/query db query {:format :sparql})]
            (is (= [["ex:bbob" [23]]
                    ["ex:fbueller" nil]
@@ -340,9 +340,9 @@
                   results))))
        (testing "basic query w/ omitted subjects works"
          (let [query   "SELECT ?person ?fullName ?favNums
-                     WHERE {?person person:handle \"jdoe\";
-                                    person:fullName ?fullName;
-                                    person:favNums ?favNums.}"
+                        WHERE {?person person:handle \"jdoe\";
+                                       person:fullName ?fullName;
+                                       person:favNums ?favNums.}"
                results @(fluree/query db query {:format :sparql})]
            (is (= [["ex:jdoe" "Jane Doe" 3]
                    ["ex:jdoe" "Jane Doe" 7]
@@ -351,7 +351,7 @@
                   results))))
        (testing "scalar fn query works"
          (let [query   "SELECT (SHA512(?handle) AS ?handleHash)
-                     WHERE {?person person:handle ?handle.}"
+                        WHERE {?person person:handle ?handle.}"
                results @(fluree/query db query {:format :sparql})]
            (is (= [["f162b1f2b3a824f459164fe40ffc24a019993058061ca1bf90eca98a4652f98ccaa5f17496be3da45ce30a1f79f45d82d8b8b532c264d4455babc1359aaa461d"]
                    ["eca2f5ab92fddbf2b1c51a60f5269086ce2415cb37964a05ae8a0b999625a8a50df876e97d34735ebae3fa3abb088fca005a596312fdf3326c4e73338f4c8c90"]
@@ -367,22 +367,22 @@
                   results))))
        (testing "aggregate fn w/ GROUP BY query works"
          (let [query   "SELECT (AVG(?favNums) AS ?avgFav)
-                     WHERE {?person person:favNums ?favNums.}
-                     GROUP BY ?person"
+                        WHERE {?person person:favNums ?favNums.}
+                        GROUP BY ?person"
                results @(fluree/query db query {:format :sparql})]
            (is (= [[5.428571428571429] [37.75] [23]]
                   results))))
        (testing "aggregate fn w/ GROUP BY ... HAVING query works"
          (let [query   "SELECT (AVG(?favNums) AS ?avgFav)
-                     WHERE {?person person:favNums ?favNums.}
-                     GROUP BY ?person HAVING(AVG(?favNums) > 10)"
+                        WHERE {?person person:favNums ?favNums.}
+                        GROUP BY ?person HAVING(AVG(?favNums) > 10)"
                results @(fluree/query db query {:format :sparql})]
            (is (= [[37.75] [23]]
                   results))))
        (testing "multi-arg fn query works"
          (let [query   "SELECT (CONCAT(?handle, '-', ?fullName) AS ?hfn)
-                     WHERE {?person person:handle ?handle.
-                            ?person person:fullName ?fullName.}"
+                        WHERE {?person person:handle ?handle.
+                               ?person person:fullName ?fullName.}"
                results @(fluree/query db query {:format :sparql})]
            (is (= [["bbob-Billy Bob"]
                    ["dankeshön-Ferris Bueller"]
@@ -419,8 +419,8 @@
        ;; Language tags aren't supported yet (even in the BNF)
        #_(testing "fn w/ langtag string arg query works"
            (let [query   "SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
-                     WHERE {?person person:handle ?handle.
-                            ?person person:fullName ?fullName.}"
+                        WHERE {?person person:handle ?handle.
+                               ?person person:fullName ?fullName.}"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [["Billy Bob's handle is bbob"]
                      ["Jane Doe's handle is jdoe"]]
@@ -431,8 +431,8 @@
        ;; it all into a :select map of {?var1 ["*"], ?var2 ["*"], ...}
        #_(testing "SELECT * query works"
            (let [query   "SELECT *
-                       WHERE {?person person:handle \"jdoe\".
-                              ?person person:fullName ?fullName.}"
+                          WHERE {?person person:handle \"jdoe\".
+                                 ?person person:fullName ?fullName.}"
                  results @(fluree/query db query {:format :sparql})]
              (is (= [["ex:jdoe" "Jane Doe"]]
                     results)))))))
