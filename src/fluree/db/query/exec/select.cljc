@@ -46,6 +46,13 @@
   (format-value [fmt db iri-cache context compact error-ch solution]
    "Formats a where search solution (map of pattern matches) by extracting and displaying relevant pattern matches."))
 
+;; This exists because many different types of data structures in :select
+;; clauses get implicit-grouping? called on them. So this defaults them to false.
+(extend-type #?(:clj Object :cljs object) ; https://cljs.github.io/api/cljs.core/extend-type
+  ValueSelector
+  (implicit-grouping? [_] false)
+  (format-value [_ _ _ _ _ _ _] nil))
+
 (defprotocol SolutionModifier
   (update-solution [this solution]))
 
