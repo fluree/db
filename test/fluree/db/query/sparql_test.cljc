@@ -6,50 +6,62 @@
    [fluree.db.test-utils :as test-utils]
    [fluree.db.json-ld.api :as fluree]))
 
-
 (deftest parse-select
   (testing "basic SELECT"
-    (let [query "SELECT ?person \n WHERE {\n ?person person:handle \"jdoe\".\n}"
+    (let [query "SELECT ?person
+                 WHERE {?person person:handle \"jdoe\".}"
           {:keys [select]} (sparql/->fql query)]
       (is (= ["?person"]
              select)))
-    (let [query "SELECT ?person ?nums\n WHERE {\n ?person person:favNums ?nums.\n}"
+    (let [query "SELECT ?person ?nums
+                 WHERE {?person person:favNums ?nums.}"
           {:keys [select]} (sparql/->fql query)]
       (is (= ["?person" "?nums"]
              select))))
   (testing "aggregates"
     (testing "AVG"
-      (let [query "SELECT (AVG(?favNums) AS ?nums)\n WHERE {\n ?person person:favNums ?favNums.\n}\n"
+      (let [query "SELECT (AVG(?favNums) AS ?nums)
+                   WHERE {?person person:favNums ?favNums.}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["(as (avg ?favNums) ?nums)"]
                select))))
     (testing "COUNT"
-      (let [query "SELECT (COUNT(?friends) AS ?friends)\n WHERE {\n ?friends person:friendsWith \"jdoe\".\n}\n"
+      (let [query "SELECT (COUNT(?friends) AS ?friends)
+                   WHERE {?friends person:friendsWith \"jdoe\".}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["(as (count ?friends) ?friends)"]
                select))))
     (testing "COUNT DISTINCT"
-      (let [query "SELECT (COUNT(DISTINCT ?handle) AS ?handles)\n WHERE {\n ?person person:handle ?handle.\n}\n"
+      (let [query "SELECT (COUNT(DISTINCT ?handle) AS ?handles)
+                   WHERE {?person person:handle ?handle.}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["(as (count-distinct ?handle) ?handles)"]
                select))))
     (testing "MAX"
-      (let [query "SELECT ?fullName (MAX(?favNums) AS ?max)\n WHERE {\n ?person person:favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
+      (let [query "SELECT ?fullName (MAX(?favNums) AS ?max)
+                   WHERE {?person person:favNums ?favNums.
+                          ?person person:fullName ?fullName}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["?fullName" "(as (max ?favNums) ?max)"]
                select))))
     (testing "MIN"
-      (let [query "SELECT ?fullName (MIN(?favNums) AS ?min)\n WHERE {\n ?person person:favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
+      (let [query "SELECT ?fullName (MIN(?favNums) AS ?min)
+                   WHERE {?person person:favNums ?favNums.
+                          ?person person:fullName ?fullName}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["?fullName" "(as (min ?favNums) ?min)"]
                select))))
     (testing "SAMPLE"
-      (let [query "SELECT ?fullName (SAMPLE(?favNums) AS ?sample)\n WHERE {\n ?person person:favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
+      (let [query "SELECT ?fullName (SAMPLE(?favNums) AS ?sample)
+                   WHERE {?person person:favNums ?favNums.
+                          ?person person:fullName ?fullName}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["?fullName" "(as (sample ?favNums) ?sample)"]
                select))))
     (testing "SUM"
-      (let [query "SELECT ?fullName (SUM(?favNums) AS ?sum)\n WHERE {\n ?person person:favNums ?favNums.\n  ?person fd:person/fullName ?fullName\n}\n"
+      (let [query "SELECT ?fullName (SUM(?favNums) AS ?sum)
+                   WHERE {?person person:favNums ?favNums.
+                          ?person person:fullName ?fullName}"
             {:keys [select]} (sparql/->fql query)]
         (is (= ["?fullName" "(as (sum ?favNums) ?sum)"]
                select))))
@@ -58,31 +70,43 @@
 
 (deftest parse-where
   (testing "simple triple"
-    (let [query "SELECT ?person \nWHERE {\n ?person person:handle \"jdoe\".\n}"
+    (let [query "SELECT ?person
+                 WHERE {?person person:handle \"jdoe\".}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person/handle" "jdoe"]]
+      (is (= [["?person" "person:handle" "jdoe"]]
              where))))
   (testing "multi clause"
-    (let [query "SELECT ?person ?nums \nWHERE {\n ?person person:handle \"jdoe\".\n ?person fd:person/favNums ?nums.\n}"
+    (let [query "SELECT ?person ?nums
+                 WHERE {?person person:handle \"jdoe\".
+                        ?person person:favNums ?nums.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person/handle" "jdoe"]
-              ["?person" "person/favNums" "?nums"]]
+      (is (= [["?person" "person:handle" "jdoe"]
+              ["?person" "person:favNums" "?nums"]]
              where))))
   (testing "multi-clause, semicolon separator"
-    (let [query "SELECT ?person ?nums\nWHERE {\n ?person person:handle \"jdoe\";\n fd:person/favNums ?nums.\n}"
+    (let [query "SELECT ?person ?nums
+                 WHERE {?person person:handle \"jdoe\";
+                                person:favNums ?nums.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person/handle" "jdoe"]
-              ["?person" "person/favNums" "?nums"]]
+      (is (= [["?person" "person:handle" "jdoe"]
+              ["?person" "person:favNums" "?nums"]]
              where))))
-  (testing "multiple objects, comma separator"
-    (let [query "SELECT ?person ?fullName ?favNums \n WHERE {\n ?person person:handle \"jdoe\";\n fd:person/fullName ?fullName;\n fd:person/favNums ?favNums\n}"
+  (testing "multiple objects, semicolon separator"
+    (let [query "SELECT ?person ?fullName ?favNums
+                 WHERE {?person person:handle \"jdoe\";
+                                person:fullName ?fullName;
+                                person:favNums ?favNums}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["?person" "person/handle" "jdoe"]
-              ["?person" "person/fullName" "?fullName"]
-              ["?person" "person/favNums" "?favNums"]]
+      (is (= [["?person" "person:handle" "jdoe"]
+              ["?person" "person:fullName" "?fullName"]
+              ["?person" "person:favNums" "?favNums"]]
              where))))
   (testing "UNION"
-    (let [query "SELECT ?person ?age\nWHERE {\n { ?person person:age 70.\n ?person person:handle \"dsanchez\". } \n  UNION \n { ?person person:handle \"anguyen\". } \n ?person person:age ?age.\n}"
+    (let [query "SELECT ?person ?age
+                 WHERE {{?person person:age 70.
+                         ?person person:handle \"dsanchez\".}
+                        UNION {?person person:handle \"anguyen\".}
+                        ?person person:age ?age.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{:union
                [[["?person" "person:age" 70]
@@ -91,20 +115,28 @@
               ["?person" "person:age" "?age"]]
              where))))
   (testing "FILTER"
-    (let [query "SELECT ?handle ?num\nWHERE {\n ?person person:handle ?handle.\n ?person person:favNums ?num.\n  FILTER ( ?num > 10 ).\n}"
+    (let [query "SELECT ?handle ?num
+                 WHERE {?person person:handle ?handle.
+                        ?person person:favNums ?num.
+                        FILTER ( ?num > 10 ).}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [["?person" "person:handle" "?handle"]
               ["?person" "person:favNums" "?num"]
               {:filter ["(> ?num 10)"]}]
              where))))
   (testing "OPTIONAL"
-    (let [query "SELECT ?handle ?num\nWHERE {\n ?person person:handle ?handle.\n OPTIONAL { ?person person:favNums ?num. }\n}"
+    (let [query "SELECT ?handle ?num
+                 WHERE {?person person:handle ?handle.
+                        OPTIONAL {?person person:favNums ?num.}}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [["?person" "person:handle" "?handle"]
               {:optional [["?person" "person:favNums" "?num"]]}]
              where)))
     (testing "multi-clause"
-      (let [query "SELECT ?person ?name ?handle ?favNums \nWHERE {\n  ?person person:fullName ?name. \n  OPTIONAL { ?person person:handle ?handle. \n ?person person:favNums ?favNums. }\n}"
+      (let [query "SELECT ?person ?name ?handle ?favNums
+                   WHERE {?person person:fullName ?name.
+                          OPTIONAL {?person person:handle ?handle.
+                                    ?person person:favNums ?favNums.}}"
             {:keys [where]} (sparql/->fql query)]
         (is (= [["?person" "person:fullName" "?name"]
                 {:optional
@@ -112,7 +144,10 @@
                   ["?person" "person:favNums" "?favNums"]]}]
                where))))
     (testing "OPTIONAL + FILTER"
-      (let [query "SELECT ?handle ?num\nWHERE {\n  ?person person:handle ?handle.\n  OPTIONAL { ?person person:favNums ?num. \n FILTER( ?num > 10 )\n }\n}"
+      (let [query "SELECT ?handle ?num
+                   WHERE {?person person:handle ?handle.
+                          OPTIONAL {?person person:favNums ?num.
+                                    FILTER( ?num > 10 )}}"
             {:keys [where]} (sparql/->fql query)]
         (is (= [["?person" "person:handle" "?handle"]
                 {:optional
@@ -120,13 +155,17 @@
                   {:filter ["(> ?num 10)"]}]}]
                where)))))
   (testing "VALUES"
-    (let [query "SELECT ?handle\nWHERE {\n VALUES ?handle { \"dsanchez\" }\n ?person person:handle ?handle.\n}"
+    (let [query "SELECT ?handle
+                 WHERE {VALUES ?handle { \"dsanchez\" }
+                        ?person person:handle ?handle.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{:bind {"?handle" "dsanchez"}}
               ["?person" "person:handle" "?handle"]]
              where))))
   (testing "BIND"
-    (let [query "SELECT ?person ?handle\nWHERE {\n BIND (\"dsanchez\" AS ?handle)\n  ?person person:handle ?handle.\n}"
+    (let [query "SELECT ?person ?handle
+                 WHERE {BIND (\"dsanchez\" AS ?handle)
+                        ?person person:handle ?handle.}"
           {:keys [where]} (sparql/->fql query)]
       (is (= [{:bind {"?handle" "dsanchez"}}
               ["?person" "person:handle" "?handle"]]
@@ -137,62 +176,81 @@
 
 (deftest parse-modifiers
   (testing "LIMIT"
-    (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n LIMIT 1000"
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName} LIMIT 1000"
           {:keys [limit]} (sparql/->fql query)]
       (is (= 1000
              limit))))
   (testing "OFFSET"
-    (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n OFFSET 10"
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName} OFFSET 10"
           {:keys [offset]} (sparql/->fql query)]
       (is (= 10
              offset))))
   (testing "ORDER BY"
     (testing "ASC"
-      (let [query "SELECT ?favNums \n WHERE {\n ?person fd:person/favNums ?favNums\n} ORDER BY ASC(?favNums)"
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums}
+                   ORDER BY ASC(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
         (is (= ["ASC" "?favNums"]
                orderBy))))
     (testing "DESC"
-      (let [query "SELECT ?favNums \n WHERE {\n ?person fd:person/favNums ?favNums\n} ORDER BY DESC(?favNums)"
+      (let [query "SELECT ?favNums
+                   WHERE {?person person:favNums ?favNums}
+                   ORDER BY DESC(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
         (is (= ["DESC" "?favNums"]
                orderBy)))))
   (testing "PRETTY-PRINT"
-    (let [query "SELECT ?person\n WHERE {\n ?person fd:person/fullName ?fullName\n}\n PRETTY-PRINT"
+    (let [query "SELECT ?person
+                 WHERE {?person person:fullName ?fullName}
+                 PRETTY-PRINT"
           {:keys [prettyPrint]} (sparql/->fql query)]
       (is (= true
              prettyPrint))))
   (testing "GROUP BY, HAVING"
-    (let [query "SELECT (SUM(?favNums) AS ?sumNums)\n WHERE {\n ?e fd:person/favNums ?favNums. \n } \n GROUP BY ?e \n HAVING(SUM(?favNums) > 1000)"
+    (let [query "SELECT (SUM(?favNums) AS ?sumNums)
+                 WHERE {?e person:favNums ?favNums.}
+                 GROUP BY ?e HAVING(SUM(?favNums) > 1000)"
           {:keys [groupBy having]} (sparql/->fql query)]
       (is (= "?e"
              groupBy))
       (is (= "(> (sum ?favNums) 1000)"
              having))))
   (testing "mutiple GROUP BY"
-    (let [query "SELECT ?handle\nWHERE {\n ?person fdb:person/handle ?handle.\n}\nGROUP BY ?person ?handle"
+    (let [query "SELECT ?handle
+                 WHERE {?person person:handle ?handle.}
+                 GROUP BY ?person ?handle"
           {:keys [groupBy]} (sparql/->fql query)]
       (is (= ["?person" "?handle"]
              groupBy))))
   (testing "DISTINCT"
-    (let [query "SELECT DISTINCT ?person ?fullName \nWHERE {\n ?person fd:person/fullName ?fullName \n}"
+    (let [query "SELECT DISTINCT ?person ?fullName
+                 WHERE {?person person:fullName ?fullName}"
           {:keys [selectDistinct]} (sparql/->fql query)]
       (is (= ["?person" "?fullName"]
              selectDistinct)))))
 
 (deftest parse-recursive
-  (let [query "SELECT ?followHandle\nWHERE {\n ?person fdb:person/handle \"anguyen\".\n ?person fdb:person/follows+ ?follows.\n ?follows fdb:person/handle ?followHandle.\n}"
+  (let [query "SELECT ?followHandle
+               WHERE {?person person:handle \"anguyen\".
+                      ?person person:follows+ ?follows.
+                      ?follows person:handle ?followHandle.}"
         {:keys [where]} (sparql/->fql query)]
-    (is (= [["$fdb" "?person" "person/handle" "anguyen"]
-            ["$fdb" "?person" "person/follows+" "?follows"]
-            ["$fdb" "?follows" "person/handle" "?followHandle"]]
+    (is (= [["?person" "person:handle" "anguyen"]
+            ["?person" "person:follows+" "?follows"]
+            ["?follows" "person:handle" "?followHandle"]]
            where)))
   (testing "depth"
-    (let [query "SELECT ?followHandle\nWHERE {\n ?person fdb:person/handle \"anguyen\".\n ?person fdb:person/follows+3 ?follows.\n ?follows fdb:person/handle ?followHandle.\n}"
+    (let [query "SELECT ?followHandle
+                 WHERE {?person person:handle \"anguyen\".
+                        ?person person:follows+3 ?follows.
+                        ?follows person:handle ?followHandle.}"
           {:keys [where]} (sparql/->fql query)]
-      (is (= [["$fdb" "?person" "person/handle" "anguyen"]
-              ["$fdb" "?person" "person/follows+3" "?follows"]
-              ["$fdb" "?follows" "person/handle" "?followHandle"]]
+      (is (= [["?person" "person:handle" "anguyen"]
+              ["?person" "person:follows+3" "?follows"]
+              ["?follows" "person:handle" "?followHandle"]]
              where)))))
 
 ;; TODO
@@ -200,7 +258,8 @@
 
 (deftest parsing-error
   (testing "invalid query throws expected error"
-    (let [query "SELECT ?person\n WHERE  ?person fd:person/fullName \"jdoe\" "]
+    (let [query "SELECT ?person
+                 WHERE  ?person person:fullName \"jdoe\""]
       (is (= {:status 400
               :error  :db/invalid-query}
              (try
