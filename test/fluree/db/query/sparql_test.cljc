@@ -56,7 +56,7 @@
                    WHERE {?person person:favNums ?favNums.
                           ?person person:fullName ?fullName}"
             {:keys [select]} (sparql/->fql query)]
-        (is (= ["?fullName" "(as (sample ?favNums) ?sample)"]
+        (is (= ["?fullName" "(as (sample1 ?favNums) ?sample)"]
                select))))
     (testing "SUM"
       (let [query "SELECT ?fullName (SUM(?favNums) AS ?sum)
@@ -193,14 +193,14 @@
                    WHERE {?person person:favNums ?favNums}
                    ORDER BY ASC(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
-        (is (= ["ASC" "?favNums"]
+        (is (= ["asc" "?favNums"]
                orderBy))))
     (testing "DESC"
       (let [query "SELECT ?favNums
                    WHERE {?person person:favNums ?favNums}
                    ORDER BY DESC(?favNums)"
             {:keys [orderBy]} (sparql/->fql query)]
-        (is (= ["DESC" "?favNums"]
+        (is (= ["desc" "?favNums"]
                orderBy)))))
   (testing "PRETTY-PRINT"
     (let [query "SELECT ?person
