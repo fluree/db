@@ -1,18 +1,24 @@
 (ns fluree.db.query.exec.eval
-  (:refer-clojure :exclude [compile rand concat replace])
+  (:refer-clojure :exclude [compile rand concat replace
+                            #?(:clj ratio? :cljs uuid)])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
-            [clojure.math :as math]
+            [clojure.math]
             [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const])
   #?(:clj (:import (java.time Instant OffsetDateTime LocalDateTime))))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+(defn ratio?
+  [x]
+  #?(:clj  (clojure.core/ratio? x)
+     :cljs false)) ; ClojureScript doesn't support ratios
 
 (defn sum
   [coll]
