@@ -412,11 +412,15 @@
   "Returns bind statement inside [ ], i.e. [{\"bind\": {\"?handle\": \"dsanchez\"}}]"
   [bind]
   (log/trace "handle-bind:" bind)
-  (let [var       (handle-var (-> bind second rest))
-        bindValue (-> (handle-expression (-> bind first rest)) first)
-        bindValue (if (str/starts-with? bindValue "(") (str "#" bindValue)
-                                                       bindValue)]
-    {:bind {var bindValue}}))
+  (let [var        (handle-var (-> bind second rest))
+        bind-value (-> bind first rest handle-expression first)
+        bind-value (if (str/starts-with? bind-value "(")
+                     (str "#" bind-value)
+                     bind-value)
+        bind-value (if (str/starts-with? bind-value "\"")
+                     (edn/read-string bind-value)
+                     bind-value)]
+    {:bind {var bind-value}}))
 
 (defn handle-arg-list
   "BNF -- NIL | 'DISTINCT'? Expression ( Expression )* "
