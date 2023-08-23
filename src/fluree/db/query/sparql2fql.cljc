@@ -45,34 +45,6 @@
   (let [iriref (-> base-dec second handle-iri-ref)]
     {"@base" iriref}))
 
-(defn handle-prefixed-name-v2
-  "Returns a source and predicate"
-  [prefixed-name]
-  (let [name   (str/join prefixed-name)
-        [source predicate] (str/split name #":")
-        ;; This is in order to accommodate ISO-8601 formatted clock times in SPARQL.
-        source (str/replace source ";" ":")]
-    (cond (or (= source "fdb") (= source "fd"))
-          ["$fdb" predicate]
-
-          (str/starts-with? source "wd")
-          (let [predicate (if (str/starts-with? predicate "?")
-                            predicate
-                            name)]
-            ["$wd" predicate])
-
-          (= source "fullText")
-          ["$fdb" (str source ":" predicate)]
-
-          (str/starts-with? source "fdb")
-          [(str "$" source) predicate]
-
-          (str/starts-with? source "fd")
-          [(str "$fdb" (subs source 2)) predicate]
-
-          :else
-          [source predicate])))
-
 (defn handle-prefixed-name
   [prefixed-name]
   (let [prefixed-name-str (str/join prefixed-name)]
