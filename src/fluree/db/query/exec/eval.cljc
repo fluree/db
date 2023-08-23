@@ -227,7 +227,7 @@
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
     #?(:clj  (.toString (.getOffset ^OffsetDateTime datetime))
-       :cljs (.getTimeZoneOffset datetime))))
+       :cljs (.getTimeZoneOffset ^js/Date datetime))))
 
 (defn sha256
   [x]
