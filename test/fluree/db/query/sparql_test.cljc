@@ -418,6 +418,27 @@
                         GROUP BY ?person"
                results @(fluree/query db query {:format :sparql})]
            (is (every? #(-> % first integer?) results))))
+       (testing "SUM query works"
+         (let [query   "SELECT (SUM(?favNums) AS ?favNum)
+                        WHERE {?person person:favNums ?favNums.}
+                        GROUP BY ?person"
+               results @(fluree/query db query {:format :sparql})]
+           (is (= [[38] [151] [23]]
+                  results))))
+       (testing "ORDER BY ASC query works"
+         (let [query   "SELECT ?handle
+                        WHERE {?person person:handle ?handle.}
+                        ORDER BY ASC(?handle)"
+               results @(fluree/query db query {:format :sparql})]
+           (is (= [["bbob"] ["dankeshön"] ["jbob"] ["jdoe"]]
+                  results))))
+       (testing "ORDER BY DESC query works"
+         (let [query   "SELECT ?handle
+                        WHERE {?person person:handle ?handle.}
+                        ORDER BY DESC(?handle)"
+               results @(fluree/query db query {:format :sparql})]
+           (is (= [["jdoe"] ["jbob"] ["dankeshön"] ["bbob"]]
+                  results))))
 
        ;; TODO: Make these tests pass
 
@@ -430,6 +451,24 @@
              (is (= [["Billy Bob's handle is bbob"]
                      ["Jane Doe's handle is jdoe"]]
                     results))))
+
+       ;; VALUES gets translated into :bind, but that expects a query fn on the right
+       ;; so this string literal doesn't work
+       #_(testing "VALUES query works"
+           (let [query   "SELECT ?handle
+                          WHERE {VALUES ?handle { \"jdoe\" }
+                                 ?person person:handle ?handle.}"
+                 results @(fluree/query db query {:format :sparql})]
+             (is (= ["jdoe"] results))))
+
+       ;; BIND gets translated into :bind, but that expects a query fn on the right
+       ;; so this string literal doesn't work
+       #_(testing "BIND query works"
+           (let [query   "SELECT ?person ?handle
+                        WHERE {BIND (\"jdoe\" AS ?handle)
+                               ?person person:handle ?handle.}"
+                 results @(fluree/query db query {:format :sparql})]
+             (is (= ["ex:jdoe" "jdoe"] results))))
 
        ;; SELECT * queries will need some kind of special handling as there isn't
        ;; an exact corollary in FQL. Will need to find all in-scope vars and turn
