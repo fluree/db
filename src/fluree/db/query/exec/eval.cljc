@@ -1,5 +1,5 @@
 (ns fluree.db.query.exec.eval
-  (:refer-clojure :exclude [compile rand concat replace
+  (:refer-clojure :exclude [compile rand concat replace max min
                             #?(:clj ratio? :cljs uuid)])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
@@ -59,6 +59,14 @@
 (defn stddev
   [coll]
   (Math/sqrt (variance coll)))
+
+(defn max
+  [coll]
+  (apply clojure.core/max coll))
+
+(defn min
+  [coll]
+  (apply clojure.core/min coll))
 
 (defn ceil
   [n]
@@ -138,8 +146,7 @@
    (subs s (dec start)))
   ([s start length]
    (let [start (dec start)]
-     (subs s start (min (+ start length)
-                        (count s))))))
+     (subs s start (clojure.core/min (+ start length) (count s))))))
 
 (defn strLen
   [s]
@@ -323,7 +330,9 @@
     struuid     fluree.db.query.exec.eval/struuid
     isNumeric   fluree.db.query.exec.eval/isNumeric
     isBlank     fluree.db.query.exec.eval/isBlank
-    str         fluree.db.query.exec.eval/sparql-str})
+    str         fluree.db.query.exec.eval/sparql-str
+    max         fluree.db.query.exec.eval/max
+    min         fluree.db.query.exec.eval/min})
 
 
 (defn variable?
