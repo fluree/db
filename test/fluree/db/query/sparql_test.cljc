@@ -401,17 +401,9 @@
                                 ?person person:favNums ?favNums.}
                         GROUP BY ?person ?handle"
                results @(fluree/query db query {:format :sparql})]
-           (is (= [[[23] 23 "ex:bbob" "bbob" [23]]
-                   [[0 3 5 6 7 8 9]
-                    5.428571428571429
-                    "ex:jbob"
-                    "jbob"
-                    [0 3 5 6 7 8 9]]
-                   [[3 7 42 99]
-                    37.75
-                    "ex:jdoe"
-                    "jdoe"
-                    [3 7 42 99]]]
+           (is (= [[[23] 23 "ex:bbob" "bbob" 23]
+                   [[0 3 5 6 7 8 9] 5.428571428571429 "ex:jbob" "jbob" 9]
+                   [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
                   results))))
 
        ;; TODO: Make these tests pass
