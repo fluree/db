@@ -541,7 +541,8 @@
   [order-condition]
   (cond (#{"ASC" "DESC"} (first order-condition))
         (let [exp (-> order-condition second second)]
-          [(first order-condition) (-> order-condition second second rest handle-expression first)])
+          (list (-> order-condition first str/lower-case)
+                (-> exp rest handle-expression first)))
 
         (= :Var (-> order-condition first first))
         (handle-var (-> order-condition first rest))
