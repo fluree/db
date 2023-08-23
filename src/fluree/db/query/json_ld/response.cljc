@@ -15,12 +15,13 @@
 
 (defn wildcard-spec
   [db cache compact-fn pid]
-  (or (get @cache pid)
-      (let [p-spec (if-let [spec (get-in db [:schema :pred pid])]
-                     (assoc spec :as (compact-fn (:iri spec)))
-                     {:as pid})]
-        (vswap! cache assoc pid p-spec)
-        p-spec)))
+  (go-try
+    (or (get @cache pid)
+        (let [p-spec (if-let [spec (get-in db [:schema :pred pid])]
+                       (assoc spec :as (compact-fn (:iri spec)))
+                       {:as (<? (dbproto/-iri db pid compact-fn))})]
+          (vswap! cache assoc pid p-spec)
+          p-spec))))
 
 (defn iri?
   [pid]
@@ -38,15 +39,14 @@
   [db cache compact-fn sid]
   (go-try
     (when-let [iri (<? (sid->iri db sid compact-fn))]
-      (vswap! cache assoc sid iri)
-      iri)))
+      (vswap! cache assoc sid {:as iri})
+      {:as iri})))
 
 (defn crawl-ref-item
   [db context compact-fn flake-sid sub-select cache fuel-vol max-fuel depth-i]
   (go-try
     (let [sub-flakes (<? (query-range/index-range db :spot = [flake-sid]))]
       (<? (flakes->res db cache context compact-fn fuel-vol max-fuel sub-select depth-i sub-flakes)))))
-
 
 (defn add-reverse-specs
   "When @reverse variables are present, crawl for the reverse specs."
@@ -65,15 +65,14 @@
                                               ;; have a sub-selection
                                               (<? (crawl-ref-item db context compact-fn ref-sid spec cache fuel-vol max-fuel (inc depth-i)))
                                               ;; no sub-selection, just return IRI
-                                              (or (get @cache ref-sid)
-                                                  (<? (cache-sid->iri db cache compact-fn ref-sid))))]
+                                              (or (:as (get @cache ref-sid))
+                                                  (:as (<? (cache-sid->iri db cache compact-fn ref-sid)))))]
                                  (recur r (conj acc-item result)))
                                (if (= 1 (count acc-item))
                                  (first acc-item)
                                  acc-item)))]
             (recur r (assoc acc as result)))
           acc)))))
-
 
 (defn flakes->res
   "depth-i param is the depth of the graph crawl. Each successive 'ref' increases the graph depth, up to
@@ -91,7 +90,7 @@
                 list? (contains? (flake/m ff) :i)
                 spec  (or (get select-spec p)
                           (when wildcard?
-                            (wildcard-spec db cache compact-fn p)))
+                            (<? (wildcard-spec db cache compact-fn p))))
                 p-iri (:as spec)
                 v     (cond
                         (nil? spec)
@@ -107,13 +106,13 @@
                                acc []]
                           (if type-id
                             (recur rest-types
-                                   (conj acc (or (get @cache type-id)
-                                                 (<? (cache-sid->iri db cache compact-fn type-id)))))
+                                   (conj acc (:as (or (get @cache type-id)
+                                                      (<? (cache-sid->iri db cache compact-fn type-id))))))
                             (if (= 1 (count acc))
                               (first acc)
                               acc)))
 
-                        :else                               ;; display all values
+                        :else ;; display all values
                         (loop [[f & r] (if list?
                                          (sort-by #(:i (flake/m %)) p-flakes)
                                          p-flakes)
@@ -132,7 +131,7 @@
                                           ;; no sub-selection, just return {@id <iri>} for each ref iri
                                           :else
                                           ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-                                          (let [id-key (:as (wildcard-spec db cache compact-fn const/$xsd:anyURI))
+                                          (let [id-key (:as (<? (wildcard-spec db cache compact-fn const/$xsd:anyURI)))
                                                 c-iri  (<? (dbproto/-iri db (flake/o f) compact-fn))]
                                             {id-key c-iri}))
                                         (flake/o f))]
