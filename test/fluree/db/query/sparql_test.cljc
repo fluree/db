@@ -359,10 +359,11 @@
                    ["fee256e1850ef33410630557356ea3efd56856e9045e59350dbceb6b5794041d50991093c07ad871e1124e6961f2198c178057cf391435051ac24eb8952bc401"]]
                   results))))
        (testing "aggregate fn query works"
-         (let [query   "SELECT (AVG(?favNums) AS ?avgFav)
-                     WHERE {?person person:favNums ?favNums.}"
+         ;; Select the bound var after the AS to make sure it is bound to the result
+         (let [query   "SELECT (AVG(?favNums) AS ?avgFav) ?avgFav
+                        WHERE {?person person:favNums ?favNums.}"
                results @(fluree/query db query {:format :sparql})]
-           (is (= [[17.66666666666667]]
+           (is (= [[17.66666666666667 17.66666666666667]]
                   results))))
        (testing "aggregate fn w/ GROUP BY query works"
          (let [query   "SELECT (AVG(?favNums) AS ?avgFav)
@@ -388,23 +389,34 @@
                    ["jbob-Jenny Bob"]
                    ["jdoe-Jane Doe"]]
                   results))))
+       (testing "multiple AS selections query works"
+         (let [query   "SELECT (AVG(?favNums) AS ?avgFav) (CEIL(?avgFav) AS ?caf)
+                        WHERE {?person person:favNums ?favNums.}"
+               results @(fluree/query db query {:format :sparql})]
+           (is (= [[17.66666666666667 18]]
+                  results))))
+       (testing "mix of bindings and variables in SELECT query works"
+         (let [query   "SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) AS ?max)
+                        WHERE  {?person person:handle ?handle.
+                                ?person person:favNums ?favNums.}
+                        GROUP BY ?person ?handle"
+               results @(fluree/query db query {:format :sparql})]
+           (is (= [[[23] 23 "ex:bbob" "bbob" [23]]
+                   [[0 3 5 6 7 8 9]
+                    5.428571428571429
+                    "ex:jbob"
+                    "jbob"
+                    [0 3 5 6 7 8 9]]
+                   [[3 7 42 99]
+                    37.75
+                    "ex:jdoe"
+                    "jdoe"
+                    [3 7 42 99]]]
+                  results))))
 
        ;; TODO: Make these tests pass
 
-       ;; These queries don't parse; issues w/ the BNF?
-       #_(testing "multiple AS selections query works"
-           (let [query   "SELECT (AVG(?favNums) AS ?avgFav) (CEIL(?avgFav) AS ?caf)
-                       WHERE {?person person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= [[34.8]]
-                    results))))
-       #_(testing "mix of bindings and variables in SELECT query works"
-           (let [query   "SELECT ?favNums (AVG(?favNums) AS ?avg) ?person ?handle (MAX(?favNums) as ?max
-                     WHERE  {?person person:handle ?handle.
-                             ?person person:favNums ?favNums.}"
-                 results @(fluree/query db query {:format :sparql})]
-             (is (= :hoobajoob
-                    results))))
+       ;; Language tags aren't supported yet (even in the BNF)
        #_(testing "fn w/ langtag string arg query works"
            (let [query   "SELECT (CONCAT(?fullName, \"'s handle is \"@en, ?handle) AS ?hfn)
                      WHERE {?person person:handle ?handle.
