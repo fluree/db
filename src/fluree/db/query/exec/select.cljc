@@ -90,25 +90,24 @@
   [agg-function]
   (->AggregateSelector agg-function))
 
-(defrecord AsSelector [as-fn aggregate?]
+(defrecord AsSelector [as-fn bind-var aggregate?]
   SolutionModifier
   (update-solution
     [_ solution]
     (log/trace "AsSelector update-solution solution:" solution)
-    (let [{:keys [::eval/var ::eval/val] :as result} (as-fn solution)]
+    (let [result (as-fn solution)]
       (log/trace "AsSelector update-solution result:" result)
-      (assoc solution var {::where/var var, ::where/val val})
-      val))
+      (assoc solution bind-var {::where/var bind-var, ::where/val result})))
   ValueSelector
   (implicit-grouping? [_] aggregate?)
   (format-value
     [_ _ _ _ _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
-    (go solution)))
+    (go (get-in solution [bind-var ::where/val]))))
 
 (defn as-selector
-  [as-fn aggregate?]
-  (->AsSelector as-fn aggregate?))
+  [as-fn bind-var aggregate?]
+  (->AsSelector as-fn bind-var aggregate?))
 
 (defrecord SubgraphSelector [var selection depth spec]
   ValueSelector

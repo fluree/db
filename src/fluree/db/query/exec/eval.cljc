@@ -338,7 +338,7 @@
   [val var]
   (log/trace "as binding value:" val "to variable:" var)
   (if (variable? var)
-    {::var var, ::val val}
+    val ; only needs to return the value b/c we store the binding variable in the AsSelector
     (throw
      (ex-info
       (str "second arg to `as` must be a query variable (e.g. ?foo); provided:"
