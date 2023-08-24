@@ -11,26 +11,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(declare flakes->res)
-
-(defn wildcard-spec
-  [db cache compact-fn pid]
-  (go-try
-    (or (get @cache pid)
-        (let [p-spec (if-let [spec (get-in db [:schema :pred pid])]
-                       (assoc spec :as (compact-fn (:iri spec)))
-                       {:as (<? (dbproto/-iri db pid compact-fn))})]
-          (vswap! cache assoc pid p-spec)
-          p-spec))))
-
-(defn iri?
-  [pid]
-  (= const/$xsd:anyURI pid))
-
-(defn rdf-type?
-  [pid]
-  (= const/$rdf:type pid))
-
 (defn sid->iri
   [db sid compact-fn]
   (dbproto/-iri db sid compact-fn))
@@ -42,6 +22,22 @@
       (vswap! cache assoc sid {:as iri})
       {:as iri})))
 
+(defn wildcard-spec
+  [db cache compact-fn pid]
+  (when-let [spec (get-in db [:schema :pred pid])]
+    (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
+      (vswap! cache assoc pid spec*)
+      spec*)))
+
+(defn iri?
+  [pid]
+  (= const/$xsd:anyURI pid))
+
+(defn rdf-type?
+  [pid]
+  (= const/$rdf:type pid))
+
+(declare flakes->res)
 (defn crawl-ref-item
   [db context compact-fn flake-sid sub-select cache fuel-vol max-fuel depth-i]
   (go-try
@@ -90,7 +86,9 @@
                 list? (contains? (flake/m ff) :i)
                 spec  (or (get select-spec p)
                           (when wildcard?
-                            (<? (wildcard-spec db cache compact-fn p))))
+                            (or (get @cache p)
+                                (wildcard-spec db cache compact-fn p)
+                                (<? (cache-sid->iri db cache compact-fn p)))))
                 p-iri (:as spec)
                 v     (cond
                         (nil? spec)
@@ -131,7 +129,9 @@
                                           ;; no sub-selection, just return {@id <iri>} for each ref iri
                                           :else
                                           ;; TODO - we generate id-key here every time, this should be done in the :spec once beforehand and used from there
-                                          (let [id-key (:as (<? (wildcard-spec db cache compact-fn const/$xsd:anyURI)))
+                                          (let [id-key (:as (or (get @cache const/$xsd:anyURI)
+                                                                (wildcard-spec db cache compact-fn const/$xsd:anyURI)
+                                                                (<? (cache-sid->iri db cache compact-fn const/$xsd:anyURI))))
                                                 c-iri  (<? (dbproto/-iri db (flake/o f) compact-fn))]
                                             {id-key c-iri}))
                                         (flake/o f))]
