@@ -101,15 +101,16 @@
                         (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
                                         {:status 400 :error :db/invalid-transaction})))
           [valid? err-msg] (shacl/coalesce-validation-results
-                             (mapcat (fn [[shape-id p-shapes]]
-                                       ;; register the validated pid so we can enforce the sh:closed constraint later
-                                       (swap! subj-mods update-in [:shape->validated-properties shape-id]
-                                              (fnil conj #{}) pid)
-                                       ;; do the actual validation
-                                       (mapv (fn [p-shape]
-                                               (shacl/validate-simple-property-constraints p-shape flakes))
-                                             p-shapes))
-                                     shape->p-shapes))]
+                             (into []
+                                   (mapcat (fn [[shape-id p-shapes]]
+                                             ;; register the validated pid so we can enforce the sh:closed constraint later
+                                             (swap! subj-mods update-in [:shape->validated-properties shape-id]
+                                                    (fnil conj #{}) pid)
+                                             ;; do the actual validation
+                                             (mapv (fn [p-shape]
+                                                     (shacl/validate-simple-property-constraints p-shape flakes))
+                                                   p-shapes)))
+                                   shape->p-shapes))]
       (when (not valid?)
         (shacl/throw-shacl-exception err-msg))
       (into flakes retractions))))
@@ -166,6 +167,30 @@
                                     "All items for a single subject should be consolidated.")
                                {:status 400 :error :db/invalid-transaction})))))))
 
+(defn consolidate-advanced-validation
+  "We need to have the shacl :datatype constraints at hand for each pid so that we can
+  properly coerce flake `dt` fields, where possible.
+
+  We also need an efficient structure for finding the p-shapes for advanced validation.
+
+  This function assembles both structures in one pass through the shacl-shapes.
+
+  Returns a two tuple of:
+  pid->shape->p-shapes
+  {<pid> {<shape-id-iri> [<p-shape1> <p-shape2> ...]}}
+
+  pid->shacl-dt
+  {<pid> <dt>}"
+  [shacl-shapes]
+  (reduce (fn [[pid->shape->p-shapes pid->shacl-dt*]
+               {:keys [advanced-validation pid->shacl-dt] :as shape}]
+            [(if advanced-validation
+               (merge-with merge pid->shape->p-shapes advanced-validation)
+               pid->shape->p-shapes)
+             (merge pid->shacl-dt* pid->shacl-dt)])
+          [{} {}]
+          shacl-shapes))
+
 (defn json-ld-node->flakes
   "Returns two-tuple of [sid node-flakes] that will contain the top-level sid
   and all flakes from the target node and all children nodes that ultimately get processed.
@@ -200,16 +225,9 @@
           pred-shapes    (when (seq referring-pids)
                            (<? (shacl/targetobject-shapes db-before referring-pids)))
           shacl-shapes (into class-shapes pred-shapes)
-          [pid->shape->p-shapes
-           pid->shacl-dt]
-          (reduce (fn [[pid->shape->p-shapes pid->shacl-dt*]
-                       {:keys [advanced-validation pid->shacl-dt] :as shape}]
-                    [(if advanced-validation
-                       (merge-with merge pid->shape->p-shapes advanced-validation)
-                       pid->shape->p-shapes)
-                     (merge pid->shacl-dt* pid->shacl-dt)])
-                  [{} {}]
-                  shacl-shapes)
+
+          [pid->shape->p-shapes pid->shacl-dt] (consolidate-advanced-validation shacl-shapes)
+
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
                          id)
@@ -245,9 +263,6 @@
                                      (jld-ledger/generate-new-pid k iris next-pid ref? refs))
                 shape->p-shapes (get pid->shape->p-shapes pid)
                 shacl-dt        (get pid->shacl-dt pid)
-                ;;it's possible the shacl constraint was discovered via a different node,
-                ;; as in `sh:targetObjectsOf`. In that case, the relevant shape would be
-                ;; available in `subj-mods`, rather than in the currently-bound `shacl-map`.
                 property-flakes* (if existing-pid
                                    property-flakes
                                    (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))

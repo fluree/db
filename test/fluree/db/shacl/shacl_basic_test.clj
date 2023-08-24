@@ -1301,8 +1301,6 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
         (is (util/exception? db-excess-ssn))
         (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
                (ex-message db-excess-ssn)))))
-    ;;TODO: this will not pass until we can enforce datatype constraints
-    ;;on triples that have already been created.
     (testing "datatype"
       (let [conn @(fluree/connect {:method :memory
                                    :defaults
