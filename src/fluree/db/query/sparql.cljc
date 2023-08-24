@@ -25,8 +25,7 @@
                              "See here for more information: "
                              docs/error-codes-page "#query-sparql-improper")
                         {:status   400
-                         :error    :db/invalid-query
-                         #_#_:provided sparql})))
+                         :error    :db/invalid-query})))
       (do
         (log/trace "Parsed SPARQL query:" parsed)
         parsed))))
