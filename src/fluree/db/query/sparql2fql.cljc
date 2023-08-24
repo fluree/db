@@ -29,14 +29,14 @@
   [ref]
   (subs ref 1 (-> ref count dec)))
 
-(defn handle-prefix-dec1
+(defn handle-prefix-decl
   "BNF -- PNAME_NS IRIREF"
-  [prefix-dec]
-  (let [name   (->> prefix-dec (drop-last 2) str/join keyword)
-        iriref (-> prefix-dec last second handle-iri-ref)]
+  [prefix-decl]
+  (let [name   (->> prefix-decl (drop-last 2) str/join keyword)
+        iriref (-> prefix-decl last second handle-iri-ref)]
     {name iriref}))
 
-(defn handle-base-dec1
+(defn handle-base-decl
   "BNF -- IRIREF"
   [base-dec]
   (let [iriref (-> base-dec second handle-iri-ref)]
@@ -640,15 +640,15 @@
         (recur q r)))))
 
 (defn handle-prologue
-  "BNF -- ( BaseDec1 | PrefixDec1 )*"
+  "BNF -- ( BaseDecl | PrefixDecl )*"
   [prologue]
   (reduce (fn [acc pro]
             (case (first pro)
-              :BaseDec1
-              (merge acc (handle-base-dec1 (rest pro)))
+              :BaseDecl
+              (merge acc (handle-base-decl (rest pro)))
 
-              :PrefixDec1
-              (merge acc (handle-prefix-dec1 (rest pro)))))
+              :PrefixDecl
+              (merge acc (handle-prefix-decl (rest pro)))))
           {} prologue))
 
 (defn assoc-if

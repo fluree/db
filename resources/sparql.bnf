@@ -1,8 +1,8 @@
 <Query> ::=  <COMMENT?> WS Prologue WS ( SelectQuery | ConstructQuery | DescribeQuery | AskQuery ) WS Modifiers
 UpdateUnit ::= Update
-Prologue ::= ( BaseDec1 | PrefixDec1 )*
-BaseDec1 ::= 'BASE' IRIREF
-PrefixDec1 ::= <'PREFIX'> WS PNAME_NS WS IRIREF
+Prologue ::= ( BaseDecl | PrefixDecl )*
+BaseDecl ::= 'BASE' IRIREF
+PrefixDecl ::= <'PREFIX'> WS PNAME_NS WS IRIREF
 SelectQuery ::= WS SelectClause WS DatasetClause* WS WhereClause WS SolutionModifier WS
 SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause
 <SelectClause> ::= WS <'SELECT'> WS ( 'DISTINCT' | 'REDUCED')? ( ( WS ( Var | ( <'('> Expression WS 'AS' WS Var <')'> ) ) )+ | ( WS '*' ) )
