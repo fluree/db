@@ -2,6 +2,7 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.core.async :as async]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.fuel :as fuel]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
@@ -134,6 +135,12 @@
 
 (defn query-sparql
   [db query]
+  (let [context-type (dbproto/-context-type db)]
+    (when-not (= :string context-type)
+      (throw (ex-info (str "SPARQL queries require context-type to be :string. "
+                           "This db's context-type is " context-type)
+                      {:status 400
+                       :error  :db/invalid-db}))))
   (go-try
     (let [fql (sparql/->fql query)]
       (<? (query-fql db fql)))))
