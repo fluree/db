@@ -32,14 +32,16 @@
 (defn handle-prefix-decl
   "BNF -- PNAME_NS IRIREF"
   [prefix-decl]
-  (let [name   (->> prefix-decl (drop-last 2) str/join keyword)
+  (log/trace "handle-prefix-decl:" prefix-decl)
+  (let [name   (->> prefix-decl (drop-last 2) str/join)
         iriref (-> prefix-decl last second handle-iri-ref)]
     {name iriref}))
 
 (defn handle-base-decl
   "BNF -- IRIREF"
-  [base-dec]
-  (let [iriref (-> base-dec second handle-iri-ref)]
+  [base-decl]
+  (log/trace "handle-base-decl:" base-decl)
+  (let [iriref (-> base-decl second second handle-iri-ref)]
     {"@base" iriref}))
 
 (defn handle-prefixed-name
