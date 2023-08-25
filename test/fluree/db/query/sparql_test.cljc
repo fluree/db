@@ -307,22 +307,9 @@
                 (done))))))
 
        :clj
-       (testing "keyword context-type throws an error"
-         (let [conn @(fluree/connect {:method   :memory
-                                      :defaults {:context-type :keyword}})
-               db   (-> conn
-                        (fluree/create "people"
-                                       {:defaultContext
-                                        {:person "http://example.org/Person#"}})
-                        deref
-                        fluree/db)
-               query "SELECT ?person ?fullName
-                      WHERE {?person person:handle \"jdoe\".
-                             ?person person:fullName ?fullName.}"]
-           (is (thrown-with-msg? ExceptionInfo #"require context-type to be :string"
-                                 @(fluree/query db query {:format :sparql})))))
        (let [conn @(fluree/connect {:method :memory
-                                    :defaults {:context-type :string}})
+                                    :defaults {:context-type :string
+                                               :context test-utils/default-str-context}})
              db   (-> conn
                       (fluree/create "people"
                                      {:defaultContext
@@ -330,12 +317,26 @@
                       deref
                       (fluree/transact! people-data nil)
                       deref)]
+         (testing "keyword context-type throws an error"
+           (let [kw-conn @(fluree/connect {:method   :memory
+                                           :defaults {:context-type :keyword}})
+                 kw-db   (-> kw-conn
+                             (fluree/create "people"
+                                            {:defaultContext
+                                             {:person "http://example.org/Person#"}})
+                             deref
+                             fluree/db)
+                 query "SELECT ?person ?fullName
+                        WHERE {?person person:handle \"jdoe\".
+                               ?person person:fullName ?fullName.}"]
+             (is (thrown-with-msg? ExceptionInfo #"require context-type to be :string"
+                                   @(fluree/query kw-db query {:format :sparql})))))
          (testing "basic query works"
            (let [query   "SELECT ?person ?fullName
                           WHERE {?person person:handle \"jdoe\".
                                  ?person person:fullName ?fullName.}"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:jdoe" "Jane Doe" :hoobajoob]]
+             (is (= [["ex:jdoe" "Jane Doe"]]
                     results))))
          (testing "basic query w/ OPTIONAL works"
            (let [query   "SELECT ?person ?favNums
