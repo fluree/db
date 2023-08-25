@@ -475,17 +475,13 @@
                           {"id"                            "http://example.org/book/2"
                            "type"                          "http://example.org/Book"
                            "http://example.org/book/title" "The Hitchhiker's Guide to the Galaxy"}]]
-
-           ;; TODO: Make this test pass
-
-           ;; I'm not sure how / if you can use relative IRIs as predicates in FQL
-           #_(testing "BASE IRI gets prefixed onto relative IRIs"
-               (let [book-db @(fluree/stage db book-data)
-                     query   "BASE <http://example.org/book/>
-                              SELECT ?book ?title
-                              WHERE {?book <title> ?title.}"
-                     results @(fluree/query book-db query {:format :sparql})]
-                 (is (= :hoobajoob results))))
+           (testing "BASE IRI gets prefixed onto relative IRIs"
+             (let [book-db @(fluree/stage db book-data)
+                   query   "BASE <http://example.org/book/>
+                            SELECT ?book ?title
+                            WHERE {?book <title> ?title.}"
+                   results @(fluree/query book-db query {:format :sparql})]
+               (is (= :hoobajoob results))))
            (testing "PREFIX declarations go into the context"
              (let [book-db @(fluree/stage db book-data)
                    query   "PREFIX book: <http://example.org/book/>
