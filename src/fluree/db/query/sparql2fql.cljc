@@ -42,7 +42,7 @@
   [base-decl]
   (log/trace "handle-base-decl:" base-decl)
   (let [iriref (-> base-decl second second handle-iri-ref)]
-    {"@base" iriref}))
+    {"@base" iriref, "@vocab" iriref}))
 
 (defn handle-prefixed-name
   [prefixed-name]
@@ -52,17 +52,12 @@
 
 (defn handle-iri
   "Returns a predicate.
-  BNF -- IRIREF | PrefixedName
-
-  IRIREF not currently supported."
+  BNF -- IRIREF | PrefixedName"
   [iri]
+  (log/trace "handle-iri:" iri)
   (case (first iri)
     :PrefixedName (handle-prefixed-name (rest iri))
-
-    :IRIREF
-    (throw (ex-info (str "IRIREF not currently supported as SPARQL predicate. Provided: " iri)
-                    {:status 400
-                     :error  :db/invalid-query}))))
+    :IRIREF (handle-iri-ref (second iri))))
 
 (defn handle-rdf-literal
   "BNF -- String ( LANGTAG | ( '^^' iri ) )?"
