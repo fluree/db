@@ -481,7 +481,9 @@
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
                    results @(fluree/query book-db query {:format :sparql})]
-               (is (= :hoobajoob results))))
+               (is (= [["1" "For Whom the Bell Tolls"]
+                       ["2" "The Hitchhiker's Guide to the Galaxy"]]
+                      results))))
            (testing "PREFIX declarations go into the context"
              (let [book-db @(fluree/stage db book-data)
                    query   "PREFIX book: <http://example.org/book/>
