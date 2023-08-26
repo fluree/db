@@ -842,7 +842,7 @@
                :ex/birthYear 1984}]
              @(fluree/query db-ok-birthyear user-query))))))
 
-(deftest shacl-multiple-properties-test
+(deftest ^:integration shacl-multiple-properties-test
   (testing "multiple properties works"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
@@ -926,7 +926,7 @@
                :schema/name  "John"}]
              @(fluree/query db-ok user-query))))))
 
-(deftest property-paths
+(deftest ^:integration property-paths
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "propertypathstest" {:defaultContext [test-utils/default-str-context {"ex" "http://example.com/"}]})
         db0    (fluree/db ledger)]
@@ -1011,7 +1011,7 @@
         (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
                (ex-message invalid-princess)))))))
 
-(deftest shacl-class-test
+(deftest ^:integration shacl-class-test
   (let [conn   @(fluree/connect {:method :memory})
         ledger @(fluree/create conn "classtest" {:defaultContext test-utils/default-str-context})
         db0    (fluree/db ledger)
@@ -1077,7 +1077,7 @@
     (is (util/exception? db5))
     (is (str/starts-with? (ex-message db5) "SHACL PropertyShape exception - sh:class"))))
 
-(deftest shacl-in-test
+(deftest ^:integration shacl-in-test
   (testing "value nodes"
     (let [conn   @(fluree/connect {:method :memory
                                    :defaults
@@ -1147,7 +1147,7 @@
       (is (util/exception? db2))
       (is (str/includes? (ex-message db2) "sh:in")))))
 
-(deftest shacl-targetobjectsof-test
+(deftest ^:integration shacl-targetobjectsof-test
   (testing "subject and object of constrained predicate in the same txn"
     (testing "datatype constraint"
       (let [conn               @(fluree/connect {:method :memory
@@ -1312,7 +1312,7 @@
           (is (util/exception? db-forbidden-friend))
           (is (str/includes? (ex-message db-forbidden-friend) "data type"))))))
 
-(deftest shape-based-constraints
+(deftest ^:integration shape-based-constraints
   (testing "sh:node"
     (let [conn           @(fluree/connect {:method :memory})
           ledger         @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
@@ -1477,3 +1477,76 @@
       (is (util/exception? invalid-hand))
       (is (= "SHACL PropertyShape exception - path [[1003 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
              (ex-message invalid-hand))))))
+
+(deftest ^:integration post-processing-validation
+  (let [conn @(fluree/connect {:method :memory})
+        ledger @(fluree/create conn "post-processing" {:defaultContext [test-utils/default-str-context
+                                                                        {"ex" "http://example.com/"}]})
+        db0 (fluree/db ledger)]
+    (testing "shacl-objects-of-test"
+      (let [db1 @(fluree/stage db0
+                               [{"@id" "ex:friendShape"
+                                 "type" ["sh:NodeShape"]
+                                 "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                 "sh:property" [{"sh:path" {"@id" "ex:name"}
+                                                 "sh:datatype" {"@id" "xsd:string"}}]}])
+            db2 @(fluree/stage db1 [{"id" "ex:Bob"
+                                     "ex:name" 123
+                                     "type" "ex:User"}])
+            db-forbidden-friend @(fluree/stage db2
+                                               {"id" "ex:Alice"
+                                                "type" "ex:User"
+                                                "ex:friend" {"@id" "ex:Bob"}})]
+        (is (util/exception? db-forbidden-friend))
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+               (ex-message db-forbidden-friend)))))
+
+    (testing "shape constraints"
+      (let [db1 @(fluree/stage db0 [{"id" "ex:CoolShape"
+                                     "type" "sh:NodeShape"
+                                     "sh:property" [{"sh:path" {"id" "ex:isCool"}
+                                                     "sh:hasValue" true
+                                                     "sh:minCount" 1}]}
+                                    {"id" "ex:PersonShape"
+                                     "type" "sh:NodeShape"
+                                     "sh:targetClass" {"id" "ex:Person"}
+                                     "sh:property" [{"sh:path" {"id" "ex:cool"}
+                                                     "sh:node" {"id" "ex:CoolShape"}
+                                                     "sh:minCount" 1}]}])
+            valid-person @(fluree/stage db1 [{"id" "ex:Bob"
+                                              "type" "ex:Person"
+                                              "ex:cool" {"ex:isCool" true}}])
+            invalid-person @(fluree/stage db1 [{"id" "ex:Reto"
+                                                "type" "ex:Person"
+                                                "ex:cool" {"ex:isCool" false}}])]
+        (is (= [{"id" "ex:Bob",
+                 "type" "ex:Person",
+                 "ex:cool" {"id" "_:f211106232532997", "ex:isCool" true}}]
+               @(fluree/query valid-person {"select" {"?s" ["*" {"ex:cool" ["*"]}]}
+                                            "where" [["?s" "id" "ex:Bob"]]})))
+        (is (util/exception? invalid-person))
+        (is (= "SHACL PropertyShape exception - sh:hasValue: at least one value must be true."
+               (ex-message invalid-person)))))
+    (testing "extended path constraints"
+      (let [db1 @(fluree/stage db0 [{"id" "ex:PersonShape"
+                                     "type" "sh:NodeShape"
+                                     "sh:targetClass" {"id" "ex:Person"}
+                                     "sh:property" [{"sh:path" [{"id" "ex:cool"} {"id" "ex:dude"}]
+                                                     "sh:nodeKind" {"id" "sh:BlankNode"}
+                                                     "sh:minCount" 1}]}])
+            valid-person @(fluree/stage db1 [{"id" "ex:Bob"
+                                              "type" "ex:Person"
+                                              "ex:cool" {"ex:dude" {"ex:isBlank" true}}}])
+            invalid-person @(fluree/stage db1 [{"id" "ex:Reto"
+                                                "type" "ex:Person"
+                                                "ex:cool" {"ex:dude" {"id" "ex:Dude"
+                                                                      "ex:isBlank" false}}}])]
+        (is (= [{"id" "ex:Bob",
+                 "type" "ex:Person",
+                 "ex:cool" {"id" "_:f211106232532995",
+                            "ex:dude" {"id" "_:f211106232532996", "ex:isBlank" true}}}]
+               @(fluree/query valid-person {"select" {"?s" ["*" {"ex:cool" ["*" {"ex:dude" ["*"]}]}]}
+                                            "where" [["?s" "id" "ex:Bob"]]})))
+        (is (util/exception? invalid-person))
+        (is (= "SHACL PropertyShape exception - sh:nodekind: every value must be a blank node identifier."
+               (ex-message invalid-person)))))))

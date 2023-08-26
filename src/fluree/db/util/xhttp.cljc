@@ -93,7 +93,8 @@
          :or   {request-timeout 5000
                 keywordize-keys true}} opts
         response-chan (async/chan)
-        multipart? (contains? message :multipart)
+        multipart?    (and (map? message)
+                           (contains? message :multipart))
         headers*      (cond-> headers
                         json? (assoc "Content-Type" "application/json")
                         token (assoc "Authorization" (str "Bearer " token)))
@@ -145,7 +146,7 @@
                    (->> (:multipart message)                ;; stringify each :content key of multipart message
                         (mapv #(assoc % :content (json/stringify (:content %))))
                         (assoc message :multipart))
-                   {:body (json/stringify message)})]
+                   (json/stringify message))]
     (post url base-req (assoc opts :json? true))))
 
 

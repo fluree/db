@@ -3,6 +3,7 @@
             [fluree.db.conn.ipfs :as ipfs-conn]
             [fluree.db.conn.file :as file-conn]
             [fluree.db.conn.memory :as memory-conn]
+            [fluree.db.conn.remote :as remote-conn]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
@@ -15,6 +16,7 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
+            [fluree.json-ld :as json-ld]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
@@ -57,12 +59,17 @@
     - commit - (optional) Function to use to write commits. If persistence desired, this must be defined
     - push - (optional) Function(s) in a vector that will attempt to push the commit to naming service(s)
     "
-  [{:keys [method parallelism] :as opts}]
+  [{:keys [method parallelism remote-servers] :as opts}]
   ;; TODO - do some validation
   (promise-wrap
     (let [opts*   (assoc opts :parallelism (or parallelism 4))
-          method* (keyword method)]
+          method* (cond
+                    method (keyword method)
+                    remote-servers :remote
+                    :else (throw (ex-info (str "No Fluree connection method type specified in configuration: " opts)
+                                          {:status 500 :error :db/invalid-configuration})))]
       (case method*
+        :remote (remote-conn/connect opts*)
         :ipfs (ipfs-conn/connect opts*)
         :file (if platform/BROWSER
                 (throw (ex-info "File connection not supported in the browser" opts))
@@ -232,10 +239,19 @@
      (ledger-proto/-commit! ledger db opts))))
 
 (defn transact!
-  "Stages and commits the transaction `json-ld` to the specified `ledger`"
-  [ledger json-ld opts]
+  "Expects a conn and json-ld document containing at least the following keys:
+  `@id`: the id of the ledger to transact to
+  `@graph`: the data to be transacted
+
+  Loads the specified ledger and peforms stage and commit! operations.
+  Returns the new db.
+
+  Note: Loading the ledger results in a new ledger object, so references to existing
+  ledger objects will be rendered stale. To obtain a ledger with the new changes,
+  call `load` on the ledger alias."
+  [conn json-ld opts]
   (promise-wrap
-    (transact-api/transact! ledger json-ld opts)))
+    (transact-api/transact! conn json-ld opts)))
 
 (defn status
   "Returns current status of ledger branch."

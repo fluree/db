@@ -390,29 +390,30 @@
             "query parse error")))))
 
 (deftest ^:integration subject-object-scan-deletions
-  (let [conn (test-utils/create-conn {:defaults {:context-type :string
-                                                 :context      {"id"     "@id",
-                                                                "type"   "@type",
-                                                                "ex"     "http://example.org/",
-                                                                "f"      "https://ns.flur.ee/ledger#",
-                                                                "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                                                "schema" "http://schema.org/",
-                                                                "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
-        love (let [ledger @(fluree/create conn "test/love")]
-               @(fluree/transact! ledger
-                                  [{"@id"                "ex:fluree",
-                                    "@type"              "schema:Organization",
-                                    "schema:description" "We ❤️ Data"}
-                                   {"@id"                "ex:w3c",
-                                    "@type"              "schema:Organization",
-                                    "schema:description" "We ❤️ Internet"}
-                                   {"@id"                "ex:mosquitos",
-                                    "@type"              "ex:Monster",
-                                    "schema:description" "We ❤️ Human Blood"}]
-                                  {})
-               ledger)
-        db1  (fluree/db love)]
+  (let [conn @(fluree/connect {:method :memory
+                               :defaults {:context-type :string
+                                          :context      {"id"     "@id",
+                                                         "type"   "@type",
+                                                         "ex"     "http://example.org/",
+                                                         "f"      "https://ns.flur.ee/ledger#",
+                                                         "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                                         "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                                         "schema" "http://schema.org/",
+                                                         "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+        ledger-id  "test/love"
+        ledger @(fluree/create conn ledger-id)
+        love @(fluree/stage (fluree/db ledger)
+                            [{"@id"                "ex:fluree",
+                              "@type"              "schema:Organization",
+                              "schema:description" "We ❤️ Data"}
+                             {"@id"                "ex:w3c",
+                              "@type"              "schema:Organization",
+                              "schema:description" "We ❤️ Internet"}
+                             {"@id"                "ex:mosquitos",
+                              "@type"              "ex:Monster",
+                              "schema:description" "We ❤️ Human Blood"}]
+                            {})
+        db1 @(fluree/commit! ledger love)]
     (testing "before deletion"
       (let [q       '{:select [?s ?p ?o]
                       :where  [[?s "schema:description" ?o]
@@ -424,12 +425,15 @@
                subject)
             "returns all results")))
     (testing "after deletion"
-      @(fluree/transact! love
-                         '{:delete [?s ?p ?o]
-                           :where  [[?s "schema:description" ?o]
-                                    [?s ?p ?o]]}
-                         {})
-      (let [db2     (fluree/db love)
+      @(fluree/transact!  conn
+                          {:context {:id "@id"
+                                     :graph "@graph"}
+                           :id ledger-id
+                           :graph {:delete '[?s ?p ?o]
+                                   :where  '[[?s "schema:description" ?o]
+                                             [?s ?p ?o]]}}
+                          {})
+      (let [db2   (fluree/db @(fluree/load conn ledger-id))
             q       '{:select [?s ?p ?o]
                       :where  [[?s "schema:description" ?o]
                                [?s ?p ?o]]}

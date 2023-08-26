@@ -45,6 +45,7 @@
 (def ^:const iri-target-objects-of "https://ns.flur.ee/ledger#targetObjectsOf")
 (def ^:const iri-property "https://ns.flur.ee/ledger#property")
 (def ^:const iri-policy "https://ns.flur.ee/ledger#Policy")
+(def ^:const iri-opts "https://ns.flur.ee/ledger#opts")
 (def ^:const iri-path "https://ns.flur.ee/ledger#path")
 (def ^:const iri-action "https://ns.flur.ee/ledger#action")
 (def ^:const iri-all-nodes "https://ns.flur.ee/ledger#allNodes")
