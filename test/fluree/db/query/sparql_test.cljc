@@ -315,7 +315,8 @@
                                      {:defaultContext
                                       ["" {"person" "http://example.org/Person#"}]})
                       deref
-                      (fluree/transact! people-data nil)
+                      fluree/db
+                      (fluree/stage people-data)
                       deref)]
          (testing "keyword context-type throws an error"
            (let [kw-conn @(fluree/connect {:method   :memory
