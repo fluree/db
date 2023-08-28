@@ -29,10 +29,10 @@
   [match db iri-cache compact error-ch]
   (go
     (let [v (::where/val match)]
-      (if-let [cached (get @iri-cache v)]
+      (if-let [cached (-> @iri-cache (get v) :as)]
         cached
         (try* (let [iri (<? (dbproto/-iri db v compact))]
-                (vswap! iri-cache assoc v iri)
+                (vswap! iri-cache assoc v {:as iri})
                 iri)
               (catch* e
                       (log/error e "Error displaying iri:" v)
