@@ -309,7 +309,8 @@
 
 
 (defn query
-  ([db q] (query db q {:format :fql}))
+  "Queries a db value and returns a promise with the results."
+  ([db q] (query db q {}))
   ([db q opts]
    (promise-wrap (query-api/query db q opts))))
 

@@ -146,7 +146,7 @@
       (<? (query-fql db fql)))))
 
 (defn query
-  [db query {:keys [format] :as _opts}]
+  [db query {:keys [format] :as _opts :or {format :fql}}]
   (case format
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
