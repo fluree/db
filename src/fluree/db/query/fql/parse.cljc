@@ -401,12 +401,12 @@
   [db context depth s]
   (cond
     (v/variable? s) (-> s parse-var-name select/variable-selector)
-    (v/as-fn? s) (let [parsed-fn  (parse-code s)
-                       fn-name    (some-> parsed-fn second first)
-                       bind-var   (last parsed-fn)
-                       aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
-                   (-> parsed-fn (log/debug->val "parsed as code:")
-                       eval/compile (select/as-selector bind-var aggregate?)))
+    (v/as-fn? s)    (let [parsed-fn  (parse-code s)
+                          fn-name    (some-> parsed-fn second first)
+                          bind-var   (last parsed-fn)
+                          aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+                      (-> parsed-fn (log/debug->val "parsed as code:")
+                          eval/compile (select/as-selector bind-var aggregate?)))
     (v/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
     (select-map? s) (let [{:keys [variable selection depth spec]}
                           (parse-subselection db context s depth)]
