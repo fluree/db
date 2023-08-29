@@ -1,5 +1,6 @@
 (ns fluree.db.validation
-  (:require [fluree.db.util.core :refer [pred-ident?]]
+  (:require [clojure.string :as str]
+            [fluree.db.util.core :refer [pred-ident?]]
             [fluree.db.constants :as const]
             [malli.core :as m]
             [malli.error :as me]))
@@ -54,6 +55,11 @@
 (defn query-fn?
   [x]
   (or (fn-string? x) (fn-list? x)))
+
+(defn as-fn?
+  [x]
+  (or (and (fn-string? x) (str/starts-with? x "(as "))
+      (and (fn-list? x) (-> x first (= 'as)))))
 
 (defn humanize-error
   [error]

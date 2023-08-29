@@ -765,7 +765,7 @@
                :schema/name "John"}]
              @(fluree/query db-ok-str user-query)))
       (is (= [{:id          :ex/john
-               :type    :ex/User
+               :type        :ex/User
                :schema/name 12345}]
              @(fluree/query db-ok-non-str user-query))))))
 

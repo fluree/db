@@ -88,9 +88,9 @@
                        :time   (util/response-time-formatted start-time)
                        :fuel   (fuel/tally fuel-tracker)})
                     (catch* e
-                            (throw (ex-info "Error updating ledger"
-                                            (-> e
-                                                ex-data
-                                                (assoc :time (util/response-time-formatted start-time)
-                                                       :fuel (fuel/tally fuel-tracker))))))))
+                      (throw (ex-info "Error updating ledger"
+                                      (-> e
+                                          ex-data
+                                          (assoc :time (util/response-time-formatted start-time)
+                                                 :fuel (fuel/tally fuel-tracker))))))))
             (<? (tx/transact! ledger txn opts*))))))))

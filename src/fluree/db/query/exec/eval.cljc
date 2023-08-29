@@ -1,12 +1,13 @@
 (ns fluree.db.query.exec.eval
-  (:refer-clojure :exclude [compile rand concat replace])
+  (:refer-clojure :exclude [compile rand concat replace max min
+                            #?(:clj ratio? :cljs uuid)])
   (:require [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.where :as where]
             [fluree.db.util.log :as log]
             [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :refer [postwalk]]
-            [clojure.math :as math]
+            [clojure.math]
             [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
             [fluree.db.constants :as const])
@@ -14,36 +15,58 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(defn ratio?
+  [x]
+  #?(:clj  (clojure.core/ratio? x)
+     :cljs false)) ; ClojureScript doesn't support ratios
+
 (defn sum
   [coll]
   (reduce + 0 coll))
 
 (defn avg
   [coll]
-  (/ (sum coll)
-     (count coll)))
+  (let [res (/ (sum coll)
+               (count coll))]
+    (if (ratio? res)
+      (double res)
+      res)))
 
 (defn median
   [coll]
   (let [terms (sort coll)
         size  (count coll)
-        med   (bit-shift-right size 1)]
-    (cond-> (nth terms med)
-      (even? size)
-      (-> (+ (nth terms (dec med)))
-          (/ 2)))))
+        med   (bit-shift-right size 1)
+        res   (cond-> (nth terms med)
+                      (even? size)
+                      (-> (+ (nth terms (dec med)))
+                          (/ 2)))]
+    (if (ratio? res)
+      (double res)
+      res)))
 
 (defn variance
   [coll]
   (let [mean (avg coll)
         sum  (sum (for [x coll
                         :let [delta (- x mean)]]
-                    (* delta delta)))]
-    (/ sum (count coll))))
+                    (* delta delta)))
+        res  (/ sum (count coll))]
+    (if (ratio? res)
+      (double res)
+      res)))
 
 (defn stddev
   [coll]
   (Math/sqrt (variance coll)))
+
+(defn max
+  [coll]
+  (apply clojure.core/max coll))
+
+(defn min
+  [coll]
+  (apply clojure.core/min coll))
 
 (defn ceil
   [n]
@@ -69,9 +92,13 @@
        (take n)
        vec))
 
+(defn sample1
+  [coll]
+  (->> coll (sample 1) first))
+
 (def allowed-aggregate-fns
   '#{avg ceil count count-distinct distinct floor groupconcat
-     median max min rand sample stddev str sum variance})
+     median max min rand sample sample1 stddev str sum variance})
 
 (defmacro coalesce
   "Evaluates args in order. The result of the first arg not to return error gets returned."
@@ -106,7 +133,7 @@
 
 (defn now
   []
-  #?(:clj (str (Instant/now))
+  #?(:clj  (str (Instant/now))
      :cljs (.toISOString (js/Date.))))
 
 (defn strStarts
@@ -123,8 +150,7 @@
    (subs s (dec start)))
   ([s start length]
    (let [start (dec start)]
-     (subs s start (min (+ start length)
-                        (count s))))))
+     (subs s start (clojure.core/min (+ start length) (count s))))))
 
 (defn strLen
   [s]
@@ -175,44 +201,44 @@
 (defn year
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getYear ^LocalDateTime datetime)
+    #?(:clj  (.getYear ^LocalDateTime datetime)
        :cljs (.getFullYear datetime))))
 
 (defn month
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getMonthValue ^LocalDateTime datetime)
+    #?(:clj  (.getMonthValue ^LocalDateTime datetime)
        :cljs (.getMonth datetime))))
 
 (defn day
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getDayOfMonth ^LocalDateTime datetime)
+    #?(:clj  (.getDayOfMonth ^LocalDateTime datetime)
        :cljs (.getDate datetime))))
 
 (defn hours
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getHour ^LocalDateTime datetime)
+    #?(:clj  (.getHour ^LocalDateTime datetime)
        :cljs (.getHours datetime))))
 
 (defn minutes
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getMinute ^LocalDateTime datetime)
+    #?(:clj  (.getMinute ^LocalDateTime datetime)
        :cljs (.getMinutes datetime))))
 
 (defn seconds
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.getSecond ^LocalDateTime datetime)
+    #?(:clj  (.getSecond ^LocalDateTime datetime)
        :cljs (.getSeconds datetime))))
 
 (defn tz
   [datetime-string]
   (let [datetime (datatype/coerce datetime-string const/$xsd:dateTime)]
-    #?(:clj (.toString (.getOffset ^OffsetDateTime datetime))
-       :cljs (.getTimeZoneOffset datetime))))
+    #?(:clj  (.toString (.getOffset ^OffsetDateTime datetime))
+       :cljs (.getTimeZoneOffset ^js/Date datetime))))
 
 (defn sha256
   [x]
@@ -244,7 +270,7 @@
   (str x))
 
 (def allowed-scalar-fns
-  '#{ && || ! > < >= <= = + - * / quot and bound coalesce if nil?
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if nil? as
      not not= or re-find re-pattern
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
@@ -267,6 +293,7 @@
     ||          fluree.db.query.exec.eval/||
     &&          fluree.db.query.exec.eval/&&
     abs         clojure.core/abs
+    as          fluree.db.query.exec.eval/as
     avg         fluree.db.query.exec.eval/avg
     bound       fluree.db.query.exec.eval/bound
     ceil        fluree.db.query.exec.eval/ceil
@@ -284,6 +311,7 @@
     replace     fluree.db.query.exec.eval/replace
     round       clojure.math/round
     sample      fluree.db.query.exec.eval/sample
+    sample1     fluree.db.query.exec.eval/sample1
     stddev      fluree.db.query.exec.eval/stddev
     strAfter    fluree.db.query.exec.eval/strAfter
     strBefore   fluree.db.query.exec.eval/strBefore
@@ -307,7 +335,9 @@
     struuid     fluree.db.query.exec.eval/struuid
     isNumeric   fluree.db.query.exec.eval/isNumeric
     isBlank     fluree.db.query.exec.eval/isBlank
-    str         fluree.db.query.exec.eval/sparql-str})
+    str         fluree.db.query.exec.eval/sparql-str
+    max         fluree.db.query.exec.eval/max
+    min         fluree.db.query.exec.eval/min})
 
 
 (defn variable?
@@ -317,6 +347,21 @@
            name
            first
            (= \?))))
+
+(defn as*
+  [val var]
+  (log/trace "as binding value:" val "to variable:" var)
+  (if (variable? var)
+    val ; only needs to return the value b/c we store the binding variable in the AsSelector
+    (throw
+     (ex-info
+      (str "second arg to `as` must be a query variable (e.g. ?foo); provided:"
+           (pr-str var))
+      {:status 400, :error :db/invalid-query}))))
+
+(defmacro as
+  [val var]
+  `(as* ~val '~var))
 
 (defn symbols
   [code]
@@ -381,7 +426,8 @@
          soln-sym       'solution
          bdg            (bind-variables soln-sym vars)
          fn-code        `(fn [~soln-sym]
-                           (log/debug "fn solution:" ~soln-sym)
+                           (log/trace "fn solution:" ~soln-sym)
+                           (log/trace "fn bindings:" (quote ~bdg))
                            (let ~bdg
                              ~qualified-code))]
      (log/debug "compiled fn:" fn-code)

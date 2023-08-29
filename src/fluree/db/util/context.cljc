@@ -25,7 +25,7 @@
                   (if default-context
                     (merge acc default-context)
                     (throw (ex-info (str "Context uses a default context with empty string (''), "
-                                         "but not default context provided.")
+                                         "but no default context provided.")
                                     {:status 400
                                      :error  :db/invalid-context})))
 

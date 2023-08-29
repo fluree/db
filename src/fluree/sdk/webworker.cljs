@@ -117,7 +117,8 @@
     (when flureeql
       (async/go
         (let [db  (conn-id->db conn-id (:forceTime opts'))
-              res (async/<! (q/query db (assoc flureeql :opts opts')))
+              res (async/<! (q/query db (assoc flureeql :opts opts')
+                                     {:format :fql}))
               ret (if (util/exception? res)
                     (error-return-map res)
                     {:result res :status "loaded"})]
