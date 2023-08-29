@@ -398,12 +398,9 @@
   type. Value coercion is only attempted when a required-type is supplied."
   [{:keys [type value] :as _value-map} required-type]
   (let [type-id (if type (get default-data-types type) (infer value))
-        to-type (if required-type required-type type-id)
-        value*  (coerce value to-type)]
-    (cond
-      (nil? value*)
+        to-type (if required-type required-type type-id)]
+    (if-let [value* (coerce value to-type)]
+      [value* to-type]
       (throw (ex-info (str "Data type " to-type
                            " cannot be coerced from provided value: " value ".")
-                      {:status 400 :error, :db/shacl-value-coercion}))
-
-      :else [value* to-type])))
+                      {:status 400 :error, :db/shacl-value-coercion})))))
