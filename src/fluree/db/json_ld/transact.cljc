@@ -111,7 +111,7 @@
                                                      (shacl/validate-simple-property-constraints p-shape flakes))
                                                    p-shapes)))
                                    shape->p-shapes))]
-      (when (not valid?)
+      (when-not valid?
         (shacl/throw-shacl-exception err-msg))
       (into flakes retractions))))
 
