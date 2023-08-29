@@ -825,7 +825,8 @@
   (boolean (:target-class shape)))
 
 (defn add-advanced-validation-lookup
-  "Constructs a map "
+  "Constructs a map to facilitate the retrieval of advanced-validation p-shapes during
+  property additions."
   [shape advanced-eligible-p-shapes]
   (let [pid->shape->p-shapes (reduce (fn [pid->shape->p-shapes p-shape]
                                        (update-in pid->shape->p-shapes [(-> p-shape :path ffirst) (:id shape)]
