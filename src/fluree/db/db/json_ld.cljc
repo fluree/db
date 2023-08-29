@@ -263,7 +263,8 @@
   (-context [_ context] (retrieve-context default-context context-cache context context-type))
   (-context [_ context type] (retrieve-context default-context context-cache context (or type context-type)))
   (-default-context [_] default-context)
-  (-default-context-update [db default-context] (default-context-update db default-context)))
+  (-default-context-update [db default-context] (default-context-update db default-context))
+  (-context-type [_] context-type))
 
 #?(:cljs
    (extend-type JsonLdDb

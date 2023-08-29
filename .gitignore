@@ -29,9 +29,9 @@ package-lock.json
 .dir-locals.el
 .cljs_node_repl
 .shadow-cljs
-/js-packages/browser/flureedb.js
-/js-packages/nodejs/flureenjs.js
-/js-packages/webworker/flureeworker.js
+/js-packages/browser/fluree-browser-sdk.js
+/js-packages/nodejs/fluree-node-sdk.js
+/js-packages/webworker/fluree-webworker.js
 **cljs-runtime
 **report.html
 test/nodejs/store

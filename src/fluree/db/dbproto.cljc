@@ -18,7 +18,8 @@
   (-index-update [db commit-index] "Updates db to reflect a new index point described by commit-index metadata")
   (-context [db] [db context] [db context context-type] "Returns parsed context given supplied context. If no context is supplied, returns default context.")
   (-default-context [db] "Returns the default context the db is configured to use.")
-  (-default-context-update [db new-default] "Updates the default context, so it will get written on out the next commit."))
+  (-default-context-update [db new-default] "Updates the default context, so it will get written on out the next commit.")
+  (-context-type [db] "Returns the db's context-type; :keyword or :string"))
 
 (defn db?
   [db]

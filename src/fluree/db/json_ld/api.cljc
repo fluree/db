@@ -309,8 +309,10 @@
 
 
 (defn query
-  [db query]
-  (promise-wrap (query-api/query db query)))
+  "Queries a db value and returns a promise with the results."
+  ([db q] (query db q {}))
+  ([db q opts]
+   (promise-wrap (query-api/query db q opts))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit

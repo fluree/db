@@ -124,3 +124,7 @@ clean:
 	rm -rf docs/*.html
 	rm -rf node_modules
 	rm -rf test/nodejs/store
+	rm -rf .shadow-cljs
+	rm -rf js-packages/browser/fluree-browser-sdk.js
+	rm -rf js-packages/nodejs/fluree-node-sdk.js
+	rm -rf js-packages/webworker/fluree-webworker.js
