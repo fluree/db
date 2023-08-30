@@ -87,38 +87,37 @@
           user-query   {:select {'?s [:*]}
                         :where  [['?s :type :ex/User]]}
           db           @(fluree/stage
-                         (fluree/db ledger)
-                         {:id             :ex/UserShape
-                          :type           :sh/NodeShape
-                          :sh/targetClass :ex/User
-                          :sh/property    [{:sh/path     :schema/name
-                                            :sh/datatype :xsd/string}]})
+                          (fluree/db ledger)
+                          {:id             :ex/UserShape
+                           :type           :sh/NodeShape
+                           :sh/targetClass :ex/User
+                           :sh/property    [{:sh/path     :schema/name
+                                             :sh/datatype :xsd/string}]})
           db-ok        @(fluree/stage
-                         db
-                         {:id          :ex/john
-                          :type        :ex/User
-                          :schema/name "John"})
-          ; no :schema/name
-          db-int-name  (try
-                         @(fluree/stage
-                           db
-                           {:id          :ex/john
-                            :type        :ex/User
-                            :schema/name 42})
-                         (catch Exception e e))
-          db-bool-name (try
-                         @(fluree/stage
-                           db
-                           {:id          :ex/john
-                            :type        :ex/User
-                            :schema/name true})
-                         (catch Exception e e))]
+                          db
+                          {:id          :ex/john
+                           :type        :ex/User
+                           :schema/name "John"})
+          ;; no :schema/name
+          db-int-name  @(fluree/stage
+                          db
+                          {:id          :ex/john
+                           :type        :ex/User
+                           :schema/name 42})
+          db-bool-name @(fluree/stage
+                          db
+                          {:id          :ex/john
+                           :type        :ex/User
+                           :schema/name true})
+          ]
       (is (util/exception? db-int-name)
           "Exception, because :schema/name is an integer and not a string.")
-      (is (str/starts-with? (ex-message db-int-name) "Data type"))
+      (is (= "Data type 1 cannot be coerced from provided value: 42."
+             (ex-message db-int-name)))
       (is (util/exception? db-bool-name)
           "Exception, because :schema/name is a boolean and not a string.")
-      (is (str/starts-with? (ex-message db-bool-name) "Data type"))
+      (is (= "Data type 1 cannot be coerced from provided value: true."
+             (ex-message db-bool-name)))
       (is (= @(fluree/query db-ok user-query)
              [{:id          :ex/john
                :type    :ex/User
@@ -156,8 +155,8 @@
                              :schema/email "john@flur.ee"})
                           (catch Exception e e))]
       (is (util/exception? db-extra-prop))
-      (is (str/starts-with? (ex-message db-extra-prop)
-                            "SHACL shape is closed"))
+      (is (= "SHACL shape is closed, extra properties not allowed: [1003]"
+             (ex-message db-extra-prop)))
 
       (is (= [{:id          :ex/john
                :type    :ex/User
@@ -196,8 +195,8 @@
                              (catch Exception e e))]
           (is (util/exception? db-not-equal)
               "Exception, because :schema/name does not equal :ex/firstName")
-          (is (str/starts-with? (ex-message db-not-equal)
-                                "SHACL PropertyShape exception - sh:equals"))
+          (is (= "SHACL PropertyShape exception - sh:equals: [\"John\"] not equal to [\"Jack\"]."
+                 (ex-message db-not-equal)))
 
           (is (= [{:id           :ex/alice
                    :type     :ex/User
@@ -266,20 +265,20 @@
                               (catch Exception e e))]
           (is (util/exception? db-not-equal1)
               "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (str/starts-with? (ex-message db-not-equal1)
-                                "SHACL PropertyShape exception - sh:equals"))
+          (is (= (ex-message db-not-equal1)
+                 "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [13 18]."))
           (is (util/exception? db-not-equal2)
               "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (str/starts-with? (ex-message db-not-equal2)
-                                "SHACL PropertyShape exception - sh:equals"))
+          (is (= "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [11]."
+                 (ex-message db-not-equal2)))
           (is (util/exception? db-not-equal3)
               "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (str/starts-with? (ex-message db-not-equal3)
-                                "SHACL PropertyShape exception - sh:equals"))
+          (is (= "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [11 17 18]."
+                 (ex-message db-not-equal3)))
           (is (util/exception? db-not-equal4)
               "Exception, because :ex/favNums does not equal :ex/luckyNums")
-          (is (str/starts-with? (ex-message db-not-equal4)
-                                "SHACL PropertyShape exception - sh:equals"))
+          (is (= "SHACL PropertyShape exception - sh:equals: [11 17] not equal to [\"11\" \"17\"]."
+                 (ex-message db-not-equal4)))
           (is (= [{:id           :ex/alice
                    :type     :ex/User
                    :schema/name  "Alice"
@@ -338,19 +337,19 @@
                                  (catch Exception e e))]
           (is (util/exception? db-not-disjoint1)
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (str/starts-with? (ex-message db-not-disjoint1)
-                                "SHACL PropertyShape exception - sh:disjoint"))
+          (is (= "SHACL PropertyShape exception - sh:disjoint: [11] not disjoint from [11]."
+                 (ex-message db-not-disjoint1)))
 
           (is (util/exception? db-not-disjoint2)
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (str/starts-with? (ex-message db-not-disjoint2)
-                                "SHACL PropertyShape exception - sh:disjoint"))
+          (is (= "SHACL PropertyShape exception - sh:disjoint: [11 17 31] not disjoint from [11]."
+                 (ex-message db-not-disjoint2)))
 
 
           (is (util/exception? db-not-disjoint3)
               "Exception, because :ex/favNums is not disjoint from :ex/luckyNums")
-          (is (str/starts-with? (ex-message db-not-disjoint3)
-                                "SHACL PropertyShape exception - sh:disjoint"))
+          (is (= "SHACL PropertyShape exception - sh:disjoint: [11 17 31] not disjoint from [11 13 18]."
+                 (ex-message db-not-disjoint3)))
 
           (is (= [{:id           :ex/alice
                    :type     :ex/User
@@ -433,29 +432,29 @@
                             (catch Exception e e))]
           (is (util/exception? db-fail1)
               "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (str/starts-with? (ex-message db-fail1)
-                                "SHACL PropertyShape exception - sh:lessThan"))
+          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 17, or values are not valid for comparison."
+                 (ex-message db-fail1)))
 
 
           (is (util/exception? db-fail2)
               "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (str/starts-with? (ex-message db-fail2)
-                                "SHACL PropertyShape exception - sh:lessThan"))
+          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 19, or values are not valid for comparison; sh:lessThan: 17 not less than 18, or values are not valid for comparison; sh:lessThan: 11 not less than 19, or values are not valid for comparison; sh:lessThan: 11 not less than 18, or values are not valid for comparison."
+                 (ex-message db-fail2)))
 
           (is (util/exception? db-fail3)
               "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (str/starts-with? (ex-message db-fail3)
-                                "SHACL PropertyShape exception - sh:lessThan"))
+          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 10, or values are not valid for comparison; sh:lessThan: 12 not less than 10, or values are not valid for comparison."
+                 (ex-message db-fail3)))
 
           (is (util/exception? db-fail4)
               "Exception, because :ex/p1 is not less than :ex/p2")
-          (is (str/starts-with? (ex-message db-fail4)
-                                "SHACL PropertyShape exception - sh:lessThan"))
+          (is (= "SHACL PropertyShape exception - sh:lessThan: 17 not less than 16, or values are not valid for comparison; sh:lessThan: 17 not less than 12, or values are not valid for comparison."
+                 (ex-message db-fail4)))
 
           (is (util/exception? db-iris)
               "Exception, because :ex/p1 and :ex/p2 are iris, and not valid for comparison")
-          (is (str/starts-with? (ex-message db-iris)
-                                "SHACL PropertyShape exception - sh:lessThan"))
+          (is (= "SHACL PropertyShape exception - sh:lessThan: 211106232532995 not less than 211106232532996, or values are not valid for comparison."
+                 (ex-message db-iris)))
 
           (is (= [{:id          :ex/alice
                    :type    :ex/User
@@ -536,24 +535,24 @@
 
           (is (util/exception? db-fail1)
               "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (str/starts-with? (ex-message db-fail1)
-                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 10, or values are not valid for comparison; sh:lessThanOrEquals: 11 not less than or equal to 10, or values are not valid for comparison."
+                 (ex-message db-fail1)))
 
 
           (is (util/exception? db-fail2)
               "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (str/starts-with? (ex-message db-fail2)
-                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 19, or values are not valid for comparison; sh:lessThanOrEquals: 17 not less than or equal to 17, or values are not valid for comparison; sh:lessThanOrEquals: 11 not less than or equal to 19, or values are not valid for comparison; sh:lessThanOrEquals: 11 not less than or equal to 17, or values are not valid for comparison."
+                 (ex-message db-fail2)))
 
           (is (util/exception? db-fail3)
               "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (str/starts-with? (ex-message db-fail3)
-                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 10, or values are not valid for comparison; sh:lessThanOrEquals: 12 not less than or equal to 10, or values are not valid for comparison."
+                 (ex-message db-fail3)))
 
           (is (util/exception? db-fail4)
               "Exception, because :ex/p1 is not less than or equal to :ex/p2")
-          (is (str/starts-with? (ex-message db-fail4)
-                                "SHACL PropertyShape exception - sh:lessThanOrEquals"))
+          (is (= "SHACL PropertyShape exception - sh:lessThanOrEquals: 17 not less than or equal to 16, or values are not valid for comparison; sh:lessThanOrEquals: 17 not less than or equal to 12, or values are not valid for comparison."
+                 (ex-message db-fail4)))
           (is (= [{:id          :ex/alice
                    :type    :ex/User
                    :schema/name "Alice"
@@ -601,13 +600,13 @@
                                (catch Exception e e))]
           (is (util/exception? db-too-low)
               "Exception, because :schema/age is below the minimum")
-          (is (str/starts-with? (ex-message db-too-low)
-                                "SHACL PropertyShape exception - sh:minExclusive: value 1"))
+          (is (= "SHACL PropertyShape exception - sh:minExclusive: value 1 is either non-numeric or lower than exclusive minimum of 1."
+                 (ex-message db-too-low)))
 
           (is (util/exception? db-too-high)
               "Exception, because :schema/age is above the maximum")
-          (is (str/starts-with? (ex-message db-too-high)
-                                "SHACL PropertyShape exception - sh:maxExclusive: value 100"))
+          (is (= "SHACL PropertyShape exception - sh:maxExclusive: value 100 is either non-numeric or higher than exclusive maximum of 100."
+                 (ex-message db-too-high)))
 
           (is (= @(fluree/query db-ok user-query)
                  [{:id         :ex/john
@@ -644,13 +643,13 @@
                              :schema/age 101})]
           (is (util/exception? db-too-low)
               "Exception, because :schema/age is below the minimum")
-          (is (str/starts-with? (ex-message db-too-low)
-                                "SHACL PropertyShape exception - sh:minInclusive: value 0"))
+          (is (= "SHACL PropertyShape exception - sh:minInclusive: value 0 is either non-numeric or lower than minimum of 1."
+                 (ex-message db-too-low)))
 
           (is (util/exception? db-too-high)
               "Exception, because :schema/age is above the maximum")
-          (is (str/starts-with? (ex-message db-too-high)
-                                "SHACL PropertyShape exception - sh:maxInclusive: value 101"))
+          (is (= "SHACL PropertyShape exception - sh:maxInclusive: value 101 is either non-numeric or higher than maximum of 100."
+                 (ex-message db-too-high)))
           (is (= @(fluree/query db-ok2 user-query)
                  [{:id         :ex/alice
                    :type   :ex/User
@@ -680,13 +679,13 @@
                               (catch Exception e e))]
           (is (util/exception? db-subj-id)
               "Exception, because :schema/age is not a number")
-          (is (str/starts-with? (ex-message db-string)
-                                "SHACL PropertyShape exception - sh:minExclusive"))
+          (is (= "SHACL PropertyShape exception - sh:minExclusive: value 10 is either non-numeric or lower than exclusive minimum of 0."
+                 (ex-message db-string)))
 
           (is (util/exception? db-string)
               "Exception, because :schema/age is not a number")
-          (is (str/starts-with? (ex-message db-string)
-                                "SHACL PropertyShape exception - sh:minExclusive: value 10")))))))
+          (is (= "SHACL PropertyShape exception - sh:minExclusive: value 10 is either non-numeric or lower than exclusive minimum of 0."
+                 (ex-message db-string))))))))
 
 (deftest ^:integration shacl-string-length-constraints
   (testing "shacl string length constraint errors"
@@ -746,20 +745,20 @@
                                 (catch Exception e e))]
       (is (util/exception? db-too-short-str)
           "Exception, because :schema/name is shorter than minimum string length")
-      (is (str/starts-with? (ex-message db-too-short-str)
-                            "SHACL PropertyShape exception - sh:minLength"))
+      (is (= "SHACL PropertyShape exception - sh:minLength: value Al has string length smaller than minimum: 4 or it is not a literal value."
+             (ex-message db-too-short-str)))
       (is (util/exception? db-too-long-str)
           "Exception, because :schema/name is longer than maximum string length")
-      (is (str/starts-with? (ex-message db-too-long-str)
-                            "SHACL PropertyShape exception - sh:maxLength"))
+      (is (= "SHACL PropertyShape exception - sh:maxLength: value Jean-Claude has string length larger than 10 or it is not a literal value."
+             (ex-message db-too-long-str)))
       (is (util/exception? db-too-long-non-str)
           "Exception, because :schema/name is longer than maximum string length")
-      (is (str/starts-with? (ex-message db-too-long-non-str)
-                            "SHACL PropertyShape exception - sh:maxLength"))
+      (is (= "SHACL PropertyShape exception - sh:maxLength: value 12345678910 has string length larger than 10 or it is not a literal value."
+             (ex-message db-too-long-non-str)))
       (is (util/exception? db-ref-value)
           "Exception, because :schema/name is not a literal value")
-      (is (str/starts-with? (ex-message db-ref-value)
-                            "SHACL PropertyShape exception - sh:maxLength:"))
+      (is (= "SHACL PropertyShape exception - sh:maxLength: value 211106232532995 has string length larger than 10 or it is not a literal value; sh:minLength: value 211106232532995 has string length smaller than minimum: 4 or it is not a literal value; sh:maxLength: value http://example.org/ns/ref has string length larger than 10 or it is not a literal value."
+             (ex-message db-ref-value)))
       (is (= [{:id          :ex/john
                :type    :ex/User
                :schema/name "John"}]
@@ -821,18 +820,20 @@
                                    (catch Exception e e))]
       (is (util/exception? db-wrong-case-greeting)
           "Exception, because :ex/greeting does not match pattern")
-      (is (str/starts-with? (ex-message db-wrong-case-greeting)
-                            "SHACL PropertyShape exception - sh:pattern"))
-      (is (str/includes? (ex-message db-wrong-case-greeting)
-                         "with provided sh:flags: [\"s\" \"x\"]"))
+      (is (= "SHACL PropertyShape exception - sh:pattern: value HELLO
+WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"s\" \"x\"] or it is not a literal value."
+             (ex-message db-wrong-case-greeting)))
+      (is (= "SHACL PropertyShape exception - sh:pattern: value HELLO
+WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"s\" \"x\"] or it is not a literal value."
+             (ex-message db-wrong-case-greeting)))
       (is (util/exception? db-wrong-birth-year)
           "Exception, because :ex/birthYear does not match pattern")
-      (is (str/starts-with? (ex-message db-wrong-birth-year)
-                            "SHACL PropertyShape exception - sh:pattern"))
+      (is (= "SHACL PropertyShape exception - sh:pattern: value 1776 does not match pattern \"(19|20)[0-9][0-9]\" or it is not a literal value."
+             (ex-message db-wrong-birth-year)))
       (is (util/exception? db-ref-value)
           "Exception, because :schema/name is not a literal value")
-      (is (str/starts-with? (ex-message db-ref-value)
-                            "SHACL PropertyShape exception - sh:pattern:"))
+      (is (= "SHACL PropertyShape exception - sh:pattern: value 211106232532996 does not match pattern \"(19|20)[0-9][0-9]\" or it is not a literal value; sh:pattern: value http://example.org/ns/ref does not match pattern \"(19|20)[0-9][0-9]\" or it is not a literal value."
+             (ex-message db-ref-value)))
       (is (= [{:id          :ex/brian
                :type    :ex/User
                :ex/greeting "hello\nworld!"}]
@@ -918,7 +919,8 @@
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message db-two-ages)))
       (is (util/exception? db-num-email))
-      (is (str/starts-with? (ex-message db-num-email) "Data type"))
+      (is (= "Data type 1 cannot be coerced from provided value: 42."
+             (ex-message db-num-email)))
       (is (= [{:id           :ex/john
                :type     :ex/User
                :schema/age   40
@@ -1073,9 +1075,11 @@
     (is (not (util/exception? db2)))
     (is (not (util/exception? db3)))
     (is (util/exception? db4))
-    (is (str/starts-with? (ex-message db4) "SHACL PropertyShape exception - sh:class"))
+    (is (= "SHACL PropertyShape exception - sh:class: class(es) #{1001} must be same set as #{1006}."
+           (ex-message db4)))
     (is (util/exception? db5))
-    (is (str/starts-with? (ex-message db5) "SHACL PropertyShape exception - sh:class"))))
+    (is (= "SHACL PropertyShape exception - sh:class: class(es) #{1001} must be same set as #{1006}."
+           (ex-message db5)))))
 
 (deftest ^:integration shacl-in-test
   (testing "value nodes"
@@ -1093,7 +1097,8 @@
                                      "type"     "ex:Pony"
                                      "ex:color" "yellow"})]
       (is (util/exception? db2))
-      (is (str/includes? (ex-message db2) "sh:in"))))
+      (is (= "SHACL PropertyShape exception - sh:in: value must be one of [\"cyan\" \"magenta\"]."
+             (ex-message db2)))))
   (testing "node refs"
     (let [conn   @(fluree/connect {:method :memory
                                    :defaults
@@ -1120,7 +1125,8 @@
                                       "ex:color" [{"id" "ex:Pink"}
                                                   {"id" "ex:Purple"}]}])]
       (is (util/exception? db2))
-      (is (str/includes? (ex-message db2) "sh:in"))
+      (is (= "SHACL PropertyShape exception - sh:in: value must be one of [211106232532994 211106232532995]."
+             (ex-message db2)))
 
       (is (not (util/exception? db3)))
       (is (= [{"id"       "ex:PastelPony"
@@ -1145,7 +1151,8 @@
                                       "ex:color" [{"id" "ex:Pink"}
                                                   {"id" "ex:Green"}]}])]
       (is (util/exception? db2))
-      (is (str/includes? (ex-message db2) "sh:in")))))
+      (is (= "SHACL PropertyShape exception - sh:in: value must be one of [211106232532994 211106232532995 \"green\"]."
+             (ex-message db2))))))
 
 (deftest ^:integration shacl-targetobjectsof-test
   (testing "subject and object of constrained predicate in the same txn"
@@ -1170,7 +1177,8 @@
                                                 "ex:name" 123
                                                 "type"    "ex:User"}])]
         (is (util/exception? db-bad-friend-name))
-        (is (str/includes? (ex-message db-bad-friend-name) "Data type"))))
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+               (ex-message db-bad-friend-name)))))
     (testing "maxCount"
       (let [conn          @(fluree/connect {:method :memory
                                             :defaults
@@ -1193,7 +1201,8 @@
                                                      "222-22-2222"]
                                            "type"   "ex:User"}])]
         (is (util/exception? db-excess-ssn))
-        (is (str/includes? (ex-message db-excess-ssn) "sh:maxCount"))))
+        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+               (ex-message db-excess-ssn)))))
     (testing "required properties"
       (let [conn          @(fluree/connect {:method :memory
                                             :defaults
@@ -1212,7 +1221,8 @@
                                            "type"      "ex:User"
                                            "ex:friend" {"@id" "ex:Bob"}}])]
         (is (util/exception? db-just-alice))
-        (is (str/includes? (ex-message db-just-alice) "sh:minCount"))))
+        (is (= "SHACL PropertyShape exception - sh:minCount of 1 higher than actual count of 0."
+               (ex-message db-just-alice)))))
     (testing "combined with `sh:targetClass`"
       (let [conn          @(fluree/connect {:method :memory
                                             :defaults
@@ -1239,7 +1249,8 @@
                                                "ex:ssn"  "111-11-1111"
                                                "type"    "ex:User"}])]
         (is (util/exception? db-bad-friend))
-        (is (str/includes? (ex-message db-bad-friend) "sh:maxCount")))))
+        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+               (ex-message db-bad-friend))))))
   (testing "separate txns"
     (testing "maxCount"
       (let [conn                   @(fluree/connect {:method :memory
@@ -1262,7 +1273,8 @@
                                                    "type"      "ex:User"
                                                    "ex:friend" {"@id" "ex:Bob"}})]
         (is (util/exception? db-db-forbidden-friend))
-        (is (str/includes? (ex-message db-db-forbidden-friend) "sh:maxCount")))
+        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+               (ex-message db-db-forbidden-friend))))
       (let [conn          @(fluree/connect {:method :memory
                                             :defaults
                                             {:context test-utils/default-str-context}})
@@ -1287,30 +1299,30 @@
                                           "ex:ssn" ["111-11-1111"
                                                     "222-22-2222"]})]
         (is (util/exception? db-excess-ssn))
-        (is (str/includes? (ex-message db-excess-ssn) "sh:maxCount"))))
-    ;;TODO: this will not pass until we can enforce datatype constraints
-    ;;on triples that have already been created.
-    #_(testing "datatype"
-        (let [conn                @(fluree/connect {:method :memory
-                                                    :defaults
-                                                    {:context test-utils/default-str-context}})
-              ledger              @(fluree/create conn "shacl-target-objects-of-test"
-                                                  {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
-              db1                 @(fluree/stage (fluree/db ledger)
-                                                 [{"@id"                "ex:friendShape"
-                                                   "type"               ["sh:NodeShape"]
-                                                   "sh:targetObjectsOf" {"@id" "ex:friend"}
-                                                   "sh:property"        [{"sh:path"     {"@id" "ex:name"}
-                                                                          "sh:datatype" {"@id" "xsd:string"}}]}])
-              db2                 @(fluree/stage db1 [{"id"      "ex:Bob"
-                                                       "ex:name" 123
-                                                       "type"    "ex:User"}])
-              db-forbidden-friend @(fluree/stage db2
-                                                 {"id"        "ex:Alice"
-                                                  "type"      "ex:User"
-                                                  "ex:friend" {"@id" "ex:Bob"}})]
-          (is (util/exception? db-forbidden-friend))
-          (is (str/includes? (ex-message db-forbidden-friend) "data type"))))))
+        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+               (ex-message db-excess-ssn)))))
+    (testing "datatype"
+      (let [conn @(fluree/connect {:method :memory
+                                   :defaults
+                                   {:context test-utils/default-str-context}})
+            ledger @(fluree/create conn "shacl-target-objects-of-test"
+                                   {:defaultContext ["" {"ex" "http://example.com/ns/"}]})
+            db1 @(fluree/stage (fluree/db ledger)
+                               [{"@id" "ex:friendShape"
+                                 "type" ["sh:NodeShape"]
+                                 "sh:targetObjectsOf" {"@id" "ex:friend"}
+                                 "sh:property" [{"sh:path" {"@id" "ex:name"}
+                                                 "sh:datatype" {"@id" "xsd:string"}}]}])
+            db2 @(fluree/stage db1 [{"id" "ex:Bob"
+                                     "ex:name" 123
+                                     "type" "ex:User"}])
+            db-forbidden-friend @(fluree/stage db2
+                                               {"id" "ex:Alice"
+                                                "type" "ex:User"
+                                                "ex:friend" {"@id" "ex:Bob"}})]
+        (is (util/exception? db-forbidden-friend))
+        (is (= "SHACL PropertyShape exception - sh:datatype: every datatype must be 1."
+               (ex-message db-forbidden-friend)))))))
 
 (deftest ^:integration shape-based-constraints
   (testing "sh:node"
@@ -1380,7 +1392,7 @@
       (is (util/exception? invalid-kid))
       (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
              (ex-message invalid-kid)))))
-  #_(testing "sh:qualifiedValueShape node shape"
+  (testing "sh:qualifiedValueShape node shape"
     (let [conn   @(fluree/connect {:method :memory})
           ledger @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context
                                                                            {"ex" "http://example.com/"}]})
@@ -1416,14 +1428,14 @@
                                                          "ex:gender" "alien"}]}])]
 
       (is (= [{"id" "ex:ValidKid"
-               "rdf:type" ["ex:Kid"]
+               "type" "ex:Kid"
                "ex:parent" [{"id" "ex:Mom"}
                             {"id" "ex:Dad"}]}]
              @(fluree/query valid-kid {"select" {"?s" ["*"]}
                                        "where" [["?s" "id" "ex:ValidKid"]]})))
       (is (util/exception? invalid-kid))
-      (is (= "SHACL PropertyShape exception - path [[1002 :predicate]] conformed to sh:qualifiedValueShape fewer than sh:qualifiedMinCount times."
-               (ex-message invalid-kid)))))
+      (is (= "SHACL PropertyShape exception - sh:pattern: value alien does not match pattern \"female\" or it is not a literal value."
+             (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
     (let [conn         @(fluree/connect {:method :memory})
           ledger       @(fluree/create conn "shape-constaints" {:defaultContext [test-utils/default-str-context

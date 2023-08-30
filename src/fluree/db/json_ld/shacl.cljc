@@ -49,13 +49,6 @@
   [existing-flakes changed-flakes]
   :TODO)
 
-
-
-(defn throw-property-shape-exception!
-  [msg]
-  (throw (ex-info (str "SHACL PropertyShape exception - " msg ".")
-                  {:status 400 :error :db/shacl-validation})))
-
 (def numeric-types
   #{const/$xsd:int
     const/$xsd:short
@@ -129,7 +122,7 @@
                                                                         " must have string length less than " min-length))])
                         max-length-result (if (and max-length (or ref? (< max-length str-length)))
                                             [false (str "sh:maxLength: value " str-val
-                                                        "has string length larger than " max-length
+                                                        " has string length larger than " max-length
                                                         " or it is not a literal value")]
                                             [true (when max-length (str "sh:not sh:maxLength: value " str-val
                                                                         " must have string length greater than " max-length))])
@@ -186,8 +179,8 @@
   [{:keys [in has-value datatype nodekind logical-constraint] :as _p-shape} p-flakes]
   (let [in-results (when in
                      (if (every? #(contains? (set in) (flake/o %)) p-flakes)
-                       [true (str "sh:not sh:in: value " val " must not be one of " in)]
-                       [false (str "sh:in: value " val " must be one of " in)]))
+                       [true (str "sh:not sh:in: value must not be one of " in)]
+                       [false (str "sh:in: value must be one of " in)]))
         has-value-results (when has-value
                             (if (some #(= (flake/o %) has-value) p-flakes)
                               [true (str "sh:not sh:hasValue: none of the values can be " has-value)]
@@ -282,6 +275,29 @@
           (recur r (conj res validation)))
         (coalesce-validation-results res)))))
 
+(defn validate-simple-property-constraints
+  "Validate property constraints that do not require any db lookups to verify."
+  [{:keys [min-count max-count
+           min-inclusive min-exclusive max-inclusive max-exclusive
+           min-length max-length pattern
+           in has-value datatype] :as p-shape} p-flakes]
+  (let [validation (if (or min-count max-count)
+                     (validate-count-properties p-shape p-flakes)
+                     [true])
+        validation (if (and (first validation)
+                            (or min-inclusive min-exclusive max-inclusive max-exclusive))
+                     (validate-value-range-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation)
+                            (or min-length max-length pattern))
+                     (validate-string-properties p-shape p-flakes)
+                     validation)
+        validation (if (and (first validation)
+                            (or in has-value datatype))
+                     (validate-value-properties p-shape p-flakes)
+                     validation)]
+    validation))
+
 (defn validate-property-constraints
   "Validates a PropertyShape for a single predicate against a set of flakes.
   Returns a tuple of [valid? error-msg]."
@@ -290,21 +306,7 @@
    p-flakes
    db]
   (go-try
-    (let [validation (if (or min-count max-count)
-                       (validate-count-properties p-shape p-flakes)
-                       [true])
-          validation (if (and (first validation)
-                              (or min-inclusive min-exclusive max-inclusive max-exclusive))
-                       (validate-value-range-properties p-shape p-flakes)
-                       validation)
-          validation (if (and (first validation)
-                              (or min-length max-length pattern))
-                       (validate-string-properties p-shape p-flakes)
-                       validation)
-          validation (if (and (first validation)
-                              (or in has-value datatype))
-                       (validate-value-properties p-shape p-flakes)
-                       validation)
+    (let [validation (validate-simple-property-constraints p-shape p-flakes)
           validation (if (and (first validation) node)
                        (<? (validate-node-constraint db p-shape p-flakes))
                        validation)
@@ -485,13 +487,13 @@
 
 (defn validate-shape
   "Check to see if each property shape is valid, then check node shape constraints."
-  [db {:keys [property] :as shape} s-flakes pid->p-flakes]
+  [db {:keys [property validated-properties] :as shape} s-flakes pid->p-flakes]
   (go-try
     (let [sid (flake/s (first s-flakes))]
       (log/debug "validate-shape" sid shape )
       (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
              q-shapes             []
-             validated-properties #{}
+             validated-properties validated-properties
              results              []]
         (if p-shape
           ;; check property shape
@@ -518,18 +520,22 @@
                 closed-results (validate-closed-constraint shape pid->p-flakes validated-properties)]
             (coalesce-validation-results (conj results q-results closed-results))))))))
 
+(defn throw-shacl-exception
+  [err-msg]
+  (throw (ex-info (if (str/starts-with? err-msg "SHACL shape is closed")
+                    err-msg
+                    (str "SHACL PropertyShape exception - " err-msg "."))
+                  {:status 400 :error :db/shacl-validation})))
+
 (defn validate-target
   "Validate the data graph (s-flakes) with the provided shapes."
-  [{:keys [shapes] :as _shape-map} db s-flakes]
+  [shapes db s-flakes]
   (go-try
     (let [pid->p-flakes (group-by flake/p s-flakes)]
       (doseq [shape shapes]
         (let [[valid? err-msg] (<? (validate-shape db shape s-flakes pid->p-flakes))]
           (when (not valid?)
-            (throw (ex-info (if (str/starts-with? err-msg "SHACL shape is closed")
-                              err-msg
-                              (str "SHACL PropertyShape exception - " err-msg "."))
-                            {:status 400 :error :db/shacl-validation}))))))))
+            (throw-shacl-exception err-msg)))))))
 
 (defn build-property-base-shape
   "Builds map out of values from a SHACL propertyShape (target of sh:property)"
@@ -538,6 +544,8 @@
    (fn [acc property-flake]
      (let [o (flake/o property-flake)]
        (condp = (flake/p property-flake)
+         const/$xsd:anyURI
+         (assoc acc :id o)
          const/$sh:path
          (update acc :path (fnil conj []) o)
 
@@ -547,8 +555,7 @@
          (assoc acc :datatype o)
 
          const/$sh:minCount
-         (cond-> (assoc acc :min-count o)
-           (>= o 1) (assoc :required? true)) ; min-count >= 1 means property is required
+         (assoc acc :min-count o)
 
          const/$sh:maxCount
          (assoc acc :max-count o)
@@ -781,7 +788,52 @@
           base*    (<? (resolve-path-types base db))]
       (cond-> base*
         (:pattern base) (build-pattern)
-        (= p const/$sh:not) (assoc :logical-constraint :not, :required? false)))))
+        (= p const/$sh:not) (assoc :logical-constraint :not)))))
+
+(def optimizable-property-constraints
+  "These are the constraint keys that can be validated with just the asserted flakes -
+  they don't rely on any sort of graph crawl."
+  #{:min-length
+    :max-length
+    :pattern
+    :flags
+
+    :datatype
+
+    :min-exclusive
+    :min-inclusive
+    :max-exclusive
+    :max-inclusive})
+
+(defn advanced-validation-eligible-p-shape?
+  "A property shape is eligible for advanced validation if it has only optimizable
+  property constraints. Property shapes that are eligible for advanced validation can be
+  processed during flake creation."
+  [p-shape]
+  (let [[[_ path-type] :as tagged-path] (:path p-shape)
+        constraints (-> p-shape
+                        (dissoc :path :id)
+                        (keys)
+                        (set))]
+    (boolean
+      (and (= 1 (count tagged-path))
+           (= :predicate path-type)
+           (set/subset? constraints optimizable-property-constraints)))))
+
+(defn advanced-validation-eligible-node-shape?
+  [shape]
+  (boolean (:target-class shape)))
+
+(defn add-advanced-validation-lookup
+  "Constructs a map to facilitate the retrieval of advanced-validation p-shapes during
+  property additions."
+  [shape advanced-eligible-p-shapes]
+  (let [pid->shape->p-shapes (reduce (fn [pid->shape->p-shapes p-shape]
+                                       (update-in pid->shape->p-shapes [(-> p-shape :path ffirst) (:id shape)]
+                                                  (fnil conj []) p-shape))
+                                     {}
+                                     advanced-eligible-p-shapes)]
+    (assoc shape :advanced-validation pid->shape->p-shapes)))
 
 (defn build-node-shape
   [db shape-flakes]
@@ -794,23 +846,8 @@
               o (flake/o flake)]
           (if (#{const/$sh:property const/$sh:not} p)
             (let [p-shape-flakes (<? (query-range/index-range db :spot = [o]))
-                  property-shape (<? (build-property-shape db p p-shape-flakes))
-                  tagged-path    (:path property-shape)
-
-                  target-key     (first (peek tagged-path))
-                  p-shapes*      (conj p-shapes property-shape)
-                  ;; elevate following conditions to top-level custom keys to optimize validations
-                  ;; when processing txs
-
-                  shape*         (cond-> shape
-                                   (:datatype property-shape)
-                                   (update-in [:datatype target-key]
-                                              register-datatype property-shape)
-
-                                   (:node-kind property-shape)
-                                   (update-in [:datatype target-key]
-                                              register-nodekind property-shape))]
-              (recur r' shape* p-shapes*))
+                  p-shape (<? (build-property-shape db p p-shape-flakes))]
+              (recur r' shape (conj p-shapes p-shape)))
             (let [shape* (condp = p
                            const/$xsd:anyURI
                            (assoc shape :id o)
@@ -830,29 +867,34 @@
                            ;; else
                            shape)]
               (recur r' shape* p-shapes))))
-        (assoc shape :property p-shapes)))))
+        (let [{advanced-eligible true p-shapes* false} (if (advanced-validation-eligible-node-shape? shape)
+                                                         (group-by advanced-validation-eligible-p-shape? p-shapes)
+                                                         {false p-shapes})
+              pid->shacl-dt (->> p-shapes
+                                 (filter :datatype)
+                                 (map (fn [p-shape] [(-> p-shape :path last first) (:datatype p-shape)]))
+                                 (into {}))]
+          (cond-> (assoc shape :property p-shapes* :pid->shacl-dt pid->shacl-dt)
+            advanced-eligible (add-advanced-validation-lookup advanced-eligible)))))))
 
 (defn build-shapes
   [db shape-sids]
   (go-try
     (when (seq shape-sids)
       (loop [[shape-sid & r] shape-sids
-             datatype nil
              shapes   []]
         (if shape-sid
           (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))
-                shape (<? (build-node-shape db shape-flakes))
-                datatype* (merge-with merge-datatype datatype (:datatype shape))]
-            (recur r datatype* (conj shapes shape)))
-          {:shapes   shapes
-           :datatype datatype})))))
+                shape (<? (build-node-shape db shape-flakes))]
+            (recur r (conj shapes shape)))
+          shapes)))))
 
 (defn build-class-shapes
   "Given a class SID, returns class shape"
   [db type-sid]
   (go-try
-    (let [shape-sids (->> (<? (query-range/index-range db :post = [const/$sh:targetClass type-sid]))
-                          (map flake/s))]
+    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass type-sid]
+                                                  {:flake-xf (map flake/s)}))]
       (<? (build-shapes db shape-sids)))))
 
 (defn merge-shapes
@@ -871,25 +913,22 @@
   (go-try
     (let [shapes-cache (:shapes schema)]
       (loop [[type-sid & r] type-sids
-             shape-maps nil]
+             shapes []]
         (if type-sid
-          (let [shape-map (if (contains? (:class @shapes-cache) type-sid)
-                            (get-in @shapes-cache [:class type-sid])
-                            (let [shapes (<? (build-class-shapes db type-sid))]
-                              (swap! shapes-cache assoc-in [:class type-sid] shapes)
-                              shapes))]
-            (recur r (if shape-map
-                       (conj shape-maps shape-map)
-                       shape-maps)))
-          (when shape-maps
-            (merge-shapes shape-maps)))))))
+          (let [class-shapes (if (contains? (:class @shapes-cache) type-sid)
+                               (get-in @shapes-cache [:class type-sid])
+                               (let [shapes (<? (build-class-shapes db type-sid))]
+                                 (swap! shapes-cache assoc-in [:class type-sid] shapes)
+                                 shapes))]
+            (recur r (into shapes class-shapes)))
+          shapes)))))
 
 (defn build-targetobject-shapes
   "Given a pred SID, returns shape"
   [db pred-sid]
   (go-try
-    (let [shape-sids (->> (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf pred-sid]))
-                          (map flake/s))]
+    (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf pred-sid]
+                                                  {:flake-xf (map flake/s)}))]
       (<? (build-shapes db shape-sids)))))
 
 (defn targetobject-shapes
@@ -899,18 +938,15 @@
   (go-try
     (let [shapes-cache (:shapes schema)]
       (loop [[pred-sid & r] pred-sids
-             shape-maps nil]
+             shapes []]
         (if pred-sid
-          (let [shape-map (if (contains? (:target-objects-of @shapes-cache) pred-sid)
-                            (get-in @shapes-cache [:target-objects-of pred-sid])
-                            (let [shapes (<? (build-targetobject-shapes db pred-sid))]
-                              (swap! shapes-cache assoc-in [:target-objects-of pred-sid] shapes)
-                              shapes))]
-            (recur r (if shape-map
-                       (conj shape-maps shape-map)
-                       shape-maps)))
-          (when shape-maps
-            (merge-shapes shape-maps)))))))
+          (let [object-shapes (if (contains? (:target-objects-of @shapes-cache) pred-sid)
+                                (get-in @shapes-cache [:target-objects-of pred-sid])
+                                (let [shapes (<? (build-targetobject-shapes db pred-sid))]
+                                  (swap! shapes-cache assoc-in [:target-objects-of pred-sid] shapes)
+                                  shapes))]
+            (recur r (into shapes object-shapes)))
+          shapes)))))
 
 (defn has-target-objects-of-rule?
   "Returns `true` if db currently has a rule that uses
