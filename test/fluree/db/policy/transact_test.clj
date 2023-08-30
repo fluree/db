@@ -105,7 +105,7 @@
               (is (= [{:id :ex/widget,
                        :type :ex/Product,
                        :schema/name "Widget",
-                       :schema/price 105.99,
+                       :schema/price 105.99M,
                        :schema/priceCurrency "USD"}]
                      @(fluree/query update-price
                                     {:select {'?s [:*]}
