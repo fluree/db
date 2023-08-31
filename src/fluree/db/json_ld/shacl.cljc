@@ -83,7 +83,7 @@
 (defn coalesce-validation-results
   ([results] (coalesce-validation-results results nil))
   ([results logical-constraint]
-   (log/debug "coalesce-validation-results results:" results)
+   (log/trace "coalesce-validation-results results:" results)
    (let [results-map   (reduce (fn [acc [valid? err-msg]]
                                  (if err-msg
                                    (update acc (-> valid? str keyword) conj err-msg)
@@ -490,7 +490,7 @@
   [db {:keys [property validated-properties] :as shape} s-flakes pid->p-flakes]
   (go-try
     (let [sid (flake/s (first s-flakes))]
-      (log/debug "validate-shape" sid shape )
+      (log/trace "validate-shape" sid shape )
       (loop [[{:keys [path rhs-property qualified-value-shape] :as p-shape} & r] property
              q-shapes             []
              validated-properties validated-properties
