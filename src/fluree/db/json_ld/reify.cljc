@@ -4,7 +4,7 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage :as storage]
@@ -294,7 +294,7 @@
 (defn db-t
   "Returns 't' value from commit data."
   [db-data]
-  (let [db-t (get-in db-data [const/iri-t :value])]
+  (let [db-t (get-first-value db-data const/iri-t)]
     (when-not (pos-int? db-t)
       (commit-error
        (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
@@ -302,20 +302,20 @@
 
 (defn db-assert
   [db-data]
-  (let [commit-assert (get-in db-data [const/iri-assert])]
+  (let [commit-assert (get db-data const/iri-assert)]
     ;; TODO - any basic validation required
     commit-assert))
 
 (defn db-retract
   [db-data]
-  (let [commit-retract (get-in db-data [const/iri-retract])]
+  (let [commit-retract (get db-data const/iri-retract)]
     ;; TODO - any basic validation required
     commit-retract))
 
 (defn parse-commit
   "Given a full commit json, returns two-tuple of [commit-data commit-proof]"
   [commit-data]
-  (let [cred-subj (get commit-data const/iri-cred-subj)
+  (let [cred-subj (get-first commit-data const/iri-cred-subj)
         commit    (or cred-subj commit-data)]
     [commit (when cred-subj commit-data)]))
 
@@ -342,7 +342,9 @@
   (go-try
    (let [iri-cache          (volatile! {})
          refs-cache         (volatile! (-> db :schema :refs))
-         db-address         (get-in commit [const/iri-data const/iri-address :value])
+         db-address         (-> commit
+                                (get-first const/iri-data)
+                                (get-first-value const/iri-address))
          db-data            (<? (read-db conn db-address))
          t-new              (- (db-t db-data))
          _                  (when (and (not= t-new (dec t))
@@ -369,7 +371,7 @@
          prev-commit-flakes (when previous-id
                               (<? (commit-data/prev-commit-flakes db t-new
                                                                   previous-id)))
-         prev-data-id       (get-in prev-commit [const/iri-data :id])
+         prev-data-id       (get-first-id prev-commit const/iri-data)
          prev-db-flakes     (when prev-data-id
                               (<? (commit-data/prev-data-flakes db db-sid t-new
                                                                 prev-data-id)))
@@ -425,10 +427,16 @@
     (loop [commit  latest-commit
            last-t  nil
            commits (list)]
-      (let [dbid             (get-in commit [const/iri-data :id])
-            db-address       (get-in commit [const/iri-data const/iri-address :value])
-            prev-commit-addr (get-in commit [const/iri-previous const/iri-address :value])
-            commit-t         (get-in commit [const/iri-data const/iri-t :value])
+      (let [dbid             (get-first-id commit const/iri-data)
+            db-address       (-> commit
+                                 (get-first const/iri-data)
+                                 (get-first-value const/iri-address))
+            prev-commit-addr (-> commit
+                                 (get-first const/iri-previous)
+                                 (get-first-value const/iri-address))
+            commit-t         (-> commit
+                                 (get-first const/iri-data)
+                                 (get-first-value const/iri-t))
             commits*         (conj commits commit)]
         (when (or (nil? commit-t)
                   (and last-t (not= (dec last-t) commit-t)))
@@ -473,8 +481,11 @@
   [{:keys [ledger] :as db} latest-commit commit-address merged-db?]
   (go-try
     (let [{:keys [conn]} ledger
-          idx-meta   (get latest-commit const/iri-index) ;; get persistent index meta if ledger has indexes
-          db-base    (if-let [idx-address (get-in idx-meta [const/iri-address :value])]
+          idx-meta   (get-first latest-commit const/iri-index) ; get persistent
+                                                               ; index meta if
+                                                               ; ledger has
+                                                               ; indexes
+          db-base    (if-let [idx-address (get-first-value idx-meta const/iri-address)]
                        (<? (storage/reify-db conn db idx-address))
                        db)
           commit-map (commit-data/json-ld->map latest-commit
