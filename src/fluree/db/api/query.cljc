@@ -2,8 +2,11 @@
   "Primary API ns for any user-invoked actions. Wrapped by language & use specific APIS
   that are directly exposed"
   (:require [clojure.core.async :as async]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.fuel :as fuel]
+            [fluree.db.ledger.json-ld :as jld-ledger]
+            [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.time-travel :as time-travel]
             [fluree.db.query.fql :as fql]
             [fluree.db.query.fql.parse :as fql-parse]
@@ -150,3 +153,23 @@
   (case format
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
+
+(defn from-query-fql
+  [conn query]
+  (go-try
+    (let [ledger-alias (:from query)
+          ledger-address (<? (conn-proto/-address conn ledger-alias nil))
+          ledger (<? (jld-ledger/load conn ledger-address))]
+      (<? (query-fql (ledger-proto/-db ledger) (dissoc query :from))))))
+
+(defn from-query-sparql
+  [conn query]
+  (go-try
+    (let [fql (sparql/->fql query)]
+      (<? (from-query-fql conn fql)))))
+
+(defn from-query
+  [conn query {:keys [format] :as _opts :or {format :fql}}]
+  (case format
+    :fql (from-query-fql conn query)
+    :sparql (from-query-sparql conn query)))

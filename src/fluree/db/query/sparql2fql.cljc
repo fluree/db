@@ -586,7 +586,7 @@
   (log/trace "handle-dataset-clause:" dataset-clause)
   (case (first dataset-clause)
     :DefaultGraphClause
-    (-> dataset-clause rest str/join)
+    (-> dataset-clause second second second handle-iri)
 
     :NamedGraphClause
     (throw (ex-info (str "SPARQL named graphs are not yet supported in Fluree. "
@@ -633,7 +633,7 @@
                       [(merge query (handle-solution-modifier (rest item))) r]
 
                       :DatasetClause
-                      [(assoc query :from (handle-dataset-clause (rest item))) r]))]
+                      [(assoc query :from (handle-dataset-clause (-> item rest second))) r]))]
         (recur q r)))))
 
 (defn handle-prologue
