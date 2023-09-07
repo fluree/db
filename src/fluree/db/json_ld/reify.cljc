@@ -276,7 +276,6 @@
        :pid    @last-pid
        :sid    @last-sid})))
 
-
 (defn merge-flakes
   [db t refs flakes]
   (let [vocab-flakes  (get-vocab-flakes flakes)]
@@ -300,11 +299,55 @@
        (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
     db-t))
 
+(defn enrich-value
+  [id->node value]
+  (mapv (fn [v]
+          (if-let [id (get v :id)]
+            (merge (get id->node id) (cond-> v (nil? (:type v)) (dissoc :type)))
+            v))
+        (util/sequential value)))
+
+(defn enrich-node
+  [id->node node]
+  (reduce-kv
+    (fn [updated-node k v]
+      (assoc updated-node k (cond (= :id k) v
+                                  (= :list (ffirst v)) {:list (enrich-value id->node (:list v))}
+                                  :else (enrich-value id->node v))))
+    {}
+    node))
+
+(defn enrich-assertion-values
+  "`asserts` is a json-ld flattened (ish) sequence of nodes. In order to properly generate
+  sids (or pids) for these nodes, we need the full node additional context for ref objects. This
+  function traverses the asserts and builds a map of node-id->node, then traverses the
+  asserts again and merges each ref object into the ref's node.
+
+  example input:
+  [{:id \"foo:bar\"
+    \"ex:key1\" {:id \"foo:ref-id\"}}
+  {:id \"foo:ref-id\"
+   :type \"some:type\"}]
+
+  example output:
+  [{:id \"foo:bar\"
+    \"ex:key1\" {:id \"foo:ref-id\"
+                 :type \"some:type\"}}
+  {:id \"foo:ref-id\"
+   :type \"some:type\"}]
+  "
+  [asserts]
+  (let [id->node (reduce (fn [id->node {:keys [id] :as node}] (assoc id->node id node))
+                         {}
+                         asserts)]
+    (mapv (partial enrich-node id->node)
+          asserts)))
+
 (defn db-assert
   [db-data]
   (let [commit-assert (get-in db-data [const/iri-assert])]
     ;; TODO - any basic validation required
-    commit-assert))
+    (enrich-assertion-values commit-assert)))
 
 (defn db-retract
   [db-data]
