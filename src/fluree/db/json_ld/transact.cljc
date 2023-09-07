@@ -200,9 +200,15 @@
   [s iri t]
   (flake/create s const/$xsd:anyURI iri const/$xsd:string t true nil))
 
+(defn retract-flakes
+  [db s p t]
+  (query-range/index-range db
+                           :spot = [s p]
+                           {:flake-xf (map #(flake/flip-flake % t))}))
+
 (defn property-value->flakes
   [sid pid property value pid->shape->p-shapes pid->shacl-dt new-subj? existing-pid?
-   {:keys [t] :as tx-state}]
+   {:keys [t db-before] :as tx-state}]
   (go-try
     (if (rdf-type-iri? property)
       (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
@@ -224,7 +230,7 @@
             new-prop-flakes (cond-> []
                               (not existing-pid?) (conj (new-iri-flake pid property t)))]
         (if (nil? value)
-          (into new-prop-flakes )
+          (into new-prop-flakes (<? (retract-flakes db-before sid pid t)))
           (into new-prop-flakes (loop [[v' & r] v*
                                        flakes  []]
                                   (if v'
@@ -283,7 +289,7 @@
              subj-flakes (into base-flakes type-flakes)]
         (if k
           (let [existing-pid    (<? (jld-reify/get-iri-sid k db-before iris))
-                ref?            (not (:value (first v))) ;; either a ref or a value
+                ref?            (not (:value (first v))) ; either a ref or a value
                 pid             (or existing-pid
                                     (get jld-ledger/predefined-properties k)
                                     (jld-ledger/generate-new-pid k iris next-pid ref? refs))]
