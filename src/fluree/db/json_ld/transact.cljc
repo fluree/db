@@ -295,11 +295,12 @@
                                     (jld-ledger/generate-new-pid k iris next-pid ref? refs))]
             (if-let [values (not-empty v)]
               (let [new-flakes (loop [[value & r] values
+                                      existing? (some? existing-pid)
                                       flakes []]
                                  (if value
                                    (let [new-flakes (<? (property-value->flakes sid pid k value pid->shape->p-shapes pid->shacl-dt
-                                                                                new-subj? (some? existing-pid) tx-state))]
-                                     (recur r (into flakes new-flakes)))
+                                                                                new-subj? existing? tx-state))]
+                                     (recur r true (into flakes new-flakes)))
                                    flakes))]
                 (recur r (into subj-flakes new-flakes)))
               (let [retracting-flakes (<? (query-range/index-range db-before
