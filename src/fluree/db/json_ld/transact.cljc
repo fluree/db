@@ -77,29 +77,31 @@
 
 (defn add-property
   "Adds property. Parameters"
-  [sid pid shacl-dt shape->p-shapes check-retracts? list? {:keys [value] :as v-map}
+  [sid pid shacl-dt shape->p-shapes check-retracts? list? {:keys [language value] :as v-map}
    {:keys [t db-before subj-mods] :as tx-state}]
   (go-try
     (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
                         (->> (<? (query-range/index-range db-before :spot = [sid pid]))
                              (map #(flake/flip-flake % t))))
-          m           (when list?
-                        {:i (-> v-map :idx last)})
 
-          flakes      (cond
-                        ;; a new node's data is contained, process as another node then link to this one
-                        (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+          m (cond-> nil
+              list?    (assoc :i (-> v-map :idx last))
+              language (assoc :lang language))
 
-                        ;; a literal value
-                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
-                        (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                          [(flake/create sid pid value* dt t true m)])
+          flakes (cond
+                   ;; a new node's data is contained, process as another node then link to this one
+                   (jld-reify/node? v-map)
+                   (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                     (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
-                        :else
-                        (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
-                                        {:status 400 :error :db/invalid-transaction})))
+                   ;; a literal value
+                   (and (some? value) (not= shacl-dt const/$xsd:anyURI))
+                   (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
+                     [(flake/create sid pid value* dt t true m)])
+
+                   :else
+                   (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
+                                   {:status 400 :error :db/invalid-transaction})))
           [valid? err-msg] (shacl/coalesce-validation-results
                              (into []
                                    (mapcat (fn [[shape-id p-shapes]]
