@@ -93,10 +93,14 @@
    {::var var-sym}))
 
 (defn match-value
-  ([m x dt]
-   (assoc m
+  ([mch x dt]
+   (assoc mch
      ::val x
-     ::datatype dt)))
+     ::datatype dt))
+  ([mch x dt m]
+   (-> mch
+       (match-value x dt)
+       (assoc ::meta m))))
 
 (defn anonymous-value
   "Build a pattern that already matches an explicit value."
@@ -216,10 +220,10 @@
   (match-value p-match (flake/p flake) const/$xsd:anyURI))
 
 (defn match-object
-  "Matches the object and data type of the supplied `flake` to the triple object
-  pattern component `o-match`."
+  "Matches the object, data type, and metadata of the supplied `flake` to the
+  triple object pattern component `o-match`."
   [o-match flake]
-  (match-value o-match (flake/o flake) (flake/dt flake)))
+  (match-value o-match (flake/o flake) (flake/dt flake) (flake/m flake)))
 
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
