@@ -1,5 +1,4 @@
 (ns fluree.db.conn.file
-  (:refer-clojure :exclude [exists?])
   (:require [clojure.core.async :as async :refer [go]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
@@ -13,14 +12,11 @@
             [fluree.db.storage :as storage]
             [fluree.db.indexer.default :as idx-default]
             [fluree.db.serde.json :refer [json-serde]]
-            #?@(:cljs [["fs" :as fs]
-                       ["path" :as path]])
+            [fluree.db.util.filesystem :as fs]
+            [fluree.db.util.bytes :as bytes]
             #?(:clj [fluree.db.full-text :as full-text])
-            #?(:clj [clojure.java.io :as io])
             [fluree.db.util.json :as json]
-            [fluree.db.ledger.proto :as ledger-proto])
-  #?(:clj
-     (:import (java.io ByteArrayOutputStream FileNotFoundException File))))
+            [fluree.db.ledger.proto :as ledger-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -31,17 +27,6 @@
     (str "fluree:file:" path)
     (str "fluree:file://" path)))
 
-(defn local-path
-  [{:keys [storage-path] :as _conn}]
-  (let [abs-path? #?(:clj (.isAbsolute (io/file storage-path))
-                     :cljs (path/isAbsolute storage-path))
-        abs-root  (if abs-path?
-                    ""
-                    (str #?(:clj  (.getAbsolutePath (io/file ""))
-                            :cljs (path/resolve ".")) "/"))
-        path      (str abs-root storage-path "/")]
-    #?(:clj  (-> path io/file .getCanonicalPath)
-       :cljs (path/resolve path))))
 
 (defn address-path
   [address]
@@ -49,115 +34,39 @@
     path))
 
 (defn address-full-path
-  [conn address]
-  (str (local-path conn) "/" (address-path address)))
+  [{:keys [storage-path] :as _conn} address]
+  (str (fs/local-path storage-path) "/" (address-path address)))
 
 (defn address-path-exists?
   [conn address]
   (let [full-path (address-full-path conn address)]
-    #?(:clj  (->> full-path io/file .exists)
-       :cljs (fs/existsSync full-path))))
-
-(defn read-file
-  "Read a string from disk at `path`. Returns nil if file does not exist."
-  [path]
-  #?(:clj
-     (try
-       (with-open [xin  (io/input-stream path)
-                   xout (ByteArrayOutputStream.)]
-         (io/copy xin xout)
-         (String. (.toByteArray xout)))
-
-       (catch FileNotFoundException _
-         nil))
-     :cljs
-     (try
-       (fs/readFileSync path "utf8")
-       (catch :default e
-         (when (not= "ENOENT" (.-code e))
-           (throw (ex-info "Error reading file."
-                           {"errno"   ^String (.-errno e)
-                            "syscall" ^String (.-syscall e)
-                            "code"    (.-code e)
-                            "path"    (.-path e)})))))))
+    (fs/exists? full-path)))
 
 (defn read-address
   [conn address]
-  (->> address (address-full-path conn) read-file))
+  (->> address (address-full-path conn) fs/read-file))
 
 (defn read-commit
   [conn address]
   (json/parse (read-address conn address) false))
 
-(defn write-file
-  "Write bytes to disk at the given file path."
-  [path ^bytes val]
-  #?(:clj
-     (try
-       (with-open [out (io/output-stream (io/file path))]
-         (.write out val))
-       (catch FileNotFoundException _
-         (try
-           (io/make-parents (io/file path))
-           (with-open [out (io/output-stream (io/file path))]
-             (.write out val))
-           (catch Exception e
-             (log/error (str "Unable to create storage directory: " path
-                             " with error: " (.getMessage e) "."))
-             (log/error (str "Fatal Error, shutting down!"))
-             (System/exit 1))))
-       (catch Exception e (throw e)))
-     :cljs
-     (try
-       (fs/writeFileSync path val)
-       (catch :default e
-         (if (= (.-code e) "ENOENT")
-           (try
-             (fs/mkdirSync (path/dirname path) #js{:recursive true})
-             (try
-               (fs/writeFileSync path val)
-               (catch :default e
-                 (log/error (str "Unable to write file to path " path
-                                 " with error: " ^String (.-message e) "."))
-                 (log/error (str "Fatal Error, shutting down! "
-                                 {"errno"   ^String (.-errno e)
-                                  "syscall" ^String (.-syscall e)
-                                  "code"    (.-code e)
-                                  "path"    (.-path e)}))
-                 (js/process.exit 1)))
-             (catch :default e
-               (log/error (str "Unable to create storage directory: " path
-                               " with error: " ^String (.-message e) "."))
-               (log/error (str "Fatal Error, shutting down!"))
-               (js/process.exit 1)))
-           (throw (ex-info "Error writing file."
-                           {"errno"   ^String (.-errno e)
-                            "syscall" ^String (.-syscall e)
-                            "code"    (.-code e)
-                            "path"    (.-path e)})))))))
-
-(defn ->bytes
-  [s]
-  #?(:clj  (.getBytes ^String s)
-     :cljs (js/Uint8Array. (js/Buffer.from s "utf8"))))
-
 (defn- write-data
-  [conn ledger data-type data]
+  [{:keys [storage-path] :as _conn} ledger data-type data]
   (let [alias      (ledger-proto/-alias ledger)
         branch     (name (:name (ledger-proto/-branch ledger)))
         json       (if (string? data)
                      data
                      (json-ld/normalize-data data))
-        bytes      (->bytes json)
+        bytes      (bytes/string->UTF8 json)
         hash       (crypto/sha2-256 bytes :hex)
         type-dir   (name data-type)
         path       (str alias
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
                         hash ".json")
-        write-path (str (local-path conn) "/" path)]
+        write-path (str (fs/local-path storage-path) "/" path)]
     (log/debug (str "Writing " (name data-type) " at " write-path))
-    (write-file write-path bytes)
+    (fs/write-file write-path bytes)
     {:name    hash
      :hash    hash
      :json    json
@@ -178,15 +87,15 @@
 
 (defn push
   "Just write to a different directory?"
-  [conn publish-address {commit-address :address}]
-  (let [local-path  (local-path conn)
+  [{:keys [storage-path] :as _conn} publish-address {commit-address :address}]
+  (let [local-path  (fs/local-path storage-path)
         commit-path (address-path commit-address)
         head-path   (address-path publish-address)
         write-path  (str local-path "/" head-path)
 
         work        (fn [complete]
                       (log/debug (str "Updating head at " write-path " to " commit-path "."))
-                      (write-file write-path (->bytes commit-path))
+                      (fs/write-file write-path (bytes/string->UTF8 commit-path))
                       (complete (file-address head-path)))]
     #?(:clj  (let [p (promise)]
                (future (work (partial deliver p)))
