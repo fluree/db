@@ -63,7 +63,14 @@
                    end-flake   (flake/create s* p o** o-dt* nil nil util/max-integer)
                    track-fuel  (when fuel-tracker
                                  (fuel/track fuel-tracker))
-                   flake-xf*   (->> [flake-xf track-fuel]
+                   subj-filter (when s-fn
+                                 (filter (fn [f] (-> f flake/s s-fn))))
+                   pred-filter (when p-fn
+                                 (filter (fn [f] (-> f flake/p p-fn))))
+                   obj-filter  (when o-fn*
+                                 (filter (fn [f] (-> f flake/o o-fn*))))
+                   flake-xf*   (->> [subj-filter pred-filter obj-filter
+                                     flake-xf track-fuel]
                                     (remove nil?)
                                     (apply comp))
                    opts        (cond-> {:idx         idx
@@ -73,10 +80,7 @@
                                         :start-flake start-flake
                                         :end-test    <=
                                         :end-flake   end-flake
-                                        :flake-xf    flake-xf*}
-                                 s-fn  (assoc :subject-fn s-fn)
-                                 p-fn  (assoc :predicate-fn p-fn)
-                                 o-fn* (assoc :object-fn o-fn*))]
+                                        :flake-xf    flake-xf*})]
                (-> (query-range/resolve-flake-slices conn idx-root novelty
                                                      error-ch opts)
                    (->> (query-range/filter-authorized db start-flake end-flake

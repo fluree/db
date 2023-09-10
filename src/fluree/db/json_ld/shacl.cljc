@@ -754,13 +754,20 @@
     (assoc p-shape :pattern #?(:clj  (Pattern/compile pattern (or valid-flags 0))
                                :cljs (js/RegExp. pattern (or valid-flags ""))))))
 
+(defn non-iri-flake?
+  [f]
+  (-> f
+      flake/p
+      (not= const/$xsd:anyURI)))
+
 (defn resolve-path-type
   "Associate each property path object with its path type in order to govern path flake resolution during validation."
   [db path-pid]
   (go-try
-    (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid] {:predicate-fn (complement #{const/$xsd:anyURI})
-                                                                                 :flake-limit  1}))
-                             (first))]
+    (if-let [path-flake (->> (<? (query-range/index-range db :spot = [path-pid]
+                                                          {:flake-xf    (filter non-iri-flake?)
+                                                           :flake-limit 1}))
+                             first)]
       (let [o (flake/o path-flake)
             p (flake/p path-flake)]
         (uc/case p
