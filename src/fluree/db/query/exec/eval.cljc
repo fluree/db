@@ -186,6 +186,22 @@
   [& strs]
   (apply str strs))
 
+(defn var->lang-var
+  [var]
+  (-> var
+      (str "$-LANG")
+      symbol))
+
+(defn var->dt-var
+  [var]
+  (-> var
+      (str "$-DATATYPE")
+      symbol))
+
+(defmacro lang
+  [var]
+  (var->lang-var var))
+
 (defn regex
   [text pattern]
   (boolean (re-find (re-pattern pattern) text)))
@@ -270,7 +286,7 @@
   (str x))
 
 (def allowed-scalar-fns
-  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if nil? as
+  '#{&& || ! > < >= <= = + - * / quot and bound coalesce if lang nil? as
      not not= or re-find re-pattern
      ;; string fns
      strStarts strEnds subStr strLen ucase lcase contains strBefore strAfter concat regex replace
@@ -303,6 +319,7 @@
     count       fluree.db.query.exec.eval/count-distinct
     floor       fluree.db.query.exec.eval/floor
     groupconcat fluree.db.query.exec.eval/groupconcat
+    lang        fluree.db.query.exec.eval/lang
     lcase       fluree.db.query.exec.eval/lcase
     median      fluree.db.query.exec.eval/median
     now         fluree.db.query.exec.eval/now
@@ -408,15 +425,17 @@
 
 (defn bind-variables
   [soln-sym var-syms]
-  (->> var-syms
-       (mapcat (fn [v]
-                 [v `(let [mch# (get ~soln-sym (quote ~v))
-                           val# (::where/val mch#)
-                           dt#  (::where/datatype mch#)]
-                       (cond->> val#
-                         (= dt# ::group/grouping)
-                         (mapv ::where/val)))]))
-       (into [])))
+  (into []
+        (mapcat (fn [var]
+                  (let [dt-var   (var->dt-var var)
+                        lang-var (var->lang-var var)]
+                    `[mch#      (get ~soln-sym (quote ~var))
+                      ~dt-var   (::where/datatype mch#)
+                      ~lang-var (-> mch# ::where/meta :lang (or ""))
+                      ~var      (cond->> (::where/val mch#)
+                                  (= ~dt-var ::group/grouping)
+                                  (mapv ::where/val))])))
+        var-syms))
 
 (defn compile
   ([code] (compile code true))
