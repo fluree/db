@@ -458,5 +458,5 @@
         soln-sym 'solution]
     (eval `(fn [~soln-sym ~var]
              (-> ~soln-sym
-                 (assoc (quote ~var) {::where/val ~var})
+                 (assoc (quote ~var) ~var)
                  ~f)))))

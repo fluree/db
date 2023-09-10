@@ -14,83 +14,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn augment-object-fn
-  "Returns a pair consisting of an object value and boolean function that will
-  return false when applied to object values whose flake should be filtered out
-  of query results. This function augments the original object function supplied
-  in an object pattern under the `::fn` key (if any) by also checking if a
-  prospective flake object is equal to the supplied `o` value if and only if the
-  `:spot` index is used, the `p` value is `nil`, and the `s` and `o` values are
-  not `nil`. In this case, the new object value returned by this function will
-  be changed to `nil`. This ensures that all necessary flakes are considered
-  from the spot index when scanned, and this is necessary because the `p` value
-  is `nil`."
-  [idx s p o o-fn]
-  (if (and (#{:spot} idx)
-           (nil? p)
-           (and s o))
-    (let [f (if o-fn
-              (fn [obj]
-                (and (#{o} obj)
-                     (o-fn obj)))
-              (fn [obj]
-                (#{o} obj)))]
-      [nil f])
-    [o o-fn]))
-
-(defn resolve-flake-range
-  ([db fuel-tracker error-ch components]
-   (resolve-flake-range db fuel-tracker nil error-ch components))
-
-  ([{:keys [conn t] :as db} fuel-tracker flake-xf error-ch components]
-   (let [out-ch               (async/chan)
-         [s-cmp p-cmp o-cmp]  components
-         {s ::val, s-fn ::fn} s-cmp
-         {p ::val, p-fn ::fn} p-cmp
-         o-fn                 (::fn o-cmp)]
-     (go
-       (try* (let [s*          (if (and s (not (number? s)))
-                                 (<? (dbproto/-subid db s true))
-                                 s)
-                   [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
-                                 [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
-                                 [(::val o-cmp) (::datatype o-cmp)])
-                   idx         (index/for-components s* p o* o-dt*)
-                   idx-root    (get db idx)
-                   novelty     (get-in db [:novelty idx])
-                   [o** o-fn*] (augment-object-fn idx s* p o* o-fn)
-                   start-flake (flake/create s* p o** o-dt* nil nil util/min-integer)
-                   end-flake   (flake/create s* p o** o-dt* nil nil util/max-integer)
-                   track-fuel  (when fuel-tracker
-                                 (fuel/track fuel-tracker))
-                   subj-filter (when s-fn
-                                 (filter (fn [f] (-> f flake/s s-fn))))
-                   pred-filter (when p-fn
-                                 (filter (fn [f] (-> f flake/p p-fn))))
-                   obj-filter  (when o-fn*
-                                 (filter (fn [f] (-> f flake/o o-fn*))))
-                   flake-xf*   (->> [subj-filter pred-filter obj-filter
-                                     flake-xf track-fuel]
-                                    (remove nil?)
-                                    (apply comp))
-                   opts        (cond-> {:idx         idx
-                                        :from-t      t
-                                        :to-t        t
-                                        :start-test  >=
-                                        :start-flake start-flake
-                                        :end-test    <=
-                                        :end-flake   end-flake
-                                        :flake-xf    flake-xf*})]
-               (-> (query-range/resolve-flake-slices conn idx-root novelty
-                                                     error-ch opts)
-                   (->> (query-range/filter-authorized db start-flake end-flake
-                                                       error-ch))
-                   (async/pipe out-ch)))
-             (catch* e
-                     (log/error e "Error resolving flake range")
-                     (>! error-ch e))))
-     out-ch)))
-
 (defn unmatched
   ([] {})
   ([var-sym]
@@ -238,6 +161,92 @@
             (unmatched? s) (assoc (::var s) (match-subject s flake))
             (unmatched? p) (assoc (::var p) (match-predicate p flake))
             (unmatched? o) (assoc (::var o) (match-object o flake)))))
+
+(defn augment-object-fn
+  "Returns a pair consisting of an object value and boolean function that will
+  return false when applied to object values whose flake should be filtered out
+  of query results. This function augments the original object function supplied
+  in an object pattern under the `::fn` key (if any) by also checking if a
+  prospective flake object is equal to the supplied `o` value if and only if the
+  `:spot` index is used, the `p` value is `nil`, and the `s` and `o` values are
+  not `nil`. In this case, the new object value returned by this function will
+  be changed to `nil`. This ensures that all necessary flakes are considered
+  from the spot index when scanned, and this is necessary because the `p` value
+  is `nil`."
+  [idx s p o o-fn]
+  (if (and (#{:spot} idx)
+           (nil? p)
+           (and s o))
+    (let [f (if o-fn
+              (fn [mch]
+                (and (#{o} (::val mch))
+                     (o-fn mch)))
+              (fn [mch]
+                (#{o} (::val mch))))]
+      [nil f])
+    [o o-fn]))
+
+(defn resolve-flake-range
+  ([db fuel-tracker error-ch components]
+   (resolve-flake-range db fuel-tracker nil error-ch components))
+
+  ([{:keys [conn t] :as db} fuel-tracker flake-xf error-ch components]
+   (let [out-ch               (async/chan)
+         [s-cmp p-cmp o-cmp]  components
+         {s ::val, s-fn ::fn} s-cmp
+         {p ::val, p-fn ::fn} p-cmp
+         o-fn                 (::fn o-cmp)]
+     (go
+       (try* (let [s*          (if (and s (not (number? s)))
+                                 (<? (dbproto/-subid db s true))
+                                 s)
+                   [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
+                                 [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
+                                 [(::val o-cmp) (::datatype o-cmp)])
+                   idx         (index/for-components s* p o* o-dt*)
+                   idx-root    (get db idx)
+                   novelty     (get-in db [:novelty idx])
+                   [o** o-fn*] (augment-object-fn idx s* p o* o-fn)
+                   start-flake (flake/create s* p o** o-dt* nil nil util/min-integer)
+                   end-flake   (flake/create s* p o** o-dt* nil nil util/max-integer)
+                   track-fuel  (when fuel-tracker
+                                 (fuel/track fuel-tracker))
+                   subj-filter (when s-fn
+                                 (filter (fn [f]
+                                           (-> (unmatched)
+                                               (match-subject f)
+                                               s-fn))))
+                   pred-filter (when p-fn
+                                 (filter (fn [f]
+                                           (-> (unmatched)
+                                               (match-predicate f)
+                                               p-fn))))
+                   obj-filter  (when o-fn*
+                                 (filter (fn [f]
+                                           (-> (unmatched)
+                                               (match-object f)
+                                               o-fn*))))
+                   flake-xf*   (->> [subj-filter pred-filter obj-filter
+                                     flake-xf track-fuel]
+                                    (remove nil?)
+                                    (apply comp))
+                   opts        (cond-> {:idx         idx
+                                        :from-t      t
+                                        :to-t        t
+                                        :start-test  >=
+                                        :start-flake start-flake
+                                        :end-test    <=
+                                        :end-flake   end-flake
+                                        :flake-xf    flake-xf*})]
+               (-> (query-range/resolve-flake-slices conn idx-root novelty
+                                                     error-ch opts)
+                   (->> (query-range/filter-authorized db start-flake end-flake
+                                                       error-ch))
+                   (async/pipe out-ch)))
+             (catch* e
+                     (log/error e "Error resolving flake range")
+                     (>! error-ch e))))
+     out-ch)))
 
 (defn get-equivalent-properties
   [db prop]
