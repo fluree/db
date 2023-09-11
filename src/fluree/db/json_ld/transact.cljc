@@ -9,6 +9,7 @@
             [fluree.db.json-ld.branch :as branch]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.json-ld.data :as data]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.reify :as jld-reify]
@@ -545,6 +546,69 @@
                       (<? (insert db fuel-tracker tx tx-state)))]
        (log/trace "stage flakes:" flakes)
        (<? (flakes->final-db tx-state flakes))))))
+
+(defn ->tx-state2
+  [db {:keys [bootstrap? did context-type txn-context] :as _opts}]
+  (let [{:keys [schema branch ledger policy], db-t :t} db
+        last-pid (volatile! (jld-ledger/last-pid db))
+        last-sid (volatile! (jld-ledger/last-sid db))
+        commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
+        t        (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
+        db-before (dbproto/-rootdb db)]
+    {:db-before     db-before
+     :policy        policy
+     :default-ctx   (if context-type
+                      (dbproto/-context db ::dbproto/default-context context-type)
+                      (dbproto/-context db))
+     :t             t
+     :next-pid      (fn [] (vswap! last-pid inc))
+     :next-sid      (fn [] (vswap! last-sid inc))
+     :iri-cache     (volatile! {})
+     :asserts       (flake/sorted-set-by flake/cmp-flakes-spot)
+     :retracts      (flake/sorted-set-by flake/cmp-flakes-spot)}))
+
+(defn valid-tx-structure?
+  [expanded-tx]
+  (m/validate [:and [:map {:closed true}
+                     [const/insert-data {:optional true} :any]
+                     [const/delete-data {:optional true} :any]
+                     [const/upsert-data {:optional true} :any]]
+               [:fn (fn [tx] (pos? (count tx)))]]
+              (dissoc expanded-tx :idx)))
+
+(defn stage2
+  "Stages changes, but does not commit.
+  Returns async channel that will contain updated db or exception."
+  ([db json-ld opts]
+   (stage2 db nil json-ld opts))
+  ([db fuel-tracker json-ld opts]
+   (def db db)
+   (go-try
+     (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
+                                      {:subject json-ld})
+
+           opts*     (cond-> opts did (assoc :did did))
+           db-before (if-let [policy-opts (perm/policy-opts opts*)]
+                       (<? (perm/wrap-policy db policy-opts))
+                       db)
+
+           [{insert-data const/insert-data
+             delete-data const/delete-data
+             upsert-data const/upsert-data
+             :as         expanded-tx}] (util/sequential (json-ld/expand tx))
+
+           _ (when-not (valid-tx-structure? expanded-tx)
+               (throw (ex-info "Transaction must contain only insertData, deleteData, or upsertData."
+                               {:status 400 :error :db/invalid-transaction
+                                :tx-keys (keys expanded-tx)})))
+
+           tx-state (->tx-state2 db-before opts*)
+           tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
+           tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
+           tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))]
+
+
+       (select-keys tx-state [:asserts :retracts ])))))
 
 (defn stage-ledger
   ([ledger json-ld opts]

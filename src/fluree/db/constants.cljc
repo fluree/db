@@ -53,6 +53,11 @@
 (def ^:const iri-modify "https://ns.flur.ee/ledger#modify")
 (def ^:const iri-role "https://ns.flur.ee/ledger#role")
 
+(def base "https://flur.ee/ns/")
+(def insert-data (str base "insertData"))
+(def delete-data (str base "deleteData"))
+(def upsert-data (str base "upsertData"))
+
 (def ^:const iri-id "@id")
 (def ^:const iri-type "@type")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")

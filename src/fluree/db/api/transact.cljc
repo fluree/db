@@ -30,8 +30,29 @@
                                                  :fuel (fuel/tally fuel-tracker))))))))
       (<? (dbproto/-stage db json-ld opts)))))
 
+(defn stage2
+  [db json-ld opts]
+  (go-try
+    (if (:meta opts)
+      (let [start-time   #?(:clj  (System/nanoTime)
+                            :cljs (util/current-time-millis))
+            fuel-tracker (fuel/tracker)]
+        (try* (let [result (<? (dbproto/-stage db fuel-tracker json-ld opts))]
+                {:status 200
+                 :result result
+                 :time   (util/response-time-formatted start-time)
+                 :fuel   (fuel/tally fuel-tracker)})
+              (catch* e
+                      (throw (ex-info "Error staging database"
+                                      (-> e
+                                          ex-data
+                                          (assoc :time (util/response-time-formatted start-time)
+                                                 :fuel (fuel/tally fuel-tracker))))))))
+      (<? (dbproto/-stage db json-ld opts)))))
+
 (defn parse-json-ld-txn
   "Expands top-level keys and parses any opts in json-ld transaction document.
+
   Throws if required keys @id or @graph are absent."
   [conn context-type json-ld]
   (let [conn-default-ctx (conn-proto/-default-context conn context-type)
