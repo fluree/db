@@ -62,12 +62,20 @@
   [x]
   {::iri x})
 
-(defn ->function
+(defn ->var-filter
   "Build a query function specification for the variable `var` out of the
   parsed function `f`."
   [var f]
   (-> var
       unmatched
+      (assoc ::fn f)))
+
+(defn ->val-filter
+  "Build a query function specification for the explicit value `val` out of the
+  boolean function `f`. `f` should accept a single flake where-match map."
+  [val f]
+  (-> val
+      anonymous-value
       (assoc ::fn f)))
 
 (defn ->predicate
