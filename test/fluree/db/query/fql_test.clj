@@ -204,29 +204,27 @@
           ledger @(fluree/create conn "jobs")
           db     @(-> ledger
                       fluree/db
-                      (fluree/stage {"@context"   {"ex"         "http://example.com/vocab/",
+                      (fluree/stage {"@context"   {"ex"         "http://example.com/vocab/"
                                                    "occupation" {"@id"        "ex:occupation"
-                                                                 "@container" "@language"}},
-                                     "ex:name"    "Frank",
-                                     "ex:age"     33,
-                                     "occupation" {"en" {"@value" "Ninja"},
+                                                                 "@container" "@language"}}
+                                     "ex:name"    "Frank"
+                                     "ex:age"     33
+                                     "occupation" {"en" {"@value" "Ninja"}
                                                    "ja" "忍者"}}))]
+
       (testing "with bound language tags"
-        (let [sut @(fluree/query db '{"@context" {"ex"         "http://example.com/vocab/",
-                                                  "occupation" {"@id"        "ex:occupation"
-                                                                "@container" "@language"}}
-                                      :select [?job ?lang]
-                                      :where [[?s "ex:occupation" ?job]
-                                              {:bind {?lang "(lang ?job)"}}]})]
+        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+                                      :select    [?job ?lang]
+                                      :where     [[?s "ex:occupation" ?job]
+                                                  {:bind {?lang "(lang ?job)"}}]})]
           (is (= [["Ninja" "en"] ["忍者" "ja"]] sut)
               "return the correct language tags.")))
+
       (testing "filtering by language tags"
-        (let [sut @(fluree/query db '{"@context" {"ex"         "http://example.com/vocab/",
-                                                  "occupation" {"@id"        "ex:occupation"
-                                                                "@container" "@language"}}
-                                      :select [?job]
-                                      :where [[?s "ex:occupation" ?job]
-                                              {:filter ["(= \"en\" (lang ?job))"]}]})]
+        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+                                      :select    [?job]
+                                      :where     [[?s "ex:occupation" ?job]
+                                                  {:filter ["(= \"en\" (lang ?job))"]}]})]
           (is (= [["Ninja"]] sut)
               "returns correctly filtered results"))))))
 
