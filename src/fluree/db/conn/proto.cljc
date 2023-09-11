@@ -9,7 +9,7 @@
   (-method [conn] "Returns connection method type (as keyword)")
   (-parallelism [conn] "Returns parallelism integer to use for running multi-thread operations (1->8)")
   (-id [conn] "Returns internal id for connection object")
-  (-default-context [conn] "Returns optional default context set at connection level")
+  (-default-context [conn] [conn context-type] "Returns optional default context set at connection level")
   (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from connection service")

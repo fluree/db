@@ -33,32 +33,36 @@
 (defn parse-json-ld-txn
   "Expands top-level keys and parses any opts in json-ld transaction document.
   Throws if required keys @id or @graph are absent."
-  [json-ld]
-  (let [context-key (cond
-                      (contains? json-ld "@context") "@context"
-                      (contains? json-ld :context) :context)
-        context (get json-ld context-key)]
-    (let [parsed-context (json-ld/parse-context context)
-          {id "@id" graph "@graph" :as parsed-txn}
-          (into {}
-                (map (fn [[k v]]
-                       (let [k* (if (= context-key k)
-                                  "@context"
-                                  (json-ld/expand-iri k parsed-context))
-                             v* (if (= const/iri-opts k*)
-                                  (keywordize-keys v)
-                                  v)]
-                         [k* v*])))
-                json-ld)]
-      (if-not (and id graph)
-        (throw (ex-info (str "Invalid transaction, missing required keys:"
-                             (when (nil? id)
-                               " @id")
-                             (when (nil? graph)
-                               " @graph")
-                             ".")
-                        {:status 400 :error :db/invalid-transaction}))
-        parsed-txn))))
+  [conn context-type json-ld]
+  (let [conn-default-ctx (conn-proto/-default-context conn context-type)
+        parsed-cdc       (json-ld/parse-context conn-default-ctx)
+        context-key      (cond
+                           (contains? json-ld "@context") "@context"
+                           (contains? json-ld :context) :context)
+        context          (get json-ld context-key)
+        parsed-context   (if context
+                           (json-ld/parse-context parsed-cdc context)
+                           parsed-cdc)
+        {id "@id" graph "@graph" :as parsed-txn}
+        (into {}
+              (map (fn [[k v]]
+                     (let [k* (if (= context-key k)
+                                "@context"
+                                (json-ld/expand-iri k parsed-context))
+                           v* (if (= const/iri-opts k*)
+                                (keywordize-keys v)
+                                v)]
+                       [k* v*])))
+              json-ld)]
+    (if-not (and id graph)
+      (throw (ex-info (str "Invalid transaction, missing required keys:"
+                           (when (nil? id)
+                             " @id")
+                           (when (nil? graph)
+                             " @graph")
+                           ".")
+                      {:status 400 :error :db/invalid-transaction}))
+      parsed-txn)))
 
 (defn ledger-transact!
   [ledger txn opts]

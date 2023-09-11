@@ -253,7 +253,9 @@
   call `load` on the ledger alias."
   [conn json-ld opts]
   (promise-wrap
-   (let [parsed-txn (transact-api/parse-json-ld-txn json-ld)]
+   (let [context-type (get opts :context-type :string)
+         parsed-txn   (transact-api/parse-json-ld-txn conn context-type json-ld)]
+     (log/trace "transact! parsed-txn:" parsed-txn)
      (transact-api/transact! conn parsed-txn opts))))
 
 (defn create-with-txn
@@ -262,19 +264,31 @@
   into it. Returns a promise with the transaction result (a db value)."
   ([conn txn] (create-with-txn conn txn nil))
   ([conn txn opts]
-   (let [{ledger-id "@id" :as parsed-txn} (transact-api/parse-json-ld-txn txn)
+   (log/trace "create-with-txn txn:" txn)
+   (log/trace "create-with-txn opts:" opts)
+   (let [context-type   (get opts :context-type :string)
+         {ledger-id       "@id"
+          txn-context     "@context"
+          txn-opts        const/iri-opts
+          default-context const/iri-default-context
+          :as             parsed-txn} (transact-api/parse-json-ld-txn conn context-type txn)
+         _              (log/trace "create-with-txn parsed-txn:" parsed-txn)
          ledger-exists? @(exists? conn ledger-id)]
      (if ledger-exists?
        (let [err-message (str "Ledger " ledger-id " already exists")]
          (throw (ex-info err-message
                          {:status 409
                           :error  :db/ledger-exists})))
-       (let [create-promise (create conn ledger-id opts)
-             ledger @create-promise]
+       (let [opts*          (cond-> opts
+                              txn-opts (clojure.core/merge txn-opts)
+                              txn-context (assoc :txn-context txn-context)
+                              default-context (assoc :defaultContext default-context))
+             create-promise (create conn ledger-id opts*)
+             ledger         @create-promise]
          (if (util/exception? ledger)
            create-promise
            (promise-wrap
-            (transact-api/ledger-transact! ledger parsed-txn opts))))))))
+            (transact-api/ledger-transact! ledger parsed-txn opts*))))))))
 
 (defn status
   "Returns current status of ledger branch."
@@ -385,5 +399,6 @@
   Returns promise"
   [db iri]
   (promise-wrap
-    (->> (expand-iri db iri)
-         (dbproto/-subid db))))
+   (->> iri
+        (expand-iri db)
+        (dbproto/-subid db))))
