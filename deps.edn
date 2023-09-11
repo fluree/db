@@ -11,7 +11,7 @@
          instaparse/instaparse           {:mvn/version "1.4.12"}
          metosin/malli                   {:mvn/version "0.11.0"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :git/sha "c9802eb7dec9c3c727b194d7c9094938d2c04d6c"}
+                                          :git/sha "728908449d861f7331f6813bfbb32d62ab917819"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
