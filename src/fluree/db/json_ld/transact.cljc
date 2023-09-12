@@ -564,8 +564,8 @@
      :next-pid      (fn [] (vswap! last-pid inc))
      :next-sid      (fn [] (vswap! last-sid inc))
      :iri-cache     (volatile! {})
-     :asserts       (flake/sorted-set-by flake/cmp-flakes-spot)
-     :retracts      (flake/sorted-set-by flake/cmp-flakes-spot)}))
+     :asserts       (flake/sorted-set-by flake/cmp-flakes-post)
+     :retracts      (flake/sorted-set-by flake/cmp-flakes-post)}))
 
 (defn valid-tx-structure?
   [expanded-tx]
@@ -603,9 +603,10 @@
                                 :tx-keys (keys expanded-tx)})))
 
            tx-state (->tx-state2 db-before opts*)
-           tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
+           ;; tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
            tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
-           tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))]
+           ;; tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))
+           ]
 
 
        (select-keys tx-state [:asserts :retracts ])))))
