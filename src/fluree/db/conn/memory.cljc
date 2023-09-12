@@ -3,7 +3,6 @@
             [fluree.db.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
@@ -145,6 +144,10 @@
   (-parallelism [_] parallelism)
   (-id [_] id)
   (-default-context [_] (:context ledger-defaults))
+  (-default-context [_ context-type] (let [ctx (:context ledger-defaults)]
+                                       (if (= :keyword context-type)
+                                         (ctx-util/keywordize-context ctx)
+                                         ctx)))
   (-new-indexer [_ opts] (idx-default/create opts)) ;; default new ledger indexer
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try

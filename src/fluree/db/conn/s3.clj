@@ -211,6 +211,10 @@
   (-parallelism [_] parallelism)
   (-id [_] id)
   (-default-context [_] (:context ledger-defaults))
+  (-default-context [_ context-type] (let [ctx (:context ledger-defaults)]
+                                       (if (= :keyword context-type)
+                                         (ctx-util/keywordize-context ctx)
+                                         ctx)))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
