@@ -9,7 +9,8 @@
    [clojure.core.async :as async]
    [fluree.db.util.log :as log]
    [fluree.db.datatype :as datatype]
-   [fluree.json-ld.processor.api :as jld-processor]))
+   [fluree.json-ld.processor.api :as jld-processor]
+   [fluree.db.json-ld.shacl :as shacl]))
 
 (defn create-id-flake
   [sid iri t]
@@ -32,51 +33,81 @@
 
 (declare insert-sid)
 (defn insert-flake
-  [sid pid m {:keys [db-before iri-cache next-sid t] :as tx-state}
+  [sid pid m shacl-dt shape-sid->p-shapes
+   {:keys [db-before iri-cache next-sid t] :as tx-state}
    {:keys [value id type language list] :as v-map}]
   (go-try
     (cond list
           (loop [[[i list-item :as item] & r] (map vector (range) list)
                  tx-state tx-state]
             (if item
-              (recur r (<? (insert-flake sid pid {:i i} tx-state list-item)))
+              (recur r (<? (insert-flake sid pid {:i i} shacl-dt shape-sid->p-shapes tx-state list-item)))
               tx-state))
 
           ;; literal
-          value
-          (let [[o dt] (datatype/from-expanded v-map nil)]
-            ;; TODO: support coercion of dt
-            ;; TODO: add language to meta
-            (update tx-state :asserts conj (flake/create sid pid o dt t true m)))
+          (some? value)
+          (let [[o dt] (datatype/from-expanded v-map shacl-dt)
+                ;; TODO: add language to meta
+                new-flake (flake/create sid pid o dt t true m)
+                [valid? err-msg] (shacl/coalesce-validation-results
+                                   (into []
+                                         (mapcat (fn [[shape-sid p-shapes]]
+                                                   (mapv (fn [p-shape]
+                                                           (shacl/validate-simple-property-constraints p-shape [new-flake]))
+                                                         p-shapes)))
+                                         shape-sid->p-shapes))]
+            (when-not valid? (shacl/throw-shacl-exception err-msg))
+            (-> tx-state
+                (update :asserts conj new-flake)
+                (update :shape->validated-properties (fn [shape->validated-properties]
+                                                       (reduce (fn [shape->validated-properties [shape-sid]]
+                                                                 (update shape->validated-properties shape-sid (fnil conj #{}) pid))
+                                                               shape->validated-properties
+                                                               shape-sid->p-shapes)))))
 
           ;; ref
           :else
           (<? (insert-sid tx-state v-map)))))
 
 (defn insert-pid
-  [sid {:keys [db-before iri-cache next-pid t] :as tx-state} [predicate values]]
+  [sid {:keys [db-before iri-cache next-pid t shape-sids] :as tx-state} [predicate values]]
   (go-try
-    (let [existing-pid (<? (lookup-iri tx-state predicate))
-          pid          (if existing-pid existing-pid (next-pid))]
+    (let [existing-pid        (<? (lookup-iri tx-state predicate))
+          target-class-sids   (when (= predicate const/iri-type)
+                                (<? (shacl/shape-target-sids db-before const/$sh:targetClass existing-pid)))
+          target-object-sids  (when existing-pid (<? (shacl/shape-target-sids db-before const/$sh:targetObjectsOf existing-pid)))
+          target-subject-sids (when existing-pid (<? (shacl/shape-target-sids db-before const/$sh:targetSubjectsOf existing-pid)))
+          shape-sids          (reduce into shape-sids [target-class-sids target-object-sids target-object-sids])
+          shapes              (<? (shacl/build-shapes-cached db-before shape-sids))
+
+          [pid->shape-sid->p-shapes pid->shacl-dt] (shacl/consolidate-advanced-validation shapes)
+
+          pid                 (if existing-pid existing-pid (next-pid))
+          shacl-dt            (get pid->shacl-dt pid)
+          shape-sid->p-shapes (get pid->shape-sid->p-shapes pid)]
       (loop [[v-map & r] values
-             tx-state (cond-> tx-state
-                        (not existing-pid) (update :asserts conj (create-id-flake pid predicate t)))]
+             tx-state    (cond-> (-> tx-state
+                                     (update :shape-sids into target-class-sids)
+                                     (update :shape-sids into target-object-sids)
+                                     (update :shape-sids into target-subject-sids))
+                           (not existing-pid) (update :asserts conj (create-id-flake pid predicate t)))]
         (println "DEP v-map" v-map)
         (if v-map
-          (recur r (<? (insert-flake sid pid nil tx-state v-map)))
+          (recur r (<? (insert-flake sid pid nil shacl-dt shape-sid->p-shapes tx-state v-map)))
           tx-state)))))
 
 (defn insert-sid
   [{:keys [db-before asserts iri-cache next-sid t] :as tx-state} {:keys [id] :as subject}]
   (go-try
-    (let [existing-sid (when id (<? (lookup-iri tx-state id)))
-          [sid iri]    (if (nil? id)
-                         (let [bnode-sid (next-sid)]
+    (let [existing-sid     (when id (<? (lookup-iri tx-state id)))
+          target-node-sids (when existing-sid (<? (shacl/shape-target-sids db-before const/$sh:targetNode existing-sid)))
+          [sid iri]        (if (nil? id)
+                             (let [bnode-sid (next-sid)]
                            [bnode-sid (bnode-id bnode-sid)])
                          ;; TODO: not handling pid generation
                          [(or existing-sid (next-sid)) id])]
       (loop [[entry & r] (dissoc subject :id :idx)
-             tx-state    (cond-> tx-state
+             tx-state    (cond-> (update tx-state :shape-sids into target-node-sids)
                            (not existing-sid) (update :asserts conj (create-id-flake sid iri t)))]
         (if entry
           (recur r (<? (insert-pid sid tx-state entry)))

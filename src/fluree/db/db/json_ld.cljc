@@ -347,6 +347,7 @@
                     :policy          root-policy-map
                     :default-context default-context
                     :context-type    context-type*
+                    :shape-cache     (atom {})
                     :context-cache   (volatile! nil)
                     :new-context?    new-context?
                     :ecount          genesis-ecount})))

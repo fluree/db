@@ -896,6 +896,45 @@
             (recur r (conj shapes shape)))
           shapes)))))
 
+(defn build-shapes-cached
+  [{:keys [shape-cache] :as db} shape-sids]
+  (go-try
+    (when (seq shape-sids)
+      (loop [[shape-sid & r] shape-sids
+             shapes   []]
+        (if shape-sid
+          (let [cached-shape (get @shape-cache shape-sid)
+                shape        (or cached-shape
+                                 (let [shape-flakes (<? (query-range/index-range db :spot = [shape-sid]))]
+                                   (<? (build-node-shape db shape-flakes))))]
+            (when-not cached-shape (swap! shape-cache assoc shape-sid shape))
+            (recur r (conj shapes shape)))
+          shapes)))))
+
+(defn consolidate-advanced-validation
+  "We need to have the shacl :datatype constraints at hand for each pid so that we can
+  properly coerce flake `dt` fields, where possible.
+
+  We also need an efficient structure for finding the p-shapes for advanced validation.
+
+  This function assembles both structures in one pass through the shacl-shapes.
+
+  Returns a two tuple of:
+  pid->shape->p-shapes
+  {<pid> {<shape-id-iri> [<p-shape1> <p-shape2> ...]}}
+
+  pid->shacl-dt
+  {<pid> <dt>}"
+  [shacl-shapes]
+  (reduce (fn [[pid->shape->p-shapes pid->shacl-dt*]
+               {:keys [advanced-validation pid->shacl-dt] :as shape}]
+            [(if advanced-validation
+               (merge-with merge pid->shape->p-shapes advanced-validation)
+               pid->shape->p-shapes)
+             (merge pid->shacl-dt* pid->shacl-dt)])
+          [{} {}]
+          shacl-shapes))
+
 (defn build-class-shapes
   "Given a class SID, returns class shape"
   [db type-sid]
@@ -929,6 +968,11 @@
                                  shapes))]
             (recur r (into shapes class-shapes)))
           shapes)))))
+
+(defn shape-target-sids
+  [db target-type target]
+  (go-try
+    (<? (query-range/index-range db :post = [target-type target] {:flake-xf (map flake/s)}))))
 
 (defn build-targetobject-shapes
   "Given a pred SID, returns shape"

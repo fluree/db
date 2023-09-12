@@ -171,30 +171,6 @@
                                     "All items for a single subject should be consolidated.")
                                {:status 400 :error :db/invalid-transaction})))))))
 
-(defn consolidate-advanced-validation
-  "We need to have the shacl :datatype constraints at hand for each pid so that we can
-  properly coerce flake `dt` fields, where possible.
-
-  We also need an efficient structure for finding the p-shapes for advanced validation.
-
-  This function assembles both structures in one pass through the shacl-shapes.
-
-  Returns a two tuple of:
-  pid->shape->p-shapes
-  {<pid> {<shape-id-iri> [<p-shape1> <p-shape2> ...]}}
-
-  pid->shacl-dt
-  {<pid> <dt>}"
-  [shacl-shapes]
-  (reduce (fn [[pid->shape->p-shapes pid->shacl-dt*]
-               {:keys [advanced-validation pid->shacl-dt] :as _shape}]
-            [(if advanced-validation
-               (merge-with merge pid->shape->p-shapes advanced-validation)
-               pid->shape->p-shapes)
-             (merge pid->shacl-dt* pid->shacl-dt)])
-          [{} {}]
-          shacl-shapes))
-
 (defn rdf-type-iri?
   [iri]
   (= const/iri-rdf-type iri))
@@ -275,7 +251,7 @@
                            (<? (shacl/targetobject-shapes db-before referring-pids)))
           shacl-shapes (into class-shapes pred-shapes)
 
-          [pid->shape->p-shapes pid->shacl-dt] (consolidate-advanced-validation shacl-shapes)
+          [pid->shape->p-shapes pid->shacl-dt] (shacl/consolidate-advanced-validation shacl-shapes)
 
           id*          (if (and new-subj? (nil? id))
                          (str "_:f" sid) ;; create a blank node id
@@ -429,7 +405,7 @@
     (let [track-fuel (when fuel-tracker
                        (fuel/track fuel-tracker))
           flakeset   (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                             (init-db? db) (track-into track-fuel (base-flakes t)))]
+                       (init-db? db) (track-into track-fuel (base-flakes t)))]
       (loop [[node & r] (util/sequential json-ld)
              flakes flakeset]
         (if node
@@ -564,6 +540,7 @@
      :next-pid      (fn [] (vswap! last-pid inc))
      :next-sid      (fn [] (vswap! last-sid inc))
      :iri-cache     (volatile! {})
+     :shape-sids    #{}
      :asserts       (flake/sorted-set-by flake/cmp-flakes-post)
      :retracts      (flake/sorted-set-by flake/cmp-flakes-post)}))
 
