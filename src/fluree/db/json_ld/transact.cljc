@@ -541,6 +541,7 @@
      :next-sid      (fn [] (vswap! last-sid inc))
      :iri-cache     (volatile! {})
      :shape-sids    #{}
+     :shapes        {:class #{} :subject #{} :object #{} :node #{}}
      :asserts       (flake/sorted-set-by flake/cmp-flakes-post)
      :retracts      (flake/sorted-set-by flake/cmp-flakes-post)}))
 
