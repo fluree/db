@@ -564,29 +564,26 @@
      (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
                                       {:subject json-ld})
 
-           opts*     (cond-> opts did (assoc :did did))
-           db-before (if-let [policy-opts (perm/policy-opts opts*)]
-                       (<? (perm/wrap-policy db policy-opts))
-                       db)
+           opts* (cond-> opts did (assoc :did did))
 
+           ;; TODO: I don't think we can safely expand just anything, need an alternative way
+           ;; to figure out if we're dropping back to old stage
            [{insert-data const/insert-data
              delete-data const/delete-data
              upsert-data const/upsert-data
-             :as         expanded-tx}] (util/sequential (json-ld/expand tx))
+             :as         expanded-tx}] (util/sequential (json-ld/expand tx))]
+       (if (valid-tx-structure? expanded-tx)
+         (let [db-before (if-let [policy-opts (perm/policy-opts opts*)]
+                           (<? (perm/wrap-policy db policy-opts))
+                           db)
 
-           _ (when-not (valid-tx-structure? expanded-tx)
-               (throw (ex-info "Transaction must contain only insertData, deleteData, or upsertData."
-                               {:status 400 :error :db/invalid-transaction
-                                :tx-keys (keys expanded-tx)})))
-
-           tx-state (->tx-state2 db-before opts*)
-           ;; tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
-           tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
-           ;; tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))
-           ]
-
-
-       (select-keys tx-state [:asserts :retracts ])))))
+               tx-state (->tx-state2 db-before opts*)
+               ;; tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
+               tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
+               ;; tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))
+               ]
+           (select-keys tx-state [:asserts :retracts]))
+         (<? (stage db fuel-tracker json-ld opts)))))))
 
 (defn stage-ledger
   ([ledger json-ld opts]
