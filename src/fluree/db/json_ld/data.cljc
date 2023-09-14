@@ -110,7 +110,7 @@
           tx-state)))))
 
 (defn insert-flakes
-  [{:keys [default-context] :as tx-state} data]
+  [{:keys [default-ctx] :as tx-state} data]
   (reduce insert-sid
           tx-state
-          (util/sequential (json-ld/expand data default-context))))
+          (util/sequential (json-ld/expand data default-ctx))))
