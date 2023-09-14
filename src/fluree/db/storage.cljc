@@ -109,12 +109,18 @@
   [db changes-ch custom-ecount]
   (go-try
     (let [{:keys [conn ledger commit t ecount stats spot psot post opst
-                  tspo fork fork-block]} db
+                  tspo fork fork-block schema]} db
           t'        (- t)
           ledger-alias (:id commit)
+
+          pred-sids (->> schema :pred (into [] (comp (filter (fn [[k _v]] (number? k)))
+                                                     (map (fn [[k _]] k))
+                                                     (distinct))))
+
           data      {:ledger-alias ledger-alias
                      :t         t'
                      :ecount    (or custom-ecount ecount)
+                     :preds     pred-sids
                      :stats     (select-keys stats [:flakes :size])
                      :spot      (child-data spot)
                      :psot      (child-data psot)
@@ -163,10 +169,11 @@
 (defn reify-db-root
   "Constructs db from blank-db, and ensure index roots have proper config as unresolved nodes."
   [conn blank-db root-data]
-  (let [{:keys [t ecount stats]} root-data
+  (let [{:keys [t ecount stats preds]} root-data
         db* (assoc blank-db :t (- t)
-                            :ecount ecount
-                            :stats (assoc stats :indexed t))]
+                   :preds preds
+                   :ecount ecount
+                   :stats (assoc stats :indexed t))]
     (reduce
       (fn [db idx]
         (let [idx-root (reify-index-root conn db idx (get root-data idx))]
@@ -212,9 +219,8 @@
                          {:status 400
                           :error  :db/unavailable}))
          (let [db     (reify-db-root conn blank-db db-root)
-               schema (<? (vocab/vocab-map db))
+               schema (<? (vocab/load-schema db))
                db*    (assoc db :schema schema)]
-           ;(assoc db* :settings settings-map)
            db*))))))
 
 (defn fetch-child-attributes

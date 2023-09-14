@@ -244,3 +244,28 @@
   (go-try
     (let [schema  (<? (vocab-map db))]
       (assoc db :schema schema))))
+
+(defn schema
+  [vocab-flakes t]
+  (let [base-schema (base-schema)
+        schema      (update-with* base-schema t vocab-flakes)
+        refs        (extract-ref-sids (:pred schema))]
+    (-> schema
+        (assoc :refs refs))))
+
+(defn load-schema
+  [{:keys [preds t] :as db}]
+  (go-try
+    (loop [[pred-sid & r] preds
+           vocab-flakes (flake/sorted-set-by flake/cmp-flakes-spot)]
+      (if pred-sid
+        (let [pred-flakes (<? (query-range/index-range db :spot = [pred-sid]))]
+          (recur r (into vocab-flakes pred-flakes)))
+
+        (schema vocab-flakes t)))))
+
+(defn refresh-schema2
+  [db add]
+  (let [pred-sids    (into #{} (comp (filter flake/op) (map flake/p)) add)
+        vocab-flakes (filterv #(pred-sids (flake/s %)) add)]
+    (assoc db :schema (schema vocab-flakes (:t db)))))

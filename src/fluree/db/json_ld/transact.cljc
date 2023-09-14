@@ -348,7 +348,7 @@
             (recur r adds removes))))
       [(not-empty adds) (not-empty removes)])))
 
-(defn db-after
+(defn integrate-novelty
   [{:keys [add remove] :as _staged} {:keys [db-before policy bootstrap? t] :as tx-state}]
   (let [new-db (-> db-before
                    (assoc :ecount (final-ecount tx-state)
@@ -372,7 +372,7 @@
           vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
           staged-map   {:add    add
                         :remove remove}
-          db-after     (cond-> (db-after staged-map tx-state)
+          db-after     (cond-> (integrate-novelty staged-map tx-state)
                                vocab-flakes vocab/refresh-schema
                                vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
@@ -561,21 +561,22 @@
 
 (defn finalize-db
   [{:keys [flakes stage-update? db-before] :as tx-state}]
-  (def tx-state tx-state)
-  ;; TODO: refactor once nobody else is depending on the shape of staged-map
-  (let [[add remove] (if stage-update?
-                       (stage-update-novelty (-> db-before :novelty :spot) flakes)
-                       [flakes])
-        staged-map {:add add :remove remove}
-        db-after   (db-after {:add add :remove remove} tx-state)
-        staged-map* (assoc staged-map :db-after db-after) ]
-    ;; TODO: validate shapes
-    ;; TODO: update vocab cache
+  (go-try
+    ;; TODO: refactor once nobody else is depending on the shape of staged-map
+    (let [[add remove] (if stage-update?
+                         (stage-update-novelty (-> db-before :novelty :spot) flakes)
+                         [flakes])
+          staged-map {:add add :remove remove}
+          db-after   (cond-> (integrate-novelty {:add add :remove remove} tx-state)
+                       add (vocab/refresh-schema2 add)
+                       )
+          staged-map* (assoc staged-map :db-after db-after) ]
+      ;; TODO: validate shapes
 
-    ;; will throw if unauthorized flakes have been created
-    (<? (policy/enforce staged-map* tx-state))
-    ;; unwrap the policy
-    (dbproto/-rootdb db-after)))
+      ;; will throw if unauthorized flakes have been created
+      (<? (policy/enforce staged-map* tx-state))
+      ;; unwrap the policy
+      (dbproto/-rootdb db-after))))
 
 (defn stage2
   "Stages changes, but does not commit.
@@ -606,7 +607,7 @@
                tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
                ;; tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))
                ]
-           (finalize-db tx-state))
+           (<? (finalize-db tx-state)))
          (<? (stage db fuel-tracker json-ld opts)))))))
 
 (defn stage-ledger
