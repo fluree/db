@@ -299,21 +299,23 @@
        (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
     db-t))
 
-(defn enrich-value
-  [id->node value]
-  (mapv (fn [v]
-          (if-let [id (get v :id)]
-            (merge (get id->node id) (cond-> v (nil? (:type v)) (dissoc :type)))
-            v))
-        (util/sequential value)))
+(defn enrich-values
+  [id->node values]
+  (mapv (fn [{:keys [id list type] :as v-map}]
+          (if id
+            (merge (get id->node id)
+                   (cond-> v-map
+                     (nil? type) (dissoc :type)))
+            v-map))
+        values))
 
 (defn enrich-node
   [id->node node]
   (reduce-kv
     (fn [updated-node k v]
-      (assoc updated-node k (cond (= :id k) v
-                                  (= :list (ffirst v)) {:list (enrich-value id->node (:list v))}
-                                  :else (enrich-value id->node v))))
+      (assoc updated-node k (cond (= :id k)         v
+                                  (:list (first v)) [{:list (enrich-values id->node (:list (first v)))}]
+                                  :else             (enrich-values id->node v))))
     {}
     node))
 
