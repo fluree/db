@@ -50,9 +50,10 @@
                 dt           (cond existing-dt existing-dt
                                    type        (next-sid)
                                    :else       (datatype/infer value))
+                m*            (cond-> m
+                                language (assoc :lang language))
                 new-dt-flake (when (and type (not existing-dt)) (create-id-flake dt type t))
-                ;; TODO: add language to meta
-                new-flake    (flake/create sid pid value dt t true m)]
+                new-flake    (flake/create sid pid value dt t true m*)]
             (-> tx-state
                 (update :flakes into (remove nil?) [new-dt-flake new-flake])))
 
