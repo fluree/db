@@ -59,7 +59,24 @@
 
           ;; ref
           :else
-          (<? (insert-sid tx-state v-map)))))
+          (let [bnode-sid (when-not id (next-sid))
+                bnode-iri (when-not id (bnode-id bnode-sid))
+
+                v-map*    (cond-> v-map
+                            bnode-iri (assoc :id bnode-iri))
+
+                tx-state  (cond-> tx-state
+                            bnode-iri (update :flakes conj (create-id-flake bnode-sid bnode-iri t)))
+
+                tx-state* (<? (insert-sid tx-state v-map*))
+
+                ref-sid   (if id
+                            ;; sid was generated/found by `insert-sid`
+                            (<? (lookup-iri tx-state* id))
+                            bnode-sid)
+                ref-flake (flake/create sid pid ref-sid const/$xsd:anyURI t true m)]
+            (-> tx-state*
+                (update :flakes conj ref-flake))))))
 
 (defn insert-pid
   [sid {:keys [db-before iri-cache next-pid t shapes] :as tx-state} [predicate values]]
@@ -82,9 +99,9 @@
                              (<? (shacl/shape-target-sids db-before const/$sh:targetNode existing-sid)))
           [sid iri]        (if (nil? id)
                              (let [bnode-sid (next-sid)]
-                           [bnode-sid (bnode-id bnode-sid)])
-                         ;; TODO: not handling pid generation
-                         [(or existing-sid (next-sid)) id])]
+                               [bnode-sid (bnode-id bnode-sid)])
+                             ;; TODO: not handling pid generation
+                             [(or existing-sid (next-sid)) id])]
       (loop [[entry & r] (dissoc subject :id :idx)
              tx-state    (cond-> (update-in tx-state [:shapes :node] into target-node-sids)
                            (not existing-sid) (update :flakes conj (create-id-flake sid iri t)))]
