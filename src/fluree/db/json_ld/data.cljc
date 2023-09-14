@@ -17,13 +17,14 @@
   (flake/create sid const/$xsd:anyURI iri const/$xsd:string t true nil))
 
 (defn lookup-iri
-  [{:keys [db-before iri-cache asserts] :as tx-state} iri]
+  [{:keys [db-before iri-cache flakes] :as tx-state} iri]
   (go-try
     (or (<? (jld-reify/get-iri-sid iri db-before iri-cache))
-        (some->> asserts
+        (some->> flakes
                  (filter (fn [f]
-                           (and (= iri (flake/o f))
-                                (= const/$xsd:anyURI (flake/p f)))))
+                           (and (flake/op f)
+                                (= const/$xsd:anyURI (flake/p f))
+                                (= iri (flake/o f)))))
                  (first)
                  (flake/s)))))
 
@@ -45,7 +46,7 @@
 
           ;; literal
           (some? value)
-          (let [existing-dt  (<? (lookup-iri tx-state type))
+          (let [existing-dt  (when type (<? (lookup-iri tx-state type)))
                 dt           (cond existing-dt existing-dt
                                    type        (next-sid)
                                    :else       (datatype/infer value))
@@ -53,7 +54,7 @@
                 ;; TODO: add language to meta
                 new-flake    (flake/create sid pid value dt t true m)]
             (-> tx-state
-                (update :asserts into (remove nil?) [new-dt-flake new-flake])))
+                (update :flakes into (remove nil?) [new-dt-flake new-flake])))
 
           ;; ref
           :else
@@ -67,13 +68,13 @@
           pid                 (if existing-pid existing-pid (next-pid))]
       (loop [[v-map & r] values
              tx-state    (cond-> tx-state
-                           (not existing-pid) (update :asserts conj (create-id-flake pid predicate t)))]
+                           (not existing-pid) (update :flakes conj (create-id-flake pid predicate t)))]
         (if v-map
           (recur r (<? (insert-flake sid pid nil tx-state v-map)))
           tx-state)))))
 
 (defn insert-sid
-  [{:keys [db-before asserts iri-cache next-sid t] :as tx-state} {:keys [id] :as subject}]
+  [{:keys [db-before iri-cache next-sid t] :as tx-state} {:keys [id] :as subject}]
   (go-try
     (let [existing-sid     (when id (<? (lookup-iri tx-state id)))
           target-node-sids (when existing-sid
@@ -85,7 +86,7 @@
                          [(or existing-sid (next-sid)) id])]
       (loop [[entry & r] (dissoc subject :id :idx)
              tx-state    (cond-> (update-in tx-state [:shapes :node] into target-node-sids)
-                           (not existing-sid) (update :asserts conj (create-id-flake sid iri t)))]
+                           (not existing-sid) (update :flakes conj (create-id-flake sid iri t)))]
         (if entry
           (recur r (<? (insert-pid sid tx-state entry)))
           tx-state)))))

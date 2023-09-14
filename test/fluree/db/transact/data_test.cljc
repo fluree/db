@@ -52,12 +52,15 @@
                                  {"@id" "ex:leia"
                                   "ex:name" "ex:Leia"
                                   "ex:kid" {"@id" "ex:ben"
-                                            "ex:name" "Ben"}}]}}]
+                                            "ex:name" "Ben"}}]}}
+
+        db1 @(fluree/stage2 db0 tx)]
     #_(is (= "Transaction must contain only insertData, deleteData, or upsertData."
-           (-> @(fluree/stage2 db0 invalid-tx)
-               (Throwable->map)
-               :cause)))
+             (-> @(fluree/stage2 db0 invalid-tx)
+                 (Throwable->map)
+                 :cause)))
     (is (= []
-           @(fluree/stage2 db0 tx)))
+           @(fluree/query db1 {"where" [["?s" "ex:name" "Vader"]]
+                               "select" {"?s" ["*"]}})))
     #_(is (= []
-           @(fluree/stage2 db0 default-context-tx)))))
+             @(fluree/stage2 db0 default-context-tx)))))

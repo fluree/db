@@ -73,3 +73,28 @@
                                 {:status 400 :error :db/policy-exception}))))
             ;; all flakes processed and passed! return final db
             db-after))))))
+
+(defn enforce
+  "Throws an exception if any new flakes violate the policy."
+  [{:keys [db-after add]} {:keys [] :as tx-state}]
+  (let [{:keys [policy]} db-after]
+    (go-try
+      (when-not (root? policy)
+        (loop [[s-flakes & r] (partition-by flake/s add)]
+          (when s-flakes
+            (let [fflake (first s-flakes)
+                  sid    (flake/s fflake)
+                  ;; TODO: how do we get classes?
+                  class-sids ()
+
+                  {defaults :default props :property}
+                  (validate/group-policies-by-default policy const/iri-modify class-sids)
+
+                  default-allow? (<? (validate/default-allow? db-after fflake defaults))
+                  allow?         (if props
+                                   (<? (check-property-policies db-after props default-allow? s-flakes))
+                                   default-allow?)]
+              (if allow?
+                (recur r)
+                (throw (ex-info "Policy enforcement prevents modification."
+                                {:status 400 :error :db/policy-exception}))))))))))

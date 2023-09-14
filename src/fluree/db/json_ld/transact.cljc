@@ -533,26 +533,49 @@
         db-before (dbproto/-rootdb db)]
     {:db-before     db-before
      :policy        policy
+     :bootstrap?    bootstrap?
      :default-ctx   (if context-type
                       (dbproto/-context db ::dbproto/default-context context-type)
                       (dbproto/-context db))
+     :stage-update? (= t db-t)
      :t             t
+     :last-pid      last-pid
+     :last-sid      last-sid
      :next-pid      (fn [] (vswap! last-pid inc))
      :next-sid      (fn [] (vswap! last-sid inc))
      :iri-cache     (volatile! {})
      :shape-sids    #{}
      :shapes        {:class #{} :subject #{} :object #{} :node #{}}
-     :asserts       (flake/sorted-set-by flake/cmp-flakes-post)
-     :retracts      (flake/sorted-set-by flake/cmp-flakes-post)}))
+     :flakes       (flake/sorted-set-by flake/cmp-flakes-spot)}))
+
+(def Data
+  [:and [:map {:closed true}
+         [const/insert-data {:optional true} :any]
+         [const/delete-data {:optional true} :any]
+         [const/upsert-data {:optional true} :any]]
+   [:fn (fn [tx] (pos? (count tx)))]])
 
 (defn valid-tx-structure?
   [expanded-tx]
-  (m/validate [:and [:map {:closed true}
-                     [const/insert-data {:optional true} :any]
-                     [const/delete-data {:optional true} :any]
-                     [const/upsert-data {:optional true} :any]]
-               [:fn (fn [tx] (pos? (count tx)))]]
-              (dissoc expanded-tx :idx)))
+  (m/validate  Data (dissoc expanded-tx :idx)))
+
+(defn finalize-db
+  [{:keys [flakes stage-update? db-before] :as tx-state}]
+  (def tx-state tx-state)
+  ;; TODO: refactor once nobody else is depending on the shape of staged-map
+  (let [[add remove] (if stage-update?
+                       (stage-update-novelty (-> db-before :novelty :spot) flakes)
+                       [flakes])
+        staged-map {:add add :remove remove}
+        db-after   (db-after {:add add :remove remove} tx-state)
+        staged-map* (assoc staged-map :db-after db-after) ]
+    ;; TODO: validate shapes
+    ;; TODO: update vocab cache
+
+    ;; will throw if unauthorized flakes have been created
+    (<? (policy/enforce staged-map* tx-state))
+    ;; unwrap the policy
+    (dbproto/-rootdb db-after)))
 
 (defn stage2
   "Stages changes, but does not commit.
@@ -583,7 +606,7 @@
                tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
                ;; tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))
                ]
-           (select-keys tx-state [:asserts :retracts]))
+           (finalize-db tx-state))
          (<? (stage db fuel-tracker json-ld opts)))))))
 
 (defn stage-ledger
