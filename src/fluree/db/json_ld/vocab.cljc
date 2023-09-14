@@ -264,8 +264,18 @@
 
         (schema vocab-flakes t)))))
 
-(defn refresh-schema2
+(defn hydrate-schema
   [db add]
   (let [pred-sids    (into #{} (comp (filter flake/op) (map flake/p)) add)
-        vocab-flakes (filterv #(pred-sids (flake/s %)) add)]
-    (assoc db :schema (schema vocab-flakes (:t db)))))
+        vocab-flakes (filterv #(pred-sids (flake/s %)) add)
+        {:keys [t refs coll pred shapes prefix fullText subclasses]}
+        (schema vocab-flakes (:t db))]
+    (-> db
+        (assoc-in [:schema :t] t)
+        (update-in [:schema :refs] into refs)
+        (update-in [:schema :coll] (partial merge-with merge) coll)
+        (update-in [:schema :pred] (partial merge-with merge) pred)
+        (update-in [:schema :prefix] merge prefix)
+        (update-in [:schema :fullText] into fullText)
+        (assoc-in [:schema :subclasses] subclasses)
+        (assoc-in [:schema :shapes] shapes))))

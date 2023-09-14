@@ -568,8 +568,7 @@
                          [flakes])
           staged-map {:add add :remove remove}
           db-after   (cond-> (integrate-novelty {:add add :remove remove} tx-state)
-                       add (vocab/refresh-schema2 add)
-                       )
+                       add (vocab/hydrate-schema add))
           staged-map* (assoc staged-map :db-after db-after) ]
       ;; TODO: validate shapes
 
