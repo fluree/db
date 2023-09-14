@@ -77,29 +77,31 @@
 
 (defn add-property
   "Adds property. Parameters"
-  [sid pid shacl-dt shape->p-shapes check-retracts? list? {:keys [value] :as v-map}
+  [sid pid shacl-dt shape->p-shapes check-retracts? list? {:keys [language value] :as v-map}
    {:keys [t db-before subj-mods] :as tx-state}]
   (go-try
     (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
                         (->> (<? (query-range/index-range db-before :spot = [sid pid]))
                              (map #(flake/flip-flake % t))))
-          m           (when list?
-                        {:i (-> v-map :idx last)})
 
-          flakes      (cond
-                        ;; a new node's data is contained, process as another node then link to this one
-                        (jld-reify/node? v-map)
-                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+          m (cond-> nil
+              list?    (assoc :i (-> v-map :idx last))
+              language (assoc :lang language))
 
-                        ;; a literal value
-                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
-                        (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                          [(flake/create sid pid value* dt t true m)])
+          flakes (cond
+                   ;; a new node's data is contained, process as another node then link to this one
+                   (jld-reify/node? v-map)
+                   (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                     (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
-                        :else
-                        (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
-                                        {:status 400 :error :db/invalid-transaction})))
+                   ;; a literal value
+                   (and (some? value) (not= shacl-dt const/$xsd:anyURI))
+                   (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
+                     [(flake/create sid pid value* dt t true m)])
+
+                   :else
+                   (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
+                                   {:status 400 :error :db/invalid-transaction})))
           [valid? err-msg] (shacl/coalesce-validation-results
                              (into []
                                    (mapcat (fn [[shape-id p-shapes]]
@@ -184,13 +186,58 @@
   {<pid> <dt>}"
   [shacl-shapes]
   (reduce (fn [[pid->shape->p-shapes pid->shacl-dt*]
-               {:keys [advanced-validation pid->shacl-dt] :as shape}]
+               {:keys [advanced-validation pid->shacl-dt] :as _shape}]
             [(if advanced-validation
                (merge-with merge pid->shape->p-shapes advanced-validation)
                pid->shape->p-shapes)
              (merge pid->shacl-dt* pid->shacl-dt)])
           [{} {}]
           shacl-shapes))
+
+(defn rdf-type-iri?
+  [iri]
+  (= const/iri-rdf-type iri))
+
+(defn new-iri-flake
+  [s iri t]
+  (flake/create s const/$xsd:anyURI iri const/$xsd:string t true nil))
+
+(defn retract-flakes
+  [db s p t]
+  (query-range/index-range db
+                           :spot = [s p]
+                           {:flake-xf (map #(flake/flip-flake % t))}))
+
+(defn property-value->flakes
+  [sid pid property value pid->shape->p-shapes pid->shacl-dt new-subj? existing-pid?
+   {:keys [t db-before] :as tx-state}]
+  (go-try
+    (if (rdf-type-iri? property)
+      (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
+                           " Please use the JSON-LD \"@type\" keyword instead.")
+                      {:status 400 :error :db/invalid-predicate}))
+      (let [list?           (list-value? value)
+            v*              (if list?
+                              (let [list-vals (:list value)]
+                                (when-not (sequential? list-vals)
+                                  (throw (ex-info (str "List values have to be vectors, provided: " value)
+                                                  {:status 400 :error :db/invalid-transaction})))
+                                list-vals)
+                              (util/sequential value))
+            shape->p-shapes (get pid->shape->p-shapes pid)
+            shacl-dt        (get pid->shacl-dt pid)
+
+            ;; check-retracts? - a new subject or property don't require checking for flake retractions
+            check-retracts? (or (not new-subj?) existing-pid?)
+            new-prop-flakes (cond-> []
+                              (not existing-pid?) (conj (new-iri-flake pid property t)))]
+        (if (nil? value)
+          (into new-prop-flakes (<? (retract-flakes db-before sid pid t)))
+          (into new-prop-flakes (loop [[v' & r] v*
+                                       flakes  []]
+                                  (if v'
+                                    (recur r (into flakes (<? (add-property sid pid shacl-dt shape->p-shapes check-retracts? list? v' tx-state))))
+                                    flakes))))))))
 
 (defn json-ld-node->flakes
   "Returns two-tuple of [sid node-flakes] that will contain the top-level sid
@@ -199,8 +246,8 @@
   If property-id is non-nil, it can be checked when assigning new subject id for the node
   if it meets certain criteria. It will only be non-nil for nested subjects in the json-ld."
   [{:keys [id type] :as node}
-   {:keys [t next-pid next-sid iris refs db-before subj-mods
-           shacl-target-objects-of?] :as tx-state}
+   {:keys [t next-pid next-sid iris db-before subj-mods
+           shacl-target-objects-of? refs] :as tx-state}
    referring-pid]
   (go-try
     (let [existing-sid (when id
@@ -241,46 +288,29 @@
                                          :new?      new-subj?
                                          :classes   classes})
       (loop [[[k v] & r] (dissoc node :id :idx :type)
-             property-flakes type-flakes ;; only used if generating new Class and Property flakes
-             subj-flakes     base-flakes]
+             subj-flakes (into base-flakes type-flakes)]
         (if k
-          (let [_ (when (= k const/iri-rdf-type)
-                    (throw (ex-info (str (pr-str const/iri-rdf-type) " is not a valid predicate IRI."
-                                         " Please use the JSON-LD \"@type\" keyword instead.")
-                                    {:status 400 :error :db/invalid-predicate})))
-                list?            (list-value? v)
-                retract?         (nil? v)
-                v*               (if list?
-                                   (let [list-vals (:list v)]
-                                     (when-not (sequential? list-vals)
-                                       (throw (ex-info (str "List values have to be vectors, provided: " v)
-                                                       {:status 400 :error :db/invalid-transaction})))
-                                     list-vals)
-                                   (util/sequential v))
-                ref?             (not (:value (first v*))) ;; either a ref or a value
-                existing-pid     (<? (jld-reify/get-iri-sid k db-before iris))
-                pid              (or existing-pid
-                                     (get jld-ledger/predefined-properties k)
-                                     (jld-ledger/generate-new-pid k iris next-pid ref? refs))
-                shape->p-shapes (get pid->shape->p-shapes pid)
-                shacl-dt        (get pid->shacl-dt pid)
-                property-flakes* (if existing-pid
-                                   property-flakes
-                                   (conj property-flakes (flake/create pid const/$xsd:anyURI k const/$xsd:string t true nil)))
-                ;; check-retracts? - a new subject or property don't require checking for flake retractions
-                check-retracts?  (or (not new-subj?) existing-pid)
-                flakes*          (if retract?
-                                   (<? (query-range/index-range db-before
-                                                                :spot = [sid pid]
-                                                                {:flake-xf (map #(flake/flip-flake % t))}))
-                                   (loop [[v' & r] v*
-                                          flakes* subj-flakes]
-                                     (if v'
-                                       (recur r (into flakes* (<? (add-property sid pid shacl-dt shape->p-shapes check-retracts? list? v' tx-state))))
-                                       flakes*)))]
-            (recur r property-flakes* flakes*))
+          (let [existing-pid    (<? (jld-reify/get-iri-sid k db-before iris))
+                ref?            (not (:value (first v))) ; either a ref or a value
+                pid             (or existing-pid
+                                    (get jld-ledger/predefined-properties k)
+                                    (jld-ledger/generate-new-pid k iris next-pid ref? refs))]
+            (if-let [values (not-empty v)]
+              (let [new-flakes (loop [[value & r] values
+                                      existing? (some? existing-pid)
+                                      flakes []]
+                                 (if value
+                                   (let [new-flakes (<? (property-value->flakes sid pid k value pid->shape->p-shapes pid->shacl-dt
+                                                                                new-subj? existing? tx-state))]
+                                     (recur r true (into flakes new-flakes)))
+                                   flakes))]
+                (recur r (into subj-flakes new-flakes)))
+              (let [retracting-flakes (<? (query-range/index-range db-before
+                                                                   :spot = [sid pid]
+                                                                   {:flake-xf (map #(flake/flip-flake % t))}))]
+                (recur r (into subj-flakes retracting-flakes)))))
           ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
-          [sid (into subj-flakes property-flakes)])))))
+          [sid subj-flakes])))))
 
 (defn ->tx-state
   [db {:keys [bootstrap? did context-type txn-context] :as _opts}]

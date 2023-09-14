@@ -11,7 +11,7 @@
             [clojure.set :as set]
             [clojure.walk :refer [postwalk]]
             [fluree.json-ld :as json-ld]
-            [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
             [fluree.db.dbproto :as dbproto]
@@ -145,14 +145,14 @@
                                       {:status 400 :error :db/invalid-query})))
         var-name  (find-filtered-var code-vars vars)
         f         (eval/compile-filter code var-name)]
-    (where/->function var-name f)))
+    (where/->var-filter var-name f)))
 
 (defn parse-bind-function
   "Evals and returns bind function."
   [var-name fn-code]
   (let [code (parse-code fn-code)
         f    (eval/compile code false)]
-    (where/->function var-name f)))
+    (where/->var-filter var-name f)))
 
 (def ^:const default-recursion-depth 100)
 
@@ -293,11 +293,23 @@
                     (json-ld/expand-iri context))]
       (where/->iri-ref o-iri))))
 
+(defn parse-value-map
+  [x context]
+  (when (map? x)
+    (let [expanded (json-ld/expand x context)]
+      (when-let [v (get-first-value expanded :value)]
+        (if-let [lang (get-first-value expanded :language)]
+          (let [lang-filter (fn [mch]
+                              (-> mch ::where/meta :lang (= lang)))]
+            (where/->val-filter v lang-filter))
+          (where/anonymous-value v))))))
+
 (defn parse-object-pattern
   [o-pat context]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
       (parse-iri-map o-pat context)
+      (parse-value-map o-pat context)
       (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern

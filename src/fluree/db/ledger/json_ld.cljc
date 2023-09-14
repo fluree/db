@@ -14,7 +14,7 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [load]))
@@ -255,12 +255,12 @@
                                          {:status 400 :error :db/invalid-db})))
           [commit proof] (jld-reify/parse-commit commit-data)
           _            (log/debug "load commit:" commit)
-          ledger-alias (or (get-in commit [const/iri-alias :value])
+          ledger-alias (or (get-first-value commit const/iri-alias)
                            (conn-proto/-alias conn db-alias))
-          branch       (keyword (get-in commit [const/iri-branch :value]))
+          branch       (keyword (get-first-value commit const/iri-branch))
           default-ctx  (-> commit
-                           (get-in [const/iri-default-context const/iri-address
-                                    :value])
+                           (get-first const/iri-default-context)
+                           (get-first-value const/iri-address)
                            (->> (jld-reify/load-default-context conn))
                            <?)
           ledger       (<? (create conn ledger-alias {:branch         branch

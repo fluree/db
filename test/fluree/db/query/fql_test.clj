@@ -198,6 +198,49 @@
         (is (= [["The Hitchhiker's Guide to the Galaxy"]]
                test-subject))))))
 
+(deftest ^:integration language-test
+  (testing "Querying ledgers loaded with language-tagged strings"
+    (let [conn   (test-utils/create-conn)
+          ledger @(fluree/create conn "jobs")
+          db     @(-> ledger
+                      fluree/db
+                      (fluree/stage {"@context" {"ex"         "http://example.com/vocab/"
+                                                 "occupation" {"@id"        "ex:occupation"
+                                                               "@container" "@language"}}
+                                     "@graph"   [{"@id"        "ex:frank"
+                                                  "occupation" {"en" {"@value" "Ninja"}
+                                                                "ja" "忍者"}}
+                                                 {"@id"        "ex:bob"
+                                                  "occupation" {"en" "Boss"
+                                                                "fr" "Chef"}}
+                                                 {"@id"        "ex:jack"
+                                                  "occupation" {"en" {"@value" "Chef"}
+                                                                "fr" {"@value" "Cuisinier"}}}]}))]
+
+      (testing "with bound language tags"
+        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+                                      :select    [?job ?lang]
+                                      :where     [["ex:frank" "ex:occupation" ?job]
+                                                  {:bind {?lang "(lang ?job)"}}]})]
+          (is (= [["Ninja" "en"] ["忍者" "ja"]] sut)
+              "return the correct language tags.")))
+
+      (testing "filtering by language tags"
+        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+                                      :select    [?s ?job]
+                                      :where     [[?s "ex:occupation" ?job]
+                                                  {:filter ["(= \"en\" (lang ?job))"]}]})]
+          (is (= [["ex:bob" "Boss"] ["ex:jack" "Chef"] ["ex:frank" "Ninja"]] sut)
+              "returns correctly filtered results")))
+
+      (testing "filtering with value maps"
+        (let [sut @(fluree/query db '{"@context" {"ex" "http://example.com/vocab/"}
+                                      :select    [?s]
+                                      :where     [[?s "ex:occupation" {"@value"    "Chef"
+                                                                       "@language" "fr"}]]})]
+          (is (= [["ex:bob"]] sut)
+              "returns correctly filtered results"))))))
+
 (deftest ^:integration subject-object-test
   (let [conn (test-utils/create-conn {:defaults {:context-type :string
                                                  :context      {"id"     "@id",
