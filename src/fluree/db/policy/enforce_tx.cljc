@@ -2,7 +2,8 @@
   (:require [fluree.db.constants :as const]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.flake :as flake]
-            [fluree.db.permissions-validate :as validate]))
+            [fluree.db.permissions-validate :as validate]
+            [fluree.db.query.range :as query-range]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -76,7 +77,7 @@
 
 (defn enforce
   "Throws an exception if any new flakes violate the policy."
-  [{:keys [db-after add]} {:keys [] :as tx-state}]
+  [{:keys [db-after add]} {:keys [db-before] :as tx-state}]
   (let [{:keys [policy]} db-after]
     (go-try
       (when-not (root? policy)
@@ -85,7 +86,16 @@
             (let [fflake (first s-flakes)
                   sid    (flake/s fflake)
                   ;; TODO: how do we get classes?
-                  class-sids ()
+
+                  new-subject? (not-empty (filter #(= (flake/p %) const/$xsd:anyURI) s-flakes))
+                  new-class-sids (into #{}
+                                       (filter #(and (flake/op %) (= const/$rdf:type (flake/p %))))
+                                       s-flakes)
+
+                  class-sids (if new-subject?
+                               new-class-sids
+                               (into #{} (<? (query-range/index-range db-before :spot = [sid const/$rdf:type]
+                                                                      {:flake-xf (map flake/o)}))))
 
                   {defaults :default props :property}
                   (validate/group-policies-by-default policy const/iri-modify class-sids)

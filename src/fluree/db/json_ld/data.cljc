@@ -33,6 +33,12 @@
   [sid]
   (str "_:" sid))
 
+(defn ref-dt
+  "Some predicates are known to have references as objects."
+  [pid]
+  (get {const/$rdf:type const/$xsd:anyURI}
+    pid))
+
 (declare insert-sid)
 (defn insert-flake
   [sid pid m {:keys [db-before iri-cache next-sid t] :as tx-state}
@@ -48,11 +54,12 @@
           ;; literal
           (some? value)
           (let [existing-dt  (when type (<? (lookup-iri tx-state type)))
-                dt           (cond existing-dt existing-dt
-                                   type        (next-sid)
-                                   :else       (datatype/infer value))
-                m*            (cond-> m
-                                language (assoc :lang language))
+                dt           (cond existing-dt  existing-dt
+                                   (ref-dt pid) (ref-dt pid)
+                                   type         (next-sid)
+                                   :else        (datatype/infer value language))
+                m*           (cond-> m
+                               language (assoc :lang language))
                 new-dt-flake (when (and type (not existing-dt)) (create-id-flake dt type t))
                 new-flake    (flake/create sid pid value dt t true m*)]
             (-> tx-state
