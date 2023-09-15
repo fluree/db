@@ -58,9 +58,9 @@
                                        "depth" 3}))))
 
          (testing "inserting additional values increases cardinality"
-           (let [db2 @(fluree/stage db1 {"@context" "https://flur.ee"
-                                         "insertData" {"@id" "ex:anakin"
-                                                       "ex:name" "Skywalker"}})]
+           (let [db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
+                                          "insertData" {"@id" "ex:anakin"
+                                                        "ex:name" "Skywalker"}})]
              (is (= [["Skywalker"] ["Vader"]]
                     @(fluree/query db2 {"where" [["ex:anakin" "ex:name" "?name"]]
                                         "select" ["?name"]})))))

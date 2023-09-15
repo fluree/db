@@ -610,7 +610,8 @@
                tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
                tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))]
            (<? (finalize-db tx-state fuel-tracker)))
-         (<? (stage db fuel-tracker json-ld opts)))))))
+
+         (throw (ex-info "Invalid transaction" {:expanded-tx expanded-tx})))))))
 
 (defn stage-ledger
   ([ledger json-ld opts]

@@ -8,7 +8,8 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [fluree.db.json-ld.transact :as jld-transact]))
 
 (defn stage
   [db json-ld opts]
@@ -37,7 +38,7 @@
       (let [start-time   #?(:clj  (System/nanoTime)
                             :cljs (util/current-time-millis))
             fuel-tracker (fuel/tracker)]
-        (try* (let [result (<? (dbproto/-stage db fuel-tracker json-ld opts))]
+        (try* (let [result (<? (jld-transact/stage2 db fuel-tracker json-ld opts))]
                 {:status 200
                  :result result
                  :time   (util/response-time-formatted start-time)
@@ -48,7 +49,7 @@
                                           ex-data
                                           (assoc :time (util/response-time-formatted start-time)
                                                  :fuel (fuel/tally fuel-tracker))))))))
-      (<? (dbproto/-stage db json-ld opts)))))
+      (<? (jld-transact/stage2 db json-ld opts)))))
 
 (defn parse-json-ld-txn
   "Expands top-level keys and parses any opts in json-ld transaction document.

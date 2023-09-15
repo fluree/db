@@ -227,7 +227,7 @@
 
 
 (defn stage2
-  ([db json-ld] (stage db json-ld nil))
+  ([db json-ld] (stage2 db json-ld nil))
   ([db json-ld opts]
    (let [result-ch (transact-api/stage2 db json-ld opts)]
      (promise-wrap result-ch))))
