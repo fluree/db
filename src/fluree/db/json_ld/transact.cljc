@@ -560,10 +560,15 @@
   (m/validate  Data (dissoc expanded-tx :idx)))
 
 (defn finalize-db
-  [{:keys [flakes stage-update? db-before] :as tx-state}]
+  [{:keys [flakes stage-update? db-before] :as tx-state} fuel-tracker]
   (go-try
     ;; TODO: refactor once nobody else is depending on the shape of staged-map
-    (let [[add remove] (if stage-update?
+    (let [flakes (if fuel-tracker
+                   (into (flake/sorted-set-by flake/cmp-flakes-spot)
+                         (fuel/track fuel-tracker)
+                         flakes)
+                   flakes)
+          [add remove] (if stage-update?
                          (stage-update-novelty (-> db-before :novelty :spot) flakes)
                          [flakes])
           staged-map {:add add :remove remove}
@@ -604,7 +609,7 @@
                tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
                tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
                tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))]
-           (<? (finalize-db tx-state)))
+           (<? (finalize-db tx-state fuel-tracker)))
          (<? (stage db fuel-tracker json-ld opts)))))))
 
 (defn stage-ledger
