@@ -115,4 +115,21 @@
                                            "ex:name" "Ben"}}]}]
                     @(fluree/query dbl {"where" [["?s" "ex:name" "Vader"]]
                                         "select" {"?s" ["*"]}
-                                        "depth" 3})))))))))
+                                        "depth" 3})))))
+         (testing "delete-data"
+           (let [db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
+                                          "deleteData" {"@id" "ex:anakin"
+                                                        "ex:father" {"id" "_:211106232532993"
+                                                                     "ex:name" "The Force"
+                                                                     "ex:description" "a blank node"}}})]
+             (is (= [{"id" "ex:anakin"
+                      "ex:name" "Vader"
+                      "ex:droid" ["C3PO" "R2D2"]
+                      "ex:kid"
+                      [{"id" "ex:luke" "ex:name" "Luke"}
+                       {"id" "ex:leia"
+                        "ex:name" "Leia"
+                        "ex:kid" {"id" "ex:ben" "ex:name" "Ben"}}]}]
+                    @(fluree/query db2 {"where" [["?s" "ex:name" "Vader"]]
+                                        "select" {"?s" ["*"]}
+                                        "depth" 2})))))))))

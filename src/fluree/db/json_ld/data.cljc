@@ -10,7 +10,8 @@
    [fluree.db.util.log :as log]
    [fluree.db.datatype :as datatype]
    [fluree.json-ld.processor.api :as jld-processor]
-   [fluree.db.json-ld.shacl :as shacl]))
+   [fluree.db.json-ld.shacl :as shacl]
+   [fluree.db.query.range :as query-range]))
 
 (defn create-id-flake
   [sid iri t]
@@ -115,4 +116,66 @@
            tx-state tx-state]
       (if subject
         (recur r (<? (insert-sid tx-state subject)))
+        tx-state))))
+
+(declare delete-sid)
+(defn delete-flake
+  [sid pid m {:keys [db-before iri-cache t] :as tx-state}
+   {:keys [value id type language list] :as v-map}]
+  (log/warn "DEP delete-flake" sid pid m v-map)
+  (go-try
+    (cond list
+          (loop [[[i list-item :as item] & r] (map vector (range) list)
+                 tx-state                     tx-state]
+            (if item
+              (recur r (<? (delete-flake sid pid {:i i} tx-state list-item)))
+              tx-state))
+
+          ;; literal
+          (some? value)
+          (if-let [existing-flake (first (<? (query-range/index-range db-before :spot = [sid pid value])))]
+            (let [dt (or (when type (<? (lookup-iri tx-state type)))
+                         (datatype/infer value))
+                  match-flake (flake/create sid pid value dt (flake/t existing-flake) true m)]
+              (update tx-state :flakes conj (flake/flip-flake existing-flake t)))
+            tx-state)
+
+          ;; ref
+          :else
+          (if-let [ref-sid (<? (lookup-iri tx-state id))]
+            (if-let [ref-flake (first (<? (query-range/index-range db-before :spot = [sid pid ref-sid])))]
+              (let [tx-state* (<? (delete-sid tx-state v-map))]
+                (update tx-state* :flakes conj (flake/flip-flake ref-flake t)))
+              tx-state)
+            tx-state))))
+
+(defn delete-pid
+  [sid tx-state [predicate values]]
+  (go-try
+    (if-let [existing-pid (<? (lookup-iri tx-state predicate))]
+      (loop [[v-map & r] values
+             tx-state tx-state]
+        (if v-map
+          (recur r (<? (delete-flake sid existing-pid nil tx-state v-map)))
+          tx-state))
+      tx-state)))
+
+(defn delete-sid
+  [tx-state {:keys [id] :as subject}]
+  (go-try
+    (if-let [existing-sid (when id (<? (lookup-iri tx-state id)))]
+      (loop [[entry & r] (dissoc subject :id :idx)
+             tx-state tx-state]
+        (if entry
+          (recur r (<? (delete-pid existing-sid tx-state entry)))
+          tx-state))
+      tx-state)))
+
+(defn delete-flakes
+  [{:keys [default-ctx] :as tx-state} data]
+  (go-try
+    (loop [[subject & r] (when data (util/sequential (json-ld/expand data default-ctx)))
+           tx-state tx-state]
+      (if subject
+        (recur r (<? (delete-sid tx-state subject)))
         tx-state))))
