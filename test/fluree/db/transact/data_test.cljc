@@ -9,7 +9,6 @@
 #?(:clj
    (deftest ^:integration insert-data
      (with-tmp-dir storage-path {::twf/delete-dir false}
-       (def storage-path storage-path)
        (let [conn @(fluree/connect {:method :file :storage-path storage-path
                                     :defaults {:indexer {:reindex-min-bytes 100}}})
              ledger @(fluree/create conn "insert-data" {:defaultContext [test-utils/default-str-context
@@ -34,12 +33,7 @@
                                              {"@id" "ex:orange" "ex:name" "Utahrapter"}]}]}
 
              db1s @(fluree/stage2 db0 tx)
-             db1 @(fluree/commit! ledger db1s)
-             ]
-         (def db db1s)
-
-         (-> db :schema :pred )
-
+             db1 @(fluree/commit! ledger db1s)]
          (testing "basic insert can be queried"
            (is (= [{"id" "ex:anakin"
                     "ex:name" "Vader"
