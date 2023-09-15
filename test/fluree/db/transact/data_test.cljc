@@ -17,17 +17,21 @@
              db0 (fluree/db ledger)
 
              tx {"@context" "https://flur.ee"
-                 "insertData" {"@id" "ex:anakin"
-                               "ex:name" "Vader"
-                               "ex:droid" {"@list" ["C3PO" "R2D2"]}
-                               "ex:father" {"ex:name" "The Force"
-                                            "ex:description" "a blank node"}
-                               "ex:kid" [{"@id" "ex:luke"
-                                          "ex:name" "Luke"}
-                                         {"@id" "ex:leia"
-                                          "ex:name" "Leia"
-                                          "ex:kid" {"@id" "ex:ben"
-                                                    "ex:name" "Ben"}}]}}
+                 "insertData" [{"@id" "ex:anakin"
+                                "ex:name" "Vader"
+                                "ex:droid" {"@list" ["C3PO" "R2D2"]}
+                                "ex:father" {"ex:name" "The Force"
+                                             "ex:description" "a blank node"}
+                                "ex:kid" [{"@id" "ex:luke"
+                                           "ex:name" "Luke"}
+                                          {"@id" "ex:leia"
+                                           "ex:name" "Leia"
+                                           "ex:kid" {"@id" "ex:ben"
+                                                     "ex:name" "Ben"}}]}
+                               {"@id" "ex:green"
+                                "ex:name" "T-Rex"
+                                "ex:friend" [{"@id" "ex:yellow" "ex:name" "Dromiceiomimus"}
+                                             {"@id" "ex:orange" "ex:name" "Utahrapter"}]}]}
 
              db1s @(fluree/stage2 db0 tx)
              db1 @(fluree/commit! ledger db1s)
@@ -62,14 +66,14 @@
                                         "select" ["?name"]})))))
 
          (testing "non-default context is processed correctly"
-             (let [db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
-                                            "insertData" {"@context" {"foo" "http://not-default.com/"}
-                                                          "@id" "foo:owen"
-                                                          "foo:name" "Lars"}})]
-               (is (= [{"foo:name" "Lars" "@id" "foo:owen"}]
-                      @(fluree/query db2 {"@context" {"foo" "http://not-default.com/"}
-                                          "where" [["?s" "foo:name" "Lars"]]
-                                          "select" {"?s" ["*"]}})))))
+           (let [db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
+                                          "insertData" {"@context" {"foo" "http://not-default.com/"}
+                                                        "@id" "foo:owen"
+                                                        "foo:name" "Lars"}})]
+             (is (= [{"foo:name" "Lars" "@id" "foo:owen"}]
+                    @(fluree/query db2 {"@context" {"foo" "http://not-default.com/"}
+                                        "where" [["?s" "foo:name" "Lars"]]
+                                        "select" {"?s" ["*"]}})))))
          (testing "loading works correctly"
            (let [db2s @(fluree/stage2 db1 {"@context" "https://flur.ee"
                                            "insertData" {"@id" "ex:anakin"

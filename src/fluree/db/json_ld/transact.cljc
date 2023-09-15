@@ -583,7 +583,6 @@
   ([db json-ld opts]
    (stage2 db nil json-ld opts))
   ([db fuel-tracker json-ld opts]
-   (def db db)
    (go-try
      (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
                                       {:subject json-ld})

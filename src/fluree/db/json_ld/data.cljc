@@ -82,7 +82,6 @@
   [sid {:keys [db-before iri-cache next-pid t shapes] :as tx-state} [predicate values]]
   (go-try
     (let [existing-pid        (<? (lookup-iri tx-state predicate))
-
           pid                 (if existing-pid existing-pid (next-pid))]
       (loop [[v-map & r] values
              tx-state    (cond-> tx-state
@@ -111,6 +110,9 @@
 
 (defn insert-flakes
   [{:keys [default-ctx] :as tx-state} data]
-  (reduce insert-sid
-          tx-state
-          (util/sequential (json-ld/expand data default-ctx))))
+  (go-try
+    (loop [[subject & r] (when data (util/sequential (json-ld/expand data default-ctx)))
+           tx-state tx-state]
+      (if subject
+        (recur r (<? (insert-sid tx-state subject)))
+        tx-state))))
