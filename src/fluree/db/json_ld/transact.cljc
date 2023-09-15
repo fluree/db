@@ -603,8 +603,7 @@
                tx-state (->tx-state2 db-before opts*)
                tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
                tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
-               ;; tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))
-               ]
+               tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))]
            (<? (finalize-db tx-state)))
          (<? (stage db fuel-tracker json-ld opts)))))))
 

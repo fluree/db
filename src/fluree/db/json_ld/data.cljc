@@ -179,3 +179,39 @@
       (if subject
         (recur r (<? (delete-sid tx-state subject)))
         tx-state))))
+
+(defn upsert-pid
+  [sid s-flakes {:keys [t] :as tx-state} [predicate values :as entry]]
+  (go-try
+    (if-let [existing-pid (<? (lookup-iri tx-state predicate))]
+      (let [existing-p-flakes (into [] (filter #(= existing-pid (flake/p %))) s-flakes)]
+        (loop [[v-map & r] values
+               tx-state (cond-> tx-state
+                          (not-empty existing-p-flakes)
+                          (update :flakes into (map #(flake/flip-flake % t))
+                                  existing-p-flakes))]
+          (if v-map
+            (recur r (<? (insert-flake sid existing-pid nil tx-state v-map)))
+            tx-state)))
+      (<? (insert-pid sid tx-state entry)))))
+
+(defn upsert-sid
+  [{:keys [db-before] :as tx-state} {:keys [id] :as subject}]
+  (go-try
+    (if-let [existing-sid (when id (<? (lookup-iri tx-state id)))]
+      (let [s-flakes (<? (query-range/index-range db-before :spot = [existing-sid]))]
+        (loop [[entry & r] (dissoc subject :id :idx)
+               tx-state tx-state]
+          (if entry
+            (recur r (<? (upsert-pid existing-sid s-flakes tx-state entry)))
+            tx-state)))
+      (<? (insert-sid tx-state subject)))))
+
+(defn upsert-flakes
+  [{:keys [default-ctx] :as tx-state} data]
+  (go-try
+    (loop [[subject & r] (when data (util/sequential (json-ld/expand data default-ctx)))
+           tx-state tx-state]
+      (if subject
+        (recur r (<? (upsert-sid tx-state subject)))
+        tx-state))))

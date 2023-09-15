@@ -132,4 +132,15 @@
                         "ex:kid" {"id" "ex:ben" "ex:name" "Ben"}}]}]
                     @(fluree/query db2 {"where" [["?s" "ex:name" "Vader"]]
                                         "select" {"?s" ["*"]}
-                                        "depth" 2})))))))))
+                                        "depth" 2})))))
+         (testing "upsert-data"
+           (let [db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
+                                          "upsertData" {"@id" "ex:anakin"
+                                                        "ex:name" "Skywalker"}})]
+             (is (= [{"id" "ex:anakin",
+                      "ex:name" "Skywalker",
+                      "ex:droid" ["C3PO" "R2D2"],
+                      "ex:father" {"id" "_:211106232532993"},
+                      "ex:kid" [{"id" "ex:luke"} {"id" "ex:leia"}]}]
+                    @(fluree/query db2 {"where" [["?s" "ex:name" "Skywalker"]]
+                                        "select" {"?s" ["*"]}})))))))))
