@@ -4,7 +4,6 @@
             #?(:clj [clojure.test :as t :refer [deftest testing is]]
                :cljs [cljs.test :as t :refer [deftest testing is] :include-macros true])
             [fluree.db.json-ld.api :as fluree]
-            [fluree.json-ld :as json-ld]
             [fluree.db.test-utils :as test-utils]
             [fluree.db.did :as did]))
 

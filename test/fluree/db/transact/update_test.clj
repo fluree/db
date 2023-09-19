@@ -278,10 +278,10 @@
                     fluree.db.query.exec.eval/struuid (fn [] "34bdb25f-9fae-419b-9c50-203b5f306e47")]
         (let [updated  (-> @(fluree/stage db1 [{"id" "ex:create-predicates"
                                                 "ex:isBlank" 0 "ex:isNumeric" 0 "ex:str" 0 "ex:uuid" 0
-                                                "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0
+                                                "ex:struuid" 0 "ex:isNotNumeric" 0 "ex:isNotBlank" 0}
                                                 ;; "ex:isIRI" 0 "ex:isURI" 0 "ex:isLiteral" 0 "ex:lang" 0 "ex:IRI" 0
                                                 ;; "ex:datatype" 0 "ex:bnode" 0 "ex:strdt" 0 "ex:strLang" 0
-                                                }
+
                                                {"id" "ex:rdf-term-fns"
                                                 "ex:text" "Abcdefg"
                                                 "ex:number" 1
@@ -425,14 +425,13 @@
                subject)
             "returns all results")))
     (testing "after deletion"
-      @(fluree/transact!  conn
-                          {:context {:id "@id"
-                                     :graph "@graph"}
-                           :id ledger-id
-                           :graph {:delete '[?s ?p ?o]
-                                   :where  '[[?s "schema:description" ?o]
-                                             [?s ?p ?o]]}}
-                          {})
+      @(fluree/transact! conn
+                         {:context  {:id "@id", :graph "@graph",
+                                     :f  "https://ns.flur.ee/ledger#"}
+                          :f/ledger ledger-id
+                          :graph    {:delete '[?s ?p ?o]
+                                     :where  '[[?s "schema:description" ?o]
+                                               [?s ?p ?o]]}})
       (let [db2   (fluree/db @(fluree/load conn ledger-id))
             q       '{:select [?s ?p ?o]
                       :where  [[?s "schema:description" ?o]
