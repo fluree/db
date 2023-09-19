@@ -524,7 +524,7 @@
        (<? (flakes->final-db tx-state flakes))))))
 
 (defn ->tx-state2
-  [db {:keys [bootstrap? did context-type txn-context] :as _opts}]
+  [db {:keys [bootstrap? did context-type txn-context fuel-tracker] :as _opts}]
   (let [{:keys [schema branch ledger policy], db-t :t} db
         last-pid (volatile! (jld-ledger/last-pid db))
         last-sid (volatile! (jld-ledger/last-sid db))
@@ -537,6 +537,9 @@
      :default-ctx   (if context-type
                       (dbproto/-context db ::dbproto/default-context context-type)
                       (dbproto/-context db))
+     :track-fuel    (if fuel-tracker
+                      (fuel/track fuel-tracker)
+                      (completing identity))
      :stage-update? (= t db-t)
      :t             t
      :last-pid      last-pid
@@ -560,21 +563,16 @@
   (m/validate  Data (dissoc expanded-tx :idx)))
 
 (defn finalize-db
-  [{:keys [flakes stage-update? db-before] :as tx-state} fuel-tracker]
+  [{:keys [flakes stage-update? db-before] :as tx-state}]
   (go-try
     ;; TODO: refactor once nobody else is depending on the shape of staged-map
-    (let [flakes (if fuel-tracker
-                   (into (flake/sorted-set-by flake/cmp-flakes-spot)
-                         (fuel/track fuel-tracker)
-                         flakes)
-                   flakes)
-          [add remove] (if stage-update?
+    (let [[add remove] (if stage-update?
                          (stage-update-novelty (-> db-before :novelty :spot) flakes)
                          [flakes])
           staged-map {:add add :remove remove}
           db-after   (cond-> (db-after {:add add :remove remove} tx-state)
                        add (vocab/hydrate-schema add))
-          staged-map* (assoc staged-map :db-after db-after) ]
+          staged-map* (assoc staged-map :db-after db-after)]
       ;; TODO: validate shapes
 
       ;; will throw if unauthorized flakes have been created
@@ -592,7 +590,9 @@
      (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
                                       {:subject json-ld})
 
-           opts* (cond-> opts did (assoc :did did))
+           opts* (cond-> opts
+                   did (assoc :did did)
+                   fuel-tracker (assoc :fuel-tracker fuel-tracker))
 
            ;; TODO: I don't think we can safely expand just anything, need an alternative way
            ;; to figure out if we're dropping back to old stage
@@ -609,7 +609,7 @@
                tx-state (<? (data/delete-flakes tx-state (-> delete-data first :value)))
                tx-state (<? (data/insert-flakes tx-state (-> insert-data first :value)))
                tx-state (<? (data/upsert-flakes tx-state (-> upsert-data first :value)))]
-           (<? (finalize-db tx-state fuel-tracker)))
+           (<? (finalize-db tx-state)))
 
          (throw (ex-info "Invalid transaction" {:expanded-tx expanded-tx})))))))
 

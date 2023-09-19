@@ -41,7 +41,7 @@
 
 (declare insert-subject)
 (defn insert-flake
-  [sid pid m {:keys [db-before iri-cache next-sid t] :as tx-state}
+  [sid pid m {:keys [db-before iri-cache track-fuel next-sid t] :as tx-state}
    {:keys [value id type language list] :as v-map}]
   (go-try
     (cond list
@@ -63,7 +63,7 @@
                 new-dt-flake (when (and type (not existing-dt)) (create-id-flake dt type t))
                 new-flake    (flake/create sid pid value dt t true m*)]
             (-> tx-state
-                (update :flakes into (remove nil?) [new-dt-flake new-flake])))
+                (update :flakes into (comp (remove nil?) track-fuel) [new-dt-flake new-flake])))
 
           ;; ref
           :else
@@ -74,7 +74,7 @@
                             bnode-iri (assoc :id bnode-iri))
 
                 tx-state  (cond-> tx-state
-                            bnode-iri (update :flakes conj (create-id-flake bnode-sid bnode-iri t)))
+                            bnode-iri (update :flakes into track-fuel [(create-id-flake bnode-sid bnode-iri t)]))
 
                 tx-state* (<? (insert-subject tx-state v-map*))
 
@@ -84,22 +84,22 @@
                             bnode-sid)
                 ref-flake (flake/create sid pid ref-sid const/$xsd:anyURI t true m)]
             (-> tx-state*
-                (update :flakes conj ref-flake))))))
+                (update :flakes into track-fuel [ref-flake]))))))
 
 (defn insert-predicate
-  [sid {:keys [db-before iri-cache next-pid t shapes] :as tx-state} [predicate values]]
+  [sid {:keys [db-before iri-cache track-fuel next-pid t shapes] :as tx-state} [predicate values]]
   (go-try
     (let [existing-pid        (<? (lookup-iri tx-state predicate))
           pid                 (if existing-pid existing-pid (next-pid))]
       (loop [[v-map & r] values
              tx-state    (cond-> tx-state
-                           (not existing-pid) (update :flakes conj (create-id-flake pid predicate t)))]
+                           (not existing-pid) (update :flakes into track-fuel [(create-id-flake pid predicate t)]))]
         (if v-map
           (recur r (<? (insert-flake sid pid nil tx-state v-map)))
           tx-state)))))
 
 (defn insert-subject
-  [{:keys [db-before iri-cache next-sid t] :as tx-state} {:keys [id] :as subject}]
+  [{:keys [db-before iri-cache track-fuel next-sid t] :as tx-state} {:keys [id] :as subject}]
   (go-try
     (let [existing-sid     (when id (<? (lookup-iri tx-state id)))
           [sid iri]        (if (nil? id)
@@ -109,7 +109,7 @@
                              [(or existing-sid (next-sid)) id])]
       (loop [[entry & r] (dissoc subject :id :idx)
              tx-state    (cond-> tx-state
-                           (not existing-sid) (update :flakes conj (create-id-flake sid iri t)))]
+                           (not existing-sid) (update :flakes into track-fuel [(create-id-flake sid iri t)]))]
         (if entry
           (recur r (<? (insert-predicate sid tx-state entry)))
           tx-state)))))
@@ -125,7 +125,7 @@
 
 (declare delete-subject)
 (defn delete-flake
-  [sid pid m {:keys [db-before iri-cache t] :as tx-state}
+  [sid pid m {:keys [db-before iri-cache track-fuel t] :as tx-state}
    {:keys [value id type language list] :as v-map}]
   (go-try
     (cond list
@@ -141,7 +141,7 @@
             (let [dt (or (when type (<? (lookup-iri tx-state type)))
                          (datatype/infer value))
                   match-flake (flake/create sid pid value dt (flake/t existing-flake) true m)]
-              (update tx-state :flakes conj (flake/flip-flake existing-flake t)))
+              (update tx-state :flakes into track-fuel [(flake/flip-flake existing-flake t)]))
             tx-state)
 
           ;; ref
@@ -149,7 +149,7 @@
           (if-let [ref-sid (<? (lookup-iri tx-state id))]
             (if-let [ref-flake (first (<? (query-range/index-range db-before :spot = [sid pid ref-sid])))]
               (let [tx-state* (<? (delete-subject tx-state v-map))]
-                (update tx-state* :flakes conj (flake/flip-flake ref-flake t)))
+                (update tx-state* :flakes into track-fuel [(flake/flip-flake ref-flake t)]))
               tx-state)
             tx-state))))
 
@@ -185,14 +185,14 @@
         tx-state))))
 
 (defn upsert-predicate
-  [sid s-flakes {:keys [t] :as tx-state} [predicate values :as entry]]
+  [sid s-flakes {:keys [track-fuel t] :as tx-state} [predicate values :as entry]]
   (go-try
     (if-let [existing-pid (<? (lookup-iri tx-state predicate))]
       (let [existing-p-flakes (into [] (filter #(= existing-pid (flake/p %))) s-flakes)]
         (loop [[v-map & r] values
                tx-state (cond-> tx-state
                           (not-empty existing-p-flakes)
-                          (update :flakes into (map #(flake/flip-flake % t))
+                          (update :flakes into (comp track-fuel (map #(flake/flip-flake % t)))
                                   existing-p-flakes))]
           (if v-map
             (recur r (<? (insert-flake sid existing-pid nil tx-state v-map)))
