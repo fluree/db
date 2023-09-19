@@ -17,6 +17,7 @@
 
              tx {"@context" "https://flur.ee"
                  "insertData" [{"@id" "ex:anakin"
+                                "@type" "schema:Person"
                                 "ex:name" "Vader"
                                 "ex:droid" {"@list" ["C3PO" "R2D2"]}
                                 "ex:father" {"ex:name" "The Force"
@@ -36,9 +37,10 @@
              db1 @(fluree/commit! ledger db1s)]
          (testing "basic insert can be queried"
            (is (= [{"id" "ex:anakin"
+                    "type" "schema:Person"
                     "ex:name" "Vader"
                     "ex:droid" ["C3PO" "R2D2"]
-                    "ex:father" {"id" "_:211106232532993"
+                    "ex:father" {"id" "_:211106232532994"
                                  "ex:name" "The Force"
                                  "ex:description" "a blank node"}
                     "ex:kid" [{"id" "ex:luke"
@@ -81,9 +83,10 @@
                  loaded @(fluree/load conn "insert-data")
                  dbl (fluree/db loaded)]
              (is (= [{"id" "ex:anakin"
+                      "type" "schema:Person"
                       "ex:name" ["Skywalker" "Vader"]
                       "ex:droid" ["C3PO" "R2D2"]
-                      "ex:father" {"id" "_:211106232532993"
+                      "ex:father" {"id" "_:211106232532994"
                                    "ex:name" "The Force"
                                    "ex:description" "a blank node"}
                       "ex:kid" [{"id" "ex:luke"
@@ -96,9 +99,10 @@
                                         "select" {"?s" ["*"]}
                                         "depth" 3})))
              (is (= [{"id" "ex:anakin"
+                      "type" "schema:Person"
                       "ex:name" ["Skywalker" "Vader"]
                       "ex:droid" ["C3PO" "R2D2"]
-                      "ex:father" {"id" "_:211106232532993"
+                      "ex:father" {"id" "_:211106232532994"
                                    "ex:name" "The Force"
                                    "ex:description" "a blank node"}
                       "ex:kid" [{"id" "ex:luke"
@@ -113,10 +117,11 @@
          (testing "delete-data"
            (let [db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
                                           "deleteData" {"@id" "ex:anakin"
-                                                        "ex:father" {"id" "_:211106232532993"
+                                                        "ex:father" {"id" "_:211106232532994"
                                                                      "ex:name" "The Force"
                                                                      "ex:description" "a blank node"}}})]
              (is (= [{"id" "ex:anakin"
+                      "type" "schema:Person"
                       "ex:name" "Vader"
                       "ex:droid" ["C3PO" "R2D2"]
                       "ex:kid"
@@ -132,9 +137,10 @@
                                           "upsertData" {"@id" "ex:anakin"
                                                         "ex:name" "Skywalker"}})]
              (is (= [{"id" "ex:anakin",
+                      "type" "schema:Person"
                       "ex:name" "Skywalker",
                       "ex:droid" ["C3PO" "R2D2"],
-                      "ex:father" {"id" "_:211106232532993"},
+                      "ex:father" {"id" "_:211106232532994"},
                       "ex:kid" [{"id" "ex:luke"} {"id" "ex:leia"}]}]
                     @(fluree/query db2 {"where" [["?s" "ex:name" "Skywalker"]]
                                         "select" {"?s" ["*"]}})))))))))

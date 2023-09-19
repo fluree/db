@@ -20,14 +20,16 @@
 (defn lookup-iri
   [{:keys [db-before iri-cache flakes] :as tx-state} iri]
   (go-try
-    (or (<? (jld-reify/get-iri-sid iri db-before iri-cache))
-        (some->> flakes
-                 (filter (fn [f]
-                           (and (flake/op f)
-                                (= const/$xsd:anyURI (flake/p f))
-                                (= iri (flake/o f)))))
-                 (first)
-                 (flake/s)))))
+    (if (= iri :type)
+      const/$rdf:type
+      (or (<? (jld-reify/get-iri-sid iri db-before iri-cache))
+          (some->> flakes
+                   (filter (fn [f]
+                             (and (flake/op f)
+                                  (= const/$xsd:anyURI (flake/p f))
+                                  (= iri (flake/o f)))))
+                   (first)
+                   (flake/s))))))
 
 (defn bnode-id
   [sid]
@@ -38,6 +40,14 @@
   [pid]
   (get {const/$rdf:type const/$xsd:anyURI}
     pid))
+
+(defn homogenize-values
+  "@type doesn't have v-maps, it just has flat strings. If we detect that case and wrap
+  the values to match every other predicate, we can process them the same way."
+  [pid values]
+  (if (= pid const/$rdf:type)
+    (mapv #(do {:id %}) values)
+    values))
 
 (declare insert-subject)
 (defn insert-flake
@@ -91,7 +101,7 @@
   (go-try
     (let [existing-pid        (<? (lookup-iri tx-state predicate))
           pid                 (if existing-pid existing-pid (next-pid))]
-      (loop [[v-map & r] values
+      (loop [[v-map & r] (homogenize-values pid values)
              tx-state    (cond-> tx-state
                            (not existing-pid) (update :flakes into track-fuel [(create-id-flake pid predicate t)]))]
         (if v-map
@@ -157,7 +167,7 @@
   [sid tx-state [predicate values]]
   (go-try
     (if-let [existing-pid (<? (lookup-iri tx-state predicate))]
-      (loop [[v-map & r] values
+      (loop [[v-map & r] (homogenize-values existing-pid values)
              tx-state tx-state]
         (if v-map
           (recur r (<? (delete-flake sid existing-pid nil tx-state v-map)))
@@ -189,7 +199,7 @@
   (go-try
     (if-let [existing-pid (<? (lookup-iri tx-state predicate))]
       (let [existing-p-flakes (into [] (filter #(= existing-pid (flake/p %))) s-flakes)]
-        (loop [[v-map & r] values
+        (loop [[v-map & r] (homogenize-values existing-pid values)
                tx-state (cond-> tx-state
                           (not-empty existing-p-flakes)
                           (update :flakes into (comp track-fuel (map #(flake/flip-flake % t)))
