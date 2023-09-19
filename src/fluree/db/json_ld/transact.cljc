@@ -551,16 +551,12 @@
      :shapes        {:class #{} :subject #{} :object #{} :node #{}}
      :flakes       (flake/sorted-set-by flake/cmp-flakes-spot)}))
 
-(def Data
-  [:and [:map {:closed true}
-         [const/insert-data {:optional true} :any]
-         [const/delete-data {:optional true} :any]
-         [const/upsert-data {:optional true} :any]]
-   [:fn (fn [tx] (pos? (count tx)))]])
-
 (defn valid-tx-structure?
   [expanded-tx]
-  (m/validate  Data (dissoc expanded-tx :idx)))
+  (or
+    (contains? expanded-tx const/delete-data)
+    (contains? expanded-tx const/insert-data)
+    (contains? expanded-tx const/upsert-data)))
 
 (defn finalize-db
   [{:keys [flakes stage-update? db-before] :as tx-state}]
