@@ -102,15 +102,13 @@
   [{:keys [db-before iri-cache next-sid t] :as tx-state} {:keys [id] :as subject}]
   (go-try
     (let [existing-sid     (when id (<? (lookup-iri tx-state id)))
-          target-node-sids (when existing-sid
-                             (<? (shacl/shape-target-sids db-before const/$sh:targetNode existing-sid)))
           [sid iri]        (if (nil? id)
                              (let [bnode-sid (next-sid)]
                                [bnode-sid (bnode-id bnode-sid)])
                              ;; TODO: not handling pid generation
                              [(or existing-sid (next-sid)) id])]
       (loop [[entry & r] (dissoc subject :id :idx)
-             tx-state    (cond-> (update-in tx-state [:shapes :node] into target-node-sids)
+             tx-state    (cond-> tx-state
                            (not existing-sid) (update :flakes conj (create-id-flake sid iri t)))]
         (if entry
           (recur r (<? (insert-predicate sid tx-state entry)))
