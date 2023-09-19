@@ -348,7 +348,7 @@
             (recur r adds removes))))
       [(not-empty adds) (not-empty removes)])))
 
-(defn integrate-novelty
+(defn db-after
   [{:keys [add remove] :as _staged} {:keys [db-before policy bootstrap? t] :as tx-state}]
   (let [new-db (-> db-before
                    (assoc :ecount (final-ecount tx-state)
@@ -372,7 +372,7 @@
           vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
           staged-map   {:add    add
                         :remove remove}
-          db-after     (cond-> (integrate-novelty staged-map tx-state)
+          db-after     (cond-> (db-after staged-map tx-state)
                                vocab-flakes vocab/refresh-schema
                                vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
@@ -572,7 +572,7 @@
                          (stage-update-novelty (-> db-before :novelty :spot) flakes)
                          [flakes])
           staged-map {:add add :remove remove}
-          db-after   (cond-> (integrate-novelty {:add add :remove remove} tx-state)
+          db-after   (cond-> (db-after {:add add :remove remove} tx-state)
                        add (vocab/hydrate-schema add))
           staged-map* (assoc staged-map :db-after db-after) ]
       ;; TODO: validate shapes
