@@ -640,8 +640,8 @@
                                                             {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
                                                :where  [[?s :type :f/Policy]]})))))))
      (testing "loading predefined properties"
-       (let [conn (test-utils/create-conn {:context test-utils/default-str-context
-                                           :context-type :string})
+       (let [conn (test-utils/create-conn {:defaults {:context test-utils/default-str-context
+                                                      :context-type :string}})
              ledger-alias  "shacl/a"
              ledger @(fluree/create conn "shacl/a" {:defaultContext ["" {"ex" "http://example.org/ns/"}]})
 

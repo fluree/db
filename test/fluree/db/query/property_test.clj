@@ -6,7 +6,7 @@
 
 (deftest ^:integration equivalent-properties-test
   (testing "Equivalent properties"
-    (let [conn    (test-utils/create-conn)
+    (let [conn    (test-utils/create-conn {:defaults {:context-type :string}})
           ledger  @(fluree/create conn "query/equivalent-properties")
           context {"vocab1" "http://vocab1.example.org/"
                    "vocab2" "http://vocab2.example.org/"
