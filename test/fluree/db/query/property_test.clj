@@ -165,7 +165,8 @@
                            "ex:preds" {"@list" [{"@id" "ex:cool"
                                                  "@type" "rdf:Property"}
                                                 {"@id" "ex:fool"
-                                                 "@type" "rdf:Property"}]}}]})
+                                                 "@type" "rdf:Property"}]}}]}
+                   nil)
           _ (Thread/sleep 100)
           db2    @(fluree/transact!
                    conn {"f:ledger" ledger-id
@@ -176,7 +177,8 @@
                                       "ex:givenName" "Dan"}
                                      {"@id" "ex:other"
                                       "ex:fool" false
-                                      "ex:cool" true}]})
+                                      "ex:cool" true}]}
+                   nil)
           loaded @(fluree/load conn ledger-id)
           dbl    (fluree/db loaded)]
       (testing "before load"

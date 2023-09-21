@@ -232,7 +232,7 @@
                              :type        :ex/User
                              :foo/baz     "baz"
                              :schema/name "Bob"}]}
-            db  @(fluree/transact! conn txn)]
+            db  @(fluree/transact! conn txn nil)]
         (is (= [{:id          :ex/bob,
                  :type        :ex/User,
                  :schema/name "Bob",
@@ -249,7 +249,7 @@
                  :f/ledger    ledger-name
                  :graph-alias {:id-alias    :ex/alice
                                :schema/givenName "Alicia"}}
-            db  @(fluree/transact! conn txn)]
+            db  @(fluree/transact! conn txn nil)]
         (is (= [{:id          :ex/bob,
                  :type        :ex/User,
                  :schema/name "Bob",
@@ -267,7 +267,7 @@
                         "@graph"  [{:context    {:quux "http://quux.com/"}
                                     :id         :ex/alice
                                     :quux/corge "grault"}]}
-            db @(fluree/transact! conn txn)]
+            db @(fluree/transact! conn txn nil)]
         (is (= [{:id          :ex/bob,
                  :type        :ex/User,
                  :schema/name "Bob",
@@ -286,7 +286,7 @@
       (let [txn        {"@graph" [{:context    {:quux "http://quux.com/"}
                                    :id         :ex/cam
                                    :quux/corge "grault"}]}
-            db (try @(fluree/transact! conn txn)
+            db (try @(fluree/transact! conn txn nil)
                     (catch Exception e e))]
         (is (util/exception? db))
         (is (str/starts-with? (ex-message db)

@@ -88,7 +88,7 @@
       (<? (tx/transact! ledger txn opts)))))
 
 (defn transact!
-  [conn parsed-json-ld]
+  [conn parsed-json-ld opts]
   (go-try
     (let [{txn-context     "@context"
            txn             "@graph"
@@ -99,7 +99,8 @@
       (if-not (<? (conn-proto/-exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger (<? (jld-ledger/load conn address))
-              opts   (cond-> (or txn-opts {})
+              opts   (cond-> opts
+                       txn-opts (merge txn-opts)
                        txn-context (assoc :txn-context txn-context)
                        default-context (assoc :defaultContext default-context))]
           (<? (ledger-transact! ledger txn opts)))))))

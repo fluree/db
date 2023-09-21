@@ -431,7 +431,7 @@
                           :f/ledger ledger-id
                           :graph    {:delete '[?s ?p ?o]
                                      :where  '[[?s "schema:description" ?o]
-                                               [?s ?p ?o]]}})
+                                               [?s ?p ?o]]}} nil)
       (let [db2   (fluree/db @(fluree/load conn ledger-id))
             q       '{:select [?s ?p ?o]
                       :where  [[?s "schema:description" ?o]

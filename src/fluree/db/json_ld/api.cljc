@@ -251,12 +251,12 @@
   Note: Loading the ledger results in a new ledger object, so references to existing
   ledger objects will be rendered stale. To obtain a ledger with the new changes,
   call `load` on the ledger alias."
-  [conn json-ld]
+  [conn json-ld opts]
   (promise-wrap
    (let [context-type (conn-proto/-context-type conn)
          parsed-txn   (transact-api/parse-json-ld-txn conn context-type json-ld)]
      (log/trace "transact! parsed-txn:" parsed-txn)
-     (transact-api/transact! conn parsed-txn))))
+     (transact-api/transact! conn parsed-txn opts))))
 
 (defn create-with-txn
   "Creates a new ledger named by the @id key (or its context alias) in txn if it
