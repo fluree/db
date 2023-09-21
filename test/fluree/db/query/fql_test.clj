@@ -188,7 +188,7 @@
     (testing "iri queries"
       (let [test-subject @(fluree/query db '{:select [?s]
                                              :where  [[?s :id :wiki/Q836821]]})]
-        (is (= [[:wiki/Q836821]]
+        (is (= [[{:id :wiki/Q836821}]]
                test-subject)
             "Returns the subject with that iri")))
     (testing "iri references"
@@ -230,7 +230,7 @@
                                       :select    [?s ?job]
                                       :where     [[?s "ex:occupation" ?job]
                                                   {:filter ["(= \"en\" (lang ?job))"]}]})]
-          (is (= [["ex:bob" "Boss"] ["ex:jack" "Chef"] ["ex:frank" "Ninja"]] sut)
+          (is (= [[{"@id" "ex:bob"} "Boss"] [{"@id" "ex:jack"} "Chef"] [{"@id" "ex:frank"} "Ninja"]] sut)
               "returns correctly filtered results")))
 
       (testing "filtering with value maps"
@@ -238,7 +238,7 @@
                                       :select    [?s]
                                       :where     [[?s "ex:occupation" {"@value"    "Chef"
                                                                        "@language" "fr"}]]})]
-          (is (= [["ex:bob"]] sut)
+          (is (= [[{"@id" "ex:bob"}]] sut)
               "returns correctly filtered results"))))))
 
 (deftest ^:integration subject-object-test
@@ -268,8 +268,8 @@
                 :where [[?s "schema:description" ?o]
                         [?s ?p ?o]]}
             subject @(fluree/query db q)]
-        (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
-                ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
-                ["ex:w3c" "schema:description" "We ❤️ Internet"]]
+        (is (= [[{"id" "ex:fluree"} {"id" "schema:description"} "We ❤️ Data"]
+                [{"id" "ex:mosquitos"} {"id" "schema:description"} "We ❤️ Human Blood"]
+                [{"id" "ex:w3c"} {"id" "schema:description"} "We ❤️ Internet"]]
                subject)
             "returns all results")))))

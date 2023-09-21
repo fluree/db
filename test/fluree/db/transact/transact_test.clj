@@ -44,12 +44,12 @@
       (is (util/exception? stage-empty-node))
       (is (= (ex-message stage-empty-node)
              "Invalid transaction, transaction node contains no properties."))
-      (is (= [[:ex/alice :id "http://example.org/ns/alice"]
-              [:ex/alice :schema/age 42]
-              [:schema/age :id "http://schema.org/age"]
-              [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
-              [:type :id "@type"]
-              [:id :id "@id"]]
+      (is (= [[{:id :ex/alice} {:id :id} "http://example.org/ns/alice"]
+              [{:id :ex/alice} {:id :schema/age} 42]
+              [{:id :schema/age} {:id :id} "http://schema.org/age"]
+              [{:id :rdfs/Class} {:id :id} "http://www.w3.org/2000/01/rdf-schema#Class"]
+              [{:id :type} {:id :id} "@type"]
+              [{:id :id} {:id :id} "@id"]]
              @(fluree/query db-ok '{:select [?s ?p ?o]
                                     :where  [[?s ?p ?o]]})))))
 
@@ -60,12 +60,12 @@
                     (fluree/db ledger)
                     {:id        :ex/alice
                      :ex/isCool false})]
-      (is (= [[:ex/alice :id "http://example.org/ns/alice"]
-              [:ex/alice :ex/isCool false]
-              [:ex/isCool :id "http://example.org/ns/isCool"]
-              [:rdfs/Class :id "http://www.w3.org/2000/01/rdf-schema#Class"]
-              [:type :id "@type"]
-              [:id :id "@id"]]
+      (is (= [[{:id :ex/alice} {:id :id} "http://example.org/ns/alice"]
+              [{:id :ex/alice} {:id :ex/isCool} false]
+              [{:id :ex/isCool} {:id :id} "http://example.org/ns/isCool"]
+              [{:id :rdfs/Class} {:id :id} "http://www.w3.org/2000/01/rdf-schema#Class"]
+              [{:id :type} {:id :id} "@type"]
+              [{:id :id} {:id :id} "@id"]]
              @(fluree/query db-bool '{:select [?s ?p ?o]
                                       :where  [[?s ?p ?o]]})))))
 

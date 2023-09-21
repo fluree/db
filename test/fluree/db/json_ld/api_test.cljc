@@ -732,10 +732,10 @@
   (let [query {:select ["?person" "?name"]
                :where  [["?person" :type :ex/User]
                         ["?person" :schema/name "?name"]]}
-        expected [[:ex/liam "Liam"]
-                  [:ex/cam "Cam"]
-                  [:ex/alice "Alice"]
-                  [:ex/brian "Brian"]]]
+        expected [[{:id :ex/liam} "Liam"]
+                  [{:id :ex/cam} "Cam"]
+                  [{:id :ex/alice} "Alice"]
+                  [{:id :ex/brian} "Brian"]]]
     (testing "basic query works"
       #?(:clj
          (let [conn    (test-utils/create-conn)

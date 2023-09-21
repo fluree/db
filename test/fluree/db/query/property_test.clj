@@ -99,27 +99,27 @@
                                  "where"  [["?s" "@id" "ex:subject-as-predicate"]]}))
           "via subgraph selector")
 
-      (is (= [["id"] ["ex:labeled-pred"] ["ex:new-pred"] ["ex:unlabeled-pred"]]
+      (is (= [[{"id" "id"}] [{"id" "ex:labeled-pred"}] [{"id" "ex:new-pred"}] [{"id" "ex:unlabeled-pred"}]]
              @(fluree/query db2 {"select" ["?p"]
                                  "where"  [["?s" "@id" "ex:subject-as-predicate"]
                                            ["?s" "?p" "?o"]]}))
           "via variable selector")
-      (is (= [["id" {"id"                "ex:subject-as-predicate",
-                     "ex:labeled-pred"   "labeled",
-                     "ex:new-pred"       {"id" "ex:nested"}
-                     "ex:unlabeled-pred" "unlabeled"}]
-              ["ex:labeled-pred" {"id"                "ex:subject-as-predicate",
-                                  "ex:labeled-pred"   "labeled",
-                                  "ex:new-pred"       {"id" "ex:nested"},
-                                  "ex:unlabeled-pred" "unlabeled"}]
-              ["ex:new-pred" {"id"                "ex:subject-as-predicate",
-                              "ex:labeled-pred"   "labeled",
-                              "ex:new-pred"       {"id" "ex:nested"},
-                              "ex:unlabeled-pred" "unlabeled"}]
-              ["ex:unlabeled-pred" {"id"                "ex:subject-as-predicate",
-                                    "ex:labeled-pred"   "labeled",
-                                    "ex:new-pred"       {"id" "ex:nested"},
-                                    "ex:unlabeled-pred" "unlabeled"}]]
+      (is (= [[{"id" "id"} {"id"                "ex:subject-as-predicate",
+                            "ex:labeled-pred"   "labeled",
+                            "ex:new-pred"       {"id" "ex:nested"}
+                            "ex:unlabeled-pred" "unlabeled"}]
+              [{"id" "ex:labeled-pred"} {"id"                "ex:subject-as-predicate",
+                                         "ex:labeled-pred"   "labeled",
+                                         "ex:new-pred"       {"id" "ex:nested"},
+                                         "ex:unlabeled-pred" "unlabeled"}]
+              [{"id" "ex:new-pred"} {"id"                "ex:subject-as-predicate",
+                                     "ex:labeled-pred"   "labeled",
+                                     "ex:new-pred"       {"id" "ex:nested"},
+                                     "ex:unlabeled-pred" "unlabeled"}]
+              [{"id" "ex:unlabeled-pred"} {"id"                "ex:subject-as-predicate",
+                                           "ex:labeled-pred"   "labeled",
+                                           "ex:new-pred"       {"id" "ex:nested"},
+                                           "ex:unlabeled-pred" "unlabeled"}]]
              @(fluree/query db2 {"select" ["?p" {"?s" ["*"]}]
                                  "where"  [["?s" "@id" "ex:subject-as-predicate"]
                                            ["?s" "?p" "?o"]]}))
@@ -184,7 +184,7 @@
                @(fluree/query db2 {"select" {"?s" ["*"]}
                                    "where" [["?s" "ex:firstName" "?o"]]})))
 
-        (is (= [["ex:other" true false]]
+        (is (= [[{"id" "ex:other"} true false]]
                @(fluree/query db2 {"select" ["?s" "?cool" "?fool"]
                                    "where" [["?s" "ex:cool" "?cool"]
                                             ["?s" "ex:fool" "?fool"]]}))
@@ -199,7 +199,7 @@
                @(fluree/query dbl {"select" {"?s" ["*"]}
                                    "where"  [["?s" "ex:firstName" "?o"]]})))
 
-        (is (= [["ex:other" true false]]
+        (is (= [[{"id" "ex:other"} true false]]
                @(fluree/query dbl {"select" ["?s" "?cool" "?fool"]
                                    "where"  [["?s" "ex:cool" "?cool"]
                                              ["?s" "ex:fool" "?fool"]]}))

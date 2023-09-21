@@ -302,7 +302,7 @@
                              WHERE {?person person:handle \"jdoe\".
                                     ?person person:fullName ?fullName.}"
                     results (<p! (fluree/query db query {:format :sparql}))]
-                (is (= [["ex:jdoe" "Jane Doe"]]
+                (is (= [[{"id" "ex:jdoe"} "Jane Doe"]]
                        results))
                 (done))))))
 
@@ -337,26 +337,26 @@
                           WHERE {?person person:handle \"jdoe\".
                                  ?person person:fullName ?fullName.}"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:jdoe" "Jane Doe"]]
+             (is (= [[{"id" "ex:jdoe"} "Jane Doe"]]
                     results))))
          (testing "basic query w/ OPTIONAL works"
            (let [query   "SELECT ?person ?favNums
                           WHERE {?person person:handle ?handle.
                                  OPTIONAL{?person person:favNums ?favNums.}}"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:bbob" 23]
-                     ["ex:fbueller" nil]
-                     ["ex:jbob" 0]
-                     ["ex:jbob" 3]
-                     ["ex:jbob" 5]
-                     ["ex:jbob" 6]
-                     ["ex:jbob" 7]
-                     ["ex:jbob" 8]
-                     ["ex:jbob" 9]
-                     ["ex:jdoe" 3]
-                     ["ex:jdoe" 7]
-                     ["ex:jdoe" 42]
-                     ["ex:jdoe" 99]]
+             (is (= [[{"id" "ex:bbob"} 23]
+                     [{"id" "ex:fbueller"} nil]
+                     [{"id" "ex:jbob"} 0]
+                     [{"id" "ex:jbob"} 3]
+                     [{"id" "ex:jbob"} 5]
+                     [{"id" "ex:jbob"} 6]
+                     [{"id" "ex:jbob"} 7]
+                     [{"id" "ex:jbob"} 8]
+                     [{"id" "ex:jbob"} 9]
+                     [{"id" "ex:jdoe"} 3]
+                     [{"id" "ex:jdoe"} 7]
+                     [{"id" "ex:jdoe"} 42]
+                     [{"id" "ex:jdoe"} 99]]
                     results))))
          (testing "basic query w/ GROUP BY & OPTIONAL works"
            (let [query   "SELECT ?person ?favNums
@@ -364,10 +364,10 @@
                                  OPTIONAL{?person person:favNums ?favNums.}}
                           GROUP BY ?person"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:bbob" [23]]
-                     ["ex:fbueller" nil]
-                     ["ex:jbob" [0 3 5 6 7 8 9]]
-                     ["ex:jdoe" [3 7 42 99]]]
+             (is (= [[{"id" "ex:bbob"} [23]]
+                     [{"id" "ex:fbueller"} nil]
+                     [{"id" "ex:jbob"} [0 3 5 6 7 8 9]]
+                     [{"id" "ex:jdoe"} [3 7 42 99]]]
                     results))))
          (testing "basic query w/ omitted subjects works"
            (let [query   "SELECT ?person ?fullName ?favNums
@@ -375,10 +375,10 @@
                                          person:fullName ?fullName;
                                          person:favNums ?favNums.}"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= [["ex:jdoe" "Jane Doe" 3]
-                     ["ex:jdoe" "Jane Doe" 7]
-                     ["ex:jdoe" "Jane Doe" 42]
-                     ["ex:jdoe" "Jane Doe" 99]]
+             (is (= [[{"id" "ex:jdoe"} "Jane Doe" 3]
+                     [{"id" "ex:jdoe"} "Jane Doe" 7]
+                     [{"id" "ex:jdoe"} "Jane Doe" 42]
+                     [{"id" "ex:jdoe"} "Jane Doe" 99]]
                     results))))
          (testing "scalar fn query works"
            (let [query   "SELECT (SHA512(?handle) AS ?handleHash)
@@ -432,9 +432,9 @@
                                   ?person person:favNums ?favNums.}
                           GROUP BY ?person ?handle"
                  results @(fluree/query db query {:format :sparql})]
-             (is (= [[[23] 23 "ex:bbob" "bbob" 23]
-                     [[0 3 5 6 7 8 9] 5.428571428571429 "ex:jbob" "jbob" 9]
-                     [[3 7 42 99] 37.75 "ex:jdoe" "jdoe" 99]]
+             (is (= [[[23] 23 {"id" "ex:bbob"} "bbob" 23]
+                     [[0 3 5 6 7 8 9] 5.428571428571429 {"id" "ex:jbob"} "jbob" 9]
+                     [[3 7 42 99] 37.75 {"id" "ex:jdoe"} "jdoe" 99]]
                     results))))
          (testing "COUNT query works"
            (let [query   "SELECT (COUNT(?favNums) AS ?numFavs)
@@ -482,8 +482,8 @@
                             SELECT ?book ?title
                             WHERE {?book <title> ?title.}"
                    results @(fluree/query book-db query {:format :sparql})]
-               (is (= [["1" "For Whom the Bell Tolls"]
-                       ["2" "The Hitchhiker's Guide to the Galaxy"]]
+               (is (= [[{"@id" "1"} "For Whom the Bell Tolls"]
+                       [{"@id" "2"} "The Hitchhiker's Guide to the Galaxy"]]
                       results))))
            (testing "PREFIX declarations go into the context"
              (let [book-db @(fluree/stage db book-data)
@@ -491,8 +491,8 @@
                             SELECT ?book ?title
                             WHERE {?book book:title ?title.}"
                    results @(fluree/query book-db query {:format :sparql})]
-               (is (= [["book:1" "For Whom the Bell Tolls"]
-                       ["book:2" "The Hitchhiker's Guide to the Galaxy"]]
+               (is (= [[{"@id" "book:1"} "For Whom the Bell Tolls"]
+                       [{"@id" "book:2"} "The Hitchhiker's Guide to the Galaxy"]]
                       results)))))
 
            ;; TODO: Make these tests pass

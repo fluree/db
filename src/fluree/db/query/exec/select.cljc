@@ -27,15 +27,20 @@
   [match _ _ _ _]
   (go (::where/val match)))
 
+(defn iri->id-map
+  [iri compact]
+  (let [id (compact "@id")]
+    {id iri}))
+
 (defmethod display const/$xsd:anyURI
   [match db iri-cache compact error-ch]
   (go
     (let [v (::where/val match)]
       (if-let [cached (-> @iri-cache (get v) :as)]
-        cached
+        (iri->id-map cached compact)
         (try* (let [iri (<? (dbproto/-iri db v compact))]
                 (vswap! iri-cache assoc v {:as iri})
-                iri)
+                (iri->id-map iri compact))
               (catch* e
                 (log/error e "Error displaying iri:" v)
                 (>! error-ch e)))))))

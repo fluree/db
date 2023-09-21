@@ -156,15 +156,15 @@
                             {:select  ['?s '?p '?o]
                              :where   [['?s :schema/age 34]
                                        ['?s '?p '?o]]})
-             [[:ex/cam :id "http://example.org/ns/cam"]
-              [:ex/cam :type :ex/User]
-              [:ex/cam :schema/name "Cam"]
-              [:ex/cam :schema/email "cam@example.org"]
-              [:ex/cam :schema/age 34]
-              [:ex/cam :ex/favNums 5]
-              [:ex/cam :ex/favNums 10]
-              [:ex/cam :ex/friend :ex/brian]
-              [:ex/cam :ex/friend :ex/alice]])
+             [[{:id :ex/cam} {:id :id} "http://example.org/ns/cam"]
+              [{:id :ex/cam} {:id :type} {:id :ex/User}]
+              [{:id :ex/cam} {:id :schema/name} "Cam"]
+              [{:id :ex/cam} {:id :schema/email} "cam@example.org"]
+              [{:id :ex/cam} {:id :schema/age} 34]
+              [{:id :ex/cam} {:id :ex/favNums} 5]
+              [{:id :ex/cam} {:id :ex/favNums} 10]
+              [{:id :ex/cam} {:id :ex/friend} {:id :ex/brian}]
+              [{:id :ex/cam} {:id :ex/friend} {:id :ex/alice}]])
           "IRIs are resolved from subj ids, whether s, p, or o vals.")
 
       ;; checking object-subject joins
