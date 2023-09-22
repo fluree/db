@@ -530,16 +530,18 @@
         last-sid (volatile! (jld-ledger/last-sid db))
         commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t        (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
-        db-before (dbproto/-rootdb db)]
+        db-before (dbproto/-rootdb db)
+        flakeset (flake/sorted-set-by flake/cmp-flakes-spot)
+        track-fuel (if fuel-tracker
+                     (fuel/track fuel-tracker)
+                     (completing identity))]
     {:db-before     db-before
      :policy        policy
      :bootstrap?    bootstrap?
      :default-ctx   (if context-type
                       (dbproto/-context db ::dbproto/default-context context-type)
                       (dbproto/-context db))
-     :track-fuel    (if fuel-tracker
-                      (fuel/track fuel-tracker)
-                      (completing identity))
+     :track-fuel    track-fuel
      :stage-update? (= t db-t)
      :t             t
      :last-pid      last-pid
@@ -549,7 +551,7 @@
      :iri-cache     (volatile! {})
      :shape-sids    #{}
      :shapes        {:class #{} :subject #{} :object #{} :node #{}}
-     :flakes       (flake/sorted-set-by flake/cmp-flakes-spot)}))
+     :flakes        flakeset}))
 
 (defn valid-tx-structure?
   [expanded-tx]
