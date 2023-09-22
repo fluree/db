@@ -46,6 +46,7 @@
    "http://www.w3.org/2001/XMLSchema#base64Binary"         const/$xsd:base64Binary
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString})
 
+
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
 
@@ -67,7 +68,7 @@
 (def iso8601-time-pattern
   (str #?(:clj  "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,9}))?"
           :cljs "([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\\.([0-9]{1,3}))?")
-       iso8601-offset-pattern))
+        iso8601-offset-pattern))
 
 (def iso8601-time-re
   (re-pattern iso8601-time-pattern))

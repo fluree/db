@@ -1,17 +1,35 @@
 (ns fluree.db.serde.json
-  (:require [fluree.db.serde.protocol :as serdeproto]
+  (:require [fluree.db.constants :as const]
+            [fluree.db.serde.protocol :as serdeproto]
+            [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]))
-
+            [fluree.db.util.core :as util])
+  #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
+                              LocalDateTime ZoneOffset)
+                   (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
+
+(def time-types
+  #{const/$xsd:date
+    const/$xsd:dateTime
+    const/$xsd:time})
+
+(defn deserialize-flake
+  [flake-vec]
+  (if-let [flake-time-dt (time-types (get flake-vec 3))]
+    (let [flake-value (get flake-vec 2)]
+      (-> flake-vec
+          (update 2 #(datatype/coerce % flake-time-dt))
+          (flake/parts->Flake)))
+    (flake/parts->Flake flake-vec)))
 
 
 (defn- deserialize-child-node
   "Turns :first and :rhs into flakes"
   [child-node]
   (assoc child-node
-         :first (some-> child-node :first flake/parts->Flake)
-         :rhs   (some-> child-node :rhs flake/parts->Flake)))
+         :first (some-> child-node :first deserialize-flake)
+         :rhs   (some-> child-node :rhs deserialize-flake)))
 
 (defn- deserialize-ecount
   "Converts ecount from keywordized keys back to integers."
@@ -42,20 +60,33 @@
   [branch]
   (assoc branch :children (mapv deserialize-child-node (:children branch))
          :rhs (some-> (:rhs branch)
-                       (flake/parts->Flake))))
-
+                      (deserialize-flake))))
 
 (defn- deserialize-leaf-node
   [leaf]
-  (assoc leaf :flakes (mapv flake/parts->Flake (:flakes leaf))))
+  (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
+
+#?(:clj (def ^DateTimeFormatter offsetDateTimeFormatter
+          (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSSXXXXX")))
+#?(:clj (def ^DateTimeFormatter localDateTimeFormatter
+          (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS")))
+
+(defn format-time
+  [time-obj dt]
+  #?(:clj (condp = dt
+            const/$xsd:dateTime (cond
+                                  (instance? java.time.OffsetDateTime time-obj) (.format offsetDateTimeFormatter time-obj)
+                                  (instance? java.time.LocalDate time-obj) (.format localDateTimeFormatter time-obj)
+                                  :else time-obj))
+     :cljs time-obj))
 
 (defn serialize-flake
   "Flake with an 'm' value need keys converted from keyword keys into strings."
+
   [flake]
-  (if-let [m (flake/m flake)]
-    (-> (vec flake)
-        (assoc 5 (util/stringify-keys m)))                  ;; flake 'm' value is at index #5 (6th flake element)
-    (vec flake)))
+  (cond-> (vec flake)
+    (contains? time-types (flake/dt flake)) (update 2 format-time (flake/dt flake))
+    (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake)))))
 
 (defn- deserialize-garbage
   [garbage-data]
@@ -68,7 +99,7 @@
   (reduce-kv
     (fn [acc k v]
       (assoc acc (name k) (if (flake/flake? v)
-                            (vec v)
+                            (serialize-flake v)
                             v)))
     {} m))
 
