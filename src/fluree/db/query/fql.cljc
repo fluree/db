@@ -46,7 +46,6 @@
      (let [q   (try*
                  (parse/parse-query query-map db)
                  (catch* e e))
-           _ (log/info "parsed query:" q)
            db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
        (if (util/exception? q)
          (async/to-chan! [q])

@@ -188,7 +188,6 @@
                                 (ctx-util/stringify-context))
                             (conn-proto/-default-context conn))
           context-type*   (or context-type (-> conn :ledger-defaults :context-type))
-          _ (log/info "context-type:" context-type*)
           did*            (if did
                             (if (map? did)
                               did
