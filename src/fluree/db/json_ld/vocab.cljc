@@ -4,7 +4,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.schema :as schema-util]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [fluree.db.json-ld.ledger :as jld-ledger]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -266,7 +267,20 @@
 
 (defn hydrate-schema
   [db add]
-  (let [pred-sids    (into #{} (comp (filter flake/op) (map flake/p)) add)
+  (let [pred-sids    (into #{} (comp (filter flake/op)
+                                     (map (fn [f]
+                                            (let [p (flake/p f)]
+                                              (cond
+                                                ;; if p is a predicate ref, we know o is a predicate sid as well
+                                                (jld-ledger/predicate-refs p)
+                                                [p (flake/o f)]
+                                                ;; if p has an o that says s is a predicate, include s as well
+                                                (and (= p const/$rdf:type) (jld-ledger/class-or-property-sid (flake/o f)))
+                                                [p (flake/s f)]
+                                                :else
+                                                [p]))))
+                                     cat)
+                           add)
         vocab-flakes (filterv #(pred-sids (flake/s %)) add)
         {:keys [t refs coll pred shapes prefix fullText subclasses]}
         (schema vocab-flakes (:t db))]
