@@ -11,7 +11,8 @@
    [fluree.db.datatype :as datatype]
    [fluree.json-ld.processor.api :as jld-processor]
    [fluree.db.json-ld.shacl :as shacl]
-   [fluree.db.query.range :as query-range]))
+   [fluree.db.query.range :as query-range]
+   [fluree.db.json-ld.ledger :as jld-ledger]))
 
 (defn create-id-flake
   [sid iri t]
@@ -115,8 +116,7 @@
           [sid iri]        (if (nil? id)
                              (let [bnode-sid (next-sid)]
                                [bnode-sid (bnode-id bnode-sid)])
-                             ;; TODO: not handling pid generation
-                             [(or existing-sid (next-sid)) id])]
+                             [(or existing-sid (get jld-ledger/predefined-sids id) (next-sid)) id])]
       (loop [[entry & r] (dissoc subject :id :idx)
              tx-state    (cond-> tx-state
                            (not existing-sid) (update :flakes into track-fuel [(create-id-flake sid iri t)]))]
