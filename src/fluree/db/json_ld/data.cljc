@@ -36,12 +36,6 @@
   [sid]
   (str "_:" sid))
 
-(defn ref-dt
-  "Some predicates are known to have references as objects."
-  [pid]
-  (get {const/$rdf:type const/$xsd:anyURI}
-    pid))
-
 (defn homogenize-values
   "@type doesn't have v-maps, it just has flat strings. If we detect that case and wrap
   the values to match every other predicate, we can process them the same way."
@@ -66,7 +60,6 @@
           (some? value)
           (let [existing-dt  (when type (<? (lookup-iri tx-state type)))
                 dt           (cond existing-dt  existing-dt
-                                   (ref-dt pid) (ref-dt pid)
                                    type         (next-sid)
                                    :else        (datatype/infer value language))
                 m*           (cond-> m
