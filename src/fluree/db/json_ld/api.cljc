@@ -253,8 +253,9 @@
   call `load` on the ledger alias."
   [conn json-ld opts]
   (promise-wrap
-   (let [context-type (conn-proto/-context-type conn)
+   (let [context-type (or (:context-type opts) (conn-proto/-context-type conn))
          parsed-txn   (transact-api/parse-json-ld-txn conn context-type json-ld)]
+     (log/trace "transact! context-type:" context-type)
      (log/trace "transact! parsed-txn:" parsed-txn)
      (transact-api/transact! conn parsed-txn opts))))
 
@@ -266,7 +267,7 @@
   ([conn txn opts]
    (log/trace "create-with-txn txn:" txn)
    (log/trace "create-with-txn opts:" opts)
-   (let [context-type   (get opts :context-type :string)
+   (let [context-type   (or (:context-type opts) (conn-proto/-context-type conn))
          {ledger-id       const/iri-ledger
           txn-context     "@context"
           txn-opts        const/iri-opts
