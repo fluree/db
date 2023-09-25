@@ -567,10 +567,16 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (-> db-before :novelty :spot) flakes)
                          [flakes])
-          staged-map {:add add :remove remove}
-          db-after   (cond-> (db-after {:add add :remove remove} tx-state)
-                       add (vocab/hydrate-schema add))
-          staged-map* (assoc staged-map :db-after db-after)]
+          staged-map   {:add add :remove remove}
+          db-after     (cond-> (db-after {:add add :remove remove} tx-state)
+                         add (vocab/hydrate-schema add))
+          staged-map*  (assoc staged-map :db-after db-after)
+
+          {:keys [class object subject node]} (<? (shacl/shape-sids db-before add))
+
+          class-shapes (<? (shacl/build-shapes-cached db-before class))
+          object-shapes (<? (shacl/build-shapes-cached db-before object))
+          ]
       ;; TODO: validate shapes
 
       ;; will throw if unauthorized flakes have been created

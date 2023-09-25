@@ -969,10 +969,52 @@
             (recur r (into shapes class-shapes)))
           shapes)))))
 
-(defn shape-target-sids
-  [db target-type target]
+(defn target-shape-sids
+  [db idx target-type target]
+  (query-range/index-range db :post = [target-type target] {:flake-xf (map flake/s)}))
+
+(defn shape-sids
+  "Returns the shapes that target any new flakes. Does not take into consideration
+  graph-crawling property shapes. "
+  [db new-flakes]
   (go-try
-    (<? (query-range/index-range db :post = [target-type target] {:flake-xf (map flake/s)}))))
+    (let [asserts       (into (empty new-flakes) (filter flake/op) new-flakes)
+          subject-ids   (into #{} (map flake/s) asserts)
+          predicate-ids (into #{} (map flake/p) asserts)
+
+          ;; look up shapes that target predicates in new-flakes
+          shape-sids
+          (loop [[pid & r] predicate-ids
+                 shape-sids {:class #{} :object #{} :subject #{}}]
+            (if pid
+              (recur r (-> shape-sids
+                           ;; this looks up shapes that target the objects of a predicate in new-flakes
+                           (update :object into (<? (target-shape-sids db :post const/$sh:targetObjectsOf pid)))
+                           (update :subject into (<? (target-shape-sids db :post const/$sh:targetSubjectsOf pid)))
+                           (cond-> (= const/$rdf:type pid)
+                             (update :class into (<? (target-shape-sids db :post const/$sh:targetClass pid))))))
+              shape-sids))
+
+          ;; look up shapes that target specific nodes in new-flakes (and referring pids while we're looking at subjects)
+          [shape-sids referring-pids]
+          (loop [[sid & r] subject-ids
+                 referring-pids #{}
+                 shape-sids shape-sids]
+            (if sid
+              (recur r
+                     (update shape-sids :node into (<? (target-shape-sids db :post const/$sh:targetNode sid)))
+                     (into referring-pids (<? (query-range/index-range db :opst = [sid] {:flake-xf (map flake/s)}))))
+              [shape-sids referring-pids]))
+
+          ;; look up shapes that target subjects in new-flakes
+          shape-sids
+          (loop [[pid & r] referring-pids
+                 shape-sids shape-sids]
+            (if pid
+              (recur r (update shape-sids :object (<? (target-shape-sids db :post const/$sh:targetObjectsOf pid))))
+              shape-sids))]
+      shape-sids)))
+
 
 (defn build-targetobject-shapes
   "Given a pred SID, returns shape"
