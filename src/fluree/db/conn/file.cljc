@@ -244,6 +244,7 @@
                                        (if (= :keyword context-type)
                                          (ctx-util/keywordize-context ctx)
                                          ctx)))
+  (-context-type [_] (:context-type ledger-defaults))
   (-new-indexer [_ opts]
     (let [indexer-fn (:indexer ledger-defaults)]
       (indexer-fn opts)))
