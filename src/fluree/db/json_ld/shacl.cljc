@@ -984,15 +984,31 @@
       :pred
       (contains? const/$sh:targetObjectsOf)))
 
+(defn shape-subject?
+  "Returns truthy if the subject is part of a SHACL shape."
+  [s-flakes]
+  (seq (filter #(or
+                  ;; class NodeShape or PropertyShape
+                  (and (= const/$rdf:type (flake/p %))
+                       (or (= (flake/o %) const/$sh:NodeShape)
+                           (= (flake/o %) const/$sh:PropertyShape)))
+                  ;; property shapes need to have a sh:path
+                  (= const/$sh:path (flake/p %)))
+               s-flakes)))
+
 (defn validate-new-flakes
   [db-before db-after new-flakes]
   (let [root-db (dbproto/-rootdb db-after)]
     (go-try
-      (loop [[new-s-flakes & r] (partition-by flake/s new-flakes)]
-        (when new-s-flakes
+      (loop [[new-s-flakes & r] (partition-by flake/s new-flakes)
+             modified-shape-sids #{}]
+        (if new-s-flakes
           (let [sid          (flake/s (first new-s-flakes))
                 new-subject? (first (filter #(= const/$xsd:anyURI (flake/p %)) new-s-flakes))
                 s-flakes     (if new-subject? new-s-flakes (<? (query-range/index-range db-before :spot = [sid])))
+
+                invalidate-shape-cache? (and (not new-subject?)
+                                             (shape-subject? s-flakes))
 
                 target-class-shapes
                 (let [class-sids (into [] (comp (filter #(= const/$rdf:type (flake/p %))) (map flake/o)) s-flakes)]
@@ -1028,7 +1044,15 @@
                 (loop [[ref-sid & r] refs]
                   (when ref-sid
                     (let [flakes (<? (query-range/index-range root-db :spot = [sid]))]
-                      (<? (validate-target target-object-of-shapes-ref-flakes root-db )))))))))))))
+                      (<? (validate-target target-object-of-shapes-ref-flakes root-db )))))))
+
+            (recur r (if invalidate-shape-cache?
+                       (conj modified-shape-sids sid)
+                       modified-shape-sids)))
+
+          ;; invalidate shape cache
+          (swap! (:shape-cache db-after)
+                 (fn [shape-sid->shape] (apply dissoc shape-sid->shape modified-shape-sids))))))))
 
 (defn build-targetobject-shapes
   "Given a pred SID, returns shape"
