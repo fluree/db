@@ -134,18 +134,9 @@
         local timezone according to your device."
   [s]
   (when-let [matches (re-matches iso8601-time-re s)]
-    #?(:clj  (let [time-parts (->> matches rest butlast)
-                   offset     (last matches)
-
-                   [hours minutes seconds second-fraction]
-                   (->> time-parts
-                        (map #(or % "0"))
-                        (map #(Integer/parseInt %)))
-
-                   nanos      (* second-fraction 1000000)]
-               (if offset
-                 (OffsetTime/of hours minutes seconds nanos (ZoneOffset/of ^String offset))
-                 (LocalTime/of hours minutes seconds nanos)))
+    #?(:clj  (if-let [offset     (peek matches)]
+               (OffsetTime/parse s)
+               (LocalTime/parse s))
        :cljs (js/Date. (str "1970-01-01T" s)))))
 
 (defn- parse-iso8601-datetime
@@ -157,20 +148,9 @@
   [s]
   (when-let [matches (re-matches iso8601-datetime-re s)]
     #?(:clj
-       (let [datetime-parts (->> matches rest (take 7))
-             offset         (last matches)
-             [years months days hours minutes seconds second-fraction]
-             (->> datetime-parts
-                  (map #(or % "0"))
-                  (map #(Integer/parseInt %)))
-
-             nanos          (* second-fraction 1000000)]
-         (if offset
-           (OffsetDateTime/of years months days hours minutes seconds nanos
-                              (ZoneOffset/of ^String offset))
-           (LocalDateTime/of ^int years ^int months ^int days ^int hours
-                             ^int minutes ^int seconds ^int nanos)))
-
+       (if-let [offset         (peek matches)]
+         (OffsetDateTime/parse s)
+         (LocalDateTime/parse s))
        :cljs
        (js/Date. s))))
 
