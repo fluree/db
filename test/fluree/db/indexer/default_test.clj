@@ -23,8 +23,19 @@
                   (fluree/db ledger)
                   [{"@id" "ex:Foo",
                     "@type" "ex:Bar",
-                    "ex:createdDate" {"@type" "xsd:dateTime"
-                                      "@value" "2023-04-01T00:00:00.000Z"}}])
+
+                    "ex:offsetDateTime" {"@type" "xsd:dateTime"
+                                         "@value" "2023-04-01T00:00:00.000Z"}
+                    "ex:localDateTime" {"@type" "xsd:dateTime"
+                                        "@value" "2021-09-24T11:14:32.833"}
+                    "ex:offsetDateTime2" {"@type" "xsd:date"
+                                          "@value" "2022-01-05Z"}
+                    "ex:localDate" {"@type" "xsd:date"
+                                    "@value" "2024-02-02"}
+                    "ex:offsetTime" {"@type" "xsd:time"
+                                     "@value" "12:42:00Z"}
+                    "ex:localTime" {"@type" "xsd:time"
+                                    "@value" "12:42:00"}}])
             db-commit @(fluree/commit! ledger db)
             loaded (test-utils/retry-load conn (:alias ledger) 100)
             q {"select" {"?s" ["*"]}

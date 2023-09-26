@@ -3,7 +3,8 @@
             [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util])
+            [fluree.db.util.core :as util]
+            #?(:clj [fluree.db.util.clj-const :as uc]))
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
@@ -19,6 +20,8 @@
   (if-let [flake-time-dt (time-types (get flake-vec 3))]
     (let [flake-value (get flake-vec 2)]
       (-> flake-vec
+          ;;TODO: coercion will fail in js for `xsd:time` and `xsd:date`
+          ;;objects, because we append data to make them dateTimes
           (update 2 #(datatype/coerce % flake-time-dt))
           (flake/parts->Flake)))
     (flake/parts->Flake flake-vec)))
@@ -66,27 +69,47 @@
   [leaf]
   (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
 
-#?(:clj (def ^DateTimeFormatter offsetDateTimeFormatter
-          (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSSXXXXX")))
-#?(:clj (def ^DateTimeFormatter localDateTimeFormatter
-          (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS")))
+#?(:clj (def ^DateTimeFormatter xsdDateTimeFormatter
+          (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS[XXXXX]")))
 
-(defn format-time
-  [time-obj dt]
-  #?(:clj (condp = dt
-            const/$xsd:dateTime (cond
-                                  (instance? java.time.OffsetDateTime time-obj) (.format offsetDateTimeFormatter time-obj)
-                                  (instance? java.time.LocalDate time-obj) (.format localDateTimeFormatter time-obj)
-                                  :else time-obj))
-     :cljs time-obj))
+#?(:clj (def ^DateTimeFormatter xsdTimeFormatter
+          (DateTimeFormatter/ofPattern "HH:mm:ss.SSSSSSSSS[XXXXX]")))
+
+;;xsd:date
+#?(:clj (def ^DateTimeFormatter xsdDateFormatter
+          (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
+
+
+(defn format-value
+  [val dt]
+  (uc/case (int dt)
+    const/$xsd:dateTime #?(:clj (cond->> val
+                                  (or (instance? java.time.OffsetDateTime val)
+                                      (instance? java.time.LocalDateTime val))
+                                  (.format xsdDateTimeFormatter))
+                           :cljs (.toJSON val))
+    const/$xsd:date      #?(:clj (cond->> val
+                                   (or (instance? java.time.OffsetDateTime val)
+                                       (instance? java.time.LocalDate val))
+                                   (.format xsdDateFormatter))
+                            :cljs (.toJSON val))
+    const/$xsd:time #?(:clj (cond->> val
+                              (or (instance? java.time.OffsetTime val)
+                                  (instance? java.time.LocalTime val))
+                              (.format xsdTimeFormatter))
+                       :cljs (.toJSON val))
+    val))
 
 (defn serialize-flake
-  "Flake with an 'm' value need keys converted from keyword keys into strings."
+  "Flakes with time types will have time objects as values.
+  We need to serialize these into strings that will be successfully re-coerced into
+  the same objects upon loading.
 
+  Flakes with an 'm' value need keys converted from keyword keys into strings."
   [flake]
-  (cond-> (vec flake)
-    (contains? time-types (flake/dt flake)) (update 2 format-time (flake/dt flake))
-    (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake)))))
+  (-> (vec flake)
+      (update 2 format-value (flake/dt flake))
+      (cond-> (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake))))))
 
 (defn- deserialize-garbage
   [garbage-data]
