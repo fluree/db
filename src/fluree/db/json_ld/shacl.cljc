@@ -9,7 +9,8 @@
             [fluree.db.flake :as flake]
             [clojure.string :as str]
             [clojure.set :as set]
-            [clojure.core.async :as async])
+            [clojure.core.async :as async]
+            [fluree.db.dbproto :as dbproto])
   #?(:clj (:import (java.util.regex Pattern))))
 
 (comment
@@ -973,48 +974,61 @@
   [db idx target-type target]
   (query-range/index-range db :post = [target-type target] {:flake-xf (map flake/s)}))
 
-(defn shape-sids
-  "Returns the shapes that target any new flakes. Does not take into consideration
-  graph-crawling property shapes. "
-  [db new-flakes]
-  (go-try
-    (let [asserts       (into (empty new-flakes) (filter flake/op) new-flakes)
-          subject-ids   (into #{} (map flake/s) asserts)
-          predicate-ids (into #{} (map flake/p) asserts)
+(defn has-target-objects-of-rule?
+  "Returns `true` if db currently has a rule that uses
+  `sh:targetObjectsOf`. Used to avoid unnecessary lookups
+  of shapes during transaction."
+  [db]
+  (-> db
+      :schema
+      :pred
+      (contains? const/$sh:targetObjectsOf)))
 
-          ;; look up shapes that target predicates in new-flakes
-          shape-sids
-          (loop [[pid & r] predicate-ids
-                 shape-sids {:class #{} :object #{} :subject #{}}]
-            (if pid
-              (recur r (-> shape-sids
-                           ;; this looks up shapes that target the objects of a predicate in new-flakes
-                           (update :object into (<? (target-shape-sids db :post const/$sh:targetObjectsOf pid)))
-                           (update :subject into (<? (target-shape-sids db :post const/$sh:targetSubjectsOf pid)))
-                           (cond-> (= const/$rdf:type pid)
-                             (update :class into (<? (target-shape-sids db :post const/$sh:targetClass pid))))))
-              shape-sids))
+(defn validate-new-flakes
+  [db-before db-after new-flakes]
+  (let [root-db (dbproto/-rootdb db-after)]
+    (go-try
+      (loop [[new-s-flakes & r] (partition-by flake/s new-flakes)]
+        (when new-s-flakes
+          (let [sid          (flake/s (first new-s-flakes))
+                new-subject? (first (filter #(= const/$xsd:anyURI (flake/p %)) new-s-flakes))
+                s-flakes     (if new-subject? new-s-flakes (<? (query-range/index-range db-before :spot = [sid])))
 
-          ;; look up shapes that target specific nodes in new-flakes (and referring pids while we're looking at subjects)
-          [shape-sids referring-pids]
-          (loop [[sid & r] subject-ids
-                 referring-pids #{}
-                 shape-sids shape-sids]
-            (if sid
-              (recur r
-                     (update shape-sids :node into (<? (target-shape-sids db :post const/$sh:targetNode sid)))
-                     (into referring-pids (<? (query-range/index-range db :opst = [sid] {:flake-xf (map flake/s)}))))
-              [shape-sids referring-pids]))
+                target-class-shapes
+                (let [class-sids (into [] (comp (filter #(= const/$rdf:type (flake/p %))) (map flake/o)) s-flakes)]
+                  (loop [[class-sid & r] class-sids
+                         shape-sids #{}]
+                    (if class-sid
+                      (recur r (into shape-sids (<? (target-shape-sids db-before :post const/$sh:targetClass class-sid))))
+                      (<? (build-shapes-cached db-before shape-sids)))))
 
-          ;; look up shapes that target subjects in new-flakes
-          shape-sids
-          (loop [[pid & r] referring-pids
-                 shape-sids shape-sids]
-            (if pid
-              (recur r (update shape-sids :object (<? (target-shape-sids db :post const/$sh:targetObjectsOf pid))))
-              shape-sids))]
-      shape-sids)))
+                target-object-of-shapes-s-flakes
+                (if (has-target-objects-of-rule? db-before)
+                  (loop [[class-sid & r] (into #{} (map flake/p) s-flakes)
+                         shape-sids #{}]
+                    (if class-sid
+                      (recur r (into shape-sids (<? (target-shape-sids db-before :post const/$sh:targetObjectsOf class-sid))))
+                      (<? (build-shapes-cached db-before shape-sids))))
+                  [])
 
+                _ (<? (validate-target (into target-object-of-shapes-s-flakes target-class-shapes) root-db s-flakes))
+
+                target-object-of-shapes-ref-flakes
+                (if (has-target-objects-of-rule? db-before)
+                  (let [referring-pids (<? (query-range/index-range db-before :opst = [sid] {:flake-xf (map flake/s)}))]
+                    (loop [[class-sid & r] referring-pids
+                           shape-sids #{}]
+                      (if class-sid
+                        (recur r (into shape-sids (<? (target-shape-sids db-before :post const/$sh:targetObjectsOf class-sid))))
+                        (<? (build-shapes-cached db-before shape-sids)))))
+                  [])]
+
+            (when (seq target-object-of-shapes-ref-flakes)
+              (let [refs (filterv #(= const/$xsd:anyURI (flake/dt %)) s-flakes)]
+                (loop [[ref-sid & r] refs]
+                  (when ref-sid
+                    (let [flakes (<? (query-range/index-range root-db :spot = [sid]))]
+                      (<? (validate-target target-object-of-shapes-ref-flakes root-db )))))))))))))
 
 (defn build-targetobject-shapes
   "Given a pred SID, returns shape"
@@ -1040,13 +1054,3 @@
                                   shapes))]
             (recur r (into shapes object-shapes)))
           shapes)))))
-
-(defn has-target-objects-of-rule?
-  "Returns `true` if db currently has a rule that uses
-  `sh:targetObjectsOf`. Used to avoid unnecessary lookups
-  of shapes during transaction."
-  [db]
-  (-> db
-      :schema
-      :pred
-      (contains? const/$sh:targetObjectsOf)))

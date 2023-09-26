@@ -549,8 +549,6 @@
      :next-pid      (fn [] (vswap! last-pid inc))
      :next-sid      (fn [] (vswap! last-sid inc))
      :iri-cache     (volatile! {})
-     :shape-sids    #{}
-     :shapes        {:class #{} :subject #{} :object #{} :node #{}}
      :flakes        flakeset}))
 
 (defn valid-tx-structure?
@@ -563,22 +561,15 @@
 (defn finalize-db
   [{:keys [flakes stage-update? db-before] :as tx-state}]
   (go-try
-    ;; TODO: refactor once nobody else is depending on the shape of staged-map
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (-> db-before :novelty :spot) flakes)
                          [flakes])
           staged-map   {:add add :remove remove}
           db-after     (cond-> (db-after {:add add :remove remove} tx-state)
                          add (vocab/hydrate-schema add))
-          staged-map*  (assoc staged-map :db-after db-after)
-
-          {:keys [class object subject node]} (<? (shacl/shape-sids db-before add))
-
-          class-shapes (<? (shacl/build-shapes-cached db-before class))
-          object-shapes (<? (shacl/build-shapes-cached db-before object))
-          ]
-      ;; TODO: validate shapes
-
+          staged-map*  (assoc staged-map :db-after db-after)]
+      ;; will throw if invalid flakes have been created
+      (<? (shacl/validate-new-flakes db-before db-after add))
       ;; will throw if unauthorized flakes have been created
       (<? (policy/enforce staged-map* tx-state))
       ;; unwrap the policy
