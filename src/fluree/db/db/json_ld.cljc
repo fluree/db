@@ -45,25 +45,6 @@
      (json-ld/expand-iri iri (dbproto/-context db provided-context :keyword))
      (json-ld/expand-iri iri (dbproto/-context db provided-context :string)))))
 
-(defn decompose-by-char
-  [iri c limit]
-  (when-let [char-idx (some-> iri
-                              (str/last-index-of c)
-                              inc)]
-    (when (< char-idx limit)
-      (let [ns  (subs iri 0 char-idx)
-            nme (subs iri char-idx)]
-        [ns nme]))))
-
-(defn decompose-iri
-  [iri]
-  (let [length (count iri)]
-    (or (decompose-by-char iri \# length)
-        (decompose-by-char iri \? length)
-        (decompose-by-char iri \/ length)
-        (decompose-by-char iri \: length)
-        [nil iri])))
-
 (defn iri->sid
   "Returns subject id or nil if no match.
 
@@ -234,7 +215,8 @@
 
 (defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post
                      opst tspo schema comparators novelty policy ecount
-                     default-context context-type context-cache new-context?]
+                     default-context context-type context-cache new-context?
+                     namespaces namespace-codes]
   dbproto/IFlureeDb
   (-rootdb [this] (jsonld-root-db this))
   (-c-prop [this property collection] (jsonld-c-prop this property collection))
