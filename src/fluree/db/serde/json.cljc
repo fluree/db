@@ -18,12 +18,11 @@
 (defn deserialize-flake
   [flake-vec]
   (if-let [flake-time-dt (time-types (get flake-vec 3))]
-    (let [flake-value (get flake-vec 2)]
-      (-> flake-vec
-          ;;TODO: coercion will fail in js for `xsd:time` and `xsd:date`
-          ;;objects, because we append data to make them dateTimes
-          (update 2 #(datatype/coerce % flake-time-dt))
-          (flake/parts->Flake)))
+    (-> flake-vec
+        (update 2 (fn [val]
+                    #?(:clj (datatype/coerce val flake-time-dt)
+                       :cljs (js/Date. val))) )
+        (flake/parts->Flake))
     (flake/parts->Flake flake-vec)))
 
 
@@ -79,7 +78,7 @@
           (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
 
 
-(defn format-value
+(defn serialize-value
   [val dt]
   (uc/case (int dt)
     const/$xsd:dateTime #?(:clj (.format xsdDateTimeFormatter val)
@@ -98,7 +97,7 @@
   Flakes with an 'm' value need keys converted from keyword keys into strings."
   [flake]
   (-> (vec flake)
-      (update 2 format-value (flake/dt flake))
+      (update 2 serialize-value (flake/dt flake))
       (cond-> (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake))))))
 
 (defn- deserialize-garbage
