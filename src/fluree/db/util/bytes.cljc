@@ -25,7 +25,7 @@
            [b & bs] utf8]
       (if b
         (recur (bit-or (bit-shift-left result 8)
-                       (bit-and b 255))
+                       (bit-and b 0xFF))
                bs)
         result))))
 
@@ -36,8 +36,8 @@
          n'     n]
     (if (= 0 n')
       #?(:clj (byte-array result)
-         :cljs (.from js/Uint8Array result))
-      (recur (conj result (bit-and n' 255))
+         :cljs (.from js/Int8Array result))
+      (recur (conj result (bit-and n' 0xFF))
              (bit-shift-right n' 8)))))
 
 (defn long-encode-str
