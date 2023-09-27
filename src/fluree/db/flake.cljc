@@ -81,12 +81,6 @@
      :cljs (js/Math.floor (lshift sid -44))))
 
 
-(defn sid->i
-  "Returns the subject index from a subject-id."
-  [sid]
-  (- sid (lshift (sid->cid sid) 44)))
-
-
 (deftype Flake [s p o dt t op m]
   #?@(:clj  [clojure.lang.Seqable
              (seq [f] (list (.-s f) (.-p f) (.-o f) (.-dt f) (.-t f) (.-op f) (.-m f)))
