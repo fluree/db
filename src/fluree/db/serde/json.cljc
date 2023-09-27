@@ -75,7 +75,6 @@
 #?(:clj (def ^DateTimeFormatter xsdTimeFormatter
           (DateTimeFormatter/ofPattern "HH:mm:ss.SSSSSSSSS[XXXXX]")))
 
-;;xsd:date
 #?(:clj (def ^DateTimeFormatter xsdDateFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
 
@@ -83,20 +82,11 @@
 (defn format-value
   [val dt]
   (uc/case (int dt)
-    const/$xsd:dateTime #?(:clj (cond->> val
-                                  (or (instance? java.time.OffsetDateTime val)
-                                      (instance? java.time.LocalDateTime val))
-                                  (.format xsdDateTimeFormatter))
+    const/$xsd:dateTime #?(:clj (.format xsdDateTimeFormatter val)
                            :cljs (.toJSON val))
-    const/$xsd:date      #?(:clj (cond->> val
-                                   (or (instance? java.time.OffsetDateTime val)
-                                       (instance? java.time.LocalDate val))
-                                   (.format xsdDateFormatter))
+    const/$xsd:date      #?(:clj (.format xsdDateFormatter val)
                             :cljs (.toJSON val))
-    const/$xsd:time #?(:clj (cond->> val
-                              (or (instance? java.time.OffsetTime val)
-                                  (instance? java.time.LocalTime val))
-                              (.format xsdTimeFormatter))
+    const/$xsd:time #?(:clj (.format xsdTimeFormatter val)
                        :cljs (.toJSON val))
     val))
 
