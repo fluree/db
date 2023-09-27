@@ -323,6 +323,28 @@
     #?(:clj (Long/compare l1 l2) :cljs (- l1 l2))
     0))
 
+(defn cmp-sid
+  "Comparator for sid values. The supplied values are reversed before the
+  comparison to account for the decreasing sort order of subjects"
+  [s1 s2]
+  (loop [s1* s1
+         s2* s2]
+    (if (and (seq s1*) (seq s2*))
+      (let [s1c  (nth s1* 0)
+            s2c  (nth s2* 0)
+            cmp (cmp-long s1c s2c)]
+        (if (> cmp 0)
+          1
+          (if (< cmp 0)
+            -1
+            (recur (subvec s1* 1)
+                   (subvec s2* 1)))))
+      (if (seq s2*)
+        -1
+        (if (seq s1*)
+          1
+          0)))))
+
 (defn cmp-subj
   "Comparator for subject values. The supplied values are reversed before the
   comparison to account for the decreasing sort order of subjects"
