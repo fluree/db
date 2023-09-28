@@ -4,7 +4,8 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
             [fluree.db.util.core :as util]
-            #?(:clj [fluree.db.util.clj-const :as uc]))
+            #?(:clj  [fluree.db.util.clj-const :as uc]
+               :cljs [fluree.db.util.cljs-const :as uc]))
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
