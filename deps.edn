@@ -51,7 +51,6 @@
    :ns-default build}
 
   :dev
-  {:extra-paths ["dev" "test" "dev-resources" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps  {org.clojure/tools.namespace         {:mvn/version "1.4.4"}
                  criterium/criterium                 {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar   {:mvn/version "0.5.20"}
@@ -60,6 +59,7 @@
                  ;;       bug reported: https://github.com/thheller/shadow-cljs/issues/1152
                  ;;       once fixed remove the ^:antq/exclude metadata & update
                  thheller/shadow-cljs ^:antq/exclude {:mvn/version "2.23.5"}}}
+  {:extra-paths ["dev" "dev-resources" "src-cljs" "src-nodejs" "src-docs"]
 
   :cljtest
   {:extra-paths ["test" "dev-resources" "test-resources"]
@@ -69,6 +69,9 @@
                                                         :git/sha "9181a2e"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {}}
+
+  :cljstest
+  {:extra-paths ["test" "dev-resources"]}
 
   :js-deps
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
