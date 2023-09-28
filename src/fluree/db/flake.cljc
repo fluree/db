@@ -298,7 +298,7 @@
 
 
 (defn cmp-bool [b1 b2]
-  (if (and (boolean? b1) (boolean? b2))
+  (if (and (some? b1) (some? b2))
     #?(:clj (Boolean/compare b1 b2) :cljs (compare b1 b2))
     0))
 
