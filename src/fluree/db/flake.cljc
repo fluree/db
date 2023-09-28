@@ -324,35 +324,19 @@
     0))
 
 (defn cmp-sid
-  "Comparator for sid values. The supplied values are reversed before the
-  comparison to account for the decreasing sort order of subjects"
-  [s1 s2]
-  (loop [s1* s1
-         s2* s2]
-    (if (and (seq s1*) (seq s2*))
-      (let [s1c  (nth s1* 0)
-            s2c  (nth s2* 0)
-            cmp (cmp-long s1c s2c)]
-        (if (> cmp 0)
-          1
-          (if (< cmp 0)
-            -1
-            (recur (subvec s1* 1)
-                   (subvec s2* 1)))))
-      (if (seq s2*)
-        -1
-        (if (seq s1*)
-          1
-          0)))))
+  [sid1 sid2]
+  (if (and sid1 sid2)
+    (compare sid1 sid2)
+    0))
 
 (defn cmp-subj
   "Comparator for subject values. The supplied values are reversed before the
   comparison to account for the decreasing sort order of subjects"
   [s1 s2]
-  (cmp-long s2 s1))
+  (cmp-sid s2 s1))
 
 (defn cmp-pred [p1 p2]
-  (cmp-long p1 p2))
+  (cmp-sid p1 p2))
 
 (defn cmp-tx
   "Comparator for transaction values. The supplied values are reversed before the
@@ -373,14 +357,16 @@
     (cond
       ;; same data types (common case), just standard compare
       (= dt1 dt2)
-      ;; TODO this does a generic compare, might boost performance if further look at common types and call specific comparator fns (e.g. boolean, long, etc.)
+      ;; TODO this does a generic compare, might boost performance if further
+      ;; look at common types and call specific comparator fns (e.g. boolean,
+      ;; long, etc.)
       (compare o1 o2)
 
       ;; different data types, but strings
       (and (string? o1)
            (string? o2))
       (let [s-cmp (compare o1 o2)]
-        (if (= 0 s-cmp)                                     ;; could be identical values, but different data types
+        (if (= 0 s-cmp) ; could be identical values, but different data types
           (cmp-dt dt1 dt2)
           s-cmp))
 
