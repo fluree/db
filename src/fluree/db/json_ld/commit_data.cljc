@@ -442,8 +442,7 @@
      ;; v
      (flake/create t const/$_v v const/$xsd:int t true nil)
      ;; time
-     (flake/create t const/$_commit:time (util/str->epoch-ms time)
-                   const/$xsd:dateTime t true nil) ;; data
+     (flake/create t const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil) ;; data
      (flake/create t const/$_commit:data db-sid const/$xsd:anyURI t true nil)
 
      ;; db flakes
