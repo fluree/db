@@ -27,15 +27,9 @@
   (or (get const/namespace->code iri-ns)
       (-> db :namespaces (get iri-ns))))
 
-(defn iri-namespace
-  [db iri-ns-code]
-  (or (get const/code->namespace iri-ns-code)
-      (-> db :namespace-codes (get iri-ns-code))))
-
-(defn split-iri-name
-  "Splits the 'name' part of an iri string into 8-byte chunks."
+(defn iri-name-code
   [iri-name]
-  (re-seq #".{1,8}" iri-name))
+  (->> iri-name bytes/string->UTF8 (take 8) bytes/UTF8->long))
 
 (defn iri->subid
   "Converts a string iri into a vector of long integer codes. The first code
@@ -44,15 +38,10 @@
   [db iri]
   (let [[ns nme] (decompose-iri iri)]
     (when-let [ns-code (iri-namespace-code db ns)]
-      (into [ns-code]
-            (map bytes/long-encode-str)
-            (split-iri-name nme)))))
+      (let [nme-code (iri-name-code nme)]
+        [ns-code nme-code iri]))))
 
 (defn subid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."
-  [db subid]
-  (let [[ns-code & nme-codes] subid
-        ns                    (iri-namespace db ns-code)]
-    (->> nme-codes
-         (map bytes/str-decode-long)
-         (apply str ns))))
+  [subid]
+  (nth subid 2))
