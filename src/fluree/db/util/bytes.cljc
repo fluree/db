@@ -39,11 +39,3 @@
          :cljs (.from js/Int8Array result))
       (recur (conj result (bit-and n' 0xFF))
              (bit-shift-right n' 8)))))
-
-(defn long-encode-str
-  [s]
-  (-> s string->UTF8 UTF8->long))
-
-(defn str-decode-long
-  [n]
-  (-> n long->UTF8 UTF8->string))
