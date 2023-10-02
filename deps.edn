@@ -1,28 +1,28 @@
 {:deps  {org.clojure/clojure             {:mvn/version "1.11.1"}
-         org.clojure/clojurescript       {:mvn/version "1.11.60"}
-         org.clojure/core.async          {:mvn/version "1.6.673"}
+         org.clojure/clojurescript       {:mvn/version "1.11.121"}
+         org.clojure/core.async          {:mvn/version "1.6.681"}
          org.clojure/core.cache          {:mvn/version "1.0.225"}
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
          org.clojure/data.xml            {:mvn/version "0.2.0-alpha8"}
          environ/environ                 {:mvn/version "1.2.0"}
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
-         cheshire/cheshire               {:mvn/version "5.11.0"}
+         cheshire/cheshire               {:mvn/version "5.12.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
-         metosin/malli                   {:mvn/version "0.11.0"}
+         metosin/malli                   {:mvn/version "0.13.0"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
                                           :git/sha "728908449d861f7331f6813bfbb32d62ab917819"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
-         ch.qos.logback/logback-classic  {:mvn/version "1.4.7"}
-         org.slf4j/slf4j-api             {:mvn/version "2.0.7"}
+         ch.qos.logback/logback-classic  {:mvn/version "1.4.11"}
+         org.slf4j/slf4j-api             {:mvn/version "2.0.9"}
 
          ;; Lucene
          clucie/clucie                   {:mvn/version "0.4.2"}
 
          ;; http
-         http-kit/http-kit               {:mvn/version "2.6.0"}
+         http-kit/http-kit               {:mvn/version "2.7.0"}
          com.fluree/http.async.client    {:mvn/version "1.3.1-25-0xae4f"}
 
          ;; benchmarking
@@ -36,38 +36,38 @@
 
          org.bouncycastle/bcprov-jdk15on {:mvn/version "1.70"}
 
-         ;; smartfunctions
-         org.babashka/sci                {:mvn/version "0.3.31"}
-
          ;; storage
-         com.cognitect.aws/api           {:mvn/version "0.8.666"}
-         com.cognitect.aws/endpoints     {:mvn/version "1.1.12.456"}
-         com.cognitect.aws/s3            {:mvn/version "847.2.1365.0"}}
+         com.cognitect.aws/api           {:mvn/version "0.8.686"}
+         com.cognitect.aws/endpoints     {:mvn/version "1.1.12.504"}
+         com.cognitect.aws/s3            {:mvn/version "848.2.1413.0"}}
 
  :paths ["src" "resources"]
 
  :aliases
  {:build
-  {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.4"
-                                               :git/sha "b0ee58b"}
+  {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.5"
+                                               :git/sha "8bf69b5"}
                 slipset/deps-deploy           {:mvn/version "0.2.1"}}
    :ns-default build}
 
   :dev
-  {:extra-paths ["dev" "test" "dev-resources" "src-cljs" "src-nodejs" "src-docs"]
+  {:extra-paths ["dev" "dev-resources" "src-cljs" "src-nodejs" "src-docs"]
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.4.4"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.23.3"}}}
+                 thheller/shadow-cljs              {:mvn/version "2.25.7"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources" "test-resources"]
-   :extra-deps  {lambdaisland/kaocha         {:mvn/version "1.83.1314"}
-                 org.clojure/test.check      {:mvn/version "1.1.1"}
+   :extra-deps  {lambdaisland/kaocha                   {:mvn/version "1.87.1366"}
+                 org.clojure/test.check                {:mvn/version "1.1.1"}
                  io.github.cap10morgan/test-with-files {:git/tag "v1.0.0"
                                                         :git/sha "9181a2e"}}
    :exec-fn     kaocha.runner/exec-fn
    :exec-args   {}}
+
+  :cljstest
+  {:extra-paths ["test" "dev-resources"]}
 
   :js-deps
   {:extra-deps {com.timetraveltoaster/target-bundle-libs {:mvn/version "RELEASE"}}
@@ -110,5 +110,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.04.14"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.09.07"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}

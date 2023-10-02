@@ -242,10 +242,10 @@
 
 (defn transact!
   "Expects a conn and json-ld document containing at least the following keys:
-  `@id`: the id of the ledger to transact to
+  `https://ns.flur.ee/ledger#ledger`: the id of the ledger to transact to
   `@graph`: the data to be transacted
 
-  Loads the specified ledger and peforms stage and commit! operations.
+  Loads the specified ledger and performs stage and commit! operations.
   Returns the new db.
 
   Note: Loading the ledger results in a new ledger object, so references to existing
@@ -253,8 +253,9 @@
   call `load` on the ledger alias."
   [conn json-ld opts]
   (promise-wrap
-   (let [context-type (get opts :context-type :string)
+   (let [context-type (or (:context-type opts) (conn-proto/-context-type conn))
          parsed-txn   (transact-api/parse-json-ld-txn conn context-type json-ld)]
+     (log/trace "transact! context-type:" context-type)
      (log/trace "transact! parsed-txn:" parsed-txn)
      (transact-api/transact! conn parsed-txn opts))))
 
@@ -266,8 +267,8 @@
   ([conn txn opts]
    (log/trace "create-with-txn txn:" txn)
    (log/trace "create-with-txn opts:" opts)
-   (let [context-type   (get opts :context-type :string)
-         {ledger-id       "@id"
+   (let [context-type   (or (:context-type opts) (conn-proto/-context-type conn))
+         {ledger-id       const/iri-ledger
           txn-context     "@context"
           txn-opts        const/iri-opts
           default-context const/iri-default-context

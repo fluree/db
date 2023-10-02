@@ -47,9 +47,9 @@
 
 ;; NOTE, below function works in conjunction with message broadcasting (not in current PR)
 #_(defn remote-lookup
-  [state servers ledger-address]
-  (go-try
-    (or (get-in @state [:lookup ledger-address])
+    [state servers ledger-address]
+    (go-try
+      (or (get-in @state [:lookup ledger-address])
           (let [head-commit  (<? (remote-read state servers ledger-address false))
                 head-address (get head-commit "address")]
             (swap! state assoc-in [:lookup ledger-address] head-address)
@@ -96,6 +96,7 @@
                                        (if (= :keyword context-type)
                                          (ctx-util/keywordize-context ctx)
                                          ctx)))
+  (-context-type [_] (:context-type ledger-defaults))
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
                      ;; TODO - push into state machine
