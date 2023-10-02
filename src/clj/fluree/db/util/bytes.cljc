@@ -18,16 +18,20 @@
 
 (defn UTF8->long
   [utf8]
-  (if (> (count utf8) 8)
-    (throw (ex-info "Can't encode more than 8 bytes into a Long"
-                    {:value utf8, :status 500, :error :db/unexpected-error}))
-    (loop [result   0
-           [b & bs] utf8]
-      (if b
-        (recur (bit-or (bit-shift-left result 8)
-                       (bit-and b 0xFF))
-               bs)
-        result))))
+  (let [size (count utf8)]
+    (if (> size 8)
+      (throw (ex-info "Can't encode more than 8 bytes into a Long"
+                      {:value utf8, :status 500, :error :db/unexpected-error}))
+      (loop [result   0
+             [b & bs] utf8]
+        (if b
+          (recur (bit-or (bit-shift-left result 8)
+                         (bit-and b 0xFF))
+                 bs)
+          (if (< size 8)
+            (let [diff (- 8 size)]
+              (bit-shift-left result (* diff 8)))
+            result))))))
 
 
 (defn long->UTF8
@@ -37,5 +41,9 @@
     (if (= 0 n')
       #?(:clj (byte-array result)
          :cljs (.from js/Int8Array result))
-      (recur (conj result (bit-and n' 0xFF))
-             (bit-shift-right n' 8)))))
+      (let [b   (bit-and n' 0xFF)
+            n'' (bit-shift-right n' 8)]
+        (if (= b 0)
+          (recur result n'')
+          (recur (conj result b)
+                 n''))))))
