@@ -1,4 +1,5 @@
 (ns build
+  (:refer-clojure :exclude [compile])
   (:require [clojure.tools.build.api :as b]
             [deps-deploy.deps-deploy :as dd]))
 
@@ -11,10 +12,17 @@
 
 (def source-uri "https://github.com/fluree/db")
 
+(defn compile [_]
+  (b/javac {:src-dirs ["src/java"]
+            :class-dir class-dir
+            :basis basis
+            :javac-opts ["--release" "11"]}))
+
 (defn clean [_]
   (b/delete {:path "target"}))
 
 (defn jar [_]
+  (compile nil)
   (b/write-pom {:class-dir class-dir
                 :lib       lib
                 :version   version
