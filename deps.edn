@@ -43,6 +43,10 @@
 
  :paths ["src/clj" "target/classes" "resources"]
 
+ :deps/prep-lib {:alias  :build
+                 :fn     compile
+                 :ensure "target/classes"}
+
  :aliases
  {:build
   {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.5"
