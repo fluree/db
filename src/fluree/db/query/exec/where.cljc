@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec.where
   (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [>! go]]
+            [clojure.core.async :as async :refer [>! go take! put!]]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
@@ -218,6 +218,8 @@
                    start-flake (flake/create s* p o** o-dt* nil nil util/min-integer)
                    end-flake   (flake/create s* p o** o-dt* nil nil util/max-integer)
                    track-fuel  (when fuel-tracker
+                                 (take! (:error-ch fuel-tracker)
+                                        #(put! error-ch %))
                                  (fuel/track fuel-tracker))
                    subj-filter (when s-fn
                                  (filter (fn [f]
@@ -252,8 +254,8 @@
                                                        error-ch))
                    (async/pipe out-ch)))
              (catch* e
-                     (log/error e "Error resolving flake range")
-                     (>! error-ch e))))
+               (log/error e "Error resolving flake range")
+               (>! error-ch e))))
      out-ch)))
 
 (defn get-equivalent-properties

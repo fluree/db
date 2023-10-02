@@ -118,11 +118,12 @@
                                (assoc-in [:policy :cache] (atom {})))
           query*           (-> query
                                (update :opts assoc :issuer did)
-                               (update :opts dissoc :meta))
+                               (update :opts dissoc :meta)
+                               (update :opts dissoc :fuel))
           start            #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))]
-      (if (:meta opts)
-        (let [fuel-tracker (fuel/tracker)]
+      (if (or (:fuel opts) (:meta opts))
+        (let [fuel-tracker (fuel/tracker (:fuel opts))]
           (try* (let [result (<? (fql/query db** fuel-tracker query*))]
                   {:status 200
                    :result result

@@ -1,6 +1,6 @@
 (ns fluree.db.json-ld.transact
   (:refer-clojure :exclude [vswap!])
-  (:require [clojure.core.async :as async :refer [go]]
+  (:require [clojure.core.async :as async :refer [go alts!]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
@@ -21,7 +21,7 @@
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.async :refer [<? go-try throw-err]]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
@@ -542,9 +542,12 @@
            tx-state (->tx-state db* opts*)
            flakes   (if (q-parse/update? tx)
                       (<? (modify db fuel-tracker tx tx-state))
-                      (<? (insert db fuel-tracker tx tx-state)))]
-       (log/trace "stage flakes:" flakes)
-       (<? (flakes->final-db tx-state flakes))))))
+                      (<? (insert db fuel-tracker tx tx-state)))
+           _        (log/trace "stage flakes:" flakes)
+           chans    (remove nil? [(:error-ch fuel-tracker)
+                                  (flakes->final-db tx-state flakes)])
+           [result] (alts! chans :priority true)]
+       (throw-err result)))))
 
 (defn stage-ledger
   ([ledger json-ld opts]
@@ -552,8 +555,7 @@
   ([ledger fuel-tracker json-ld opts]
    (let [{:keys [defaultContext]} opts
          db (cond-> (ledger-proto/-db ledger)
-              defaultContext  (dbproto/-default-context-update
-                                defaultContext))]
+              defaultContext (dbproto/-default-context-update defaultContext))]
      (stage db fuel-tracker json-ld opts))))
 
 (defn transact!

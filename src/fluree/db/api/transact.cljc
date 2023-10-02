@@ -13,10 +13,10 @@
 (defn stage
   [db json-ld opts]
   (go-try
-    (if (:meta opts)
-      (let [start-time #?(:clj (System/nanoTime)
-                          :cljs (util/current-time-millis))
-            fuel-tracker       (fuel/tracker)]
+    (if (or (:fuel opts) (:meta opts))
+      (let [start-time   #?(:clj (System/nanoTime)
+                            :cljs (util/current-time-millis))
+            fuel-tracker (fuel/tracker (:fuel opts))]
         (try* (let [result (<? (dbproto/-stage db fuel-tracker json-ld opts))]
                 {:status 200
                  :result result
@@ -24,10 +24,9 @@
                  :fuel   (fuel/tally fuel-tracker)})
               (catch* e
                 (throw (ex-info "Error staging database"
-                                (-> e
-                                    ex-data
-                                    (assoc :time (util/response-time-formatted start-time)
-                                           :fuel (fuel/tally fuel-tracker))))))))
+                                {:time (util/response-time-formatted start-time)
+                                 :fuel (fuel/tally fuel-tracker)}
+                                e)))))
       (<? (dbproto/-stage db json-ld opts)))))
 
 (defn parse-json-ld-txn
