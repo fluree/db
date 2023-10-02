@@ -42,7 +42,7 @@
          com.cognitect.aws/endpoints     {:mvn/version "1.1.12.504"}
          com.cognitect.aws/s3            {:mvn/version "848.2.1413.0"}}
 
- :paths ["src" "resources"]
+ :paths ["src/clj" "resources"]
 
  :aliases
  {:build
