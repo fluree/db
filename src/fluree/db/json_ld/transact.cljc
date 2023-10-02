@@ -535,18 +535,23 @@
    (go-try
      (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
                                       {:subject json-ld})
-           opts*    (cond-> opts did (assoc :did did))
-           db*      (if-let [policy-opts (perm/policy-opts opts*)]
-                      (<? (perm/wrap-policy db policy-opts))
-                      db)
-           tx-state (->tx-state db* opts*)
-           flakes   (if (q-parse/update? tx)
-                      (<? (modify db fuel-tracker tx tx-state))
-                      (<? (insert db fuel-tracker tx tx-state)))
-           _        (log/trace "stage flakes:" flakes)
-           chans    (remove nil? [(:error-ch fuel-tracker)
-                                  (flakes->final-db tx-state flakes)])
-           [result] (alts! chans :priority true)]
+           opts*         (cond-> opts did (assoc :did did))
+           db*           (if-let [policy-opts (perm/policy-opts opts*)]
+                           (<? (perm/wrap-policy db policy-opts))
+                           db)
+           tx-state      (->tx-state db* opts*)
+           flakes-ch     (if (q-parse/update? tx)
+                           (modify db fuel-tracker tx tx-state)
+                           (insert db fuel-tracker tx tx-state))
+           fuel-error-ch (:error-ch fuel-tracker)
+           flakes-chans  (remove nil? [fuel-error-ch flakes-ch])
+           [flakes]      (alts! flakes-chans :priority true)
+           _             (when (util/exception? flakes)
+                           (throw flakes))
+           _             (log/trace "stage flakes:" flakes)
+           final-chans   (remove nil? [fuel-error-ch
+                                       (flakes->final-db tx-state flakes)])
+           [result] (alts! final-chans :priority true)]
        (throw-err result)))))
 
 (defn stage-ledger
