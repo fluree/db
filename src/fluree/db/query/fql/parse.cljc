@@ -488,6 +488,12 @@
     (assoc q :having (eval/compile code))
     q))
 
+(defn parse-fuel
+  [{:keys [opts] :as q}]
+  (if-let [mf (or (:max-fuel opts) (:maxFuel opts))]
+    (assoc q :fuel mf)
+    q))
+
 (defn parse-analytical-query*
   [q db]
   (let [context  (parse-context q db)
@@ -502,7 +508,8 @@
                 grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
         parse-having
-        (parse-select db context))))
+        (parse-select db context)
+        parse-fuel)))
 
 (defn parse-analytical-query
   [q db]

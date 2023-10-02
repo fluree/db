@@ -773,7 +773,7 @@
                (is (nil? (:fuel response))
                    "Returns no fuel")))
            (testing "short-circuits if request fuel exhausted"
-             (let [response @(fluree/stage db0 test-utils/people {:fuel 1})]
+             (let [response @(fluree/stage db0 test-utils/people {:max-fuel 1})]
                (is (util/exception? response))
                (is (re-find #"Fuel limit exceeded"
                             (-> response ex-cause ex-message))))))
@@ -794,7 +794,7 @@
            (testing "short-circuits if request fuel exhausted"
              (let [query   '{:select [?s ?p ?o]
                              :where  [[?s ?p ?o]]
-                             :opts   {:fuel 1}}
+                             :opts   {:max-fuel 1}}
                    db      @(fluree/stage db0 test-utils/people)
                    results @(fluree/query db query)]
                (is (util/exception? results))
@@ -822,7 +822,8 @@
                       "Returns no fuel")))
               (testing "short-circuits if request fuel exhausted"
                 (let [response (try
-                                 (<p! (fluree/stage db0 test-utils/people {:fuel 1}))
+                                 (<p! (fluree/stage db0 test-utils/people
+                                                    {:max-fuel 1}))
                                  (catch :default e (ex-cause e)))]
                   (is (util/exception? response))
                   (is (re-find #"Fuel limit exceeded"
@@ -844,7 +845,7 @@
               (testing "short-circuits if request fuel exhausted"
                 (let [query   '{:select [?s ?p ?o]
                                 :where  [[?s ?p ?o]]
-                                :opts   {:fuel 1}}
+                                :opts   {:max-fuel 1}}
                       db      (<p! (fluree/stage db0 test-utils/people))
                       results (try
                                 (<p! (fluree/query db query))

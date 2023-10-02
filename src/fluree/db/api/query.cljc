@@ -109,21 +109,22 @@
                                          {:subject query})
 
           {:keys [opts t]} query
-          db*              (if-let [policy-opts (perm/policy-opts (cond-> opts did (assoc :did did)))]
-                             (<? (perm/wrap-policy db policy-opts))
-                             db)
-          db**             (-> (if t
-                                 (<? (time-travel/as-of db* t))
-                                 db*)
-                               (assoc-in [:policy :cache] (atom {})))
-          query*           (-> query
-                               (update :opts assoc :issuer did)
-                               (update :opts dissoc :meta)
-                               (update :opts dissoc :fuel))
-          start            #?(:clj  (System/nanoTime)
-                              :cljs (util/current-time-millis))]
-      (if (or (:fuel opts) (:meta opts))
-        (let [fuel-tracker (fuel/tracker (:fuel opts))]
+          db*      (if-let [policy-opts (perm/policy-opts (cond-> opts did (assoc :did did)))]
+                     (<? (perm/wrap-policy db policy-opts))
+                     db)
+          db**     (-> (if t
+                         (<? (time-travel/as-of db* t))
+                         db*)
+                       (assoc-in [:policy :cache] (atom {})))
+          query*   (-> query
+                       (update :opts assoc :issuer did)
+                       (update :opts dissoc :meta)
+                       (update :opts dissoc :fuel))
+          start    #?(:clj  (System/nanoTime)
+                      :cljs (util/current-time-millis))
+          max-fuel (or (:max-fuel opts) (:maxFuel opts))]
+      (if (or max-fuel (:meta opts))
+        (let [fuel-tracker (fuel/tracker max-fuel)]
           (try* (let [result (<? (fql/query db** fuel-tracker query*))]
                   {:status 200
                    :result result
