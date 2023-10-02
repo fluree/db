@@ -19,11 +19,11 @@
                 :lib       lib
                 :version   version
                 :basis     basis
-                :src-dirs  ["src"]
+                :src-dirs  ["src/clj"]
                 :scm       {:url                 source-uri
                             :connection          "scm:git:https://github.com/fluree/db.git"
                             :developerConnection "scm:git:git@github.com:fluree/db.git"}})
-  (b/copy-dir {:src-dirs    ["src" "resources"]
+  (b/copy-dir {:src-dirs    ["src/clj" "resources"]
                :target-dir  class-dir})
   (b/jar {:class-dir class-dir
           :jar-file  jar-file}))
