@@ -2,8 +2,8 @@ package fluree.db;
 
 import clojure.lang.IPersistentVector;
 
-public final class IRI {
-    private IRI() {}
+public final class SID {
+    private SID() {}
 
     public static final long compare(IPersistentVector x, IPersistentVector y) {
         final int xCount = x.count();
@@ -14,7 +14,7 @@ public final class IRI {
                 final Long xi = (Long) x.nth(i);
                 final Long yi = (Long) y.nth(i);
                 int c = Long.compare(xi, yi);
-                if(c != 0) {
+                if (c != 0) {
                     return c;
                 }
             } else {
