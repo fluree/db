@@ -4,7 +4,8 @@
             [fluree.db.constants :as const]
             [fluree.db.util.core :as util]
             #?(:clj [clojure.pprint :as pprint]))
-  #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]])))
+  #?(:cljs (:require-macros [fluree.db.flake :refer [combine-cmp]]))
+  (:import (fluree.db SID)))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -326,7 +327,7 @@
 (defn cmp-sid
   [sid1 sid2]
   (if (and sid1 sid2)
-    (compare sid1 sid2)
+    (SID/compare sid1 sid2)
     0))
 
 (defn cmp-subj
