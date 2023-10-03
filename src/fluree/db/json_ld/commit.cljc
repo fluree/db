@@ -15,6 +15,7 @@
             [fluree.db.indexer.proto :as idx-proto]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.nameservice.core :as nameservice]
             [fluree.db.util.log :as log :include-macros true])
   (:refer-clojure :exclude [vswap!]))
 
@@ -157,22 +158,22 @@
     (mapv stringify-context context)
     (if (map? context)
       (reduce-kv
-       (fn [acc k v]
-         (let [k* (if (keyword? k)
-                    (name k)
-                    k)
-               v* (if (and (map? v)
-                           (not (contains? v :id)))
-                    (stringify-context v)
-                    v)]
-           (assoc acc k* v*)))
-       {} context)
+        (fn [acc k v]
+          (let [k* (if (keyword? k)
+                     (name k)
+                     k)
+                v* (if (and (map? v)
+                            (not (contains? v :id)))
+                     (stringify-context v)
+                     v)]
+            (assoc acc k* v*)))
+        {} context)
       context)))
 
 (defn- enrich-commit-opts
   "Takes commit opts and merges in with defaults defined for the db."
   [{:keys [ledger branch schema t commit stats] :as _db}
-   {:keys [context did private push? message tag file-data? index-files-ch] :as _opts}]
+   {:keys [context did private message tag file-data? index-files-ch] :as _opts}]
   (let [context*      (-> (if context
                             (json-ld/parse-context (:context schema) context)
                             (:context schema))
@@ -193,7 +194,6 @@
      :tag            tag
      :file-data?     file-data? ;; if instead of returning just a db from commit, return also the written files (for consensus)
      :alias          (ledger-proto/-alias ledger)
-     :push?          (not (false? push?))
      :t              (- t)
      :v              0
      :prev-commit    (:address commit)
@@ -282,7 +282,7 @@
   [{:keys [conn ledger default-context] :as _db} commit]
   (go-try
     (let [{:keys [hash address] :as context-res} (<? (conn-proto/-ctx-write
-                                                      conn ledger default-context))
+                                                       conn ledger default-context))
           commit* (assoc commit :defaultContext
                                 {:id      (str "fluree:context:" hash)
                                  :type    const/iri-Context
@@ -291,7 +291,7 @@
 
 (defn do-commit+push
   "Writes commit and pushes, kicks off indexing if necessary."
-  [{:keys [ledger commit new-context?] :as db} {:keys [branch push? did private] :as _opts}]
+  [{:keys [ledger commit new-context?] :as db} {:keys [branch did private] :as _opts}]
   (go-try
     (let [{:keys [conn state]} ledger
           ledger-commit (:commit (ledger-proto/-status ledger branch))
@@ -315,15 +315,12 @@
           db**          (if new-t?
                           (<? (commit-data/add-commit-flakes (:prev-commit db) db*))
                           db*)
-          db***         (ledger-proto/-commit-update ledger branch db**)]
-      ;; push is asynchronous!
-      (when push?
-        (let [address     (ledger-proto/-address ledger)
-              commit-data (assoc new-commit*** :meta commit-res
-                                               :ledger-state state)]
-          (conn-proto/-push conn address commit-data)))
+          db***         (ledger-proto/-commit-update ledger branch db**)
+          push-res      (<? (nameservice/push! conn (assoc new-commit*** :meta commit-res
+                                                                         :ledger-state state)))]
       {:commit-res  commit-res
        :context-res context-res
+       :push-res    push-res
        :db          db***})))
 
 (defn update-commit-fn

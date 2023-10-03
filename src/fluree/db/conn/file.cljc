@@ -1,8 +1,10 @@
 (ns fluree.db.conn.file
   (:require [clojure.core.async :as async :refer [go]]
+            [fluree.db.util.async :refer [<? go-try]]
             [clojure.string :as str]
             [fluree.crypto :as crypto]
             [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util]
             [fluree.json-ld :as json-ld]
             [fluree.db.index :as index]
             [fluree.db.conn.proto :as conn-proto]
@@ -16,6 +18,7 @@
             [fluree.db.util.bytes :as bytes]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.json :as json]
+            [fluree.db.nameservice.filesystem :as ns-filesystem]
             [fluree.db.ledger.proto :as ledger-proto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -107,7 +110,7 @@
   (json/parse (read-address conn context-key) true))
 
 (defrecord FileConnection [id memory state ledger-defaults parallelism msg-in-ch
-                           serializer msg-out-ch lru-cache-atom]
+                           nameservices serializer msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
   (-c-read [conn commit-key] (go (read-commit conn commit-key)))
@@ -122,23 +125,6 @@
   (-index-file-read [conn index-address]
     #?(:clj (async/thread (json/parse (read-address conn index-address) true))
        :cljs (async/go (json/parse (read-address conn index-address) true))))
-
-  conn-proto/iNameService
-  (-pull [conn ledger] (throw (ex-info "Unsupported FileConnection op: pull" {})))
-  (-subscribe [conn ledger] (throw (ex-info "Unsupported FileConnection op: subscribe" {})))
-  (-alias [conn ledger-address]
-    ;; TODO: need to validate that the branch doesn't have a slash?
-    (-> (address-path ledger-address)
-        (str/split #"/")
-        (->> (drop-last 2) ; branch-name, head
-             (str/join #"/"))))
-  (-push [conn head-path commit-data] (go (push conn head-path commit-data)))
-  (-lookup [conn head-address] (go (file-address (read-address conn head-address))))
-  (-address [conn ledger-alias {:keys [branch] :as _opts}]
-    (let [branch (if branch (name branch) "main")]
-      (go (file-address (str ledger-alias "/" branch "/head")))))
-  (-exists? [conn ledger-address]
-    (go (address-path-exists? conn ledger-address)))
 
   conn-proto/iConnection
   (-close [_]
@@ -156,6 +142,7 @@
   (-did [_] (:did ledger-defaults))
   (-msg-in [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-in" {})))
   (-msg-out [conn msg] (throw (ex-info "Unsupported FileConnection op: msg-out" {})))
+  (-nameservices [_] nameservices)
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
@@ -202,15 +189,21 @@
                                         "default indexer options map. Provided: " indexer)
                                    {:status 400 :error :db/invalid-file-connection})))})
 
+(defn default-file-nameservice
+  "Returns file nameservice or will throw if storage-path generates an exception."
+  [storage-path]
+  (ns-filesystem/initialize storage-path))
+
 (defn connect
   "Create a new file system connection."
-  [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer]
+  [{:keys [defaults parallelism storage-path lru-cache-atom memory serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [storage-path   (trim-last-slash storage-path)
           conn-id        (str (random-uuid))
           state          (state-machine/blank-state)
-
+          nameservices*  (util/sequential
+                           (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
       ;; TODO - need to set up monitor loops for async chans
@@ -221,5 +214,6 @@
                             :parallelism     parallelism
                             :msg-in-ch       (async/chan)
                             :msg-out-ch      (async/chan)
+                            :nameservices    nameservices*
                             :state           state
                             :lru-cache-atom  lru-cache-atom}))))

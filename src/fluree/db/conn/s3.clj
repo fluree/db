@@ -1,8 +1,8 @@
 (ns fluree.db.conn.s3
-  (:require [clojure.java.io :as io]
-            [clojure.string :as str]
-            [cognitect.aws.client.api :as aws]
-            [clojure.core.async :as async :refer [go go-loop <! >!]]
+  (:require [cognitect.aws.client.api :as aws]
+            [fluree.db.method.s3.core :as s3]
+            [fluree.db.nameservice.s3 :as ns-s3]
+            [clojure.core.async :as async :refer [go <!]]
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.proto :as conn-proto]
@@ -14,109 +14,16 @@
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.storage :as storage]
             [fluree.db.util.context :as ctx-util]
+            [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld])
-  (:import (java.io Closeable ByteArrayOutputStream)))
+            [fluree.json-ld :as json-ld]))
 
 (set! *warn-on-reflection* true)
 
-(defn s3-address
-  [{:keys [s3-bucket s3-prefix]} path]
-  (if (str/starts-with? path "//")
-    (str "fluree:s3://" s3-bucket "/" s3-prefix "/" (-> path (str/split #"//")
-                                                        last))
-    (str "fluree:s3://" s3-bucket "/" s3-prefix "/" path)))
-
-(defn address-path
-  ([conn address] (address-path conn address true))
-  ([{:keys [s3-bucket s3-prefix]} address strip-prefix?]
-   (log/debug "address-path address:" address)
-   (let [path (-> address (str/split #"://") last)]
-     (if strip-prefix?
-       (-> path (str/replace-first (str s3-bucket "/" s3-prefix "/") ""))
-       (str "//" path)))))
-
-(defn handle-s3-response
-  [resp]
-  (if (:cognitect.anomalies/category resp)
-    (if (:cognitect.aws.client/throwable resp)
-      resp
-      (ex-info "S3 read failed"
-               {:status 500, :error :db/unexpected-error, :aws/response resp}))
-    (let [{in :Body} resp
-          _        (log/debug "S3 response:" resp)
-          body-str (when in
-                     (with-open [out (ByteArrayOutputStream.)]
-                       (io/copy in out)
-                       (.close ^Closeable in)
-                       (String. (.toByteArray out))))]
-      (cond-> resp
-              body-str (assoc :Body body-str)))))
-
-(defn s3-list*
-  ([conn path] (s3-list* conn path nil))
-  ([{:keys [s3-client s3-bucket s3-prefix]} path continuation-token]
-   (let [ch        (async/promise-chan (map handle-s3-response))
-         base-req  {:op      :ListObjectsV2
-                    :ch      ch
-                    :request {:Bucket s3-bucket}}
-         full-path (if (empty? s3-prefix)
-                     path
-                     (str s3-prefix "/" path))
-         req       (cond-> base-req
-                           (not= full-path "/") (assoc-in [:request :Prefix]
-                                                          full-path)
-                           continuation-token (assoc-in
-                                               [:request :ContinuationToken]
-                                               continuation-token))]
-     (log/debug "s3-list* req:" req)
-     (aws/invoke-async s3-client req)
-     ch)))
-
-(defn s3-list
-  "Returns a core.async channel that will contain one or more result batches of
-  1000 or fewer object names. You should continue to take from the channel until
-  it closes (i.e. returns nil)."
-  [conn path]
-  (let [ch (async/chan 1)]
-    (go-loop [results (<! (s3-list* conn path))]
-      (>! ch results)
-      (let [truncated?         (:IsTruncated results)
-            continuation-token (:NextContinuationToken results)]
-        (if truncated?
-          (recur (<! (s3-list* conn path continuation-token)))
-          (async/close! ch))))
-    ch))
-
-(defn s3-key-exists?
-  [conn key]
-  (go
-    (let [list (<! (s3-list conn key))]
-      (< 0 (:KeyCount list)))))
-
-(defn read-s3-data
-  [{:keys [s3-client s3-bucket s3-prefix]} path]
-  (let [ch        (async/promise-chan (map handle-s3-response))
-        full-path (str s3-prefix "/" path)
-        req       {:op      :GetObject
-                   :ch      ch
-                   :request {:Bucket s3-bucket, :Key full-path}}]
-    (aws/invoke-async s3-client req)
-    ch))
-
-(defn write-s3-data
-  [{:keys [s3-client s3-bucket s3-prefix]} path ^bytes data]
-  (let [ch        (async/promise-chan (map handle-s3-response))
-        full-path (str s3-prefix "/" path)
-        req       {:op      :PutObject
-                   :ch      ch
-                   :request {:Bucket s3-bucket, :Key full-path, :Body data}}]
-    (aws/invoke-async s3-client req)
-    ch))
 
 (defn write-data
-  [conn ledger data-type data]
+  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} ledger data-type data]
   (go
     (let [alias    (ledger-proto/-alias ledger)
           branch   (-> ledger ledger-proto/-branch :name name)
@@ -130,30 +37,26 @@
                         (when branch (str "/" branch))
                         (str "/" type-dir "/")
                         hash ".json")
-          result   (<! (write-s3-data conn path bytes))]
+          result   (<! (s3/write-s3-data s3-client s3-bucket s3-prefix path bytes))]
       (if (instance? Throwable result)
         result
         {:name    hash
          :hash    hash
          :json    json
          :size    (count json)
-         :address (s3-address conn path)}))))
-
-(defn read-address
-  [conn address]
-  (->> address (address-path conn) (read-s3-data conn)))
+         :address (s3/s3-address s3-bucket s3-prefix path)}))))
 
 (defn read-commit
-  [conn address]
-  (go (json/parse (<! (read-address conn address)) false)))
+  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} address]
+  (go (json/parse (<! (s3/read-address s3-client s3-bucket s3-prefix address)) false)))
 
 (defn write-commit
   [conn ledger commit-data]
   (write-data conn ledger :commit commit-data))
 
 (defn read-context
-  [conn address]
-  (go (json/parse (<! (read-address conn address)) false)))
+  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} address]
+  (go (json/parse (<! (s3/read-address s3-client s3-bucket s3-prefix address)) false)))
 
 (defn write-context
   [conn ledger context-data]
@@ -164,21 +67,13 @@
   (write-data conn ledger (str "index/" (name index-type)) index-data))
 
 (defn read-index
-  [conn index-address]
-  (go (-> conn (read-address index-address) <! (json/parse true))))
+  [{:keys [s3-client s3-bucket s3-prefix] :as _conn} index-address]
+  (go (-> (s3/read-address s3-client s3-bucket s3-prefix index-address) <! (json/parse true))))
 
-(defn push
-  [conn publish-address {commit-address :address}]
-  (go
-    (let [commit-path (address-path conn commit-address false)
-          head-path   (address-path conn publish-address)]
-      (->> (.getBytes ^String commit-path)
-           (write-s3-data conn head-path)
-           :address))))
 
 (defrecord S3Connection [id s3-client s3-bucket s3-prefix memory state
                          ledger-defaults parallelism msg-in-ch msg-out-ch
-                         lru-cache-atom]
+                         lru-cache-atom nameservices]
   conn-proto/iStorage
   (-c-read [conn commit-key] (read-commit conn commit-key))
   (-c-write [conn ledger commit-data] (write-commit conn ledger commit-data))
@@ -188,21 +83,6 @@
     (write-index conn ledger index-type index-data))
   (-index-file-read [conn index-address]
     (read-index conn index-address))
-
-  conn-proto/iNameService
-  (-pull [_conn _ledger] (throw (ex-info "Unsupported S3Connection op: pull" {})))
-  (-subscribe [_conn _ledger]
-    (throw (ex-info "Unsupported S3Connection op: subscribe" {})))
-  (-alias [conn ledger-address]
-    (-> ledger-address (->> (address-path conn)) (str/split #"/")
-        (->> (drop-last 2) (str/join #"/"))))
-  (-push [conn head-path commit-data] (push conn head-path commit-data))
-  (-lookup [conn head-address]
-    (go (s3-address conn (<! (read-address conn head-address)))))
-  (-address [conn ledger-alias {:keys [branch] :as _opts}]
-    (let [branch (if branch (name branch) "main")]
-      (go (s3-address conn (str ledger-alias "/" branch "/head")))))
-  (-exists? [conn ledger-address] (s3-key-exists? conn ledger-address))
 
   conn-proto/iConnection
   (-close [_] (swap! state assoc :closed? true))
@@ -217,6 +97,7 @@
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ _] (throw (ex-info "Unsupported S3Connection op: msg-in" {})))
   (-msg-out [_ _] (throw (ex-info "Unsupported S3Connection op: msg-out" {})))
+  (-nameservices [_] nameservices)
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
@@ -228,9 +109,9 @@
         (conn-cache/lru-lookup lru-cache-atom cache-key
                                (fn [_]
                                  (storage/resolve-index-node
-                                  conn node
-                                  (fn [] (conn-cache/lru-evict lru-cache-atom
-                                                               cache-key))))))))
+                                   conn node
+                                   (fn [] (conn-cache/lru-evict lru-cache-atom
+                                                                cache-key))))))))
 
   full-text/IndexConnection
   (open-storage [_conn _network _dbid _lang]
@@ -255,10 +136,15 @@
                                         indexer)
                                    {:status 400, :error :db/invalid-s3-connection})))})
 
+(defn default-S3-nameservice
+  "Returns S3 nameservice or will throw if storage-path generates an exception."
+  [s3-client s3-bucket s3-prefix]
+  (ns-s3/initialize s3-client s3-bucket s3-prefix))
+
 (defn connect
   "Create a new S3 connection."
   [{:keys [defaults parallelism s3-endpoint s3-bucket s3-prefix lru-cache-atom
-           memory serializer]
+           memory serializer nameservices]
     :or   {serializer (json-serde)} :as _opts}]
   (go
     (let [aws-opts       (cond-> {:api :s3}
@@ -266,6 +152,8 @@
           client         (aws/client aws-opts)
           conn-id        (str (random-uuid))
           state          (state-machine/blank-state)
+          nameservices*  (util/sequential
+                           (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
           cache-size     (conn-cache/memory->cache-size memory)
           lru-cache-atom (or lru-cache-atom
                              (atom (conn-cache/create-lru-cache cache-size)))]
@@ -280,4 +168,5 @@
                           :parallelism     parallelism
                           :msg-in-ch       (async/chan)
                           :msg-out-ch      (async/chan)
+                          :nameservices    nameservices*
                           :lru-cache-atom  lru-cache-atom}))))

@@ -16,7 +16,7 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
-            [fluree.json-ld :as json-ld]
+            [fluree.db.nameservice.core :as nameservice]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
@@ -147,7 +147,7 @@
   given ledger-alias."
   [conn ledger-alias]
   (log/debug "Looking up address for ledger alias" ledger-alias)
-  (conn-proto/-address conn ledger-alias nil))
+  (nameservice/primary-address conn ledger-alias nil))
 
 (defn load
   "Loads an existing ledger by its alias (which will be converted to a
@@ -169,7 +169,7 @@
                       ledger-alias-or-address
                       (<! (alias->address conn ledger-alias-or-address)))]
         (log/debug "exists? - ledger address:" address)
-        (<! (conn-proto/-exists? conn address))))))
+        (<! (nameservice/exists? conn address))))))
 
 (defn default-context
   "Returns the current default context set on the db."
@@ -260,7 +260,7 @@
 
 
 (defn push
-  "Pushes all commits since last push to a naming service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
+  "Pushes all commits since last push to a name service, e.g. a Fluree Network, IPNS, DNS, Fluree Nexus.
   Depending on consensus requirements for a Fluree Network, will accept or reject push as newest update."
   [])
 

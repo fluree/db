@@ -103,8 +103,7 @@
 
 (def json-ld-ns-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
-  [["id" :id]
-   ["type" ["FNS"]]])
+  [["id" :id]])
 
 (def json-ld-index-template
   "Note, key-val pairs are in vector form to preserve ordering of final commit map"
@@ -156,7 +155,7 @@
                       :previous (merge-template previous json-ld-prev-commit-template)
                       :data (merge-template (assoc data :previous prev-data) json-ld-data-template)
                       :issuer (merge-template issuer json-ld-issuer-template)
-                      :ns (merge-template ns json-ld-ns-template)
+                      :ns (mapv #(merge-template % json-ld-ns-template) ns)
                       :index (-> (merge-template (:data index) json-ld-data-template) ;; index has an embedded db map
                                  (#(assoc index :data %))
                                  (merge-template json-ld-index-template))
@@ -175,11 +174,11 @@
          time        const/iri-time,
          tag         const/iri-tag,
          default-ctx const/iri-default-context
-         message const/iri-message
+         message     const/iri-message
          prev-commit const/iri-previous,
-         data const/iri-data,
-         ns const/iri-ns,
-         index const/iri-index} commit-json-ld
+         data        const/iri-data,
+         ns          const/iri-ns,
+         index       const/iri-index} commit-json-ld
         db-object (fn [{id      :id,
                         t       const/iri-t,
                         address const/iri-address,
@@ -190,36 +189,36 @@
                      :address (:value address) ;; address to locate db
                      :flakes  (:value flakes)
                      :size    (:value size)})]
-    {:id       id
-     :address  (if (empty? (:value address)) ;; commit address, if using something like IPFS this is empty string
-                 commit-address
-                 (:value address))
-     :v        (:value v) ;; version of commit format
-     :alias    (:value alias) ;; human-readable alias name for ledger
-     :branch   (:value branch) ;; ledger's "branch" - if not included, default of 'main'
-     :issuer   (when issuer {:id (:id issuer)})
-     :time     (:value time) ;; ISO-8601 timestamp of commit
-     :tag      (mapv :value tag)
-     :message  (:value message)
-     :previous {:id      (:id prev-commit)
-                :address (get-in prev-commit [const/iri-address :value])} ;; previous commit address
+    {:id             id
+     :address        (if (empty? (:value address)) ;; commit address, if using something like IPFS this is empty string
+                       commit-address
+                       (:value address))
+     :v              (:value v) ;; version of commit format
+     :alias          (:value alias) ;; human-readable alias name for ledger
+     :branch         (:value branch) ;; ledger's "branch" - if not included, default of 'main'
+     :issuer         (when issuer {:id (:id issuer)})
+     :time           (:value time) ;; ISO-8601 timestamp of commit
+     :tag            (mapv :value tag)
+     :message        (:value message)
+     :previous       {:id      (:id prev-commit)
+                      :address (get-in prev-commit [const/iri-address :value])} ;; previous commit address
      ;; database information commit refers to:
-     :data     (db-object data)
+     :data           (db-object data)
      ;; name service(s) used to manage global ledger state
      ;; TODO - flesh out with final ns data structure
-     :ns       (when ns ;; one (or more) Fluree Name Services that can be consulted for the latest ledger state
-                 (if (sequential? ns)
-                   (mapv (fn [namespace] {:id (:id namespace)}) ns)
-                   {:id (:id ns)}))
+     :ns             (when ns ;; one (or more) Fluree Name Services that can be consulted for the latest ledger state
+                       (if (sequential? ns)
+                         (mapv (fn [namespace] {:id (:id namespace)}) ns)
+                         {:id (:id ns)}))
      ;; latest index (note the index roots below are not recorded into JSON-LD commit file, but short-cut when internally managing transitions)
-     :index    (when index
-                 {:id      (:id index) ;; unique id (hash of root) of index
-                  :address (get-in index [const/iri-address :value]) ;; address to get to index 'root'
-                  :data    (db-object (get index const/iri-data))
-                  :spot    spot ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
-                  :post    post
-                  :opst    opst
-                  :tspo    tspo})
+     :index          (when index
+                       {:id      (:id index) ;; unique id (hash of root) of index
+                        :address (get-in index [const/iri-address :value]) ;; address to get to index 'root'
+                        :data    (db-object (get index const/iri-data))
+                        :spot    spot ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
+                        :post    post
+                        :opst    opst
+                        :tspo    tspo})
      :defaultContext (let [address (get-in default-ctx [const/iri-address :value])]
                        (-> default-ctx
                            (select-keys [:id :type])
@@ -258,11 +257,16 @@
 
 (defn blank-commit
   "Creates a skeleton blank commit map."
-  [{:keys [v branch alias]
-    :or   {v 0, branch "main"}}]
+  [alias branch ns-addresses]
   {:alias  alias
-   :v      v
-   :branch branch})
+   :v      0
+   :branch (if branch
+             (util/keyword->str branch)
+             "main")
+   :ns     (mapv #(if (map? %)
+                    %
+                    {:id %})
+                 ns-addresses)})
 
 (defn new-index
   "Creates a new commit index record, given the commit-map used to trigger
@@ -370,11 +374,11 @@
    (let [ref-add     (ref-flakes add)
          ref-rem     (ref-flakes rem)
          flake-count (cond-> 0
-                       add (+ (count add))
-                       rem (- (count rem)))
+                             add (+ (count add))
+                             rem (- (count rem)))
          flake-size  (cond-> 0
-                       add (+ (flake/size-bytes add))
-                       rem (- (flake/size-bytes rem)))]
+                             add (+ (flake/size-bytes add))
+                             rem (- (flake/size-bytes rem)))]
      (-> db
          (update-in [:novelty :spot] flake/revise add rem)
          (update-in [:novelty :post] flake/revise add rem)
@@ -472,8 +476,8 @@
   load."
   [db t previous-id]
   (go-try
-   (let [prev-sid (<? (dbproto/-subid db previous-id))]
-     [(flake/create t const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
+    (let [prev-sid (<? (dbproto/-subid db previous-id))]
+      [(flake/create t const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
 
 (defn prev-data-flakes
   "Builds and returns a channel containing the previous data flakes for the
@@ -482,8 +486,8 @@
   reifying a ledger from storage on load."
   [db db-sid t prev-data-id]
   (go-try
-   (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
-     [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
+    (let [prev-sid (<? (dbproto/-subid db prev-data-id))]
+      [(flake/create db-sid const/$_previous prev-sid const/$xsd:anyURI t true nil)])))
 
 (defn issuer-flakes
   "Builds and returns a channel containing the credential issuer's flakes for
@@ -494,16 +498,16 @@
   ledger value and when reifying a ledger from storage on load."
   [db t next-sid issuer-iri]
   (go-try
-   (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
-     ;; create reference to existing issuer
-     [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true
-                    nil)]
-     ;; create new issuer flake and a reference to it
-     (let [new-issuer-sid (next-sid)]
-       [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
-                      true nil)
-        (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
-                      const/$xsd:string t true nil)]))))
+    (if-let [issuer-sid (<? (dbproto/-subid db issuer-iri))]
+      ;; create reference to existing issuer
+      [(flake/create t const/$_commit:signer issuer-sid const/$xsd:anyURI t true
+                     nil)]
+      ;; create new issuer flake and a reference to it
+      (let [new-issuer-sid (next-sid)]
+        [(flake/create t const/$_commit:signer new-issuer-sid const/$xsd:anyURI t
+                       true nil)
+         (flake/create new-issuer-sid const/$xsd:anyURI issuer-iri
+                       const/$xsd:string t true nil)]))))
 
 (defn message-flakes
   "Builds and returns the commit message flakes for the given t and message.
@@ -521,52 +525,52 @@
   in-memory ledger value and when reifying a ledger from storage on load."
   [db t next-sid {:keys [id address] :as _defaultContext}]
   (go-try
-   (if-let [default-ctx-id (<? (dbproto/-subid db id))]
-     [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t
-                    true nil)]
-     (let [new-default-ctx-id (next-sid)]
-       [(flake/create t const/$_ledger:context new-default-ctx-id
-                      const/$xsd:anyURI t true nil)
-        (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
-                      true nil)
-        (flake/create new-default-ctx-id const/$_address address
-                      const/$xsd:string t true nil)]))))
+    (if-let [default-ctx-id (<? (dbproto/-subid db id))]
+      [(flake/create t const/$_ledger:context default-ctx-id const/$xsd:anyURI t
+                     true nil)]
+      (let [new-default-ctx-id (next-sid)]
+        [(flake/create t const/$_ledger:context new-default-ctx-id
+                       const/$xsd:anyURI t true nil)
+         (flake/create new-default-ctx-id const/$xsd:anyURI id const/$xsd:string t
+                       true nil)
+         (flake/create new-default-ctx-id const/$_address address
+                       const/$xsd:string t true nil)]))))
 
 
 (defn add-commit-flakes
   "Translate commit metadata into flakes and merge them into novelty."
   [prev-commit {:keys [commit] :as db}]
   (go-try
-   (let [last-sid           (volatile! (jld-ledger/last-commit-sid db))
-         next-sid           (fn [] (vswap! last-sid inc))
+    (let [last-sid           (volatile! (jld-ledger/last-commit-sid db))
+          next-sid           (fn [] (vswap! last-sid inc))
 
-         {:keys [data defaultContext issuer message]} commit
-         {db-t :t} data
+          {:keys [data defaultContext issuer message]} commit
+          {db-t :t} data
 
-         {previous-id :id prev-data :data} prev-commit
-         prev-data-id       (:id prev-data)
+          {previous-id :id prev-data :data} prev-commit
+          prev-data-id       (:id prev-data)
 
-         t                  (- db-t)
-         db-sid             (next-sid)
-         base-flakes        (commit-metadata-flakes commit t db-sid)
-         prev-commit-flakes (when previous-id
-                              (<? (prev-commit-flakes db t previous-id)))
-         prev-db-flakes     (when prev-data-id
-                              (<? (prev-data-flakes db db-sid t prev-data-id)))
-         issuer-flakes      (when-let [issuer-iri (:id issuer)]
-                              (<? (issuer-flakes db t next-sid issuer-iri)))
-         message-flakes     (when message
-                              (message-flakes t message))
-         default-ctx-flakes (when defaultContext
-                              (<? (default-ctx-flakes db t next-sid defaultContext)))
-         commit-flakes      (cond-> base-flakes
-                                    prev-commit-flakes (into prev-commit-flakes)
-                                    prev-db-flakes (into prev-db-flakes)
-                                    issuer-flakes (into issuer-flakes)
-                                    message-flakes (into message-flakes)
-                                    default-ctx-flakes (into default-ctx-flakes))]
-     (-> db
-         (assoc-in [:ecount const/$_shard] @last-sid)
-         (cond-> (= 1 db-t) add-commit-schema-flakes)
-         (update-novelty commit-flakes)
-         add-tt-id))))
+          t                  (- db-t)
+          db-sid             (next-sid)
+          base-flakes        (commit-metadata-flakes commit t db-sid)
+          prev-commit-flakes (when previous-id
+                               (<? (prev-commit-flakes db t previous-id)))
+          prev-db-flakes     (when prev-data-id
+                               (<? (prev-data-flakes db db-sid t prev-data-id)))
+          issuer-flakes      (when-let [issuer-iri (:id issuer)]
+                               (<? (issuer-flakes db t next-sid issuer-iri)))
+          message-flakes     (when message
+                               (message-flakes t message))
+          default-ctx-flakes (when defaultContext
+                               (<? (default-ctx-flakes db t next-sid defaultContext)))
+          commit-flakes      (cond-> base-flakes
+                                     prev-commit-flakes (into prev-commit-flakes)
+                                     prev-db-flakes (into prev-db-flakes)
+                                     issuer-flakes (into issuer-flakes)
+                                     message-flakes (into message-flakes)
+                                     default-ctx-flakes (into default-ctx-flakes))]
+      (-> db
+          (assoc-in [:ecount const/$_shard] @last-sid)
+          (cond-> (= 1 db-t) add-commit-schema-flakes)
+          (update-novelty commit-flakes)
+          add-tt-id))))

@@ -14,6 +14,7 @@
   (-did [conn] "Returns optional default did map if set at connection level")
   (-msg-in [conn msg] "Handler for incoming message from connection service")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
+  (-nameservices [conn] "Returns a sequence of all nameservices configured for the connection.")
   (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))
 
 (defprotocol iStorage
