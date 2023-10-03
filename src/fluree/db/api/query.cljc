@@ -121,9 +121,7 @@
                        (assoc-in [:policy :cache] (atom {})))
           query**  (-> query*
                        (update :opts assoc :issuer did)
-                       (update :opts dissoc :meta)
-                       (update :opts dissoc :max-fuel)
-                       (update :opts dissoc ::util/track-fuel?))
+                       (update :opts dissoc :meta :max-fuel ::util/track-fuel?))
           start    #?(:clj  (System/nanoTime)
                       :cljs (util/current-time-millis))
           max-fuel (:max-fuel opts*)]
