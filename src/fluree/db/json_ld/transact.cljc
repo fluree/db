@@ -544,15 +544,12 @@
                            (modify db fuel-tracker tx tx-state)
                            (insert db fuel-tracker tx tx-state))
            fuel-error-ch (:error-ch fuel-tracker)
-           flakes-chans  (remove nil? [fuel-error-ch flakes-ch])
-           [flakes]      (alts! flakes-chans :priority true)
-           _             (when (util/exception? flakes)
-                           (throw flakes))
-           _             (log/trace "stage flakes:" flakes)
-           final-chans   (remove nil? [fuel-error-ch
-                                       (flakes->final-db tx-state flakes)])
-           [result] (alts! final-chans :priority true)]
-       (throw-err result)))))
+           chans         (remove nil? [fuel-error-ch flakes-ch])
+           [flakes]      (alts! chans :priority true)]
+       (when (util/exception? flakes)
+         (throw flakes))
+       (log/trace "stage flakes:" flakes)
+       (<? (flakes->final-db tx-state flakes))))))
 
 (defn stage-ledger
   ([ledger json-ld opts]
