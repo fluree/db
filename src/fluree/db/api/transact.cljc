@@ -13,12 +13,13 @@
 (defn stage
   [db json-ld opts]
   (go-try
-    (let [max-fuel (or (:max-fuel opts) (:maxFuel opts))]
-      (if (or max-fuel (:meta opts))
+    (let [opts*    (util/parse-opts opts)
+          max-fuel (:max-fuel opts*)]
+      (if (::util/track-fuel? opts*)
         (let [start-time   #?(:clj (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker max-fuel)]
-          (try* (let [result (<? (dbproto/-stage db fuel-tracker json-ld opts))]
+          (try* (let [result (<? (dbproto/-stage db fuel-tracker json-ld opts*))]
                   {:status 200
                    :result result
                    :time   (util/response-time-formatted start-time)
@@ -28,7 +29,7 @@
                                   {:time (util/response-time-formatted start-time)
                                    :fuel (fuel/tally fuel-tracker)}
                                   e)))))
-        (<? (dbproto/-stage db json-ld opts))))))
+        (<? (dbproto/-stage db json-ld opts*))))))
 
 (defn parse-json-ld-txn
   "Expands top-level keys and parses any opts in json-ld transaction document.
@@ -68,13 +69,14 @@
 (defn ledger-transact!
   [ledger txn opts]
   (go-try
-    (let [max-fuel (or (:max-fuel opts) (:maxFuel opts))]
-      (if (or max-fuel (:meta opts))
+    (let [opts*    (util/parse-opts opts)
+          max-fuel (:max-fuel opts*)]
+      (if (::util/track-fuel? opts*)
         (let [start-time   #?(:clj  (System/nanoTime)
                               :cljs (util/current-time-millis))
               fuel-tracker (fuel/tracker max-fuel)]
           (try*
-            (let [tx-result (<? (tx/transact! ledger fuel-tracker txn opts))]
+            (let [tx-result (<? (tx/transact! ledger fuel-tracker txn opts*))]
               {:status 200
                :result tx-result
                :time   (util/response-time-formatted start-time)
@@ -86,7 +88,7 @@
                             ex-data
                             (assoc :time (util/response-time-formatted start-time)
                                    :fuel (fuel/tally fuel-tracker))))))))
-        (<? (tx/transact! ledger txn opts))))))
+        (<? (tx/transact! ledger txn opts*))))))
 
 (defn transact!
   [conn parsed-json-ld opts]

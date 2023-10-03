@@ -490,8 +490,8 @@
 
 (defn parse-fuel
   [{:keys [opts] :as q}]
-  (if-let [mf (or (:max-fuel opts) (:maxFuel opts))]
-    (assoc q :fuel mf)
+  (if-let [max-fuel (or (:max-fuel opts) (:maxFuel opts))]
+    (assoc q :fuel max-fuel)
     q))
 
 (defn parse-analytical-query*
