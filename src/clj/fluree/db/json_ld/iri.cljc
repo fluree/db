@@ -22,14 +22,15 @@
         (decompose-by-char iri \: length)
         [nil iri])))
 
-(defn iri-namespace-code
+(defn namespace->code
   [db iri-ns]
   (or (get const/namespace->code iri-ns)
       (-> db :namespaces (get iri-ns))))
 
-(defn iri-name-code
-  [iri-name]
-  (->> iri-name bytes/string->UTF8 (take 8) bytes/UTF8->long))
+(defn code->namespace
+  [db ns-code]
+  (or (get const/code->namespace ns-code)
+      (-> db :namespaces-codes (get ns-code))))
 
 (defn iri->subid
   "Converts a string iri into a vector of long integer codes. The first code
@@ -37,11 +38,19 @@
   iri's name split into 8-byte chunks"
   [db iri]
   (let [[ns nme] (decompose-iri iri)]
-    (when-let [ns-code (iri-namespace-code db ns)]
-      (let [nme-code (iri-name-code nme)]
-        [ns-code nme-code iri]))))
+    (when-let [ns-code (namespace->code db ns)]
+      (into [ns-code]
+            (comp (partition-all 8)
+                  (map bytes/UTF8->long))
+            (bytes/string->UTF8 nme)))))
 
 (defn subid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."
-  [subid]
-  (nth subid 2))
+  [db sid]
+  (let [ns-code   (nth sid 0)
+        ns        (code->namespace db ns-code)
+        nme-codes (subvec sid 1)]
+    (->> nme-codes
+         (map bytes/long->UTF8)
+         (map bytes/UTF8->string)
+         (apply str ns))))
