@@ -87,7 +87,7 @@
    v/registry
    {::limit           pos-int?
     ::offset          nat-int?
-    ::max-fuel        number?
+    ::max-fuel        pos-int?
     ::depth           nat-int?
     ::pretty-print    boolean?
     ::parse-json      boolean?

@@ -109,21 +109,26 @@
                                          {:subject query})
 
           {:keys [opts t]} query
-          db*              (if-let [policy-opts (perm/policy-opts (cond-> opts did (assoc :did did)))]
-                             (<? (perm/wrap-policy db policy-opts))
-                             db)
-          db**             (-> (if t
-                                 (<? (time-travel/as-of db* t))
-                                 db*)
-                               (assoc-in [:policy :cache] (atom {})))
-          query*           (-> query
-                               (update :opts assoc :issuer did)
-                               (update :opts dissoc :meta))
-          start            #?(:clj  (System/nanoTime)
-                              :cljs (util/current-time-millis))]
-      (if (:meta opts)
-        (let [fuel-tracker (fuel/tracker)]
-          (try* (let [result (<? (fql/query db** fuel-tracker query*))]
+          opts*    (util/parse-opts opts)
+          query*   (assoc query :opts opts*)
+          db*      (if-let [policy-opts (perm/policy-opts
+                                         (cond-> opts* did (assoc :did did)))]
+                     (<? (perm/wrap-policy db policy-opts))
+                     db)
+          db**     (-> (if t
+                         (<? (time-travel/as-of db* t))
+                         db*)
+                       (assoc-in [:policy :cache] (atom {})))
+          query**  (-> query*
+                       (update :opts assoc :issuer did)
+                       (update :opts dissoc :meta :max-fuel ::util/track-fuel?))
+          start    #?(:clj  (System/nanoTime)
+                      :cljs (util/current-time-millis))
+          max-fuel (:max-fuel opts*)]
+      (if (::util/track-fuel? opts*)
+        (let [fuel-tracker (fuel/tracker max-fuel)]
+          (try* (let [fuel-tracker (fuel/tracker max-fuel)
+                      result (<? (fql/query db** fuel-tracker query**))]
                   {:status 200
                    :result result
                    :time   (util/response-time-formatted start)
@@ -134,7 +139,7 @@
                                    :time   (util/response-time-formatted start)
                                    :fuel   (fuel/tally fuel-tracker)}
                                   e)))))
-        (<? (fql/query db** query*))))))
+        (<? (fql/query db** query**))))))
 
 (defn query-sparql
   [db query]
