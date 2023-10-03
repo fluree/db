@@ -1,13 +1,24 @@
 (ns fluree.db.serde.json
-  (:require [fluree.db.datatype :as datatype]
-            [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]))
+  (:require  [fluree.db.constants :as const]
+             [fluree.db.datatype :as datatype]
+             [fluree.db.serde.protocol :as serdeproto]
+             [fluree.db.flake :as flake]
+             [fluree.db.util.core :as util]
+             #?(:clj  [fluree.db.util.clj-const :as uc]
+                :cljs [fluree.db.util.cljs-const :as uc]))
+  #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
+                              LocalDateTime ZoneOffset)
+                   (java.time.format DateTimeFormatter))))
 #?(:clj (set! *warn-on-reflection* true))
+
+(def time-types
+  #{const/$xsd:date
+    const/$xsd:dateTime
+    const/$xsd:time})
 
 (defn deserialize-flake
   [flake-vec]
-  (if-let [flake-time-dt (datatype/time-types (get flake-vec 3))]
+  (if-let [flake-time-dt (time-types (get flake-vec 3))]
     (-> flake-vec
         (update 2 (fn [val]
                     #?(:clj (datatype/coerce val flake-time-dt)
@@ -58,6 +69,29 @@
   [leaf]
   (assoc leaf :flakes (mapv deserialize-flake (:flakes leaf))))
 
+#?(:clj (def ^DateTimeFormatter xsdDateTimeFormatter
+          (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS[XXXXX]")))
+
+#?(:clj (def ^DateTimeFormatter xsdTimeFormatter
+          (DateTimeFormatter/ofPattern "HH:mm:ss.SSSSSSSSS[XXXXX]")))
+
+#?(:clj (def ^DateTimeFormatter xsdDateFormatter
+          (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
+
+(defn serialize-flake-value
+  "Flakes with time types will have time objects as values.
+  We need to serialize these into strings that will be successfully re-coerced into
+  the same objects upon loading."
+  [val dt]
+  (uc/case (int dt)
+    const/$xsd:dateTime #?(:clj (.format xsdDateTimeFormatter val)
+                           :cljs (.toJSON val))
+    const/$xsd:date      #?(:clj (.format xsdDateFormatter val)
+                            :cljs (.toJSON val))
+    const/$xsd:time #?(:clj (.format xsdTimeFormatter val)
+                       :cljs (.toJSON val))
+    val))
+
 (defn serialize-flake
   "Serializes flakes into vectors, ensuring values are written such that they will
   be correctly coerced when loading.
@@ -65,7 +99,7 @@
   Flakes with an 'm' value need keys converted from keyword keys into strings."
   [flake]
   (-> (vec flake)
-      (update 2 datatype/serialize-flake-value (flake/dt flake))
+      (update 2 serialize-flake-value (flake/dt flake))
       (cond-> (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake))))))
 
 (defn- deserialize-garbage

@@ -47,35 +47,6 @@
    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString" const/$rdf:langString})
 
 
-(def time-types
-  #{const/$xsd:date
-    const/$xsd:dateTime
-    const/$xsd:time})
-
-#?(:clj (def ^DateTimeFormatter xsdDateTimeFormatter
-          (DateTimeFormatter/ofPattern "uuuu-MM-dd'T'HH:mm:ss.SSSSSSSSS[XXXXX]")))
-
-#?(:clj (def ^DateTimeFormatter xsdTimeFormatter
-          (DateTimeFormatter/ofPattern "HH:mm:ss.SSSSSSSSS[XXXXX]")))
-
-#?(:clj (def ^DateTimeFormatter xsdDateFormatter
-          (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
-
-(defn serialize-flake-value
-  "Flakes with time types will have time objects as values.
-  We need to serialize these into strings that will be successfully re-coerced into
-  the same objects upon loading."
-  [val dt]
-  (uc/case (int dt)
-    const/$xsd:dateTime #?(:clj (.format xsdDateTimeFormatter val)
-                           :cljs (.toJSON val))
-    const/$xsd:date      #?(:clj (.format xsdDateFormatter val)
-                            :cljs (.toJSON val))
-    const/$xsd:time #?(:clj (.format xsdTimeFormatter val)
-                       :cljs (.toJSON val))
-    val))
-
-
 (def iso8601-offset-pattern
   "(Z|(?:[+-][0-9]{2}:[0-9]{2}))?")
 

@@ -1,7 +1,7 @@
 (ns fluree.db.json-ld.commit
   (:require [fluree.json-ld :as json-ld]
             [fluree.crypto :as crypto]
-            [fluree.db.datatype :as datatype]
+            [fluree.db.serde.json :as serde-json]
             [fluree.db.flake :as flake]
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
@@ -49,12 +49,12 @@
                                                      db iri-map
                                                      compact-fn))}
                                (if (nil? all-refs?) true all-refs?)]
-                              [{"@value" (datatype/serialize-flake-value
+                              [{"@value" (serde-json/serialize-flake-value
                                            (flake/o p-flake)
                                            pdt)} false])
             obj*      (cond-> obj
                         list? (assoc :i (-> p-flake flake/m :i))
-                        (contains? datatype/time-types pdt)
+                        (contains? serde-json/time-types pdt)
                         ;;need to retain the `@type` for times
                         ;;so they will be coerced correctly when loading
                         (assoc "@type"
