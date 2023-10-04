@@ -1,11 +1,11 @@
 (ns fluree.db.serde.json
-  (:require [fluree.db.constants :as const]
-            [fluree.db.serde.protocol :as serdeproto]
-            [fluree.db.datatype :as datatype]
-            [fluree.db.flake :as flake]
-            [fluree.db.util.core :as util]
-            #?(:clj  [fluree.db.util.clj-const :as uc]
-               :cljs [fluree.db.util.cljs-const :as uc]))
+  (:require  [fluree.db.constants :as const]
+             [fluree.db.datatype :as datatype]
+             [fluree.db.serde.protocol :as serdeproto]
+             [fluree.db.flake :as flake]
+             [fluree.db.util.core :as util]
+             #?(:clj  [fluree.db.util.clj-const :as uc]
+                :cljs [fluree.db.util.cljs-const :as uc]))
   #?(:clj (:import (java.time OffsetDateTime OffsetTime LocalDate LocalTime
                               LocalDateTime ZoneOffset)
                    (java.time.format DateTimeFormatter))))
@@ -78,8 +78,10 @@
 #?(:clj (def ^DateTimeFormatter xsdDateFormatter
           (DateTimeFormatter/ofPattern "uuuu-MM-dd[XXXXX]")))
 
-
-(defn serialize-value
+(defn serialize-flake-value
+  "Flakes with time types will have time objects as values.
+  We need to serialize these into strings that will be successfully re-coerced into
+  the same objects upon loading."
   [val dt]
   (uc/case (int dt)
     const/$xsd:dateTime #?(:clj (.format xsdDateTimeFormatter val)
@@ -91,14 +93,13 @@
     val))
 
 (defn serialize-flake
-  "Flakes with time types will have time objects as values.
-  We need to serialize these into strings that will be successfully re-coerced into
-  the same objects upon loading.
+  "Serializes flakes into vectors, ensuring values are written such that they will
+  be correctly coerced when loading.
 
   Flakes with an 'm' value need keys converted from keyword keys into strings."
   [flake]
   (-> (vec flake)
-      (update 2 serialize-value (flake/dt flake))
+      (update 2 serialize-flake-value (flake/dt flake))
       (cond-> (flake/m flake) (assoc 5 (util/stringify-keys (flake/m flake))))))
 
 (defn- deserialize-garbage

@@ -5,7 +5,9 @@
                        [clojure.core.async.interop :refer [<p!]]])
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.api :as fluree]
+            [fluree.db.query.range :as query-range]
             [fluree.db.test-utils :as test-utils]
+            [fluree.db.util.async :refer [<?? <?]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.util.core :as util]
             #?(:clj  [test-with-files.tools :refer [with-tmp-dir]
@@ -385,7 +387,39 @@
                                             {:f/property
                                              [:* {:f/allow
                                                   [:* {:f/targetRole [:_id]}]}]}]}
-                                       :where  [[?s :type :f/Policy]]}))))))))))
+                                       :where  [[?s :type :f/Policy]]}))))))))
+
+     (testing "Can load a ledger with time values"
+       (with-tmp-dir storage-path
+         (let [conn @(fluree/connect {:method :file
+                                      :storage-path storage-path
+                                      :defaults
+                                      {:context (merge test-utils/default-str-context
+                                                       {"ex" "http://example.org/ns/"})}})
+               ledger @(fluree/create conn "index/datetimes")
+               db @(fluree/stage
+                     (fluree/db ledger)
+                     [{"@id" "ex:Foo",
+                       "@type" "ex:Bar",
+
+                       "ex:offsetDateTime" {"@type" "xsd:dateTime"
+                                            "@value" "2023-04-01T00:00:00.000Z"}
+                       "ex:localDateTime" {"@type" "xsd:dateTime"
+                                           "@value" "2021-09-24T11:14:32.833"}
+                       "ex:offsetDateTime2" {"@type" "xsd:date"
+                                             "@value" "2022-01-05Z"}
+                       "ex:localDate" {"@type" "xsd:date"
+                                       "@value" "2024-02-02"}
+                       "ex:offsetTime" {"@type" "xsd:time"
+                                        "@value" "12:42:00Z"}
+                       "ex:localTime" {"@type" "xsd:time"
+                                       "@value" "12:42:00"}}])
+               db-commit @(fluree/commit! ledger db)
+               loaded (test-utils/retry-load conn (:alias ledger) 100)
+               q {"select" {"?s" ["*"]}
+                  "where" [["?s" "type" "ex:Bar"]]}]
+           (is (= @(fluree/query (fluree/db loaded) q)
+                  @(fluree/query db q))))))))
 
 #?(:clj
    (deftest load-from-memory-test
@@ -728,7 +762,7 @@
                   @(fluree/query loaded-db3 description-query))
                "Only :ex/kittens should be left"))))))
 
-(deftest query-test
+(deftest ^:integration query-test
   (let [query {:select ["?person" "?name"]
                :where  [["?person" :type :ex/User]
                         ["?person" :schema/name "?name"]]}
@@ -750,3 +784,105 @@
                   results (<p! (fluree/query (fluree/db ledger) query))]
               (is (= expected results))
               (done))))))))
+
+(deftest ^:integration fuel-test
+  #?(:clj
+     (testing "fuel tracking"
+       (let [conn   (test-utils/create-conn)
+             ledger @(fluree/create conn "test/fuel-tracking"
+                                    {:defaultContext
+                                     ["" {:ex "http://example.org/ns/"}]})
+             db0    (fluree/db ledger)]
+         (testing "transactions"
+           (testing "with the `:meta` option"
+             (let [response    @(fluree/stage db0 test-utils/people {:meta true})
+                   db          (:result response)
+                   flake-total (count (<?? (query-range/index-range db :spot)))]
+               (is (= flake-total (:fuel response))
+                   "Reports fuel for all the generated flakes")))
+           (testing "without the `:meta` option"
+             (let [response @(fluree/stage db0 test-utils/people)]
+               (is (nil? (:fuel response))
+                   "Returns no fuel")))
+           (testing "short-circuits if request fuel exhausted"
+             (let [response @(fluree/stage db0 test-utils/people {:max-fuel 1})]
+               (is (util/exception? response))
+               (is (re-find #"Fuel limit exceeded"
+                            (-> response ex-cause ex-message))))))
+         (testing "queries"
+           (let [db          @(fluree/stage db0 test-utils/people)
+                 flake-total (count (<?? (query-range/index-range db :spot)))
+                 query       '{:select [?s ?p ?o]
+                               :where  [[?s ?p ?o]]}]
+             (testing "queries not returning metadata"
+               (let [sut @(fluree/query db query)]
+                 (is (nil? (:fuel sut))
+                     "Reports no fuel")))
+             (testing "queries returning metadata"
+               (let [query* (assoc-in query [:opts :meta] true)
+                     sut    @(fluree/query db query*)]
+                 (is (= flake-total (:fuel sut))
+                     "Reports that all flakes were traversed"))))
+           (testing "short-circuits if request fuel exhausted"
+             (let [query   '{:select [?s ?p ?o]
+                             :where  [[?s ?p ?o]]
+                             :opts   {:max-fuel 1}}
+                   db      @(fluree/stage db0 test-utils/people)
+                   results @(fluree/query db query)]
+               (is (util/exception? results))
+               (is (re-find #"Fuel limit exceeded"
+                            (-> results ex-cause ex-message))))))))
+     :cljs
+     (async done
+       (go
+        (testing "fuel tracking"
+          (let [conn   (<! (test-utils/create-conn))
+                ledger (<p! (fluree/create conn "test/fuel-tracking"
+                                           {:defaultContext
+                                            ["" {:ex "http://example.org/ns/"}]}))
+                db0    (fluree/db ledger)]
+            (testing "transactions"
+              (testing "with the `:meta` option"
+                (let [response    (<p! (fluree/stage db0 test-utils/people {:meta true}))
+                      db          (:result response)
+                      flake-total (count (<? (query-range/index-range db :spot)))]
+                  (is (= flake-total (:fuel response))
+                      "Reports fuel for all the generated flakes")))
+              (testing "without the `:meta` option"
+                (let [response (<p! (fluree/stage db0 test-utils/people))]
+                  (is (nil? (:fuel response))
+                      "Returns no fuel")))
+              (testing "short-circuits if request fuel exhausted"
+                (let [response (try
+                                 (<p! (fluree/stage db0 test-utils/people
+                                                    {:max-fuel 1}))
+                                 (catch :default e (ex-cause e)))]
+                  (is (util/exception? response))
+                  (is (re-find #"Fuel limit exceeded"
+                               (-> response ex-cause ex-message))))))
+            (testing "queries"
+              (let [db          (<p! (fluree/stage db0 test-utils/people))
+                    flake-total (count (<? (query-range/index-range db :spot)))
+                    query       '{:select [?s ?p ?o]
+                                  :where  [[?s ?p ?o]]}]
+                (testing "queries not returning metadata"
+                  (let [sut (<p! (fluree/query db query))]
+                    (is (nil? (:fuel sut))
+                        "Reports no fuel")))
+                (testing "queries returning metadata"
+                  (let [query* (assoc-in query [:opts :meta] true)
+                        sut    (<p! (fluree/query db query*))]
+                    (is (= flake-total (:fuel sut))
+                        "Reports that all flakes were traversed"))))
+              (testing "short-circuits if request fuel exhausted"
+                (let [query   '{:select [?s ?p ?o]
+                                :where  [[?s ?p ?o]]
+                                :opts   {:max-fuel 1}}
+                      db      (<p! (fluree/stage db0 test-utils/people))
+                      results (try
+                                (<p! (fluree/query db query))
+                                (catch :default e (ex-cause e)))]
+                  (is (util/exception? results))
+                  (is (re-find #"Fuel limit exceeded"
+                               (-> results ex-cause ex-message))))))))
+        (done)))))

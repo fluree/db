@@ -1,6 +1,6 @@
 (ns fluree.db.json-ld.transact
   (:refer-clojure :exclude [vswap!])
-  (:require [clojure.core.async :as async :refer [go]]
+  (:require [clojure.core.async :as async :refer [go alts!]]
             [fluree.db.constants :as const]
             [fluree.db.datatype :as datatype]
             [fluree.db.dbproto :as dbproto]
@@ -21,7 +21,7 @@
             [fluree.db.query.fql.parse :as q-parse]
             [fluree.db.query.fql.syntax :as syntax]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.async :refer [<? go-try throw-err]]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
@@ -84,35 +84,35 @@
                         (->> (<? (query-range/index-range db-before :spot = [sid pid]))
                              (map #(flake/flip-flake % t))))
 
-          m (cond-> nil
-              list?    (assoc :i (-> v-map :idx last))
-              language (assoc :lang language))
+          m           (cond-> nil
+                        list? (assoc :i (-> v-map :idx last))
+                        language (assoc :lang language))
 
-          flakes (cond
-                   ;; a new node's data is contained, process as another node then link to this one
-                   (jld-reify/node? v-map)
-                   (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
-                     (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
+          flakes      (cond
+                        ;; a new node's data is contained, process as another node then link to this one
+                        (jld-reify/node? v-map)
+                        (let [[node-sid node-flakes] (<? (json-ld-node->flakes v-map tx-state pid))]
+                          (conj node-flakes (flake/create sid pid node-sid const/$xsd:anyURI t true m)))
 
-                   ;; a literal value
-                   (and (some? value) (not= shacl-dt const/$xsd:anyURI))
-                   (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
-                     [(flake/create sid pid value* dt t true m)])
+                        ;; a literal value
+                        (and (some? value) (not= shacl-dt const/$xsd:anyURI))
+                        (let [[value* dt] (datatype/from-expanded v-map shacl-dt)]
+                          [(flake/create sid pid value* dt t true m)])
 
-                   :else
-                   (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
-                                   {:status 400 :error :db/invalid-transaction})))
+                        :else
+                        (throw (ex-info (str "JSON-LD value must be a node or a value, instead found ambiguous value: " v-map)
+                                        {:status 400 :error :db/invalid-transaction})))
           [valid? err-msg] (shacl/coalesce-validation-results
-                             (into []
-                                   (mapcat (fn [[shape-id p-shapes]]
-                                             ;; register the validated pid so we can enforce the sh:closed constraint later
-                                             (swap! subj-mods update-in [:shape->validated-properties shape-id]
-                                                    (fnil conj #{}) pid)
-                                             ;; do the actual validation
-                                             (mapv (fn [p-shape]
-                                                     (shacl/validate-simple-property-constraints p-shape flakes))
-                                                   p-shapes)))
-                                   shape->p-shapes))]
+                            (into []
+                                  (mapcat (fn [[shape-id p-shapes]]
+                                            ;; register the validated pid so we can enforce the sh:closed constraint later
+                                            (swap! subj-mods update-in [:shape->validated-properties shape-id]
+                                                   (fnil conj #{}) pid)
+                                            ;; do the actual validation
+                                            (mapv (fn [p-shape]
+                                                    (shacl/validate-simple-property-constraints p-shape flakes))
+                                                  p-shapes)))
+                                  shape->p-shapes))]
       (when-not valid?
         (shacl/throw-shacl-exception err-msg))
       (into flakes retractions))))
@@ -234,7 +234,7 @@
         (if (nil? value)
           (into new-prop-flakes (<? (retract-flakes db-before sid pid t)))
           (into new-prop-flakes (loop [[v' & r] v*
-                                       flakes  []]
+                                       flakes []]
                                   (if v'
                                     (recur r (into flakes (<? (add-property sid pid shacl-dt shape->p-shapes check-retracts? list? v' tx-state))))
                                     flakes))))))))
@@ -250,21 +250,21 @@
            shacl-target-objects-of? refs] :as tx-state}
    referring-pid]
   (go-try
-    (let [existing-sid (when id
-                         (<? (jld-reify/get-iri-sid id db-before iris)))
-          new-subj?    (not existing-sid)
+    (let [existing-sid   (when id
+                           (<? (jld-reify/get-iri-sid id db-before iris)))
+          new-subj?      (not existing-sid)
           [new-type-sids type-flakes] (when type
                                         (<? (json-ld-type-data type tx-state)))
-          sid          (if new-subj?
-                         ;; TODO - this will check if subject is rdfs:Class, but we already have the new-type-sids above and know that - this can be a little faster, but reify.cljc also uses this logic and they need to align
-                         (jld-ledger/generate-new-sid node referring-pid iris next-pid next-sid)
-                         existing-sid)
-          classes      (if new-subj?
-                         new-type-sids
-                         ;;note: use of `db-before` here (and below)
-                         ;; means we cannot transact shacl in same txn as
-                         ;;data and have it enforced.
-                         (<? (get-subject-types db-before sid new-type-sids)))
+          sid            (if new-subj?
+                           ;; TODO - this will check if subject is rdfs:Class, but we already have the new-type-sids above and know that - this can be a little faster, but reify.cljc also uses this logic and they need to align
+                           (jld-ledger/generate-new-sid node referring-pid iris next-pid next-sid)
+                           existing-sid)
+          classes        (if new-subj?
+                           new-type-sids
+                           ;;note: use of `db-before` here (and below)
+                           ;; means we cannot transact shacl in same txn as
+                           ;;data and have it enforced.
+                           (<? (get-subject-types db-before sid new-type-sids)))
 
           class-shapes   (<? (shacl/class-shapes db-before classes))
           referring-pids (when shacl-target-objects-of?
@@ -272,33 +272,33 @@
                              referring-pid (conj referring-pid)))
           pred-shapes    (when (seq referring-pids)
                            (<? (shacl/targetobject-shapes db-before referring-pids)))
-          shacl-shapes (into class-shapes pred-shapes)
+          shacl-shapes   (into class-shapes pred-shapes)
 
           [pid->shape->p-shapes pid->shacl-dt] (consolidate-advanced-validation shacl-shapes)
 
-          id*          (if (and new-subj? (nil? id))
-                         (str "_:f" sid) ;; create a blank node id
-                         id)
-          base-flakes  (cond-> []
-                         new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
-                         new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
+          id*            (if (and new-subj? (nil? id))
+                           (str "_:f" sid) ;; create a blank node id
+                           id)
+          base-flakes    (cond-> []
+                           new-subj? (conj (flake/create sid const/$xsd:anyURI id* const/$xsd:string t true nil))
+                           new-type-sids (into (map #(flake/create sid const/$rdf:type % const/$xsd:anyURI t true nil) new-type-sids)))]
       ;; save SHACL, class data into atom for later validation - checks that same @id not being updated in multiple spots
       (register-node subj-mods node sid {:iri-only? (iri-only? node)
-                                         :shacl    shacl-shapes
+                                         :shacl     shacl-shapes
                                          :new?      new-subj?
                                          :classes   classes})
       (loop [[[k v] & r] (dissoc node :id :idx :type)
              subj-flakes (into base-flakes type-flakes)]
         (if k
-          (let [existing-pid    (<? (jld-reify/get-iri-sid k db-before iris))
-                ref?            (not (:value (first v))) ; either a ref or a value
-                pid             (or existing-pid
-                                    (get jld-ledger/predefined-properties k)
-                                    (jld-ledger/generate-new-pid k iris next-pid ref? refs))]
+          (let [existing-pid (<? (jld-reify/get-iri-sid k db-before iris))
+                ref?         (not (:value (first v))) ; either a ref or a value
+                pid          (or existing-pid
+                                 (get jld-ledger/predefined-properties k)
+                                 (jld-ledger/generate-new-pid k iris next-pid ref? refs))]
             (if-let [values (not-empty v)]
               (let [new-flakes (loop [[value & r] values
                                       existing? (some? existing-pid)
-                                      flakes []]
+                                      flakes    []]
                                  (if value
                                    (let [new-flakes (<? (property-value->flakes sid pid k value pid->shape->p-shapes pid->shacl-dt
                                                                                 new-subj? existing? tx-state))]
@@ -315,28 +315,28 @@
 (defn ->tx-state
   [db {:keys [bootstrap? did context-type txn-context] :as _opts}]
   (let [{:keys [schema branch ledger policy], db-t :t} db
-        last-pid (volatile! (jld-ledger/last-pid db))
-        last-sid (volatile! (jld-ledger/last-sid db))
-        commit-t (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
-        t        (-> commit-t inc -)  ;; commit-t is always positive, need to make negative for internal indexing
+        last-pid  (volatile! (jld-ledger/last-pid db))
+        last-sid  (volatile! (jld-ledger/last-sid db))
+        commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
+        t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
         db-before (dbproto/-rootdb db)]
-    {:did           did
-     :db-before     db-before
-     :policy        policy
-     :bootstrap?    bootstrap?
-     :default-ctx   (if context-type
-                      (dbproto/-context db ::dbproto/default-context context-type)
-                      (dbproto/-context db))
-     :stage-update? (= t db-t) ;; if a previously staged db is getting updated again before committed
-     :refs          (volatile! (or (:refs schema) #{const/$rdf:type}))
-     :t             t
-     :last-pid      last-pid
-     :last-sid      last-sid
-     :next-pid      (fn [] (vswap! last-pid inc))
-     :next-sid      (fn [] (vswap! last-sid inc))
-     :subj-mods     (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
-     :iris          (volatile! {})
-     :txn-context       txn-context
+    {:did                      did
+     :db-before                db-before
+     :policy                   policy
+     :bootstrap?               bootstrap?
+     :default-ctx              (if context-type
+                                 (dbproto/-context db ::dbproto/default-context context-type)
+                                 (dbproto/-context db))
+     :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
+     :refs                     (volatile! (or (:refs schema) #{const/$rdf:type}))
+     :t                        t
+     :last-pid                 last-pid
+     :last-sid                 last-sid
+     :next-pid                 (fn [] (vswap! last-pid inc))
+     :next-sid                 (fn [] (vswap! last-sid inc))
+     :subj-mods                (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
+     :iris                     (volatile! {})
+     :txn-context              txn-context
      :shacl-target-objects-of? (shacl/has-target-objects-of-rule? db-before)}))
 
 (defn final-ecount
@@ -396,8 +396,8 @@
           staged-map   {:add    add
                         :remove remove}
           db-after     (cond-> (db-after staged-map tx-state)
-                               vocab-flakes vocab/refresh-schema
-                               vocab-flakes <?)]
+                         vocab-flakes vocab/refresh-schema
+                         vocab-flakes <?)]
       (assoc staged-map :db-after db-after))))
 
 (defn track-into
@@ -428,12 +428,12 @@
     (let [track-fuel (when fuel-tracker
                        (fuel/track fuel-tracker))
           flakeset   (cond-> (flake/sorted-set-by flake/cmp-flakes-spot)
-                             (init-db? db) (track-into track-fuel (base-flakes t)))]
+                       (init-db? db) (track-into track-fuel (base-flakes t)))]
       (loop [[node & r] (util/sequential json-ld)
              flakes flakeset]
         (if node
-          (let [node*  {"@context" txn-context
-                        "@graph" [node]}
+          (let [node*   {"@context" txn-context
+                         "@graph"   [node]}
                 [expanded] (json-ld/expand node* default-ctx)
                 flakes* (if (map? expanded)
                           (let [[_sid node-flakes] (<? (json-ld-node->flakes (validate-node expanded) tx-state nil))]
@@ -455,16 +455,16 @@
         {:keys [shape->validated-properties]} subj-mods']
     (go-try
       (loop [[s-flakes & r] (partition-by flake/s add)
-             all-classes #{}
+             all-classes         #{}
              remaining-subj-mods subj-mods']
         (if s-flakes
           (let [sid (flake/s (first s-flakes))
                 {:keys [new? classes shacl]} (get subj-mods' sid)]
             (when shacl
-              (let [shacl* (mapv (fn [shape]
-                                    (update shape :validated-properties (fnil into #{})
-                                            (get shape->validated-properties (:id shape)) ))
-                                  shacl)
+              (let [shacl*    (mapv (fn [shape]
+                                      (update shape :validated-properties (fnil into #{})
+                                              (get shape->validated-properties (:id shape))))
+                                    shacl)
                     s-flakes* (if new?
                                 s-flakes
                                 (<? (query-range/index-range root-db :spot = [sid])))]
@@ -508,8 +508,8 @@
                            (update/modify db mdfn t fuel-tracker error-ch)
                            (into-flakeset fuel-tracker))]
         (async/alt!
-          error-ch ([e] e)
-          update-ch ([flakes] flakes))))))
+         error-ch ([e] e)
+         update-ch ([flakes] flakes))))))
 
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
@@ -535,14 +535,19 @@
    (go-try
      (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
                                       {:subject json-ld})
-           opts*    (cond-> opts did (assoc :did did))
-           db*      (if-let [policy-opts (perm/policy-opts opts*)]
-                      (<? (perm/wrap-policy db policy-opts))
-                      db)
-           tx-state (->tx-state db* opts*)
-           flakes   (if (q-parse/update? tx)
-                      (<? (modify db fuel-tracker tx tx-state))
-                      (<? (insert db fuel-tracker tx tx-state)))]
+           opts*         (cond-> opts did (assoc :did did))
+           db*           (if-let [policy-opts (perm/policy-opts opts*)]
+                           (<? (perm/wrap-policy db policy-opts))
+                           db)
+           tx-state      (->tx-state db* opts*)
+           flakes-ch     (if (q-parse/update? tx)
+                           (modify db fuel-tracker tx tx-state)
+                           (insert db fuel-tracker tx tx-state))
+           fuel-error-ch (:error-ch fuel-tracker)
+           chans         (remove nil? [fuel-error-ch flakes-ch])
+           [flakes]      (alts! chans :priority true)]
+       (when (util/exception? flakes)
+         (throw flakes))
        (log/trace "stage flakes:" flakes)
        (<? (flakes->final-db tx-state flakes))))))
 
@@ -552,8 +557,7 @@
   ([ledger fuel-tracker json-ld opts]
    (let [{:keys [defaultContext]} opts
          db (cond-> (ledger-proto/-db ledger)
-              defaultContext  (dbproto/-default-context-update
-                                defaultContext))]
+              defaultContext (dbproto/-default-context-update defaultContext))]
      (stage db fuel-tracker json-ld opts))))
 
 (defn transact!
