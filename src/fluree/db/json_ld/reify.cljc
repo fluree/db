@@ -480,7 +480,6 @@
   "Returns a list of two-tuples each containing [commit proof] as applicable.
   First commit will be t value of `from-t` and increment from there."
   [conn latest-commit-tuple from-t]
-  (log/warn "REIFY latest-commit-tuple: " latest-commit-tuple)
   (go-try
     (loop [[commit proof] latest-commit-tuple
            last-t        nil

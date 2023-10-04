@@ -13,7 +13,7 @@
   [conn]
   (conn-proto/-nameservices conn))
 
-(defn relative?
+(defn relative-ledger-alias?
   [ledger-alias]
   (not (str/starts-with? ledger-alias "fluree:")))
 
@@ -30,7 +30,7 @@
   we should retrieve all stored ns addresses in the commit if possible and
   try to use all nameservices."
   [conn ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
-  (if (relative? ledger-alias)
+  (if (relative-ledger-alias? ledger-alias)
     (let [nameservices (nameservices conn)]
       (go-try
         (loop [nameservices* nameservices
