@@ -27,12 +27,3 @@
   (-txn-read [conn txn-key] "Reads a transaction from storage")
   (-index-file-write [conn ledger idx-type index-data] "Writes an index item to storage")
   (-index-file-read [conn file-address] "Reads an index item from storage"))
-
-(defprotocol iNameService
-  (-push [conn address commit-data] "Pushes ledger metadata to all name service destinations")
-  (-pull [conn ledger-address] "Performs a pull operation from all name service destinations")
-  (-subscribe [conn ledger] "Creates a subscription to nameservice(s) for ledger events")
-  (-lookup [conn ledger-address] "Performs lookup operation on ledger address and returns latest commit address")
-  (-alias [conn ledger-address] "Given a ledger address, returns ledger's default alias name else nil, if not avail")
-  (-address [conn ledger-alias key] "Returns address/iri for provided ledger alias specific to the connection type")
-  (-exists? [conn ledger-address] "Returns true if ledger exists (must have had at least one commit), false otherwise"))

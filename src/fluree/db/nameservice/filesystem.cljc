@@ -64,7 +64,6 @@
 (defn lookup
   [local-path ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
   (go-try
-    (log/warn "Lookup - local-path, ledger-alias:" local-path ledger-alias)
     (file-address (read-address local-path ledger-alias))))
 
 
