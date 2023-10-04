@@ -194,32 +194,31 @@
         index       (get-first commit-json-ld const/iri-index)
         default-ctx (get-first commit-json-ld const/iri-default-context)
         ctx-address (get-first-value default-ctx const/iri-address)]
-    (cond->
-      {:id             id
-       :address        address
-       :v              v
-       :alias          alias
-       :branch         branch
-       :time           time
-       :message        message
-       :tag            (mapv :value tags)
-       :previous       {:id      (:id prev-commit)
-                        :address (get-first-value prev-commit const/iri-address)}
-       :data           (parse-db-data data)
-       :defaultContext (-> default-ctx
-                           (select-keys [:id :type])
-                           (assoc :address ctx-address))}
-      ns (assoc :ns (->> ns
-                         util/sequential
-                         (mapv (fn [namespace] {:id (:id namespace)}))))
-      index (assoc :index {:id      (:id index)
-                           :address (get-first-value index const/iri-address)
-                           :data    (parse-db-data (get-first index const/iri-data))
-                           :spot    spot
-                           :post    post
-                           :opst    opst
-                           :tspo    tspo})
-      issuer (assoc :issuer {:id (:id issuer)}))))
+    (cond-> {:id             id
+             :address        address
+             :v              v
+             :alias          alias
+             :branch         branch
+             :time           time
+             :message        message
+             :tag            (mapv :value tags)
+             :previous       {:id      (:id prev-commit)
+                              :address (get-first-value prev-commit const/iri-address)}
+             :data           (parse-db-data data)
+             :defaultContext (-> default-ctx
+                                 (select-keys [:id :type])
+                                 (assoc :address ctx-address))}
+            ns (assoc :ns (->> ns
+                               util/sequential
+                               (mapv (fn [namespace] {:id (:id namespace)}))))
+            index (assoc :index {:id      (:id index)
+                                 :address (get-first-value index const/iri-address)
+                                 :data    (parse-db-data (get-first index const/iri-data))
+                                 :spot    spot
+                                 :post    post
+                                 :opst    opst
+                                 :tspo    tspo})
+            issuer (assoc :issuer {:id (:id issuer)}))))
 
 
 (defn update-commit-id
