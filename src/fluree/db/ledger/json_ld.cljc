@@ -134,7 +134,7 @@
   "Returns true if update was successful, else false or exception
   if unexpected exception occurs."
   [ledger updated-db]
-  updated-db
+
   true)
 
 (defn notify
