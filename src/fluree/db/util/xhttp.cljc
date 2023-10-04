@@ -19,14 +19,6 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-
-;; enable SNI in http-kit
-;; See https://github.com/http-kit/http-kit#enabling-client-sni-support-disabled-by-default
-;; for details.
-#?(:clj (alter-var-root #'http/*default-client*
-                        (fn [_] sni-client/default-client)))
-
-
 ;; allow large websocket frames of ~10mb
 #?(:clj (System/setProperty "org.asynchttpclient.webSocketMaxFrameSize" "10000000"))
 

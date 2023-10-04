@@ -6,6 +6,7 @@
             [fluree.db.conn.remote :as remote-conn]
             #?(:clj [fluree.db.conn.s3 :as s3-conn])
             [fluree.db.conn.proto :as conn-proto]
+            [fluree.db.constants :as const]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.platform :as platform]
             [clojure.core.async :as async :refer [go <!]]
@@ -119,13 +120,14 @@
 
   Options map (opts) can include:
   - did - DiD information to use, if storing blocks as verifiable credentials
-  - context - Default @context map to use for ledgers formed with this connection
-    "
+  - defaultContext - Default @context map to use for ledgers formed with this connection"
   ([conn] (create conn nil nil))
   ([conn ledger-alias] (create conn ledger-alias nil))
   ([conn ledger-alias opts]
    (promise-wrap
-     (jld-ledger/create conn ledger-alias opts))))
+    (do
+      (log/info "Creating ledger" ledger-alias)
+      (jld-ledger/create conn ledger-alias opts)))))
 
 (defn load-from-address
   "Loads a ledger defined with a Fluree address, e.g.:
@@ -240,10 +242,10 @@
 
 (defn transact!
   "Expects a conn and json-ld document containing at least the following keys:
-  `@id`: the id of the ledger to transact to
+  `https://ns.flur.ee/ledger#ledger`: the id of the ledger to transact to
   `@graph`: the data to be transacted
 
-  Loads the specified ledger and peforms stage and commit! operations.
+  Loads the specified ledger and performs stage and commit! operations.
   Returns the new db.
 
   Note: Loading the ledger results in a new ledger object, so references to existing
@@ -251,7 +253,43 @@
   call `load` on the ledger alias."
   [conn json-ld opts]
   (promise-wrap
-    (transact-api/transact! conn json-ld opts)))
+   (let [context-type (or (:context-type opts) (conn-proto/-context-type conn))
+         parsed-txn   (transact-api/parse-json-ld-txn conn context-type json-ld)]
+     (log/trace "transact! context-type:" context-type)
+     (log/trace "transact! parsed-txn:" parsed-txn)
+     (transact-api/transact! conn parsed-txn opts))))
+
+(defn create-with-txn
+  "Creates a new ledger named by the @id key (or its context alias) in txn if it
+  doesn't exist and transacts the data in txn's @graph (or its context alias)
+  into it. Returns a promise with the transaction result (a db value)."
+  ([conn txn] (create-with-txn conn txn nil))
+  ([conn txn opts]
+   (log/trace "create-with-txn txn:" txn)
+   (log/trace "create-with-txn opts:" opts)
+   (let [context-type   (or (:context-type opts) (conn-proto/-context-type conn))
+         {ledger-id       const/iri-ledger
+          txn-context     "@context"
+          txn-opts        const/iri-opts
+          default-context const/iri-default-context
+          :as             parsed-txn} (transact-api/parse-json-ld-txn conn context-type txn)
+         _              (log/trace "create-with-txn parsed-txn:" parsed-txn)
+         ledger-exists? @(exists? conn ledger-id)]
+     (if ledger-exists?
+       (let [err-message (str "Ledger " ledger-id " already exists")]
+         (throw (ex-info err-message
+                         {:status 409
+                          :error  :db/ledger-exists})))
+       (let [opts*          (cond-> opts
+                              txn-opts (clojure.core/merge txn-opts)
+                              txn-context (assoc :txn-context txn-context)
+                              default-context (assoc :defaultContext default-context))
+             create-promise (create conn ledger-id opts*)
+             ledger         @create-promise]
+         (if (util/exception? ledger)
+           create-promise
+           (promise-wrap
+            (transact-api/ledger-transact! ledger parsed-txn opts*))))))))
 
 (defn status
   "Returns current status of ledger branch."
@@ -327,7 +365,7 @@
   that produced the changes."
   [ledger query]
   (let [latest-db (ledger-proto/-db ledger)
-        res-chan (query-api/history latest-db query)]
+        res-chan  (query-api/history latest-db query)]
     (promise-wrap res-chan)))
 
 (defn range
@@ -362,5 +400,6 @@
   Returns promise"
   [db iri]
   (promise-wrap
-    (->> (expand-iri db iri)
-         (dbproto/-subid db))))
+   (->> iri
+        (expand-iri db)
+        (dbproto/-subid db))))

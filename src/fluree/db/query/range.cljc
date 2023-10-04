@@ -97,34 +97,18 @@
            (and (not (:leftmost? node))
                 (flake/higher-than-all? (:first node) range-set)))))
 
-(defn query-filter
-  "Returns a transducer to filter flakes according to the boolean function values
-  of the `:subject-fn`, `:predicate-fn`, and `:object-fn` keys from the supplied
-  options map. All three functions are optional, and each supplied function will
-  be applied to its corresponding flake component, and only flakes where each
-  function evaluates to a truthy value will be included."
-  [{:keys [subject-fn predicate-fn object-fn]}]
-  (let [filter-xfs (cond-> []
-                     subject-fn   (conj (filter (fn [f] (subject-fn (flake/s f)))))
-                     predicate-fn (conj (filter (fn [f] (predicate-fn (flake/p f)))))
-                     object-fn    (conj (filter (fn [f] (object-fn (flake/o f))))))]
-    (apply comp filter-xfs)))
-
 (defn extract-query-flakes
   "Returns a transducer to extract flakes from each leaf from a stream of index
-  leaf nodes that satisfy the bounds specified in the supplied query options
-  map. The result of the transformation will be a stream of collections of
-  flakes from the leaf nodes in the input stream, with one flake collection for
-  each input leaf."
-  [{:keys [flake-xf] :as opts}]
-  (let [flake-xfs (cond-> [(query-filter opts)]
-                    flake-xf (conj flake-xf))
-        flake-xf* (apply comp flake-xfs)
-        query-xf  (comp (filter index/resolved-leaf?)
-                        (map :flakes)
-                        (map (fn [flakes]
-                               (into [] flake-xf* flakes))))]
-    query-xf))
+  leaf nodes, transformed by the `flake-xf` parameter specified in the supplied
+  query options map. The result of the transformation will be a stream of
+  collections of flakes from the leaf nodes in the input stream, with one flake
+  collection for each input leaf."
+  [{:keys [flake-xf] :as _opts}]
+  (let [flake-xf* (or flake-xf identity)]
+    (comp (filter index/resolved-leaf?)
+          (map :flakes)
+          (map (fn [flakes]
+                 (into [] flake-xf* flakes))))))
 
 (defn resolve-flake-slices
   "Returns a channel that will contain a stream of chunked flake collections that
@@ -306,19 +290,12 @@
      (index-range db idx start-test start-match end-test end-match opts)))
   ([db idx start-test start-match end-test end-match]
    (index-range db idx start-test start-match end-test end-match {}))
-  ([{:keys [policy t] :as db} idx start-test start-match end-test end-match
-    {:keys [object-fn] :as opts}]
+  ([{:keys [t] :as db} idx start-test start-match end-test end-match opts]
    (let [[s1 p1 o1 t1 op1 m1]
          (match->flake-parts db idx start-match)
 
          [s2 p2 o2 t2 op2 m2]
-         (match->flake-parts db idx end-match)
-
-         [[o1 o2] object-fn] (if-some [bool (cond (boolean? o1) o1
-                                                  (boolean? o2) o2
-                                                  :else nil)]
-                               [[nil nil] (fn [o] (= o bool))]
-                               [[o1 o2] object-fn])]
+         (match->flake-parts db idx end-match)]
 
      (go-try
        (let [s1*         (if (or (number? s1) (nil? s1))
@@ -329,7 +306,7 @@
                            (or (number? s2) (nil? s2))
                            s2
 
-                           (= s2 s1)                        ;; common case when 'test' is =
+                           (= s2 s1) ; common case when 'test' is =
                            s1*
 
                            :else
@@ -345,8 +322,7 @@
                                          :start-test start-test
                                          :start-flake start-flake
                                          :end-test end-test
-                                         :end-flake end-flake
-                                         :object-fn object-fn))]
+                                         :end-flake end-flake))]
          (async/alt!
            error-ch ([e]
                      (throw e))

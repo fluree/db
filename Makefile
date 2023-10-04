@@ -23,17 +23,17 @@ jar: target/fluree-db.jar
 package-lock.json node_modules: package.json
 	npm install && touch package-lock.json node_modules
 
-out/fluree-node-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
+out/fluree-node-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs shadow-cljs.edn $(SOURCES) $(NODEJS_SOURCES) $(RESOURCES)
 	npx shadow-cljs release fluree-node-sdk && cp out/nodejs/fluree-node-sdk.js out/fluree-node-sdk.js
 
 nodejs: out/fluree-node-sdk.js
 
-out/fluree-browser-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
+out/fluree-browser-sdk.js: package.json package-lock.json node_modules deps.edn src/deps.cljs shadow-cljs.edn $(SOURCES) $(BROWSER_SOURCES) $(RESOURCES)
 	npx shadow-cljs release fluree-browser-sdk && cp out/browser/fluree-browser-sdk.js out/fluree-browser-sdk.js
 
 browser: out/fluree-browser-sdk.js
 
-out/fluree-webworker.js: package.json package-lock.json node_modules deps.edn src/deps.cljs $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
+out/fluree-webworker.js: package.json package-lock.json node_modules deps.edn src/deps.cljs shadow-cljs.edn $(SOURCES) $(WEBWORKER_SOURCES) $(RESOURCES)
 	npx shadow-cljs release fluree-webworker && cp out/webworker/fluree-webworker.js out/fluree-webworker.js
 
 webworker: out/fluree-webworker.js

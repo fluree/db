@@ -3,7 +3,7 @@
             [fluree.db.constants :as const]
             [fluree.db.datatype :refer [coerce]])
   #?(:clj (:import (java.time LocalDate LocalTime OffsetDateTime OffsetTime
-                              ZoneOffset))))
+                              LocalDateTime ZoneOffset))))
 
 (deftest coerce-test
   (testing "strings"
@@ -55,16 +55,39 @@
               (OffsetTime/of 9 30 10 0 (ZoneOffset/of "-06:00"))
               :cljs
               #inst "1970-01-01T09:30:10.000-06:00")
-          (coerce "09:30:10-06:00" const/$xsd:time)))
+           (coerce "09:30:10-06:00" const/$xsd:time)))
     (is (= nil
            (coerce "12:42:5" const/$xsd:time)))
     (is (= nil
            (coerce "12:42:5Z" const/$xsd:time)))
+    (testing "nanoseconds"
+      (is (= #?(:clj
+                (OffsetTime/of 11 14 32 833000000 (ZoneOffset/of "Z"))
+                :cljs
+                #inst "1970-01-01T11:14:32.833-00:00")
+             (coerce "11:14:32.833Z" const/$xsd:time)))
+      (is (= #?(:clj
+                (OffsetTime/of 11 14 32 830000000 (ZoneOffset/of "Z"))
+                :cljs
+                #inst "1970-01-01T11:14:32.83-00:00")
+             (coerce "11:14:32.83Z" const/$xsd:time)))
+      (is (= #?(:clj
+                (OffsetTime/of 11 14 32 833100000 (ZoneOffset/of "Z"))
+                ;;only  3 digits of ms allowed in js
+                :cljs
+                nil)
+             (coerce "11:14:32.8331Z" const/$xsd:time)))
+      (is (= #?(:clj
+                (LocalTime/of 12 42 0 430000000)
+                :cljs
+                (js/Date. "1970-01-01T12:42:00.43"))
+             (coerce "12:42:00.43" const/$xsd:time))))
     (is (= #?(:clj
-              (OffsetTime/of 11 14 32 833000000 (ZoneOffset/of "Z"))
+              (LocalTime/of 12 42 0 433100000)
+              ;;only  3 digits of ms allowed in js
               :cljs
-              #inst "1970-01-01T11:14:32.833-00:00")
-           (coerce "11:14:32.833Z" const/$xsd:time)))
+              nil)
+           (coerce "12:42:00.4331" const/$xsd:time)))
     (is (= nil (coerce "foo" const/$xsd:time))))
 
   (testing "datetime"
@@ -83,10 +106,19 @@
               #inst "1980-10-05T11:23:00.000-00:00")
            (coerce "1980-10-05T11:23:00Z" const/$xsd:dateTime))
         "z")
-    (is (= #?(:clj (OffsetDateTime/of 2021 9 24 11 14 32 833000000 (ZoneOffset/of "Z")))
-           (coerce "2021-09-24T11:14:32.833Z" const/$xsd:dateTime))
-        "with nanoseconds")
-
+    (testing "nanoseconds"
+      (is (= #?(:clj (OffsetDateTime/of 2021 9 24 11 14 32 833000000 (ZoneOffset/of "Z")))
+             (coerce "2021-09-24T11:14:32.833Z" const/$xsd:dateTime)))
+      (is (= #?(:clj (OffsetDateTime/of 2021 9 24 11 14 32 833100000 (ZoneOffset/of "Z")))
+             (coerce "2021-09-24T11:14:32.8331Z" const/$xsd:dateTime)))
+      (is (= #?(:clj (OffsetDateTime/of 2021 9 24 11 14 32 830000000 (ZoneOffset/of "Z")))
+             (coerce "2021-09-24T11:14:32.83Z" const/$xsd:dateTime)))
+      (is (= #?(:clj (LocalDateTime/of 2021 9 24 11 14 32 833000000))
+             (coerce "2021-09-24T11:14:32.833" const/$xsd:dateTime)))
+      (is (= #?(:clj (LocalDateTime/of 2021 9 24 11 14 32 833100000))
+             (coerce "2021-09-24T11:14:32.8331" const/$xsd:dateTime)))
+      (is (= #?(:clj (LocalDateTime/of 2021 9 24 11 14 32 830000000))
+             (coerce "2021-09-24T11:14:32.83" const/$xsd:dateTime))))
     (is (= nil (coerce "foo" const/$xsd:dateTime))))
 
   (testing "decimal"

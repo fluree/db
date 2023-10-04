@@ -1,7 +1,8 @@
 (ns fluree.db.query.property-test
   (:require [clojure.test :refer [deftest is testing]]
             [fluree.db.test-utils :as test-utils]
-            [fluree.db.json-ld.api :as fluree]))
+            [fluree.db.json-ld.api :as fluree]
+            [test-with-files.tools :refer [with-tmp-dir] :as twf]))
 
 (deftest ^:integration equivalent-properties-test
   (testing "Equivalent properties"
@@ -131,7 +132,7 @@
                 "ex:new-pred"       {"id" "ex:nested"}
                 "ex:unlabeled-pred" "unlabeled"}}]
              @(fluree/query db2 {"@context" ["" {"ex:reversed-pred" {"@reverse" "ex:new-pred"}}]
-                                 "select"   {"?s" ["id" {"ex:reversed-pred" ["*"]} ]}
+                                 "select"   {"?s" ["id" {"ex:reversed-pred" ["*"]}]}
                                  "where"    [["?s" "@id" "ex:nested"]]}))
           "via reverse crawl")
       (is (= [{"id" "ex:nested", "ex:reversed-pred" "ex:subject-as-predicate"}]
@@ -139,3 +140,74 @@
                                  "select"   {"?s" ["id" "ex:reversed-pred"]}
                                  "where"    [["?s" "@id" "ex:nested"]]}))
           "via reverse no subgraph"))))
+
+(deftest nested-properties
+  (with-tmp-dir storage-path
+    (let [conn   @(fluree/connect {:method :file, :storage-path storage-path
+                                   :defaults {:context test-utils/default-str-context}})
+          ledger-id "bugproperty-iri"
+          ledger @(fluree/create conn ledger-id
+                                 {:defaultContext
+                                  ["" {"ex" "http://example.com/"
+                                       "owl" "http://www.w3.org/2002/07/owl#"}]})
+          db0      (->> @(fluree/stage (fluree/db ledger) {"ex:new" true})
+                        (fluree/commit! ledger)
+                        (deref))
+
+          _ (Thread/sleep 100)
+          db1    @(fluree/transact!
+                   conn {"f:ledger" ledger-id
+                         "@graph"
+                         [{"@id" "ex:givenName"
+                           "@type" "rdf:Property"
+                           "owl:equivalentProperty" {"@id" "ex:firstName"
+                                                     "@type" "rdf:Property"}
+                           "ex:preds" {"@list" [{"@id" "ex:cool"
+                                                 "@type" "rdf:Property"}
+                                                {"@id" "ex:fool"
+                                                 "@type" "rdf:Property"}]}}]}
+                   nil)
+          _ (Thread/sleep 100)
+          db2    @(fluree/transact!
+                   conn {"f:ledger" ledger-id
+                         "@graph"   [{"@id" "ex:andrew"
+                                      "ex:firstName" "Andrew"
+                                      "ex:age" 35}
+                                     {"@id" "ex:dan"
+                                      "ex:givenName" "Dan"}
+                                     {"@id" "ex:other"
+                                      "ex:fool" false
+                                      "ex:cool" true}]}
+                   nil)
+          loaded @(fluree/load conn ledger-id)
+          dbl    (fluree/db loaded)]
+      (testing "before load"
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
+               @(fluree/query db2 {"select" {"?s" ["*"]}
+                                   "where" [["?s" "ex:givenName" "?o"]]})))
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
+               @(fluree/query db2 {"select" {"?s" ["*"]}
+                                   "where" [["?s" "ex:firstName" "?o"]]})))
+
+        (is (= [["ex:other" true false]]
+               @(fluree/query db2 {"select" ["?s" "?cool" "?fool"]
+                                   "where" [["?s" "ex:cool" "?cool"]
+                                            ["?s" "ex:fool" "?fool"]]}))
+            "handle list values"))
+      (testing "after load"
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
+               @(fluree/query dbl {"select" {"?s" ["*"]}
+                                   "where"  [["?s" "ex:givenName" "?o"]]})))
+        (is (= [{"id" "ex:andrew", "ex:firstName" "Andrew", "ex:age" 35}
+                {"id" "ex:dan", "ex:givenName" "Dan"}]
+               @(fluree/query dbl {"select" {"?s" ["*"]}
+                                   "where"  [["?s" "ex:firstName" "?o"]]})))
+
+        (is (= [["ex:other" true false]]
+               @(fluree/query dbl {"select" ["?s" "?cool" "?fool"]
+                                   "where"  [["?s" "ex:cool" "?cool"]
+                                             ["?s" "ex:fool" "?fool"]]}))
+            "handle list values")))))

@@ -410,3 +410,19 @@
    (clojure.core/vswap! vol f arg1 arg2))
   ([vol f arg1 arg2 arg3]
    (clojure.core/vswap! vol f arg1 arg2 arg3)))
+
+(defn get-first
+  [json-ld k]
+  (get-in json-ld [k 0]))
+
+(defn get-first-value
+  [json-ld k]
+  (-> json-ld
+      (get-first k)
+      :value))
+
+(defn get-first-id
+  [json-ld k]
+  (-> json-ld
+      (get-first k)
+      :id))

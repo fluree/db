@@ -4,7 +4,7 @@
             [fluree.db.flake :as flake]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.json-ld :as json-ld]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]
@@ -162,67 +162,64 @@
                       :defaultContext (merge-template defaultContext json-ld-default-ctx-template))]
     (merge-template commit-map* json-ld-base-template)))
 
+(defn parse-db-data
+  [data]
+  {:id      (:id data)
+   :t       (get-first-value data const/iri-t)
+   :address (get-first-value data const/iri-address)
+   :flakes  (get-first-value data const/iri-flakes)
+   :size    (get-first-value data const/iri-size)})
+
 (defn json-ld->map
   "Turns json-ld commit meta into the clojure map structure."
   [commit-json-ld {:keys [commit-address spot post opst tspo]}]
-  (let [{id          :id,
-         address     const/iri-address,
-         v           const/iri-v,
-         alias       const/iri-alias,
-         branch      const/iri-branch,
-         issuer      const/iri-issuer
-         time        const/iri-time,
-         tag         const/iri-tag,
-         default-ctx const/iri-default-context
-         message     const/iri-message
-         prev-commit const/iri-previous,
-         data        const/iri-data,
-         ns          const/iri-ns,
-         index       const/iri-index} commit-json-ld
-        db-object (fn [{id      :id,
-                        t       const/iri-t,
-                        address const/iri-address,
-                        flakes  const/iri-flakes,
-                        size    const/iri-size :as _db-item}]
-                    {:id      id ;; db's unique identifier
-                     :t       (:value t)
-                     :address (:value address) ;; address to locate db
-                     :flakes  (:value flakes)
-                     :size    (:value size)})]
-    {:id             id
-     :address        (if (empty? (:value address)) ;; commit address, if using something like IPFS this is empty string
-                       commit-address
-                       (:value address))
-     :v              (:value v) ;; version of commit format
-     :alias          (:value alias) ;; human-readable alias name for ledger
-     :branch         (:value branch) ;; ledger's "branch" - if not included, default of 'main'
-     :issuer         (when issuer {:id (:id issuer)})
-     :time           (:value time) ;; ISO-8601 timestamp of commit
-     :tag            (mapv :value tag)
-     :message        (:value message)
-     :previous       {:id      (:id prev-commit)
-                      :address (get-in prev-commit [const/iri-address :value])} ;; previous commit address
-     ;; database information commit refers to:
-     :data           (db-object data)
-     ;; name service(s) used to manage global ledger state
-     ;; TODO - flesh out with final ns data structure
-     :ns             (when ns ;; one (or more) Fluree Name Services that can be consulted for the latest ledger state
-                       (if (sequential? ns)
-                         (mapv (fn [namespace] {:id (:id namespace)}) ns)
-                         {:id (:id ns)}))
-     ;; latest index (note the index roots below are not recorded into JSON-LD commit file, but short-cut when internally managing transitions)
-     :index          (when index
-                       {:id      (:id index) ;; unique id (hash of root) of index
-                        :address (get-in index [const/iri-address :value]) ;; address to get to index 'root'
-                        :data    (db-object (get index const/iri-data))
-                        :spot    spot ;; following 4 items are not recorded in the commit, but used to shortcut updated index retrieval in-process
-                        :post    post
-                        :opst    opst
-                        :tspo    tspo})
-     :defaultContext (let [address (get-in default-ctx [const/iri-address :value])]
-                       (-> default-ctx
+  (let [id          (:id commit-json-ld)
+        address     (-> commit-json-ld
+                        (get-first-value const/iri-address)
+                        not-empty
+                        (or commit-address)) ; address, if using something like
+                                             ; IPFS, is empty string
+        v           (get-first-value commit-json-ld const/iri-v)
+        alias       (get-first-value commit-json-ld const/iri-alias)
+        branch      (get-first-value commit-json-ld const/iri-branch)
+
+        time        (get-first-value commit-json-ld const/iri-time)
+        message     (get-first-value commit-json-ld const/iri-message)
+        tags        (get-first commit-json-ld const/iri-tag)
+        issuer      (get-first commit-json-ld const/iri-issuer)
+        prev-commit (get-first commit-json-ld const/iri-previous)
+        data        (get-first commit-json-ld const/iri-data)
+        ns          (get-first commit-json-ld const/iri-ns)
+
+        index       (get-first commit-json-ld const/iri-index)
+        default-ctx (get-first commit-json-ld const/iri-default-context)
+        ctx-address (get-first-value default-ctx const/iri-address)]
+    (cond->
+      {:id             id
+       :address        address
+       :v              v
+       :alias          alias
+       :branch         branch
+       :time           time
+       :message        message
+       :tag            (mapv :value tags)
+       :previous       {:id      (:id prev-commit)
+                        :address (get-first-value prev-commit const/iri-address)}
+       :data           (parse-db-data data)
+       :defaultContext (-> default-ctx
                            (select-keys [:id :type])
-                           (assoc :address address)))}))
+                           (assoc :address ctx-address))}
+      ns (assoc :ns (->> ns
+                         util/sequential
+                         (mapv (fn [namespace] {:id (:id namespace)}))))
+      index (assoc :index {:id      (:id index)
+                           :address (get-first-value index const/iri-address)
+                           :data    (parse-db-data (get-first index const/iri-data))
+                           :spot    spot
+                           :post    post
+                           :opst    opst
+                           :tspo    tspo})
+      issuer (assoc :issuer {:id (:id issuer)}))))
 
 
 (defn update-commit-id
@@ -452,8 +449,7 @@
      ;; v
      (flake/create t const/$_v v const/$xsd:int t true nil)
      ;; time
-     (flake/create t const/$_commit:time (util/str->epoch-ms time)
-                   const/$xsd:dateTime t true nil) ;; data
+     (flake/create t const/$_commit:time (util/str->epoch-ms time) const/$xsd:long t true nil) ;; data
      (flake/create t const/$_commit:data db-sid const/$xsd:anyURI t true nil)
 
      ;; db flakes

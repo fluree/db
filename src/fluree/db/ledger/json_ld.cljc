@@ -14,7 +14,7 @@
             [fluree.db.json-ld.reify :as jld-reify]
             [clojure.string :as str]
             [fluree.db.indexer.proto :as idx-proto]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [get-first get-first-value]]
             [fluree.db.util.context :as ctx-util]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
@@ -282,7 +282,7 @@
   "Returns ledger alias from commit map, if present. If not present
   then tries to resolve the ledger alias from the nameservice."
   [conn db-alias commit-map]
-  (or (get-in commit-map [const/iri-alias :value])
+  (or (get-first-value commit-map const/iri-alias)
       (->> (conn-proto/-nameservices conn)
            (some #(ns-proto/-alias % db-alias)))))
 
@@ -299,10 +299,10 @@
                                          {:status 400 :error :db/invalid-db})))
           _            (log/debug "load commit:" commit)
           ledger-alias (commit->ledger-alias conn db-alias commit)
-          branch       (keyword (get-in commit [const/iri-branch :value]))
+          branch       (keyword (get-first-value commit const/iri-branch))
           default-ctx  (-> commit
-                           (get-in [const/iri-default-context const/iri-address
-                                    :value])
+                           (get-first const/iri-default-context)
+                           (get-first-value const/iri-address)
                            (->> (jld-reify/load-default-context conn))
                            <?)
           ledger       (<? (create conn ledger-alias {:branch         branch

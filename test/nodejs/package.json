@@ -1,7 +1,7 @@
 {
   "name": "flureenjstest",
   "version": "0.0.0",
-  "description": "Use this to test builds of flureenjs",
+  "description": "Use this to test builds of fluree-node-sdk",
   "main": "index.js",
   "scripts": {
     "test": "jest"
@@ -10,7 +10,7 @@
     "@fluree/fluree-node-sdk": "file:../../out/nodejs/fluree-node-sdk.js"
   },
   "devDependencies": {
-    "jest": "^28.1.1",
-    "prettier": "^2.7.1"
+    "jest": "^29.7.0",
+    "prettier": "^3.0.3"
   }
 }

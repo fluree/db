@@ -4,7 +4,7 @@
             [fluree.db.constants :as const]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.json-ld.vocab :as vocab]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [get-first get-first-id get-first-value]]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.storage :as storage]
@@ -276,7 +276,6 @@
        :pid    @last-pid
        :sid    @last-sid})))
 
-
 (defn merge-flakes
   "Returns updated db with merged flakes."
   [db t refs flakes]
@@ -295,21 +294,67 @@
 (defn db-t
   "Returns 't' value from commit data."
   [db-data]
-  (let [db-t (get-in db-data [const/iri-t :value])]
+  (let [db-t (get-first-value db-data const/iri-t)]
     (when-not (pos-int? db-t)
       (commit-error
         (str "Invalid, or non existent 't' value inside commit: " db-t) db-data))
     db-t))
 
+(defn enrich-values
+  [id->node values]
+  (mapv (fn [{:keys [id list type] :as v-map}]
+          (if id
+            (merge (get id->node id)
+                   (cond-> v-map
+                     (nil? type) (dissoc :type)))
+            v-map))
+        values))
+
+(defn enrich-node
+  [id->node node]
+  (reduce-kv
+    (fn [updated-node k v]
+      (assoc updated-node k (cond (= :id k)         v
+                                  (:list (first v)) [{:list (enrich-values id->node (:list (first v)))}]
+                                  :else             (enrich-values id->node v))))
+    {}
+    node))
+
+(defn enrich-assertion-values
+  "`asserts` is a json-ld flattened (ish) sequence of nodes. In order to properly generate
+  sids (or pids) for these nodes, we need the full node additional context for ref objects. This
+  function traverses the asserts and builds a map of node-id->node, then traverses the
+  asserts again and merges each ref object into the ref's node.
+
+  example input:
+  [{:id \"foo:bar\"
+    \"ex:key1\" {:id \"foo:ref-id\"}}
+  {:id \"foo:ref-id\"
+   :type \"some:type\"}]
+
+  example output:
+  [{:id \"foo:bar\"
+    \"ex:key1\" {:id \"foo:ref-id\"
+                 :type \"some:type\"}}
+  {:id \"foo:ref-id\"
+   :type \"some:type\"}]
+  "
+  [asserts]
+  (let [id->node (reduce (fn [id->node {:keys [id] :as node}] (assoc id->node id node))
+                         {}
+                         asserts)]
+    (mapv (partial enrich-node id->node)
+          asserts)))
+
 (defn db-assert
   [db-data]
-  (let [commit-assert (get-in db-data [const/iri-assert])]
+  (let [commit-assert (get db-data const/iri-assert)]
     ;; TODO - any basic validation required
-    commit-assert))
+    (enrich-assertion-values commit-assert)))
 
 (defn db-retract
   [db-data]
-  (let [commit-retract (get-in db-data [const/iri-retract])]
+  (let [commit-retract (get db-data const/iri-retract)]
     ;; TODO - any basic validation required
     commit-retract))
 
@@ -327,7 +372,7 @@
   [commit-data]
   (let [has-proof? (contains? commit-data const/iri-cred-subj)
         commit     (if has-proof?
-                     (get commit-data const/iri-cred-subj)
+                     (get-first commit-data const/iri-cred-subj)
                      commit-data)]
     (if has-proof?
       (do
@@ -363,7 +408,9 @@
   (go-try
     (let [iri-cache          (volatile! {})
           refs-cache         (volatile! (-> db :schema :refs))
-          db-address         (get-in commit [const/iri-data const/iri-address :value])
+          db-address         (-> commit
+                                 (get-first const/iri-data)
+                                 (get-first-value const/iri-address))
           db-data            (<? (read-db conn db-address))
           t-new              (- (db-t db-data))
           _                  (when (and (not= t-new (dec t))
@@ -389,7 +436,7 @@
           prev-commit-flakes (when previous-id
                                (<? (commit-data/prev-commit-flakes db t-new
                                                                    previous-id)))
-          prev-data-id       (get-in prev-commit [const/iri-data :id])
+          prev-data-id       (get-first-id prev-commit const/iri-data)
           prev-db-flakes     (when prev-data-id
                                (<? (commit-data/prev-data-flakes db db-sid t-new
                                                                  prev-data-id)))
@@ -438,10 +485,16 @@
     (loop [[commit proof] latest-commit-tuple
            last-t        nil
            commit-tuples (list)]
-      (let [dbid             (get-in commit [const/iri-data :id])
-            db-address       (get-in commit [const/iri-data const/iri-address :value])
-            prev-commit-addr (get-in commit [const/iri-previous const/iri-address :value])
-            commit-t         (get-in commit [const/iri-data const/iri-t :value])
+      (let [dbid             (get-first-id commit const/iri-data)
+            db-address       (-> commit
+                                 (get-first const/iri-data)
+                                 (get-first-value const/iri-address))
+            prev-commit-addr (-> commit
+                                 (get-first const/iri-previous)
+                                 (get-first-value const/iri-address))
+            commit-t         (-> commit
+                                 (get-first const/iri-data)
+                                 (get-first-value const/iri-t))
             commit-tuples*   (conj commit-tuples [commit proof])]
         (when (or (nil? commit-t)
                   (and last-t (not= (dec last-t) commit-t)))
@@ -483,8 +536,11 @@
   [{:keys [ledger] :as db} latest-commit commit-address merged-db?]
   (go-try
     (let [{:keys [conn]} ledger
-          idx-meta   (get latest-commit const/iri-index) ;; get persistent index meta if ledger has indexes
-          db-base    (if-let [idx-address (get-in idx-meta [const/iri-address :value])]
+          idx-meta   (get-first latest-commit const/iri-index) ; get persistent
+                                                               ; index meta if
+                                                               ; ledger has
+                                                               ; indexes
+          db-base    (if-let [idx-address (get-first-value idx-meta const/iri-address)]
                        (<? (storage/reify-db conn db idx-address))
                        db)
           commit-map (commit-data/json-ld->map latest-commit

@@ -28,11 +28,11 @@
                             {:context    ["" {:ex "http://example.org/ns/"}]
                              :id         :ex/alice,
                              :schema/age nil})]
-      (is (= @(fluree/query db-age-retract
+      (is (= [{:id           :ex/alice,
+               :type     :ex/User,
+               :schema/name  "Alice"}]
+             @(fluree/query db-age-retract
                             '{:context ["" {:ex "http://example.org/ns/"}],
                               :select {?s [:*]},
-                              :where [[?s :id :ex/alice]]})
-             [{:id           :ex/alice,
-               :type     :ex/User,
-               :schema/name  "Alice"}])
+                              :where [[?s :id :ex/alice]]}))
           "Alice should no longer have an age property"))))
