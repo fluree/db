@@ -81,7 +81,7 @@
 (defn exists?
   [path]
   #?(:clj  (->> path io/file .exists)
-     :cljs (fs/existsSync full-path)))
+     :cljs (fs/existsSync path)))
 
 
 (defn local-path
