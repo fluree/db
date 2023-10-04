@@ -1,1 +1,0 @@
-(ns sid-tuple-test)
