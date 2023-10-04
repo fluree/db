@@ -32,6 +32,13 @@
   (or (get const/code->namespace ns-code)
       (-> db :namespaces-codes (get ns-code))))
 
+(defn append-name-codes
+  [ns-sid nme]
+  (into ns-sid
+        (comp (partition-all 8)
+              (map bytes/UTF8->long))
+        (bytes/string->UTF8 nme)))
+
 (defn iri->subid
   "Converts a string iri into a vector of long integer codes. The first code
   corresponds to the iri's namespace, and the remaining codes correspond to the
@@ -39,10 +46,7 @@
   [db iri]
   (let [[ns nme] (decompose-iri iri)]
     (when-let [ns-code (namespace->code db ns)]
-      (into [ns-code]
-            (comp (partition-all 8)
-                  (map bytes/UTF8->long))
-            (bytes/string->UTF8 nme)))))
+      (append-name-codes [ns-code] nme))))
 
 (defn subid->iri
   "Converts a vector as would be returned by `iri->subid` back into a string iri."

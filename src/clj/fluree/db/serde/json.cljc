@@ -3,6 +3,7 @@
             [fluree.db.serde.protocol :as serdeproto]
             [fluree.db.datatype :as datatype]
             [fluree.db.flake :as flake]
+            [fluree.db.json-ld.iri :as iri]
             [fluree.db.util.core :as util]
             #?(:clj  [fluree.db.util.clj-const :as uc]
                :cljs [fluree.db.util.cljs-const :as uc]))
@@ -15,6 +16,12 @@
   #{const/$xsd:date
     const/$xsd:dateTime
     const/$xsd:time})
+
+(defn deserialize-subject
+  [sid]
+  (let [ns  (nth sid 0)
+        nme (nth sid 1)]
+    (iri/append-name-codes [ns] nme)))
 
 (defn deserialize-flake
   [flake-vec]
