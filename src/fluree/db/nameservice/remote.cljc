@@ -5,18 +5,7 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.log :as log]))
 
-;conn-proto/iNameService
-;(-pull [this ledger] :TODO)
-;(-subscribe [this ledger] :TODO)
-;(-alias [this address]
-;        address)
-;(-lookup [this ledger-alias]
-;         (remote-lookup state servers ledger-alias))
-;(-address [_ ledger-alias {:keys [branch] :or {branch :main} :as _opts}]
-;          (go (str ledger-alias "/" (name branch) "/head")))
-;(-exists? [_ ledger-address]
-;          (remote-ledger-exists? state servers ledger-address))
-
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn remote-lookup
   [state servers ledger-address opts]

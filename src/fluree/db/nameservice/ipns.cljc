@@ -7,6 +7,8 @@
             [fluree.db.method.ipfs.keys :as ipfs-keys]
             [fluree.db.util.log :as log]))
 
+#?(:clj (set! *warn-on-reflection* true))
+
 (defn trim-slashes
   "Trims any leading or following slash '/' characters from string"
   [s]
