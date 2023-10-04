@@ -3,6 +3,8 @@
             [fluree.db.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
+            [fluree.db.nameservice.memory :as ns-memory]
+            [fluree.db.util.core :as util]
             [fluree.db.util.log :as log :include-macros true]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
@@ -12,7 +14,6 @@
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
-            [clojure.string :as str]
             [fluree.crypto :as crypto]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -77,63 +78,15 @@
   [data-atom context-key]
   (read-data data-atom context-key))
 
-(defn push!
-  [data-atom publish-address {commit-address :address :as ledger-data}]
-  (let [commit-path (address-path commit-address)
-        head-path   (address-path publish-address)]
-    (swap! data-atom
-           (fn [state]
-             (let [commit (get state commit-path)]
-               (when-not commit
-                 (throw (ex-info (str "Unable to locate commit in memory, cannot push!: " commit-address)
-                                 {:status 500 :error :db/invalid-db})))
-               (log/debug "pushing:" publish-address "referencing commit:" commit-address)
-               (let [commit (assoc commit "address" commit-address)]
-                 (assoc state head-path commit)))))
-    #?(:cljs (and platform/BROWSER (.setItem js/localStorage address-path commit-path)))
-    ledger-data))
-
 
 (defrecord MemoryConnection [id memory state ledger-defaults lru-cache-atom
-                             parallelism msg-in-ch msg-out-ch data-atom]
+                             parallelism msg-in-ch msg-out-ch nameservices data-atom]
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (go (read-commit data-atom commit-key)))
   (-c-write [_ _ledger commit-data] (go (write-commit! data-atom commit-data)))
   (-ctx-write [_ _ledger context-data] (go (write-context! data-atom context-data)))
   (-ctx-read [_ context-key] (go (read-context data-atom context-key)))
-
-  conn-proto/iNameService
-  (-pull [this ledger] :TODO)
-  (-subscribe [this ledger] :TODO)
-  (-push [this address ledger-data] (go (push! data-atom address ledger-data)))
-  (-alias [this address]
-    (-> (address-path address)
-        (str/split #"/")
-        (->> (drop 2)
-             (str/join "/"))))
-  (-lookup [this head-commit-address]
-    (go #?(:clj
-           (if-let [head-commit (read-address data-atom head-commit-address)]
-             (-> head-commit (get "address"))
-             (throw (ex-info (str "Unable to lookup ledger address from conn: "
-                                  head-commit-address)
-                             {:status 500 :error :db/missing-head})))
-
-           :cljs
-           (if platform/BROWSER
-             (if-let [head-commit (read-address data-atom head-commit-address)]
-               (memory-address head-commit)
-               (throw (ex-info (str "Unable to lookup ledger address from localStorage: "
-                                    head-commit-address)
-                               {:status 500 :error :db/missing-head})))
-             (throw (ex-info (str "Cannot lookup ledger address with memory connection: "
-                                  head-commit-address)
-                             {:status 500 :error :db/invalid-ledger}))))))
-  (-address [_ ledger-alias {:keys [branch] :or {branch :main} :as _opts}]
-    (go (memory-address (str ledger-alias "/" (name branch) "/head"))))
-  (-exists? [_ ledger-address]
-    (go (boolean (read-address data-atom ledger-address))))
 
   conn-proto/iConnection
   (-close [_]
@@ -159,6 +112,7 @@
                       ;; TODO - register/submit event
                       (log/warn "-msg-out: " msg)
                       :TODO))
+  (-nameservices [_] nameservices)
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
@@ -183,15 +137,22 @@
      :context-type context-type
      :did          did}))
 
+(defn default-memory-nameservice
+  "Returns memory nameservice"
+  [data-atom]
+  (ns-memory/initialize data-atom))
+
 (defn connect
   "Creates a new memory connection."
-  [{:keys [parallelism lru-cache-atom memory defaults]}]
+  [{:keys [parallelism lru-cache-atom memory defaults nameservices]}]
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
           data-atom       (atom {})
           state           (state-machine/blank-state)
-
+          nameservices*   (util/sequential
+                            (or nameservices
+                                (default-memory-nameservice data-atom)))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
@@ -203,4 +164,5 @@
                               :msg-out-ch      (async/chan)
                               :memory          true
                               :state           state
+                              :nameservices    nameservices*
                               :lru-cache-atom  lru-cache-atom}))))

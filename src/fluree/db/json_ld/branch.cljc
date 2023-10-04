@@ -32,15 +32,14 @@
 (defn new-branch-map
   "Returns a new branch name for specified branch name off of
   supplied current-branch."
-  [current-branch-map alias branch]
+  [current-branch-map alias branch ns-addresses]
   (let [{:keys [t commit]
          :or   {t 0}} current-branch-map
         ;; is current branch uncommitted? If so, when committing new branch we must commit current-branch too
         uncommitted? (and commit (> t (-> commit :db :t)))]
     {:name      branch
      :t         t
-     :commit    (commit-data/blank-commit {:alias  alias
-                                           :branch (util/keyword->str branch)})
+     :commit    (commit-data/blank-commit alias branch ns-addresses)
      ;:index     {:id               nil                      ;; unique id (hash of root) of index
      ;            :address          nil                      ;; address to get to index 'root'
      ;            :db               {}                       ;; db commit-map object of indexed db
@@ -49,8 +48,8 @@
      ;            :post             nil
      ;            :opst             nil
      ;            :tspo             nil}
-     :latest-db nil                                         ;; latest staged db (if different from commit-db)
-     :commit-db nil                                         ;; latest committed db
+     :latest-db nil ;; latest staged db (if different from commit-db)
+     :commit-db nil ;; latest committed db
      :from      (-> current-branch-map
                     (select-keys [:name :t])
                     (assoc :uncommitted? uncommitted?))}))
@@ -60,7 +59,7 @@
   [{:keys [t index] :as branch-data} {db-t :t, :as db}]
   (if (or (= (dec t) db-t)
           (= t db-t)
-          (zero? t))                                        ;; when loading a ledger from disk, 't' will be zero but ledger will be >= 1
+          (zero? t)) ;; when loading a ledger from disk, 't' will be zero but ledger will be >= 1
     (let [db* (dbproto/-index-update db index)]
       (-> branch-data
           (assoc :t db-t

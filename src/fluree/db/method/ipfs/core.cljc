@@ -57,12 +57,13 @@
 (defn push!
   "Publishes ledger metadata document (ledger root) to IPFS and recursively updates any
   directory files, culminating in an update to the IPNS address."
-  [ipfs-endpoint address commit-map]
+  [ipfs-endpoint commit-map]
   (go-try
-    (let [{:keys [meta db ledger-state]} commit-map
+    (let [{:keys [meta db ledger-state ns]} commit-map
+          my-ns-iri   (some #(when (re-matches #"^fluree:file:.+" (:id %)) (:id %)) ns)
           {:keys [t]} db
           {:keys [hash size]} meta
-          {:keys [ipns-address relative-address]} (address-parts address)
+          {:keys [ipns-address relative-address]} (address-parts my-ns-iri)
           current-dag-map  (<? (ipfs-dir/refresh-state ipfs-endpoint (str "/ipns/" ipns-address)))
           updated-dir-map  (<? (ipfs-dir/update-directory! current-dag-map ipfs-endpoint relative-address hash size))
           _                (swap! ledger-state update-in [:push :pending] assoc :t t :dag updated-dir-map)

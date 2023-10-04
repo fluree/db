@@ -4,7 +4,8 @@
 
 (defprotocol iCommit
   ;; retrieving/updating DBs
-  (-commit! [ledger db] [ledger db opts] "Commits a db to a ledger."))
+  (-commit! [ledger db] [ledger db opts] "Commits a db to a ledger.")
+  (-notify [ledger commit-notification] "Notifies of an updated commit for a given ledger, will attempt cached ledger."))
 
 (defprotocol iLedger
   ;; retrieving/updating DBs

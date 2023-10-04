@@ -8,6 +8,7 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.dbproto :as dbproto]
+            [fluree.db.nameservice.core :as nameservice]
             [fluree.json-ld :as json-ld]))
 
 (defn stage
@@ -98,8 +99,8 @@
            ledger-id       const/iri-ledger
            txn-opts        const/iri-opts
            default-context const/iri-default-context} parsed-json-ld
-          address (<? (conn-proto/-address conn ledger-id nil))]
-      (if-not (<? (conn-proto/-exists? conn address))
+           address         (<? (nameservice/primary-address conn ledger-id nil))]
+      (if-not (<? (nameservice/exists? conn address))
         (throw (ex-info "Ledger does not exist" {:ledger address}))
         (let [ledger (<? (jld-ledger/load conn address))
               opts   (cond-> opts

@@ -17,6 +17,7 @@
             [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
+            [fluree.db.nameservice.core :as nameservice]
             [fluree.db.validation :as v]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -163,7 +164,7 @@
   [conn query]
   (go-try
     (let [ledger-alias (:from query)
-          ledger-address (<? (conn-proto/-address conn ledger-alias nil))
+          ledger-address (<? (nameservice/primary-address conn ledger-alias nil))
           ledger (<? (jld-ledger/load conn ledger-address))]
       (<? (query-fql (ledger-proto/-db ledger) (dissoc query :from))))))
 
