@@ -177,6 +177,29 @@
   ;;TODO: not yet supported
   #_(testing "language labels"))
 
+(deftest parse-prefixes
+  (testing "PREFIX"
+    (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+                 SELECT ?name ?mbox
+                 WHERE {?x foaf:name ?name.
+                        ?x foaf:mbox ?mbox}"
+          {:keys [context where]} (sparql/->fql query)]
+      (is (= {"foaf" "http://xmlns.com/foaf/0.1/"}
+             context))
+      (is (= [["?x" "foaf:name" "?name"]
+              ["?x" "foaf:mbox" "?mbox"]]
+             where))))
+  (testing "multiple PREFIXes"
+    (let [query "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+                 PREFIX ex: <http://example.org/ns/>
+                 SELECT ?name ?mbox
+                 WHERE {?x foaf:name ?name.
+                        ?x foaf:mbox ?mbox}"
+          {:keys [context]} (sparql/->fql query)]
+      (is (= {"foaf" "http://xmlns.com/foaf/0.1/"
+              "ex"   "http://example.org/ns/"}
+             context)))))
+
 (deftest parse-modifiers
   (testing "LIMIT"
     (let [query "SELECT ?person
