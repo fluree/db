@@ -1,5 +1,6 @@
 (ns fluree.db.query.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
+            [clojure.string :as str]
             [malli.core :as m]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
@@ -49,18 +50,25 @@
         [:map-of :keyword :any]
         [:map
          [:from {:optional true} [:or
-                                  [:= :latest]
-                                  [:int {:min 0}]
-                                  [:re datatype/iso8601-datetime-re]]]
+                                  [:= {:error/message "the key \"latest\""}:latest]
+                                  [:int {:min 0
+                                         :error/message "an integer > 0"} ]
+                                  [:re {:error/message "an iso-8601 datetime value"}
+                                   datatype/iso8601-datetime-re]]]
          [:to {:optional true} [:or
-                                [:= :latest]
-                                [:int {:min 0}]
-                                [:re datatype/iso8601-datetime-re]]]
+                                [:= {:error/message "the key \"latest\""} :latest]
+                                [:int {:min 0
+                                       :error/message "an integer > 0"}]
+                                [:re {:error/message "an iso-8601 datetime value"}
+                                 datatype/iso8601-datetime-re]]]
          [:at {:optional true} [:or
-                                [:= :latest]
-                                [:int {:min 0}]
-                                [:re datatype/iso8601-datetime-re]]]]
-        [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+                                  [:= {:error/message "the key \"latest\""}:latest]
+                                  [:int {:min 0
+                                         :error/message "an integer > 0"} ]
+                                  [:re {:error/message "an iso-8601 datetime value"}
+                                   datatype/iso8601-datetime-re]]]]
+        ;;TODO reword, does not explain that "at" is also an option.
+        [:fn {:error/message "either \"from\" or \"to\" `t` keys must be provided."}
          (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
            (if at
@@ -71,9 +79,10 @@
                                    (<= from to)
                                    true))]]]]
      extra-kvs)
-     [:fn {:error/message "Must supply either a :history or :commit-details key."}
+     [:fn {:error/message "Must supply a value for either \"history\" or \"commit-details\"."}
       (fn [{:keys [history commit-details t]}]
-        (or history commit-details))]])
+        (or (string? history) (keyword? history) (seq history) commit-details))]])
+
 
 (def registry
   (merge
@@ -108,6 +117,28 @@
        - :latest keyword"
   (m/coercer ::history-query (mt/transformer {:name :fql})
              {:registry registry}))
+
+
+(defn coalesce-disjunction-error-map
+  [error-map]
+  (into [] (map (fn [[k v]]
+                  (str "Error in value of key \"" (name k) "\": must be one of: " (str/join ", " v) ".")))
+        error-map))
+
+(defn coalesce-for-key
+  [error k]
+  (when-let [errs (get error k)]
+    (if (map? errs)
+      (coalesce-disjunction-error-map errs)
+      (str "Error in value of key \"" (name k) "\": " (str/join " " errs)))))
+
+(defn massage-history-errors
+  [humanized-error]
+  ;;TODO could have errors from more than one place.
+  (str/join "" (or (get humanized-error :malli/error)
+                   (coalesce-for-key humanized-error :t)
+                   (coalesce-for-key humanized-error :commit-details))))
+
 
 (def explain-error
   (m/explainer ::history-query {:registry registry}))
