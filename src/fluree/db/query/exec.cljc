@@ -48,15 +48,15 @@
   exception if there was an error."
   [db fuel-tracker q]
   (go
-    (let [error-ch     (async/chan)
-          result-ch    (->> (where/search db q fuel-tracker error-ch)
-                            (group/combine q)
-                            (having/filter q error-ch)
-                            (order/arrange q)
-                            (select/format db q error-ch)
-                            (drop-offset q)
-                            (take-limit q)
-                            (collect-results q))]
+    (let [error-ch  (async/chan)
+          result-ch (->> (where/search db q fuel-tracker error-ch)
+                         (group/combine q)
+                         (having/filter q error-ch)
+                         (order/arrange q)
+                         (select/format db q error-ch)
+                         (drop-offset q)
+                         (take-limit q)
+                         (collect-results q))]
       (async/alt!
         error-ch  ([e] e)
         result-ch ([result] result)))))
