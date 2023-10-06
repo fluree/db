@@ -3,7 +3,8 @@
             [fluree.db.util.core :refer [pred-ident?]]
             [fluree.db.constants :as const]
             [malli.core :as m]
-            [malli.error :as me]))
+            [malli.error :as me]
+            [malli.util :as mu]))
 
 (defn iri?
   [v]
@@ -64,6 +65,41 @@
 (defn humanize-error
   [error]
   (-> error ex-data :data :explain me/humanize))
+
+(defn explain-error
+  [error]
+  (-> error ex-data :data :explain))
+
+(defn format-explained-errors
+  "Takes the output of `explain` and emits a string
+  explaining the error(s) in plain english. "
+  [explained-error]
+  (let [{:keys [errors schema value]} explained-error
+        error-data (->> errors
+                        (mapv #(-> %
+                                   (assoc :message (me/error-message %))
+                                   (assoc :op (m/type (mu/get-in schema (pop (:path %)))))))
+                        (group-by (comp pop :path))
+                        ;;ensure errors always print in the same order
+                        (into (sorted-map-by (fn [l r]
+                                               (compare (mapv pr-str l)
+                                                        (mapv pr-str r))))))]
+    (if-let [top-level-error (get error-data [0])]
+      (-> top-level-error first :message)
+      (str/join "\n"(into [] (map (fn [[path data]]
+                                    (let [{:keys [op in]} (first data)
+                                          provided (get-in value in)
+                                          position (peek in)]
+                                      (str "Error"
+                                           ;;TODO position might be a number, as in a vector.
+                                           (when position (str " in value of field " position))
+                                           ": must meet " (case op
+                                                            :or "one of "
+                                                            :and "all of "
+                                                            "") "the following criteria: "
+                                           (str/join ", "  (map :message data))
+                                           "\n Provided: " (pr-str provided)))))
+                          error-data)))))
 
 (def registry
   (merge

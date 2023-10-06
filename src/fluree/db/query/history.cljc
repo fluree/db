@@ -48,6 +48,7 @@
       [:t
        [:and
         [:map-of :keyword :any]
+        ;;TODO how to just have one error mesage for all of from?
         [:map
          [:from {:optional true} [:or
                                   [:= {:error/message "the key \"latest\""}:latest]
@@ -117,28 +118,6 @@
        - :latest keyword"
   (m/coercer ::history-query (mt/transformer {:name :fql})
              {:registry registry}))
-
-
-(defn coalesce-disjunction-error-map
-  [error-map]
-  (into [] (map (fn [[k v]]
-                  (str "Error in value of key \"" (name k) "\": must be one of: " (str/join ", " v) ".")))
-        error-map))
-
-(defn coalesce-for-key
-  [error k]
-  (when-let [errs (get error k)]
-    (if (map? errs)
-      (coalesce-disjunction-error-map errs)
-      (str "Error in value of key \"" (name k) "\": " (str/join " " errs)))))
-
-(defn massage-history-errors
-  [humanized-error]
-  ;;TODO could have errors from more than one place.
-  (str/join "" (or (get humanized-error :malli/error)
-                   (coalesce-for-key humanized-error :t)
-                   (coalesce-for-key humanized-error :commit-details))))
-
 
 (def explain-error
   (m/explainer ::history-query {:registry registry}))

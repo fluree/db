@@ -93,8 +93,8 @@
                            (throw
                              (ex-info
                                (-> e
-                                   v/humanize-error
-                                   history/massage-history-errors)
+                                   v/explain-error
+                                   v/format-explained-errors)
                                {:status  400
                                 :error   :db/invalid-query}))))
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]

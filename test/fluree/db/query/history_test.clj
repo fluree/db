@@ -35,7 +35,7 @@
                                (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data bad-commit-details-err)))
-        (is (= "Error in value of key \"commit-details\": should be a boolean"
+        (is (= "Error in value of field :commit-details: must meet the following criteria: should be a boolean\n Provided: \"I like cats\""
                (ex-message bad-commit-details-err)))))
     (testing "missing subject"
       (let [missing-subject {:history nil}
@@ -58,28 +58,28 @@
                             (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data bad-ts-err)))
-        (is (= "Error in value of key \"t\": \"from\" value must be less than or equal to \"to\" value."
+        (is (= "Error in value of field :t: must meet all of the following criteria: \"from\" value must be less than or equal to \"to\" value.\n Provided: {:from 2, :to 0}"
                (ex-message bad-ts-err))))
       (let [bad-t {:history [:ex/cat] :t {:from -2 :to -1}}
             bad-t-err (try @(fluree/history ledger bad-t)
                            (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data bad-t-err)))
-        (is (= "Error in value of key \"from\": must be one of: the key \"latest\", an integer > 0, an iso-8601 datetime value.Error in value of key \"to\": must be one of: the key \"latest\", an integer > 0, an iso-8601 datetime value."
+        (is (= "Error in value of field :from: must meet one of the following criteria: the key \"latest\", an integer > 0, an iso-8601 datetime value\n Provided: -2\nError in value of field :to: must meet one of the following criteria: the key \"latest\", an integer > 0, an iso-8601 datetime value\n Provided: -1"
                (ex-message bad-t-err))))
       (let [no-t {:history [:ex/cat] :t {}}
             no-t-err (try @(fluree/history ledger no-t)
                           (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data no-t-err)))
-        (is (= "Error in value of key \"t\": either \"from\" or \"to\" `t` keys must be provided."
+        (is (= "Error in value of field :t: must meet all of the following criteria: either \"from\" or \"to\" `t` keys must be provided.\n Provided: {}"
                (ex-message no-t-err))))
       (let [invalid-t-keys {:history [:ex/cat] :t {:at 1 :from 1}}
             invalid-t-keys-err (try @(fluree/history ledger invalid-t-keys)
                                     (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data invalid-t-keys-err)))
-        (is (= "Error in value of key \"t\": either \"from\" or \"to\" `t` keys must be provided."
+        (is (= "Error in value of field :t: must meet all of the following criteria: either \"from\" or \"to\" `t` keys must be provided.\n Provided: {:at 1, :from 1}"
                (ex-message invalid-t-keys-err)))))))
 
 (deftest ^:integration history-query-test
