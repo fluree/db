@@ -75,14 +75,19 @@
                          (flake/create type-sid const/$xsd:anyURI class-iri const/$xsd:string t true nil)))))
         [class-sids class-flakes]))))
 
+(defn retract-flakes
+  [db s p t]
+  (query-range/index-range db
+                           :spot = [s p]
+                           {:flake-xf (map #(flake/flip-flake % t))}))
+
 (defn add-property
   "Adds property. Parameters"
   [sid pid shacl-dt shape->p-shapes check-retracts? list? {:keys [language value] :as v-map}
    {:keys [t db-before subj-mods] :as tx-state}]
   (go-try
     (let [retractions (when check-retracts? ;; don't need to check if generated pid during this transaction
-                        (->> (<? (query-range/index-range db-before :spot = [sid pid]))
-                             (map #(flake/flip-flake % t))))
+                        (<? (retract-flakes db-before sid pid t)))
 
           m           (cond-> nil
                         list? (assoc :i (-> v-map :idx last))
@@ -202,12 +207,6 @@
   [s iri t]
   (flake/create s const/$xsd:anyURI iri const/$xsd:string t true nil))
 
-(defn retract-flakes
-  [db s p t]
-  (query-range/index-range db
-                           :spot = [s p]
-                           {:flake-xf (map #(flake/flip-flake % t))}))
-
 (defn property-value->flakes
   [sid pid property value pid->shape->p-shapes pid->shacl-dt new-subj? existing-pid?
    {:keys [t db-before] :as tx-state}]
@@ -305,9 +304,7 @@
                                      (recur r true (into flakes new-flakes)))
                                    flakes))]
                 (recur r (into subj-flakes new-flakes)))
-              (let [retracting-flakes (<? (query-range/index-range db-before
-                                                                   :spot = [sid pid]
-                                                                   {:flake-xf (map #(flake/flip-flake % t))}))]
+              (let [retracting-flakes (<? (retract-flakes db-before sid pid t))]
                 (recur r (into subj-flakes retracting-flakes)))))
           ;; return two-tuple of node's final sid (needed to link nodes together) and the resulting flakes
           [sid subj-flakes])))))
