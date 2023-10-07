@@ -70,36 +70,60 @@
   [error]
   (-> error ex-data :data :explain))
 
+
+;;TODO simplify
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string
-  explaining the error(s) in plain english. "
-  [explained-error]
-  (let [{:keys [errors schema value]} explained-error
-        error-data (->> errors
-                        (mapv #(-> %
-                                   (assoc :message (me/error-message %))
-                                   (assoc :op (m/type (mu/get-in schema (pop (:path %)))))))
-                        (group-by (comp pop :path))
-                        ;;ensure errors always print in the same order
-                        (into (sorted-map-by (fn [l r]
-                                               (compare (mapv pr-str l)
-                                                        (mapv pr-str r))))))]
-    (if-let [top-level-error (get error-data [0])]
-      (-> top-level-error first :message)
-      (str/join "\n"(into [] (map (fn [[path data]]
-                                    (let [{:keys [op in]} (first data)
-                                          provided (get-in value in)
-                                          position (peek in)]
-                                      (str "Error"
-                                           ;;TODO position might be a number, as in a vector.
-                                           (when position (str " in value of field " position))
-                                           ": must meet " (case op
-                                                            :or "one of "
-                                                            :and "all of "
-                                                            "") "the following criteria: "
-                                           (str/join ", "  (map :message data))
-                                           "\n Provided: " (pr-str provided)))))
-                          error-data)))))
+  explaining the error(s) in plain english.
+
+  Chooses the most general error (highest in the schema tree)"
+  ([explained-error] (format-explained-errors explained-error {}))
+  ([explained-error error-opts]
+   (let [{:keys [errors schema value]} explained-error
+         error-data (->> errors
+                         (mapv (fn [e]
+                                 (let [[path message] (me/-resolve-root-error
+                                                        explained-error
+                                                        e
+                                                        error-opts)]
+                                   (-> e
+                                       ;;  (assoc :path path)
+                                       ;;  (assoc :in (mu/path->in schema path))
+                                       ;;TODO  Provided value is wrong because mu/path->in is not
+                                       ;; the right thing here.
+                                       ;;  (assoc :value (get-in value (mu/path->in schema path)))
+                                       (assoc :message message)
+                                       (assoc :op (m/type (mu/get-in schema (pop (:path e)))))))))
+                         ;;TODO now that we resolve-root-error, this group-by might not make sense
+                         (group-by (comp pop :path))
+                         (into (sorted-map-by (fn [l r]
+                                                (compare (mapv pr-str l)
+                                                         (mapv pr-str r))))) )]
+     ;;TODO: check that this is even needed and works in the absence of root errors
+     (let [[path data] (first error-data)]
+       (let [{:keys [op in value]} (first data)
+             position (peek in)
+             messages (distinct
+                        (map (fn [{inner-schema :schema
+                                   :keys [message]}]
+                               ;;override unhelpful type errors
+                               (if (= message "invalid type")
+                                 (str "should be "
+                                      (name (m/type inner-schema))
+                                      ".")
+                                 message))
+                             data))]
+         (str
+           (when (> (count messages) 1)
+             (str "Errors: must meet "
+                  (case op
+                    (:or :orn) "one of "
+                    :and "all of "
+                    "")
+                  "the following criteria: "))
+           (str/join ", " messages )
+           ;;TODO, wrong value is provided sometimes?
+           " Provided: " (pr-str value)))))))
 
 (def registry
   (merge
@@ -112,7 +136,8 @@
                             ::iri-key ::iri]
     ::json-ld-keyword      [:keyword {:decode/json decode-json-ld-keyword
                                       :decode/fql  decode-json-ld-keyword}]
-    ::var                  [:fn variable?]
+    ::var                  [:fn {:error/message "should be a valid variable, eg \"?s\""}
+                            variable?]
     ::val                  [:fn value?]
     ::subject              [:orn
                             [:sid [:fn sid?]]
@@ -155,9 +180,10 @@
     ::where-tuple          [:orn
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
-    ::where                [:sequential [:orn
-                                         [:where-map ::where-map]
-                                         [:tuple ::where-tuple]]]
+    ::where                [:sequential {:error/message "Where clause should be a vector of maps or tuples."}
+                            [:orn
+                             [:where-map ::where-map]
+                             [:tuple ::where-tuple]]]
     ::delete               [:orn
                             [:single ::triple]
                             [:collection [:sequential ::triple]]]

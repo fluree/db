@@ -209,3 +209,28 @@
                  group-by))
           (is (= [['?name :asc]]
                  order-by)))))))
+(deftest test-validation
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "query/parse"
+                               {:defaultContext ["" {:ex "http://example.org/ns/"}]})
+        db     @(fluree/stage
+                  (fluree/db ledger)
+                  [{:id           :ex/brian,
+                    :type         :ex/User,
+                    :schema/name  "Brian"}
+                   {:id           :ex/alice,
+                    :type         :ex/User,
+                    :schema/name  "Alice"}
+                   {:id          :ex/cam,
+                    :type        :ex/User,
+                    :schema/name "Cam"}])]
+    (testing "group-by"
+      (let [bad-type '{:select [?s]
+                       :where [[?s ?p ?o]]
+                       :group-by {}}
+            bad-type-err (try @(fluree/query db bad-type)
+                              (catch Exception e e))]
+        (is (= {:status 400 :error :db/invalid-query}
+               (ex-data bad-type-err)))
+        (is (= "Invalid groupBy clause, must be a variable or a vector of variables. Provided: {}"
+               (ex-message bad-type-err)))))) )

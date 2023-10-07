@@ -138,10 +138,10 @@
                                  [:catn
                                   [:direction ::direction]
                                   [:dimension ::var]]]]]
-    ::order-by        [:orn
+    ::order-by        [:orn {:error/message  "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]."}
                        [:clause ::ordering]
                        [:collection [:sequential ::ordering]]]
-    ::group-by        [:orn
+    ::group-by        [:orn {:error/message "Invalid groupBy clause, must be a variable or a vector of variables."}
                        [:clause ::var]
                        [:collection [:sequential ::var]]]
     ::triple          ::v/triple
@@ -164,6 +164,25 @@
 (def coerce-query*
   (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
 
+(def default-error-overrides
+  (-> me/default-errors
+      (assoc
+        ::m/missing-key
+        {:error/fn
+         (fn [{:keys [in]} _]
+           (let [k (-> in last name)]
+             (str "Query is missing a '" k "' clause. "
+                  "'" k "' is required in queries. "
+                  "See documentation here for details: "
+                  docs/error-codes-page "#query-missing-" k)))}
+        ::m/extra-key
+        {:error/fn
+         (fn [{:keys [in]} _]
+           (let [k (-> in last name)]
+             (str "Query contains an unknown key: '" k "'. "
+                  "See documentation here for more information on allowed query keys: "
+                  docs/error-codes-page "#query-unknown-key")))})))
+
 (defn humanize-error
   [error]
   (let [explain-data (-> error ex-data :data :explain)]
@@ -171,45 +190,17 @@
                (update explain-data :errors
                        (fn [errors] (map #(dissoc % :schema) errors))))
     (-> explain-data
-        (me/humanize
-         {:errors
-          (-> me/default-errors
-              (assoc
-                ::m/missing-key
-                {:error/fn
-                 (fn [{:keys [in]} _]
-                   (let [k (-> in last name)]
-                     (str "Query is missing a '" k "' clause. "
-                          "'" k "' is required in queries. "
-                          "See documentation here for details: "
-                          docs/error-codes-page "#query-missing-" k)))}
-                ::m/extra-key
-                {:error/fn
-                 (fn [{:keys [in]} _]
-                   (let [k (-> in last name)]
-                     (str "Query contains an unknown key: '" k "'. "
-                          "See documentation here for more information on allowed query keys: "
-                          docs/error-codes-page "#query-unknown-key")))}))}))))
+        (v/format-explained-errors {:errors default-error-overrides}))))
 
-(defn coalesce-query-errors
-  [humanized-errors qry]
-  (str "Invalid query: " (pr-str qry) " - "
-       (str/join "; "
-                 (if (map? humanized-errors)
-                   (map (fn [[k v]]
-                          (str (name k) ": "
-                               (str/join " " v))) humanized-errors)
-                   humanized-errors))))
 
 (defn coerce-query
   [qry]
   (try*
-   (coerce-query* qry)
-   (catch* e
-     (let [he        (humanize-error e)
-           _         (log/trace "humanized errors:" he)
-           error-msg (coalesce-query-errors he qry)]
-       (throw (ex-info error-msg {:status 400, :error :db/invalid-query}))))))
+    (coerce-query* qry)
+    (catch* e
+            (let [error-msg        (humanize-error e)
+                  _         (log/trace "humanized errors:" error-msg)]
+              (throw (ex-info error-msg {:status 400, :error :db/invalid-query}))))))
 
 (def coerce-modification*
   (m/coercer ::modification (mt/transformer {:name :fql}) {:registry registry}))

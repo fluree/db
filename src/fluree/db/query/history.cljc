@@ -42,7 +42,8 @@
            [:s [:maybe ::iri]]
            [:p ::iri]
            [:o [:not :nil]]]]]]]
-      [:commit-details {:optional true} :boolean]
+      [:commit-details {:optional true
+                        :error/message "Value of \"commit-details\" must be a boolean."} :boolean]
       [:context {:optional true} ::context]
       [:opts {:optional true} [:map-of :keyword :any]]
       [:t
@@ -50,24 +51,21 @@
         [:map-of :keyword :any]
         ;;TODO how to just have one error mesage for all of from?
         [:map
-         [:from {:optional true} [:or
-                                  [:= {:error/message "the key \"latest\""}:latest]
-                                  [:int {:min 0
-                                         :error/message "an integer > 0"} ]
-                                  [:re {:error/message "an iso-8601 datetime value"}
-                                   datatype/iso8601-datetime-re]]]
-         [:to {:optional true} [:or
-                                [:= {:error/message "the key \"latest\""} :latest]
-                                [:int {:min 0
-                                       :error/message "an integer > 0"}]
-                                [:re {:error/message "an iso-8601 datetime value"}
-                                 datatype/iso8601-datetime-re]]]
-         [:at {:optional true} [:or
-                                  [:= {:error/message "the key \"latest\""}:latest]
-                                  [:int {:min 0
-                                         :error/message "an integer > 0"} ]
-                                  [:re {:error/message "an iso-8601 datetime value"}
-                                   datatype/iso8601-datetime-re]]]]
+         [:from {:optional true
+                 :error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value."} [:or
+                                  [:= :latest]
+                                  [:int {:min 0} ]
+                                  [:re datatype/iso8601-datetime-re]]]
+         [:to {:optional true
+               :error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value."} [:or
+                                [:=  :latest]
+                                [:int {:min 0}]
+                                [:re datatype/iso8601-datetime-re]]]
+         [:at {:optional true
+               :error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value."} [:or
+                                  [:= :latest]
+                                  [:int {:min 0} ]
+                                  [:re datatype/iso8601-datetime-re]]]]
         ;;TODO reword, does not explain that "at" is also an option.
         [:fn {:error/message "either \"from\" or \"to\" `t` keys must be provided."}
          (fn [{:keys [from to at]}]
