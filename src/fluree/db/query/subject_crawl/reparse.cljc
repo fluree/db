@@ -4,7 +4,8 @@
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             #?(:clj [fluree.db.query.exec.select]
                :cljs [fluree.db.query.exec.select :refer [SubgraphSelector]])
-            [fluree.db.query.exec.where :as where])
+            [fluree.db.query.exec.where :as where]
+            [fluree.db.dbproto :as dbproto])
   #?(:clj (:import [fluree.db.query.exec.select SubgraphSelector])))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -99,11 +100,20 @@
       var {:variable var}
       val {:value val})))
 
+(defn reparse-predicate-component
+  [db pred]
+  (let [reparsed (reparse-component pred)]
+    (if (contains? reparsed :value)
+      (update reparsed :value (fn [iri]
+                                (if-not (number? iri)
+                                  (dbproto/-p-prop db :id iri)
+                                  iri)))
+      reparsed)))
 
 (defn re-parse-pattern
   "Re-parses a pattern into the format recognized
   by downstream simple-subject-crawl code"
-  [pattern]
+  [db pattern]
   (let [type (where/pattern-type pattern)
         [s p o] (if (= :tuple type)
                   pattern
@@ -111,24 +121,24 @@
                     tuple))]
     {:type type
      :s (reparse-component s)
-     :p (reparse-component p)
+     :p (reparse-predicate-component db p)
      :o (assoc (reparse-component o) :datatype (::where/datatype o))}))
 
 (defn simple-subject-merge-where
   "Revises where clause for simple-subject-crawl query to optimize processing.
   If where does not end up meeting simple-subject-crawl criteria, returns nil
   so other strategies can be tried."
-  [{:keys [where vars] :as parsed-query}]
+  [db {:keys [where vars] :as parsed-query}]
   (let [{::where/keys [patterns]} where
         [first-pattern & rest-patterns] patterns
-        reparsed-first-clause (re-parse-pattern first-pattern)]
+        reparsed-first-clause (re-parse-pattern db first-pattern)]
     (when-let [first-s (and (mergeable-where-clause? first-pattern)
                             (clause-subject-var first-pattern))]
       (if (empty? rest-patterns)
         (assoc parsed-query
                :where [reparsed-first-clause]
                :strategy :simple-subject-crawl)
-        (if-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
+        (when-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
           (assoc parsed-query :where [reparsed-first-clause
                                       {:s-filter subj-filter-map}]
                               :strategy :simple-subject-crawl))))))
@@ -148,7 +158,7 @@
        (empty? (::where/filters where))
        ;;TODO: vars support not complete
        (empty? vars)
-       (if-let [{select-var :var} select]
+       (when-let [{select-var :var} select]
          (let [{::where/keys [patterns]} where]
            (every? (fn [pattern]
                      (and (mergeable-where-clause? pattern)
@@ -168,4 +178,4 @@
              (not order-by)
              (simple-subject-crawl? parsed-query db))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
-    (simple-subject-merge-where parsed-query)))
+    (simple-subject-merge-where db parsed-query)))
