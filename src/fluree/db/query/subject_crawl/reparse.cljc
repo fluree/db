@@ -92,6 +92,13 @@
                      filter-map))))
         (assoc filter-map :required-p required-p)))))
 
+(defn reparse-component
+  [component]
+  (let [{::where/keys [var val]} component]
+    (cond
+      var {:variable var}
+      val {:value val})))
+
 
 (defn re-parse-pattern
   "Re-parses a pattern into the format recognized
@@ -101,12 +108,7 @@
         [s p o] (if (= :tuple type)
                   pattern
                   (let [[_type-kw tuple] pattern]
-                    tuple))
-        reparse-component (fn [component]
-                            (let [{::where/keys [var val]} component]
-                              (cond
-                                var {:variable var}
-                                val {:value val})))]
+                    tuple))]
     {:type type
      :s (reparse-component s)
      :p (reparse-component p)
