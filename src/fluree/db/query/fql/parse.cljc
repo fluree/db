@@ -180,31 +180,17 @@
 
 (defn parse-subject-iri
   [x context]
-  (-> x
-      (json-ld/expand-iri context)
-      (where/anonymous-value const/$xsd:anyURI)))
-
-(defn parse-sid
-  [x]
-  (when (v/sid? x)
-    (where/anonymous-value x)))
-
-(defn parse-subject
-  ([x]
-   (parse-sid x))
-
-  ([x context]
-   (if-let [parsed (parse-subject x)]
-     parsed
-     (when context
-       (parse-subject-iri x context)))))
+  (when context
+    (-> x
+        (json-ld/expand-iri context)
+        (where/anonymous-value const/$xsd:anyURI))))
 
 (defn parse-subject-pattern
   [s-pat context]
   (when s-pat
     (or (parse-variable s-pat)
         (parse-pred-ident s-pat)
-        (parse-subject s-pat context)
+        (parse-subject-iri s-pat context)
         (throw (ex-info (str "Subject values in where statement must be integer subject IDs or two-tuple identies. "
                              "Provided: " s-pat ".")
                         {:status 400 :error :db/invalid-query})))))
