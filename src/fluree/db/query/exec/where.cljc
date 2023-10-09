@@ -208,15 +208,18 @@
        (try* (let [s*          (if (and s (not (number? s)))
                                  (<? (dbproto/-subid db s true))
                                  s)
+                   p*          (if (and p (not (number? p)))
+                                 (dbproto/-p-prop db :id p)
+                                 p)
                    [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
                                  [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
                                  [(::val o-cmp) (::datatype o-cmp)])
-                   idx         (index/for-components s* p o* o-dt*)
+                   idx         (index/for-components s* p* o* o-dt*)
                    idx-root    (get db idx)
                    novelty     (get-in db [:novelty idx])
-                   [o** o-fn*] (augment-object-fn idx s* p o* o-fn)
-                   start-flake (flake/create s* p o** o-dt* nil nil util/min-integer)
-                   end-flake   (flake/create s* p o** o-dt* nil nil util/max-integer)
+                   [o** o-fn*] (augment-object-fn idx s* p* o* o-fn)
+                   start-flake (flake/create s* p* o** o-dt* nil nil util/min-integer)
+                   end-flake   (flake/create s* p* o** o-dt* nil nil util/max-integer)
                    track-fuel  (when fuel-tracker
                                  (take! (:error-ch fuel-tracker)
                                         #(put! error-ch %))

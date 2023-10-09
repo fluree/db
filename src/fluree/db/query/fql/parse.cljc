@@ -198,7 +198,7 @@
 (defn parse-class-predicate
   [x]
   (when (rdf-type? x)
-    (where/anonymous-value const/$rdf:type)))
+    (where/->predicate const/$rdf:type)))
 
 (defn parse-iri-predicate
   [x]
