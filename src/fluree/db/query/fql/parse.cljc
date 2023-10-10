@@ -261,41 +261,38 @@
       where/anonymous-value))
 
 (defn iri-map?
-  [x context]
-  (and (map? x)
-       (= (count x) 1)
-       (-> x
-           keys
-           first
-           (json-ld/expand-iri context)
-           v/iri-key?)))
+  [m]
+  (and (contains? m :id)
+       (= (count m) 2))) ; account for :idx key in expanded maps
 
 (defn parse-iri-map
-  [x context]
-  (when (iri-map? x context)
-    (let [o-iri (-> x
-                    vals
-                    first
-                    (json-ld/expand-iri context))]
-      (where/->iri-ref o-iri))))
+  [m]
+  (when (iri-map? m)
+    (-> m
+        (get :id)
+        where/->iri-ref)))
 
 (defn parse-value-map
-  [x context]
-  (when (map? x)
-    (let [expanded (json-ld/expand x context)]
-      (when-let [v (get-first-value expanded :value)]
-        (if-let [lang (get-first-value expanded :language)]
-          (let [lang-filter (fn [mch]
-                              (-> mch ::where/meta :lang (= lang)))]
-            (where/->val-filter v lang-filter))
-          (where/anonymous-value v))))))
+  [m]
+  (when-let [v (get-first-value m :value)]
+    (if-let [lang (get-first-value m :language)]
+      (let [lang-filter (fn [mch]
+                          (-> mch ::where/meta :lang (= lang)))]
+        (where/->val-filter v lang-filter))
+      (where/anonymous-value v))))
+
+(defn parse-reference-map
+  [pat context]
+  (when (map? pat)
+    (let [expanded (json-ld/expand pat context)]
+      (or (parse-iri-map expanded)
+          (parse-value-map expanded)))))
 
 (defn parse-object-pattern
   [o-pat context]
   (or (parse-variable o-pat)
       (parse-pred-ident o-pat)
-      (parse-iri-map o-pat context)
-      (parse-value-map o-pat context)
+      (parse-reference-map o-pat context)
       (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
