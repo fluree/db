@@ -70,9 +70,36 @@
   [error]
   (-> error ex-data :data :explain))
 
+(def ERR (atom []))
+(defn format-explained-errors
+  "Takes the output of `explain` and emits a string
+  explaining the error(s) in plain english.
+
+  Chooses the most general error (highest in the schema tree)"
+  ([explained-error] (format-explained-errors explained-error {}))
+  ([explained-error error-opts]
+   (let [{:keys [errors schema value]} explained-error
+         error-data (->> errors
+                         (mapv (fn [e]
+                                 (let [[root-path root-message :as root] (me/-resolve-root-error
+                                                                           explained-error
+                                                                           e
+                                                                           error-opts)
+                                       [child-path child-message :as direct] (me/-resolve-direct-error
+                                                                               explained-error
+                                                                               e
+                                                                               error-opts)]
+                                   (-> e
+                                       (assoc :child-message child-message)
+                                       (assoc :root-message root-message))))))
+         sorted (sort-by #(count (:path %)) error-data)]
+     (swap! ERR conj sorted)
+     (str (str/join " " (distinct (mapcat (fn [{:keys [child-message root-message]}]
+                                            [root-message child-message]) sorted)))
+          " Provided: " value))))
 
 ;;TODO simplify
-(defn format-explained-errors
+#_(defn format-explained-errors
   "Takes the output of `explain` and emits a string
   explaining the error(s) in plain english.
 
@@ -100,6 +127,7 @@
                                                 (compare (mapv pr-str l)
                                                          (mapv pr-str r))))) )]
      ;;TODO: check that this is even needed and works in the absence of root errors
+
      (let [[path data] (first error-data)]
        (let [{:keys [op in value]} (first data)
              position (peek in)
@@ -136,14 +164,14 @@
                             ::iri-key ::iri]
     ::json-ld-keyword      [:keyword {:decode/json decode-json-ld-keyword
                                       :decode/fql  decode-json-ld-keyword}]
-    ::var                  [:fn {:error/message "should be a valid variable, eg \"?s\""}
+    ::var                  [:fn {:error/message "Invalid variable, should begin with `?`"}
                             variable?]
     ::val                  [:fn value?]
     ::subject              [:orn
                             [:sid [:fn sid?]]
                             [:ident [:fn pred-ident?]]
                             [:iri ::iri]]
-    ::triple               [:catn
+    ::triple               [:catn {:error/message "Invalid triple. "}
                             [:subject [:orn
                                        [:var ::var]
                                        [:val ::subject]]]
@@ -155,24 +183,26 @@
                                       [:ident [:fn pred-ident?]]
                                       [:iri-map ::iri-map]
                                       [:val :any]]]]
-    ::function             [:orn
+    ::function             [:orn {:error/message "Invalid function. TODO"}
                             [:string [:fn fn-string?]]
                             [:list [:fn fn-list?]]]
     ::where-pattern        [:orn
                             [:map ::where-map]
                             [:tuple ::where-tuple]]
-    ::filter               [:sequential ::function]
-    ::optional             [:orn
+    ::filter               [:sequential {:error/message "Filter must be sequential. "} ::function]
+    ::optional             [:orn {:error/message "Invalid optional."}
                             [:single ::where-pattern]
                             [:collection [:sequential ::where-pattern]]]
     ::union                [:sequential [:sequential ::where-pattern]]
-    ::bind                 [:map-of ::var :any]
+    ::bind                 [:map-of {:error/message "Invalid bind."} ::var :any]
     ::where-op             [:enum {:decode/fql  string->keyword
                                    :decode/json string->keyword}
                             :filter :optional :union :bind]
     ::where-map            [:and
-                            [:map-of {:max 1} ::where-op :any]
-                            [:multi {:dispatch where-op}
+                            [:map-of {:max 1
+                                      :error/message "Where map can only have one key/value pair."} ::where-op :any]
+                            [:multi {:dispatch where-op
+                                     :error/message "Unrecognized operation in where map."}
                              [:filter [:map [:filter [:ref ::filter]]]]
                              [:optional [:map [:optional [:ref ::optional]]]]
                              [:union [:map [:union [:ref ::union]]]]
@@ -180,8 +210,8 @@
     ::where-tuple          [:orn
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
-    ::where                [:sequential {:error/message "Where clause should be a vector of maps or tuples."}
-                            [:orn
+    ::where                [:sequential
+                            [:orn {:error/message "Not a valid where map or tuple."}
                              [:where-map ::where-map]
                              [:tuple ::where-tuple]]]
     ::delete               [:orn

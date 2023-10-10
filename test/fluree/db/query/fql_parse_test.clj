@@ -209,28 +209,248 @@
                  group-by))
           (is (= [['?name :asc]]
                  order-by)))))))
-(deftest test-validation
+
+
+
+
+
+(deftest test-validation-errs
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/parse"
                                {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db     @(fluree/stage
                   (fluree/db ledger)
-                  [{:id           :ex/brian,
-                    :type         :ex/User,
-                    :schema/name  "Brian"}
-                   {:id           :ex/alice,
-                    :type         :ex/User,
-                    :schema/name  "Alice"}
-                   {:id          :ex/cam,
+                  [{:id          :ex/brian,
                     :type        :ex/User,
-                    :schema/name "Cam"}])]
-    (testing "group-by"
-      (let [bad-type '{:select [?s]
-                       :where [[?s ?p ?o]]
-                       :group-by {}}
-            bad-type-err (try @(fluree/query db bad-type)
-                              (catch Exception e e))]
+                    :schema/name "Brian"}
+                   {:id          :ex/alice,
+                    :type        :ex/User,
+                    :ex/email    "alice@foo.com"
+                    :schema/name "Alice"}
+                   {:id           :ex/cam,
+                    :type         :ex/User,
+                    :schema/email "cam@bar.com"
+                    :schema/name  "Cam"}])]
+    (testing "bad select"
+      (let [bad-select     '{:select [+]
+                             :where  [[?s ?p ?o ]]}
+            bad-select-err (try @(fluree/query db bad-select)
+                                (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
-               (ex-data bad-type-err)))
-        (is (= "Invalid groupBy clause, must be a variable or a vector of variables. Provided: {}"
-               (ex-message bad-type-err)))))) )
+               (ex-data bad-select-err)))
+        (is (= "Invalid select statement. Every selection must be a string or map. Provided: [+]"
+               (ex-message bad-select-err)))))
+    (comment
+      (testing "bad-where-map "
+        (let [bad-where-map     '{:select ['?name '?email]
+                                  :where  [['?s :type :ex/User]
+                                           ['?s :schema/age '?age]
+                                           ['?s :schema/name '?name]
+                                           {:union  [[['?s :ex/email '?email]]
+                                                     [['?s :schema/email '?email]]]
+                                            :filter ["(> ?age 30)"]}]}
+              bad-where-map-err (try @(fluree/query db bad-where-map)
+                                     (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data bad-where-map-err)))
+          ;;TODO prints out "quote" fn
+
+          (is (= "Where clause maps can only have one key/val, provided: {:union [[['?s :ex/email '?email]]
+                                              [['?s :schema/email '?email]]]
+                                      :filter [\"(> ?age 30)\"]}"
+                 (ex-message bad-where-map-err)))))
+      (testing "unrecognized op"
+        (let [unrecognized-where-op     '{:select ['?name '?age]
+                                          :where  [['?s :type :ex/User]
+                                                   ['?s :schema/age '?age]
+                                                   ['?s :schema/name '?name]
+                                                   {:foo "(> ?age 45)"}]}
+              unrecognized-where-op-err (try @(fluree/query db unrecognized-where-op)
+                                             (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data unrecognized-where-op-err)))
+          ;;TODO it doesn't seem to know this is an op? "Where clause should be a vector of maps or tuples. Provided: {:foo \"(> ?age 45)\"}"
+          (is (= "Invalid where clause, unsupported where clause operation: :foo"
+                 (ex-message unrecognized-where-op-err)))))
+
+      ;;TODO "Where clause should be a vector of maps or tuples. Provided: quote"
+      (testing "nonsequential where"
+        (let [non-sequential-where     '{:select [?s ?o]
+                                         :where  ?s}
+              non-sequential-where-err (try @(fluree/query db non-sequential-where)
+                                            (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data non-sequential-where-err)))
+          ;;*TODO just "invalid type" as root message
+          (is (= "Invalid where clause, must be a vector of tuples and/or maps. Provided: ?s"
+                 (ex-message non-sequential-where-err)))))
+      (testing "unwrapped where"
+        (let [unwrapped-where     '{:select [?s ?o]
+                                    :where  [?s ?p ?o]}
+              unwrapped-where-err (try @(fluree/query db unwrapped-where)
+                                       (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data unwrapped-where-err)))
+          ;;*TODO "not valid where map or tuple." no messag efor the sequential att he top.
+          (is (= "Invalid where clause, must be a vector of tuples and/or maps. Provided:"
+                 (ex-message unwrapped-where-err)))))
+      (testing "invalid group-by"
+        (let [invalid-group-by     '{:select   [?s]
+                                     :where    [[?s ?p ?o]]
+                                     :group-by {}}
+              invalid-group-by-err (try @(fluree/query db invalid-group-by)
+                                        (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data invalid-group-by-err)))
+          (is (= "Invalid groupBy clause, must be a variable or a vector of variables. Provided: {}"
+                 (ex-message invalid-group-by-err)))))
+      ;;TODO invalid schema??
+      (testing "invalid order-by"
+        (let [invalid-order-by-op     '{:select  ['?name '?favNums]
+                                        :where   [['?s :schema/name '?name]
+                                                  ['?s :schema/age '?age]
+                                                  ['?s :ex/favNums '?favNums]]
+                                        :orderBy ['(foo  ?favNums)]}
+              invalid-order-by-op-err (try @(fluree/query db invalid-order-by-op)
+                                           (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data invalid-order-by-op-err)))
+          (is (= "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: foo "
+                 (ex-message invalid-order-by-op-err)))))
+      ;;TODO: bind not winning, just getting generic where clause errror
+      (testing "invalid bind"
+        (let [invalid-bind     '{:select [?firstLetterOfName ?name ?canVote]
+                                 :where  [[?s :schema/age ?age]
+                                          [?s :schema/name ?name]
+                                          {:bind [?canVote           (>= ?age 18)]}]}
+              invalid-bind-err (try @(fluree/query db invalid-bind)
+                                    (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data invalid-bind-err)))
+          (is (= "Invalid where clause, 'bind' must be a map with binding vars as keys and binding scalars, or aggregates, as values. Provided: [?canVote (>= ?age 18)]"
+                 (ex-message invalid-bind-err)))))
+      ;;TODO just getting top-level where error
+      (testing "filter not wrapped"
+        (let [filter-type-err     '{:select ['?name '?age]
+                                    :where  [['?s :type :ex/User]
+                                             ['?s :schema/age '?age]
+                                             ['?s :schema/name '?name]
+                                             {:filter "(> ?age 45)"}]}
+              filter-type-err-err (try @(fluree/query db filter-type-err)
+                                       (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data filter-type-err-err)))
+          (is (= "Filter must be enclosed in square brackets. Provided: (> ?age 45)"
+                 (ex-message filter-type-err-err)))))
+      ;;TODO: just getting top-level where clause error
+      (testing "filter bad type"
+        (let [filter-type-err     '{:select ['?name '?age]
+                                    :where  [['?s :type :ex/User]
+                                             ['?s :schema/age '?age]
+                                             ['?s :schema/name '?name]
+                                             {:filter :foo}]}
+              filter-type-err-err (try @(fluree/query db filter-type-err)
+                                       (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data filter-type-err-err)))
+          (is (= "Filter must be a vector/array. Provided: :foo"
+                 (ex-message filter-type-err-err))))))))
+
+;; (comment
+
+;; {:explained
+;;  ({:path [0 2 :where 0 0 0 :where-map 0 0],
+;;    :in [:where 3],
+;;    :schema
+;;    [:map-of
+;;     {:max 1,
+;;      :error/message "Where clause maps can only have one key/val."}
+;;     :fluree.db.validation/where-op
+;;     :any],
+;;    :value
+;;    {:union [[['?s :ex/email '?email]] [['?s :schema/email '?email]]],
+;;     :filter ["(> ?age 30)"]},
+;;    :type :malli.core/limits}
+;;   {:path [0 2 :where 0 0 0 :tuple 0 :triple 0],
+;;    :in [:where 3],
+;;    :schema
+;;    [:catn
+;;     [:subject
+;;      [:orn
+;;       [:var :fluree.db.validation/var]
+;;       [:val :fluree.db.validation/subject]]]
+;;     [:predicate
+;;      [:orn
+;;       [:var :fluree.db.validation/var]
+;;       [:iri :fluree.db.validation/iri]]]
+;;     [:object
+;;      [:orn
+;;       [:var :fluree.db.validation/var]
+;;       [:ident [:fn "[fluree.db.util.core/pred-ident?]"]]
+;;       [:iri-map :fluree.db.validation/iri-map]
+;;       [:val :any]]]],
+;;    :value
+;;    {:union [[['?s :ex/email '?email]] [['?s :schema/email '?email]]],
+;;     :filter ["(> ?age 30)"]},
+;;    :type :malli.core/invalid-type}
+;;   {:path [0 2 :where 0 0 0 :tuple 0 :remote],
+;;    :in [:where 3],
+;;    :schema [:sequential {:max 4} :any],
+;;    :value
+;;    {:union [[['?s :ex/email '?email]] [['?s :schema/email '?email]]],
+;;     :filter ["(> ?age 30)"]},
+;;    :type :malli.core/invalid-type}),
+;;  :resolved
+;;  [[:where]
+;;   "Invalid where clause, must be a vector of tuples and/or maps."
+;;   #:error{:message
+;;           "Invalid where clause, must be a vector of tuples and/or maps."}]}
+
+
+;; (do
+
+;;     (require '[malli.core :as m])
+;;     (require ' [fluree.db.validation :as v])
+;;     (require '[malli.error :as me])
+;;     (require '[malli.util :as mu])
+;;     (require '[fluree.db.query.fql.syntax :as stx]))
+;;   (do
+;;     (def conn   (test-utils/create-conn))
+;;     (def  ledger @(fluree/create conn "query/parse"
+;;                                  {:defaultContext ["" {:ex "http://example.org/ns/"}]}))
+;;     (def  db     @(fluree/stage
+;;                     (fluree/db ledger)
+;;                     [{:id           :ex/brian,
+;;                       :type         :ex/User,
+;;                       :schema/name  "Brian"}
+;;                      {:id           :ex/alice,
+;;                       :type         :ex/User,
+;;                       :schema/name  "Alice"}
+;;                      {:id          :ex/cam,
+;;                       :type        :ex/User,
+;;                       :schema/name "Cam"}])))
+;;   ;;unnested where that doesn't work
+;; (let [bad-type '{:select [?s]
+
+;;                        :where [[?s ?p ?o]]
+;;                  :group-by {}}]
+;;   (ex-message @(fluree/query db bad-type)))
+
+;; (let [bad-type '{:select [?s]
+;;                        :where [?s ?p ?o]
+;;   }]
+;;   (ex-message @(fluree/query db bad-type)))
+
+
+
+;; {:path [0 2 :group-by 0 :clause 0 0],
+;;   :in [:group-by],
+;;   :schema :symbol,
+;;   :value {}}
+;;  {:path [0 2 :group-by 0 :collection],
+;;   :in [:group-by],
+;;   :schema [:sequential :fluree.db.query.fql.syntax/var],
+;;   :value {},
+;;   :type :malli.core/invalid-type}
+
+;;  )

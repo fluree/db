@@ -28,7 +28,8 @@
      [:map-of ::json-ld-keyword :any]
    (into
      [:map
-      [:history {:optional true}
+      [:history {:optional true
+                 :error/message "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object."}
        [:orn
         [:subject ::iri]
         [:flake
@@ -67,7 +68,7 @@
                                   [:int {:min 0} ]
                                   [:re datatype/iso8601-datetime-re]]]]
         ;;TODO reword, does not explain that "at" is also an option.
-        [:fn {:error/message "either \"from\" or \"to\" `t` keys must be provided."}
+        [:fn {:error/message "Missing or incorrect keys in \"t\" map. Must provide: either \"from\" or \"to\", or the key \"at\"."}
          (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
            (if at

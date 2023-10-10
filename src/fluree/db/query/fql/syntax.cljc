@@ -115,24 +115,32 @@
     ::iri             ::v/iri
     ::subject         ::v/subject
     ::subselect-map   [:map-of ::iri [:ref ::subselection]]
-    ::subselection    [:sequential [:orn
-                                    [:wildcard ::wildcard]
-                                    [:predicate ::iri]
-                                    [:subselect-map [:ref ::subselect-map]]]]
-    ::select-map      [:map-of {:max 1}
+    ::subselection    [:sequential {:error/message
+                                    "Invalid subselection. Must be vector or valid subselec map."}
+                       [:orn
+                        [:wildcard ::wildcard]
+                        [:predicate ::iri]
+                        [:subselect-map [:ref ::subselect-map]]]]
+    ::select-map      [:map-of {:max 1
+                                :error/fn (fn [{:keys [value]} _]
+                                            (when (map? value)
+                                              "Invalid select map."))}
                        ::var ::subselection]
-    ::selector        [:orn
+    ::selector        [:orn {:error/fn (fn [{:keys [value]} _]
+                                         (if (map? value)
+                                           "Invalid select tmap."
+                                           "Must be a var, iri, or function application."))}
                        [:var ::var]
                        [:pred ::iri]
                        [:aggregate ::function]
                        [:select-map ::select-map]]
-    ::select          [:orn
+    ::select          [:orn {:error/message "Invalid select statement."}
                        [:selector ::selector]
                        [:collection [:sequential ::selector]]]
-    ::direction       [:orn
+    ::direction       [:orn {:error/messag "Direction must be ASC or DESC. "}
                        [:asc [:fn asc?]]
                        [:desc [:fn desc?]]]
-    ::ordering        [:orn
+    ::ordering        [:orn {:error/messge "Invalid order-by. Must be valid var or direction."}
                        [:scalar ::var]
                        [:vector [:and list?
                                  [:catn
