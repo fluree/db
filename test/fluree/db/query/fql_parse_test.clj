@@ -240,7 +240,6 @@
                (ex-data bad-select-err)))
         (is (= "Invalid select statement. Every selection must be a string or map. Provided: [+]"
                (ex-message bad-select-err)))))
-    (comment
       (testing "bad-where-map "
         (let [bad-where-map     '{:select ['?name '?email]
                                   :where  [['?s :type :ex/User]
@@ -354,7 +353,7 @@
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data filter-type-err-err)))
           (is (= "Filter must be a vector/array. Provided: :foo"
-                 (ex-message filter-type-err-err))))))))
+                 (ex-message filter-type-err-err)))))))
 
 ;; (comment
 

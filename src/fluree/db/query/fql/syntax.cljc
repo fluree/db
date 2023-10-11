@@ -122,14 +122,9 @@
                         [:predicate ::iri]
                         [:subselect-map [:ref ::subselect-map]]]]
     ::select-map      [:map-of {:max 1
-                                :error/fn (fn [{:keys [value]} _]
-                                            (when (map? value)
-                                              "Invalid select map."))}
+                                :error/message "Only one key/val for select-map"}
                        ::var ::subselection]
-    ::selector        [:orn {:error/fn (fn [{:keys [value]} _]
-                                         (if (map? value)
-                                           "Invalid select tmap."
-                                           "Must be a var, iri, or function application."))}
+    ::selector        [:orn
                        [:var ::var]
                        [:pred ::iri]
                        [:aggregate ::function]
@@ -137,7 +132,7 @@
     ::select          [:orn {:error/message "Invalid select statement."}
                        [:selector ::selector]
                        [:collection [:sequential ::selector]]]
-    ::direction       [:orn {:error/messag "Direction must be ASC or DESC. "}
+    ::direction       [:orn {:error/message "Direction must be ASC or DESC. "}
                        [:asc [:fn asc?]]
                        [:desc [:fn desc?]]]
     ::ordering        [:orn {:error/messge "Invalid order-by. Must be valid var or direction."}
