@@ -29,15 +29,25 @@
   with other clauses to create a filter for the simple-subject-crawl
   strategy"
   [where-clause]
-  (and (#{:class :tuple} (where/pattern-type where-clause))
-       ;;exclude full s+p+o queries
-       (some ::where/val where-clause)))
+  (let [type (where/pattern-type where-clause)]
+    (case type
+      :class (let [pattern (val where-clause)]
+               (some ::where/val pattern))
+      :tuple (some ::where/val where-clause)
+      false)))
 
 (defn clause-subject-var
   [where-clause]
   (-> where-clause
       first
       ::where/var))
+
+(defn iri->pid
+  [iri db]
+  (log/info "p-prop:" (dbproto/-p-prop db :id iri))
+  (if-not (number? iri)
+    (dbproto/-p-prop db :id iri)
+    iri))
 
 (defn merge-wheres-to-filter
   "Merges all subsequent where clauses (rest where) for simple-subject-crawl
@@ -57,12 +67,12 @@
 
    Note that for multi-cardinality predicates, the prediate filters must pass for just one flake
   "
-  [first-s rest-where supplied-vars]
+  [db first-s rest-where supplied-vars]
   (loop [[{:keys [s p o] :as where-smt} & r] rest-where
          required-p #{} ;; set of 'p' values that are going to be required for a subject to have
          filter-map {}] ;; key 'p' value, val is list of filtering fns
     (let [[s p o] where-smt
-          {p* ::where/val} p
+          p*      (-> p ::where/val (iri->pid db))
           type (where/pattern-type where-smt)]
       (if where-smt
         (when (and (= :tuple type)
@@ -104,10 +114,7 @@
   [db pred]
   (let [reparsed (reparse-component pred)]
     (if (contains? reparsed :value)
-      (update reparsed :value (fn [iri]
-                                (if-not (number? iri)
-                                  (dbproto/-p-prop db :id iri)
-                                  iri)))
+      (update reparsed :value iri->pid db)
       reparsed)))
 
 (defn re-parse-pattern
@@ -138,7 +145,7 @@
         (assoc parsed-query
                :where [reparsed-first-clause]
                :strategy :simple-subject-crawl)
-        (when-let [subj-filter-map (merge-wheres-to-filter first-s rest-patterns vars)]
+        (when-let [subj-filter-map (merge-wheres-to-filter db first-s rest-patterns vars)]
           (assoc parsed-query :where [reparsed-first-clause
                                       {:s-filter subj-filter-map}]
                               :strategy :simple-subject-crawl))))))
@@ -178,4 +185,5 @@
              (not order-by)
              (simple-subject-crawl? parsed-query db))
     ;; following will return nil if parts of where clause exclude it from being a simple-subject-crawl
-    (simple-subject-merge-where db parsed-query)))
+    (let [merged (simple-subject-merge-where db parsed-query)]
+      merged)))

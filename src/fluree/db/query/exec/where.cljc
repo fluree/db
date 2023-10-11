@@ -194,6 +194,12 @@
       [nil f])
     [o o-fn]))
 
+(defn ensure-pid
+  [db p-val]
+  (if (and p-val (not (number? p-val)))
+    (dbproto/-p-prop db :id p-val)
+    p-val))
+
 (defn resolve-flake-range
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
@@ -208,9 +214,7 @@
        (try* (let [s*          (if (and s (not (number? s)))
                                  (<? (dbproto/-subid db s true))
                                  s)
-                   p*          (if (and p (not (number? p)))
-                                 (dbproto/-p-prop db :id p)
-                                 p)
+                   p*          (ensure-pid db p)
                    [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
                                  [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
                                  [(::val o-cmp) (::datatype o-cmp)])
@@ -276,7 +280,7 @@
         p-val    (::val p)]
 
     (if-let [props (and p-val (get-equivalent-properties db p-val))]
-      (let [prop-ch (async/to-chan! (conj props p-val))]
+      (let [prop-ch (async/to-chan! (conj props (ensure-pid db p-val)))]
         (async/pipeline-async 2
                               match-ch
                               (fn [prop ch]
@@ -316,21 +320,32 @@
         ([result]
          (rf result))))))
 
+(defn iri-cmp->value
+  [db o]
+  (if-let [class-iri (::iri o)]
+    {::val      (dbproto/-p-prop db :id class-iri)
+     ::datatype const/$xsd:anyURI}
+    o))
+
 (defmethod match-pattern :class
   [db fuel-tracker solution pattern filters error-ch]
-  (let [triple   (val pattern)
-        [s p o] (assign-matched-values triple solution filters)
-        cls      (::val o)
-        classes  (into [cls] (dbproto/-class-prop db :subclasses cls))
-        class-ch (async/to-chan! classes)
-        match-ch (async/chan 2 (comp cat
+  (let [triple     (val pattern)
+        [s p o]    (assign-matched-values triple solution filters)
+        o*         (iri-cmp->value db o)
+        cls        (::val o*)
+        class-objs (into [o*]
+                         (map (fn [cls]
+                                (assoc o* ::val cls)))
+                         (dbproto/-class-prop db :subclasses cls))
+        class-ch   (async/to-chan! class-objs)
+        match-ch   (async/chan 2 (comp cat
                                      (with-distinct-subjects)
                                      (map (fn [flake]
                                             (match-flake solution triple flake)))))]
     (async/pipeline-async 2
                           match-ch
-                          (fn [cls ch]
-                            (-> (resolve-flake-range db fuel-tracker error-ch [s p (assoc o ::val cls)])
+                          (fn [class-obj ch]
+                            (-> (resolve-flake-range db fuel-tracker error-ch [s p class-obj])
                                 (async/pipe ch)))
                           class-ch)
     match-ch))

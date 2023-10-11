@@ -195,16 +195,6 @@
                              "Provided: " s-pat ".")
                         {:status 400 :error :db/invalid-query})))))
 
-(defn parse-class-predicate
-  [x]
-  (when (rdf-type? x)
-    (where/->predicate const/$rdf:type)))
-
-(defn parse-iri-predicate
-  [x]
-  (when (v/iri-key? x)
-    (where/->predicate const/$xsd:anyURI)))
-
 (defn iri->pred-id
   [iri db context]
   (let [full-iri (json-ld/expand-iri iri context)]
@@ -232,27 +222,23 @@
         (iri->pred-id-strict db context)
         where/->full-text)))
 
-(defn parse-predicate-id
-  [x db context]
-  (-> x
-      (iri->pred-id-strict db context)
-      where/anonymous-value))
+(defn parse-predicate-iri
+  [p context]
+  (let [iri (json-ld/expand-iri p context)]
+    (where/->predicate iri)))
 
 (defn parse-predicate-pattern
   [p-pat db context]
-  (or (parse-iri-predicate p-pat)
-      (parse-class-predicate p-pat)
-      (parse-variable p-pat)
+  (or (parse-variable p-pat)
       (parse-recursion-predicate p-pat db context)
       (parse-full-text-predicate p-pat db context)
-      (parse-predicate-id p-pat db context)))
+      (parse-predicate-iri p-pat context)))
 
 (defn parse-class
-  [o-iri db context]
-  (if-let [id (iri->pred-id o-iri db context)]
-    (where/anonymous-value id const/$xsd:anyURI)
-    (throw (ex-info (str "Undefined RDF type specified: " (json-ld/expand-iri o-iri context))
-                    {:status 400 :error :db/invalid-query}))))
+  [o-iri context]
+  (-> o-iri
+      (json-ld/expand-iri context)
+      where/->iri-ref))
 
 (defn parse-object-iri
   [x context]
@@ -348,11 +334,11 @@
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
-    (if (and (= const/$rdf:type (::where/val p))
+    (if (and (#{const/iri-type const/iri-rdf-type} (::where/val p))
              (not (v/variable? o-pat)))
-      (let [cls (parse-class o-pat db context)]
-        (where/->pattern :class [s p cls]))
-      (if (= const/$xsd:anyURI (::where/val p))
+      (let [class-ref (parse-class o-pat context)]
+        (where/->pattern :class [s p class-ref]))
+      (if (= const/iri-id (::where/val p))
         (let [o (parse-object-iri o-pat context)]
           [s p o])
         (let [o (parse-object-pattern o-pat context)]
@@ -497,8 +483,9 @@
 (defn parse-analytical-query
   [q db]
   (let [parsed (parse-analytical-query* q db)]
-    (or (re-parse-as-simple-subj-crawl parsed db)
-        parsed)))
+    (let [parsed-parse (or (re-parse-as-simple-subj-crawl parsed db)
+                           parsed)]
+      parsed-parse)))
 
 (defn parse-query
   [q db]

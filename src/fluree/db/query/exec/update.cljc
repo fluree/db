@@ -70,10 +70,13 @@
             (when (and (some? s) (some? p) (some? o) (some? dt))
               (let [s* (if-not (number? s)
                          (<? (dbproto/-subid db s true))
+                         s)
+                    p* (if-not (number? p)
+                         (dbproto/-p-prop db :id p)
                          s)]
                 ;; wrap created flake in a vector so the output of this function has the
                 ;; same shape as the retract functions
-                [(flake/create s* p o dt t true nil)])))
+                [(flake/create s* p* o dt t true nil)])))
           (catch* e
                   (log/error e "Error inserting new triple")
                   (>! error-ch e)))))
