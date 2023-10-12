@@ -85,7 +85,7 @@
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
-      (log/debug "retract v-map:" v-map)
+      (log/trace "retract v-map:" v-map)
 
       (let [ref-id (:id v-map)]
         (cond (and ref-id (node? v-map))
@@ -114,7 +114,7 @@
                             (throw (ex-info (str "Retraction on a property that does not exist: " k)
                                             {:status 400
                                              :error  :db/invalid-commit})))
-                _       (log/debug "retract-node* v-maps:" v-maps)
+                _       (log/trace "retract-node* v-maps:" v-maps)
                 v-maps* (if (sequential? v-maps) v-maps [v-maps])
                 acc*    (<? (retract-v-maps (assoc retract-state :pid pid :acc acc)
                                             v-maps*))]
@@ -152,8 +152,8 @@
   (go-try
     (loop [[v-map & r-v-maps] v-maps
            acc* acc]
-      (log/debug "assert-v-maps v-map:" v-map)
-      (log/debug "assert-v-maps id:" id)
+      (log/trace "assert-v-maps v-map:" v-map)
+      (log/trace "assert-v-maps id:" id)
       (let [ref-id (:id v-map)
             meta   (when list-members? {:i (-> v-map :idx last)})
             acc**
@@ -166,7 +166,7 @@
                                                 v-map pid iri-cache next-pid next-sid))
                              new-flake    (flake/create sid pid ref-sid
                                                         const/$xsd:anyURI t true meta)]
-                         (log/debug "creating ref flake:" new-flake)
+                         (log/trace "creating ref flake:" new-flake)
                          (cond-> (conj acc* new-flake)
                                  (nil? existing-sid) (conj
                                                        (flake/create ref-sid const/$xsd:anyURI
@@ -179,7 +179,7 @@
 
                        :else (let [[value dt] (datatype/from-expanded v-map nil)
                                    new-flake (flake/create sid pid value dt t true meta)]
-                               (log/debug "creating value flake:" new-flake)
+                               (log/trace "creating value flake:" new-flake)
                                (conj acc* new-flake)))
 
                      (nil? existing-pid) (conj (flake/create pid const/$xsd:anyURI k
@@ -238,7 +238,7 @@
 (defn assert-node
   [db node t iri-cache ref-cache next-pid next-sid]
   (go-try
-    (log/debug "assert-node:" node)
+    (log/trace "assert-node:" node)
     (let [{:keys [id type]} node
           existing-sid    (<? (get-iri-sid id db iri-cache))
           sid             (or existing-sid
