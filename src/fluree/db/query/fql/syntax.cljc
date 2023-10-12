@@ -114,9 +114,10 @@
     ::var             ::v/var
     ::iri             ::v/iri
     ::subject         ::v/subject
-    ::subselect-map   [:map-of ::iri [:ref ::subselection]]
+    ::subselect-map   [:map-of {:error/message "Must be map from iri to subselection"}
+                       ::iri [:ref ::subselection]]
     ::subselection    [:sequential {:error/message
-                                    "Invalid subselection. Must be vector or valid subselec map."}
+                                    "Invalid subselection"}
                        [:orn
                         [:wildcard ::wildcard]
                         [:predicate ::iri]
@@ -124,24 +125,24 @@
     ::select-map      [:map-of {:max 1
                                 :error/message "Only one key/val for select-map"}
                        ::var ::subselection]
-    ::selector        [:orn
+    ::selector        [:orn {:error/message "Must be either a variable, iri, function application, or select map"}
                        [:var ::var]
                        [:pred ::iri]
                        [:aggregate ::function]
                        [:select-map ::select-map]]
-    ::select          [:orn {:error/message "Invalid select statement."}
+    ::select          [:orn {:error/message "Invalid select statement"}
                        [:selector ::selector]
                        [:collection [:sequential ::selector]]]
-    ::direction       [:orn {:error/message "Direction must be ASC or DESC. "}
+    ::direction       [:orn {:error/message "Direction must be ASC or DESC"}
                        [:asc [:fn asc?]]
                        [:desc [:fn desc?]]]
-    ::ordering        [:orn {:error/messge "Invalid order-by. Must be valid var or direction."}
+    ::ordering        [:orn {:error/messge "Must be valid var vector containing a var and a direction."}
                        [:scalar ::var]
                        [:vector [:and list?
                                  [:catn
                                   [:direction ::direction]
                                   [:dimension ::var]]]]]
-    ::order-by        [:orn {:error/message  "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]."}
+    ::order-by        [:orn {:error/message  "Invalid orderBy clause"}
                        [:clause ::ordering]
                        [:collection [:sequential ::ordering]]]
     ::group-by        [:orn {:error/message "Invalid groupBy clause, must be a variable or a vector of variables."}

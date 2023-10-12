@@ -20,38 +20,38 @@
                                                   {:id   :ex/dog
                                                    :ex/x "foo-1"
                                                    :ex/y "bar-1"}])]
-    (testing "empty request"
-      (let [empty-req {}
-            empty-req-err (try @(fluree/history ledger empty-req)
-                               (catch Exception e e))]
-        (is (= {:status 400 :error :db/invalid-query}
-               (ex-data empty-req-err)))
-        (is (= "Must supply a value for either \"history\" or \"commit-details\". Provided: {}"
-               (ex-message empty-req-err)))))
-    (testing "Invalid commit-details"
-      (let [bad-commit-details {:history [:ex/cat] :commit-details "I like cats"
-                                :t {:at :latest}}
-            bad-commit-details-err (try @(fluree/history ledger bad-commit-details)
-                               (catch Exception e e))]
-        (is (= {:status 400 :error :db/invalid-query}
-               (ex-data bad-commit-details-err)))
-        (is (= "Value of \"commit-details\" must be a boolean. Provided: \"I like cats\""
-               (ex-message bad-commit-details-err)))))
-    (testing "missing subject"
-      (let [missing-subject {:history nil}
-            missing-subject-err (try @(fluree/history ledger missing-subject)
-                                     (catch Exception e e))]
-        (is (= {:status 400 :error :db/invalid-query}
-               (ex-data missing-subject-err)))
-        (is (= "Must supply a value for either \"history\" or \"commit-details\". Provided: {:history nil}"
-               (ex-message missing-subject-err))))
-      (let [missing-subject2 {:history []}
-            missing-subject2-err (try @(fluree/history ledger missing-subject2)
-                                      (catch Exception e e))]
-        (is (= {:status 400 :error :db/invalid-query}
-               (ex-data missing-subject2-err)))
-        (is (= "Must supply a value for either \"history\" or \"commit-details\". Provided: {:history []}"
-               (ex-message missing-subject2-err)))))
+      (testing "empty request"
+        (let [empty-req {}
+              empty-req-err (try @(fluree/history ledger empty-req)
+                                 (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data empty-req-err)))
+          (is (= "Must supply a value for either \"history\" or \"commit-details\"; missing required key. Provided: {}"
+                 (ex-message empty-req-err)))))
+      (testing "Invalid commit-details"
+        (let [bad-commit-details {:history [:ex/cat] :commit-details "I like cats"
+                                  :t {:at :latest}}
+              bad-commit-details-err (try @(fluree/history ledger bad-commit-details)
+                                          (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data bad-commit-details-err)))
+          (is (= "Invalid value of \"commit-details\" key; should be a boolean. Provided: \"I like cats\""
+                 (ex-message bad-commit-details-err)))))
+      (testing "missing subject"
+        (let [missing-subject {:history nil}
+              missing-subject-err (try @(fluree/history ledger missing-subject)
+                                       (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data missing-subject-err)))
+          (is (= "Must supply a value for either \"history\" or \"commit-details\". Provided: {:history nil}"
+                 (ex-message missing-subject-err))))
+        (let [missing-subject2 {:history []}
+              missing-subject2-err (try @(fluree/history ledger missing-subject2)
+                                        (catch Exception e e))]
+          (is (= {:status 400 :error :db/invalid-query}
+                 (ex-data missing-subject2-err)))
+          (is (= "Must supply a value for either \"history\" or \"commit-details\". Provided: {:history []}"
+                 (ex-message missing-subject2-err)))))
     (testing "invalid t values"
       (let [bad-ts {:history [:ex/cat] :t {:from 2 :to 0}}
             bad-ts-err (try @(fluree/history ledger bad-ts)
@@ -72,14 +72,14 @@
                           (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data no-t-err)))
-        (is (= "either \"from\" or \"to\" `t` keys must be provided. Provided: {}"
+        (is (= "Invalid value for \"t\". Must provide: either \"from\" or \"to\", or the key \"at\". Provided: {}"
                (ex-message no-t-err))))
       (let [invalid-t-keys {:history [:ex/cat] :t {:at 1 :from 1}}
             invalid-t-keys-err (try @(fluree/history ledger invalid-t-keys)
                                     (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data invalid-t-keys-err)))
-        (is (= "either \"from\" or \"to\" `t` keys must be provided. Provided: {:at 1, :from 1}"
+        (is (= "Invalid value for \"t\". Must provide: either \"from\" or \"to\", or the key \"at\". Provided: {:at 1, :from 1}"
                (ex-message invalid-t-keys-err)))))))
 
 (deftest ^:integration history-query-test

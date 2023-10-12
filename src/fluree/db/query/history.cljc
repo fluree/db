@@ -25,12 +25,15 @@
   it wants to require, which are not required/supported here in the db library."
   [extra-kvs]
   [:and
-     [:map-of ::json-ld-keyword :any]
+   [:map-of ::json-ld-keyword :any]
+   [:fn {:error/message "Must supply a value for either \"history\" or \"commit-details\""}
+    (fn [{:keys [history commit-details t]}]
+      (or (string? history) (keyword? history) (seq history) commit-details))]
    (into
      [:map
-      [:history {:optional true
-                 :error/message "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object."}
-       [:orn
+      [:history {:optional true}
+       [:orn {:error/message
+              "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object"}
         [:subject ::iri]
         [:flake
          [:or
@@ -44,44 +47,43 @@
            [:p ::iri]
            [:o [:not :nil]]]]]]]
       [:commit-details {:optional true
-                        :error/message "Value of \"commit-details\" must be a boolean."} :boolean]
+                        :error/message "Invalid value of \"commit-details\" key"} :boolean]
       [:context {:optional true} ::context]
       [:opts {:optional true} [:map-of :keyword :any]]
-      [:t
+      [:t {:error/messag "Invalid value for \"t\""}
        [:and
-        [:map-of :keyword :any]
-        ;;TODO how to just have one error mesage for all of from?
+        [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
         [:map
-         [:from {:optional true
-                 :error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value."} [:or
-                                  [:= :latest]
-                                  [:int {:min 0} ]
-                                  [:re datatype/iso8601-datetime-re]]]
-         [:to {:optional true
-               :error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value."} [:or
-                                [:=  :latest]
-                                [:int {:min 0}]
-                                [:re datatype/iso8601-datetime-re]]]
-         [:at {:optional true
-               :error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value."} [:or
-                                  [:= :latest]
-                                  [:int {:min 0} ]
-                                  [:re datatype/iso8601-datetime-re]]]]
-        ;;TODO reword, does not explain that "at" is also an option.
-        [:fn {:error/message "Missing or incorrect keys in \"t\" map. Must provide: either \"from\" or \"to\", or the key \"at\"."}
+         [:from {:optional true}
+          [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+           [:= :latest]
+           [:int {:min 0
+                  :error/message "Must be a positive value"} ]
+           [:re datatype/iso8601-datetime-re]]]
+         [:to {:optional true}
+          [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+           [:=  :latest]
+           [:int {:min 0
+                  :error/message "Must be a positive value"}]
+           [:re datatype/iso8601-datetime-re]]]
+         [:at {:optional true}
+          [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+           [:= :latest]
+           [:int {:min 0
+                  :error/message "Must be a positive value"} ]
+           [:re datatype/iso8601-datetime-re]]]]
+        [:fn {:error/message "Invalid value for \"t\". Must provide: either \"from\" or \"to\", or the key \"at\""}
          (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
            (if at
              (not (or from to))
              (or from to)))]
-        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value"}
          (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                    (<= from to)
                                    true))]]]]
      extra-kvs)
-     [:fn {:error/message "Must supply a value for either \"history\" or \"commit-details\"."}
-      (fn [{:keys [history commit-details t]}]
-        (or (string? history) (keyword? history) (seq history) commit-details))]])
+     ])
 
 
 (def registry

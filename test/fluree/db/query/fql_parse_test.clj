@@ -231,33 +231,32 @@
                     :type         :ex/User,
                     :schema/email "cam@bar.com"
                     :schema/name  "Cam"}])]
-    (testing "bad select"
-      (let [bad-select     '{:select [+]
+    (testing "invalid var select"
+      (let [invalid-var-select     '{:select [+]
                              :where  [[?s ?p ?o ]]}
-            bad-select-err (try @(fluree/query db bad-select)
+            invalid-var-select-err (try @(fluree/query db invalid-var-select)
                                 (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
-               (ex-data bad-select-err)))
+               (ex-data invalid-var-select-err)))
         (is (= "Invalid select statement. Every selection must be a string or map. Provided: [+]"
-               (ex-message bad-select-err)))))
-      (testing "bad-where-map "
-        (let [bad-where-map     '{:select ['?name '?email]
+               (ex-message invalid-var-select-err)))))
+      (testing "more than 1 key in where map"
+        (let [multi-key-where-map     '{:select ['?name '?email]
                                   :where  [['?s :type :ex/User]
                                            ['?s :schema/age '?age]
                                            ['?s :schema/name '?name]
                                            {:union  [[['?s :ex/email '?email]]
                                                      [['?s :schema/email '?email]]]
                                             :filter ["(> ?age 30)"]}]}
-              bad-where-map-err (try @(fluree/query db bad-where-map)
+              multi-key-where-map-err (try @(fluree/query db multi-key-where-map)
                                      (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
-                 (ex-data bad-where-map-err)))
-          ;;TODO prints out "quote" fn
-
+                 (ex-data multi-key-where-map-err)))
           (is (= "Where clause maps can only have one key/val, provided: {:union [[['?s :ex/email '?email]]
                                               [['?s :schema/email '?email]]]
                                       :filter [\"(> ?age 30)\"]}"
-                 (ex-message bad-where-map-err)))))
+                 (ex-message multi-key-where-map-err)))))
+      ;;TODO missing a good error/message somewhere.
       (testing "unrecognized op"
         (let [unrecognized-where-op     '{:select ['?name '?age]
                                           :where  [['?s :type :ex/User]
@@ -265,14 +264,12 @@
                                                    ['?s :schema/name '?name]
                                                    {:foo "(> ?age 45)"}]}
               unrecognized-where-op-err (try @(fluree/query db unrecognized-where-op)
-                                             (catch Exception e e))]
+                                            (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data unrecognized-where-op-err)))
-          ;;TODO it doesn't seem to know this is an op? "Where clause should be a vector of maps or tuples. Provided: {:foo \"(> ?age 45)\"}"
           (is (= "Invalid where clause, unsupported where clause operation: :foo"
                  (ex-message unrecognized-where-op-err)))))
-
-      ;;TODO "Where clause should be a vector of maps or tuples. Provided: quote"
+      ;;TODO just top-level error
       (testing "nonsequential where"
         (let [non-sequential-where     '{:select [?s ?o]
                                          :where  ?s}
@@ -280,9 +277,9 @@
                                             (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data non-sequential-where-err)))
-          ;;*TODO just "invalid type" as root message
           (is (= "Invalid where clause, must be a vector of tuples and/or maps. Provided: ?s"
                  (ex-message non-sequential-where-err)))))
+      ;;TODO just top-level error, only returning '?s
       (testing "unwrapped where"
         (let [unwrapped-where     '{:select [?s ?o]
                                     :where  [?s ?p ?o]}
@@ -290,7 +287,6 @@
                                        (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data unwrapped-where-err)))
-          ;;*TODO "not valid where map or tuple." no messag efor the sequential att he top.
           (is (= "Invalid where clause, must be a vector of tuples and/or maps. Provided:"
                  (ex-message unwrapped-where-err)))))
       (testing "invalid group-by"
@@ -303,20 +299,19 @@
                  (ex-data invalid-group-by-err)))
           (is (= "Invalid groupBy clause, must be a variable or a vector of variables. Provided: {}"
                  (ex-message invalid-group-by-err)))))
-      ;;TODO invalid schema??
+      ;;TODO not getting the asc/desc error
       (testing "invalid order-by"
         (let [invalid-order-by-op     '{:select  ['?name '?favNums]
                                         :where   [['?s :schema/name '?name]
                                                   ['?s :schema/age '?age]
                                                   ['?s :ex/favNums '?favNums]]
-                                        :orderBy ['(foo  ?favNums)]}
+                                        :orderBy [(foo  ?favNums)]}
               invalid-order-by-op-err (try @(fluree/query db invalid-order-by-op)
                                            (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data invalid-order-by-op-err)))
           (is (= "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]. Provided: foo "
                  (ex-message invalid-order-by-op-err)))))
-      ;;TODO: bind not winning, just getting generic where clause errror
       (testing "invalid bind"
         (let [invalid-bind     '{:select [?firstLetterOfName ?name ?canVote]
                                  :where  [[?s :schema/age ?age]
@@ -328,7 +323,6 @@
                  (ex-data invalid-bind-err)))
           (is (= "Invalid where clause, 'bind' must be a map with binding vars as keys and binding scalars, or aggregates, as values. Provided: [?canVote (>= ?age 18)]"
                  (ex-message invalid-bind-err)))))
-      ;;TODO just getting top-level where error
       (testing "filter not wrapped"
         (let [filter-type-err     '{:select ['?name '?age]
                                     :where  [['?s :type :ex/User]
@@ -341,7 +335,6 @@
                  (ex-data filter-type-err-err)))
           (is (= "Filter must be enclosed in square brackets. Provided: (> ?age 45)"
                  (ex-message filter-type-err-err)))))
-      ;;TODO: just getting top-level where clause error
       (testing "filter bad type"
         (let [filter-type-err     '{:select ['?name '?age]
                                     :where  [['?s :type :ex/User]

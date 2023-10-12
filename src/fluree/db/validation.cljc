@@ -69,51 +69,61 @@
 (defn explain-error
   [error]
   (-> error ex-data :data :explain))
-;;maybe direct errors always, and root for the "top" ?
+
 (def ERR (atom []))
 
-(defn get-latest-common-or
+(defn most-specific-relevant-message
   [errors schema]
-  (let [first-same-ins (->> errors
-                            (sort-by (fn [{:keys [in path]}]
-                                       [(- (count in)) (count path)]))
-                            (partition-by #(count (:in %)))
-                            first
-                            first)
-        {:keys [path]} first-same-ins
-        subpath (loop [i (count path)]
-                  (let [subpath (subvec path 0 i)]
-                    (cond
-                      (= 0 i) nil
-                      (#{:or :orn} (m/type (mu/get-in schema subpath))) subpath
-                      :else (recur (dec i) ))))]
-    {:value (:value first-same-ins)
-     :subpath subpath}))
+  (let [[e :as longest-in-paths] (->> errors
+                                       (sort-by (fn [{:keys [in path]}]
+                                                  [(- (count in)) (count path)]))
+                                       (partition-by #(count (:in %)))
+                                       first)
 
+        {:keys [value path]} e
+        message (if (= (count longest-in-paths) 1)
+                  (me/error-message e)
+                  (loop [i (count path)]
+                    (when-not (= 0 i)
+                      (let [subpath (subvec path 0 i)
+                            schema-fragment (mu/get-in schema subpath)]
+                        (if (#{:or :orn} (some-> schema-fragment
+                                                 m/type))
+                          (let [props (m/properties schema-fragment)]
+                            (or (:error/message props)
+                                (some-> (:error/fn props)
+                                        (apply [e nil]))))
+                          (recur (dec i) ))))))]
+    {:value value
+     :message message}))
 
 ;;TODO better docstring
-;;TODO if there isn't an or, use the message from the longest `:in`?
 ;;TODO: same length `:in` paths, but what if different paths?
+;;TODO Factor out some of the or-checking?
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string
   explaining the error(s) in plain english. "
   ([explained-error] (format-explained-errors explained-error {}))
   ([explained-error error-opts]
    (let [{:keys [errors schema value]} explained-error
-         {or-value :value :keys [subpath]} (get-latest-common-or errors schema)
-         or-message (when subpath
-                    (:error/message (m/properties (mu/get-in schema subpath))))
+         [{:keys [path] :as first-e}] errors
+         first-e-parent (mu/get-in schema (butlast path))
+         [_ first-direct-message] (if (#{:or :orn} (m/type first-e-parent))
+                                    (let [props (m/properties first-e-parent)]
+                                      [nil (or (:error/message props)
+                                               (some-> (:error/fn props)
+                                                       (apply [first-e nil])))])
+                                    (me/-resolve-direct-error
+                                      explained-error
+                                      first-e
+                                      error-opts))
+         {specific-value :value specific-message :message} (most-specific-relevant-message errors schema)
          [_ first-root-message] (me/-resolve-root-error
                                 explained-error
-                                (first errors)
-                                error-opts)
-         [_ first-direct-message] (me/-resolve-direct-error
-                                  explained-error
-                                  (first errors)
-                                  error-opts)]
-     (str (str/join " "  (distinct [first-root-message or-message first-direct-message]))
-          " Provided: " (or or-value value)))))
-
+                                first-e
+                                error-opts)]
+     (str (str/join "; "  (remove nil? (distinct [first-root-message specific-message first-direct-message])))
+          ". Provided: " (pr-str (or specific-value value))))))
 
 (comment
   ;;idea: top error, root and child.
@@ -301,20 +311,20 @@
    (m/base-schemas)
    (m/type-schemas)
    (m/sequence-schemas)
-   {::iri                  [:or {:error/message "Not a valid iri."} :string :keyword]
+   {::iri                  [:or {:error/message "Not a valid iri"} :string :keyword]
     ::iri-key              [:fn iri-key?]
     ::iri-map              [:map-of {:max 1}
                             ::iri-key ::iri]
     ::json-ld-keyword      [:keyword {:decode/json decode-json-ld-keyword
                                       :decode/fql  decode-json-ld-keyword}]
-    ::var                  [:fn {:error/message "Invalid variable, should begin with `?`"}
+    ::var                  [:fn {:error/message "Invalid variable, should be one or more characters begin with `?`"}
                             variable?]
     ::val                  [:fn value?]
     ::subject              [:orn
-                            [:sid [:fn sid?]]
+                            [:sid [:fn {:error/message "Invalid subject id"} sid?]]
                             [:ident [:fn pred-ident?]]
                             [:iri ::iri]]
-    ::triple               [:catn {:error/message "Invalid triple. "}
+    ::triple               [:catn {:error/message "Invalid triple"}
                             [:subject [:orn
                                        [:var ::var]
                                        [:val ::subject]]]
@@ -326,26 +336,28 @@
                                       [:ident [:fn pred-ident?]]
                                       [:iri-map ::iri-map]
                                       [:val :any]]]]
-    ::function             [:orn {:error/message "Invalid function. TODO"}
-                            [:string [:fn {:error/message "Not a valid function."} fn-string?]]
-                            [:list [:fn {:error/message "Not a valid list of functions"}fn-list?]]]
+    ::function             [:orn
+                            [:string [:fn {:error/message "Not a valid function"}
+                                      fn-string?]]
+                            [:list [:fn {:error/message "Not a valid list of functions"}
+                                    fn-list?]]]
     ::where-pattern        [:orn
                             [:map ::where-map]
                             [:tuple ::where-tuple]]
-    ::filter               [:sequential {:error/message "Filter must be sequential. "} ::function]
+    ::filter               [:sequential {:error/message "Filter must be a function call wrapped in a vector"} ::function]
     ::optional             [:orn {:error/message "Invalid optional."}
                             [:single ::where-pattern]
                             [:collection [:sequential ::where-pattern]]]
     ::union                [:sequential [:sequential ::where-pattern]]
-    ::bind                 [:map-of {:error/message "Invalid bind."} ::var :any]
+    ::bind                 [:map-of {:error/message "Invalid bind, must be a map with variable keys"} ::var :any]
     ::where-op             [:enum {:decode/fql  string->keyword
                                    :decode/json string->keyword}
                             :filter :optional :union :bind]
-    ::where-map            [:and {:error/message "Invalid where map."}
-                            [:map-of {:max 1
-                                      :error/message "Where map can only have one key/value pair."} ::where-op :any]
+    ::where-map            [:and
+                            [:map-of {:max 1 :error/message "Where map can only have one key/value pair"}
+                             ::where-op :any]
                             [:multi {:dispatch where-op
-                                     :error/message "Unrecognized operation in where map."}
+                                     :error/message "Unrecognized operation"}
                              [:filter [:map [:filter [:ref ::filter]]]]
                              [:optional [:map [:optional [:ref ::optional]]]]
                              [:union [:map [:union [:ref ::union]]]]
@@ -353,8 +365,8 @@
     ::where-tuple          [:orn
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
-    ::where                [:sequential {:error/message "Invalid where statement."}
-                            [:orn {:error/message "Where clause does not contain valid tuple or map operation."}
+    ::where                [:sequential {:error/message "Invalid \"where\""}
+                            [:orn
                              [:where-map ::where-map]
                              [:tuple ::where-tuple]]]
     ::delete               [:orn
