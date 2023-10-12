@@ -1,6 +1,6 @@
 (ns fluree.db.query.exec.where
   (:require [fluree.db.query.range :as query-range]
-            [clojure.core.async :as async :refer [>! go take! put!]]
+            [clojure.core.async :as async :refer [<! >! go take! put!]]
             [fluree.db.flake :as flake]
             [fluree.db.fuel :as fuel]
             [fluree.db.index :as index]
@@ -194,6 +194,17 @@
       [nil f])
     [o o-fn]))
 
+(defn get-sid
+  [db error-ch s-cmp]
+  (go (try*
+        (if-let [s-val (::val s-cmp)]
+          s-val
+          (when-let [s-iri (::iri s-cmp)]
+            (<? (dbproto/-subid db s-iri true))))
+        (catch* e
+                (log/error e "Error resolving subject id")
+                (>! error-ch e)))))
+
 (defn ensure-pid
   [db p-val]
   (if (and p-val (not (number? p-val)))
@@ -207,23 +218,21 @@
   ([{:keys [conn t] :as db} fuel-tracker flake-xf error-ch components]
    (let [out-ch               (async/chan)
          [s-cmp p-cmp o-cmp]  components
-         {s ::val, s-fn ::fn} s-cmp
+         s-fn                 (::fn s-cmp)
          {p ::val, p-fn ::fn} p-cmp
          o-fn                 (::fn o-cmp)]
      (go
-       (try* (let [s*          (if (and s (not (number? s)))
-                                 (<? (dbproto/-subid db s true))
-                                 s)
+       (try* (let [s           (<! (get-sid db error-ch s-cmp))
                    p*          (ensure-pid db p)
                    [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
                                  [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
                                  [(::val o-cmp) (::datatype o-cmp)])
-                   idx         (index/for-components s* p* o* o-dt*)
+                   idx         (index/for-components s p* o* o-dt*)
                    idx-root    (get db idx)
                    novelty     (get-in db [:novelty idx])
-                   [o** o-fn*] (augment-object-fn idx s* p* o* o-fn)
-                   start-flake (flake/create s* p* o** o-dt* nil nil util/min-integer)
-                   end-flake   (flake/create s* p* o** o-dt* nil nil util/max-integer)
+                   [o** o-fn*] (augment-object-fn idx s p* o* o-fn)
+                   start-flake (flake/create s p* o** o-dt* nil nil util/min-integer)
+                   end-flake   (flake/create s p* o** o-dt* nil nil util/max-integer)
                    track-fuel  (when fuel-tracker
                                  (take! (:error-ch fuel-tracker)
                                         #(put! error-ch %))

@@ -178,19 +178,18 @@
   (when (util/pred-ident? x)
     (where/->ident x)))
 
-(defn parse-subject-iri
+(defn parse-iri
   [x context]
-  (when context
-    (-> x
-        (json-ld/expand-iri context)
-        (where/anonymous-value const/$xsd:anyURI))))
+  (-> x
+      (json-ld/expand-iri context)
+      where/->iri-ref))
 
 (defn parse-subject-pattern
   [s-pat context]
   (when s-pat
     (or (parse-variable s-pat)
         (parse-pred-ident s-pat)
-        (parse-subject-iri s-pat context)
+        (parse-iri s-pat context)
         (throw (ex-info (str "Subject values in where statement must be integer subject IDs or two-tuple identies. "
                              "Provided: " s-pat ".")
                         {:status 400 :error :db/invalid-query})))))
