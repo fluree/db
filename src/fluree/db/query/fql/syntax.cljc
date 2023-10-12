@@ -34,6 +34,27 @@
       (= 1 (count skeys)))
     true))
 
+(defn sequential-where?
+  [q]
+  (if (map? q)
+    (let [{:keys [where]} q]
+      (log/trace "sequential-where? where:" where)
+      (if-not (sequential? where)
+        where
+        true))
+    true))
+
+(defn wrapped-where?
+  [q]
+  (log/trace "wrapped-where? q:" q)
+  (if (map? q)
+    (let [{:keys [where]} q
+          invalid-clauses (remove #(or (sequential? %)
+                                       (map? %)) where)]
+      (log/warn "wrapped-where? invalid clauses: " invalid-clauses)
+      (empty? invalid-clauses))
+    true))
+
 (defn query-schema
   "Returns schema for queries, with any extra key/value pairs `extra-kvs`
   added to the query map.
@@ -50,6 +71,19 @@
             "See documentation here for more details: "
             docs/error-codes-page "#query-missing-select"))}
     one-select-key-present?]
+   [:fn
+    {:error/fn
+     (fn [{:keys [value]} _]
+       (str "Query: " (pr-str value) " contains an invalid where clause."
+            "Where clause must be a vector/array of tuples and/or maps."))}
+    sequential-where?]
+   [:fn
+    {:error/fn
+     (fn [{:keys [value]} _]
+       (str "Query: " (pr-str value) " contains an invalid where pattern. "
+            "Every pattern must be a tuple or map "))}
+    wrapped-where?]
+
    (into [:map {:closed true}
           [:where ::where]
           [:t {:optional true} ::t]
