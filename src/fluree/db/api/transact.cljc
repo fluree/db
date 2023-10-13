@@ -10,7 +10,8 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [catch* try*]]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [fluree.db.json-ld.credential :as cred]))
 
 (defn stage
   [db json-ld opts]
@@ -32,6 +33,38 @@
                                    :fuel (fuel/tally fuel-tracker)}
                                   e)))))
         (<? (dbproto/-stage db json-ld opts*))))))
+
+(defn parse-opts
+  [opts parsed-opts]
+  (reduce (fn [opts* [k v]] (assoc opts* (keyword k) v))
+          parsed-opts
+          opts))
+
+(defn stage2
+  [db txn parsed-opts]
+  (go-try
+    (let [{txn :subject did :did} (or (<? (cred/verify txn))
+                                      {:subject txn})
+          expanded                (json-ld/expand txn)
+          opts                    (util/get-first-value expanded const/iri-opts)
+          parsed-opts             (cond-> parsed-opts did (assoc :did did))
+
+          {:keys [maxFuel meta] :as parsed-opts*} (parse-opts opts parsed-opts)]
+      (if (or maxFuel meta)
+        (let [start-time   #?(:clj (System/nanoTime)
+                              :cljs (util/current-time-millis))
+              fuel-tracker (fuel/tracker maxFuel)]
+          (try* (let [result (<? (tx/stage2 db fuel-tracker expanded parsed-opts*))]
+                  {:status 200
+                   :result result
+                   :time   (util/response-time-formatted start-time)
+                   :fuel   (fuel/tally fuel-tracker)})
+                (catch* e
+                        (throw (ex-info "Error staging database"
+                                        {:time (util/response-time-formatted start-time)
+                                         :fuel (fuel/tally fuel-tracker)}
+                                        e)))))
+        (<? (tx/stage2 db expanded parsed-opts*))))))
 
 (defn parse-json-ld-txn
   "Expands top-level keys and parses any opts in json-ld transaction document.

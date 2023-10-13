@@ -564,3 +564,12 @@
    (go-try
      (let [staged (<? (stage-ledger ledger fuel-tracker json-ld opts))]
        (<? (ledger-proto/-commit! ledger staged))))))
+
+;; ----------------------------------------
+
+(defn stage2
+  ([db txn parsed-opts]
+   (stage2 db nil txn parsed-opts))
+  ([db fuel-tracker txn parsed-opts]
+   (println "DEP stage2" txn)
+   ))
