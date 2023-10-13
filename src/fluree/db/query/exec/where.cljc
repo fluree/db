@@ -80,10 +80,10 @@
 
 (defn ->predicate
   "Build a pattern that already matches the explicit predicate value `value`."
-  ([value]
-   (anonymous-value value))
-  ([value recur-n]
-   (-> value
+  ([iri]
+   (->iri-ref iri))
+  ([iri recur-n]
+   (-> iri
        ->predicate
        (assoc ::recur recur-n))))
 
@@ -205,11 +205,32 @@
                 (log/error e "Error resolving subject id")
                 (>! error-ch e)))))
 
-(defn ensure-pid
-  [db p-val]
-  (if (and p-val (not (number? p-val)))
-    (dbproto/-p-prop db :id p-val)
-    p-val))
+(defn evaluate-subject-match
+  [db error-ch s-mch]
+  (go (try*
+        (if (::val s-mch)
+          s-mch
+          (if-let [s-iri (::iri s-mch)]
+            (let [sid (<? (dbproto/-subid db s-iri true))]
+              (assoc s-mch ::val sid))
+            s-mch))
+        (catch* e
+                (log/error e "Error resolving subject id")
+                (>! error-ch e)))))
+
+(defn evaluate-predicate-match
+  [db p-mch]
+  (if (::val p-mch)
+    p-mch
+    (if-let [p-iri (::iri p-mch)]
+      (let [pid (dbproto/-p-prop db :id p-iri)]
+        (assoc p-mch ::val pid))
+      p-mch)))
+
+(defn get-pid
+  [db p-cmp]
+  (or (::val p-cmp)
+      (->> p-cmp ::iri (dbproto/-p-prop db :id))))
 
 (defn resolve-flake-range
   ([db fuel-tracker error-ch components]
@@ -219,20 +240,20 @@
    (let [out-ch               (async/chan)
          [s-cmp p-cmp o-cmp]  components
          s-fn                 (::fn s-cmp)
-         {p ::val, p-fn ::fn} p-cmp
+         p-fn                 (::fn p-cmp)
          o-fn                 (::fn o-cmp)]
      (go
        (try* (let [s           (<! (get-sid db error-ch s-cmp))
-                   p*          (ensure-pid db p)
+                   p           (get-pid db p-cmp)
                    [o* o-dt*]  (if-let [o-iri (::iri o-cmp)]
                                  [(<? (dbproto/-subid db o-iri true)) const/$xsd:anyURI]
                                  [(::val o-cmp) (::datatype o-cmp)])
-                   idx         (index/for-components s p* o* o-dt*)
+                   idx         (index/for-components s p o* o-dt*)
                    idx-root    (get db idx)
                    novelty     (get-in db [:novelty idx])
-                   [o** o-fn*] (augment-object-fn idx s p* o* o-fn)
-                   start-flake (flake/create s p* o** o-dt* nil nil util/min-integer)
-                   end-flake   (flake/create s p* o** o-dt* nil nil util/max-integer)
+                   [o** o-fn*] (augment-object-fn idx s p o* o-fn)
+                   start-flake (flake/create s p o** o-dt* nil nil util/min-integer)
+                   end-flake   (flake/create s p o** o-dt* nil nil util/max-integer)
                    track-fuel  (when fuel-tracker
                                  (take! (:error-ch fuel-tracker)
                                         #(put! error-ch %))
@@ -286,10 +307,10 @@
         match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
                                             (match-flake solution pattern flake)))))
-        p-val    (::val p)]
+        pid      (get-pid db p)]
 
-    (if-let [props (and p-val (get-equivalent-properties db p-val))]
-      (let [prop-ch (async/to-chan! (conj props (ensure-pid db p-val)))]
+    (if-let [props (and pid (get-equivalent-properties db pid))]
+      (let [prop-ch (async/to-chan! (conj props pid))]
         (async/pipeline-async 2
                               match-ch
                               (fn [prop ch]

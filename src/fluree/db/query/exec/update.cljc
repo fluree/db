@@ -7,7 +7,7 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log]
-            [clojure.core.async :as async :refer [>! go]]))
+            [clojure.core.async :as async :refer [<! >! go]]))
 
 (defn match-component
   [c solution]
@@ -36,15 +36,26 @@
         matched    (match-solution triple solution)]
     (where/resolve-flake-range db fuel-tracker retract-xf error-ch matched)))
 
+(defn evaluate-iris
+  [db error-ch [s p o]]
+  (go (try*
+        (let [s* (<? (where/evaluate-subject-match db error-ch s))
+              p* (where/evaluate-predicate-match db p)]
+          [s* p* o])
+        (catch* e
+                (log/error e "Error looking up iri")
+                (>! error-ch e)))))
+
 (defn retract-clause
   [db clause t solution fuel-tracker error-ch out-ch]
   (let [clause-ch  (async/to-chan! clause)]
     (async/pipeline-async 2
                           out-ch
                           (fn [triple ch]
-                            (-> db
-                                (retract-triple triple t solution fuel-tracker error-ch)
-                                (async/pipe ch)))
+                            (go (let [triple* (<! (evaluate-iris db error-ch triple))]
+                                  (-> db
+                                      (retract-triple triple* t solution fuel-tracker error-ch)
+                                      (async/pipe ch)))))
                           clause-ch)
     out-ch))
 
@@ -68,15 +79,9 @@
                 o                   (::where/val o-mch)
                 dt                  (::where/datatype o-mch)]
             (when (and (some? s) (some? p) (some? o) (some? dt))
-              (let [s* (if-not (number? s)
-                         (<? (dbproto/-subid db s true))
-                         s)
-                    p* (if-not (number? p)
-                         (dbproto/-p-prop db :id p)
-                         s)]
-                ;; wrap created flake in a vector so the output of this function has the
-                ;; same shape as the retract functions
-                [(flake/create s* p* o dt t true nil)])))
+              ;; wrap created flake in a vector so the output of this function has the
+              ;; same shape as the retract functions
+              [(flake/create s p o dt t true nil)]))
           (catch* e
                   (log/error e "Error inserting new triple")
                   (>! error-ch e)))))
@@ -86,9 +91,10 @@
   (async/pipeline-async 2
                         out-ch
                         (fn [triple ch]
-                          (-> db
-                              (insert-triple triple t solution error-ch)
-                              (async/pipe ch)))
+                          (go (let [triple* (<! (evaluate-iris db error-ch triple))]
+                                (-> db
+                                    (insert-triple triple* t solution error-ch)
+                                    (async/pipe ch)))))
                         (async/to-chan! clause))
   out-ch)
 

@@ -333,11 +333,11 @@
   [[s-pat p-pat o-pat] db context]
   (let [s (parse-subject-pattern s-pat context)
         p (parse-predicate-pattern p-pat db context)]
-    (if (and (#{const/iri-type const/iri-rdf-type} (::where/val p))
+    (if (and (#{const/iri-type const/iri-rdf-type} (::where/iri p))
              (not (v/variable? o-pat)))
       (let [class-ref (parse-class o-pat context)]
         (where/->pattern :class [s p class-ref]))
-      (if (= const/iri-id (::where/val p))
+      (if (= const/iri-id (::where/iri p))
         (let [o (parse-object-iri o-pat context)]
           [s p o])
         (let [o (parse-object-pattern o-pat context)]

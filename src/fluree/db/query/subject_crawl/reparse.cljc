@@ -42,13 +42,6 @@
       first
       ::where/var))
 
-(defn iri->pid
-  [iri db]
-  (log/info "p-prop:" (dbproto/-p-prop db :id iri))
-  (if-not (number? iri)
-    (dbproto/-p-prop db :id iri)
-    iri))
-
 (defn merge-wheres-to-filter
   "Merges all subsequent where clauses (rest where) for simple-subject-crawl
   into a map containing predicate filters.
@@ -72,7 +65,7 @@
          required-p #{} ;; set of 'p' values that are going to be required for a subject to have
          filter-map {}] ;; key 'p' value, val is list of filtering fns
     (let [[s p o] where-smt
-          p*      (-> p ::where/val (iri->pid db))
+          p*      (->> p ::where/iri (dbproto/-p-prop db :id))
           type (where/pattern-type where-smt)]
       (if where-smt
         (when (and (= :tuple type)
@@ -110,12 +103,17 @@
       var {:variable var}
       val {:value val})))
 
+(defn reparse-subject-component
+  [subj]
+  (if-let [s-iri (::where/iri subj)]
+    {:value s-iri}
+    (reparse-component subj)))
+
 (defn reparse-predicate-component
   [db pred]
-  (let [reparsed (reparse-component pred)]
-    (if (contains? reparsed :value)
-      (update reparsed :value iri->pid db)
-      reparsed)))
+  (if-let [p-iri (::where/iri pred)]
+    {:value (dbproto/-p-prop db :id p-iri)}
+    (reparse-component pred)))
 
 (defn re-parse-pattern
   "Re-parses a pattern into the format recognized
@@ -127,7 +125,7 @@
                   (let [[_type-kw tuple] pattern]
                     tuple))]
     {:type type
-     :s (reparse-component s)
+     :s (reparse-subject-component s)
      :p (reparse-predicate-component db p)
      :o (assoc (reparse-component o) :datatype (::where/datatype o))}))
 
