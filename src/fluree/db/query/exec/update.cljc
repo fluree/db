@@ -7,7 +7,10 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log]
-            [clojure.core.async :as async :refer [>! go]]))
+            [clojure.core.async :as async :refer [>! go]]
+            [clojure.string :as str]
+            [fluree.db.json-ld.ledger :as jld-ledger]
+            [fluree.db.datatype :as datatype]))
 
 (defn match-component
   [c solution]
@@ -59,8 +62,22 @@
                           solution-ch)
     retract-ch))
 
+(defn fdb-bnode?
+  "Is the iri a fluree-generated temporary bnode?"
+  [iri]
+  (str/starts-with? iri "_:fdb"))
+
+(defn bnode-id
+  "A stable bnode."
+  [sid]
+  (str "_:" sid))
+
+(defn create-id-flake
+  [sid iri t]
+  (flake/create sid const/$xsd:anyURI iri const/$xsd:string t true nil))
+
 (defn insert-triple
-  [db triple {:keys [t]} solution error-ch]
+  [db triple {:keys [t next-sid next-pid]} solution error-ch]
   (go
     (try* (let [[s-mch p-mch o-mch] (match-solution triple solution)
                 s                   (::where/val s-mch)
@@ -138,3 +155,103 @@
 
     (retract? mdfn)
     (retract db mdfn tx-state fuel-tracker error-ch solution-ch)))
+
+(defn insert-triple2
+  [db triple {:keys [t next-sid next-pid]} solution error-ch]
+  (go
+    (try* (let [[s-mch p-mch o-mch] (match-solution triple solution)
+                s                   (::where/val s-mch)
+                p                   (::where/val p-mch)
+                o                   (::where/val o-mch)
+                dt                  (::where/datatype o-mch)
+                m                   (::where/m o-mch)]
+
+            (when (and (some? s) (some? p) (some? o) (some? dt))
+              (let [existing-sid   (<? (dbproto/-subid db s))
+                    [sid s-iri]    (if (fdb-bnode? s)
+                                     (let [bnode-sid (next-sid)]
+                                       [bnode-sid (bnode-id bnode-sid)])
+                                     [(or (existing-sid) (get jld-ledger/predefined-properties s) (next-sid)) s])
+                    new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
+
+                    existing-pid   (<? (dbproto/-subid db p))
+                    pid            (if existing-pid existing-pid (next-pid))
+                    new-pred-flake (when-not existing-pid (create-id-flake pid p t))
+
+                    ;; subid works for sids
+                    existing-dt   (<? (dbproto/-subid db dt))
+                    dt-sid        (cond existing-dt existing-dt
+                                        (string? dt) (next-sid)
+                                        :else (datatype/infer o (:lang m)))
+                    new-dt-flake  (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
+
+
+                    ;; how do I ensure the same sid gets used for the same bnode?
+                    zzz (if (and (= const/$xsd:anyURI dt) (fdb-bnode? o))
+                          :foo)
+                    obj-flake  (flake/create sid pid o dt t true m)]
+
+                (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake obj-flake]))
+
+              (let [s* (if-not (number? s)
+                         (<? (dbproto/-subid db s true))
+                         s)]
+
+                ;; wrap created flake in a vector so the output of this function has the
+                ;; same shape as the retract functions
+                [(flake/create s* p o dt t true nil)])))
+          (catch* e
+                  (log/error e "Error inserting new triple")
+                  (>! error-ch e)))))
+
+(defn insert-clause2
+  [db clause tx-state solution error-ch out-ch]
+  (async/pipeline-async 2
+                        out-ch
+                        (fn [triple ch]
+                          (-> db
+                              (insert-triple2 triple tx-state solution error-ch)
+                              (async/pipe ch)))
+                        (async/to-chan! clause))
+  out-ch)
+
+(defn insert2
+  [db mdfn tx-state error-ch solution-ch]
+  (let [clause    (:insert mdfn)
+        insert-ch (async/chan 2)]
+    (async/pipeline-async 2
+                          insert-ch
+                          (fn [solution ch]
+                            (println "DEP insert solution" (pr-str solution))
+                            (insert-clause db clause tx-state solution error-ch ch))
+                          solution-ch)
+    insert-ch))
+
+(defn insert-retract2
+  [db mdfn tx-state fuel-tracker error-ch solution-ch]
+  (let [solution-ch*    (async/chan 2)  ; create an extra channel to multiply so
+                                        ; solutions don't get dropped before we
+                                        ; can add taps to process them.
+        solution-mult   (async/mult solution-ch*)
+        insert-soln-ch  (->> (async/chan 2)
+                             (async/tap solution-mult))
+        insert-ch       (insert2 db mdfn tx-state error-ch insert-soln-ch)
+        retract-soln-ch (->> (async/chan 2)
+                             (async/tap solution-mult))
+        retract-ch      (retract db mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
+    (async/pipe solution-ch solution-ch*) ; now hook up the solution input
+                                        ; after everything is wired
+    (async/merge [insert-ch retract-ch])))
+
+(defn modify2
+  [db parsed-txn tx-state fuel-tracker error-ch solution-ch]
+  (cond
+    (and (insert? parsed-txn)
+         (retract? parsed-txn))
+    (insert-retract2 db parsed-txn tx-state fuel-tracker error-ch solution-ch)
+
+    (insert? parsed-txn)
+    (insert2 db parsed-txn tx-state error-ch solution-ch)
+
+    (retract? parsed-txn)
+    (retract db parsed-txn tx-state fuel-tracker error-ch solution-ch)))

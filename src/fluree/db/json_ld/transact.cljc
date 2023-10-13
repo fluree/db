@@ -567,9 +567,47 @@
 
 ;; ----------------------------------------
 
+(defn ->tx-state2
+  [db]
+  (let [{:keys [schema branch ledger policy], db-t :t} db
+        last-pid  (atom (jld-ledger/last-pid db))
+        last-sid  (atom (jld-ledger/last-sid db))
+        commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
+        t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
+        db-before (dbproto/-rootdb db)]
+    {:db-before                db-before
+     :policy                   policy
+     :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
+     :t                        t
+     :last-pid                 last-pid
+     :last-sid                 last-sid
+     :next-pid                 (fn [] (swap! last-pid inc))
+     :next-sid                 (fn [] (swap! last-sid inc))
+     :iris                     (volatile! {})}))
+
+(defn generate-flakes
+  [db fuel-tracker parsed-txn {:keys [t] :as tx-state}]
+  (go
+    (let [error-ch  (async/chan)
+          update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
+                         (update/modify2 db parsed-txn tx-state fuel-tracker error-ch)
+                         (into-flakeset fuel-tracker))]
+      (async/alt!
+        error-ch ([e] e)
+        update-ch ([flakes] flakes)))))
+
 (defn stage2
   ([db txn parsed-opts]
    (stage2 db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
    (println "DEP stage2" txn)
-   ))
+   (go-try
+     (let [db* (if-let [policy-opts (perm/policy-opts parsed-opts)]
+                 (<? (perm/wrap-policy db policy-opts))
+                 db)
+
+           tx-state (->tx-state2 db*)
+
+           parsed-txn (q-parse/parse-txn txn db*)
+           flakes-ch  (generate-flakes db fuel-tracker parsed-txn tx-state)]
+       (<? flakes-ch)))))
