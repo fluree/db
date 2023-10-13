@@ -585,3 +585,87 @@
   (-> mdfn
       syntax/coerce-modification
       (parse-ledger-update db)))
+
+(defn bnode-id
+  [bnode-counter]
+  (str "_:fdb" (vswap! bnode-counter inc)))
+
+(declare parse-subj-cmp)
+(defn parse-obj-cmp
+  [bnode-counter subj-cmp pred-cmp m triples {:keys [list id value type language] :as v-map}]
+  (cond list
+        (reduce (fn [triples [i list-item]]
+                  (parse-obj-cmp bnode-counter subj-cmp pred-cmp {:i i} triples list-item))
+                triples
+                (map vector (range) list))
+
+        value
+        (let [obj-cmp (if (v/variable? value)
+                        (parse-variable value)
+                        (cond-> {::where/val value
+                                 ::where/m (cond-> m language (assoc :lang language))}
+                          type (assoc ::where/datatype type)))]
+          (conj triples [subj-cmp pred-cmp obj-cmp]))
+
+        :else
+        (let [ref-cmp (if (nil? id)
+                        {::where/val (bnode-id bnode-counter) ::where/datatype const/$xsd:anyURI}
+                        (cond-> {::where/val id ::where/datatype const/$xsd:anyURI}
+                          m (assoc ::where/m m)))
+              v-map* (if (nil? id)
+                       ;; project newly created bnode-id into v-map
+                       (assoc v-map :id (:val ref-cmp))
+                       v-map)]
+          (conj (parse-subj-cmp bnode-counter triples v-map*) [subj-cmp pred-cmp ref-cmp]))))
+
+(defn parse-pred-cmp
+  [bnode-counter subj-cmp triples [pred values]]
+  (let [values*  (if (= pred :type)
+                   ;; homogenize @type values so they have the same structure as other predicates
+                   (map #(do {:id %}) values)
+                   values)
+        pred-cmp (cond (v/variable? pred) (parse-variable pred)
+                       ;; we want the actual iri here, not the keyword
+                       (= pred :type)     {::where/val "@type"}
+                       :else              {::where/val pred})]
+    (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp nil)
+            triples
+            values*)))
+
+(defn parse-subj-cmp
+  [bnode-counter triples {:keys [id] :as node}]
+  (let [subj-cmp (cond (nil? id) {::where/val (bnode-id bnode-counter)}
+                       (v/variable? id) (parse-variable id)
+                       :else {::where/val id})]
+    (reduce (partial parse-pred-cmp bnode-counter subj-cmp)
+            triples
+            (dissoc node :id :idx))))
+
+(defn parse-triples
+  "Flattens and parses expanded json-ld into update triples."
+  [expanded]
+  (let [bnode-counter (volatile! 0)]
+    (reduce (partial parse-subj-cmp bnode-counter)
+            []
+            expanded)))
+
+(defn parse-txn
+  [txn db]
+  (let [context       (parse-context txn db)
+        [vars values] (parse-values {:values (util/get-first-value txn const/iri-values)})
+        where         (parse-where {:where (util/get-first-value txn const/iri-where)} vars db context)
+
+        delete (-> (util/get-first-value txn const/iri-delete)
+                   (json-ld/expand context)
+                   (util/sequential)
+                   (parse-triples))
+        insert (-> (util/get-first-value txn const/iri-insert)
+                   (json-ld/expand context)
+                   (util/sequential)
+                   (parse-triples))]
+    (cond-> {}
+      context            (assoc :context context)
+      where              (assoc :where where)
+      (seq values)       (assoc :values values)
+      (not-empty delete) (assoc :delete delete)
+      (not-empty insert) (assoc :insert insert))))
