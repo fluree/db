@@ -567,11 +567,23 @@
 
 ;; ----------------------------------------
 
+(defn next-id
+  "counter is either :last-pid or :last-sid"
+  [iri->sid counter iri]
+  (if-let [sid (get @iri->sid iri)]
+    sid
+    (let [iri->sid* (swap! iri->sid #(-> %
+                                         (assoc iri (get % counter))
+                                         (update counter inc)))]
+      (get iri->sid* iri))))
+
 (defn ->tx-state2
   [db]
   (let [{:keys [schema branch ledger policy], db-t :t} db
         last-pid  (atom (jld-ledger/last-pid db))
         last-sid  (atom (jld-ledger/last-sid db))
+        iri->sid (atom {:last-pid (jld-ledger/last-pid db)
+                        :last-sid (jld-ledger/last-sid db)})
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
         db-before (dbproto/-rootdb db)]
@@ -581,8 +593,8 @@
      :t                        t
      :last-pid                 last-pid
      :last-sid                 last-sid
-     :next-pid                 (fn [] (swap! last-pid inc))
-     :next-sid                 (fn [] (swap! last-sid inc))
+     :next-pid                 (partial next-id iri->sid :last-pid)
+     :next-sid                 (partial next-id iri->sid :last-sid)
      :iris                     (volatile! {})}))
 
 (defn generate-flakes

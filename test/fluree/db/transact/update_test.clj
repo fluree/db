@@ -459,21 +459,32 @@
                                                          "ex:spouse" {"@id" "ex:dan"}}]}]}))
 
   db1
-  (def db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
-                                "where" [["?s" "ex:name" "?name"]]
-                                "delete" {"@graph"
-                                          [{"@id" "?s" "ex:name" "?name"}]}
-                                "insert" {"@context" {"ex:zip" {"@type" "ex:PostalCode"}}
-                                          "@graph"
-                                          [{"@id" "?s", "ex:name" "WAT"}
-                                           {"@id" "ex:mp",
-                                            "@type" "ex:Cat"
-                                            "ex:nickname" {"@language" "en" "@value" "The Wretch"}
-                                            "ex:name" "Murray",
-                                            "ex:address"
-                                            {"ex:street" "55 Bashford", "ex:city" "St. Paul", "ex:zip" 55105, "ex:state" "MN"},
-                                            "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}}))
 
+  (def db1* @(fluree/stage db0 [{"@id" "ex:dan"
+                                 "ex:name" "Dan"
+                                 "ex:child" [{"@id" "ex:ap" "ex:name" "AP"}
+                                             {"@id" "ex:np" "ex:name" "NP"}]
+                                 "ex:spouse" [{"@id" "ex:kp" "ex:name" "KP"
+                                               "ex:spouse" {"@id" "ex:dan"}}]}]))
+
+  db1*
+
+  (def db2 @(fluree/stage2 db1* {"@context" "https://flur.ee"
+                                 "where" [["?s" "ex:name" "?name"]]
+                                 "delete" {"@graph"
+                                           [{"@id" "?s" "ex:name" "?name"}]}
+                                 "insert" {"@context" {"ex:zip" {"@type" "ex:PostalCode"}}
+                                           "@graph"
+                                           [{"@id" "?s", "ex:name" "WAT"}
+                                            {"@id" "ex:mp",
+                                             "@type" "ex:Cat"
+                                             "ex:nickname" {"@language" "en" "@value" "The Wretch"}
+                                             "ex:name" "Murray",
+                                             "ex:address"
+                                             {"ex:street" "55 Bashford", "ex:city" "St. Paul", "ex:zip" 55105, "ex:state" "MN"},
+                                             "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}}))
+
+  db2
 
   (require '[fluree.json-ld :as json-ld])
   (json-ld/expand {"@context" {"ex:zip" {"@type" "ex:PostalCode"}}

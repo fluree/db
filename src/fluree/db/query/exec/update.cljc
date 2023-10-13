@@ -169,37 +169,34 @@
             (when (and (some? s) (some? p) (some? o) (some? dt))
               (let [existing-sid   (<? (dbproto/-subid db s))
                     [sid s-iri]    (if (fdb-bnode? s)
-                                     (let [bnode-sid (next-sid)]
+                                     (let [bnode-sid (next-sid s)]
                                        [bnode-sid (bnode-id bnode-sid)])
-                                     [(or (existing-sid) (get jld-ledger/predefined-properties s) (next-sid)) s])
+                                     [(or existing-sid (get jld-ledger/predefined-properties s) (next-sid s)) s])
                     new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
                     existing-pid   (<? (dbproto/-subid db p))
-                    pid            (if existing-pid existing-pid (next-pid))
+                    pid            (if existing-pid existing-pid (next-pid p))
                     new-pred-flake (when-not existing-pid (create-id-flake pid p t))
 
                     ;; subid works for sids
                     existing-dt   (<? (dbproto/-subid db dt))
                     dt-sid        (cond existing-dt existing-dt
-                                        (string? dt) (next-sid)
+                                        (string? dt) (next-sid dt)
                                         :else (datatype/infer o (:lang m)))
                     new-dt-flake  (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
 
+                    ref?             (= const/$xsd:anyURI dt)
+                    existing-ref-sid (when ref? (<? (dbproto/-subid db o)))
+                    ref-sid          (when (and (= const/$xsd:anyURI dt)
+                                                (not existing-ref-sid))
+                                       (next-sid o))
+                    new-ref-flake    (when (and (not existing-ref-sid) (= const/$xsd:anyURI dt))
+                                       (create-id-flake (next-sid o) o t))
 
-                    ;; how do I ensure the same sid gets used for the same bnode?
-                    zzz (if (and (= const/$xsd:anyURI dt) (fdb-bnode? o))
-                          :foo)
-                    obj-flake  (flake/create sid pid o dt t true m)]
+                    ;; o needs to be a sid if it's a ref, otherwise the literal o
+                    obj-flake  (flake/create sid pid (if ref? ref-sid o) dt-sid t true m)]
 
-                (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake obj-flake]))
-
-              (let [s* (if-not (number? s)
-                         (<? (dbproto/-subid db s true))
-                         s)]
-
-                ;; wrap created flake in a vector so the output of this function has the
-                ;; same shape as the retract functions
-                [(flake/create s* p o dt t true nil)])))
+                (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))))
           (catch* e
                   (log/error e "Error inserting new triple")
                   (>! error-ch e)))))
@@ -223,7 +220,7 @@
                           insert-ch
                           (fn [solution ch]
                             (println "DEP insert solution" (pr-str solution))
-                            (insert-clause db clause tx-state solution error-ch ch))
+                            (insert-clause2 db clause tx-state solution error-ch ch))
                           solution-ch)
     insert-ch))
 
