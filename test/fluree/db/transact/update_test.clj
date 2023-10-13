@@ -90,7 +90,7 @@
              ["Alice" "Bob"])
           "Only Bob and Alice should be left in the db.")
 
-      (testing "Updating property value only if it's current value is a match."
+      (testing "Updating property value only if its current value is a match."
         (is (= [{:id          :ex/bob,
                  :type    :ex/User,
                  :schema/name "Bob"
@@ -440,3 +440,121 @@
         (is (= []
                subject)
             "returns no results")))))
+
+(comment
+
+  (def conn @(fluree/connect {:method :memory}))
+
+  (def ledger @(fluree/create conn "update" {:defaultContext [test-utils/default-str-context {"ex" "ns:ex/"}]}))
+
+  (def db0 (fluree/db ledger))
+  db0
+
+  (def db1 @(fluree/stage2 db0 {"@context" "https://flur.ee"
+                                "insert" [{"@id" "ex:dan"
+                                           "ex:name" "Dan"
+                                           "ex:child" [{"@id" "ex:ap" "ex:name" "AP"}
+                                                       {"@id" "ex:np" "ex:name" "NP"}]
+                                           "ex:spouse" [{"@id" "ex:kp" "ex:name" "KP"
+                                                         "ex:spouse" {"@id" "ex:dan"}}]}]}))
+
+  db1
+  (def db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
+                                "where" [["?s" "ex:name" "?name"]]
+                                "delete" {"@graph"
+                                          [{"@id" "?s" "ex:name" "?name"}]}
+                                "insert" {"@context" {"ex:zip" {"@type" "ex:PostalCode"}}
+                                          "@graph"
+                                          [{"@id" "?s", "ex:name" "WAT"}
+                                           {"@id" "ex:mp",
+                                            "@type" "ex:Cat"
+                                            "ex:nickname" {"@language" "en" "@value" "The Wretch"}
+                                            "ex:name" "Murray",
+                                            "ex:address"
+                                            {"ex:street" "55 Bashford", "ex:city" "St. Paul", "ex:zip" 55105, "ex:state" "MN"},
+                                            "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}}))
+
+
+  (require '[fluree.json-ld :as json-ld])
+  (json-ld/expand {"@context" {"ex:zip" {"@type" "ex:PostalCode"}}
+                   "@graph"
+                   [{"@id" "?s", "ex:name" "WAT"}
+                    {"@id" "ex:mp",
+                     "@type" "ex:Cat"
+                     "ex:nickname" {"@language" "en" "@value" "The Wretch"}
+                     "ex:name" "Murray",
+                     "ex:address"
+                     {"ex:street" "55 Bashford", "ex:city" "St. Paul", "ex:zip" 55105, "ex:state" "MN"},
+                     "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}
+                  (fluree.db.dbproto/-context db1))
+  [{:idx ["@graph" 0],
+    :id "?s",
+    "ns:ex/name" [{:value "WAT", :type nil, :idx ["@graph" 0 "ex:name"]}]}
+   {:idx ["@graph" 1],
+    :type ["ns:ex/Cat"],
+    :id "ns:ex/mp",
+    "ns:ex/nickname" [{:value "The Wretch", :language "en", :idx ["@graph" 1 "ex:nickname"]}],
+    "ns:ex/name" [{:value "Murray", :type nil, :idx ["@graph" 1 "ex:name"]}],
+    "ns:ex/address" [{:idx ["@graph" 1 "ex:address"],
+                      "ns:ex/street" [{:value "55 Bashford", :type nil, :idx ["@graph" 1 "ex:address" "ex:street"]}],
+                      "ns:ex/city" [{:value "St. Paul", :type nil, :idx ["@graph" 1 "ex:address" "ex:city"]}],
+                      "ns:ex/zip" [{:value 55105, :type "ns:ex/PostalCode", :idx ["@graph" 1 "ex:address" "ex:zip"]}],
+                      "ns:ex/state" [{:value "MN", :type nil, :idx ["@graph" 1 "ex:address" "ex:state"]}]}],
+    "ns:ex/favs"
+    [{:list
+      [{:value "Persey", :type nil, :idx ["@graph" 1 "ex:favs" "@list" 0]}
+       {:idx ["@graph" 1 "ex:favs" "@list" 1], :id "ns:ex/dp"}]}]}]
+
+  (fluree.db.query.fql.parse/parse-triples
+    [{:idx ["@graph" 0],
+      :id "?s",
+      "ns:ex/name" [{:value "WAT", :type nil, :idx ["@graph" 0 "ex:name"]}]}
+     {:idx ["@graph" 1],
+      :type ["ns:ex/Cat"],
+      :id "ns:ex/mp",
+      "ns:ex/nickname" [{:value "The Wretch", :language "en", :idx ["@graph" 1 "ex:nickname"]}],
+      "ns:ex/name" [{:value "Murray", :type nil, :idx ["@graph" 1 "ex:name"]}],
+      "ns:ex/address" [{:idx ["@graph" 1 "ex:address"],
+                        "ns:ex/street" [{:value "55 Bashford", :type nil, :idx ["@graph" 1 "ex:address" "ex:street"]}],
+                        "ns:ex/city" [{:value "St. Paul", :type nil, :idx ["@graph" 1 "ex:address" "ex:city"]}],
+                        "ns:ex/zip" [{:value 55105, :type "ns:ex/PostalCode", :idx ["@graph" 1 "ex:address" "ex:zip"]}],
+                        "ns:ex/state" [{:value "MN", :type nil, :idx ["@graph" 1 "ex:address" "ex:state"]}]}],
+      "ns:ex/favs"
+      [{:list
+        [{:value "Persey", :type nil, :idx ["@graph" 1 "ex:favs" "@list" 0]}
+         {:idx ["@graph" 1 "ex:favs" "@list" 1], :id "ns:ex/dp"}]}]}])
+  [[#:fluree.db.query.exec.where{:var ?s}
+    #:fluree.db.query.exec.where{:val "ns:ex/name"}
+    #:fluree.db.query.exec.where{:val "WAT", :datatype 1, :m nil}]
+   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
+    #:fluree.db.query.exec.where{:val "@type"}
+    #:fluree.db.query.exec.where{:val "ns:ex/Cat", :datatype 0}]
+   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
+    #:fluree.db.query.exec.where{:val "ns:ex/nickname"}
+    #:fluree.db.query.exec.where{:val "The Wretch", :datatype 205, :m {:lang "en"}}]
+   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
+    #:fluree.db.query.exec.where{:val "ns:ex/name"}
+    #:fluree.db.query.exec.where{:val "Murray", :datatype 1, :m nil}]
+   [#:fluree.db.query.exec.where{:val "_:fdb2"}
+    #:fluree.db.query.exec.where{:val "ns:ex/street"}
+    #:fluree.db.query.exec.where{:val "55 Bashford", :datatype 1, :m nil}]
+   [#:fluree.db.query.exec.where{:val "_:fdb2"}
+    #:fluree.db.query.exec.where{:val "ns:ex/city"}
+    #:fluree.db.query.exec.where{:val "St. Paul", :datatype 1, :m nil}]
+   [#:fluree.db.query.exec.where{:val "_:fdb2"}
+    #:fluree.db.query.exec.where{:val "ns:ex/zip"}
+    #:fluree.db.query.exec.where{:val 55105, :datatype "ns:ex/PostalCode", :m nil}]
+   [#:fluree.db.query.exec.where{:val "_:fdb2"}
+    #:fluree.db.query.exec.where{:val "ns:ex/state"}
+    #:fluree.db.query.exec.where{:val "MN", :datatype 1, :m nil}]
+   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
+    #:fluree.db.query.exec.where{:val "ns:ex/address"}
+    #:fluree.db.query.exec.where{:val "_:fdb1", :datatype 0}]
+   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
+    #:fluree.db.query.exec.where{:val "ns:ex/favs"}
+    #:fluree.db.query.exec.where{:val "Persey", :datatype 1, :m {:i 0}}]
+   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
+    #:fluree.db.query.exec.where{:val "ns:ex/favs"}
+    #:fluree.db.query.exec.where{:val "ns:ex/dp", :datatype 0, :m {:i 1}}]]
+
+  ,)
