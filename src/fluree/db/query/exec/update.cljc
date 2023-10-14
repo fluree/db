@@ -36,23 +36,13 @@
         matched    (match-solution triple solution)]
     (where/resolve-flake-range db fuel-tracker retract-xf error-ch matched)))
 
-(defn evaluate-iris
-  [db error-ch [s p o]]
-  (go (try*
-        (let [s* (<? (where/evaluate-subject-match db error-ch s))
-              p* (where/evaluate-predicate-match db p)]
-          [s* p* o])
-        (catch* e
-                (log/error e "Error looking up iri")
-                (>! error-ch e)))))
-
 (defn retract-clause
   [db clause t solution fuel-tracker error-ch out-ch]
   (let [clause-ch  (async/to-chan! clause)]
     (async/pipeline-async 2
                           out-ch
                           (fn [triple ch]
-                            (go (let [triple* (<! (evaluate-iris db error-ch triple))]
+                            (go (let [triple* (<! (where/evaluate-iris db error-ch triple))]
                                   (-> db
                                       (retract-triple triple* t solution fuel-tracker error-ch)
                                       (async/pipe ch)))))
@@ -91,7 +81,7 @@
   (async/pipeline-async 2
                         out-ch
                         (fn [triple ch]
-                          (go (let [triple* (<! (evaluate-iris db error-ch triple))]
+                          (go (let [triple* (<! (where/evaluate-iris db error-ch triple))]
                                 (-> db
                                     (insert-triple triple* t solution error-ch)
                                     (async/pipe ch)))))
