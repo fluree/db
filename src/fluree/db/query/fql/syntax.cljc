@@ -51,6 +51,7 @@
             docs/error-codes-page "#query-missing-select"))}
     one-select-key-present?]
    (into [:map {:closed true}
+          [:from {:optional true} ::from]
           [:where ::where]
           [:t {:optional true} ::t]
           [:context {:optional true} ::context]
@@ -152,7 +153,8 @@
     ::context         ::v/context
     ::json-ld-keyword ::v/json-ld-keyword
     ::query           (query-schema [])
-    ::modification    ::v/modification-txn}))
+    ::modification    ::v/modification-txn
+    ::from            ::v/from}))
 
 (def triple-validator
   (m/validator ::triple {:registry registry}))

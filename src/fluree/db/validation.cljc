@@ -122,6 +122,10 @@
     ::where                [:sequential [:orn
                                          [:where-map ::where-map]
                                          [:tuple ::where-tuple]]]
+    ::ledger               ::iri
+    ::from                 [:orn
+                            [:single ::ledger]
+                            [:collection [:sequential ::ledger]]]
     ::delete               [:orn
                             [:single ::triple]
                             [:collection [:sequential ::triple]]]
