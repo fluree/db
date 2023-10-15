@@ -194,43 +194,14 @@
                              "Provided: " s-pat ".")
                         {:status 400 :error :db/invalid-query})))))
 
-(defn iri->pred-id
-  [iri db context]
-  (let [full-iri (json-ld/expand-iri iri context)]
-    (dbproto/-p-prop db :id full-iri)))
-
-(defn iri->pred-id-strict
-  [iri db context]
-  (or (iri->pred-id iri db context)
-      (throw (ex-info (str "Invalid predicate: " iri)
-                      {:status 400 :error :db/invalid-query}))))
-
-(defn parse-recursion-predicate
-  [x db context]
-  (when-let [[p-iri recur-n] (recursion-predicate x context)]
-    (let [iri     (iri->pred-id-strict p-iri db context)
-          recur-n (or recur-n util/max-integer)]
-      (where/->predicate iri recur-n))))
-
-(defn parse-full-text-predicate
-  [x db context]
-  (when (and (string? x)
-             (str/starts-with? x "fullText:"))
-    (-> x
-        (subs 9)
-        (iri->pred-id-strict db context)
-        where/->full-text)))
-
 (defn parse-predicate-iri
   [p context]
   (let [iri (json-ld/expand-iri p context)]
     (where/->predicate iri)))
 
 (defn parse-predicate-pattern
-  [p-pat db context]
+  [p-pat context]
   (or (parse-variable p-pat)
-      (parse-recursion-predicate p-pat db context)
-      (parse-full-text-predicate p-pat db context)
       (parse-predicate-iri p-pat context)))
 
 (defn parse-class
@@ -281,7 +252,7 @@
       (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
-  (fn [pattern _vars _db _context]
+  (fn [pattern _vars _context]
     (cond
       (map? pattern) (->> pattern keys first)
       (map-entry? pattern) :binding
@@ -319,20 +290,20 @@
              {} bind))
 
 (defn parse-where-clause
-  [clause vars db context]
+  [clause vars context]
   (let [patterns (->> clause
                       (remove filter-pattern?)
                       (mapv (fn [pattern]
-                              (parse-pattern pattern vars db context))))
+                              (parse-pattern pattern vars context))))
         filters  (->> clause
                       (filter filter-pattern?)
                       (parse-filter-maps vars))]
     (where/->where-clause patterns filters)))
 
 (defn parse-triple
-  [[s-pat p-pat o-pat] db context]
+  [[s-pat p-pat o-pat] context]
   (let [s (parse-subject-pattern s-pat context)
-        p (parse-predicate-pattern p-pat db context)]
+        p (parse-predicate-pattern p-pat context)]
     (if (and (#{const/iri-type const/iri-rdf-type} (::where/iri p))
              (not (v/variable? o-pat)))
       (let [class-ref (parse-class o-pat context)]
@@ -344,38 +315,38 @@
           [s p o])))))
 
 (defmethod parse-pattern :triple
-  [triple _ db context]
-  (parse-triple triple db context))
+  [triple _ context]
+  (parse-triple triple context))
 
 (defmethod parse-pattern :union
-  [{:keys [union]} vars db context]
+  [{:keys [union]} vars context]
   (let [parsed (mapv (fn [clause]
-                       (parse-where-clause clause vars db context))
+                       (parse-where-clause clause vars context))
                      union)]
     (where/->pattern :union parsed)))
 
 (defmethod parse-pattern :optional
-  [{:keys [optional]} vars db context]
+  [{:keys [optional]} vars context]
   (let [clause (if (coll? (first optional))
                  optional
                  [optional])
-        parsed (parse-where-clause clause vars db context)]
+        parsed (parse-where-clause clause vars context)]
     (where/->pattern :optional parsed)))
 
 (defmethod parse-pattern :bind
-  [{:keys [bind]} _vars _db _context]
+  [{:keys [bind]} _vars _context]
   (let [parsed  (parse-bind-map bind)
         pattern (where/->pattern :bind parsed)]
     pattern))
 
 (defmethod parse-pattern :binding
-  [[v f] _vars _db _context]
+  [[v f] _vars _context]
   (where/->pattern :binding [v f]))
 
 (defn parse-where
-  [q vars db context]
+  [q vars context]
   (when-let [where (:where q)]
-    (parse-where-clause where vars db context)))
+    (parse-where-clause where vars context)))
 
 (defn parse-selector
   [db context depth s]
@@ -466,7 +437,7 @@
   [q db]
   (let [context  (parse-context q db)
         [vars values] (parse-values q)
-        where    (parse-where q vars db context)
+        where    (parse-where q vars context)
         grouping (parse-grouping q)
         ordering (parse-ordering q)]
     (-> q
@@ -482,9 +453,8 @@
 (defn parse-analytical-query
   [q db]
   (let [parsed (parse-analytical-query* q db)]
-    (let [parsed-parse (or (re-parse-as-simple-subj-crawl parsed db)
-                           parsed)]
-      parsed-parse)))
+    (or (re-parse-as-simple-subj-crawl parsed db)
+        parsed)))
 
 (defn parse-query
   [q db]
@@ -507,7 +477,7 @@
                   [clause]
                   clause)]
     (mapv (fn [trip]
-            (parse-triple trip db context))
+            (parse-triple trip context))
           clause*)))
 
 (defn parse-ledger-update
@@ -515,7 +485,7 @@
   (when (update? mdfn)
     (let [context (parse-context mdfn db)
           [vars values] (parse-values mdfn)
-          where   (parse-where mdfn vars db context)]
+          where   (parse-where mdfn vars context)]
       (-> mdfn
           (assoc :context context
                  :where where)
