@@ -160,7 +160,7 @@
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
 
-(defn from-query-fql
+(defn query-connection-fql
   [conn query]
   (go-try
     (let [ledger-alias (:from query)
@@ -168,14 +168,14 @@
           ledger (<? (jld-ledger/load conn ledger-address))]
       (<? (query-fql (ledger-proto/-db ledger) (dissoc query :from))))))
 
-(defn from-query-sparql
+(defn query-connection-sparql
   [conn query]
   (go-try
     (let [fql (sparql/->fql query)]
-      (<? (from-query-fql conn fql)))))
+      (<? (query-connection-fql conn fql)))))
 
-(defn from-query
+(defn query-connection
   [conn query {:keys [format] :as _opts :or {format :fql}}]
   (case format
-    :fql (from-query-fql conn query)
-    :sparql (from-query-sparql conn query)))
+    :fql (query-connection-fql conn query)
+    :sparql (query-connection-sparql conn query)))

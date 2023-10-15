@@ -352,13 +352,13 @@
   ([db q opts]
    (promise-wrap (query-api/query db q opts))))
 
-(defn from-query
+(defn query-connection
   "Queries the latest db in the ledger specified by the 'from' parameter in the
   query (what that actually looks like is format-specific). Returns a promise
   with the results."
-  ([conn q] (from-query conn q {}))
+  ([conn q] (query-connection conn q {}))
   ([conn q opts]
-   (promise-wrap (query-api/from-query conn q opts))))
+   (promise-wrap (query-api/query-connection conn q opts))))
 
 (defn history
   "Return the change history over a specified time range. Optionally include the commit
