@@ -44,49 +44,45 @@
                    :ex/favNums   [5, 10]
                    :ex/friend    [:ex/brian :ex/alice]}])
         context  (dbproto/-context db)
-        ssc-q1-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
+        ssc-q1-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
                                                       :where  [["?s" :schema/name "Alice"]]}
                                                      context)
-        ssc-q2-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
+        ssc-q2-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
                                                       :where  [["?s" :schema/age 50]
                                                                ["?s" :ex/favColor "Blue"]]}
                                                      context)
-        not-ssc-parsed (parse/parse-analytical-query* {:select  ['?name '?age '?email]
+        not-ssc-parsed (parse/parse-analytical-query {:select  ['?name '?age '?email]
                                                        :where   [['?s :schema/name "Cam"]
                                                                  ['?s :ex/friend '?f]
                                                                  ['?f :schema/name '?name]
                                                                  ['?f :schema/age '?age]
                                                                  ['?f :schema/email '?email]]}
                                                       context)
-        order-group-parsed (parse/parse-analytical-query* {:select   ['?name '?favNums]
+        order-group-parsed (parse/parse-analytical-query {:select   ['?name '?favNums]
                                                            :where    [['?s :schema/name '?name]
                                                                       ['?s :ex/favNums '?favNums]]
                                                            :group-by '?name
                                                            :order-by '?name}
                                                           context)
-        vars-query-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
+        vars-query-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
                                                           :where  [["?s" :schema/name '?name]]
                                                           :vars {'?name "Alice"}}
                                                          context)
         s+p+o-parsed (parse/parse-analytical-query {:select {"?s" [:*]}
                                                     :where  [["?s" "?p" "?o"]]}
-                                                   context
-                                                   db)
+                                                   context)
         s+p+o2-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
                                                      :where [['?s :schema/age 50]
                                                              ['?s '?p '?o]]}
-                                                    context
-                                                    db)
+                                                    context)
         s+p+o3-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
                                                      :where [['?s '?p '?o]
                                                              ['?s :schema/age 50]]}
-                                                    context
-                                                    db)
+                                                    context)
         equivalent-property-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
                                                                   :where [['?s :schema/name '?name]
                                                                           ['?s :vocab1/credential '?credential]]}
-                                                                 context
-                                                                 db)]
+                                                                 context)]
     (testing "simple-subject-crawl?"
       (is (= true
              (reparse/simple-subject-crawl? ssc-q1-parsed db)))

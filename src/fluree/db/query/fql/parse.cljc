@@ -5,7 +5,6 @@
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.datatype :as datatype]
-            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.string :as str]
             [clojure.set :as set]
@@ -422,7 +421,7 @@
     (assoc q :fuel max-fuel)
     q))
 
-(defn parse-analytical-query*
+(defn parse-analytical-query
   [q context]
   (let [[vars values] (parse-values q)
         where    (parse-where q vars context)
@@ -438,18 +437,12 @@
         (parse-select context)
         parse-fuel)))
 
-(defn parse-analytical-query
-  [q context db]
-  (let [parsed (parse-analytical-query* q context)]
-    (or (re-parse-as-simple-subj-crawl parsed db)
-        parsed)))
-
 (defn parse-query
-  [q context db]
+  [q context]
   (log/trace "parse-query" q)
   (-> q
       syntax/coerce-query
-      (parse-analytical-query context db)))
+      (parse-analytical-query context)))
 
 (defn parse-update-clause
   [clause context]

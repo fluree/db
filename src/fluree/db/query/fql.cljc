@@ -6,7 +6,8 @@
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec]
-            [fluree.db.query.exec.update :as update])
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -54,7 +55,9 @@
      (let [q-ctx (get-context query-map)
            ctx   (dbproto/-context db q-ctx (:context-type opts))
            q     (try*
-                   (parse/parse-query query-map ctx db)
+                   (let [parsed (parse/parse-query query-map ctx)]
+                     (or (re-parse-as-simple-subj-crawl parsed db)
+                         parsed))
                    (catch* e e))
            db*   (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
        (if (util/exception? q)
