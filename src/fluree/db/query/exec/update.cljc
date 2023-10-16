@@ -14,7 +14,7 @@
 
 (defn match-component
   [c solution]
-  (if (::where/val c)
+  (if (some? (::where/val c))
     c
     (get solution (::where/var c))))
 

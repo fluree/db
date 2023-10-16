@@ -599,7 +599,7 @@
                 triples
                 (map vector (range) list))
 
-        value
+        (some? value)
         (let [obj-cmp (if (v/variable? value)
                         (parse-variable value)
                         (cond-> {::where/val value
