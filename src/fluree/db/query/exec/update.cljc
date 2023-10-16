@@ -227,7 +227,7 @@
                     new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
                     existing-pid   (<? (dbproto/-subid db p))
-                    pid            (if existing-pid existing-pid (next-pid p))
+                    pid            (or existing-pid (get jld-ledger/predefined-properties p) (next-pid p))
                     new-pred-flake (when-not existing-pid (create-id-flake pid p t))
 
                     ;; subid works for sids
