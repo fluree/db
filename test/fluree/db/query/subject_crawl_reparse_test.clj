@@ -4,7 +4,8 @@
    [fluree.db.test-utils :as test-utils]
    [fluree.db.json-ld.api :as fluree]
    [fluree.db.query.fql.parse :as parse]
-   [fluree.db.query.subject-crawl.reparse :as reparse]))
+   [fluree.db.query.subject-crawl.reparse :as reparse]
+   [fluree.db.dbproto :as dbproto]))
 
 (deftest test-reparse-as-ssc
   (let [conn   (test-utils/create-conn)
@@ -42,44 +43,49 @@
                    :schema/age   34
                    :ex/favNums   [5, 10]
                    :ex/friend    [:ex/brian :ex/alice]}])
+        context  (dbproto/-context db)
         ssc-q1-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
                                                       :where  [["?s" :schema/name "Alice"]]}
-                                                     db)
+                                                     context)
         ssc-q2-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
                                                       :where  [["?s" :schema/age 50]
                                                                ["?s" :ex/favColor "Blue"]]}
-                                                     db)
+                                                     context)
         not-ssc-parsed (parse/parse-analytical-query* {:select  ['?name '?age '?email]
                                                        :where   [['?s :schema/name "Cam"]
                                                                  ['?s :ex/friend '?f]
                                                                  ['?f :schema/name '?name]
                                                                  ['?f :schema/age '?age]
                                                                  ['?f :schema/email '?email]]}
-                                                      db)
+                                                      context)
         order-group-parsed (parse/parse-analytical-query* {:select   ['?name '?favNums]
                                                            :where    [['?s :schema/name '?name]
                                                                       ['?s :ex/favNums '?favNums]]
                                                            :group-by '?name
                                                            :order-by '?name}
-                                                          db)
+                                                          context)
         vars-query-parsed (parse/parse-analytical-query* {:select {"?s" ["*"]}
                                                           :where  [["?s" :schema/name '?name]]
                                                           :vars {'?name "Alice"}}
-                                                         db)
+                                                         context)
         s+p+o-parsed (parse/parse-analytical-query {:select {"?s" [:*]}
                                                     :where  [["?s" "?p" "?o"]]}
+                                                   context
                                                    db)
         s+p+o2-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
                                                      :where [['?s :schema/age 50]
                                                              ['?s '?p '?o]]}
+                                                    context
                                                     db)
         s+p+o3-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
                                                      :where [['?s '?p '?o]
                                                              ['?s :schema/age 50]]}
+                                                    context
                                                     db)
         equivalent-property-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
                                                                   :where [['?s :schema/name '?name]
                                                                           ['?s :vocab1/credential '?credential]]}
+                                                                 context
                                                                  db)]
     (testing "simple-subject-crawl?"
       (is (= true

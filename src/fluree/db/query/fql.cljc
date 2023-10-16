@@ -1,10 +1,12 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.util.log :as log :include-macros true]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.query.exec :as exec])
+            [fluree.db.query.exec :as exec]
+            [fluree.db.query.exec.update :as update])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -36,19 +38,45 @@
   #?(:clj (:cache opts)
      :cljs false))
 
+(defn get-context
+  [q]
+  (cond (contains? q :context) (:context q)
+        (contains? q "@context") (get q "@context")
+        :else ::dbproto/default-context))
+
 (defn query
   "Returns core async channel with results or exception"
   ([db query-map]
    (query db nil query-map))
-  ([db fuel-tracker query-map]
+  ([db fuel-tracker {:keys [opts] :as query-map}]
    (if (cache? query-map)
      (cache-query db query-map)
-     (let [q   (try*
-                 (parse/parse-query query-map db)
-                 (catch* e e))
-           db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
+     (let [q-ctx (get-context query-map)
+           ctx   (dbproto/-context db q-ctx (:context-type opts))
+           q     (try*
+                   (parse/parse-query query-map ctx db)
+                   (catch* e e))
+           db*   (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
        (if (util/exception? q)
          (async/to-chan! [q])
          (if (= :simple-subject-crawl (:strategy q))
            (simple-subject-crawl db* q)
            (exec/query db* fuel-tracker q)))))))
+
+(defn update?
+  [x]
+  (and (map? x)
+       (or (update/insert? x)
+           (update/retract? x))
+       (or (contains? x :where)
+           (contains? x "where"))))
+
+(defn modify
+  ([db t json-ld]
+   (modify db t nil json-ld))
+
+  ([db t fuel-tracker {:keys [opts] :as mdfn-map}]
+   (let [m-ctx (get-context mdfn-map)
+         ctx   (dbproto/-context db m-ctx (:context-type opts))
+         mdfn  (parse/parse-modification mdfn-map ctx)]
+     (exec/modify db t fuel-tracker mdfn))))

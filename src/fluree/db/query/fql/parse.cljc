@@ -14,21 +14,10 @@
             [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.validation :as v]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const]
             #?(:cljs [cljs.reader :refer [read-string]])))
 
 #?(:clj (set! *warn-on-reflection* true))
-
-(defn get-context
-  [q]
-  (cond (contains? q :context) (:context q)
-        (contains? q "@context") (get q "@context")
-        :else ::dbproto/default-context))
-
-(defn parse-context
-  [{:keys [opts] :as q} db]
-  (dbproto/-context db (get-context q) (:context-type opts)))
 
 (defn parse-var-name
   "Returns a `x` as a symbol if `x` is a valid '?variable'."
@@ -434,9 +423,8 @@
     q))
 
 (defn parse-analytical-query*
-  [q db]
-  (let [context  (parse-context q db)
-        [vars values] (parse-values q)
+  [q context]
+  (let [[vars values] (parse-values q)
         where    (parse-where q vars context)
         grouping (parse-grouping q)
         ordering (parse-ordering q)]
@@ -451,25 +439,17 @@
         parse-fuel)))
 
 (defn parse-analytical-query
-  [q db]
-  (let [parsed (parse-analytical-query* q db)]
+  [q context db]
+  (let [parsed (parse-analytical-query* q context)]
     (or (re-parse-as-simple-subj-crawl parsed db)
         parsed)))
 
 (defn parse-query
-  [q db]
+  [q context db]
   (log/trace "parse-query" q)
   (-> q
       syntax/coerce-query
-      (parse-analytical-query db)))
-
-(defn update?
-  [x]
-  (and (map? x)
-       (or (update/insert? x)
-           (update/retract? x))
-       (or (contains? x :where)
-           (contains? x "where"))))
+      (parse-analytical-query context db)))
 
 (defn parse-update-clause
   [clause context]
@@ -481,26 +461,24 @@
           clause*)))
 
 (defn parse-ledger-update
-  [mdfn db]
-  (when (update? mdfn)
-    (let [context (parse-context mdfn db)
-          [vars values] (parse-values mdfn)
-          where   (parse-where mdfn vars context)]
-      (-> mdfn
-          (assoc :context context
-                 :where where)
-          (cond-> (seq values) (assoc :values values))
-          (as-> mod
-                (if (update/retract? mod)
-                  (update mod :delete parse-update-clause context)
-                  mod))
-          (as-> mod
-                (if (update/insert? mod)
-                  (update mod :insert parse-update-clause context)
-                  mod))))))
+  [mdfn context]
+  (let [[vars values] (parse-values mdfn)
+        where   (parse-where mdfn vars context)]
+    (-> mdfn
+        (assoc :context context
+               :where where)
+        (cond-> (seq values) (assoc :values values))
+        (as-> mod
+            (if (update/retract? mod)
+              (update mod :delete parse-update-clause context)
+              mod))
+        (as-> mod
+            (if (update/insert? mod)
+              (update mod :insert parse-update-clause context)
+              mod)))))
 
 (defn parse-modification
-  [mdfn db]
-  (-> mdfn
+  [json-ld context]
+  (-> json-ld
       syntax/coerce-modification
-      (parse-ledger-update db)))
+      (parse-ledger-update context)))

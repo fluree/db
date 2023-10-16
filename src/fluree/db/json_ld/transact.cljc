@@ -16,10 +16,7 @@
             [fluree.db.json-ld.vocab :as vocab]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.policy.enforce-tx :as policy]
-            [fluree.db.query.exec.update :as update]
-            [fluree.db.query.exec.where :as where]
-            [fluree.db.query.fql.parse :as q-parse]
-            [fluree.db.query.fql.syntax :as syntax]
+            [fluree.db.query.fql :as fql]
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try throw-err]]
             [fluree.db.util.core :as util :refer [vswap!]]
@@ -486,28 +483,6 @@
                 (vocab/reset-shapes (:schema db-after)))
               staged-map)))))))
 
-(defn into-flakeset
-  [fuel-tracker flake-ch]
-  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
-    (if fuel-tracker
-      (let [track-fuel (fuel/track fuel-tracker)]
-        (async/transduce track-fuel into flakeset flake-ch))
-      (async/reduce into flakeset flake-ch))))
-
-(defn modify
-  [db fuel-tracker json-ld {:keys [t] :as _tx-state}]
-  (let [mdfn (-> json-ld
-                 syntax/coerce-modification
-                 (q-parse/parse-modification db))]
-    (go
-      (let [error-ch  (async/chan)
-            update-ch (->> (where/search db mdfn fuel-tracker error-ch)
-                           (update/modify db mdfn t fuel-tracker error-ch)
-                           (into-flakeset fuel-tracker))]
-        (async/alt!
-         error-ch ([e] e)
-         update-ch ([flakes] flakes))))))
-
 (defn flakes->final-db
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
@@ -530,19 +505,19 @@
    (stage db nil json-ld opts))
   ([db fuel-tracker json-ld opts]
    (go-try
-     (let [{tx :subject did :did} (or (<? (cred/verify json-ld))
-                                      {:subject json-ld})
-           opts*         (cond-> opts did (assoc :did did))
-           db*           (if-let [policy-opts (perm/policy-opts opts*)]
-                           (<? (perm/wrap-policy db policy-opts))
-                           db)
-           tx-state      (->tx-state db* opts*)
-           flakes-ch     (if (q-parse/update? tx)
-                           (modify db fuel-tracker tx tx-state)
-                           (insert db fuel-tracker tx tx-state))
-           fuel-error-ch (:error-ch fuel-tracker)
-           chans         (remove nil? [fuel-error-ch flakes-ch])
-           [flakes]      (alts! chans :priority true)]
+     (let [{tx :subject did :did}   (or (<? (cred/verify json-ld))
+                                        {:subject json-ld})
+           opts*                    (cond-> opts did (assoc :did did))
+           db*                      (if-let [policy-opts (perm/policy-opts opts*)]
+                                      (<? (perm/wrap-policy db policy-opts))
+                                      db)
+           {:keys [t] :as tx-state} (->tx-state db* opts*)
+           flakes-ch                (if (fql/update? tx)
+                                      (fql/modify db t fuel-tracker tx)
+                                      (insert db fuel-tracker tx tx-state))
+           fuel-error-ch            (:error-ch fuel-tracker)
+           chans                    (remove nil? [fuel-error-ch flakes-ch])
+           [flakes]                 (alts! chans :priority true)]
        (when (util/exception? flakes)
          (throw flakes))
        (log/trace "stage flakes:" flakes)

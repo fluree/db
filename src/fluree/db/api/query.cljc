@@ -30,7 +30,6 @@
                           (<? (perm/wrap-policy db policy-opts))
                           db)
          {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
-         context        (fql-parse/get-context parsed)
 
          ;; from and to are positive ints, need to convert to negative or fill in default values
          {:keys [from to at]} t
@@ -49,7 +48,8 @@
                                 (number? to) (- to)
                                 (nil? to) (:t db*))])
 
-         parsed-context (fql-parse/parse-context query-map db*)
+         context        (fql/get-context parsed)
+         parsed-context (dbproto/-context db context (:context-type opts))
          error-ch       (async/chan)]
      (if history
        ;; filter flakes for history pattern
