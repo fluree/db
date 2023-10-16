@@ -570,12 +570,14 @@
 (defn next-id
   "counter is either :last-pid or :last-sid"
   [iri->sid counter iri]
-  (if-let [sid (get @iri->sid iri)]
-    sid
-    (let [iri->sid* (swap! iri->sid #(-> %
-                                         (assoc iri (get % counter))
-                                         (update counter inc)))]
-      (get iri->sid* iri))))
+  (let [iri->sid* (swap! iri->sid
+                         (fn [iri->sid]
+                           (if (get iri->sid iri)
+                             iri->sid
+                             (-> iri->sid
+                                 (assoc iri (get iri->sid counter))
+                                 (update counter inc)))))]
+    (get iri->sid* iri)))
 
 (defn ->tx-state2
   [db]
