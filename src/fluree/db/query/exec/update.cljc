@@ -233,7 +233,7 @@
                     ;; subid works for sids
                     existing-dt   (<? (dbproto/-subid db dt))
                     dt-sid        (cond existing-dt existing-dt
-                                        (string? dt) (next-sid dt)
+                                        (string? dt) (next-pid dt)
                                         :else (datatype/infer o (:lang m)))
                     new-dt-flake  (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
 
