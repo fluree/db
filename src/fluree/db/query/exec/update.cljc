@@ -211,49 +211,47 @@
 (defn insert-triple2
   [db triple {:keys [t next-sid next-pid]} solution error-ch]
   (go
-    (try* (let [[s-mch p-mch o-mch] (match-solution triple solution)
-                s                   (::where/val s-mch)
-                p                   (::where/val p-mch)
-                o                   (::where/val o-mch)
-                dt                  (::where/datatype o-mch)
-                m                   (::where/m o-mch)]
+    (try*
+      (let [[s-mch p-mch o-mch] (match-solution triple solution)
 
-            (when (and (some? s) (some? p) (some? o) (some? dt))
-              (let [existing-sid   (<? (dbproto/-subid db s))
-                    [sid s-iri]    (if (temp-bnode? s)
-                                     (let [bnode-sid (next-sid s)]
-                                       [bnode-sid (bnode-id bnode-sid)])
-                                     [(or existing-sid (get jld-ledger/predefined-properties s) (next-sid s)) s])
-                    new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
+            s  (::where/val s-mch)
+            p  (::where/val p-mch)
+            o  (::where/val o-mch)
+            dt (::where/datatype o-mch)
+            m  (::where/m o-mch)
 
-                    existing-pid   (<? (dbproto/-subid db p))
-                    pid            (or existing-pid (get jld-ledger/predefined-properties p) (next-pid p))
-                    new-pred-flake (when-not existing-pid (create-id-flake pid p t))
+            existing-sid   (<? (dbproto/-subid db s))
+            [sid s-iri]    (if (temp-bnode? s)
+                             (let [bnode-sid (next-sid s)]
+                               [bnode-sid (bnode-id bnode-sid)])
+                             [(or existing-sid (get jld-ledger/predefined-properties s) (next-sid s)) s])
+            new-subj-flake (when-not existing-sid (create-id-flake sid s-iri t))
 
-                    ;; subid works for sids
-                    existing-dt   (<? (dbproto/-subid db dt))
-                    dt-sid        (cond existing-dt existing-dt
-                                        (string? dt) (next-pid dt)
-                                        :else (datatype/infer o (:lang m)))
-                    new-dt-flake  (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
+            existing-pid   (<? (dbproto/-subid db p))
+            pid            (or existing-pid (get jld-ledger/predefined-properties p) (next-pid p))
+            new-pred-flake (when-not existing-pid (create-id-flake pid p t))
 
-                    ref?             (= const/$xsd:anyURI dt)
-                    existing-ref-sid (when ref? (<? (dbproto/-subid db o)))
-                    ref-sid          (when ref?
-                                       (if existing-ref-sid
-                                         existing-ref-sid
-                                         (next-sid o)))
-                    ref-iri          (when ref?
-                                       (if (temp-bnode? o)
-                                         (bnode-id ref-sid)
-                                         o))
-                    new-ref-flake    (when (and ref? (not existing-ref-sid))
-                                       (create-id-flake ref-sid ref-iri t))
+            existing-dt  (when dt (<? (dbproto/-subid db dt)))
+            dt-sid       (cond existing-dt  existing-dt
+                               (string? dt) (next-pid dt)
+                               :else        (datatype/infer o (:lang m)))
+            new-dt-flake (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
 
-                    ;; o needs to be a sid if it's a ref, otherwise the literal o
-                    obj-flake  (flake/create sid pid (if ref? ref-sid o) dt-sid t true m)]
-
-                (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))))
+            ref?             (= const/$xsd:anyURI dt)
+            existing-ref-sid (when ref? (<? (dbproto/-subid db o)))
+            ref-sid          (when ref?
+                               (if existing-ref-sid
+                                 existing-ref-sid
+                                 (next-sid o)))
+            ref-iri          (when ref?
+                               (if (temp-bnode? o)
+                                 (bnode-id ref-sid)
+                                 o))
+            new-ref-flake    (when (and ref? (not existing-ref-sid))
+                               (create-id-flake ref-sid ref-iri t))
+            ;; o needs to be a sid if it's a ref, otherwise the literal o
+            obj-flake        (flake/create sid pid (if ref? ref-sid o) dt-sid t true m)]
+        (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))
           (catch* e
                   (log/error e "Error inserting new triple")
                   (>! error-ch e)))))

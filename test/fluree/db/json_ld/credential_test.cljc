@@ -182,7 +182,7 @@
                 "f:retract" [{"name" "Daniel", "favnums" 1, :id (:id auth)}]}]
               @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private auth)))))
            "history query credential - allowing access")
-       (is (= "Subject identity does not exist: did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh"
+       (is (= "Subject identity does not exist: \"did:fluree:TfHgFTQQiJMHaK1r1qxVPZ3Ridj9pCozqnh\""
               (-> @(fluree/history ledger (async/<!! (cred/generate {:history (:id auth) :t {:from 1}} (:private pleb-auth))))
                   (Throwable->map)
                   (:cause)))
