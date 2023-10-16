@@ -586,7 +586,8 @@
       syntax/coerce-modification
       (parse-ledger-update db)))
 
-(defn bnode-id
+(defn temp-bnode-id
+  "Generate a temporary bnode id. This will get replaced during flake creation when a sid is generated."
   [bnode-counter]
   (str "_:fdb" (vswap! bnode-counter inc)))
 
@@ -609,12 +610,12 @@
 
         :else
         (let [ref-cmp (if (nil? id)
-                        {::where/val (bnode-id bnode-counter) ::where/datatype const/$xsd:anyURI}
+                        {::where/val (temp-bnode-id bnode-counter) ::where/datatype const/$xsd:anyURI}
                         (cond-> {::where/val id ::where/datatype const/$xsd:anyURI}
                           m (assoc ::where/m m)))
               v-map* (if (nil? id)
                        ;; project newly created bnode-id into v-map
-                       (assoc v-map :id (:val ref-cmp))
+                       (assoc v-map :id (::where/val ref-cmp))
                        v-map)]
           (conj (parse-subj-cmp bnode-counter triples v-map*) [subj-cmp pred-cmp ref-cmp]))))
 
@@ -634,7 +635,7 @@
 
 (defn parse-subj-cmp
   [bnode-counter triples {:keys [id] :as node}]
-  (let [subj-cmp (cond (nil? id) {::where/val (bnode-id bnode-counter)}
+  (let [subj-cmp (cond (nil? id) {::where/val (temp-bnode-id bnode-counter)}
                        (v/variable? id) (parse-variable id)
                        :else {::where/val id})]
     (reduce (partial parse-pred-cmp bnode-counter subj-cmp)

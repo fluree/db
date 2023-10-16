@@ -194,7 +194,7 @@
                           solution-ch)
     retract-ch))
 
-(defn fdb-bnode?
+(defn temp-bnode?
   "Is the iri a fluree-generated temporary bnode?"
   [iri]
   (str/starts-with? iri "_:fdb"))
@@ -220,7 +220,7 @@
 
             (when (and (some? s) (some? p) (some? o) (some? dt))
               (let [existing-sid   (<? (dbproto/-subid db s))
-                    [sid s-iri]    (if (fdb-bnode? s)
+                    [sid s-iri]    (if (temp-bnode? s)
                                      (let [bnode-sid (next-sid s)]
                                        [bnode-sid (bnode-id bnode-sid)])
                                      [(or existing-sid (get jld-ledger/predefined-properties s) (next-sid s)) s])
@@ -243,8 +243,12 @@
                                        (if existing-ref-sid
                                          existing-ref-sid
                                          (next-sid o)))
-                    new-ref-flake    (when (and (not existing-ref-sid) (= const/$xsd:anyURI dt))
-                                       (create-id-flake (next-sid o) o t))
+                    ref-iri          (when ref?
+                                       (if (temp-bnode? o)
+                                         (bnode-id ref-sid)
+                                         o))
+                    new-ref-flake    (when (and ref? (not existing-ref-sid))
+                                       (create-id-flake ref-sid ref-iri t))
 
                     ;; o needs to be a sid if it's a ref, otherwise the literal o
                     obj-flake  (flake/create sid pid (if ref? ref-sid o) dt-sid t true m)]
