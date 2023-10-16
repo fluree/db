@@ -10,10 +10,15 @@
             [clojure.math]
             [fluree.db.datatype :as datatype]
             [fluree.crypto :as crypto]
-            [fluree.db.constants :as const])
+            [fluree.db.constants :as const]
+            #?@(:clj []
+                :cljs [[sci.core :as sci]]))
   #?(:clj (:import (java.time Instant OffsetDateTime LocalDateTime))))
 
 #?(:clj (set! *warn-on-reflection* true))
+
+#?(:cljs (def ctx (sci/init {:classes {'js js/globalThis :allow :allowed-symbols}})))
+#?(:cljs (set! *eval* #(sci/eval-form ctx %)))
 
 (defn ratio?
   [x]
@@ -445,8 +450,8 @@
          soln-sym       'solution
          bdg            (bind-variables soln-sym vars)
          fn-code        `(fn [~soln-sym]
-                           (log/trace "fn solution:" ~soln-sym)
-                           (log/trace "fn bindings:" (quote ~bdg))
+                           #?(:clj (log/trace "fn solution:" ~soln-sym))
+                           #?(:clj (log/trace "fn bindings:" (quote ~bdg)))
                            (let ~bdg
                              ~qualified-code))]
      (log/debug "compiled fn:" fn-code)

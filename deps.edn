@@ -5,6 +5,7 @@
          org.clojars.mmb90/cljs-cache    {:mvn/version "0.1.4"}
          org.clojure/data.avl            {:mvn/version "0.1.0"}
          org.clojure/data.xml            {:mvn/version "0.2.0-alpha8"}
+         org.babashka/sci                {:mvn/version "0.8.40"}
          environ/environ                 {:mvn/version "1.2.0"}
          byte-streams/byte-streams       {:mvn/version "0.2.4"}
          cheshire/cheshire               {:mvn/version "5.12.0"}
