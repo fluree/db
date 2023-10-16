@@ -349,7 +349,7 @@
     (parse-where-clause where vars context)))
 
 (defn parse-selector
-  [db context depth s]
+  [context depth s]
   (cond
     (v/variable? s) (-> s parse-var-name select/variable-selector)
     (v/as-fn? s)    (let [parsed-fn  (parse-code s)
@@ -361,18 +361,18 @@
                           (select/as-selector bind-var aggregate?)))
     (v/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
     (select-map? s) (let [{:keys [variable selection depth spec]}
-                          (parse-subselection db context s depth)]
+                          (parse-subselection context s depth)]
                       (select/subgraph-selector variable selection depth spec))))
 
 (defn parse-select-clause
-  [clause db context depth]
+  [clause context depth]
   (if (sequential? clause)
-    (mapv (partial parse-selector db context depth)
+    (mapv (partial parse-selector context depth)
           clause)
-    (parse-selector db context depth clause)))
+    (parse-selector context depth clause)))
 
 (defn parse-select
-  [q db context]
+  [q context]
   (let [depth      (or (:depth q) 0)
         select-key (some (fn [k]
                            (when (contains? q k) k))
@@ -380,7 +380,7 @@
                           :selectDistinct :select-distinct])
         select     (-> q
                        (get select-key)
-                       (parse-select-clause db context depth))]
+                       (parse-select-clause context depth))]
     (case select-key
       (:select
        :select-one
@@ -447,7 +447,7 @@
                 grouping (assoc :group-by grouping)
                 ordering (assoc :order-by ordering))
         parse-having
-        (parse-select db context)
+        (parse-select context)
         parse-fuel)))
 
 (defn parse-analytical-query
@@ -472,7 +472,7 @@
            (contains? x "where"))))
 
 (defn parse-update-clause
-  [clause db context]
+  [clause context]
   (let [clause* (if (syntax/triple? clause)
                   [clause]
                   clause)]
@@ -492,11 +492,11 @@
           (cond-> (seq values) (assoc :values values))
           (as-> mod
                 (if (update/retract? mod)
-                  (update mod :delete parse-update-clause db context)
+                  (update mod :delete parse-update-clause context)
                   mod))
           (as-> mod
                 (if (update/insert? mod)
-                  (update mod :insert parse-update-clause db context)
+                  (update mod :insert parse-update-clause context)
                   mod))))))
 
 (defn parse-modification

@@ -61,25 +61,24 @@
 
 
 (defn expand-selection
-  [{:keys [schema] :as db} context depth selection]
+  [context depth selection]
   (reduce
     (fn [acc select-item]
       (cond
         (map? select-item)
         (let [[k v] (first select-item)
               iri    (json-ld/expand-iri k context)
-              spec   (get-in schema [:pred iri])
-              pid    (:id spec)
+              spec   {:iri iri}
               depth* (if (zero? depth)
                        0
                        (dec depth))
               reverse? (boolean (get-in context [k :reverse]))
               spec* (-> spec
-                        (assoc :spec (expand-selection db context depth* v)
+                        (assoc :spec (expand-selection context depth* v)
                                :as k))]
           (if reverse?
-            (assoc-in acc [:reverse pid] spec*)
-            (assoc acc pid spec*)))
+            (assoc-in acc [:reverse iri] spec*)
+            (assoc acc iri spec*)))
 
         (#{"*" :* '*} select-item)
         (assoc acc :wildcard? true)
@@ -89,18 +88,17 @@
 
         :else
         (let [iri      (json-ld/expand-iri select-item context)
-              spec     (get-in schema [:pred iri])
-              pid      (:id spec)
+              spec     {:iri iri}
               reverse? (boolean (get-in context [select-item :reverse]))]
           (if reverse?
-            (assoc-in acc [:reverse pid] (assoc spec :as select-item))
-            (assoc acc pid (assoc spec :as select-item))))))
+            (assoc-in acc [:reverse iri] (assoc spec :as select-item))
+            (assoc acc iri (assoc spec :as select-item))))))
     {:depth depth} selection))
 
 (defn parse-subselection
-  [db context select-map depth]
+  [context select-map depth]
   (let [{:keys [variable selection depth]} (parse-map select-map depth)
-        spec                               (expand-selection db context depth selection)]
+        spec                               (expand-selection context depth selection)]
     {:variable  variable
      :selection selection
      :depth     depth

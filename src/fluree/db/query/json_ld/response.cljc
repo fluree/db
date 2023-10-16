@@ -23,10 +23,10 @@
       {:as iri})))
 
 (defn wildcard-spec
-  [db cache compact-fn pid]
-  (when-let [spec (get-in db [:schema :pred pid])]
+  [db cache compact-fn iri]
+  (when-let [spec (get-in db [:schema :pred iri])]
     (let [spec* (assoc spec :as (compact-fn (:iri spec)))]
-      (vswap! cache assoc pid spec*)
+      (vswap! cache assoc iri spec*)
       spec*)))
 
 (defn iri?
@@ -83,10 +83,11 @@
         (if p-flakes
           (let [ff    (first p-flakes)
                 p     (flake/p ff)
+                iri   (dbproto/-p-prop db :iri p)
                 list? (contains? (flake/m ff) :i)
-                spec  (or (get select-spec p)
+                spec  (or (get select-spec iri)
                           (when wildcard?
-                            (or (get @cache p)
+                            (or (get @cache iri)
                                 (wildcard-spec db cache compact-fn p)
                                 (<? (cache-sid->iri db cache compact-fn p)))))
                 p-iri (:as spec)
