@@ -239,9 +239,10 @@
 
                     ref?             (= const/$xsd:anyURI dt)
                     existing-ref-sid (when ref? (<? (dbproto/-subid db o)))
-                    ref-sid          (when (and (= const/$xsd:anyURI dt)
-                                                (not existing-ref-sid))
-                                       (next-sid o))
+                    ref-sid          (when ref?
+                                       (if existing-ref-sid
+                                         existing-ref-sid
+                                         (next-sid o)))
                     new-ref-flake    (when (and (not existing-ref-sid) (= const/$xsd:anyURI dt))
                                        (create-id-flake (next-sid o) o t))
 
