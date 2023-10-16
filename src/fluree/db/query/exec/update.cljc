@@ -62,20 +62,6 @@
                           solution-ch)
     retract-ch))
 
-(defn fdb-bnode?
-  "Is the iri a fluree-generated temporary bnode?"
-  [iri]
-  (str/starts-with? iri "_:fdb"))
-
-(defn bnode-id
-  "A stable bnode."
-  [sid]
-  (str "_:" sid))
-
-(defn create-id-flake
-  [sid iri t]
-  (flake/create sid const/$xsd:anyURI iri const/$xsd:string t true nil))
-
 (defn insert-triple
   [db triple {:keys [t next-sid next-pid]} solution error-ch]
   (go
@@ -156,6 +142,72 @@
     (retract? mdfn)
     (retract db mdfn tx-state fuel-tracker error-ch solution-ch)))
 
+(defn retract-triple2
+  [db triple {:keys [t]} solution fuel-tracker error-ch]
+  (go
+    (try*
+      (let [retract-xf (keep (fn [f]
+                               ;;do not retract the flakes which map subject ids to iris.
+                               ;;they are an internal optimization, which downstream code
+                               ;;(eg the commit pipeline) relies on
+                               (when-not (iri-mapping? f)
+                                 (flake/flip-flake f t))))
+
+            [s-mch p-mch o-mch] (match-solution triple solution)
+
+            s-cmp  (if (string? (::where/val s-mch))
+                     (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch))))
+                     s-mch)
+
+            p-cmp  (if (string? (::where/val p-mch))
+                     (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch))))
+                     p-mch)
+            o-cmp  (if (and (= const/$xsd:anyURI (::where/val o-mch))
+                            (string? (::where/val o-mch)))
+                     (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch))))
+                     o-mch)]
+        (<? (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])))
+      (catch* e
+              (log/error e "Error retracting triple")
+              (>! error-ch e)))))
+
+(defn retract-clause2
+  [db clause tx-state solution fuel-tracker error-ch out-ch]
+  (let [clause-ch  (async/to-chan! clause)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [triple ch]
+                            (-> db
+                                (retract-triple2 triple tx-state solution fuel-tracker error-ch)
+                                (async/pipe ch)))
+                          clause-ch)
+    out-ch))
+
+(defn retract2
+  [db txn tx-state fuel-tracker error-ch solution-ch]
+  (let [{:keys [delete]} txn
+        retract-ch       (async/chan 2)]
+    (async/pipeline-async 2
+                          retract-ch
+                          (fn [solution ch]
+                            (retract-clause2 db delete tx-state solution fuel-tracker error-ch ch))
+                          solution-ch)
+    retract-ch))
+
+(defn fdb-bnode?
+  "Is the iri a fluree-generated temporary bnode?"
+  [iri]
+  (str/starts-with? iri "_:fdb"))
+
+(defn bnode-id
+  "A stable bnode."
+  [sid]
+  (str "_:" sid))
+
+(defn create-id-flake
+  [sid iri t]
+  (flake/create sid const/$xsd:anyURI iri const/$xsd:string t true nil))
+
 (defn insert-triple2
   [db triple {:keys [t next-sid next-pid]} solution error-ch]
   (go
@@ -213,8 +265,8 @@
   out-ch)
 
 (defn insert2
-  [db mdfn tx-state error-ch solution-ch]
-  (let [clause    (:insert mdfn)
+  [db txn tx-state error-ch solution-ch]
+  (let [clause    (:insert txn)
         insert-ch (async/chan 2)]
     (async/pipeline-async 2
                           insert-ch
@@ -235,7 +287,7 @@
         insert-ch       (insert2 db mdfn tx-state error-ch insert-soln-ch)
         retract-soln-ch (->> (async/chan 2)
                              (async/tap solution-mult))
-        retract-ch      (retract db mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
+        retract-ch      (retract2 db mdfn tx-state fuel-tracker error-ch retract-soln-ch)]
     (async/pipe solution-ch solution-ch*) ; now hook up the solution input
                                         ; after everything is wired
     (async/merge [insert-ch retract-ch])))
