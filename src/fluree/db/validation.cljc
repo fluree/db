@@ -109,13 +109,21 @@
     ::where-op             [:enum {:decode/fql  string->keyword
                                    :decode/json string->keyword}
                             :filter :optional :union :bind]
-    ::where-map            [:and
-                            [:map-of {:max 1} ::where-op :any]
-                            [:multi {:dispatch where-op}
-                             [:filter [:map [:filter [:ref ::filter]]]]
-                             [:optional [:map [:optional [:ref ::optional]]]]
-                             [:union [:map [:union [:ref ::union]]]]
-                             [:bind [:map [:bind [:ref ::bind]]]]]]
+    ::graph                [:orn
+                            [:ledger ::ledger]
+                            [:variable ::var]]
+    ::graph-map            [:map {:closed true}
+                            [:graph ::graph]
+                            [:where [:ref ::where]]]
+    ::where-map            [:orn
+                            [:named ::graph-map]
+                            [:default [:and
+                                      [:map-of {:max 1} ::where-op :any]
+                                      [:multi {:dispatch where-op}
+                                       [:filter [:map [:filter [:ref ::filter]]]]
+                                       [:optional [:map [:optional [:ref ::optional]]]]
+                                       [:union [:map [:union [:ref ::union]]]]
+                                       [:bind [:map [:bind [:ref ::bind]]]]]]]]
     ::where-tuple          [:orn
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
