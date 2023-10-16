@@ -8,8 +8,8 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.time-travel :as time-travel]
+            [fluree.db.query.dataset :as dataset]
             [fluree.db.query.fql :as fql]
-            [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql :as sparql]
@@ -160,13 +160,19 @@
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
 
+(defn load-alias
+  [conn alias]
+  (go-try (let [address (<? (nameservice/primary-address conn alias nil))
+                ledger  (<? (jld-ledger/load conn address))]
+            (ledger-proto/-db ledger))))
+
 (defn query-connection-fql
   [conn query]
   (go-try
-    (let [ledger-alias (:from query)
-          ledger-address (<? (nameservice/primary-address conn ledger-alias nil))
-          ledger (<? (jld-ledger/load conn ledger-address))]
-      (<? (query-fql (ledger-proto/-db ledger) (dissoc query :from))))))
+    (let [alias  (:from query)
+          db     (<? (load-alias conn alias))
+          query* (dissoc query :from)]
+      (<? (query-fql db query*)))))
 
 (defn query-connection-sparql
   [conn query]
