@@ -2,9 +2,8 @@
   (:refer-clojure :exclude [get])
   (:require #?@(:clj [[org.httpkit.sni-client :as sni-client]
                       [org.httpkit.client :as http]
-                      [http.async.client :as ha]
                       [byte-streams :as bs]
-                      [http.async.client.websocket :as ws]])
+                      [hato.websocket :as ws]])
             #?@(:cljs [["axios" :as axios]
                        ["ws" :as NodeWebSocket]])
             [clojure.core.async :as async]
@@ -13,8 +12,7 @@
             [fluree.db.platform :as platform]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
-  (:import #?@(:clj  ((org.httpkit.client TimeoutException)
-                      (org.asynchttpclient.ws WebSocket))
+  (:import #?@(:clj  ((org.httpkit.client TimeoutException))
                :cljs ((goog.net.ErrorCode)))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -230,9 +228,11 @@
         (log/info "Web socket pub/producer channel closed.")
         (let [[msg resp-chan] val]
           (try*
-            #?(:clj  (ws/-sendText ^WebSocket ws msg)
+            #?(:clj  (ws/send! ws msg)
                :cljs (.send ws msg))
-            (async/put! resp-chan true)
+            (when resp-chan
+              (async/put! resp-chan true)
+              (async/close! resp-chan))
             (catch* e
                     (log/error e "Error sending websocket message:" msg)
                     (async/put! resp-chan false)))
@@ -241,28 +241,33 @@
 
 (defn close-websocket
   [ws]
-  #?(:clj  (ha/close-websocket ws)
+  #?(:clj  (ws/close! ws)
      :cljs (.close ws)))
 
 
 (defn try-socket
   [url sub-chan pub-chan resp-chan timeout close-fn]
   #?(:clj
-     (let [client (ha/create-client)
-           ws     (ha/websocket client url
-                                :timeout timeout
-                                :close (fn [_ code reason]
-                                         (log/debug "Websocket closed; code" code
+     (let [ws-config {:connect-timeout timeout
+                      :on-close        (fn [_ status reason]
+                                         (log/debug "Websocket closed; status:" status
                                                     "reason:" reason)
                                          (close-fn))
-                                :error (fn [^WebSocket ws e]
-                                         (log/error e "websocket error")
-                                         (.sendCloseFrame ws)
+                      :headers         nil
+                      :on-open         (fn [_]
+                                         (log/debug "Websocket opened"))
+                      :on-error        (fn [_ e]
+                                         (log/error e "Websocket error")
                                          (close-fn)
                                          (when-not (nil? e) (async/put! resp-chan e)))
-                                :text (fn [_ msg]
-                                        (when-not (nil? msg)
-                                          (async/put! sub-chan msg))))]
+                      :on-message      (fn [_ msg last?]
+                                         (async/put! sub-chan [:on-message msg last?]))
+                      :on-ping         (fn [ws msg]
+                                         (async/put! sub-chan [:on-ping msg])
+                                         (ws/pong! ws msg))
+                      :on-pong         (fn [_ msg]
+                                         (async/put! sub-chan [:on-pong msg]))}
+           ws        @(ws/websocket url ws-config)]
        (socket-publish-loop ws pub-chan)
        (async/put! resp-chan ws))
 

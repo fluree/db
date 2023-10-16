@@ -1,4 +1,5 @@
-(ns fluree.db.nameservice.proto)
+(ns fluree.db.nameservice.proto
+  (:refer-clojure :exclude [-lookup]))
 
 
 (defprotocol iNameService

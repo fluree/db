@@ -1,5 +1,4 @@
-(ns fluree.db.conn.proto
-  (:refer-clojure :exclude [-lookup]))
+(ns fluree.db.conn.proto)
 
 #?(:clj (set! *warn-on-reflection* true))
 

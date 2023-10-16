@@ -12,16 +12,17 @@
             [fluree.db.conn.state-machine :as state-machine]
             [fluree.db.method.remote.core :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
+            [fluree.db.indexer.default :as idx-default]
             [clojure.string :as str]))
 
 
-(defrecord RemoteConnection [id servers state lru-cache-atom serializer nameservices
+(defrecord RemoteConnection [id server-state state lru-cache-atom serializer nameservices
                              ledger-defaults parallelism msg-in-ch msg-out-ch]
 
   conn-proto/iStorage
-  (-c-read [_ commit-key] (remote/remote-read state servers commit-key false))
-  (-ctx-read [_ context-key] (remote/remote-read state servers context-key false))
-  (-index-file-read [_ index-address] (remote/remote-read state servers index-address true))
+  (-c-read [_ commit-key] (remote/remote-read state server-state commit-key false))
+  (-ctx-read [_ context-key] (remote/remote-read state server-state context-key false))
+  (-index-file-read [_ index-address] (remote/remote-read state server-state index-address true))
 
   conn-proto/iConnection
   (-close [_]
@@ -47,6 +48,7 @@
                       (log/warn "-msg-out: " msg)
                       :TODO))
   (-nameservices [_] nameservices)
+  (-new-indexer [_ opts] (idx-default/create opts))
   (-state [_] @state)
   (-state [_ ledger] (get @state ledger))
 
@@ -71,10 +73,10 @@
      :context-type context-type
      :did          did}))
 
-(defn default-file-nameservice
-  "Returns file nameservice or will throw if storage-path generates an exception."
-  [servers state-atom]
-  (ns-remote/initialize servers state-atom))
+(defn default-remote-nameservice
+  "Returns remote nameservice or will throw if generates an exception."
+  [server-state state-atom]
+  (ns-remote/initialize server-state state-atom))
 
 
 (defn connect
@@ -84,20 +86,23 @@
   (go-try
     (let [ledger-defaults (<? (ledger-defaults defaults))
           servers*        (str/split servers #",")
+          server-state    (atom {:servers      servers*
+                                 :connected-to nil
+                                 :stats        {:connected-at nil}})
           conn-id         (str (random-uuid))
           state           (state-machine/blank-state)
           nameservices*   (util/sequential
-                            (or nameservices (default-file-nameservice servers* state)))
+                            (or nameservices (default-remote-nameservice server-state state)))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]
       (map->RemoteConnection {:id              conn-id
-                              :servers         servers*
+                              :server-state    server-state
                               :state           state
                               :lru-cache-atom  lru-cache-atom
                               :serializer      serializer
                               :ledger-defaults ledger-defaults
                               :parallelism     parallelism
-                              :nameservice     nameservices*
+                              :nameservices    nameservices*
                               :msg-in-ch       (chan)
                               :msg-out-ch      (chan)}))))
