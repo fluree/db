@@ -448,26 +448,68 @@
   (def ledger @(fluree/create conn "update" {:defaultContext [test-utils/default-str-context {"ex" "ns:ex/"}]}))
 
   (def db0 (fluree/db ledger))
-  db0
+  (-> db0 :novelty :spot)
+  #{#Flake [203 0 "http://www.w3.org/2000/01/rdf-schema#Class" 1 -1 true nil]
+    #Flake [200 0 "@type" 1 -1 true nil]
+    #Flake [0 0 "@id" 1 -1 true nil]}
 
   (def db1 @(fluree/stage2 db0 {"@context" "https://flur.ee"
-                                "insert" [{"@id" "ex:dan"
+                                "insert" [{"@id" "ex:dp"
                                            "ex:name" "Dan"
                                            "ex:child" [{"@id" "ex:ap" "ex:name" "AP"}
                                                        {"@id" "ex:np" "ex:name" "NP"}]
                                            "ex:spouse" [{"@id" "ex:kp" "ex:name" "KP"
-                                                         "ex:spouse" {"@id" "ex:dan"}}]}]}))
+                                                         "ex:spouse" {"@id" "ex:dp"}}]}]}))
 
   db1
+  #{#Flake [211106232532994 0 "ns:ex/kp" 1 -1 true nil]
+    #Flake [211106232532994 1000 "KP" 1 -1 true nil]
+    #Flake [211106232532994 1002 211106232532991 1 -1 true nil]
+    #Flake [211106232532993 0 "ns:ex/np" 1 -1 true nil]
+    #Flake [211106232532993 1000 "NP" 1 -1 true nil]
+    #Flake [211106232532992 0 "ns:ex/ap" 1 -1 true nil]
+    #Flake [211106232532992 1000 "AP" 1 -1 true nil]
+    #Flake [211106232532991 0 "ns:ex/dp" 1 -1 true nil]
+    #Flake [211106232532991 1000 "Dan" 1 -1 true nil]
+    #Flake [211106232532991 1001 211106232532992 1 -1 true nil]
+    #Flake [211106232532991 1001 211106232532993 1 -1 true nil]
+    #Flake [211106232532991 1002 211106232532994 1 -1 true nil]
+    #Flake [1002 0 "ns:ex/spouse" 1 -1 true nil]
+    #Flake [1001 0 "ns:ex/child" 1 -1 true nil]
+    #Flake [1000 0 "ns:ex/name" 1 -1 true nil]}
 
-  (def db1* @(fluree/stage db0 [{"@id" "ex:dan"
+
+
+  (def db1* @(fluree/stage db0 [{"@id" "ex:dp"
                                  "ex:name" "Dan"
                                  "ex:child" [{"@id" "ex:ap" "ex:name" "AP"}
                                              {"@id" "ex:np" "ex:name" "NP"}]
                                  "ex:spouse" [{"@id" "ex:kp" "ex:name" "KP"
-                                               "ex:spouse" {"@id" "ex:dan"}}]}]))
+                                               "ex:spouse" {"@id" "ex:dp"}}]}]))
 
-  db1*
+  (-> db1* :novelty :spot)
+  #{#Flake [211106232532995 0 "ns:ex/kp" 1 -1 true nil]
+    #Flake [211106232532995 1001 "KP" 1 -1 true nil]
+    #Flake [211106232532995 1003 211106232532992 0 -1 true nil]
+    #Flake [211106232532994 0 "ns:ex/np" 1 -1 true nil]
+    #Flake [211106232532994 1001 "NP" 1 -1 true nil]
+    #Flake [211106232532993 0 "ns:ex/ap" 1 -1 true nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 true nil]
+    #Flake [211106232532992 0 "ns:ex/dp" 1 -1 true nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 true nil]
+    #Flake [211106232532992 1002 211106232532993 0 -1 true nil]
+    #Flake [211106232532992 1002 211106232532994 0 -1 true nil]
+    #Flake [211106232532992 1003 211106232532995 0 -1 true nil]
+    #Flake [1003 0 "ns:ex/spouse" 1 -1 true nil]
+    #Flake [1002 0 "ns:ex/child" 1 -1 true nil]
+    #Flake [1001 0 "ns:ex/name" 1 -1 true nil]
+    #Flake [203 0 "http://www.w3.org/2000/01/rdf-schema#Class" 1 0 true nil]
+    #Flake [203 0 "http://www.w3.org/2000/01/rdf-schema#Class" 1 -1 true nil]
+    #Flake [200 0 "@type" 1 0 true nil]
+    #Flake [200 0 "@type" 1 -1 true nil]
+    #Flake [0 0 "@id" 1 0 true nil]
+    #Flake [0 0 "@id" 1 -1 true nil]}
+
 
   (def db2 @(fluree/stage2 db1* {"@context" "https://flur.ee"
                                  "where" [["?s" "ex:name" "?name"]]
@@ -478,6 +520,8 @@
                                            [{"@id" "?s", "ex:name" "WAT"}
                                             {"@id" "ex:mp",
                                              "@type" "ex:Cat"
+                                             "ex:isPerson" false
+                                             "ex:isOrange" true
                                              "ex:nickname" {"@language" "en" "@value" "The Wretch"}
                                              "ex:name" "Murray",
                                              "ex:address"
@@ -485,6 +529,242 @@
                                              "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}}))
 
   db2
+  (count #{#Flake [211106232532997 0 "ns:ex/Cat" 1 -1 true nil]
+           #Flake [211106232532996 0 "ns:ex/mp" 1 -1 true nil]
+           #Flake [211106232532996 200 211106232532997 0 -1 true nil]
+           #Flake [211106232532996 1001 "Murray" 1 -1 true nil]
+           #Flake [211106232532996 1008 211106232532995 0 -1 true nil]
+           #Flake [211106232532996 1009 211106232532992 0 -1 true {:i 1}]
+           #Flake [211106232532996 1009 "Persey" 1 -1 true {:i 0}]
+           #Flake [211106232532996 1010 true 2 -1 true nil]
+           #Flake [211106232532996 1011 nil nil -1 true nil]
+           #Flake [211106232532996 1012 "The Wretch" 205 -1 true {:lang "en"}]
+           #Flake [211106232532995 0 "_:211106232532995" 1 -1 true nil]
+           #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+           #Flake [211106232532995 1001 "WAT" 1 -1 true nil]
+           #Flake [211106232532995 1003 "St. Paul" 1 -1 true nil]
+           #Flake [211106232532995 1004 "55 Bashford" 1 -1 true nil]
+           #Flake [211106232532995 1005 55105 1006 -1 true nil]
+           #Flake [211106232532995 1007 "MN" 1 -1 true nil]
+           #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+           #Flake [211106232532994 1001 "WAT" 1 -1 true nil]
+           #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+           #Flake [211106232532993 1001 "WAT" 1 -1 true nil]
+           #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+           #Flake [211106232532992 1001 "WAT" 1 -1 true nil]
+           #Flake [1012 0 "ns:ex/nickname" 1 -1 true nil]
+           #Flake [1011 0 "ns:ex/isPerson" 1 -1 true nil]
+           #Flake [1010 0 "ns:ex/isOrange" 1 -1 true nil]
+           #Flake [1009 0 "ns:ex/favs" 1 -1 true nil]
+           #Flake [1008 0 "ns:ex/address" 1 -1 true nil]
+           #Flake [1007 0 "ns:ex/state" 1 -1 true nil]
+           #Flake [1006 0 "ns:ex/PostalCode" 1 -1 true nil]
+           #Flake [1005 0 "ns:ex/zip" 1 -1 true nil]
+           #Flake [1004 0 "ns:ex/street" 1 -1 true nil]
+           #Flake [1003 0 "ns:ex/city" 1 -1 true nil]})
+
+  #{#Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532995 1001 "WAT" 1 -1 true nil]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532994 1001 "WAT" 1 -1 true nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "WAT" 1 -1 true nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+    #Flake [211106232532992 1001 "WAT" 1 -1 true nil]}
+
+
+  #{#Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]}
+  (count #{#Flake [211106232532997 0 "ns:ex/Cat" 1 -1 true nil]
+           #Flake [211106232532996 0 "ns:ex/mp" 1 -1 true nil]
+           #Flake [211106232532996 200 211106232532997 0 -1 true nil]
+           #Flake [211106232532996 1004 211106232532995 0 -1 true nil]
+           #Flake [211106232532996 1006 211106232532992 0 -1 true {:i 1}]
+           #Flake [211106232532995 0 "_:211106232532995" 1 -1 true nil]
+           #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+           #Flake [211106232532995 1003 55105 1005 -1 true nil]
+           #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+           #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+           #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+           #Flake [1006 0 "ns:ex/favs" 1 -1 true nil]
+           #Flake [1005 0 "ns:ex/PostalCode" 1 -1 true nil]
+           #Flake [1004 0 "ns:ex/address" 1 -1 true nil]
+           #Flake [1003 0 "ns:ex/zip" 1 -1 true nil]})
+
+
+  ;; I expect these flakes
+  (count [["ex:dp" "name" "WAT"]
+          ["ex:kp" "name" "WAT"]
+          ["ex:ap" "name" "WAT"]
+          ["ex:np" "name" "WAT"]
+          ["ex:dp" "name" "Dan"]
+          ["ex:kp" "name" "kp"]
+          ["ex:ap" "name" "ap"]
+          ["ex:np" "name" "np"]
+          ["ex:mp" 200 "ex:Cat"]
+          ["ex:mp" "isPerson" false]
+          ["ex:mp" "isOrange" true]
+          ["ex:mp" "nickname" "The Wretch"]
+          ["ex:mp" "name" "Murray"]
+          ["ex:mp" "address" "address-sid"]
+          ["address-sid" "street" "55 B"]
+          ["address-sid" "city" "St. P"]
+          ["address-sid" "state" "MN"]
+          ["address-sid" "zip" "55105"]
+          ["ex:mp" "favs" "Persey"]
+          ["ex:mp" "favs" "ex:dan"]
+          ["ex:mp" 0 "ex:mp"]
+          ["ex:Cat" 0 "ex:Cat"]
+          ["isPerson" 0 "isPerson"]
+          ["isOrange" 0 "isOrange"]
+          ["nickname" 0 "nickname"]
+          ["favs" 0 "favs"]
+          ["address" 0 "address"]
+          ["street" 0 "street"]
+          ["city" 0 "city"]
+          ["state" 0 "state"]
+          ["zip" 0 "zip"]
+          ["PostalCode" 0 "PostalCode"]
+          ["address-sid" 0 "address-bnode"]])
+  33
+  (+
+    ;; new id flakes
+    13
+    ;; var solutions
+    8
+    ;; plain data
+    12)
+  33
+
+
+
+
+
+  db2
+
+  #{#Flake [211106232532997 0 "_:211106232532997" 1 -1 true nil]
+    #Flake [211106232532997 1004 55105 1005 -1 true nil]
+    #Flake [211106232532996 0 "ns:ex/Cat" 1 -1 true nil]
+    #Flake [211106232532995 0 "ns:ex/mp" 1 -1 true nil]
+    #Flake [211106232532995 200 211106232532996 0 -1 true nil]
+    #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532995 1003 211106232532997 0 -1 true nil]
+    #Flake [211106232532995 1006 211106232532992 0 -1 true {:i 1}]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+    #Flake [1006 0 "ns:ex/favs" 1 -1 true nil]
+    #Flake [1005 0 "ns:ex/PostalCode" 1 -1 true nil]
+    #Flake [1004 0 "ns:ex/zip" 1 -1 true nil]
+    #Flake [1003 0 "ns:ex/address" 1 -1 true nil]}
+
+
+  #{#Flake [211106232532997 0 "_:211106232532997" 1 -1 true nil]
+    #Flake [211106232532997 0 "_:fdb1" 1 -1 true nil]
+    #Flake [211106232532997 1003 55105 1005 -1 true nil]
+    #Flake [211106232532996 0 "ns:ex/Cat" 1 -1 true nil]
+    #Flake [211106232532995 0 "ns:ex/mp" 1 -1 true nil]
+    #Flake [211106232532995 200 211106232532996 0 -1 true nil]
+    #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532995 1004 211106232532997 0 -1 true nil]
+    #Flake [211106232532995 1006 211106232532992 0 -1 true {:i 1}]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+    #Flake [1006 0 "ns:ex/favs" 1 -1 true nil]
+    #Flake [1005 0 "ns:ex/PostalCode" 1 -1 true nil]
+    #Flake [1004 0 "ns:ex/address" 1 -1 true nil]
+    #Flake [1003 0 "ns:ex/zip" 1 -1 true nil]}
+
+  #{#Flake [211106232532998 0 "_:fdb1" 1 -1 true nil]
+    #Flake [211106232532997 0 "_:211106232532997" 1 -1 true nil]
+    #Flake [211106232532997 1003 55105 1005 -1 true nil]
+    #Flake [211106232532996 0 "ns:ex/Cat" 1 -1 true nil]
+    #Flake [211106232532995 0 "ns:ex/mp" 1 -1 true nil]
+    #Flake [211106232532995 200 211106232532996 0 -1 true nil]
+    #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532995 1004 211106232532998 0 -1 true nil]
+    #Flake [211106232532995 1006 211106232532992 0 -1 true {:i 1}]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+    #Flake [1006 0 "ns:ex/favs" 1 -1 true nil]
+    #Flake [1005 0 "ns:ex/PostalCode" 1 -1 true nil]
+    #Flake [1004 0 "ns:ex/address" 1 -1 true nil]
+    #Flake [1003 0 "ns:ex/zip" 1 -1 true nil]}
+
+  #{#Flake [211106232532998 0 "ns:ex/Cat" 1 -1 true nil]
+    #Flake [211106232532997 0 "_:fdb1" 1 -1 true nil]
+    #Flake [211106232532996 0 "ns:ex/mp" 1 -1 true nil]
+    #Flake [211106232532996 200 211106232532998 0 -1 true nil]
+    #Flake [211106232532996 1004 211106232532997 0 -1 true nil]
+    #Flake [211106232532996 1006 nil 0 -1 true {:i 1}]
+    #Flake [211106232532995 0 "_:211106232532995" 1 -1 true nil]
+    #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532995 1003 55105 1005 -1 true nil]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+    #Flake [1006 0 "ns:ex/favs" 1 -1 true nil]
+    #Flake [1005 0 "ns:ex/PostalCode" 1 -1 true nil]
+    #Flake [1004 0 "ns:ex/address" 1 -1 true nil]
+    #Flake [1003 0 "ns:ex/zip" 1 -1 true nil]
+    }
+  #{#Flake [211106232532999 0 "ns:ex/Cat" 1 -1 true nil]
+    #Flake [211106232532998 0 "_:fdb1" 1 -1 true nil]
+    #Flake [211106232532997 0 "ns:ex/PostalCode" 1 -1 true nil]
+    #Flake [211106232532996 0 "ns:ex/mp" 1 -1 true nil]
+    #Flake [211106232532996 200 211106232532999 0 -1 true nil]
+    #Flake [211106232532996 1004 211106232532998 0 -1 true nil]
+    #Flake [211106232532996 1005 nil 0 -1 true {:i 1}]
+    #Flake [211106232532995 0 "_:211106232532995" 1 -1 true nil]
+    #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532995 1003 55105 211106232532997 -1 true nil]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+    #Flake [1005 0 "ns:ex/favs" 1 -1 true nil]
+    #Flake [1004 0 "ns:ex/address" 1 -1 true nil]
+    #Flake [1003 0 "ns:ex/zip" 1 -1 true nil]}
+
+  #{#Flake [211106232532999 0 "_:fdb1" 1 -1 true nil]
+    #Flake [211106232532998 0 "ns:ex/PostalCode" 1 -1 true nil]
+    #Flake [211106232532997 0 "_:211106232532997" 1 -1 true nil]
+    #Flake [211106232532997 1004 "55 Bashford" 1 -1 true nil]
+    #Flake [211106232532997 1005 "St. Paul" 1 -1 true nil]
+    #Flake [211106232532997 1006 55105 211106232532998 -1 true nil]
+    #Flake [211106232532997 1007 "MN" 1 -1 true nil]
+    #Flake [211106232532996 0 "ns:ex/Cat" 1 -1 true nil]
+    #Flake [211106232532995 0 "ns:ex/mp" 1 -1 true nil]
+    #Flake [211106232532995 200 211106232532996 0 -1 true nil]
+    #Flake [211106232532995 1001 "KP" 1 -1 false nil]
+    #Flake [211106232532995 1001 "Murray" 1 -1 true nil]
+    #Flake [211106232532995 1001 "WAT" 1 -1 true nil]
+    #Flake [211106232532995 1003 "The Wretch" 205 -1 true {:lang "en"}]
+    #Flake [211106232532995 1008 211106232532999 0 -1 true nil]
+    #Flake [211106232532995 1009 nil 0 -1 true {:i 1}]
+    #Flake [211106232532995 1009 "Persey" 1 -1 true {:i 0}]
+    #Flake [211106232532994 1001 "NP" 1 -1 false nil]
+    #Flake [211106232532994 1001 "WAT" 1 -1 true nil]
+    #Flake [211106232532993 1001 "AP" 1 -1 false nil]
+    #Flake [211106232532993 1001 "WAT" 1 -1 true nil]
+    #Flake [211106232532992 1001 "Dan" 1 -1 false nil]
+    #Flake [211106232532992 1001 "WAT" 1 -1 true nil]
+    #Flake [1009 0 "ns:ex/favs" 1 -1 true nil]
+    #Flake [1008 0 "ns:ex/address" 1 -1 true nil]
+    #Flake [1007 0 "ns:ex/state" 1 -1 true nil]
+    #Flake [1006 0 "ns:ex/zip" 1 -1 true nil]
+    #Flake [1005 0 "ns:ex/city" 1 -1 true nil]
+    #Flake [1004 0 "ns:ex/street" 1 -1 true nil]
+    #Flake [1003 0 "ns:ex/nickname" 1 -1 true nil]}
+
+
+
+
+
+
 
   (require '[fluree.json-ld :as json-ld])
   (json-ld/expand {"@context" {"ex:zip" {"@type" "ex:PostalCode"}}
@@ -534,38 +814,16 @@
       [{:list
         [{:value "Persey", :type nil, :idx ["@graph" 1 "ex:favs" "@list" 0]}
          {:idx ["@graph" 1 "ex:favs" "@list" 1], :id "ns:ex/dp"}]}]}])
-  [[#:fluree.db.query.exec.where{:var ?s}
-    #:fluree.db.query.exec.where{:val "ns:ex/name"}
-    #:fluree.db.query.exec.where{:val "WAT", :datatype 1, :m nil}]
-   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
-    #:fluree.db.query.exec.where{:val "@type"}
-    #:fluree.db.query.exec.where{:val "ns:ex/Cat", :datatype 0}]
-   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
-    #:fluree.db.query.exec.where{:val "ns:ex/nickname"}
-    #:fluree.db.query.exec.where{:val "The Wretch", :datatype 205, :m {:lang "en"}}]
-   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
-    #:fluree.db.query.exec.where{:val "ns:ex/name"}
-    #:fluree.db.query.exec.where{:val "Murray", :datatype 1, :m nil}]
-   [#:fluree.db.query.exec.where{:val "_:fdb2"}
-    #:fluree.db.query.exec.where{:val "ns:ex/street"}
-    #:fluree.db.query.exec.where{:val "55 Bashford", :datatype 1, :m nil}]
-   [#:fluree.db.query.exec.where{:val "_:fdb2"}
-    #:fluree.db.query.exec.where{:val "ns:ex/city"}
-    #:fluree.db.query.exec.where{:val "St. Paul", :datatype 1, :m nil}]
-   [#:fluree.db.query.exec.where{:val "_:fdb2"}
-    #:fluree.db.query.exec.where{:val "ns:ex/zip"}
-    #:fluree.db.query.exec.where{:val 55105, :datatype "ns:ex/PostalCode", :m nil}]
-   [#:fluree.db.query.exec.where{:val "_:fdb2"}
-    #:fluree.db.query.exec.where{:val "ns:ex/state"}
-    #:fluree.db.query.exec.where{:val "MN", :datatype 1, :m nil}]
-   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
-    #:fluree.db.query.exec.where{:val "ns:ex/address"}
-    #:fluree.db.query.exec.where{:val "_:fdb1", :datatype 0}]
-   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
-    #:fluree.db.query.exec.where{:val "ns:ex/favs"}
-    #:fluree.db.query.exec.where{:val "Persey", :datatype 1, :m {:i 0}}]
-   [#:fluree.db.query.exec.where{:val "ns:ex/mp"}
-    #:fluree.db.query.exec.where{:val "ns:ex/favs"}
-    #:fluree.db.query.exec.where{:val "ns:ex/dp", :datatype 0, :m {:i 1}}]]
+  [[{:var ?s} {:val "ns:ex/name"} {:val "WAT", :datatype 1, :m nil}]
+   [{:val "ns:ex/mp"} {:val "@type"} {:val "ns:ex/Cat", :datatype 0}]
+   [{:val "ns:ex/mp"} {:val "ns:ex/nickname"} {:val "The Wretch", :datatype 205, :m {:lang "en"}}]
+   [{:val "ns:ex/mp"} {:val "ns:ex/name"} {:val "Murray", :datatype 1, :m nil}]
+   [{:val "_:fdb2"} {:val "ns:ex/street"} {:val "55 Bashford", :datatype 1, :m nil}]
+   [{:val "_:fdb2"} {:val "ns:ex/city"} {:val "St. Paul", :datatype 1, :m nil}]
+   [{:val "_:fdb2"} {:val "ns:ex/zip"} {:val 55105, :datatype "ns:ex/PostalCode", :m nil}]
+   [{:val "_:fdb2"} {:val "ns:ex/state"} {:val "MN", :datatype 1, :m nil}]
+   [{:val "ns:ex/mp"} {:val "ns:ex/address"} {:val "_:fdb1", :datatype 0}]
+   [{:val "ns:ex/mp"} {:val "ns:ex/favs"} {:val "Persey", :datatype 1, :m {:i 0}}]
+   [{:val "ns:ex/mp"} {:val "ns:ex/favs"} {:val "ns:ex/dp", :datatype 0, :m {:i 1}}]]
 
   ,)
