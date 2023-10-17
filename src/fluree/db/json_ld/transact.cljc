@@ -582,8 +582,6 @@
 (defn ->tx-state2
   [db]
   (let [{:keys [schema branch ledger policy], db-t :t} db
-        last-pid  (atom (jld-ledger/last-pid db))
-        last-sid  (atom (jld-ledger/last-sid db))
         iri->sid (atom {:last-pid (jld-ledger/last-pid db)
                         :last-sid (jld-ledger/last-sid db)})
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
@@ -593,8 +591,7 @@
      :policy                   policy
      :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
      :t                        t
-     :last-pid                 last-pid
-     :last-sid                 last-sid
+     :iri->sid                 iri->sid
      :next-pid                 (partial next-id iri->sid :last-pid)
      :next-sid                 (partial next-id iri->sid :last-sid)
      :iris                     (volatile! {})}))
@@ -610,12 +607,41 @@
         error-ch ([e] e)
         update-ch ([flakes] flakes)))))
 
+(defn db-after2
+  [{:keys [add remove] :as _staged} {:keys [db-before iri->sid policy bootstrap? t] :as tx-state}]
+  (let [{:keys [last-pid last-sid]} @iri->sid]
+    ;; TODO - we used to add tt-id to break the cache, so multiple 'staged' dbs with same t value don't get cached as the same
+    ;; TODO - now that each db should have its own unique hash, we can use the db's hash id instead of 't' or 'tt-id' for caching
+    (-> db-before
+        (update :ecount assoc const/$_predicate last-pid)
+        (update :ecount assoc const/$_default last-sid)
+        (assoc :policy policy) ;; re-apply policy to db-after
+        (assoc :t t)
+        (commit-data/update-novelty add remove)
+        (commit-data/add-tt-id))))
+
+(defn final-db2
+  "Returns map of all elements for a stage transaction required to create an
+  updated db."
+  [new-flakes {:keys [stage-update? db-before] :as tx-state}]
+  (go-try
+    (let [[add remove] (if stage-update?
+                         (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
+                         [new-flakes nil])
+          vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
+          staged-map   {:add    add
+                        :remove remove}
+          db-after     (cond-> (db-after2 staged-map tx-state)
+                         vocab-flakes vocab/refresh-schema
+                         vocab-flakes <?)]
+      (assoc staged-map :db-after db-after))))
+
 (defn flakes->final-db2
   "Takes final set of proposed staged flakes and turns them into a new db value
   along with performing any final validation and policy enforcement."
   [tx-state flakes]
   (go-try
-    (-> (<? (final-db flakes tx-state))
+    (-> (<? (final-db2 flakes tx-state))
         :db-after
         (dbproto/-rootdb))))
 
