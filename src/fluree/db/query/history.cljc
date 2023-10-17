@@ -115,6 +115,25 @@
 (def parse-history-query
   (m/parser ::history-query {:registry registry}))
 
+(def default-error-overrides
+  {:errors (-> me/default-errors
+               (assoc
+                 ::m/missing-key
+                 {:error/fn
+                  (fn [{:keys [in]} _]
+                    (let [k (-> in last name)]
+                      (str "Query is missing a '" k "' key. "
+                           "'" k "' is required in history queries. "
+                           "See documentation here for details: "
+                           docs/error-codes-page "#query-missing-" k)))}
+                 ::m/extra-key
+                 {:error/fn
+                  (fn [{:keys [in]} _]
+                    (let [k (-> in last name)]
+                      (str "Query contains an unknown key: '" k "'. "
+                           "See documentation here for more information on allowed query keys: "
+                           docs/error-codes-page "#query-unknown-key")))}))})
+
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.
 

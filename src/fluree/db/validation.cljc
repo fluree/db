@@ -3,7 +3,8 @@
             [fluree.db.util.core :refer [pred-ident?]]
             [fluree.db.constants :as const]
             [malli.core :as m]
-            [malli.error :as me]))
+            [malli.error :as me]
+            [malli.util :as mu]))
 
 (defn iri?
   [v]
@@ -64,6 +65,22 @@
 (defn humanize-error
   [error]
   (-> error ex-data :data :explain me/humanize))
+
+(defn explain-error
+  [error]
+  (-> error ex-data :data :explain))
+
+
+(defn format-explained-error
+  ([explained-error] (format-explained-error {}))
+  ([{:keys [errors] :as explained} opts]
+   (if-let [top-level-errs (->> errors
+                                (filter #(every? number? %))
+                                not-empty)]
+     ;;TODO is there ever more than one anyway?
+     (str/join " " (mapv #(me/error-message % opts) top-level-errs)))
+   ;;TODO format humanize results
+   (str/join " " (me/humanize explained opts))))
 
 (def registry
   (merge
