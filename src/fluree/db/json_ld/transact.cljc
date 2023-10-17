@@ -312,8 +312,8 @@
 (defn ->tx-state
   [db {:keys [bootstrap? did context-type txn-context] :as _opts}]
   (let [{:keys [schema branch ledger policy], db-t :t} db
-        last-pid  (atom (jld-ledger/last-pid db))
-        last-sid  (atom (jld-ledger/last-sid db))
+        last-pid  (volatile! (jld-ledger/last-pid db))
+        last-sid  (volatile! (jld-ledger/last-sid db))
         commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
         t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
         db-before (dbproto/-rootdb db)]
@@ -329,8 +329,8 @@
      :t                        t
      :last-pid                 last-pid
      :last-sid                 last-sid
-     :next-pid                 (fn [] (swap! last-pid inc))
-     :next-sid                 (fn [] (swap! last-sid inc))
+     :next-pid                 (fn [] (vswap! last-pid inc))
+     :next-sid                 (fn [] (vswap! last-sid inc))
      :subj-mods                (atom {}) ;; holds map of subj ids (keys) for modified flakes map with shacl shape and classes
      :iris                     (volatile! {})
      :txn-context              txn-context
@@ -495,14 +495,14 @@
       (async/reduce into flakeset flake-ch))))
 
 (defn modify
-  [db fuel-tracker json-ld {:keys [t] :as tx-state}]
+  [db fuel-tracker json-ld {:keys [t] :as _tx-state}]
   (let [mdfn (-> json-ld
                  syntax/coerce-modification
                  (q-parse/parse-modification db))]
     (go
       (let [error-ch  (async/chan)
             update-ch (->> (where/search db mdfn fuel-tracker error-ch)
-                           (update/modify db mdfn tx-state fuel-tracker error-ch)
+                           (update/modify db mdfn t fuel-tracker error-ch)
                            (into-flakeset fuel-tracker))]
         (async/alt!
          error-ch ([e] e)
