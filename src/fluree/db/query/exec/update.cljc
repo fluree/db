@@ -250,7 +250,11 @@
             new-ref-flake    (when (and ref? (not existing-ref-sid))
                                (create-id-flake ref-sid ref-iri t))
             ;; o needs to be a sid if it's a ref, otherwise the literal o
-            obj-flake        (flake/create sid pid (if ref? ref-sid o) dt-sid t true m)]
+
+            o*               (if ref?
+                               ref-sid
+                               (datatype/coerce-value o dt-sid))
+            obj-flake        (flake/create sid pid o* dt-sid t true m)]
         (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))
           (catch* e
                   (log/error e "Error inserting new triple")
