@@ -29,6 +29,12 @@
        (match-value x dt)
        (assoc ::meta m))))
 
+(defn match-iri
+  [mch iri]
+  (assoc mch
+         ::iri iri
+         ::datatype const/$xsd:anyURI))
+
 (defn anonymous-value
   "Build a pattern that already matches an explicit value."
   ([v]
