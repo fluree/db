@@ -156,15 +156,15 @@
             [s-mch p-mch o-mch] (match-solution triple solution)
 
             s-cmp  (if (string? (::where/val s-mch))
-                     (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch))))
+                     (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch) true)))
                      s-mch)
 
             p-cmp  (if (string? (::where/val p-mch))
-                     (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch))))
+                     (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch) true)))
                      p-mch)
             o-cmp  (if (and (= const/$xsd:anyURI (::where/val o-mch))
                             (string? (::where/val o-mch)))
-                     (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch))))
+                     (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch) true)))
                      o-mch)]
         (<? (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])))
       (catch* e
@@ -256,9 +256,9 @@
                         (datatype/coerce-value o dt-sid))
             obj-flake (flake/create sid pid o* dt-sid t true m)]
         (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))
-          (catch* e
-                  (log/error e "Error inserting new triple")
-                  (>! error-ch e)))))
+      (catch* e
+              (log/error e "Error inserting new triple")
+              (>! error-ch e)))))
 
 (defn insert-clause2
   [db clause tx-state solution error-ch out-ch]
@@ -278,7 +278,6 @@
     (async/pipeline-async 2
                           insert-ch
                           (fn [solution ch]
-                            (println "DEP insert solution" (pr-str solution))
                             (insert-clause2 db clause tx-state solution error-ch ch))
                           solution-ch)
     insert-ch))
