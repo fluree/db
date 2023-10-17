@@ -172,9 +172,9 @@
   [solution triple-pattern flake]
   (let [[s p o] triple-pattern]
     (cond-> solution
-            (unmatched? s) (assoc (::var s) (match-subject s flake))
-            (unmatched? p) (assoc (::var p) (match-predicate p flake))
-            (unmatched? o) (assoc (::var o) (match-object o flake)))))
+      (unmatched? s) (assoc (::var s) (match-subject s flake))
+      (unmatched? p) (assoc (::var p) (match-predicate p flake))
+      (unmatched? o) (assoc (::var o) (match-object o flake)))))
 
 (defn augment-object-fn
   "Returns a pair consisting of an object value and boolean function that will
