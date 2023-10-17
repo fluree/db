@@ -324,8 +324,7 @@
                         context-type)]
     (map->JsonLdDb {:ledger          ledger
                     :conn            conn
-                    :method          method
-                    :ledger-alias    alias
+                    :alias           alias
                     :branch          (:name branch)
                     :commit          (:commit branch)
                     :t               0
