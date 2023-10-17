@@ -199,8 +199,7 @@
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
   ([{:keys [conn t] :as db} fuel-tracker flake-xf error-ch components]
-   (let [out-ch               (async/chan)
-         [s-mch p-mch o-mch]  components
+   (let [[s-mch p-mch o-mch]  components
          {s ::val, s-fn ::fn} s-mch
          {p ::val, p-fn ::fn} p-mch
          {o ::val, o-fn ::fn,
@@ -247,8 +246,7 @@
                                        :end-flake   end-flake
                                        :flake-xf    flake-xf*})]
      (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
-         (->> (query-range/filter-authorized db start-flake end-flake error-ch))
-         (async/pipe out-ch)))))
+         (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
 
 
 (defn evaluate-subject-match
