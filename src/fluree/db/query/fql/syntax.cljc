@@ -71,13 +71,13 @@
             "See documentation here for more details: "
             docs/error-codes-page "#query-missing-select"))}
     one-select-key-present?]
-   [:fn
+   #_[:fn
     {:error/fn
      (fn [{:keys [value]} _]
        (str "Query: " (pr-str value) " contains an invalid where clause."
             "Where clause must be a vector/array of tuples and/or maps."))}
     sequential-where?]
-   [:fn
+  #_ [:fn
     {:error/fn
      (fn [{:keys [value]} _]
        (str "Query: " (pr-str value) " contains an invalid where pattern. "
@@ -176,7 +176,7 @@
                                  [:catn
                                   [:direction ::direction]
                                   [:dimension ::var]]]]]
-    ::order-by        [:orn {:error/message  "Invalid orderBy clause"}
+    ::order-by        [:orn {:error/message  "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:clause ::ordering]
                        [:collection [:sequential ::ordering]]]
     ::group-by        [:orn {:error/message "Invalid groupBy clause, must be a variable or a vector of variables."}

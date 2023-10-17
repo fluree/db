@@ -231,6 +231,24 @@
                     :type         :ex/User,
                     :schema/email "cam@bar.com"
                     :schema/name  "Cam"}])]
+    (testing "missing select"
+      (let [missing-select     '{:where  [[?s ?p ?o ]]}
+            missing-select-err (try @(fluree/query db missing-select)
+                                     (catch Exception e e))]
+        (is (= {:status 400 :error :db/invalid-query}
+               (ex-data missing-select-err)))
+        (is (= "Missing select"
+               (ex-message missing-select-err)))))
+    (testing "multiple select"
+      (let [multiple-select     '{:select [?s]
+                                  :selectOne [?s ?p]
+                                  :where  [[?s ?p ?o ]]}
+            multiple-select-err (try @(fluree/query db multiple-select)
+                                     (catch Exception e e))]
+        (is (= {:status 400 :error :db/invalid-query}
+               (ex-data multiple-select-err)))
+        (is (= "Invalid select statement."
+               (ex-message multiple-select-err)))))
     (testing "invalid var select"
       (let [invalid-var-select     '{:select [+]
                              :where  [[?s ?p ?o ]]}
