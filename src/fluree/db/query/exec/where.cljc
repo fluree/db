@@ -93,11 +93,6 @@
        ->predicate
        (assoc ::recur recur-n))))
 
-(defn ->full-text
-  "Build a full text predicate pattern match."
-  [pred]
-  {::full-text pred})
-
 (defn ->where-clause
   "Build a pattern that matches all the patterns in the supplied `patterns`
   collection and filters any matches for variables appearing as a key in the
