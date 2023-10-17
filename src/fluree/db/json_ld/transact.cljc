@@ -610,6 +610,15 @@
         error-ch ([e] e)
         update-ch ([flakes] flakes)))))
 
+(defn flakes->final-db2
+  "Takes final set of proposed staged flakes and turns them into a new db value
+  along with performing any final validation and policy enforcement."
+  [tx-state flakes]
+  (go-try
+    (-> (<? (final-db flakes tx-state))
+        :db-after
+        (dbproto/-rootdb))))
+
 (defn stage2
   ([db txn parsed-opts]
    (stage2 db nil txn parsed-opts))
@@ -629,5 +638,4 @@
            [flakes]      (alts! chans :priority true)]
        (when (util/exception? flakes)
          (throw flakes))
-       #_(flakes->final-db2 tx-state flakes)
-       flakes))))
+       (<? (flakes->final-db2 tx-state flakes))))))
