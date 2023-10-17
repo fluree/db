@@ -603,8 +603,8 @@
         (some? value)
         (let [obj-cmp (if (v/variable? value)
                         (parse-variable value)
-                        (cond-> {::where/val value
-                                 ::where/m (cond-> m language (assoc :lang language))}
+                        (cond-> {::where/val value}
+                          (or m language) (assoc ::where/m (cond-> m language (assoc :lang language)))
                           type (assoc ::where/datatype type)))]
           (conj triples [subj-cmp pred-cmp obj-cmp]))
 
@@ -627,7 +627,7 @@
                    values)
         pred-cmp (cond (v/variable? pred) (parse-variable pred)
                        ;; we want the actual iri here, not the keyword
-                       (= pred :type)     {::where/val "@type"}
+                       (= pred :type)     {::where/val const/iri-type}
                        :else              {::where/val pred})]
     (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp nil)
             triples
