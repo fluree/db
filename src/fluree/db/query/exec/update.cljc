@@ -242,7 +242,7 @@
             ref-sid          (when ref?
                                (if existing-ref-sid
                                  existing-ref-sid
-                                 (next-sid o)))
+                                 (or (get jld-ledger/predefined-properties o) (next-sid o))))
             ref-iri          (when ref?
                                (if (temp-bnode? o)
                                  (bnode-id ref-sid)
