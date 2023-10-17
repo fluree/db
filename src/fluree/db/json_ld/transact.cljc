@@ -568,7 +568,7 @@
 ;; ----------------------------------------
 
 (defn next-id
-  "counter is either :last-pid or :last-sid"
+  "Generate the next subject id - `counter` is either :last-pid or :last-sid."
   [iri->sid counter iri]
   (let [iri->sid* (swap! iri->sid
                          (fn [iri->sid]
