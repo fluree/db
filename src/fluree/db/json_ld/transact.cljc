@@ -622,6 +622,12 @@
 
            tx-state (->tx-state2 db*)
 
-           parsed-txn (q-parse/parse-txn txn db*)
-           flakes-ch  (generate-flakes db fuel-tracker parsed-txn tx-state)]
-       (<? flakes-ch)))))
+           parsed-txn    (q-parse/parse-txn txn db*)
+           flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
+           fuel-error-ch (:error-ch fuel-tracker)
+           chans         (remove nil? [fuel-error-ch flakes-ch])
+           [flakes]      (alts! chans :priority true)]
+       (when (util/exception? flakes)
+         (throw flakes))
+       #_(flakes->final-db2 tx-state flakes)
+       flakes))))
