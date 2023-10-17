@@ -399,6 +399,33 @@
               (with-constraint db fuel-tracker pattern filters error-ch solution-ch))
             initial-ch patterns)))
 
+(defn match-alias
+  [ds alias fuel-tracker solution clause error-ch]
+  (if-let [db (get ds alias)]
+    (match-clause db fuel-tracker solution clause error-ch)
+    (doto (async/chan)
+      (async/close!))))
+
+(defmethod match-pattern :graph
+  [ds fuel-tracker solution pattern _filters error-ch]
+  (let [[g clause] (val pattern)]
+    (if-let [v (::var g)]
+      (if-let [v-match (get solution v)]
+        (let [alias (or (::iri v-match)
+                        (::val v-match))]
+          (match-alias ds alias fuel-tracker solution clause error-ch))
+        (let [out-ch (async/chan)
+              db-ch  (async/to-chan! ds)]
+          (async/pipeline-async 2
+                                out-ch
+                                (fn [[alias db] ch]
+                                  (let [solution* (update solution v match-iri alias)]
+                                    (-> (match-clause db fuel-tracker solution* clause error-ch)
+                                        (async/pipe ch))))
+                                db-ch)
+          out-ch))
+      (match-alias ds g fuel-tracker solution clause error-ch))))
+
 (defmethod match-pattern :union
   [db fuel-tracker solution pattern _ error-ch]
   (let [clauses   (val pattern)

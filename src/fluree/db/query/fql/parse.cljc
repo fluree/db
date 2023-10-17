@@ -241,10 +241,13 @@
 
 (defmulti parse-pattern
   (fn [pattern _vars _context]
-    (cond
-      (map? pattern) (->> pattern keys first)
-      (map-entry? pattern) :binding
-      :else :triple)))
+    (if (map? pattern)
+      (if (contains? pattern :graph)
+        :graph
+        (->> pattern keys first))
+      (if (map-entry? pattern)
+        :binding
+        :triple))))
 
 (defn type-pattern?
   [typ x]
@@ -330,6 +333,13 @@
 (defmethod parse-pattern :binding
   [[v f] _vars _context]
   (where/->pattern :binding [v f]))
+
+(defmethod parse-pattern :graph
+  [{:keys [graph where]} vars context]
+  (let [graph* (or (parse-variable graph)
+                   (json-ld/expand-iri graph context))
+        where* (parse-where-clause where vars context)]
+    (where/->pattern :graph [graph* where*])))
 
 (defn parse-where
   [q vars context]
