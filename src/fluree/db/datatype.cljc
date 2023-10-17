@@ -398,7 +398,6 @@
   coercion for the datatype is known, nothing will be done. If a coercion does exist but
   fails, an error will be thrown."
   [value datatype]
-  (println "DEP coerce-value" (pr-str value) (pr-str datatype))
   (let [value* (coerce value datatype)]
     (if (nil? value*)
       (throw (ex-info (str "Data type " datatype " cannot be coerced from provided value: " value ".")

@@ -610,8 +610,8 @@
 
         :else
         (let [ref-cmp (if (nil? id)
-                        {::where/val (temp-bnode-id bnode-counter) ::where/datatype const/$xsd:anyURI}
-                        (cond-> {::where/val id ::where/datatype const/$xsd:anyURI}
+                        {::where/val (temp-bnode-id bnode-counter) ::where/datatype const/iri-id}
+                        (cond-> {::where/val id ::where/datatype const/iri-id}
                           m (assoc ::where/m m)))
               v-map* (if (nil? id)
                        ;; project newly created bnode-id into v-map

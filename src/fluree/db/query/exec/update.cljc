@@ -233,11 +233,11 @@
 
             existing-dt  (when dt (<? (dbproto/-subid db dt)))
             dt-sid       (cond existing-dt  existing-dt
-                               (string? dt) (next-pid dt)
+                               (string? dt) (or (get jld-ledger/predefined-properties dt) (next-pid dt))
                                :else        (datatype/infer o (:lang m)))
             new-dt-flake (when (and (not existing-dt) (string? dt)) (create-id-flake dt-sid dt t))
 
-            ref?             (= const/$xsd:anyURI dt)
+            ref?             (= dt const/iri-id)
             existing-ref-sid (when ref? (<? (dbproto/-subid db o)))
             ref-sid          (when ref?
                                (if existing-ref-sid
@@ -249,12 +249,12 @@
                                  o))
             new-ref-flake    (when (and ref? (not existing-ref-sid))
                                (create-id-flake ref-sid ref-iri t))
-            ;; o needs to be a sid if it's a ref, otherwise the literal o
 
-            o*               (if ref?
-                               ref-sid
-                               (datatype/coerce-value o dt-sid))
-            obj-flake        (flake/create sid pid o* dt-sid t true m)]
+            ;; o needs to be a sid if it's a ref, otherwise the literal o
+            o*        (if ref?
+                        ref-sid
+                        (datatype/coerce-value o dt-sid))
+            obj-flake (flake/create sid pid o* dt-sid t true m)]
         (into [] (remove nil?) [new-subj-flake new-pred-flake new-dt-flake new-ref-flake obj-flake]))
           (catch* e
                   (log/error e "Error inserting new triple")
