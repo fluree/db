@@ -303,28 +303,32 @@
       (get-in [:schema :pred prop :equivalentProperty])
       not-empty))
 
+(defn match-tuple
+  [db fuel-tracker solution pattern filters error-ch flake-ch]
+  (go (let [triple  (assign-matched-values pattern solution filters)
+            [s p o] (<! (evaluate-iris db error-ch triple))
+            pid     (::val p)]
+        (if-let [props (and pid (get-equivalent-properties db pid))]
+          (let [prop-ch (async/to-chan! (conj props pid))]
+            (async/pipeline-async 2
+                                  flake-ch
+                                  (fn [prop ch]
+                                    (let [p* (assoc p ::val prop)]
+                                      (-> db
+                                          (resolve-flake-range fuel-tracker error-ch [s p* o])
+                                          (async/pipe ch))))
+                                  prop-ch))
+
+          (-> db
+              (resolve-flake-range fuel-tracker error-ch [s p o])
+              (async/pipe flake-ch))))))
+
 (defmethod match-pattern :tuple
   [db fuel-tracker solution pattern filters error-ch]
   (let [match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
                                             (match-flake solution pattern flake)))))]
-    (go (let [triple  (assign-matched-values pattern solution filters)
-              [s p o] (<! (evaluate-iris db error-ch triple))
-              pid     (::val p)]
-          (if-let [props (and pid (get-equivalent-properties db pid))]
-            (let [prop-ch (async/to-chan! (conj props pid))]
-              (async/pipeline-async 2
-                                    match-ch
-                                    (fn [prop ch]
-                                      (let [p* (assoc p ::val prop)]
-                                        (-> db
-                                            (resolve-flake-range fuel-tracker error-ch [s p* o])
-                                            (async/pipe ch))))
-                                    prop-ch))
-
-            (-> db
-                (resolve-flake-range fuel-tracker error-ch [s p o])
-                (async/pipe match-ch)))))
+    (match-tuple db fuel-tracker solution pattern filters error-ch match-ch)
     match-ch))
 
 (defn with-distinct-subjects
