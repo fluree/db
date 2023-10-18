@@ -71,19 +71,6 @@
             "See documentation here for more details: "
             docs/error-codes-page "#query-missing-select"))}
     one-select-key-present?]
-   #_[:fn
-    {:error/fn
-     (fn [{:keys [value]} _]
-       (str "Query: " (pr-str value) " contains an invalid where clause."
-            "Where clause must be a vector/array of tuples and/or maps."))}
-    sequential-where?]
-  #_ [:fn
-    {:error/fn
-     (fn [{:keys [value]} _]
-       (str "Query: " (pr-str value) " contains an invalid where pattern. "
-            "Every pattern must be a tuple or map "))}
-    wrapped-where?]
-
    (into [:map {:closed true}
           [:where ::where]
           [:t {:optional true} ::t]

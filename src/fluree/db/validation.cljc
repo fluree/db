@@ -100,6 +100,28 @@
 ;;TODO better docstring
 ;;TODO: same length `:in` paths, but what if different paths?
 ;;TODO Factor out some of the or-checking?
+
+;;Copied from https://github.com/metosin/malli/blob/a43c28d90b4eb18054df2a21c91a18d4b58cacc2/src/malli/error.cljc#L268
+;;with fix to correctly calculate `:value` in root error messages
+(defn -resolve-root-error [{:keys [schema]} {:keys [path in] :as error} options]
+  (let [options (assoc options :unknown false)]
+    (loop [path path, l nil, mp path, p (m/properties (:schema error)), m (me/error-message error options)]
+      (let [[path' m' p'] (or (let [value (get-in (:value error) (mu/path->in schema  path))
+                                    ;;^ fix for value calculation, used in call to `me/error-message` below
+                                    schema (mu/get-in schema path)]
+                                (when-let [m' (me/error-message {:schema schema
+                                                                 :value value} options)] [path m' (m/properties schema)]))
+                              (let [res (and l (mu/find (mu/get-in schema path) l))]
+                                (when (vector? res)
+                                  (let [[_ props schema] res
+                                        schema (mu/update-properties schema merge props)
+                                        message (me/error-message {:schema schema} options)]
+                                    (when message [(conj path l) message (m/properties schema)]))))
+                              (when m [mp m p]))]
+        (if (seq path)
+          (recur (pop path) (last path) path' p' m')
+          (when m [(if (seq in) (mu/path->in schema path') (me/error-path error options)) m' p']))))))
+
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string
   explaining the error(s) in plain english. "
@@ -118,10 +140,10 @@
                                       first-e
                                       error-opts))
          {specific-value :value specific-message :message} (most-specific-relevant-message errors schema)
-         [_ first-root-message] (me/-resolve-root-error
-                                explained-error
-                                first-e
-                                error-opts)]
+         [_ first-root-message] (-resolve-root-error
+                                 explained-error
+                                 first-e
+                                 error-opts)]
      (str (str/join "; "  (remove nil? (distinct [first-root-message specific-message first-direct-message])))
           ". Provided: " (pr-str (or specific-value value))))))
 

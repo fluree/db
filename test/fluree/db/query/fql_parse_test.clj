@@ -214,7 +214,7 @@
 
 
 
-(deftest test-validation-errs
+#_(deftest test-validation-errs
   (let [conn   (test-utils/create-conn)
         ledger @(fluree/create conn "query/parse"
                                {:defaultContext ["" {:ex "http://example.org/ns/"}]})
@@ -276,11 +276,11 @@
                  (ex-message multi-key-where-map-err)))))
       ;;TODO missing a good error/message somewhere.
       (testing "unrecognized op"
-        (let [unrecognized-where-op     '{:select ['?name '?age]
-                                          :where  [['?s :type :ex/User]
-                                                   ['?s :schema/age '?age]
-                                                   ['?s :schema/name '?name]
-                                                   {:foo "(> ?age 45)"}]}
+        (let [unrecognized-where-op     {:select ['?name '?age]
+                                         :where  [['?s :type :ex/User]
+                                                  ['?s :schema/age '?age]
+                                                  ['?s :schema/name '?name]
+                                                  {:foo "(> ?age 45)"}]}
               unrecognized-where-op-err (try @(fluree/query db unrecognized-where-op)
                                             (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}

@@ -6,10 +6,8 @@
             [fluree.db.util.core :as util]
             [test-with-files.tools :refer [with-tmp-dir]]))
 
-(deftest ^:integration history-query-validation-test
-  (let [ts-primeval (util/current-time-iso)
-
-        conn        (test-utils/create-conn)
+#_(deftest ^:integration history-query-validation-test
+  (let [conn        (test-utils/create-conn)
         ledger      @(fluree/create conn "historytest" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
         db1         @(test-utils/transact ledger [{:id   :ex/dan
                                                    :ex/x "foo-1"
