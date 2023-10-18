@@ -92,20 +92,20 @@
           const/iri-target-class                                const/$fluree:targetClass
           const/iri-default-context                             const/$fluree:default-context}))
 
+(def class-or-property-sid
+  (into #{} (map predefined-properties class+property-iris)))
+
 (def predefined-sids
-  (-> predefined-properties
-      set/map-invert
-      ;; use @type json-ld shorthand instead of rdf:type full URL
-      (assoc const/$rdf:type "@type")))
+  (set/map-invert predefined-properties))
 
 (defn predefined-sids-compact
   "Allows predefined sids to be mapped to values based on supplied compacting function
   generated from a context"
   [compact-fn]
   (reduce-kv
-    (fn [acc k v]
-      (let [v* (json-ld/compact v compact-fn)]
-        (assoc acc k v*)))
+    (fn [acc sid iri]
+      (let [compacted-iri (json-ld/compact iri compact-fn)]
+        (assoc acc sid compacted-iri)))
     {}
     predefined-sids))
 
@@ -127,6 +127,25 @@
   (or (-> db :ecount (get const/$_shard))
       (dec (flake/->sid const/$_shard 0))))
 
+(def predicate-refs
+  "The following predicates have objects that are refs to other predicates."
+  #{const/$rdfs:subClassOf
+    const/$sh:path
+    const/$sh:ignoredProperties
+    const/$sh:targetClass
+    const/$fluree:targetClass
+    const/$sh:targetSubjectsOf
+    const/$sh:targetObjectsOf
+    const/$sh:equals
+    const/$sh:disjoint
+    const/$sh:lessThan
+    const/$sh:lessThanOrEquals
+    const/$sh:inversePath
+    const/$sh:alternativePath
+    const/$sh:zeroOrMorePath
+    const/$sh:oneOrMorePath
+    const/$sh:zeroOrOnePath})
+
 (defn generate-new-sid
   "Generates a new subject ID. If it is known this is a property or class will
   assign the lower range of subject ids."
@@ -134,23 +153,7 @@
   (let [new-sid (or
                   (get predefined-properties id)
                   (if (or (class-or-property? node)
-                          (#{const/$rdfs:subClassOf
-                             const/$sh:path
-                             const/$sh:ignoredProperties
-                             const/$sh:targetClass
-                             const/$fluree:targetClass
-                             const/$sh:targetSubjectsOf
-                             const/$sh:targetObjectsOf
-                             const/$sh:equals
-                             const/$sh:disjoint
-                             const/$sh:lessThan
-                             const/$sh:lessThanOrEquals
-                             const/$sh:inversePath
-                             const/$sh:alternativePath
-                             const/$sh:zeroOrMorePath
-                             const/$sh:oneOrMorePath
-                             const/$sh:zeroOrOnePath}
-                           referring-pid))
+                          (predicate-refs referring-pid))
                     (next-pid)
                     (next-sid)))]
     (vswap! iris assoc id new-sid)

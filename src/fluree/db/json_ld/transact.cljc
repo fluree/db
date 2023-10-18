@@ -650,11 +650,9 @@
                         (assoc :policy policy) ;; re-apply policy to db-after
                         (assoc :t t)
                         (commit-data/update-novelty add remove)
-                        (commit-data/add-tt-id))
-          db-after* (if vocab-flakes
-                      (<? (vocab/refresh-schema db-after))
-                      db-after)]
-      {:add add :remove remove :db-after db-after*})))
+                        (commit-data/add-tt-id)
+                        (vocab/hydrate-schema add))]
+      {:add add :remove remove :db-after db-after})))
 
 (defn flakes->final-db2
   "Takes final set of proposed staged flakes and turns them into a new db value
