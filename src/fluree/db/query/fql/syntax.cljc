@@ -122,8 +122,8 @@
     ::select-map      [:map-of {:max 1}
                        ::var ::subselection]
     ::selector        [:orn
+                       [:wildcard ::wildcard]
                        [:var ::var]
-                       [:pred ::iri]
                        [:aggregate ::function]
                        [:select-map ::select-map]]
     ::select          [:orn
@@ -210,6 +210,9 @@
            _         (log/trace "humanized errors:" he)
            error-msg (coalesce-query-errors he qry)]
        (throw (ex-info error-msg {:status 400, :error :db/invalid-query}))))))
+
+(def parse-selector
+  (m/parser ::selector {:registry registry}))
 
 (def coerce-modification*
   (m/coercer ::modification (mt/transformer {:name :fql}) {:registry registry}))
