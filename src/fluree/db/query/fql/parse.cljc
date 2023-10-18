@@ -409,21 +409,41 @@
   (when-let [where (:where q)]
     (parse-where-clause where vars db context)))
 
+(defn parse-as-fn
+  [f]
+  (let [parsed-fn  (parse-code f)
+        fn-name    (some-> parsed-fn second first)
+        bind-var   (last parsed-fn)
+        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+    (-> parsed-fn
+        eval/compile
+        (select/as-selector bind-var aggregate?))))
+
+(defn parse-fn
+  [f]
+  (-> f parse-code eval/compile select/aggregate-selector))
+
+(defn parse-select-map
+  [sm db context depth]
+  (log/trace "parse-select-map:" sm)
+  (let [{:keys [variable selection depth spec]} (parse-subselection db context
+                                                                    sm depth)]
+    (select/subgraph-selector variable selection depth spec)))
+
 (defn parse-selector
   [db context depth s]
-  (cond
-    (v/variable? s) (-> s parse-var-name select/variable-selector)
-    (v/as-fn? s)    (let [parsed-fn  (parse-code s)
-                          fn-name    (some-> parsed-fn second first)
-                          bind-var   (last parsed-fn)
-                          aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
-                      (-> parsed-fn
-                          eval/compile
-                          (select/as-selector bind-var aggregate?)))
-    (v/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
-    (select-map? s) (let [{:keys [variable selection depth spec]}
-                          (parse-subselection db context s depth)]
-                      (select/subgraph-selector variable selection depth spec))))
+  (let [[selector-type selector-val] (syntax/parse-selector s)]
+    (case selector-type
+      :wildcard select/wildcard-selector
+      :var (-> selector-val symbol select/variable-selector)
+      :aggregate (case (first selector-val)
+                   :string-fn (if (re-find #"^\(as " s)
+                                (parse-as-fn s)
+                                (parse-fn s))
+                   :list-fn (if (= 'as (first s))
+                              (parse-as-fn s)
+                              (parse-fn s)))
+      :select-map (parse-select-map s db context depth))))
 
 (defn parse-select-clause
   [clause db context depth]
