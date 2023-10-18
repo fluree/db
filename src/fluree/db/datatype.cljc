@@ -320,7 +320,6 @@
    - numbers in strings
    - the strings 'true' or 'false' to a boolean"
   [value required-type]
-  (log/trace "coerce value:" value "to type:" required-type)
   (uc/case (int required-type)
     (const/$xsd:string
      const/$rdf:langString)

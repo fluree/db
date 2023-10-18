@@ -597,7 +597,7 @@
      :iris                     (volatile! {})}))
 
 (defn generate-flakes
-  [db fuel-tracker parsed-txn {:keys [t] :as tx-state}]
+  [db fuel-tracker parsed-txn tx-state]
   (go
     (let [error-ch  (async/chan)
           update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
@@ -610,27 +610,30 @@
 (defn subject-mods
   [new-flakes db-before]
   (go-try
-    (loop [[s-flakes & r] (partition-by flake/s new-flakes)
-           subj-mods      {}]
-      (if s-flakes
-        (let [sid            (flake/s (first s-flakes))
-              new-subject?   (first (filter #(= const/$xsd:anyURI (flake/p %)) s-flakes))
-              new-classes    (->> s-flakes
-                                  (filter #(= const/$rdf:type (flake/p %)))
-                                  (map flake/o))
-              classes        (if new-subject?
-                               new-classes
-                               (into new-classes (<? (query-range/index-range db-before :spot = [sid const/$rdf:type] {:flake-xf flake/o}))))
-              class-shapes   (<? (shacl/class-shapes db-before classes))
-              referring-pids (when (shacl/has-target-objects-of-rule? db-before)
-                               (<? (query-range/index-range db-before :opst = [sid] {:flake-xf (map flake/p)})))
-              pred-shapes    (when (seq referring-pids)
-                               (<? (shacl/targetobject-shapes db-before referring-pids)))
-              subject-meta   {:new?    new-subject?
-                              :classes classes
-                              :shacl   (into class-shapes pred-shapes)}]
-          (recur r (assoc subj-mods sid subject-meta)))
-        subj-mods))))
+    (let [has-target-objects-of-shapes (shacl/has-target-objects-of-rule? db-before)]
+      (loop [[s-flakes & r] (partition-by flake/s new-flakes)
+             subj-mods      {}]
+        (if s-flakes
+          (let [sid            (flake/s (first s-flakes))
+                new-subject?   (first (filterv #(= const/$xsd:anyURI (flake/p %)) s-flakes))
+                new-classes    (->> s-flakes
+                                    (filterv #(= const/$rdf:type (flake/p %)))
+                                    (mapv flake/o))
+                classes        (if new-subject?
+                                 new-classes
+                                 (into new-classes
+                                       (<? (query-range/index-range db-before :spot = [sid const/$rdf:type]
+                                                                    {:flake-xf (map flake/o)}))))
+                class-shapes   (<? (shacl/class-shapes db-before classes))
+                referring-pids (when has-target-objects-of-shapes
+                                 (<? (query-range/index-range db-before :opst = [sid] {:flake-xf (map flake/p)})))
+                pred-shapes    (when (seq referring-pids)
+                                 (<? (shacl/targetobject-shapes db-before referring-pids)))
+                subject-meta   {:new?    new-subject?
+                                :classes classes
+                                :shacl   (into class-shapes pred-shapes)}]
+            (recur r (assoc subj-mods sid subject-meta)))
+          subj-mods)))))
 
 (defn final-db2
   "Returns map of all elements for a stage transaction required to create an
@@ -661,7 +664,7 @@
   (go-try
     (let [subj-mods (<? (subject-mods flakes (:db-before tx-state)))
           ;; wrap it in an atom to reuse old validate-rules and policy/allowed? unchanged
-          ;; TODO: remove this once subj-mods is no longer shared code
+          ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
           tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
       (-> (final-db2 flakes tx-state)
           <?
