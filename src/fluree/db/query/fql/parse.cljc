@@ -85,15 +85,15 @@
 (defn safe-read
   [code-str]
   (try*
-   (let [code (read-string code-str)]
-     (when-not (list? code)
-       (throw (ex-info (code-str "Invalid function: " code-str)
-                       {:status 400 :error :db/invalid-query})))
-     code)
-   (catch* e
-     (log/warn e "Invalid query function attempted: " code-str)
-     (throw (ex-info (str "Invalid query function: " code-str)
-                     {:status 400 :error :db/invalid-query})))))
+    (let [code (read-string code-str)]
+      (when-not (list? code)
+        (throw (ex-info (code-str "Invalid function: " code-str)
+                        {:status 400 :error :db/invalid-query})))
+      code)
+    (catch* e
+      (log/warn e "Invalid query function attempted: " code-str)
+      (throw (ex-info (str "Invalid query function: " code-str)
+                      {:status 400 :error :db/invalid-query})))))
 
 (defn variables
   "Returns the set of items within the arbitrary data structure `data` that
