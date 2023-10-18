@@ -254,38 +254,43 @@
          (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
 
 
-(defn evaluate-subject-match
+(defn evaluate-subject-iri
   [db error-ch s-mch]
   (go (try*
-        (if (::val s-mch)
-          s-mch
-          (if-let [s-iri (::iri s-mch)]
-            (let [sid (<? (dbproto/-subid db s-iri true))]
-              (assoc s-mch
-                     ::val sid
-                     ::datatype const/$xsd:anyURI))
-            s-mch))
+        (let [s-iri (::iri s-mch)
+              sid   (<? (dbproto/-subid db s-iri true))]
+          (assoc s-mch
+                 ::val sid
+                 ::datatype const/$xsd:anyURI))
         (catch* e
                 (log/error e "Error resolving subject id")
                 (>! error-ch e)))))
 
-(defn evaluate-predicate-match
+(defn evaluate-predicate-iri
   [db p-mch]
   (if (::val p-mch)
     p-mch
-    (if-let [p-iri (::iri p-mch)]
-      (let [pid (dbproto/-p-prop db :id p-iri)]
-        (assoc p-mch
-               ::val pid
-               ::datatype const/$xsd:anyURI))
-      p-mch)))
+    (let [p-iri (::iri p-mch)
+          pid (dbproto/-p-prop db :id p-iri)]
+      (assoc p-mch
+             ::val pid
+             ::datatype const/$xsd:anyURI))))
 
 (defn evaluate-iris
   [db error-ch [s p o]]
   (go (try*
-        (let [s* (<? (evaluate-subject-match db error-ch s))
-              p* (evaluate-predicate-match db p)
-              o* (<? (evaluate-subject-match db error-ch o))]
+        (let [s* (if (and (::iri s)
+                          (not (::val s)))
+                   (<! (evaluate-subject-iri db error-ch s))
+                   s)
+              p* (if (and (::iri p)
+                          (not (::val p)))
+                   (evaluate-predicate-iri db p)
+                   p)
+              o* (if (and (::iri o)
+                          (not (::val o)))
+                   (<! (evaluate-subject-iri db error-ch o))
+                   o)]
           [s* p* o*])
         (catch* e
                 (log/error e "Error looking up iri")
@@ -303,10 +308,9 @@
   (let [match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
                                             (match-flake solution pattern flake)))))]
-    (go (let [triple   (assign-matched-values pattern solution filters)
-              [s p o]  (<! (evaluate-iris db error-ch triple))
-              pid      (::val p)]
-
+    (go (let [triple  (assign-matched-values pattern solution filters)
+              [s p o] (<! (evaluate-iris db error-ch triple))
+              pid     (::val p)]
           (if-let [props (and pid (get-equivalent-properties db pid))]
             (let [prop-ch (async/to-chan! (conj props pid))]
               (async/pipeline-async 2
@@ -355,9 +359,18 @@
                                        (map (fn [flake]
                                               (match-flake solution triple flake)))))]
     (go (let [[s p o]    (assign-matched-values triple solution filters)
-              s*         (<! (evaluate-subject-match db error-ch s))
-              p*         (evaluate-predicate-match db p)
-              o*         (evaluate-predicate-match db o)
+              s*         (if (and (::iri s)
+                                  (not (::val s)))
+                           (<! (evaluate-subject-iri db error-ch s))
+                           s)
+              p*         (if (and (::iri p)
+                                  (not (::val p)))
+                           (evaluate-predicate-iri db p)
+                           p)
+              o*         (if (and (::iri o)
+                                  (not (::val o)))
+                           (evaluate-predicate-iri db o)
+                           o)
               cls        (::val o*)
               sub-obj    (dissoc o* ::val ::iri)
               class-objs (into [o*]
