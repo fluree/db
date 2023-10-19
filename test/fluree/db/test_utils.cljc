@@ -248,7 +248,7 @@
     result))
 
 (def commit-id-regex
-  (re-pattern (str "fluree:commit:sha256:" base32-pattern "{52,53}")))
+  (re-pattern (str "fluree:commit:sha256:" base32-pattern "{51,53}")))
 
 (defn commit-id?
   [s]
