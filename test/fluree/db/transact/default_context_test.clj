@@ -54,7 +54,8 @@
               "skos"   "http://www.w3.org/2008/05/skos#"
               "type"   "@type"
               "wiki"   "https://www.wikidata.org/wiki/"
-              "xsd"    "http://www.w3.org/2001/XMLSchema#"}
+              "xsd"    "http://www.w3.org/2001/XMLSchema#"
+              "graph"  "@graph"}
              (dbproto/-default-context db1))))
 
     (testing "Default context on original db and loaded db are identical."
@@ -79,7 +80,8 @@
               "skos"   "http://www.w3.org/2008/05/skos#"
               "type"   "@type"
               "wiki"   "https://www.wikidata.org/wiki/"
-              "xsd"    "http://www.w3.org/2001/XMLSchema#"}
+              "xsd"    "http://www.w3.org/2001/XMLSchema#"
+              "graph"  "@graph"}
              (dbproto/-default-context db-update-ctx))))
 
     (testing "Updated context db loaded is same as one before commit."
@@ -108,7 +110,8 @@
               "skos"   "http://www.w3.org/2008/05/skos#"
               "type"   "@type"
               "wiki"   "https://www.wikidata.org/wiki/"
-              "xsd"    "http://www.w3.org/2001/XMLSchema#"}
+              "xsd"    "http://www.w3.org/2001/XMLSchema#"
+              "graph"  "@graph"}
              @(fluree/default-context-at-t ledger-updated-load 1)))
 
       (is (= {"ex-new" "http://example.org/ns/"
@@ -121,7 +124,8 @@
               "skos"   "http://www.w3.org/2008/05/skos#"
               "type"   "@type"
               "wiki"   "https://www.wikidata.org/wiki/"
-              "xsd"    "http://www.w3.org/2001/XMLSchema#"}
+              "xsd"    "http://www.w3.org/2001/XMLSchema#"
+              "graph"  "@graph"}
              @(fluree/default-context-at-t ledger-updated-load 2))))
 
     (testing "Default contexts can be retrieved by ISO datetime"
@@ -135,7 +139,8 @@
               "skos"   "http://www.w3.org/2008/05/skos#"
               "type"   "@type"
               "wiki"   "https://www.wikidata.org/wiki/"
-              "xsd"    "http://www.w3.org/2001/XMLSchema#"}
+              "xsd"    "http://www.w3.org/2001/XMLSchema#"
+              "graph"  "@graph"}
              @(fluree/default-context-at-t ledger-updated-load "1972-01-01T00:00:00.00000Z")))
 
       (is (= {"ex-new" "http://example.org/ns/"
@@ -148,7 +153,8 @@
               "skos"   "http://www.w3.org/2008/05/skos#"
               "type"   "@type"
               "wiki"   "https://www.wikidata.org/wiki/"
-              "xsd"    "http://www.w3.org/2001/XMLSchema#"}
+              "xsd"    "http://www.w3.org/2001/XMLSchema#"
+              "graph"  "@graph"}
              @(fluree/default-context-at-t ledger-updated-load "1982-01-01T00:00:00.00000Z"))))))
 
 (deftest ^:integration default-context-update-file-storage-test
@@ -205,7 +211,8 @@
                 :skos   "http://www.w3.org/2008/05/skos#"
                 :type   "@type"
                 :wiki   "https://www.wikidata.org/wiki/"
-                :xsd    "http://www.w3.org/2001/XMLSchema#"}
+                :xsd    "http://www.w3.org/2001/XMLSchema#"
+                :graph  "@graph"}
                @(fluree/default-context-at-t ledger-updated-load 1)))
 
         (is (= {:ex-new "http://example.org/ns/"
@@ -218,5 +225,6 @@
                 :skos   "http://www.w3.org/2008/05/skos#"
                 :type   "@type"
                 :wiki   "https://www.wikidata.org/wiki/"
-                :xsd    "http://www.w3.org/2001/XMLSchema#"}
+                :xsd    "http://www.w3.org/2001/XMLSchema#"
+                :graph  "@graph"}
                @(fluree/default-context-at-t ledger-updated-load 2)))))))
