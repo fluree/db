@@ -309,4 +309,4 @@
     (insert2 db parsed-txn tx-state error-ch solution-ch)
 
     (retract? parsed-txn)
-    (retract db parsed-txn tx-state fuel-tracker error-ch solution-ch)))
+    (retract2 db parsed-txn tx-state fuel-tracker error-ch solution-ch)))
