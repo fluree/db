@@ -157,7 +157,7 @@
   (let [new-sid (or
                   (get predefined-properties id)
                   (if (or (class-or-property? node)
-                          (predicate-refs referring-pid))
+                          (contains? predicate-refs referring-pid))
                     (next-pid)
                     (next-sid)))]
     (vswap! iris assoc id new-sid)

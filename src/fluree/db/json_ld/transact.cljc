@@ -568,15 +568,15 @@
 ;; ----------------------------------------
 
 (defn next-id
-  "Generate the next subject id - `counter` is either :last-pid or :last-sid."
-  [iri->sid counter iri]
+  "Generate the next subject id - `counter-key` is either :last-pid or :last-sid."
+  [iri->sid counter-key iri]
   (let [iri->sid* (swap! iri->sid
                          (fn [iri->sid]
                            (if (get iri->sid iri)
                              iri->sid
                              (-> iri->sid
-                                 (assoc iri (get iri->sid counter))
-                                 (update counter inc)))))]
+                                 (assoc iri (get iri->sid counter-key))
+                                 (update counter-key inc)))))]
     (get iri->sid* iri)))
 
 (defn ->tx-state2
@@ -615,7 +615,7 @@
              subj-mods      {}]
         (if s-flakes
           (let [sid            (flake/s (first s-flakes))
-                new-subject?   (first (filterv #(= const/$xsd:anyURI (flake/p %)) s-flakes))
+                new-subject?   (nth (filterv #(= const/$xsd:anyURI (flake/p %)) s-flakes) 0)
                 new-classes    (->> s-flakes
                                     (filterv #(= const/$rdf:type (flake/p %)))
                                     (mapv flake/o))
