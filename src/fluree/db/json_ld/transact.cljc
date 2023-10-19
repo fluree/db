@@ -677,7 +677,6 @@
   ([db txn parsed-opts]
    (stage2 db nil txn parsed-opts))
   ([db fuel-tracker txn parsed-opts]
-   (println "DEP stage2" txn)
    (go-try
      (let [db* (if-let [policy-opts (perm/policy-opts parsed-opts)]
                  (<? (perm/wrap-policy db policy-opts))
