@@ -165,6 +165,51 @@
   [o-match flake]
   (match-value o-match (flake/o flake) (flake/dt flake) (flake/m flake)))
 
+(defn match-subject-iri
+  [db s-mch flake error-ch]
+  (go
+    (try* (let [matched (match-subject s-mch flake)
+                sid     (::val matched)
+                iri     (<? (dbproto/-iri db sid))]
+            (match-iri matched iri))
+          (catch* e
+                  (log/error e "Error looking up subject iri")
+                  (>! error-ch e)))))
+
+(defn match-predicate-iri
+  [db p-mch flake]
+  (let [matched (match-predicate p-mch flake)
+        pid     (::val matched)
+        iri     (dbproto/-p-prop db :iri pid)]
+    (match-iri matched iri)))
+
+(defn match-object-iri
+  [db o-mch flake error-ch]
+  (go
+    (try* (let [matched (match-object o-mch flake)
+                sid     (::val matched)
+                iri     (<? (dbproto/-iri db sid))]
+            (match-iri matched iri))
+          (catch* e
+                  (log/error e "Error looking up subject iri")
+                  (>! error-ch e)))))
+
+(defn match-flake-iris
+  [db solution [s p o] flake error-ch]
+  (go
+    (let [s* (when (unmatched-var? s)
+               (<! (match-subject-iri db s flake error-ch)))
+          p* (when (unmatched-var? p)
+               (match-predicate-iri db p flake))
+          o* (when (unmatched-var? o)
+               (if (= const/$xsd:anyURI (flake/dt flake))
+                 (<! (match-object-iri db o flake error-ch))
+                 (match-object o flake)))]
+      (cond-> solution
+        (some? s*) (assoc (::var s*) s*)
+        (some? p*) (assoc (::var p*) p*)
+        (some? o*) (assoc (::var o*) o*)))))
+
 (defn match-flake
   "Assigns the unmatched variables within the supplied `triple-pattern` to their
   corresponding values from `flake` in the supplied match `solution`."
@@ -330,6 +375,22 @@
                                             (match-flake solution pattern flake)))))]
     (match-tuple db fuel-tracker solution pattern filters error-ch match-ch)
     match-ch))
+
+(defmethod match-pattern :tuple-dataset
+  [db fuel-tracker solution pattern filters error-ch]
+  (let [out-ch   (async/chan 2)
+        flake-ch (async/chan 2 cat)]
+
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [flake ch]
+                            (-> (match-flake-iris db solution pattern flake error-ch)
+                                (async/pipe ch)))
+                          flake-ch)
+
+    (match-tuple db fuel-tracker solution pattern filters error-ch flake-ch)
+
+    out-ch))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
