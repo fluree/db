@@ -37,29 +37,6 @@
      :selection selection
      :depth     depth}))
 
-(defn parse-select
-  [select-smt depth]
-  (let [_ (or (every? #(or (string? %) (map? %) (symbol? %) (list? %)) select-smt)
-              (throw (ex-info (str "Invalid select statement. Every selection must be a string or map. Provided: " select-smt)
-                              {:status 400 :error :db/invalid-query})))]
-    (map (fn [select]
-           (let [var-symbol (q-var->symbol select)]
-             (cond
-               var-symbol
-               {:variable var-symbol}
-
-               (aggregate? select)
-               (parse-aggregate select)
-
-               (map? select)
-               (parse-map select depth)
-
-               :else
-               (throw (ex-info (str "Invalid select in statement, provided: " select)
-                               {:status 400 :error :db/invalid-query})))))
-         select-smt)))
-
-
 (defn expand-selection
   [context depth selection]
   (reduce

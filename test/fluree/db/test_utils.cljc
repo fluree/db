@@ -3,12 +3,14 @@
             [fluree.db.did :as did]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.util.core :as util :refer [try* catch*]]
+            [fluree.db.util.log :as log]
             #?@(:cljs [[clojure.core.async :refer [go go-loop]]
                        [clojure.core.async.interop :refer [<p!]]])))
 
 (def default-context
   {:id     "@id"
    :type   "@type"
+   :graph  "@graph"
    :xsd    "http://www.w3.org/2001/XMLSchema#"
    :rdf    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
    :rdfs   "http://www.w3.org/2000/01/rdf-schema#"
@@ -21,6 +23,7 @@
 (def default-str-context
   {"id"     "@id"
    "type"   "@type"
+   "graph"  "@graph"
    "xsd"    "http://www.w3.org/2001/XMLSchema#"
    "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
    "rdfs"   "http://www.w3.org/2000/01/rdf-schema#"
@@ -209,35 +212,50 @@
 
 (defn did?
   [s]
-  (and (string? s) (re-matches did-regex s)))
+  (let [result (and (string? s) (re-matches did-regex s))]
+    (when-not result
+      (log/trace "did? falsey result from:" s))
+    result))
 
 (def addr-regex
   (re-pattern (str "fluree:(memory|file|ipfs)://.+")))
 
 (defn address?
   [s]
-  (and (string? s) (re-matches addr-regex s)))
+  (let [result (and (string? s) (re-matches addr-regex s))]
+    (when-not result
+      (log/trace "address? falsey result from:" s))
+    result))
 
 (def context-id-regex
   (re-pattern (str "fluree:context:" base64-pattern "{64}")))
 
 (defn context-id?
   [s]
-  (and (string? s) (re-matches context-id-regex s)))
+  (let [result (and (string? s) (re-matches context-id-regex s))]
+    (when-not result
+      (log/trace "context-id? falsey result from:" s))
+    result))
 
 (def db-id-regex
   (re-pattern (str "fluree:db:sha256:" base32-pattern "{52,53}")))
 
 (defn db-id?
   [s]
-  (and (string? s) (re-matches db-id-regex s)))
+  (let [result (and (string? s) (re-matches db-id-regex s))]
+    (when-not result
+      (log/trace "db-id? falsey result from:" s))
+    result))
 
 (def commit-id-regex
-  (re-pattern (str "fluree:commit:sha256:" base32-pattern "{52,53}")))
+  (re-pattern (str "fluree:commit:sha256:" base32-pattern "{51,53}")))
 
 (defn commit-id?
   [s]
-  (and (string? s) (re-matches commit-id-regex s)))
+  (let [result (and (string? s) (re-matches commit-id-regex s))]
+    (when-not result
+      (log/trace "commit-id? falsey result from:" s))
+    result))
 
 (defn pred-match?
   "Does a deep compare of expected and actual map values but any predicate fns

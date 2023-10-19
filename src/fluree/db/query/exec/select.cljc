@@ -60,7 +60,7 @@
   ValueSelector
   (implicit-grouping? [_] false)
   (format-value
-    [_ db iri-cache context compact error-ch solution]
+    [_ db iri-cache _context compact error-ch solution]
     (log/trace "VariableSelector format-value var:" var "solution:" solution)
     (-> solution
         (get var)
@@ -71,6 +71,29 @@
   `variable` in where search solutions for presentation."
   [variable]
   (->VariableSelector variable))
+
+(defrecord WildcardSelector []
+  ValueSelector
+  (implicit-grouping? [_] false)
+  (format-value
+   [_ db iri-cache _context compact error-ch solution]
+   (go-loop [ks        (keys solution)
+             formatted {}]
+     (let [k          (first ks)
+           fv         (-> solution
+                          (get k)
+                          (display db iri-cache compact error-ch)
+                          <!)
+           formatted' (assoc formatted k fv)
+           next-ks    (rest ks)]
+         (if (seq next-ks)
+           (recur next-ks formatted')
+           formatted')))))
+
+(def wildcard-selector
+  "Returns a selector that extracts and formats every bound value bound in the
+  where clause."
+  (->WildcardSelector))
 
 (defrecord AggregateSelector [agg-fn]
   ValueSelector

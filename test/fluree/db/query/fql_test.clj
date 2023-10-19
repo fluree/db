@@ -273,3 +273,33 @@
                 ["ex:w3c" "schema:description" "We ❤️ Internet"]]
                subject)
             "returns all results")))))
+
+(deftest ^:integration select-star-no-graph-crawl-test
+  (let [conn   (test-utils/create-conn)
+        ledger (test-utils/load-people conn)
+        db     (fluree/db ledger)]
+    (testing "select * w/o graph crawl returns all vars bound in where clause"
+      (let [query   '{:select :*
+                      :where  [[?s :schema/name ?name]
+                               [?s :ex/favNums ?favNums]]}
+            results @(fluree/query db query)]
+        (is (= '[{?favNums 9, ?name "Alice", ?s :ex/alice}
+                 {?favNums 42, ?name "Alice", ?s :ex/alice}
+                 {?favNums 76, ?name "Alice", ?s :ex/alice}
+                 {?favNums 7, ?name "Brian", ?s :ex/brian}
+                 {?favNums 5, ?name "Cam", ?s :ex/cam}
+                 {?favNums 10, ?name "Cam", ?s :ex/cam}
+                 {?favNums 11, ?name "Liam", ?s :ex/liam}
+                 {?favNums 42, ?name "Liam", ?s :ex/liam}]
+               results))))
+    (testing "select * w/o graph crawl returns all vars bound in where clause w/ grouping"
+      (let [query   '{:select :*
+                      :where  [[?s :schema/name ?name]
+                               [?s :ex/favNums ?favNums]]
+                      :group-by [?s ?name]}
+            results @(fluree/query db query)]
+        (is (= '[{?favNums [9 42 76], ?name "Alice", ?s :ex/alice}
+                 {?favNums [7], ?name "Brian", ?s :ex/brian}
+                 {?favNums [5 10], ?name "Cam", ?s :ex/cam}
+                 {?favNums [11 42], ?name "Liam", ?s :ex/liam}]
+               results))))))

@@ -17,8 +17,12 @@
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.policy.enforce-tx :as policy]
             [fluree.db.query.fql :as fql]
+            [fluree.db.query.fql.parse :as q-parse]
+            [fluree.db.query.exec :as exec]
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.exec.where :as where]
             [fluree.db.query.range :as query-range]
-            [fluree.db.util.async :refer [<? go-try throw-err]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [vswap!]]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
@@ -539,3 +543,132 @@
    (go-try
      (let [staged (<? (stage-ledger ledger fuel-tracker json-ld opts))]
        (<? (ledger-proto/-commit! ledger staged))))))
+
+;; ----------------------------------------
+
+(defn next-id
+  "Generate the next subject id - `counter-key` is either :last-pid or :last-sid."
+  [iri->sid counter-key iri]
+  (let [iri->sid* (swap! iri->sid
+                         (fn [iri->sid]
+                           (if (get iri->sid iri)
+                             iri->sid
+                             (-> iri->sid
+                                 (assoc iri (get iri->sid counter-key))
+                                 (update counter-key inc)))))]
+    (get iri->sid* iri)))
+
+(defn ->tx-state2
+  [db]
+  (let [{:keys [schema branch ledger policy], db-t :t} db
+        iri->sid (atom {:last-pid (jld-ledger/last-pid db)
+                        :last-sid (jld-ledger/last-sid db)})
+        commit-t  (-> (ledger-proto/-status ledger branch) branch/latest-commit-t)
+        t         (-> commit-t inc -) ;; commit-t is always positive, need to make negative for internal indexing
+        db-before (dbproto/-rootdb db)]
+    {:db-before                db-before
+     :policy                   policy
+     :stage-update?            (= t db-t) ;; if a previously staged db is getting updated again before committed
+     :t                        t
+     :iri->sid                 iri->sid
+     :next-pid                 (partial next-id iri->sid :last-pid)
+     :next-sid                 (partial next-id iri->sid :last-sid)
+     :iris                     (volatile! {})}))
+
+(defn generate-flakes
+  [db fuel-tracker parsed-txn tx-state]
+  (go
+    (let [error-ch  (async/chan)
+          update-ch (->> (where/search db parsed-txn fuel-tracker error-ch)
+                         (update/modify2 db parsed-txn tx-state fuel-tracker error-ch)
+                         (exec/into-flakeset fuel-tracker))]
+      (async/alt!
+        error-ch ([e] e)
+        update-ch ([flakes] flakes)))))
+
+(defn subject-mods
+  [new-flakes db-before]
+  (go-try
+    (let [has-target-objects-of-shapes (shacl/has-target-objects-of-rule? db-before)]
+      (loop [[s-flakes & r] (partition-by flake/s new-flakes)
+             subj-mods      {}]
+        (if s-flakes
+          (let [sid            (flake/s (first s-flakes))
+                new-subject?   (first (filterv #(= const/$xsd:anyURI (flake/p %)) s-flakes))
+                new-classes    (->> s-flakes
+                                    (filterv #(= const/$rdf:type (flake/p %)))
+                                    (mapv flake/o))
+                classes        (if new-subject?
+                                 new-classes
+                                 (into new-classes
+                                       (<? (query-range/index-range db-before :spot = [sid const/$rdf:type]
+                                                                    {:flake-xf (map flake/o)}))))
+                class-shapes   (<? (shacl/class-shapes db-before classes))
+                referring-pids (when has-target-objects-of-shapes
+                                 (<? (query-range/index-range db-before :opst = [sid] {:flake-xf (map flake/p)})))
+                pred-shapes    (when (seq referring-pids)
+                                 (<? (shacl/targetobject-shapes db-before referring-pids)))
+                subject-meta   {:new?    new-subject?
+                                :classes classes
+                                :shacl   (into class-shapes pred-shapes)}]
+            (recur r (assoc subj-mods sid subject-meta)))
+          subj-mods)))))
+
+(defn final-db2
+  "Returns map of all elements for a stage transaction required to create an
+  updated db."
+  [new-flakes {:keys [stage-update? db-before iri->sid policy t] :as tx-state}]
+  (go-try
+    (let [[add remove] (if stage-update?
+                         (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
+                         [new-flakes nil])
+
+          {:keys [last-pid last-sid]} @iri->sid
+
+          db-after  (-> db-before
+                        (update :ecount assoc const/$_predicate last-pid)
+                        (update :ecount assoc const/$_default last-sid)
+                        (assoc :policy policy) ;; re-apply policy to db-after
+                        (assoc :t t)
+                        (commit-data/update-novelty add remove)
+                        (commit-data/add-tt-id)
+                        (vocab/hydrate-schema add))]
+      {:add add :remove remove :db-after db-after})))
+
+(defn flakes->final-db2
+  "Takes final set of proposed staged flakes and turns them into a new db value
+  along with performing any final validation and policy enforcement."
+  [tx-state flakes]
+  (go-try
+    (let [subj-mods (<? (subject-mods flakes (:db-before tx-state)))
+          ;; wrap it in an atom to reuse old validate-rules and policy/allowed? unchanged
+          ;; TODO: remove the atom wrapper once subj-mods is no longer shared code
+          tx-state* (assoc tx-state :subj-mods (atom subj-mods))]
+      (-> (final-db2 flakes tx-state)
+          <?
+          (validate-rules tx-state*)
+          <?
+          (policy/allowed? tx-state*)
+          <?
+          dbproto/-rootdb))))
+
+(defn stage2
+  ([db txn parsed-opts]
+   (stage2 db nil txn parsed-opts))
+  ([db fuel-tracker txn parsed-opts]
+   (go-try
+     (let [db* (if-let [policy-opts (perm/policy-opts parsed-opts)]
+                 (<? (perm/wrap-policy db policy-opts))
+                 db)
+
+           tx-state      (->tx-state2 db*)
+           context       (-> db*
+                             (dbproto/-context (fql/get-context txn) (:ocntext-type parsed-opts)))
+           parsed-txn    (q-parse/parse-txn txn context)
+           flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
+           fuel-error-ch (:error-ch fuel-tracker)
+           chans         (remove nil? [fuel-error-ch flakes-ch])
+           [flakes]      (alts! chans :priority true)]
+       (when (util/exception? flakes)
+         (throw flakes))
+       (<? (flakes->final-db2 tx-state flakes))))))

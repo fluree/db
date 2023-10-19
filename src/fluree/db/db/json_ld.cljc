@@ -89,7 +89,7 @@
 
             (and (nil? res) strict?)
             (async/put! return-chan
-                        (ex-info (str "Subject identity does not exist: " ident)
+                        (ex-info (str "Subject identity does not exist: " (pr-str ident))
                                  {:status 400 :error :db/invalid-subject}))
 
             :else
@@ -97,7 +97,7 @@
 
         (catch* e
                 (async/put! return-chan
-                            (ex-info (str "Error looking up subject id: " ident)
+                            (ex-info (str "Error looking up subject id: " (pr-str ident))
                                      {:status 400 :error :db/invalid-subject}
                                      e)))))
     return-chan))

@@ -368,7 +368,7 @@
               (resolve-flake-range fuel-tracker error-ch [s p o])
               (async/pipe flake-ch))))))
 
-(defmethod match-pattern :tuple
+(defmethod match-pattern :tuple-prev
   [db fuel-tracker solution pattern filters error-ch]
   (let [match-ch (async/chan 2 (comp cat
                                      (map (fn [flake]
@@ -376,7 +376,7 @@
     (match-tuple db fuel-tracker solution pattern filters error-ch match-ch)
     match-ch))
 
-(defmethod match-pattern :tuple-dataset
+(defmethod match-pattern :tuple
   [db fuel-tracker solution pattern filters error-ch]
   (let [out-ch   (async/chan 2)
         flake-ch (async/chan 2 cat)]

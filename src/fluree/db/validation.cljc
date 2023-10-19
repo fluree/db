@@ -1,7 +1,6 @@
 (ns fluree.db.validation
-  (:require [clojure.string :as str]
+  (:require [fluree.db.constants :as const]
             [fluree.db.util.core :refer [pred-ident?]]
-            [fluree.db.constants :as const]
             [malli.core :as m]
             [malli.error :as me]))
 
@@ -42,25 +41,6 @@
     (keyword x)
     x))
 
-(defn fn-string?
-  [x]
-  (and (string? x)
-       (re-matches #"^\(.+\)$" x)))
-
-(defn fn-list?
-  [x]
-  (and (list? x)
-       (-> x first symbol?)))
-
-(defn query-fn?
-  [x]
-  (or (fn-string? x) (fn-list? x)))
-
-(defn as-fn?
-  [x]
-  (or (and (fn-string? x) (str/starts-with? x "(as "))
-      (and (fn-list? x) (-> x first (= 'as)))))
-
 (defn humanize-error
   [error]
   (-> error ex-data :data :explain me/humanize))
@@ -70,6 +50,7 @@
    (m/base-schemas)
    (m/type-schemas)
    (m/sequence-schemas)
+   (m/predicate-schemas)
    {::iri                  [:or :string :keyword]
     ::iri-key              [:fn iri-key?]
     ::iri-map              [:map-of {:max 1}
@@ -95,8 +76,8 @@
                                       [:iri-map ::iri-map]
                                       [:val :any]]]]
     ::function             [:orn
-                            [:string [:fn fn-string?]]
-                            [:list [:fn fn-list?]]]
+                            [:string-fn [:and :string [:re #"^\(.+\)$"]]]
+                            [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
     ::where-pattern        [:orn
                             [:map ::where-map]
                             [:tuple ::where-tuple]]
