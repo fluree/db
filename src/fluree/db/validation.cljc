@@ -131,6 +131,8 @@
          [{:keys [path] :as first-e}] errors
          first-e-parent (mu/get-in schema (butlast path))
          [_ first-direct-message] (if (#{:or :orn} (m/type first-e-parent))
+                                    ;;if it's a child of an `:or`, return the error message from the `:or`
+                                    ;;itself. Otherwise, you're returning an arbitrary child without context.
                                     (let [props (m/properties first-e-parent)]
                                       [nil (or (:error/message props)
                                                (some-> (:error/fn props)
