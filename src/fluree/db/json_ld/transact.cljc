@@ -643,7 +643,6 @@
     (let [[add remove] (if stage-update?
                          (stage-update-novelty (get-in db-before [:novelty :spot]) new-flakes)
                          [new-flakes nil])
-          vocab-flakes (jld-reify/get-vocab-flakes new-flakes)
 
           {:keys [last-pid last-sid]} @iri->sid
 

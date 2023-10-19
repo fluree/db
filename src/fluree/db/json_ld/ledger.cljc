@@ -9,7 +9,7 @@
 ;; methods to link/trace back a ledger and return flakes
 #?(:clj (set! *warn-on-reflection* true))
 
-(def class+property-iris #{"http://www.w3.org/2000/01/rdf-schema#Class"
+(def class+property-iris #{const/iri-class
                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#Property"
                            "http://www.w3.org/2002/07/owl#Class"
                            "http://www.w3.org/2002/07/owl#ObjectProperty"
@@ -129,22 +129,26 @@
 
 (def predicate-refs
   "The following predicates have objects that are refs to other predicates."
-  #{const/$rdfs:subClassOf
-    const/$sh:path
-    const/$sh:ignoredProperties
-    const/$sh:targetClass
-    const/$fluree:targetClass
-    const/$sh:targetSubjectsOf
-    const/$sh:targetObjectsOf
-    const/$sh:equals
+  #{const/$fluree:targetClass
+    const/$rdfs:Class
+    const/$rdfs:subClassOf
+    const/$sh:alternativePath
+    const/$sh:class
+    const/$sh:datatype
     const/$sh:disjoint
+    const/$sh:equals
+    const/$sh:ignoredProperties
+    const/$sh:inversePath
     const/$sh:lessThan
     const/$sh:lessThanOrEquals
-    const/$sh:inversePath
-    const/$sh:alternativePath
-    const/$sh:zeroOrMorePath
     const/$sh:oneOrMorePath
-    const/$sh:zeroOrOnePath})
+    const/$sh:path
+    const/$sh:targetClass
+    const/$sh:targetObjectsOf
+    const/$sh:targetSubjectsOf
+    const/$sh:zeroOrMorePath
+    const/$sh:zeroOrOnePath
+    const/$rdf:type})
 
 (defn generate-new-sid
   "Generates a new subject ID. If it is known this is a property or class will
