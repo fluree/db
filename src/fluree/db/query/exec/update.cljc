@@ -7,7 +7,7 @@
             [fluree.db.util.core :refer [try* catch*]]
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.log :as log]
-            [clojure.core.async :as async :refer [>! go]]
+            [clojure.core.async :as async :refer [>! <! go]]
             [clojure.string :as str]
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.datatype :as datatype]))
@@ -144,32 +144,35 @@
 
 (defn retract-triple2
   [db triple {:keys [t]} solution fuel-tracker error-ch]
-  (go
-    (try*
-      (let [retract-xf (keep (fn [f]
-                               ;;do not retract the flakes which map subject ids to iris.
-                               ;;they are an internal optimization, which downstream code
-                               ;;(eg the commit pipeline) relies on
-                               (when-not (iri-mapping? f)
-                                 (flake/flip-flake f t))))
+  (let [retract-flakes-ch (async/chan)]
+    (go
+      (try*
+        (let [retract-xf (keep (fn [f]
+                                 ;;do not retract the flakes which map subject ids to iris.
+                                 ;;they are an internal optimization, which downstream code
+                                 ;;(eg the commit pipeline) relies on
+                                 (when-not (iri-mapping? f)
+                                   (flake/flip-flake f t))))
 
-            [s-mch p-mch o-mch] (match-solution triple solution)
+              [s-mch p-mch o-mch] (match-solution triple solution)
 
-            s-cmp  (if (string? (::where/val s-mch))
-                     (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch) true)))
-                     s-mch)
+              s-cmp  (if (string? (::where/val s-mch))
+                       (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch) true)))
+                       s-mch)
 
-            p-cmp  (if (string? (::where/val p-mch))
-                     (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch) true)))
-                     p-mch)
-            o-cmp  (if (and (= const/$xsd:anyURI (::where/val o-mch))
-                            (string? (::where/val o-mch)))
-                     (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch) true)))
-                     o-mch)]
-        (<? (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])))
-      (catch* e
-              (log/error e "Error retracting triple")
-              (>! error-ch e)))))
+              p-cmp  (if (string? (::where/val p-mch))
+                       (assoc p-mch ::where/val (<? (dbproto/-subid db (::where/val p-mch) true)))
+                       p-mch)
+              o-cmp  (if (and (= const/$xsd:anyURI (::where/val o-mch))
+                              (string? (::where/val o-mch)))
+                       (assoc o-mch ::where/val (<? (dbproto/-subid db (::where/val o-mch) true)))
+                       o-mch)]
+          (async/pipe (where/resolve-flake-range db fuel-tracker retract-xf error-ch [s-cmp p-cmp o-cmp])
+                      retract-flakes-ch))
+        (catch* e
+                (log/error e "Error retracting triple")
+                (>! error-ch e))))
+    retract-flakes-ch))
 
 (defn retract-clause2
   [db clause tx-state solution fuel-tracker error-ch out-ch]
