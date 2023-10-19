@@ -52,7 +52,12 @@
 (def ^:const iri-view "https://ns.flur.ee/ledger#view")
 (def ^:const iri-modify "https://ns.flur.ee/ledger#modify")
 (def ^:const iri-role "https://ns.flur.ee/ledger#role")
+(def ^:const iri-where "https://ns.flur.ee/ledger#where")
+(def ^:const iri-values "https://ns.flur.ee/ledger#values")
+(def ^:const iri-insert "https://ns.flur.ee/ledger#insert")
+(def ^:const iri-delete "https://ns.flur.ee/ledger#delete")
 
+(def ^:const iri-context "@context")
 (def ^:const iri-id "@id")
 (def ^:const iri-type "@type")
 (def ^:const iri-rdf-type "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")

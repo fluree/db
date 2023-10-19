@@ -90,7 +90,7 @@
              ["Alice" "Bob"])
           "Only Bob and Alice should be left in the db.")
 
-      (testing "Updating property value only if it's current value is a match."
+      (testing "Updating property value only if its current value is a match."
         (is (= [{:id          :ex/bob,
                  :type    :ex/User,
                  :schema/name "Bob"

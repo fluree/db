@@ -320,7 +320,6 @@
    - numbers in strings
    - the strings 'true' or 'false' to a boolean"
   [value required-type]
-  (log/trace "coerce value:" value "to type:" required-type)
   (uc/case (int required-type)
     (const/$xsd:string
      const/$rdf:langString)
@@ -392,3 +391,14 @@
                            " cannot be coerced from provided value: " value ".")
                       {:status 400 :error, :db/shacl-value-coercion}))
       [value* to-type])))
+
+(defn coerce-value
+  "Attempt to coerce the value into an in-memory instance of the supplied datatype. If no
+  coercion for the datatype is known, nothing will be done. If a coercion does exist but
+  fails, an error will be thrown."
+  [value datatype]
+  (let [value* (coerce value datatype)]
+    (if (nil? value*)
+      (throw (ex-info (str "Data type " datatype " cannot be coerced from provided value: " value ".")
+                      {:status 400 :error, :db/value-coercion}))
+      value*)))
