@@ -891,7 +891,8 @@
 #?(:clj
    (deftest transaction-test
      (let [conn   @(fluree/connect {:method :memory})
-           ledger @(fluree/create conn "update" {:defaultContext [test-utils/default-str-context {"ex" "ns:ex/"}]})
+           ledger-id "update-syntax"
+           ledger @(fluree/create conn ledger-id {:defaultContext [test-utils/default-str-context {"ex" "ns:ex/"}]})
            db0    (fluree/db ledger)
 
            db1 @(fluree/stage2 db0 {"@context" "https://flur.ee"
@@ -971,7 +972,10 @@
                                                                          "f:targetRole" "ex:userRole"
                                                                          "f:action" {"@id" "f:view"}
                                                                          "f:equals" {"@list" [{"@id" "f:$identity"}
-                                                                                              {"@id" "ex:user"}]}}}}]}})]
+                                                                                              {"@id" "ex:user"}]}}}}]}})
+
+           committed @(fluree/commit! ledger db5)
+           loaded    @(fluree/load conn ledger-id)]
        (is (= ["AP" "Dan" "KP" "NP"]
               @(fluree/query db1 {"where" [["?s" "ex:name" "?name"]]
                                   "select" "?name"})))
@@ -979,32 +983,32 @@
                 "type" "ex:Cat"
                 "ex:name" "Murray"
                 "ex:favs" ["Persey" {"id" "ex:dp"}]
-                "ex:address" {"id" "_:211106232532995"}
+                "ex:address" {"ex:street" "55 Bashford" "ex:city" "St. Paul" "ex:zip" 55105 "ex:state" "MN"}
                 "ex:isOrange" true
                 "ex:isPerson" false
                 "ex:nickname" "The Wretch"}]
               @(fluree/query db2 {"where" [["?s" "ex:name" "Murray"]]
-                                  "select" {"?s" ["*"]}})))
+                                  "select" {"?s" ["*" {"ex:address" ["ex:street" "ex:city" "ex:state" "ex:zip"]}]}})))
 
        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
               (ex-message db4)))
 
        (is (= [{"id" "ex:john"
                 "type" "ex:User"
-                "ex:address" {"id" "_:211106232533009" "ex:state" "SC" "ex:country" "USA"}
+                "ex:address" {"ex:state" "SC" "ex:country" "USA"}
                 "schema:birthDate" "2022-08-17"
                 "schema:name" "John"
                 "schema:email" "john@flur.ee"
                 "schema:ssn" "222-22-2222"}
                {"id" "ex:alice"
                 "type" "ex:User"
-                "ex:address" {"id" "_:211106232533007" "ex:state" "NC" "ex:country" "USA"}
+                "ex:address" {"ex:state" "NC" "ex:country" "USA"}
                 "schema:birthDate" "2022-08-17"
                 "schema:name" "Alice"
                 "schema:email" "alice@flur.ee"
                 "schema:ssn" "111-11-1111"}]
               @(fluree/query db5 {:where [["?s" "@type" "ex:User"]]
-                                  :select {"?s" ["*" {"ex:address" ["*"]}]}
+                                  :select {"?s" ["*" {"ex:address" ["ex:state" "ex:country"]}]}
                                   :opts {:did root-did
                                          :role "ex:rootRole"}}))
            "rootRole user can see all ex:Users")
@@ -1021,4 +1025,17 @@
               @(fluree/query db5 {:where [["?s" "@type" "ex:User"]]
                                   :select {"?s" ["*" {"ex:address" ["*"]}]}
                                   :opts {:did alice-did :role "ex:userRole"}}))
-           "userRole user can see all ex:Users but only their own ssn"))))
+           "userRole user can see all ex:Users but only their own ssn")
+
+       (is (= 132
+              (-> @(fluree/history ledger {:commit-details true :t {:from :latest}})
+                  (first)
+                  (get "f:commit")
+                  (get "f:data")
+                  (get "f:flakes"))))
+       (is (= 132
+              (-> @(fluree/history loaded {:commit-details true :t {:from :latest}})
+                  (first)
+                  (get "f:commit")
+                  (get "f:data")
+                  (get "f:flakes")))))))
