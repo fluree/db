@@ -206,7 +206,15 @@
            (let [k (-> in last name)]
              (str "Query contains an unknown key: '" k "'. "
                   "See documentation here for more information on allowed query keys: "
-                  docs/error-codes-page "#query-unknown-key")))})))
+                  docs/error-codes-page "#query-unknown-key")))}
+        ::m/invalid-type
+        {:error/fn (fn [{:keys [schema]} _]
+                     (if-let [expected-type (-> schema m/type)]
+                       (str "should be a " (case expected-type
+                                                   (:map-of :map) "map"
+                                                   (:cat :catn :sequential) "sequence"
+                                                   :else (name type)))
+                       "type is incorrect"))})))
 
 (defn humanize-error
   [error]
