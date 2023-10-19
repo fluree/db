@@ -1,14 +1,15 @@
 (ns fluree.db.api.transact
   (:require [clojure.walk :refer [keywordize-keys]]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.fuel :as fuel]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [catch* try*]]
+            [fluree.db.util.log :as log]
             [fluree.json-ld :as json-ld]))
 
 (defn stage
@@ -37,14 +38,19 @@
   Throws if required keys @id or @graph are absent."
   [conn context-type json-ld]
   (let [conn-default-ctx (conn-proto/-default-context conn context-type)
-        parsed-cdc       (json-ld/parse-context conn-default-ctx)
         context-key      (cond
                            (contains? json-ld "@context") "@context"
                            (contains? json-ld :context) :context)
-        context          (get json-ld context-key)
-        parsed-context   (if context
-                           (json-ld/parse-context parsed-cdc context)
-                           parsed-cdc)
+        txn-context      (get json-ld context-key)
+        _                (log/trace "parse-json-ld-txn txn-context:" txn-context)
+        parsed-context   (if (or (nil? txn-context)
+                                 (and (sequential? txn-context)
+                                      (= "" (first txn-context))))
+                           (json-ld/parse-context
+                            (cons conn-default-ctx (rest txn-context)))
+                           (json-ld/parse-context txn-context))
+        _                (log/trace "parse-json-ld-txn parsed-context:" parsed-context)
+
         {ledger-id const/iri-ledger graph "@graph" :as parsed-txn}
         (into {}
               (map (fn [[k v]]
