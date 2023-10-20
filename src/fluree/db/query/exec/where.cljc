@@ -369,6 +369,17 @@
               (resolve-flake-range fuel-tracker error-ch [s p o])
               (async/pipe flake-ch))))))
 
+(defn match-tuple-in
+  [db fuel-tracker solution pattern filters error-ch out-ch]
+  (let [flake-ch (async/chan 2 cat)]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [flake ch]
+                            (-> (match-flake-iris db solution pattern flake error-ch)
+                                (async/pipe ch)))
+                          flake-ch)
+    (match-tuple db fuel-tracker solution pattern filters error-ch flake-ch)))
+
 (defmethod match-pattern :tuple-prev
   [db fuel-tracker solution pattern filters error-ch]
   (let [match-ch (async/chan 2 (comp cat
@@ -379,18 +390,11 @@
 
 (defmethod match-pattern :tuple
   [ds fuel-tracker solution pattern filters error-ch]
-  (let [out-ch   (async/chan 2)
-        flake-ch (async/chan 2 cat)]
-
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [flake ch]
-                            (-> (match-flake-iris ds solution pattern flake error-ch)
-                                (async/pipe ch)))
-                          flake-ch)
-
-    (match-tuple ds fuel-tracker solution pattern filters error-ch flake-ch)
-
+  (let [out-ch (async/chan 2)]
+    (if (dataset/dataset? ds)
+      (doseq [db (dataset/defaults ds)]
+        (match-tuple-in db fuel-tracker solution pattern filters error-ch out-ch))
+      (match-tuple-in ds fuel-tracker solution pattern filters error-ch out-ch))
     out-ch))
 
 (defn with-distinct-subjects
@@ -446,6 +450,18 @@
                                     (async/pipe ch)))
                               class-ch))))
 
+(defn match-class-in
+  [db fuel-tracker solution triple filters error-ch out-ch]
+  (let [flake-ch (async/chan 2 (comp cat
+                                     (with-distinct-subjects)))]
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [flake ch]
+                            (-> (match-flake-iris db solution triple flake error-ch)
+                                (async/pipe ch)))
+                          flake-ch)
+    (match-class db fuel-tracker solution triple filters error-ch flake-ch)))
+
 (defmethod match-pattern :class-prev
   [db fuel-tracker solution pattern filters error-ch]
   (let [triple     (val pattern)
@@ -460,21 +476,13 @@
 
 
 (defmethod match-pattern :class
-  [db fuel-tracker solution pattern filters error-ch]
+  [ds fuel-tracker solution pattern filters error-ch]
   (let [triple   (val pattern)
-        out-ch   (async/chan 2)
-        flake-ch (async/chan 2 (comp cat
-                                     (with-distinct-subjects)))]
-
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [flake ch]
-                            (-> (match-flake-iris db solution triple flake error-ch)
-                                (async/pipe ch)))
-                          flake-ch)
-
-    (match-class db fuel-tracker solution triple filters error-ch flake-ch)
-
+        out-ch   (async/chan 2)]
+    (if (dataset/dataset? ds)
+      (doseq [db (dataset/defaults ds)]
+        (match-class-in db fuel-tracker solution triple filters error-ch out-ch))
+      (match-class-in ds fuel-tracker solution triple filters error-ch out-ch))
     out-ch))
 
 (defn with-constraint

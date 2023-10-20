@@ -11,7 +11,9 @@
   [ds alias]
   (-> ds :db-map (get alias)))
 
-
+(defn defaults
+  [ds]
+  (:defaults ds))
 
 (defn set
   [ds alias]
