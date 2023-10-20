@@ -15,11 +15,11 @@
 (defn compare-solutions-by
   [variable direction x y]
   (let [x-var (get x variable)
-        x-val (::where/val x-var)
+        x-val (where/get-value x-var)
         x-dt  (::where/datatype x-var)
 
         y-var (get y variable)
-        y-val (::where/val y-var)
+        y-val (where/get-value y-var)
         y-dt  (::where/datatype y-var)]
     (if (= direction :asc)
       (compare-vals x-val x-dt y-val y-dt)

@@ -12,8 +12,8 @@
             [fluree.db.util.async :refer [<?]]
             [fluree.db.util.core :refer [catch* try*]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.validation :as v]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld]
+            [fluree.db.datatype :as datatype]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -25,12 +25,12 @@
 
 (defmethod display :default
   [match _ _ _ _]
-  (go (::where/val match)))
+  (go (where/get-value match)))
 
 (defmethod display const/$xsd:anyURI
   [match db iri-cache compact error-ch]
   (go
-    (let [v (::where/val match)]
+    (let [v (where/get-value match)]
       (if-let [cached (-> @iri-cache (get v) :as)]
         cached
         (try* (let [iri (<? (dbproto/-iri db v compact))]
@@ -118,15 +118,19 @@
   (update-solution
     [_ solution]
     (log/trace "AsSelector update-solution solution:" solution)
-    (let [result (as-fn solution)]
+    (let [result (as-fn solution)
+          dt     (datatype/infer result)]
       (log/trace "AsSelector update-solution result:" result)
-      (assoc solution bind-var {::where/var bind-var, ::where/val result})))
+      (assoc solution bind-var (-> bind-var
+                                   where/unmatched
+                                   (where/match-value result dt)))))
   ValueSelector
   (implicit-grouping? [_] aggregate?)
   (format-value
     [_ _ _ _ _ _ solution]
     (log/trace "AsSelector format-value solution:" solution)
-    (go (get-in solution [bind-var ::where/val]))))
+    (go (let [match (get solution bind-var)]
+          (where/get-value match)))))
 
 (defn as-selector
   [as-fn bind-var aggregate?]
@@ -140,7 +144,7 @@
     (go
       (let [sid (-> solution
                     (get var)
-                    ::where/val)]
+                    where/get-value)]
         (try*
          (let [flakes (<? (query-range/index-range db :spot = [sid]))]
            ;; TODO: Replace these nils with fuel values when we turn fuel back on

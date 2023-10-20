@@ -15,14 +15,6 @@
   [ds]
   (:defaults ds))
 
-(defn set
-  [ds alias]
-  (assoc ds :current alias))
-
-(defn set-default
-  [ds]
-  (assoc ds :current ::default))
-
 (defn dataset?
   [ds]
   (instance? DataSet ds))

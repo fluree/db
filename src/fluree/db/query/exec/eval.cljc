@@ -432,9 +432,9 @@
                     `[mch#      (get ~soln-sym (quote ~var))
                       ~dt-var   (::where/datatype mch#)
                       ~lang-var (-> mch# ::where/meta :lang (or ""))
-                      ~var      (cond->> (::where/val mch#)
+                      ~var      (cond->> (where/get-value mch#)
                                   (= ~dt-var ::group/grouping)
-                                  (mapv ::where/val))])))
+                                  (mapv where/get-value))])))
         var-syms))
 
 (defn compile

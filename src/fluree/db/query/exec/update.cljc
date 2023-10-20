@@ -14,7 +14,7 @@
 
 (defn match-component
   [c solution]
-  (if (some? (::where/val c))
+  (if (some? (where/get-value c))
     c
     (get solution (::where/var c))))
 
@@ -67,9 +67,9 @@
   [db triple t solution error-ch]
   (go
     (try* (let [[s-mch p-mch o-mch] (match-solution triple solution)
-                s                   (::where/val s-mch)
-                p                   (::where/val p-mch)
-                o                   (::where/val o-mch)
+                s                   (where/get-value s-mch)
+                p                   (where/get-value p-mch)
+                o                   (where/get-value o-mch)
                 dt                  (::where/datatype o-mch)]
             (when (and (some? s) (some? p) (some? o) (some? dt))
               ;; wrap created flake in a vector so the output of this function has the

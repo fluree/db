@@ -58,6 +58,10 @@
   (and (contains? component ::var)
        (unmatched? component)))
 
+(defn get-value
+  [match]
+  (::val match))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]
@@ -134,7 +138,7 @@
   (mapv (fn [component]
           (if-let [variable (::var component)]
             (let [match (get solution variable)]
-              (if-let [value (::val match)]
+              (if-let [value (get-value match)]
                 (let [dt (::datatype match)]
                   (match-value component value dt))
                 (let [filter-fn (some->> (get filters variable)
@@ -170,7 +174,7 @@
   [db s-mch flake error-ch]
   (go
     (try* (let [matched (match-subject s-mch flake)
-                sid     (::val matched)
+                sid     (get-value matched)
                 iri     (<? (dbproto/-iri db sid))]
             (match-iri matched iri))
           (catch* e
@@ -180,7 +184,7 @@
 (defn match-predicate-iri
   [db p-mch flake]
   (let [matched (match-predicate p-mch flake)
-        pid     (::val matched)
+        pid     (get-value matched)
         iri     (dbproto/-p-prop db :iri pid)]
     (match-iri matched iri)))
 
@@ -188,7 +192,7 @@
   [db o-mch flake error-ch]
   (go
     (try* (let [matched (match-object o-mch flake)
-                sid     (::val matched)
+                sid     (get-value matched)
                 iri     (<? (dbproto/-iri db sid))]
             (match-iri matched iri))
           (catch* e
@@ -238,10 +242,10 @@
            (and s o))
     (let [f (if o-fn
               (fn [mch]
-                (and (#{o} (::val mch))
+                (and (#{o} (get-value mch))
                      (o-fn mch)))
               (fn [mch]
-                (#{o} (::val mch))))]
+                (#{o} (get-value mch))))]
       [nil f])
     [o o-fn]))
 
@@ -249,53 +253,55 @@
   ([db fuel-tracker error-ch components]
    (resolve-flake-range db fuel-tracker nil error-ch components))
 
-  ([{:keys [conn t] :as db} fuel-tracker flake-xf error-ch components]
-   (let [[s-mch p-mch o-mch]  components
-         {s ::val, s-fn ::fn} s-mch
-         {p ::val, p-fn ::fn} p-mch
-         {o ::val, o-fn ::fn,
-          o-dt ::datatype}    o-mch
+  ([{:keys [conn t] :as db} fuel-tracker flake-xf error-ch [s-mch p-mch o-mch]]
+   (let [s                 (get-value s-mch)
+         s-fn              (::fn s-mch)
+         p                 (get-value p-mch)
+         p-fn              (::fn p-mch)
+         o                 (get-value o-mch)
+         {o-fn ::fn,
+          o-dt ::datatype} o-mch
 
-         idx                  (try* (index/for-components s p o o-dt)
-                                    (catch* e
-                                            (log/error e "Error resolving flake range")
-                                            (async/put! error-ch e)))
-         idx-root             (get db idx)
-         novelty              (get-in db [:novelty idx])
-         [o* o-fn*]           (augment-object-fn idx s p o o-fn)
-         start-flake          (flake/create s p o* o-dt nil nil util/min-integer)
-         end-flake            (flake/create s p o* o-dt nil nil util/max-integer)
-         track-fuel           (when fuel-tracker
-                                (take! (:error-ch fuel-tracker)
-                                       #(put! error-ch %))
-                                (fuel/track fuel-tracker))
-         subj-filter          (when s-fn
-                                (filter (fn [f]
-                                          (-> (unmatched)
-                                              (match-subject f)
-                                              s-fn))))
-         pred-filter          (when p-fn
-                                (filter (fn [f]
-                                          (-> (unmatched)
-                                              (match-predicate f)
-                                              p-fn))))
-         obj-filter           (when o-fn*
-                                (filter (fn [f]
-                                          (-> (unmatched)
-                                              (match-object f)
-                                              o-fn*))))
-         flake-xf*            (->> [subj-filter pred-filter obj-filter
-                                    flake-xf track-fuel]
-                                   (remove nil?)
-                                   (apply comp))
-         opts                 (cond-> {:idx         idx
-                                       :from-t      t
-                                       :to-t        t
-                                       :start-test  >=
-                                       :start-flake start-flake
-                                       :end-test    <=
-                                       :end-flake   end-flake
-                                       :flake-xf    flake-xf*})]
+         idx         (try* (index/for-components s p o o-dt)
+                           (catch* e
+                                   (log/error e "Error resolving flake range")
+                                   (async/put! error-ch e)))
+         idx-root    (get db idx)
+         novelty     (get-in db [:novelty idx])
+         [o* o-fn*]  (augment-object-fn idx s p o o-fn)
+         start-flake (flake/create s p o* o-dt nil nil util/min-integer)
+         end-flake   (flake/create s p o* o-dt nil nil util/max-integer)
+         track-fuel  (when fuel-tracker
+                       (take! (:error-ch fuel-tracker)
+                              #(put! error-ch %))
+                       (fuel/track fuel-tracker))
+         subj-filter (when s-fn
+                       (filter (fn [f]
+                                 (-> (unmatched)
+                                     (match-subject f)
+                                     s-fn))))
+         pred-filter (when p-fn
+                       (filter (fn [f]
+                                 (-> (unmatched)
+                                     (match-predicate f)
+                                     p-fn))))
+         obj-filter  (when o-fn*
+                       (filter (fn [f]
+                                 (-> (unmatched)
+                                     (match-object f)
+                                     o-fn*))))
+         flake-xf*   (->> [subj-filter pred-filter obj-filter
+                           flake-xf track-fuel]
+                          (remove nil?)
+                          (apply comp))
+         opts        (cond-> {:idx         idx
+                              :from-t      t
+                              :to-t        t
+                              :start-test  >=
+                              :start-flake start-flake
+                              :end-test    <=
+                              :end-flake   end-flake
+                              :flake-xf    flake-xf*})]
      (-> (query-range/resolve-flake-slices conn idx-root novelty error-ch opts)
          (->> (query-range/filter-authorized db start-flake end-flake error-ch))))))
 
@@ -305,22 +311,16 @@
   (go (try*
         (let [s-iri (::iri s-mch)
               sid   (<? (dbproto/-subid db s-iri true))]
-          (assoc s-mch
-                 ::val sid
-                 ::datatype const/$xsd:anyURI))
+          (match-value s-mch sid const/$xsd:anyURI))
         (catch* e
                 (log/error e "Error resolving subject id")
                 (>! error-ch e)))))
 
 (defn evaluate-predicate-iri
   [db p-mch]
-  (if (::val p-mch)
-    p-mch
-    (let [p-iri (::iri p-mch)
-          pid (dbproto/-p-prop db :id p-iri)]
-      (assoc p-mch
-             ::val pid
-             ::datatype const/$xsd:anyURI))))
+  (let [p-iri (::iri p-mch)
+        pid   (dbproto/-p-prop db :id p-iri)]
+    (match-value p-mch pid const/$xsd:anyURI)))
 
 (defn evaluate-iris
   [db error-ch [s p o]]
@@ -353,13 +353,13 @@
   [db fuel-tracker solution pattern filters error-ch flake-ch]
   (go (let [triple  (assign-matched-values pattern solution filters)
             [s p o] (<! (evaluate-iris db error-ch triple))
-            pid     (::val p)]
+            pid     (get-value p)]
         (if-let [props (and pid (get-equivalent-properties db pid))]
           (let [prop-ch (async/to-chan! (conj props pid))]
             (async/pipeline-async 2
                                   flake-ch
                                   (fn [prop ch]
-                                    (let [p* (assoc p ::val prop)]
+                                    (let [p* (match-value p prop const/$xsd:anyURI)]
                                       (-> db
                                           (resolve-flake-range fuel-tracker error-ch [s p* o])
                                           (async/pipe ch))))
@@ -424,31 +424,31 @@
 (defn match-class
   [db fuel-tracker solution triple filters error-ch flake-ch]
   (go (let [[s p o]    (assign-matched-values triple solution filters)
-            s*         (if (and (::iri s)
-                                (not (::val s)))
-                         (<! (evaluate-subject-iri db error-ch s))
-                         s)
-            p*         (if (and (::iri p)
-                                (not (::val p)))
-                         (evaluate-predicate-iri db p)
-                         p)
-            o*         (if (and (::iri o)
-                                (not (::val o)))
-                         (evaluate-predicate-iri db o)
-                         o)
-            cls        (::val o*)
-            sub-obj    (dissoc o* ::val ::iri)
-            class-objs (into [o*]
-                             (map (fn [cls]
-                                    (assoc sub-obj ::val cls)))
-                             (dbproto/-class-prop db :subclasses cls))
-            class-ch   (async/to-chan! class-objs)]
-        (async/pipeline-async 2
-                              flake-ch
-                              (fn [class-obj ch]
-                                (-> (resolve-flake-range db fuel-tracker error-ch [s* p* class-obj])
-                                    (async/pipe ch)))
-                              class-ch))))
+              s*         (if (and (::iri s)
+                                  (not (::val s)))
+                           (<! (evaluate-subject-iri db error-ch s))
+                           s)
+              p*         (if (and (::iri p)
+                                  (not (::val p)))
+                           (evaluate-predicate-iri db p)
+                           p)
+              o*         (if (and (::iri o)
+                                  (not (::val o)))
+                           (evaluate-predicate-iri db o)
+                           o)
+              cls        (get-value o*)
+              sub-obj    (dissoc o* ::val ::iri)
+              class-objs (into [o*]
+                               (map (fn [cls]
+                                      (assoc sub-obj ::val cls)))
+                               (dbproto/-class-prop db :subclasses cls))
+              class-ch   (async/to-chan! class-objs)]
+          (async/pipeline-async 2
+                                flake-ch
+                                (fn [class-obj ch]
+                                  (-> (resolve-flake-range db fuel-tracker error-ch [s* p* class-obj])
+                                      (async/pipe ch)))
+                                class-ch))))
 
 (defn match-class-in
   [db fuel-tracker solution triple filters error-ch out-ch]
@@ -523,7 +523,7 @@
     (if-let [v (::var g)]
       (if-let [v-match (get solution v)]
         (let [alias (or (::iri v-match)
-                        (::val v-match))]
+                        (get-value v-match))]
           (match-alias ds alias fuel-tracker solution clause error-ch))
         (let [out-ch (async/chan)
               db-ch  (async/to-chan! ds)]
@@ -589,11 +589,14 @@
 
 (defn add-fn-result-to-solution
   [solution var-name result]
-  (let [dt (datatype/infer result)]
-    (assoc solution var-name {::var var-name ::val result ::datatype dt})))
+  (let [dt  (datatype/infer result)
+        mch (-> var-name
+                unmatched
+                (match-value result dt))]
+    (assoc solution var-name mch)))
 
 (defmethod match-pattern :bind
-  [_db fuel-tracker solution pattern _ error-ch]
+  [_db _fuel-tracker solution pattern _ error-ch]
   (let [bind (val pattern)]
     (go
       (let [result
@@ -601,9 +604,9 @@
                       (let [f        (::fn b)
                             var-name (::var b)]
                         (try*
-                         (->> (f solution)
-                              (add-fn-result-to-solution solution* var-name))
-                         (catch* e (update solution* ::errors conj e)))))
+                          (->> (f solution)
+                               (add-fn-result-to-solution solution* var-name))
+                          (catch* e (update solution* ::errors conj e)))))
                     solution (vals bind))]
         (when-let [errors (::errors result)]
           (async/onto-chan! error-ch errors))

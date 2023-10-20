@@ -6,10 +6,14 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
+(def grouping-value
+  (juxt where/get-value ::where/datatype))
+
 (defn split-solution-by
   [variables solution]
   (let [group-key   (mapv (fn [v]
-                            (-> (get solution v)
+                            (-> solution
+                                (get v)
                                 (select-keys [::where/val ::where/datatype])))
                           variables)
         grouped-val (apply dissoc solution variables)]
@@ -38,10 +42,11 @@
   (reduce-kv (fn [solutions group-key grouped-vals]
                (let [merged-vals (->> grouped-vals
                                       (reduce merge-with-colls {})
-                                      (reduce-kv (fn [m k v]
-                                                   (assoc m k {::where/var       k
-                                                               ::where/val       v
-                                                               ::where/datatype ::grouping}))
+                                      (reduce-kv (fn [soln var val]
+                                                   (let [match (-> var
+                                                                   where/unmatched
+                                                                   (where/match-value val ::grouping))]
+                                                     (assoc soln var match)))
                                                  {}))
                      solution    (into merged-vals
                                        (map vector grouping group-key))]
@@ -55,7 +60,7 @@
 
 (defmethod select/display ::grouping
   [match db select-cache compact error-ch]
-  (let [group (::where/val match)]
+  (let [group (where/get-value match)]
     (->> group
          (map (fn [grouped-val]
                 (select/display grouped-val db select-cache compact error-ch)))
