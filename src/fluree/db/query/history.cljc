@@ -51,7 +51,7 @@
                         :error/message "Invalid value of \"commit-details\" key"} :boolean]
       [:context {:optional true} ::context]
       [:opts {:optional true} [:map-of :keyword :any]]
-      [:t {:error/message "Invalid value for \"t\""}
+      [:t
        [:and
         [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
         [:map

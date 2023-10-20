@@ -146,12 +146,12 @@
     ::select-map      [:map-of {:max 1
                                 :error/message "Only one key/val for select-map"}
                        ::var ::subselection]
-    ::selector        [:orn {:error/message "Must be either a variable, iri, function application, or select map"}
+    ::selector        [:orn {:error/message "selector must be either a variable, iri, function application, or select map"}
                        [:var ::var]
                        [:pred ::iri]
                        [:aggregate ::function]
                        [:select-map ::select-map]]
-    ::select          [:orn {:error/message "Invalid select statement"}
+    ::select          [:orn {:error/message "Select must be a valid selector or vector of selectors"}
                        [:selector ::selector]
                        [:collection [:sequential ::selector]]]
     ::direction       [:orn {:error/message "Direction must be ASC or DESC"}
@@ -163,10 +163,10 @@
                                  [:catn
                                   [:direction ::direction]
                                   [:dimension ::var]]]]]
-    ::order-by        [:orn {:error/message  "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
+    ::order-by        [:orn {:error/message  "orderBy clause must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:clause ::ordering]
                        [:collection [:sequential ::ordering]]]
-    ::group-by        [:orn {:error/message "Invalid groupBy clause, must be a variable or a vector of variables"}
+    ::group-by        [:orn {:error/message "groupBy clause must be a variable or a vector of variables."}
                        [:clause ::var]
                        [:collection [:sequential ::var]]]
     ::triple          ::v/triple

@@ -126,6 +126,35 @@
         (if (seq path)
           (recur (pop path) (last path) path' p' m')
           (when m [(if (seq in) (mu/path->in schema path') (me/error-path error options)) m' p']))))))
+(defn resolve-parent-for-segment
+  [{:keys [schema]} {:keys [path in] :as error} options]
+  (let [options (assoc options :unknown false)]
+    (loop [path path, l nil, mp path, p (m/properties (:schema error)), m (me/error-message error options)]
+      (let [[path' m' p']
+            (or
+             (when-let [schema' (mu/get-in schema path)]
+               (let [in' (mu/path->in schema  path)]
+                 (when (= in in')
+                   (or (let [value (get-in (:value error) (mu/path->in schema  path))]
+                         (when-let [m' (me/error-message {:schema schema'
+                                                          :value value} options)]
+                           [path m' (m/properties schema')]))
+                       (let [res (and l (mu/find (mu/get-in schema path) l))]
+                         (when (vector? res)
+                           (let [[_ props schema] res
+                                 schema (mu/update-properties schema merge props)
+                                 message (me/error-message {:schema schema} options)]
+                             (when message [(conj path l) message (m/properties schema)]))))))))
+             (when m [mp m p]))]
+        (if (seq path)
+          (recur (pop path) (last path) path' p' m')
+          (when m [(if (seq in) (mu/path->in schema path') (me/error-path error options)) m' p']))))))
+
+
+(defn path->message
+  [path]
+  (when-let [top-level-key (first (filter keyword? path))]
+    (str "Invalid value for \"" (name top-level-key) "\": ")))
 
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string
@@ -143,15 +172,16 @@
                                                (some-> (:error/fn props)
                                                        (apply [first-e nil])))])
                                     (me/-resolve-direct-error
-                                      explained-error
-                                      first-e
-                                      error-opts))
+                                     explained-error
+                                     first-e
+                                     error-opts))
          {specific-value :value specific-message :message} (most-specific-relevant-message errors schema error-opts)
-         [_ first-root-message] (-resolve-root-error
+         [_ first-root-message] (resolve-parent-for-segment
                                  explained-error
                                  first-e
-                                 error-opts)]
-     (str (str/join "; "  (remove nil? (distinct [first-root-message specific-message first-direct-message])))
+                                 error-opts)
+         top-level-message (path->message path)]
+     (str top-level-message (str/join "; "  (remove nil? (distinct [first-root-message specific-message first-direct-message])))
           ". Provided: " (pr-str (or specific-value value))))))
 
 (comment
@@ -370,7 +400,7 @@
                                       fn-string?]]
                             [:list [:fn {:error/message "Not a valid list of functions"}
                                     fn-list?]]]
-    ::where-pattern        [:orn
+    ::where-pattern        [:orn {:error/message "Invalid where pattern, must be a where map or tuple"}
                             [:map ::where-map]
                             [:tuple ::where-tuple]]
     ::filter               [:sequential {:error/message "Filter must be a function call wrapped in a vector"} ::function]
@@ -395,14 +425,16 @@
                              [:optional [:map [:optional [:ref ::optional]]]]
                              [:union [:map [:union [:ref ::union]]]]
                              [:bind [:map [:bind [:ref ::bind]]]]]]
-    ::where-tuple          [:orn
+    ::where-tuple          [:orn {:error/message
+                                  ;;TODO
+                                  "Invalid tuple"}
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
-    ::where                [:sequential {:error/message "Invalid \"where\""}
-                            [:orn {:error/message "where clauses must be tuples or maps"}
+    ::where                [:sequential {:error/message "Where must be a vector of clauses"}
+                            [:orn {:error/message "where clauses must be valid tuples or maps"}
                              [:where-map ::where-map]
                              [:tuple ::where-tuple]]]
-    ::delete               [:orn
+    ::delete               [:orn {:error/message "delete statements must be a triple or collection of triples"}
                             [:single ::triple]
                             [:collection [:sequential ::triple]]]
     ::insert               [:orn
