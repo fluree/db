@@ -369,19 +369,19 @@
                             [:map ::where-map]
                             [:tuple ::where-tuple]]
     ::filter               [:sequential {:error/message "Filter must be a function call wrapped in a vector"} ::function]
-    ::optional             [:orn {:error/message "Invalid optional."}
+    ::optional             [:orn {:error/message "Invalid optional"}
                             [:single ::where-pattern]
                             [:collection [:sequential ::where-pattern]]]
     ::union                [:sequential [:sequential ::where-pattern]]
     ::bind                 [:map-of {:error/message "Invalid bind, must be a map with variable keys"} ::var :any]
     ::where-op             [:enum {:decode/fql  string->keyword
-                                   :decode/json string->keyword}
+                                   :decode/json string->keyword
+                                   :error/message "Unrecognized operation in where map, must be one of: filter, optional, union, bind"}
                             :filter :optional :union :bind]
     ::where-map            [:and
                             [:map-of {:max 1 :error/message "Where map can only have one key/value pair"}
                              ::where-op :any]
-                            [:multi {:dispatch where-op
-                                     :error/message "Unrecognized operation"}
+                            [:multi {:dispatch where-op}
                              [:filter [:map [:filter [:ref ::filter]]]]
                              [:optional [:map [:optional [:ref ::optional]]]]
                              [:union [:map [:union [:ref ::union]]]]
@@ -389,7 +389,7 @@
     ::where-tuple          [:orn
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
-    ::where                [:sequential {:error/message "Invalid \"where\""}
+    ::where                [:sequential {:error/message "Invalid \"where\", must be a vector of valid tuples and/or maps"}
                             [:orn
                              [:where-map ::where-map]
                              [:tuple ::where-tuple]]]

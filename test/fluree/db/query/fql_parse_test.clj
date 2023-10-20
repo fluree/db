@@ -270,7 +270,7 @@
                                      (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data multi-key-where-map-err)))
-          (is (= "Invalid \"where\"; Where map can only have one key/value pair. Provided: {:union [[[(quote ?s) :ex/email (quote ?email)]] [[(quote ?s) :schema/email (quote ?email)]]], :filter [\"(> ?age 30)\"]}"
+          (is (= "Invalid \"where\", must be a vector of valid tuples and/or maps; Where map can only have one key/value pair. Provided: {:union [[[(quote ?s) :ex/email (quote ?email)]] [[(quote ?s) :schema/email (quote ?email)]]], :filter [\"(> ?age 30)\"]}"
                  (ex-message multi-key-where-map-err)))))
       (testing "unrecognized op"
         (let [unrecognized-where-op     {:select ['?name '?age]
@@ -282,10 +282,8 @@
                                             (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data unrecognized-where-op-err)))
-          (is (= "Invalid \"where\"; Unrecognized operation in where map, must be one of: filter, optional, union, bind. Provided: :foo"
+          (is (= "Invalid \"where\", must be a vector of valid tuples and/or maps; Unrecognized operation in where map, must be one of: filter, optional, union, bind. Provided: :foo"
                  (ex-message unrecognized-where-op-err)))))
-      ;;TODO just top-level error
-      ;;;;"Invalid \"where\". Provided: ?s"
       (testing "nonsequential where"
         (let [non-sequential-where     '{:select [?s ?o]
                                          :where  ?s}
@@ -293,10 +291,9 @@
                                             (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data non-sequential-where-err)))
-          (is (= "Invalid where clause, must be a vector of tuples and/or maps. Provided: ?s"
+          (is (= "Invalid \"where\", must be a vector of valid tuples and/or maps. Provided: ?s"
                  (ex-message non-sequential-where-err)))))
-      ;;TODO just top-level error, only returning '?s
-      ;;"Invalid \"where\"; Where map can only have one key/value pair. Provided: ?s"
+      ;;TODO misleading where-map max error
       (testing "unwrapped where"
         (let [unwrapped-where     '{:select [?s ?o]
                                     :where  [?s ?p ?o]}
@@ -304,7 +301,7 @@
                                        (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data unwrapped-where-err)))
-          (is (= "Invalid where clause, must be a vector of tuples and/or maps. Provided:"
+          (is (= "Invalid where clause, must be a vector of valid tuples and/or maps. Provided:"
                  (ex-message unwrapped-where-err)))))
       (testing "invalid group-by"
         (let [invalid-group-by     '{:select   [?s]
@@ -314,7 +311,7 @@
                                         (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data invalid-group-by-err)))
-          (is (= "Invalid groupBy clause, must be a variable or a vector of variables.; Invalid variable, should be one or more characters begin with `?`. Provided: {}"
+          (is (= "Invalid groupBy clause, must be a variable or a vector of variables; Invalid variable, should be one or more characters begin with `?`. Provided: {}"
                  (ex-message invalid-group-by-err)))))
       ;;TODO not getting the asc/desc error
       (testing "invalid order-by"
@@ -338,7 +335,7 @@
                                     (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data invalid-bind-err)))
-          (is (= "Invalid \"where\"; Invalid bind, must be a map with variable keys. Provided: [?canVote (>= ?age 18)]"
+          (is (= "Invalid \"where\", must be a vector of valid tuples and/or maps; Invalid bind, must be a map with variable keys. Provided: [?canVote (>= ?age 18)]"
                  (ex-message invalid-bind-err)))))
       (testing "filter not wrapped"
         (let [filter-type-err     '{:select ['?name '?age]
@@ -350,7 +347,7 @@
                                        (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data filter-type-err-err)))
-          (is (= "Invalid \"where\"; Filter must be a function call wrapped in a vector. Provided: \"(> ?age 45)\""
+          (is (= "Invalid \"where\", must be a vector of valid tuples and/or maps; Filter must be a function call wrapped in a vector. Provided: \"(> ?age 45)\""
                  (ex-message filter-type-err-err)))))
       (testing "filter bad type"
         (let [filter-type-err     '{:select ['?name '?age]
@@ -362,7 +359,7 @@
                                        (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data filter-type-err-err)))
-          (is (= "Invalid \"where\"; Filter must be a function call wrapped in a vector. Provided: :foo"
+          (is (= "Invalid \"where\", must be a vector of valid tuples and/or maps; Filter must be a function call wrapped in a vector. Provided: :foo"
                  (ex-message filter-type-err-err)))))))
 
 ;; (comment

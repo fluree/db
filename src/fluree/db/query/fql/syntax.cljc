@@ -166,7 +166,7 @@
     ::order-by        [:orn {:error/message  "Invalid orderBy clause, must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:clause ::ordering]
                        [:collection [:sequential ::ordering]]]
-    ::group-by        [:orn {:error/message "Invalid groupBy clause, must be a variable or a vector of variables."}
+    ::group-by        [:orn {:error/message "Invalid groupBy clause, must be a variable or a vector of variables"}
                        [:clause ::var]
                        [:collection [:sequential ::var]]]
     ::triple          ::v/triple
