@@ -73,16 +73,16 @@
 (def ERR (atom []))
 
 (defn most-specific-relevant-message
-  [errors schema]
+  [errors schema error-opts]
   (let [[e :as longest-in-paths] (->> errors
-                                       (sort-by (fn [{:keys [in path]}]
-                                                  [(- (count in)) (count path)]))
-                                       (partition-by #(count (:in %)))
-                                       first)
+                                      (sort-by (fn [{:keys [in path]}]
+                                                 [(- (count in)) (count path)]))
+                                      (partition-by #(count (:in %)))
+                                      first)
 
         {:keys [value path]} e
         message (if (= (count longest-in-paths) 1)
-                  (me/error-message e)
+                  (me/error-message e error-opts)
                   (loop [i (count path)]
                     (when-not (= 0 i)
                       (let [subpath (subvec path 0 i)
@@ -141,7 +141,7 @@
                                       explained-error
                                       first-e
                                       error-opts))
-         {specific-value :value specific-message :message} (most-specific-relevant-message errors schema)
+         {specific-value :value specific-message :message} (most-specific-relevant-message errors schema error-opts)
          [_ first-root-message] (-resolve-root-error
                                  explained-error
                                  first-e

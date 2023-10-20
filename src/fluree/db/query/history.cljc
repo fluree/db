@@ -11,6 +11,7 @@
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.db.json-ld :as jld-db]
@@ -50,7 +51,7 @@
                         :error/message "Invalid value of \"commit-details\" key"} :boolean]
       [:context {:optional true} ::context]
       [:opts {:optional true} [:map-of :keyword :any]]
-      [:t {:error/messag "Invalid value for \"t\""}
+      [:t {:error/message "Invalid value for \"t\""}
        [:and
         [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
         [:map
@@ -72,7 +73,7 @@
            [:int {:min 0
                   :error/message "Must be a positive value"} ]
            [:re datatype/iso8601-datetime-re]]]]
-        [:fn {:error/message "Invalid value for \"t\". Must provide: either \"from\" or \"to\", or the key \"at\""}
+        [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\""}
          (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
            (if at
@@ -125,6 +126,33 @@
 
 (def parse-history-query
   (m/parser ::history-query {:registry registry}))
+
+(def default-error-overrides
+  (-> me/default-errors
+      (assoc
+        ::m/missing-key
+        {:error/fn
+         (fn [{:keys [in]} _]
+           (let [k (-> in last name)]
+             (str "Query is missing a '" k "' clause. "
+                  "'" k "' is required in history queries. "
+                  "See documentation here for details: "
+                  docs/error-codes-page "#query-missing-" k)))}
+        ::m/extra-key
+        {:error/fn
+         (fn [{:keys [in]} _]
+           (let [k (-> in last name)]
+             (str "Query contains an unknown key: '" k "'. "
+                  "See documentation here for more information on allowed query keys: "
+                  docs/error-codes-page "#query-unknown-key")))}
+        ::m/invalid-type
+        {:error/fn (fn [{:keys [schema]} _]
+                     (if-let [expected-type (-> schema m/type)]
+                       (str "should be a " (case expected-type
+                                                   (:map-of :map) "map"
+                                                   (:cat :catn :sequential) "sequence"
+                                                   :else (name type)))
+                       "type is incorrect"))})))
 
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.
