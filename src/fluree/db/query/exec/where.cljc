@@ -416,41 +416,65 @@
         ([result]
          (rf result))))))
 
-(defmethod match-pattern :class
+(defn match-class
+  [db fuel-tracker solution triple filters error-ch flake-ch]
+  (go (let [[s p o]    (assign-matched-values triple solution filters)
+            s*         (if (and (::iri s)
+                                (not (::val s)))
+                         (<! (evaluate-subject-iri db error-ch s))
+                         s)
+            p*         (if (and (::iri p)
+                                (not (::val p)))
+                         (evaluate-predicate-iri db p)
+                         p)
+            o*         (if (and (::iri o)
+                                (not (::val o)))
+                         (evaluate-predicate-iri db o)
+                         o)
+            cls        (::val o*)
+            sub-obj    (dissoc o* ::val ::iri)
+            class-objs (into [o*]
+                             (map (fn [cls]
+                                    (assoc sub-obj ::val cls)))
+                             (dbproto/-class-prop db :subclasses cls))
+            class-ch   (async/to-chan! class-objs)]
+        (async/pipeline-async 2
+                              flake-ch
+                              (fn [class-obj ch]
+                                (-> (resolve-flake-range db fuel-tracker error-ch [s* p* class-obj])
+                                    (async/pipe ch)))
+                              class-ch))))
+
+(defmethod match-pattern :class-prev
   [db fuel-tracker solution pattern filters error-ch]
   (let [triple     (val pattern)
         match-ch   (async/chan 2 (comp cat
                                        (with-distinct-subjects)
                                        (map (fn [flake]
                                               (match-flake solution triple flake)))))]
-    (go (let [[s p o]    (assign-matched-values triple solution filters)
-              s*         (if (and (::iri s)
-                                  (not (::val s)))
-                           (<! (evaluate-subject-iri db error-ch s))
-                           s)
-              p*         (if (and (::iri p)
-                                  (not (::val p)))
-                           (evaluate-predicate-iri db p)
-                           p)
-              o*         (if (and (::iri o)
-                                  (not (::val o)))
-                           (evaluate-predicate-iri db o)
-                           o)
-              cls        (::val o*)
-              sub-obj    (dissoc o* ::val ::iri)
-              class-objs (into [o*]
-                               (map (fn [cls]
-                                      (assoc sub-obj ::val cls)))
-                               (dbproto/-class-prop db :subclasses cls))
-              class-ch   (async/to-chan! class-objs)]
-          (async/pipeline-async 2
-                                match-ch
-                                (fn [class-obj ch]
-                                  (-> (resolve-flake-range db fuel-tracker error-ch [s* p* class-obj])
-                                      (async/pipe ch)))
-                                class-ch)))
+
+    (match-class db fuel-tracker solution triple filters error-ch match-ch)
+
     match-ch))
 
+
+(defmethod match-pattern :class
+  [db fuel-tracker solution pattern filters error-ch]
+  (let [triple   (val pattern)
+        out-ch   (async/chan 2)
+        flake-ch (async/chan 2 (comp cat
+                                     (with-distinct-subjects)))]
+
+    (async/pipeline-async 2
+                          out-ch
+                          (fn [flake ch]
+                            (-> (match-flake-iris db solution triple flake error-ch)
+                                (async/pipe ch)))
+                          flake-ch)
+
+    (match-class db fuel-tracker solution triple filters error-ch flake-ch)
+
+    out-ch))
 (defn with-constraint
   "Return a channel of all solutions from `db` that extend from the solutions in
   `solution-ch` and also match the where-clause pattern `pattern`."
