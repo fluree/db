@@ -218,7 +218,7 @@
 
 (defn humanize-error
   [error]
-  (let [explain-data (-> error ex-data :data :explain)]
+  (let [explain-data (v/explain-error error)]
     (log/trace "query validation error:"
                (update explain-data :errors
                        (fn [errors] (map #(dissoc % :schema) errors))))
