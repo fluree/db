@@ -166,13 +166,44 @@
                 ledger  (<? (jld-ledger/load conn address))]
             (ledger-proto/-db ledger))))
 
+(defn load-aliases
+  [conn aliases]
+  (go-try
+    (loop [[alias & r] aliases
+           db-map      {}]
+        (if alias
+          (let [db      (<? (load-alias conn alias))
+                db-map* (assoc db-map alias db)]
+            (recur r db-map*))
+          db-map))))
+
+(defn load-dataset
+  [conn defaults named]
+  (go-try
+    (if (and (= (count defaults) 1)
+             (empty? named))
+      (let [alias (first defaults)]
+        (<? (load-alias conn alias))) ; return an unwrapped db if the data set
+                                      ; consists of one ledger
+      (let [db-map       (<? (load-aliases conn (->> defaults (concat named) distinct)))
+            default-coll (-> db-map
+                             (select-keys defaults)
+                             vals)
+            named-map    (select-keys db-map named)]
+        (dataset/combine named-map default-coll)))))
+
 (defn query-connection-fql
   [conn query]
   (go-try
-    (let [alias  (:from query)
-          db     (<? (load-alias conn alias))
-          query* (dissoc query :from)]
-      (<? (query-fql db query*)))))
+    (let [default-aliases (-> query :from util/sequential)
+          named-aliases   (-> query :from-named util/sequential)]
+      (if (or (seq default-aliases)
+              (seq named-aliases))
+        (let [ds (<? (load-dataset conn default-aliases named-aliases))]
+          (<? (query-fql ds query)))
+        (throw (ex-info "Missing ledger specification in connection query"
+                        {:status 400, :error :db/invalid-query}))))))
+
 
 (defn query-connection-sparql
   [conn query]

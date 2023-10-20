@@ -8,6 +8,7 @@
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.datatype :as datatype]
+            [fluree.db.query.dataset :as dataset]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.constants :as const])
   #?(:clj (:import (clojure.lang MapEntry))))
@@ -191,7 +192,7 @@
                 iri     (<? (dbproto/-iri db sid))]
             (match-iri matched iri))
           (catch* e
-                  (log/error e "Error looking up subject iri")
+                  (log/error e "Error looking up object iri")
                   (>! error-ch e)))))
 
 (defn match-flake-iris
@@ -377,18 +378,18 @@
     match-ch))
 
 (defmethod match-pattern :tuple
-  [db fuel-tracker solution pattern filters error-ch]
+  [ds fuel-tracker solution pattern filters error-ch]
   (let [out-ch   (async/chan 2)
         flake-ch (async/chan 2 cat)]
 
     (async/pipeline-async 2
                           out-ch
                           (fn [flake ch]
-                            (-> (match-flake-iris db solution pattern flake error-ch)
+                            (-> (match-flake-iris ds solution pattern flake error-ch)
                                 (async/pipe ch)))
                           flake-ch)
 
-    (match-tuple db fuel-tracker solution pattern filters error-ch flake-ch)
+    (match-tuple ds fuel-tracker solution pattern filters error-ch flake-ch)
 
     out-ch))
 
@@ -475,34 +476,35 @@
     (match-class db fuel-tracker solution triple filters error-ch flake-ch)
 
     out-ch))
+
 (defn with-constraint
-  "Return a channel of all solutions from `db` that extend from the solutions in
-  `solution-ch` and also match the where-clause pattern `pattern`."
-  [db fuel-tracker pattern filters error-ch solution-ch]
+  "Return a channel of all solutions from the data set `ds` that extend from the
+  solutions in `solution-ch` and also match the where-clause pattern `pattern`."
+  [ds fuel-tracker pattern filters error-ch solution-ch]
   (let [out-ch (async/chan 2)]
     (async/pipeline-async 2
                           out-ch
                           (fn [solution ch]
-                            (-> (match-pattern db fuel-tracker solution pattern filters error-ch)
+                            (-> (match-pattern ds fuel-tracker solution pattern filters error-ch)
                                 (async/pipe ch)))
                           solution-ch)
     out-ch))
 
 (defn match-clause
-  "Returns a channel that will eventually contain all match solutions in `db`
-  extending from `solution` that also match all the patterns in the parsed where
-  clause collection `clause`."
-  [db fuel-tracker solution clause error-ch]
+  "Returns a channel that will eventually contain all match solutions in the
+  dataset `ds` extending from `solution` that also match all the patterns in the
+  parsed where clause collection `clause`."
+  [ds fuel-tracker solution clause error-ch]
   (let [initial-ch (async/to-chan! [solution])
         filters    (::filters clause)
         patterns   (::patterns clause)]
     (reduce (fn [solution-ch pattern]
-              (with-constraint db fuel-tracker pattern filters error-ch solution-ch))
+              (with-constraint ds fuel-tracker pattern filters error-ch solution-ch))
             initial-ch patterns)))
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (if-let [db (get ds alias)]
+  (if-let [db (dataset/for-alias ds alias)]
     (match-clause db fuel-tracker solution clause error-ch)
     (doto (async/chan)
       (async/close!))))
@@ -602,7 +604,7 @@
 (def blank-solution {})
 
 (defn search
-  [db q fuel-tracker error-ch]
+  [ds q fuel-tracker error-ch]
   (let [where-clause      (:where q)
         initial-solutions (-> q
                               :values
@@ -612,7 +614,7 @@
     (async/pipeline-async 2
                           out-ch
                           (fn [initial-solution ch]
-                            (-> (match-clause db fuel-tracker initial-solution where-clause error-ch)
+                            (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)
                                 (async/pipe ch)))
                           (async/to-chan! initial-solutions))
     out-ch))
