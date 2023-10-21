@@ -175,7 +175,7 @@
   ([explained-error error-opts]
    (let [{:keys [errors schema value]} explained-error
          [first-e] errors
-         e (or (top-level-fn-errors errors)
+         e (or (top-level-fn-error errors)
                (most-specific-relevant-error errors schema error-opts))
          msgs (format-error explained-error e error-opts)]
      (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts)))))))
