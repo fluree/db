@@ -237,7 +237,7 @@
                                      (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data missing-select-err)))
-        (is (= "Query: {:where [[?s ?p ?o]], :opts {:issuer nil}} does not have exactly one select clause. One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. See documentation here for more details: https://next.developers.flur.ee/docs/reference/errorcodes#query-missing-select. Provided: {:where [[?s ?p ?o]], :opts {:issuer nil}}"
+        (is (= "Query: {:where [[?s ?p ?o]], :opts {:issuer nil}} does not have exactly one select clause. One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. See documentation here for more details: https://next.developers.flur.ee/docs/reference/errorcodes#query-missing-select; Provided: {:where [[?s ?p ?o]], :opts {:issuer nil}}"
                (ex-message missing-select-err)))))
     (testing "multiple select"
       (let [multiple-select     '{:select [?s]
@@ -247,7 +247,7 @@
                                      (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data multiple-select-err)))
-        (is (= "Query: {:select [?s], :selectOne [?s ?p], :where [[?s ?p ?o]], :opts {:issuer nil}} does not have exactly one select clause. One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. See documentation here for more details: https://next.developers.flur.ee/docs/reference/errorcodes#query-missing-select. Provided: {:select [?s], :selectOne [?s ?p], :where [[?s ?p ?o]], :opts {:issuer nil}}"
+        (is (= "Query: {:select [?s], :selectOne [?s ?p], :where [[?s ?p ?o]], :opts {:issuer nil}} does not have exactly one select clause. One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. See documentation here for more details: https://next.developers.flur.ee/docs/reference/errorcodes#query-missing-select; Provided: {:select [?s], :selectOne [?s ?p], :where [[?s ?p ?o]], :opts {:issuer nil}}"
                (ex-message multiple-select-err)))))
     (testing "invalid var select"
       (let [invalid-var-select     '{:select [+]
@@ -256,7 +256,7 @@
                                 (catch Exception e e))]
         (is (= {:status 400 :error :db/invalid-query}
                (ex-data invalid-var-select-err)))
-        (is (= "Invalid value for \"select\": Select must be a valid selector or vector of selectors; selector must be either a variable, iri, function application, or select map; Invalid variable, should be one or more characters begin with `?`. Provided: +"
+        (is (= "Error in value for \"select\"; selector must be either a variable, iri, function application, or select map; Provided: +"
                (ex-message invalid-var-select-err)))))
       (testing "more than 1 key in where map"
         (let [multi-key-where-map     '{:select ['?name '?email]
@@ -270,7 +270,7 @@
                                      (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data multi-key-where-map-err)))
-          (is (= "Invalid \"where\", must be a vector of valid tuples and/or maps; Where map can only have one key/value pair. Provided: {:union [[[(quote ?s) :ex/email (quote ?email)]] [[(quote ?s) :schema/email (quote ?email)]]], :filter [\"(> ?age 30)\"]}"
+          (is (= "Error in value for \"where\"; Where map can only have one key/value pair; Provided: {:union [[[(quote ?s) :ex/email (quote ?email)]] [[(quote ?s) :schema/email (quote ?email)]]], :filter [\"(> ?age 30)\"]}"
                  (ex-message multi-key-where-map-err)))))
       (testing "unrecognized op"
         (let [unrecognized-where-op     {:select ['?name '?age]
@@ -282,8 +282,7 @@
                                             (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data unrecognized-where-op-err)))
-          (is (= "Invalid value for \"where\": Unrecognized operation in where map, must be one of: filter, optional, union, bind. Provided: :foo"
-                 (ex-message unrecognized-where-op-err)))))
+          (is (= "Error in value for \"where\"; Unrecognized operation in where map, must be one of: filter, optional, union, bind; Provided: :foo"                            (ex-message unrecognized-where-op-err)))))
       (testing "nonsequential where"
         (let [non-sequential-where     '{:select [?s ?o]
                                          :where  ?s}
@@ -291,9 +290,8 @@
                                             (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data non-sequential-where-err)))
-          (is (= "Invalid value for \"where\": Where must be a vector of clauses. Provided: ?s"
+          (is (= "Error in value for \"where\"; Where must be a vector of clauses; Provided: ?s"
                  (ex-message non-sequential-where-err)))))
-      ;;TODO misleading where-map error
       (testing "unwrapped where"
         (let [unwrapped-where     '{:select [?s ?o]
                                     :where  [?s ?p ?o]}
@@ -301,7 +299,7 @@
                                        (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data unwrapped-where-err)))
-          (is (= "Invalid value for \"where\": where clauses must be valid tuples or maps; Provided: ?s"
+          (is (= "Error in value for \"where\"; where clauses must be valid tuples or maps; Provided: ?s"
                  (ex-message unwrapped-where-err)))))
       (testing "invalid group-by"
         (let [invalid-group-by     '{:select   [?s]
@@ -311,9 +309,8 @@
                                         (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data invalid-group-by-err)))
-          (is (= "Invalid value for \"group-by\": groupBy clause must be a variable or a vector of variables; Invalid variable, should be one or more characters begin with `?`. Provided: {}"
+          (is (= "Error in value for \"group-by\"; groupBy clause must be a variable or a vector of variables; Provided: {}"
                  (ex-message invalid-group-by-err)))))
-      ;;TODO not getting the asc/desc error
       (testing "invalid order-by"
         (let [invalid-order-by-op     '{:select  ['?name '?favNums]
                                         :where   [['?s :schema/name '?name]
@@ -324,7 +321,7 @@
                                            (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data invalid-order-by-op-err)))
-          (is (= "Invalid value for \"orderBy\": orderBy clause must be variable or two-tuple formatted ['ASC' or 'DESC', var]; Invalid variable, should be one or more characters begin with `?`. Provided: foo"
+          (is (= "Error in value for \"orderBy\"; Must be valid var vector containing a var and a direction.; Provided: foo"
                  (ex-message invalid-order-by-op-err)))))
       (testing "invalid bind"
         (let [invalid-bind     '{:select [?firstLetterOfName ?name ?canVote]
@@ -335,7 +332,7 @@
                                     (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data invalid-bind-err)))
-          (is (= "Invalid value for \"where\": Invalid bind, must be a map with variable keys. Provided: [?canVote (>= ?age 18)]"
+          (is (= "Error in value for \"where\"; Invalid bind, must be a map with variable keys; Provided: [?canVote (>= ?age 18)]"
                  (ex-message invalid-bind-err)))))
       (testing "filter not wrapped"
         (let [filter-type-err     '{:select ['?name '?age]
@@ -347,8 +344,7 @@
                                        (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data filter-type-err-err)))
-          (is (= "Invalid value for \"where\": Filter must be a function call wrapped in a vector. Provided: \"(> ?age 45)\""
-                 (ex-message filter-type-err-err)))))
+          (is (= "Error in value for \"where\"; Filter must be a function call wrapped in a vector; Provided: \"(> ?age 45)\""                            (ex-message filter-type-err-err)))))
       (testing "filter bad type"
         (let [filter-type-err     '{:select ['?name '?age]
                                     :where  [['?s :type :ex/User]
@@ -359,7 +355,7 @@
                                        (catch Exception e e))]
           (is (= {:status 400 :error :db/invalid-query}
                  (ex-data filter-type-err-err)))
-          (is (= "Invalid value for \"where\": Filter must be a function call wrapped in a vector. Provided: :foo"
+          (is (= "Error in value for \"where\"; Filter must be a function call wrapped in a vector; Provided: :foo"
                  (ex-message filter-type-err-err)))))))
 
 ;; (comment
