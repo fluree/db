@@ -157,7 +157,7 @@
     ::direction       [:orn {:error/message "Direction must be ASC or DESC"}
                        [:asc [:fn asc?]]
                        [:desc [:fn desc?]]]
-    ::ordering        [:orn {:error/message "Must be valid var vector containing a var and a direction."}
+    ::ordering        [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:scalar ::var]
                        [:vector [:and list?
                                  [:catn
