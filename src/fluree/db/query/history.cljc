@@ -62,13 +62,13 @@
                   :error/message "Must be a positive value"} ]
            [:re datatype/iso8601-datetime-re]]]
          [:to {:optional true}
-          [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:or {:error/message "must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
            [:=  :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"}]
            [:re datatype/iso8601-datetime-re]]]
          [:at {:optional true}
-          [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:or {:error/message "must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
            [:= :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"} ]

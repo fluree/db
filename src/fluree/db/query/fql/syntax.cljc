@@ -135,11 +135,11 @@
     ::var             ::v/var
     ::iri             ::v/iri
     ::subject         ::v/subject
-    ::subselect-map   [:map-of {:error/message "Must be map from iri to subselection"}
+    ::subselect-map   [:map-of {:error/message "must be map from iri to subselection"}
                        ::iri [:ref ::subselection]]
     ::subselection    [:sequential {:error/message
-                                    "Invalid subselection"}
-                       [:orn
+                                    "subselection must be a vector"}
+                       [:orn {:error/message "must be a wildcard (\"*\") or subselection map"}
                         [:wildcard ::wildcard]
                         [:predicate ::iri]
                         [:subselect-map [:ref ::subselect-map]]]]
@@ -157,7 +157,7 @@
     ::direction       [:orn {:error/message "Direction must be ASC or DESC"}
                        [:asc [:fn asc?]]
                        [:desc [:fn desc?]]]
-    ::ordering        [:orn {:error/messge "Must be valid var vector containing a var and a direction."}
+    ::ordering        [:orn {:error/message "Must be valid var vector containing a var and a direction."}
                        [:scalar ::var]
                        [:vector [:and list?
                                  [:catn
@@ -166,7 +166,7 @@
     ::order-by        [:orn {:error/message  "orderBy clause must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:clause ::ordering]
                        [:collection [:sequential ::ordering]]]
-    ::group-by        [:orn {:error/message "groupBy clause must be a variable or a vector of variables."}
+    ::group-by        [:orn {:error/message "groupBy clause must be a variable or a vector of variables"}
                        [:clause ::var]
                        [:collection [:sequential ::var]]]
     ::triple          ::v/triple
