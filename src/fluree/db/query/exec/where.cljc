@@ -137,8 +137,15 @@
   "Return a channel that will contain all pattern match solutions from flakes in
    `db` that are compatible with the initial solution `solution` and matches the
    additional where-clause pattern `pattern`."
-  (fn [_db _fuel-tracker _solution pattern _filters _error-ch]
-    (pattern-type pattern)))
+  (fn [ds _fuel-tracker _solution pattern _filters _error-ch]
+    (let [typ (pattern-type pattern)
+          ds? (dataset/dataset? ds)]
+      (case [typ ds]
+        :tuple (if (dataset/dataset? ds)
+                 :tuple-ds :tuple)
+        :class (if (dataset/dataset? ds)
+                 :class-ds :class)
+        typ))))
 
 (defn assign-matched-values
   "Assigns the value of any variables within the supplied `triple-pattern` that
@@ -184,6 +191,16 @@
   [o-match flake]
   (match-value o-match (flake/o flake) (flake/dt flake) (flake/m flake)))
 
+(defn match-flake
+  "Assigns the unmatched variables within the supplied `triple-pattern` to their
+  corresponding values from `flake` in the supplied match `solution`."
+  [solution triple-pattern flake]
+  (let [[s p o] triple-pattern]
+    (cond-> solution
+      (unmatched-var? s) (assoc (::var s) (match-subject s flake))
+      (unmatched-var? p) (assoc (::var p) (match-predicate p flake))
+      (unmatched-var? o) (assoc (::var o) (match-object o flake)))))
+
 (defn match-subject-iri
   [db matched error-ch]
   (go
@@ -224,16 +241,6 @@
         (some? s*) (assoc (::var s*) s*)
         (some? p*) (assoc (::var p*) p*)
         (some? o*) (assoc (::var o*) o*)))))
-
-(defn match-flake
-  "Assigns the unmatched variables within the supplied `triple-pattern` to their
-  corresponding values from `flake` in the supplied match `solution`."
-  [solution triple-pattern flake]
-  (let [[s p o] triple-pattern]
-    (cond-> solution
-      (unmatched-var? s) (assoc (::var s) (match-subject s flake))
-      (unmatched-var? p) (assoc (::var p) (match-predicate p flake))
-      (unmatched-var? o) (assoc (::var o) (match-object o flake)))))
 
 (defn augment-object-fn
   "Returns a pair consisting of an object value and boolean function that will
@@ -379,7 +386,15 @@
               (resolve-flake-range fuel-tracker error-ch [s p o])
               (async/pipe flake-ch))))))
 
-(defn match-tuple-in
+(defmethod match-pattern :tuple
+  [db fuel-tracker solution pattern filters error-ch]
+  (let [match-ch (async/chan 2 (comp cat
+                                     (map (fn [flake]
+                                            (match-flake solution pattern flake)))))]
+    (match-tuple db fuel-tracker solution pattern filters error-ch match-ch)
+    match-ch))
+
+(defn match-tuple-iris
   [db fuel-tracker solution pattern filters error-ch]
   (let [flake-ch (async/chan 2 cat)
         out-ch (async/chan 2)]
@@ -392,23 +407,15 @@
     (match-tuple db fuel-tracker solution pattern filters error-ch flake-ch)
     out-ch))
 
-(defmethod match-pattern :tuple-prev
-  [db fuel-tracker solution pattern filters error-ch]
-  (let [match-ch (async/chan 2 (comp cat
-                                     (map (fn [flake]
-                                            (match-flake solution pattern flake)))))]
-    (match-tuple db fuel-tracker solution pattern filters error-ch match-ch)
-    match-ch))
-
-(defmethod match-pattern :tuple
+(defmethod match-pattern :tuple-ds
   [ds fuel-tracker solution pattern filters error-ch]
   (if (dataset/dataset? ds)
     (->> (dataset/defaults ds)
          (map (fn [db]
-                (match-tuple-in db fuel-tracker solution pattern filters
+                (match-tuple-iris db fuel-tracker solution pattern filters
                                 error-ch)))
          async/merge)
-    (match-tuple-in ds fuel-tracker solution pattern filters error-ch)))
+    (match-tuple-iris ds fuel-tracker solution pattern filters error-ch)))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -463,7 +470,19 @@
                                       (async/pipe ch)))
                                 class-ch))))
 
-(defn match-class-in
+(defmethod match-pattern :class
+  [db fuel-tracker solution pattern filters error-ch]
+  (let [triple     (val pattern)
+        match-ch   (async/chan 2 (comp cat
+                                       (with-distinct-subjects)
+                                       (map (fn [flake]
+                                              (match-flake solution triple flake)))))]
+
+    (match-class db fuel-tracker solution triple filters error-ch match-ch)
+
+    match-ch))
+
+(defn match-class-iris
   [db fuel-tracker solution triple filters error-ch]
   (let [flake-ch (async/chan 2 (comp cat
                                      (with-distinct-subjects)))
@@ -477,28 +496,16 @@
     (match-class db fuel-tracker solution triple filters error-ch flake-ch)
     out-ch))
 
-(defmethod match-pattern :class-prev
-  [db fuel-tracker solution pattern filters error-ch]
-  (let [triple     (val pattern)
-        match-ch   (async/chan 2 (comp cat
-                                       (with-distinct-subjects)
-                                       (map (fn [flake]
-                                              (match-flake solution triple flake)))))]
 
-    (match-class db fuel-tracker solution triple filters error-ch match-ch)
-
-    match-ch))
-
-
-(defmethod match-pattern :class
+(defmethod match-pattern :class-ds
   [ds fuel-tracker solution pattern filters error-ch]
   (let [triple (val pattern)]
     (if (dataset/dataset? ds)
       (->> (dataset/defaults ds)
            (map (fn [db]
-                  (match-class-in db fuel-tracker solution triple filters error-ch)))
+                  (match-class-iris db fuel-tracker solution triple filters error-ch)))
            async/merge)
-      (match-class-in ds fuel-tracker solution triple filters error-ch))))
+      (match-class-iris ds fuel-tracker solution triple filters error-ch))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
