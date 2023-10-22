@@ -123,7 +123,7 @@
           dt     (datatype/infer result)]
       (log/trace "AsSelector update-solution result:" result)
       (assoc solution bind-var (-> bind-var
-                                   where/unmatched
+                                   where/unmatched-var
                                    (where/match-value result dt)))))
   ValueSelector
   (implicit-grouping? [_] aggregate?)

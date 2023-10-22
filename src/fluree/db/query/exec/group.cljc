@@ -38,7 +38,7 @@
                                       (reduce merge-with-colls {})
                                       (reduce-kv (fn [soln var val]
                                                    (let [match (-> var
-                                                                   where/unmatched
+                                                                   where/unmatched-var
                                                                    (where/match-value val ::grouping))]
                                                      (assoc soln var match)))
                                                  {}))

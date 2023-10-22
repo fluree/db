@@ -26,7 +26,7 @@
 
 (defn parse-variable
   [x]
-  (some-> x parse-var-name where/unmatched))
+  (some-> x parse-var-name where/unmatched-var))
 
 (defn parse-value-binding
   [vars vals]

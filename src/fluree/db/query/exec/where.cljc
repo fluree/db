@@ -15,10 +15,12 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(defn unmatched
-  ([] {})
-  ([var-sym]
-   {::var var-sym}))
+(def unmatched
+  {})
+
+(defn unmatched-var
+  [var-sym]
+  (assoc unmatched ::var var-sym))
 
 (defn match-value
   ([mch x dt]
@@ -41,24 +43,23 @@
    (let [dt (datatype/infer v)]
      (anonymous-value v dt)))
   ([v dt]
-   (-> (unmatched)
-       (match-value v dt))))
+   (match-value unmatched v dt)))
 
-(defn iri-match?
+(defn matched-iri?
   [match]
   (-> match ::iri boolean))
 
-(defn value-match?
+(defn matched-value?
   [match]
   (-> match ::val boolean))
 
 (defn matched?
   [match]
-  (or (value-match? match)
-      (iri-match? match)))
+  (or (matched-value? match)
+      (matched-iri? match)))
 
 (def unmatched?
-  "Returns true if the triple pattern component `component` represents a variable
+  "Returns true if the triple pattern component `match` represents a variable
   without an associated value."
   (complement matched?))
 
@@ -95,7 +96,7 @@
   parsed function `f`."
   [var f]
   (-> var
-      unmatched
+      unmatched-var
       (assoc ::fn f)))
 
 (defn ->val-filter
@@ -210,8 +211,8 @@
           p* (when (unmatched-var? p)
                (let [matched (match-predicate p flake)
                      p-iri   (match-predicate-iri db matched)]
-                 (if (iri-match? p-iri) ; check if sid falls outside of
-                                        ; predicate range
+                 (if (matched-iri? p-iri) ; check if sid falls outside of
+                                          ; predicate range
                    p-iri
                    (<! (match-subject-iri db matched error-ch)))))
           o* (when (unmatched-var? o)
@@ -286,17 +287,17 @@
                        (fuel/track fuel-tracker))
          subj-filter (when s-fn
                        (filter (fn [f]
-                                 (-> (unmatched)
+                                 (-> unmatched
                                      (match-subject f)
                                      s-fn))))
          pred-filter (when p-fn
                        (filter (fn [f]
-                                 (-> (unmatched)
+                                 (-> unmatched
                                      (match-predicate f)
                                      p-fn))))
          obj-filter  (when o-fn*
                        (filter (fn [f]
-                                 (-> (unmatched)
+                                 (-> unmatched
                                      (match-object f)
                                      o-fn*))))
          flake-xf*   (->> [subj-filter pred-filter obj-filter
@@ -600,7 +601,7 @@
   [solution var-name result]
   (let [dt  (datatype/infer result)
         mch (-> var-name
-                unmatched
+                unmatched-var
                 (match-value result dt))]
     (assoc solution var-name mch)))
 
