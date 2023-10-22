@@ -44,9 +44,18 @@
    (-> (unmatched)
        (match-value v dt))))
 
+(defn iri-match?
+  [match]
+  (-> match ::iri boolean))
+
+(defn value-match?
+  [match]
+  (-> match ::val boolean))
+
 (defn matched?
-  [component]
-  (-> component ::val boolean))
+  [match]
+  (or (value-match? match)
+      (iri-match? match)))
 
 (def unmatched?
   "Returns true if the triple pattern component `component` represents a variable
@@ -175,45 +184,41 @@
   (match-value o-match (flake/o flake) (flake/dt flake) (flake/m flake)))
 
 (defn match-subject-iri
-  [db s-mch flake error-ch]
+  [db matched error-ch]
   (go
-    (try* (let [matched (match-subject s-mch flake)
-                sid     (get-value matched)
-                iri     (<? (dbproto/-iri db sid))]
-            (match-iri matched iri))
+    (try* (let [sid (get-value matched)]
+            (if-let [iri (<? (dbproto/-iri db sid))]
+              (match-iri matched iri)
+              matched))
           (catch* e
-                  (log/error e "Error looking up subject iri")
+                  (log/error e "Error looking up iri")
                   (>! error-ch e)))))
 
 (defn match-predicate-iri
-  [db p-mch flake]
-  (let [matched (match-predicate p-mch flake)
-        pid     (get-value matched)
-        iri     (dbproto/-p-prop db :iri pid)]
-    (match-iri matched iri)))
-
-(defn match-object-iri
-  [db o-mch flake error-ch]
-  (go
-    (try* (let [matched (match-object o-mch flake)
-                sid     (get-value matched)
-                iri     (<? (dbproto/-iri db sid))]
-            (match-iri matched iri))
-          (catch* e
-                  (log/error e "Error looking up object iri")
-                  (>! error-ch e)))))
+  [db matched]
+  (let [pid (get-value matched)]
+    (if-let [iri (dbproto/-p-prop db :iri pid)]
+      (match-iri matched iri)
+      matched)))
 
 (defn match-flake-iris
   [db solution [s p o] flake error-ch]
   (go
     (let [s* (when (unmatched-var? s)
-               (<! (match-subject-iri db s flake error-ch)))
+               (let [matched (match-subject s flake)]
+                 (<! (match-subject-iri db matched error-ch))))
           p* (when (unmatched-var? p)
-               (match-predicate-iri db p flake))
+               (let [matched (match-predicate p flake)
+                     p-iri   (match-predicate-iri db matched)]
+                 (if (iri-match? p-iri) ; check if sid falls outside of
+                                        ; predicate range
+                   p-iri
+                   (<! (match-subject-iri db matched error-ch)))))
           o* (when (unmatched-var? o)
-               (if (= const/$xsd:anyURI (flake/dt flake))
-                 (<! (match-object-iri db o flake error-ch))
-                 (match-object o flake)))]
+               (let [matched (match-object o flake)]
+                 (if (= const/$xsd:anyURI (flake/dt flake))
+                   (<! (match-subject-iri db matched error-ch))
+                   matched)))]
       (cond-> solution
         (some? s*) (assoc (::var s*) s*)
         (some? p*) (assoc (::var p*) p*)

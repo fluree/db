@@ -30,15 +30,16 @@
 (defmethod display const/$xsd:anyURI
   [match db iri-cache compact error-ch]
   (go
-    (let [v (where/get-value match)]
-      (if-let [cached (-> @iri-cache (get v) :as)]
-        cached
-        (try* (let [iri (<? (dbproto/-iri db v compact))]
-                (vswap! iri-cache assoc v {:as iri})
-                iri)
-              (catch* e
-                (log/error e "Error displaying iri:" v)
-                (>! error-ch e)))))))
+    (or (some-> match ::where/iri compact)
+        (let [v (where/get-value match)]
+          (if-let [cached (-> @iri-cache (get v) :as)]
+            cached
+            (try* (let [iri (<? (dbproto/-iri db v compact))]
+                    (vswap! iri-cache assoc v {:as iri})
+                    iri)
+                  (catch* e
+                          (log/error e "Error displaying iri:" v)
+                          (>! error-ch e))))))))
 
 (defprotocol ValueSelector
   (implicit-grouping? [this]
