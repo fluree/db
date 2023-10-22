@@ -62,6 +62,10 @@
   [match]
   (::val match))
 
+(defn sanitize-match
+  [match]
+  (select-keys match [::iri ::val ::datatype]))
+
 (defn ->pattern
   "Build a new non-tuple match pattern of type `typ`."
   [typ data]

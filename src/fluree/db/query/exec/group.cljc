@@ -6,25 +6,19 @@
 
 #?(:clj (set! *warn-on-reflection* true))
 
-(def grouping-value
-  (juxt where/get-value ::where/datatype))
-
 (defn split-solution-by
   [variables solution]
   (let [group-key   (mapv (fn [v]
                             (-> solution
                                 (get v)
-                                (select-keys [::where/val ::where/datatype])))
+                                where/sanitize-match))
                           variables)
         grouped-val (apply dissoc solution variables)]
     [group-key grouped-val]))
 
 (defn assoc-coll
   [m k v]
-  (update m k (fn [coll]
-                (-> coll
-                    (or [])
-                    (conj v)))))
+  (update m k (fnil conj []) v))
 
 (defn group-solution
   [groups [group-key grouped-val]]
