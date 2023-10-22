@@ -409,13 +409,14 @@
 
 (defmethod match-pattern :tuple-ds
   [ds fuel-tracker solution pattern filters error-ch]
-  (if (dataset/dataset? ds)
-    (->> (dataset/defaults ds)
-         (map (fn [db]
-                (match-tuple-iris db fuel-tracker solution pattern filters
-                                error-ch)))
-         async/merge)
-    (match-tuple-iris ds fuel-tracker solution pattern filters error-ch)))
+  (let [active-graph (dataset/active ds)]
+    (if (sequential? active-graph)
+      (->> active-graph
+           (map (fn [db]
+                  (match-tuple-iris db fuel-tracker solution pattern filters
+                                    error-ch)))
+           async/merge)
+      (match-tuple-iris active-graph fuel-tracker solution pattern filters error-ch))))
 
 (defn with-distinct-subjects
   "Return a transducer that filters a stream of flakes by removing any flakes with
@@ -496,16 +497,16 @@
     (match-class db fuel-tracker solution triple filters error-ch flake-ch)
     out-ch))
 
-
 (defmethod match-pattern :class-ds
   [ds fuel-tracker solution pattern filters error-ch]
-  (let [triple (val pattern)]
-    (if (dataset/dataset? ds)
-      (->> (dataset/defaults ds)
+  (let [triple (val pattern)
+        active-graph (dataset/active ds)]
+    (if (sequential? active-graph)
+      (->> active-graph
            (map (fn [db]
                   (match-class-iris db fuel-tracker solution triple filters error-ch)))
            async/merge)
-      (match-class-iris ds fuel-tracker solution triple filters error-ch))))
+      (match-class-iris active-graph fuel-tracker solution triple filters error-ch))))
 
 (defn with-constraint
   "Return a channel of all solutions from the data set `ds` that extend from the
@@ -534,10 +535,9 @@
 
 (defn match-alias
   [ds alias fuel-tracker solution clause error-ch]
-  (if-let [db (dataset/for-alias ds alias)]
-    (match-clause db fuel-tracker solution clause error-ch)
-    (doto (async/chan)
-      (async/close!))))
+  (-> ds
+      (dataset/activate alias)
+      (match-clause fuel-tracker solution clause error-ch)))
 
 (defmethod match-pattern :graph
   [ds fuel-tracker solution pattern _filters error-ch]
