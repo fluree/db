@@ -52,7 +52,9 @@
   (-> error ex-data :data :explain))
 
 (defn nearest-or-parent
-  [error schema error-opts]
+  "If a given error is the child of a disjunction,
+   returns the error data corresponding to that disjunction."
+  [error schema]
   (let [{:keys [value path]} error]
     (loop [i (count path)]
       (when-not (= 0 i)
@@ -70,40 +72,69 @@
                :value value})
             (recur (dec i) )))))))
 
-(defn longest-in-errors
-  [errors schema error-opts]
-  (let [in-with-tiebreak (fn [{:keys [schema value in path]}]
-                           (let [type (m/type schema)]
-                             [(- (count in)) (if (and (#{:map :map-of} type)
-                                                      (map? value))
-                                               -1
-                                               1)]))]
-    (->> errors
-         (sort-by in-with-tiebreak)
-         (partition-by in-with-tiebreak)
-         first)))
+(defn error-specificity-score
+  "Given an error, applies a heursitic
+   intended to favor errors corresponding
+   to smaller/more specific parts of a failing value.
+   Those errors should hopefully be more relevant to
+   users' intent.
 
-(defn most-specific-relevant-error
-  [errors schema error-opts]
-  (let [longest-in-errors (longest-in-errors errors schema error-opts)]
-    (if (= (count longest-in-errors) 1)
-      (first longest-in-errors)
-      (let [common-in (val (first (group-by :in longest-in-errors)))
-            [e & es] common-in
-            parent-or (loop [{:keys [path] :as parent} (nearest-or-parent e schema error-opts)]
+   When used in sorting, will push those errors
+   toward the start of the list. "
+  [error]
+  (let [{:keys [schema value in path]} error
+        type (m/type schema)]
+    ;;When inline property constraints, eg limits like
+    ;;`[:map {:max 1} ...]` are used, then both type and limit
+    ;; failures will have the same `:in`, despite the limit failure
+    ;; being more specific. This second number differentiates
+    ;; those cases.
+    [(- (count in)) (if (and (#{:map :map-of} type)
+                             (map? value))
+                      -1
+                      1)]))
+
+(defn choose-relevant-error
+  "Calculates the most specific error (per our heuristic).
+   If there are more than one of equal specificity,
+   chooses a chunk of errors which share the same `:in`
+   (portion of the value whch failed), and attempts to
+   find the nearest disjunction which contains all of
+   those errors. "
+  [{:keys [errors schema] :as _explained-error}]
+  (let [most-specific-errors  (->> errors
+                                   (sort-by error-specificity-score)
+                                   (partition-by error-specificity-score)
+                                   first)]
+    (if (= (count most-specific-errors) 1)
+      (first most-specific-errors)
+      (let [same-in (val (first (group-by :in most-specific-errors)))
+            [e & es] same-in
+            or-parent (loop [{:keys [path] :as parent} (nearest-or-parent e schema)]
                         (when parent
                           (if (every? (fn [err]
                                         (let [path' (:path err)]
                                           (when (<= (count path) (count path'))
                                             (= path (subvec path' 0 (count path)))))) es)
                             parent
-                            (recur (nearest-or-parent parent schema error-opts)))))]
-        (or parent-or (first common-in))))))
+                            (recur (nearest-or-parent parent schema)))))]
+        (or or-parent (first same-in))))))
 
-;;Based on `-resolve-root-error`: https://github.com/metosin/malli/blob/a43c28d90b4eb18054df2a21c91a18d4b58cacc2/src/malli/error.cljc#L268
-;;with fix to correctly calculate `:value` in root error messages, and guard against `:invalid-schema` exceptions
-;;due to values having keys that are not present in the schema
-(defn resolve-parent-for-segment
+(defn resolve-root-error-for-in
+  "Traverses the schema tree backwards from a given error message,
+   resolving the highest eligible error.
+
+   This is based on malli's `-resolve-root-error` fn
+   (https://github.com/metosin/malli/blob/a43c28d90b4eb18054df2a21c91a18d4b58cacc2/src/malli/error.cljc#L268),
+   But importantly, it will stop and return when it has reached the highest error
+   which still has the same `:in` as the originating error, rather than continuing
+   as far as possible.
+
+  This limit on the traversal constrains us to errors which are still relevant to
+  the part of the value for which we are returning an error.
+
+  (This version also has some fixes to prevent returning a `nil` value, or
+   blowing up with an `:invalid-schema` exception in certain cases.) "
   [{:keys [schema]} {:keys [path in] :as error} options]
   (let [options (assoc options :unknown false)]
     (loop [path path, l nil, mp path, p (m/properties (:schema error)), m (me/error-message error options)]
@@ -131,17 +162,17 @@
 (defn format-error
   [explained error error-opts]
   (let [{:keys [path value]} error
-        [_ direct-message] (me/-resolve-direct-error
-                            explained
-                            error
-                            error-opts)
-        [_ root-message] (resolve-parent-for-segment
+        top-level-message (when-not (= ::m/extra-key (:type error))
+                            (when-let [top-level-key (first (filter keyword? path))]
+                              (str "Error in value for \"" (name top-level-key) "\"")))
+        [_ root-message] (resolve-root-error-for-in
                           explained
                           error
                           error-opts)
-        top-level-message (when-not (= ::m/extra-key (:type error))
-                            (when-let [top-level-key (first (filter keyword? path))]
-                              (str "Error in value for \"" (name top-level-key) "\"")))]
+        [_ direct-message] (me/-resolve-direct-error
+                            explained
+                            error
+                            error-opts)]
     [top-level-message root-message direct-message (str "Provided: " (pr-str value))]))
 
 (defn top-level-fn-error
@@ -151,14 +182,16 @@
 
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string
-  explaining the error(s) in plain english. "
+  explaining the failure in plain english.
+
+  Prefers top-level `:fn` errors, if present, otherwise
+  chooses an error based on heuristics."
   ([explained-error] (format-explained-errors explained-error {}))
   ([explained-error error-opts]
    (let [{:keys [errors schema value]} explained-error
          [first-e] errors
          e (or (top-level-fn-error errors)
-               (most-specific-relevant-error errors schema error-opts))
-         msgs (format-error explained-error e error-opts)]
+               (choose-relevant-error explained-error))]
      (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts)))))))
 
 (def registry
