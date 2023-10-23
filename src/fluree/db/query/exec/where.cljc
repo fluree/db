@@ -64,9 +64,9 @@
   (complement matched?))
 
 (defn unmatched-var?
-  [component]
-  (and (contains? component ::var)
-       (unmatched? component)))
+  [match]
+  (and (contains? match ::var)
+       (unmatched? match)))
 
 (defn get-value
   [match]
@@ -158,16 +158,14 @@
   [triple-pattern solution filters]
   (mapv (fn [component]
           (if-let [variable (::var component)]
-            (let [match (get solution variable)]
-              (if-let [value (get-value match)]
-                (let [dt (::datatype match)]
-                  (match-value component value dt))
-                (let [filter-fn (some->> (get filters variable)
-                                         (map ::fn)
-                                         (map (fn [f]
-                                                (partial f solution)))
-                                         (apply every-pred))]
-                  (assoc component ::fn filter-fn))))
+            (if-let [match (get solution variable)]
+              match
+              (let [filter-fn (some->> (get filters variable)
+                                       (map ::fn)
+                                       (map (fn [f]
+                                              (partial f solution)))
+                                       (apply every-pred))]
+                (assoc component ::fn filter-fn)))
             component))
         triple-pattern))
 
