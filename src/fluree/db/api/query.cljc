@@ -170,31 +170,34 @@
     :sparql (query-sparql db query)))
 
 (defn load-alias
-  [conn alias]
-  (go-try (let [address (<? (nameservice/primary-address conn alias nil))
-                ledger  (<? (jld-ledger/load conn address))]
-            (ledger-proto/-db ledger))))
+  [conn alias t opts]
+  (go-try
+    (let [address (<? (nameservice/primary-address conn alias nil))
+          ledger  (<? (jld-ledger/load conn address))
+          db      (ledger-proto/-db ledger)]
+      (<? (restrict-db db t opts)))))
 
 (defn load-aliases
-  [conn aliases]
+  [conn aliases opts]
   (go-try
     (loop [[alias & r] aliases
            db-map      {}]
-        (if alias
-          (let [db      (<? (load-alias conn alias))
-                db-map* (assoc db-map alias db)]
-            (recur r db-map*))
-          db-map))))
+      (if alias
+        ;; TODO: allow restricting federated dataset components individually by t
+        (let [db      (<? (load-alias conn alias nil opts))
+              db-map* (assoc db-map alias db)]
+          (recur r db-map*))
+        db-map))))
 
 (defn load-dataset
-  [conn defaults named]
+  [conn defaults named opts]
   (go-try
     (if (and (= (count defaults) 1)
              (empty? named))
       (let [alias (first defaults)]
-        (<? (load-alias conn alias))) ; return an unwrapped db if the data set
-                                      ; consists of one ledger
-      (let [db-map       (<? (load-aliases conn (->> defaults (concat named) distinct)))
+        (<? (load-alias conn alias nil opts))) ; return an unwrapped db if the data set
+                                               ; consists of one ledger
+      (let [db-map       (<? (load-aliases conn (->> defaults (concat named) distinct) opts))
             default-coll (-> db-map
                              (select-keys defaults)
                              vals)
@@ -204,12 +207,20 @@
 (defn query-connection-fql
   [conn query]
   (go-try
-    (let [default-aliases (-> query :from util/sequential)
-          named-aliases   (-> query :from-named util/sequential)]
+    (let [{query :subject, did :did} (or (<? (cred/verify query))
+                                         {:subject query})
+          {:keys [opts] :as query*}  (update query :opts sanitize-query-options did)
+
+          default-aliases (-> query* :from util/sequential)
+          named-aliases   (-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds (<? (load-dataset conn default-aliases named-aliases))]
-          (<? (query-fql ds query)))
+        (let [ds       (<? (load-dataset conn default-aliases named-aliases opts))
+              query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
+              max-fuel (:max-fuel opts)]
+          (if (::util/track-fuel? opts)
+            (<? (track-query ds max-fuel query**))
+            (<? (fql/query ds query**))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 
