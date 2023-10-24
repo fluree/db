@@ -895,7 +895,7 @@
            ledger @(fluree/create conn ledger-id {:defaultContext [test-utils/default-str-context {"ex" "ns:ex/"}]})
            db0    (fluree/db ledger)
 
-           db1 @(fluree/stage2 db0 {"@context" "https://flur.ee"
+           db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
                                     "insert" [{"@id" "ex:dp"
                                                "ex:name" "Dan"
                                                "ex:child" [{"@id" "ex:ap" "ex:name" "AP"}
@@ -903,10 +903,9 @@
                                                "ex:spouse" [{"@id" "ex:kp" "ex:name" "KP"
                                                              "ex:spouse" {"@id" "ex:dp"}}]}]})
 
-           db2 @(fluree/stage2 db1 {"@context" "https://flur.ee"
+           db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
                                     "where" [["?s" "ex:name" "?name"]]
-                                    "delete" {"@graph"
-                                              [{"@id" "?s" "ex:name" "?name"}]}
+                                    "delete" {"@id" "?s" "ex:name" "?name"}
                                     "insert" {"@graph"
                                               [{"@id" "?s" "ex:name" "BORG"}
                                                {"@id" "ex:mp"
@@ -921,7 +920,7 @@
                                                  "ex:zip" {"@value" 55105 "@type" "ex:PostalCode"}
                                                  "ex:state" "MN"}
                                                 "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}})
-           db3 @(fluree/stage2 db2 {"@context" "https://flur.ee"
+           db3 @(fluree/stage2 db2 {"@context" "https://ns.flur.ee"
                                     "insert" {"@type" "sh:NodeShape"
                                               "sh:targetClass" {"@id" "ex:Friend"}
                                               "sh:property"
@@ -929,7 +928,7 @@
                                                 "sh:maxCount" 1
                                                 "sh:datatype" {"@id" "xsd:string"}}]}})
 
-           db4 @(fluree/stage2 db3 {"@context" "https://flur.ee"
+           db4 @(fluree/stage2 db3 {"@context" "https://ns.flur.ee"
                                     "insert" {"@id" "ex:mp"
                                               "@type" "ex:Friend"
                                               "ex:nickname" "Murrseph Gordon-Levitt"}})
@@ -937,7 +936,7 @@
            root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
            alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
 
-           db5 @(fluree/stage2 db3 {"@context" "https://flur.ee"
+           db5 @(fluree/stage2 db3 {"@context" "https://ns.flur.ee"
                                     "insert" {"@graph"
                                               [{"@id" root-did "f:role" {"@id" "ex:rootRole"}}
                                                {"@id" alice-did "f:role" {"@id" "ex:userRole"} "ex:user" {"@id" "ex:alice"}}
