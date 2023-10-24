@@ -12,18 +12,6 @@
             [fluree.db.json-ld.ledger :as jld-ledger]
             [fluree.db.datatype :as datatype]))
 
-(defn match-component
-  [c solution]
-  (if (some? (where/get-value c))
-    c
-    (get solution (::where/var c))))
-
-(defn match-solution
-  [pattern solution]
-  (mapv (fn [c]
-          (match-component c solution))
-        pattern))
-
 (defn iri-mapping?
   [flake]
   (= const/$xsd:anyURI (flake/p flake)))
@@ -36,7 +24,7 @@
                            ;;(eg the commit pipeline) relies on
                            (when-not (iri-mapping? f)
                              (flake/flip-flake f t))))
-        matched    (match-solution triple solution)]
+        matched    (where/assign-matched-values triple solution nil)]
     (where/resolve-flake-range db fuel-tracker retract-xf error-ch matched)))
 
 (defn retract-clause
@@ -66,11 +54,13 @@
 (defn insert-triple
   [db triple t solution error-ch]
   (go
-    (try* (let [[s-mch p-mch o-mch] (match-solution triple solution)
-                s                   (where/get-value s-mch)
-                p                   (where/get-value p-mch)
-                o                   (where/get-value o-mch)
-                dt                  (::where/datatype o-mch)]
+    (try* (let [alias               (:alias db)
+                [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
+                s                   (where/get-sid s-mch alias)
+                p                   (where/get-sid p-mch alias)
+                o                   (or (where/get-sid o-mch alias)
+                                        (where/get-value o-mch))
+                dt                  (where/get-datatype o-mch)]
             (when (and (some? s) (some? p) (some? o) (some? dt))
               ;; wrap created flake in a vector so the output of this function has the
               ;; same shape as the retract functions
@@ -84,7 +74,7 @@
   (async/pipeline-async 2
                         out-ch
                         (fn [triple ch]
-                          (go (let [triple* (<! (where/evaluate-iris db error-ch triple))]
+                           (go (let [triple* (<! (where/evaluate-iris db error-ch triple))]
                                 (-> db
                                     (insert-triple triple* t solution error-ch)
                                     (async/pipe ch)))))
@@ -153,7 +143,7 @@
                                  (when-not (iri-mapping? f)
                                    (flake/flip-flake f t))))
 
-              [s-mch p-mch o-mch] (match-solution triple solution)
+              [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
 
               s-cmp  (if (string? (::where/val s-mch))
                        (assoc s-mch ::where/val (<? (dbproto/-subid db (::where/val s-mch) true)))
@@ -214,11 +204,14 @@
   [db triple {:keys [t next-sid next-pid]} solution error-ch]
   (go
     (try*
-      (let [[s-mch p-mch o-mch] (match-solution triple solution)
-
-            s  (::where/val s-mch)
-            p  (::where/val p-mch)
-            o  (::where/val o-mch)
+      (let [db-alias (:alias db)
+            [s-mch p-mch o-mch] (where/assign-matched-values triple solution nil)
+            s  (or (where/get-sid s-mch db-alias)
+                   (::where/val s-mch))
+            p  (or (where/get-sid p-mch db-alias)
+                   (::where/val p-mch))
+            o  (or (where/get-sid o-mch db-alias)
+                   (::where/val o-mch))
             dt (::where/datatype o-mch)
             m  (::where/m o-mch)
 
