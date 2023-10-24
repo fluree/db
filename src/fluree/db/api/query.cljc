@@ -106,6 +106,35 @@
   (cond-> (util/parse-opts opts)
     did (assoc :did did :issuer did)))
 
+(defn restrict-db
+  [db t opts]
+  (go-try
+    (let [db*  (if-let [policy-opts (perm/policy-opts opts)]
+                 (<? (perm/wrap-policy db policy-opts))
+                 db)
+          db** (-> (if t
+                     (<? (time-travel/as-of db* t))
+                     db*))]
+      (assoc-in db** [:policy :cache] (atom {})))))
+
+(defn track-query
+  [db max-fuel query]
+  (go-try
+    (let [start        #?(:clj  (System/nanoTime)
+                          :cljs (util/current-time-millis))
+          fuel-tracker (fuel/tracker max-fuel)]
+      (try* (let [result (<? (fql/query db fuel-tracker query))]
+              {:status 200
+               :result result
+               :time   (util/response-time-formatted start)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+                    (throw (ex-info "Error executing query"
+                                    {:status (-> e ex-data :status)
+                                     :time   (util/response-time-formatted start)
+                                     :fuel   (fuel/tally fuel-tracker)}
+                                    e)))))))
+
 (defn query-fql
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
@@ -113,33 +142,14 @@
   (go-try
     (let [{query :subject, did :did}  (or (<? (cred/verify query))
                                           {:subject query})
-          {:keys [opts t] :as query*} (update query :opts sanitize-query-options did)
+          {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
 
-          db*      (if-let [policy-opts (perm/policy-opts opts)]
-                     (<? (perm/wrap-policy db policy-opts))
-                     db)
-          db**     (-> (if t
-                         (<? (time-travel/as-of db* t))
-                         db*)
-                       (assoc-in [:policy :cache] (atom {})))
+          db*      (<? (restrict-db db t opts))
           query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-          start    #?(:clj  (System/nanoTime)
-                      :cljs (util/current-time-millis))
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
-        (let [fuel-tracker (fuel/tracker max-fuel)]
-          (try* (let [result (<? (fql/query db** fuel-tracker query**))]
-                  {:status 200
-                   :result result
-                   :time   (util/response-time-formatted start)
-                   :fuel   (fuel/tally fuel-tracker)})
-                (catch* e
-                  (throw (ex-info "Error executing query"
-                                  {:status (-> e ex-data :status)
-                                   :time   (util/response-time-formatted start)
-                                   :fuel   (fuel/tally fuel-tracker)}
-                                  e)))))
-        (<? (fql/query db** query**))))))
+        (<? (track-query db* max-fuel query**))
+        (<? (fql/query db* query**))))))
 
 (defn query-sparql
   [db query]
