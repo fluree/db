@@ -178,7 +178,10 @@
                             error-opts)
         docs-pointer-msg (when top-level-key
                            (str " See documentation for details: "
-                                docs/error-codes-page "#query-invalid-" top-level-key ))]
+                                docs/error-codes-page "#query-invalid-"
+                                (->> (str/replace top-level-key #"-" "")
+                                     (map str/lower-case)
+                                     str/join)))]
     [top-level-message root-message direct-message
      (str "Provided: " (pr-str value)) docs-pointer-msg]))
 
