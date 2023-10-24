@@ -217,7 +217,9 @@
 
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string
-  explaining the failure in plain english.
+  explaining the failure in plain english. The string
+  contains contextual information about a specific error
+  chosen from all the errors.
 
   Prefers top-level `:fn` errors, if present, otherwise
   chooses an error based on heuristics."
