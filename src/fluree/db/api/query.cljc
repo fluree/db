@@ -128,8 +128,7 @@
           max-fuel (:max-fuel opts*)]
       (if (::util/track-fuel? opts*)
         (let [fuel-tracker (fuel/tracker max-fuel)]
-          (try* (let [fuel-tracker (fuel/tracker max-fuel)
-                      result (<? (fql/query db** fuel-tracker query**))]
+          (try* (let [result (<? (fql/query db** fuel-tracker query**))]
                   {:status 200
                    :result result
                    :time   (util/response-time-formatted start)
