@@ -242,11 +242,7 @@
                                    :error/message "Unrecognized operation in where map, must be one of: filter, optional, union, bind"}
                             :filter :optional :union :bind]
     ::where-map            [:and
-                            [:map-of {:max 1 :error/fn (fn [{:keys [value]} _]
-                                                         ;;this can fail either the `:map-of` or the `:max`
-                                                         (when (and (map? value)
-                                                                    (not= 1 (count value)))
-                                                           "Where map can only have one key/value pair"))}
+                            [:map-of {:max 1 :error/message "Where map can only have 1 key/value pair"}
                              ::where-op :any]
                             [:multi {:dispatch where-op}
                              [:filter [:map [:filter [:ref ::filter]]]]
