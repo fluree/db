@@ -37,8 +37,7 @@
               "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object"}
         [:subject {:error/message "Invalid iri"} ::iri]
         [:flake
-         [:or {:error/message (str "Must provide a tuple of one more more iris, see documentation for details:"
-                                   docs/error-codes-page "#history-query-flake")}
+         [:or {:error/message "Must provide a tuple of one more more iris"}
           [:catn
            [:s ::iri]]
           [:catn
@@ -57,40 +56,34 @@
         [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
         [:map
          [:from {:optional true}
-          [:or {:error/message (str  "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"
-                                     "see documentation for details: " docs/error-codes-page "#history-query-invalid-t" )}
+          [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
            [:= :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"} ]
            [:re datatype/iso8601-datetime-re]]]
          [:to {:optional true}
-          [:or {:error/message (str "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"
-                                    "see documentation for details: " docs/error-codes-page "#history-query-invalid-t")}
+          [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
            [:=  :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"}]
            [:re datatype/iso8601-datetime-re]]]
          [:at {:optional true}
-          [:or {:error/message (str "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"
-                                    "see documentation for details: " docs/error-codes-page "#history-query-invalid-t")}
+          [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
            [:= :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"} ]
            [:re datatype/iso8601-datetime-re]]]]
-        [:fn {:error/message (str "Must provide: either \"from\" or \"to\", or the key \"at\" "
-                                 "see documentation for details: " docs/error-codes-page "#history-query-invalid-t" )}
+        [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\" "}
          (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
            (if at
              (not (or from to))
              (or from to)))]
-        [:fn {:error/message (str  "\"from\" value must be less than or equal to \"to\" value,"
-                                   "see documentation for details: " docs/error-codes-page "#history-query-invalid-t")}
+        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value,"}
          (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                    (<= from to)
                                    true))]]]]
-     extra-kvs)
-     ])
+     extra-kvs)])
 
 
 (def registry
@@ -132,33 +125,6 @@
 
 (def parse-history-query
   (m/parser ::history-query {:registry registry}))
-
-(def default-error-overrides
-  (-> me/default-errors
-      (assoc
-        ::m/missing-key
-        {:error/fn
-         (fn [{:keys [in]} _]
-           (let [k (-> in last name)]
-             (str "Query is missing a '" k "' clause. "
-                  "'" k "' is required in history queries. "
-                  "See documentation here for details: "
-                  docs/error-codes-page "#query-missing-" k)))}
-        ::m/extra-key
-        {:error/fn
-         (fn [{:keys [in]} _]
-           (let [k (-> in last name)]
-             (str "Query contains an unknown key: '" k "'. "
-                  "See documentation here for more information on allowed query keys: "
-                  docs/error-codes-page "#query-unknown-key")))}
-        ::m/invalid-type
-        {:error/fn (fn [{:keys [schema]} _]
-                     (if-let [expected-type (-> schema m/type)]
-                       (str "should be a " (case expected-type
-                                                   (:map-of :map) "map"
-                                                   (:cat :catn :sequential) "sequence"
-                                                   :else (name type)))
-                       "type is incorrect"))})))
 
 (defn s-flakes->json-ld
   "Build a subject map out a set of flakes with the same subject.

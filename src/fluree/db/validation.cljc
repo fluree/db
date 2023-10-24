@@ -1,6 +1,7 @@
 (ns fluree.db.validation
   (:require [fluree.db.constants :as const]
             [fluree.db.util.core :refer [pred-ident?]]
+            [fluree.db.util.docs :as docs]
             [malli.core :as m]
             [malli.error :as me]
             [malli.util :as mu]
@@ -166,7 +167,7 @@
                         (some->  (first (filter keyword? path))
                                  name))
         top-level-message (when top-level-key
-                           (str "Error in value for \"" top-level-key "\""))
+                            (str "Error in value for \"" top-level-key "\""))
         [_ root-message] (resolve-root-error-for-in
                           explained
                           error
@@ -186,19 +187,47 @@
   (first (filter #(and (empty? (:in %))
                     (= :fn (m/type (:schema %)))) errors)))
 
+(def default-error-overrides
+  {:errors
+   (-> me/default-errors
+       (assoc
+        ::m/missing-key
+        {:error/fn
+         (fn [{:keys [in]} _]
+           (let [k (-> in last name)]
+             (str "Query is missing a '" k "' clause. "
+                  "'" k "' is required in queries. "
+                  "See documentation here for details: "
+                  docs/error-codes-page "#query-missing-" k)))}
+        ::m/extra-key
+        {:error/fn
+         (fn [{:keys [in]} _]
+           (let [k (-> in last name)]
+             (str "Query contains an unknown key: '" k "'. "
+                  "See documentation here for more information on allowed query keys: "
+                  docs/error-codes-page "#query-unknown-key")))}
+        ::m/invalid-type
+        {:error/fn (fn [{:keys [schema value]} _]
+                     (if-let [expected-type (-> schema m/type)]
+                       (str "should be a " (case expected-type
+                                             (:map-of :map) "map"
+                                             (:cat :catn :sequential) "sequence"
+                                             :else (name type)))
+                       (str "type of " (pr-str value) " does not match expected type")))}))})
+
 (defn format-explained-errors
   "Takes the output of `explain` and emits a string
   explaining the failure in plain english.
 
   Prefers top-level `:fn` errors, if present, otherwise
   chooses an error based on heuristics."
-  ([explained-error] (format-explained-errors explained-error {}))
-  ([explained-error error-opts]
-   (let [{:keys [errors schema value]} explained-error
+  [explained-error opts]
+   (let [error-opts   (or opts default-error-overrides)
+         {:keys [errors schema value]} explained-error
          [first-e] errors
          e (or (top-level-fn-error errors)
                (choose-relevant-error explained-error))]
-     (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts)))))))
+     (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
 
 (def registry
   (merge

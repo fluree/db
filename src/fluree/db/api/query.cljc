@@ -95,7 +95,7 @@
                              (ex-info
                                (-> e
                                    v/explain-error
-                                   (v/format-explained-errors {:errors history/default-error-overrides}))
+                                   (v/format-explained-errors nil))
                                {:status  400
                                 :error   :db/invalid-query}))))
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
