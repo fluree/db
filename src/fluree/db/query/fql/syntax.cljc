@@ -187,13 +187,13 @@
                   "See documentation here for more information on allowed query keys: "
                   docs/error-codes-page "#query-unknown-key")))}
         ::m/invalid-type
-        {:error/fn (fn [{:keys [schema]} _]
+        {:error/fn (fn [{:keys [schema value]} _]
                      (if-let [expected-type (-> schema m/type)]
                        (str "should be a " (case expected-type
                                                    (:map-of :map) "map"
                                                    (:cat :catn :sequential) "sequence"
                                                    :else (name type)))
-                       "type is incorrect"))})))
+                       (str "type of " (pr-str value) " does not match expected type")))})))
 
 (defn humanize-error
   [error]
