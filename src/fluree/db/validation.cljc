@@ -56,7 +56,7 @@
    returns the error data corresponding to that disjunction."
   [error schema]
   (let [{:keys [value path]} error]
-    (loop [i (count path)]
+    (loop [i (dec (count path))]
       (when-not (= 0 i)
         (let [subpath (subvec path 0 i)
               schema-fragment (mu/get-in schema subpath)
