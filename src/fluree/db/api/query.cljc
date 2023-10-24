@@ -101,32 +101,32 @@
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
      (<? (history* db history-query)))))
 
+(defn sanitize-query-options
+  [opts did]
+  (cond-> (util/parse-opts opts)
+    did (assoc :did did :issuer did)))
+
 (defn query-fql
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
   [db query]
   (go-try
-    (let [{query :subject, did :did} (or (<? (cred/verify query))
-                                         {:subject query})
+    (let [{query :subject, did :did}  (or (<? (cred/verify query))
+                                          {:subject query})
+          {:keys [opts t] :as query*} (update query :opts sanitize-query-options did)
 
-          {:keys [opts t]} query
-          opts*    (util/parse-opts opts)
-          query*   (assoc query :opts opts*)
-          db*      (if-let [policy-opts (perm/policy-opts
-                                         (cond-> opts* did (assoc :did did)))]
+          db*      (if-let [policy-opts (perm/policy-opts opts)]
                      (<? (perm/wrap-policy db policy-opts))
                      db)
           db**     (-> (if t
                          (<? (time-travel/as-of db* t))
                          db*)
                        (assoc-in [:policy :cache] (atom {})))
-          query**  (-> query*
-                       (update :opts assoc :issuer did)
-                       (update :opts dissoc :meta :max-fuel ::util/track-fuel?))
+          query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
           start    #?(:clj  (System/nanoTime)
                       :cljs (util/current-time-millis))
-          max-fuel (:max-fuel opts*)]
-      (if (::util/track-fuel? opts*)
+          max-fuel (:max-fuel opts)]
+      (if (::util/track-fuel? opts)
         (let [fuel-tracker (fuel/tracker max-fuel)]
           (try* (let [result (<? (fql/query db** fuel-tracker query**))]
                   {:status 200
