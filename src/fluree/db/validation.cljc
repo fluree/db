@@ -159,13 +159,14 @@
           (recur (pop path) (last path) path' p' m')
           (when m [(if (seq in) (mu/path->in schema path') (me/error-path error options)) m' p']))))))
 
-
 (defn format-error
   [explained error error-opts]
   (let [{:keys [path value]} error
-        top-level-message (when-not (= ::m/extra-key (:type error))
-                            (when-let [top-level-key (first (filter keyword? path))]
-                              (str "Error in value for \"" (name top-level-key) "\"")))
+        top-level-key (when-not (= ::m/extra-key (:type error))
+                        (some->  (first (filter keyword? path))
+                                 name))
+        top-level-message (when top-level-key
+                           (str "Error in value for \"" top-level-key "\""))
         [_ root-message] (resolve-root-error-for-in
                           explained
                           error
@@ -173,8 +174,12 @@
         [_ direct-message] (me/-resolve-direct-error
                             explained
                             error
-                            error-opts)]
-    [top-level-message root-message direct-message (str "Provided: " (pr-str value))]))
+                            error-opts)
+        docs-pointer-msg (when top-level-key
+                           (str " See documentation for details: "
+                                docs/error-codes-page "#query-invalid-" top-level-key ))]
+    [top-level-message root-message direct-message
+     (str "Provided: " (pr-str value)) docs-pointer-msg]))
 
 (defn top-level-fn-error
   [errors]
