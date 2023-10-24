@@ -35,9 +35,10 @@
       [:history {:optional true}
        [:orn {:error/message
               "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object"}
-        [:subject ::iri]
+        [:subject {:error/message "Invalid iri"} ::iri]
         [:flake
-         [:or
+         [:or {:error/message (str "Must provide a tuple of one more more iris, see documentation for details:"
+                                   docs/error-codes-page "#history-query-flake")}
           [:catn
            [:s ::iri]]
           [:catn
@@ -56,30 +57,35 @@
         [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
         [:map
          [:from {:optional true}
-          [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:or {:error/message (str  "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"
+                                     "see documentation for details: " docs/error-codes-page "#history-query-invalid-t" )}
            [:= :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"} ]
            [:re datatype/iso8601-datetime-re]]]
          [:to {:optional true}
-          [:or {:error/message "must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:or {:error/message (str "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"
+                                    "see documentation for details: " docs/error-codes-page "#history-query-invalid-t")}
            [:=  :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"}]
            [:re datatype/iso8601-datetime-re]]]
          [:at {:optional true}
-          [:or {:error/message "must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+          [:or {:error/message (str "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"
+                                    "see documentation for details: " docs/error-codes-page "#history-query-invalid-t")}
            [:= :latest]
            [:int {:min 0
                   :error/message "Must be a positive value"} ]
            [:re datatype/iso8601-datetime-re]]]]
-        [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\""}
+        [:fn {:error/message (str "Must provide: either \"from\" or \"to\", or the key \"at\" "
+                                 "see documentation for details: " docs/error-codes-page "#history-query-invalid-t" )}
          (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
            (if at
              (not (or from to))
              (or from to)))]
-        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value"}
+        [:fn {:error/message (str  "\"from\" value must be less than or equal to \"to\" value,"
+                                   "see documentation for details: " docs/error-codes-page "#history-query-invalid-t")}
          (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                    (<= from to)
                                    true))]]]]

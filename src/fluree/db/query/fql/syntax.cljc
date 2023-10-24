@@ -118,7 +118,7 @@
                        ::iri [:ref ::subselection]]
     ::subselection    [:sequential {:error/message
                                     "subselection must be a vector"}
-                       [:orn {:error/message "must be a wildcard (\"*\") or subselection map"}
+                       [:orn {:error/message "subselection must be a wildcard (\"*\") or subselection map"}
                         [:wildcard ::wildcard]
                         [:predicate ::iri]
                         [:subselect-map [:ref ::subselect-map]]]]

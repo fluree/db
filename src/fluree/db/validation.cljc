@@ -209,11 +209,11 @@
     ::var                  [:fn {:error/message "Invalid variable, should be one or more characters begin with `?`"}
                             variable?]
     ::val                  [:fn value?]
-    ::subject              [:orn
+    ::subject              [:orn {:error/message "Subject must be a subject id, ident, or iri"}
                             [:sid [:fn {:error/message "Invalid subject id"} sid?]]
-                            [:ident [:fn pred-ident?]]
+                            [:ident [:fn {:error/message "Invalid pred ident, must be two-tuple of [pred-name-or-id pred-value] "}pred-ident?]]
                             [:iri ::iri]]
-    ::triple               [:catn {:error/message "Invalid triple"}
+    ::triple               [:catn
                             [:subject [:orn
                                        [:var ::var]
                                        [:val ::subject]]]
@@ -222,7 +222,7 @@
                                          [:iri ::iri]]]
                             [:object [:orn
                                       [:var ::var]
-                                      [:ident [:fn pred-ident?]]
+                                      [:ident [:fn {:error/message "Invalid pred ident, must be two-tuple of [pred-name-or-id pred-value] "}pred-ident?]]
                                       [:iri-map ::iri-map]
                                       [:val :any]]]]
     ::function             [:orn
@@ -232,7 +232,7 @@
                             [:map ::where-map]
                             [:tuple ::where-tuple]]
     ::filter               [:sequential {:error/message "Filter must be a function call wrapped in a vector"} ::function]
-    ::optional             [:orn {:error/message "Invalid optional"}
+    ::optional             [:orn {:error/message "Invalid optional, must be a signle where pattern or vector of where patterns."}
                             [:single ::where-pattern]
                             [:collection [:sequential ::where-pattern]]]
     ::union                [:sequential [:sequential ::where-pattern]]
@@ -253,19 +253,17 @@
                              [:optional [:map [:optional [:ref ::optional]]]]
                              [:union [:map [:union [:ref ::union]]]]
                              [:bind [:map [:bind [:ref ::bind]]]]]]
-    ::where-tuple          [:orn {:error/message
-                                  ;;TODO
-                                  "Invalid tuple"}
+    ::where-tuple          [:orn {:error/message "Invalid tuple"}
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
     ::where                [:sequential {:error/message "Where must be a vector of clauses"}
-                                [:orn {:error/message "where clauses must be valid tuples or maps"}
+                            [:orn {:error/message "where clauses must be valid tuples or maps"}
                              [:where-map ::where-map]
                              [:tuple ::where-tuple]]]
-    ::delete               [:orn {:error/message "delete statements must be a triple or collection of triples"}
+    ::delete               [:orn {:error/message "delete statements must be a triple or vector of triples"}
                             [:single ::triple]
                             [:collection [:sequential ::triple]]]
-    ::insert               [:orn
+    ::insert               [:orn {:error/message "insert statements must be a triple or vector of triples"}
                             [:single ::triple]
                             [:collection [:sequential ::triple]]]
     ::single-var-binding   [:tuple ::var [:sequential ::val]]
