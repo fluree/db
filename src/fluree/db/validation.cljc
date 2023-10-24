@@ -82,15 +82,16 @@
    When used in sorting, will push those errors
    toward the start of the list. "
   [error]
-  (let [{:keys [schema value in path]} error
-        type (m/type schema)]
-    ;;When inline property constraints, eg limits like
+  (let [{:keys [schema value in path type]} error
+        properties (m/properties schema)]
+    ;;When inline limit constraints, eg
     ;;`[:map {:max 1} ...]` are used, then both type and limit
     ;; failures will have the same `:in`, despite the limit failure
     ;; being more specific. This second number differentiates
     ;; those cases.
-    [(- (count in)) (if (and (#{:map :map-of} type)
-                             (map? value))
+    [(- (count in)) (if (and (or (contains? properties :max )
+                                 (contains? properties :min))
+                             (= type :malli.core/limits))
                       -1
                       1)]))
 
