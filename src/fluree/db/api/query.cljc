@@ -15,6 +15,7 @@
             [fluree.db.query.sparql :as sparql]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
@@ -48,7 +49,7 @@
                                 (number? to) (- to)
                                 (nil? to) (:t db*))])
 
-         context        (fql/get-context parsed)
+         context        (ctx-util/get-context parsed)
          parsed-context (dbproto/-context db context (:context-type opts))
          error-ch       (async/chan)]
      (if history

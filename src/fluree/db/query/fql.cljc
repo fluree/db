@@ -1,8 +1,8 @@
 (ns fluree.db.query.fql
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.util.log :as log :include-macros true]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
             [fluree.db.query.exec :as exec]
@@ -39,12 +39,6 @@
   #?(:clj (:cache opts)
      :cljs false))
 
-(defn get-context
-  [q]
-  (cond (contains? q :context) (:context q)
-        (contains? q "@context") (get q "@context")
-        :else ::dbproto/default-context))
-
 (defn query
   "Returns core async channel with results or exception"
   ([db query-map]
@@ -52,8 +46,7 @@
   ([db fuel-tracker {:keys [opts] :as query-map}]
    (if (cache? query-map)
      (cache-query db query-map)
-     (let [q-ctx (get-context query-map)
-           ctx   (dbproto/-context db q-ctx (:context-type opts))
+     (let [ctx   (ctx-util/extract db query-map opts)
            q     (try*
                    (let [parsed (parse/parse-query query-map ctx)]
                      (or (re-parse-as-simple-subj-crawl parsed db)
@@ -79,7 +72,6 @@
    (modify db t nil json-ld))
 
   ([db t fuel-tracker {:keys [opts] :as mdfn-map}]
-   (let [m-ctx (get-context mdfn-map)
-         ctx   (dbproto/-context db m-ctx (:context-type opts))
-         mdfn  (parse/parse-modification mdfn-map ctx)]
+   (let [ctx  (ctx-util/extract db mdfn-map opts)
+         mdfn (parse/parse-modification mdfn-map ctx)]
      (exec/modify db t fuel-tracker mdfn))))

@@ -24,6 +24,7 @@
             [fluree.db.query.range :as query-range]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util :refer [vswap!]]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.util.log :as log]
             [fluree.db.validation :as v]
             [fluree.json-ld :as json-ld]
@@ -662,8 +663,7 @@
                  db)
 
            tx-state      (->tx-state2 db*)
-           context       (-> db*
-                             (dbproto/-context (fql/get-context txn) (:ocntext-type parsed-opts)))
+           context       (ctx-util/extract db* txn parsed-opts)
            parsed-txn    (q-parse/parse-txn txn context)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)

@@ -192,34 +192,6 @@
           (assoc-in [:stats :indexed] index-t))
       db)))
 
-(defn retrieve-context
-  "Returns the parsed context. Caches."
-  [default-context context-cache supplied-context context-type]
-  (or (get-in @context-cache [context-type supplied-context])
-      (let [context (cond (= ::dbproto/default-context supplied-context)
-                          (if (= :keyword context-type)
-                            (ctx-util/keywordize-context default-context)
-                            default-context)
-
-                          ;; clearing the context
-                          (nil? supplied-context)
-                          nil
-
-                          :else
-                          (if (sequential? supplied-context)
-                            (mapv #(if (= "" %)
-                                     ;; we need to substitute in the default context, keywordize if of type :keyword
-                                     (if (= :keyword context-type)
-                                       (ctx-util/keywordize-context default-context)
-                                       default-context)
-                                     %)
-                                  supplied-context)
-                            supplied-context))
-
-            parsed-ctx (json-ld/parse-context context)]
-        (vswap! context-cache assoc-in [context-type supplied-context] parsed-ctx)
-        parsed-ctx)))
-
 (defn default-context-update
   "Updates default context, so on next commit it will get written in the commit file."
   [db default-context]
@@ -259,9 +231,9 @@
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
-  (-context [_] (retrieve-context default-context context-cache ::dbproto/default-context context-type))
-  (-context [_ context] (retrieve-context default-context context-cache context context-type))
-  (-context [_ context type] (retrieve-context default-context context-cache context (or type context-type)))
+  (-context [_] (ctx-util/retrieve-context default-context context-cache ::dbproto/default-context context-type))
+  (-context [_ context] (ctx-util/retrieve-context default-context context-cache context context-type))
+  (-context [_ context type] (ctx-util/retrieve-context default-context context-cache context (or type context-type)))
   (-default-context [_] default-context)
   (-default-context-update [db default-context] (default-context-update db default-context))
   (-context-type [_] context-type))
