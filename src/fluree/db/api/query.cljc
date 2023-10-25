@@ -119,12 +119,12 @@
       (assoc-in db** [:policy :cache] (atom {})))))
 
 (defn track-query
-  [db max-fuel query]
+  [db ctx max-fuel query]
   (go-try
     (let [start        #?(:clj  (System/nanoTime)
                           :cljs (util/current-time-millis))
           fuel-tracker (fuel/tracker max-fuel)]
-      (try* (let [result (<? (fql/query db fuel-tracker query))]
+      (try* (let [result (<? (fql/query db ctx fuel-tracker query))]
               {:status 200
                :result result
                :time   (util/response-time-formatted start)
@@ -146,11 +146,12 @@
           {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
 
           db*      (<? (restrict-db db t opts))
-          query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
+          query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
+          ctx      (ctx-util/extract db* query** opts)
           max-fuel (:max-fuel opts)]
       (if (::util/track-fuel? opts)
-        (<? (track-query db* max-fuel query**))
-        (<? (fql/query db* query**))))))
+        (<? (track-query db* ctx max-fuel query**))
+        (<? (fql/query db* ctx query**))))))
 
 (defn query-sparql
   [db query]
@@ -216,12 +217,18 @@
           named-aliases   (-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
-        (let [ds       (<? (load-dataset conn default-aliases named-aliases opts))
-              query**  (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
-              max-fuel (:max-fuel opts)]
+        (let [ds          (<? (load-dataset conn default-aliases named-aliases opts))
+              query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
+              max-fuel    (:max-fuel opts)
+              default-ctx (conn-proto/-default-context conn)
+              q-ctx       (ctx-util/get-context query**)
+              ctx-type    (or (:context-type opts)
+                              (conn-proto/-context-type conn))
+              ctx         (ctx-util/retrieve-context default-ctx q-ctx ctx-type)]
+
           (if (::util/track-fuel? opts)
-            (<? (track-query ds max-fuel query**))
-            (<? (fql/query ds query**))))
+            (<? (track-query ds ctx max-fuel query**))
+            (<? (fql/query ds ctx query**))))
         (throw (ex-info "Missing ledger specification in connection query"
                         {:status 400, :error :db/invalid-query}))))))
 
