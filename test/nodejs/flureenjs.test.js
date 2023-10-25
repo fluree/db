@@ -62,35 +62,35 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
 
   expect(dc).toStrictEqual(defaultCtx);
 
-   const results = await flureenjs.query(
-     db1,
-     {
-       select: { "?s": ["*"] },
-       where: [["?s", "type", "ex:User"]]
-     }
-   );
+  const results = await flureenjs.query(
+    db1,
+    {
+      select: { "?s": ["*"] },
+      where: [["?s", "type", "ex:User"]]
+    }
+  );
 
 
-   expect(results).toStrictEqual(
-       [
-         {
-           id: 'ex:john',
-           type: 'ex:User',
-           'schema:name': "John"
-         }
-       ]
-   );
+  expect(results).toStrictEqual(
+    [
+      {
+        id: 'ex:john',
+        type: 'ex:User',
+        'schema:name': "John"
+      }
+    ]
+  );
 
-   // test providing context works and remaps keys
-   const contextResults = await flureenjs.query(
-     db1,
-     { "@context": ["", {"flhubee": "http://schema.org/name"}],
-       select: { "?s": ["*"] },
-       where: [["?s", "type", "ex:User"]]
-     }
-   );
+  // test providing context works and remaps keys
+  const contextResults = await flureenjs.query(
+    db1,
+    { "@context": ["", {"flhubee": "http://schema.org/name"}],
+      select: { "?s": ["*"] },
+      where: [["?s", "type", "ex:User"]]
+    }
+  );
 
-   expect(contextResults).toStrictEqual(
+  expect(contextResults).toStrictEqual(
     [
       {
         id: 'ex:john',
@@ -98,7 +98,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
         flhubee: 'John'
       }
     ]
-   );
+  );
 
 
   const db2 = await flureenjs.stage(db, {
@@ -107,7 +107,7 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
     bar: "bar",
   });
 
-//  await flureenjs.jldCommit(db);
+//  await flureenjs.commit(db);
 
   const results2 = await flureenjs.query(db2, {
     select: { "?s": ["*"] },
@@ -145,37 +145,40 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
 //  const connOpts = {
 //    method: "file",
 //    "storage-path": "store/",
-//    context: {
-//      id: "@id",
-//      type: "@type",
-//      schema: "http://schema.org/",
-//      rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-//      rdfs: "http://www.w3.org/2000/01/rdf-schema#",
-//      wiki: "https://www.wikidata.org/wiki/",
-//      skos: "http://www.w3.org/2008/05/skos#",
-//      f: "https://ns.flur.ee/ledger#",
+//    defaults: {
+//      context: {
+//        id: "@id",
+//        type: "@type",
+//        schema: "http://schema.org/",
+//        rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+//        rdfs: "http://www.w3.org/2000/01/rdf-schema#",
+//        wiki: "https://www.wikidata.org/wiki/",
+//        skos: "http://www.w3.org/2008/05/skos#",
+//        f: "https://ns.flur.ee/ledger#",
+//      },
 //    },
 //  };
-//  const conn = await flureenjs.jldConnect(connOpts);
+//  const conn = await flureenjs.connect(connOpts);
 //  const ledgerName = "jld/one";
-//  const newLedger = await flureenjs.jldCreate(conn, ledgerName);
-//  const db = await flureenjs.jldStage(newLedger, testJson);
+//  const newLedger = await flureenjs.create(conn, ledgerName);
+//  const db0 = flureenjs.db(newLedger);
+//  const db1 = await flureenjs.stage(db0, testJson);
 //
-//  await flureenjs.jldCommit(newLedger, db, {
+//  const db2 = await flureenjs.commit(newLedger, db1, {
 //    message: "commit!",
 //    push: true,
 //  });
-//  // console.log("DB", db);
+//  // console.log("DB", db1);
 //
-//  const results = await flureenjs.jldQuery(db, {
+//  const results = await flureenjs.query(db2, {
 //    select: { "?s": ["id", "isbn", "name", "type"] },
 //    where: [["?s", "id", "https://www.wikidata.org/wiki/Q3107329"]],
 //  });
 //
 //  expect(results).toStrictEqual([
 //    {
-//      id: "https://www.wikidata.org/wiki/Q3107329",
-//      type: "Book",
+//      id:   "wiki:Q3107329",
+//      type: "schema:Book",
 //      name: "The Hitchhiker's Guide to the Galaxy",
 //      isbn: "0-330-25864-8",
 //    },
