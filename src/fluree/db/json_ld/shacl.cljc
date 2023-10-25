@@ -797,51 +797,6 @@
         (:pattern base) (build-pattern)
         (= p const/$sh:not) (assoc :logical-constraint :not)))))
 
-(def optimizable-property-constraints
-  "These are the constraint keys that can be validated with just the asserted flakes -
-  they don't rely on any sort of graph crawl."
-  #{:min-length
-    :max-length
-    :pattern
-    :flags
-
-    :datatype
-
-    :min-exclusive
-    :min-inclusive
-    :max-exclusive
-    :max-inclusive})
-
-(defn advanced-validation-eligible-p-shape?
-  "A property shape is eligible for advanced validation if it has only optimizable
-  property constraints. Property shapes that are eligible for advanced validation can be
-  processed during flake creation."
-  [p-shape]
-  (let [[[_ path-type] :as tagged-path] (:path p-shape)
-        constraints (-> p-shape
-                        (dissoc :path :id)
-                        (keys)
-                        (set))]
-    (boolean
-      (and (= 1 (count tagged-path))
-           (= :predicate path-type)
-           (set/subset? constraints optimizable-property-constraints)))))
-
-(defn advanced-validation-eligible-node-shape?
-  [shape]
-  (boolean (:target-class shape)))
-
-(defn add-advanced-validation-lookup
-  "Constructs a map to facilitate the retrieval of advanced-validation p-shapes during
-  property additions."
-  [shape advanced-eligible-p-shapes]
-  (let [pid->shape->p-shapes (reduce (fn [pid->shape->p-shapes p-shape]
-                                       (update-in pid->shape->p-shapes [(-> p-shape :path ffirst) (:id shape)]
-                                                  (fnil conj []) p-shape))
-                                     {}
-                                     advanced-eligible-p-shapes)]
-    (assoc shape :advanced-validation pid->shape->p-shapes)))
-
 (defn build-node-shape
   [db shape-flakes]
   (go-try
@@ -874,15 +829,11 @@
                            ;; else
                            shape)]
               (recur r' shape* p-shapes))))
-        (let [{advanced-eligible true p-shapes* false} (if (advanced-validation-eligible-node-shape? shape)
-                                                         (group-by advanced-validation-eligible-p-shape? p-shapes)
-                                                         {false p-shapes})
-              pid->shacl-dt (->> p-shapes
+        (let [pid->shacl-dt (->> p-shapes
                                  (filter :datatype)
                                  (map (fn [p-shape] [(-> p-shape :path last first) (:datatype p-shape)]))
                                  (into {}))]
-          (cond-> (assoc shape :property p-shapes* :pid->shacl-dt pid->shacl-dt)
-            advanced-eligible (add-advanced-validation-lookup advanced-eligible)))))))
+          (assoc shape :property p-shapes :pid->shacl-dt pid->shacl-dt))))))
 
 (defn build-shapes
   [db shape-sids]
