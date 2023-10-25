@@ -14,7 +14,7 @@
   ([conn] (fluree/create conn))
   ([conn ledger-alias] (fluree/create conn ledger-alias))
   ([conn ledger-alias opts] (fluree/create conn ledger-alias
-                                           (js->clj opts :keywordize-keys true))))
+                                           (js->clj opts))))
 
 (defn ^:export exists
   [conn alias-or-address]
@@ -34,13 +34,13 @@
   ([db json-ld opts]
    (fluree/stage db (js->clj json-ld)
                  (-> opts
-                     (js->clj :keywordize-keys true)
+                     (js->clj)
                      (assoc :context-type :string)))))
 
 (defn ^:export commit
   ([ledger db] (fluree/commit! ledger db))
   ([ledger db opts] (fluree/commit! ledger db
-                                    (js->clj opts :keywordize-keys true))))
+                                    (js->clj opts))))
 
 (defn ^:export status
   ([ledger] (clj->js (fluree/status ledger)))
@@ -48,11 +48,11 @@
 
 (defn ^:export db
   ([ledger] (fluree/db ledger))
-  ([ledger opts] (fluree/db ledger (js->clj opts :keywordize-keys true))))
+  ([ledger opts] (fluree/db ledger (js->clj opts))))
 
 (defn ^:export query
   [db query]
-  (let [query* (->> (js->clj query :keywordize-keys false)
+  (let [query* (->> (js->clj query)
                     (reduce-kv (fn [acc k v]
                                  (assoc acc (if (str/starts-with? k "@")
                                               k
@@ -77,6 +77,6 @@
   1. level [Values: severe, warning, info, config, fine, finer, finest]
   "
   [opts]
-  (let [opts' (js->clj opts :keywordize-keys true)
-        {:keys [level]} opts']
+  (let [opts' (js->clj opts)
+        {:strs [level]} opts']
     (log/set-level! (keyword level))))
