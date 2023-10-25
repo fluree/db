@@ -1,7 +1,7 @@
 (ns fluree.db.conn.core
   (:require [clojure.core.async :as async]
             [fluree.db.constants :as const]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch* get-first-value]]
+            [fluree.db.util.core :as util :refer [try* catch* get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.json-ld :as json-ld]
