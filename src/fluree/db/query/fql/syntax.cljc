@@ -52,6 +52,7 @@
     one-select-key-present?]
    (into [:map {:closed true}
           [:from {:optional true} ::from]
+          [:from-named {:optional true} ::from-named]
           [:where ::where]
           [:t {:optional true} ::t]
           [:context {:optional true} ::context]
@@ -158,7 +159,8 @@
     ::json-ld-keyword ::v/json-ld-keyword
     ::query           (query-schema [])
     ::modification    ::v/modification-txn
-    ::from            ::v/from}))
+    ::from            ::v/from
+    ::from-named      ::v/from-named}))
 
 (def triple-validator
   (m/validator ::triple {:registry registry}))

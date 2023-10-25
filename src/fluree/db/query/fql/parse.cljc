@@ -336,7 +336,7 @@
 (defmethod parse-pattern :graph
   [{:keys [graph where]} vars context]
   (let [graph* (or (parse-variable graph)
-                   (json-ld/expand-iri graph context))
+                   graph)
         where* (parse-where-clause where vars context)]
     (where/->pattern :graph [graph* where*])))
 

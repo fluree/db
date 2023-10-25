@@ -584,15 +584,15 @@
         (let [alias (or (::iri v-match)
                         (get-value v-match))]
           (match-alias ds alias fuel-tracker solution clause error-ch))
-        (let [out-ch (async/chan)
-              db-ch  (async/to-chan! ds)]
+        (let [out-ch  (async/chan)
+              name-ch (-> ds dataset/names async/to-chan!)]
           (async/pipeline-async 2
                                 out-ch
-                                (fn [[alias db] ch]
+                                (fn [alias ch]
                                   (let [solution* (update solution v match-iri alias)]
-                                    (-> (match-clause db fuel-tracker solution* clause error-ch)
+                                    (-> (match-alias ds alias fuel-tracker solution* clause error-ch)
                                         (async/pipe ch))))
-                                db-ch)
+                                name-ch)
           out-ch))
       (match-alias ds g fuel-tracker solution clause error-ch))))
 

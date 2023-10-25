@@ -3,14 +3,12 @@
   (:require [fluree.db.util.core :as util]))
 
 
-(defrecord DataSet [db-map active])
+(defrecord DataSet [named default active])
 
 (defn combine
   [named-map defaults]
   (let [default-graph (util/sequential defaults)]
-    (-> named-map
-        (assoc ::default default-graph)
-        (->DataSet ::default))))
+    (->DataSet named-map default-graph ::default)))
 
 (defn dataset?
   [ds]
@@ -18,7 +16,7 @@
 
 (defn activate
   [ds alias]
-  (when (-> ds :names (contains? alias))
+  (when (-> ds :named (contains? alias))
     (assoc ds :active alias)))
 
 (defn activate-default
@@ -28,4 +26,10 @@
 (defn active
   [ds]
   (let [active-graph (:active ds)]
-    (-> ds :db-map (get active-graph))))
+    (if (#{::default} active-graph)
+      (:default ds)
+      (-> ds :named (get active-graph)))))
+
+(defn names
+  [ds]
+  (-> ds :named keys))

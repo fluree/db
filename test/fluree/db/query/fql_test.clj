@@ -385,4 +385,21 @@
           (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
                   ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
                  @(fluree/query-connection conn q))
+              "returns unified results from each component ledger")))
+      (testing "with separate data sets"
+        (let [q '{"@context" "https://schema.org"
+                  :from-named ["test/authors" "test/books" "test/movies"]
+                  :select    [?movieName ?bookIsbn ?authorName]
+                  :where     [{:graph "test/movies"
+                               :where [[?movie "type" "Movie"]
+                                       [?movie "name" ?movieName]
+                                       [?movie "isBasedOn" ?book]]}
+                              {:graph "test/books"
+                               :where [[?book "isbn" ?bookIsbn]
+                                       [?book "author" ?author]]}
+                              {:graph "test/authors"
+                               :where [[?author "name" ?authorName]]}]}]
+          (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
+                  ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
+                 @(fluree/query-connection conn q))
               "returns unified results from each component ledger"))))))

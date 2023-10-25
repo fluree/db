@@ -307,6 +307,7 @@
     ::from                 [:orn
                             [:single ::ledger]
                             [:collection [:sequential ::ledger]]]
+    ::from-named           ::from
     ::delete               [:orn {:error/message "delete statements must be a triple or vector of triples"}
                             [:single ::triple]
                             [:collection [:sequential ::triple]]]
