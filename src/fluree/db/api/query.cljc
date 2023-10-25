@@ -199,7 +199,8 @@
       (let [alias (first defaults)]
         (<? (load-alias conn alias nil opts))) ; return an unwrapped db if the data set
                                                ; consists of one ledger
-      (let [db-map       (<? (load-aliases conn (->> defaults (concat named) distinct) opts))
+      (let [all-aliases  (->> defaults (concat named) distinct)
+            db-map       (<? (load-aliases conn all-aliases opts))
             default-coll (-> db-map
                              (select-keys defaults)
                              vals)
@@ -213,8 +214,8 @@
                                          {:subject query})
           {:keys [opts] :as query*}  (update query :opts sanitize-query-options did)
 
-          default-aliases (-> query* :from util/sequential)
-          named-aliases   (-> query* :from-named util/sequential)]
+          default-aliases (some-> query* :from util/sequential)
+          named-aliases   (some-> query* :from-named util/sequential)]
       (if (or (seq default-aliases)
               (seq named-aliases))
         (let [ds          (<? (load-dataset conn default-aliases named-aliases opts))
