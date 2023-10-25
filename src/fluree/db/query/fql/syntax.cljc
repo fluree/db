@@ -114,34 +114,38 @@
     ::var             ::v/var
     ::iri             ::v/iri
     ::subject         ::v/subject
-    ::subselect-map   [:map-of ::iri [:ref ::subselection]]
-    ::subselection    [:sequential [:orn
-                                    [:wildcard ::wildcard]
-                                    [:predicate ::iri]
-                                    [:subselect-map [:ref ::subselect-map]]]]
-    ::select-map      [:map-of {:max 1}
+    ::subselect-map   [:map-of {:error/message "must be map from iri to subselection"}
+                       ::iri [:ref ::subselection]]
+    ::subselection    [:sequential {:error/message
+                                    "subselection must be a vector"}
+                       [:orn {:error/message "subselection must be a wildcard (\"*\") or subselection map"}
+                        [:wildcard ::wildcard]
+                        [:predicate ::iri]
+                        [:subselect-map [:ref ::subselect-map]]]]
+    ::select-map      [:map-of {:max 1
+                                :error/message "Only one key/val for select-map"}
                        ::var ::subselection]
-    ::selector        [:orn
+    ::selector        [:orn {:error/message "selector must be either a variable, wildcard symbol (`*`), iri, function application, or select map"}
                        [:wildcard ::wildcard]
                        [:var ::var]
                        [:aggregate ::function]
                        [:select-map ::select-map]]
-    ::select          [:orn
+    ::select          [:orn {:error/message "Select must be a valid selector or vector of selectors"}
                        [:selector ::selector]
                        [:collection [:sequential ::selector]]]
-    ::direction       [:orn
+    ::direction       [:orn {:error/message "Direction must be ASC or DESC"}
                        [:asc [:fn asc?]]
                        [:desc [:fn desc?]]]
-    ::ordering        [:orn
+    ::ordering        [:orn {:error/message "Ordering must be a var or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:scalar ::var]
                        [:vector [:and list?
                                  [:catn
                                   [:direction ::direction]
                                   [:dimension ::var]]]]]
-    ::order-by        [:orn
+    ::order-by        [:orn {:error/message  "orderBy clause must be variable or two-tuple formatted ['ASC' or 'DESC', var]"}
                        [:clause ::ordering]
                        [:collection [:sequential ::ordering]]]
-    ::group-by        [:orn
+    ::group-by        [:orn {:error/message "groupBy clause must be a variable or a vector of variables"}
                        [:clause ::var]
                        [:collection [:sequential ::var]]]
     ::triple          ::v/triple
@@ -164,52 +168,26 @@
 (def coerce-query*
   (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
 
+
+
 (defn humanize-error
   [error]
-  (let [explain-data (-> error ex-data :data :explain)]
+  (let [explain-data (v/explain-error error)]
     (log/trace "query validation error:"
                (update explain-data :errors
                        (fn [errors] (map #(dissoc % :schema) errors))))
     (-> explain-data
-        (me/humanize
-         {:errors
-          (-> me/default-errors
-              (assoc
-                ::m/missing-key
-                {:error/fn
-                 (fn [{:keys [in]} _]
-                   (let [k (-> in last name)]
-                     (str "Query is missing a '" k "' clause. "
-                          "'" k "' is required in queries. "
-                          "See documentation here for details: "
-                          docs/error-codes-page "#query-missing-" k)))}
-                ::m/extra-key
-                {:error/fn
-                 (fn [{:keys [in]} _]
-                   (let [k (-> in last name)]
-                     (str "Query contains an unknown key: '" k "'. "
-                          "See documentation here for more information on allowed query keys: "
-                          docs/error-codes-page "#query-unknown-key")))}))}))))
+        (v/format-explained-errors nil))))
 
-(defn coalesce-query-errors
-  [humanized-errors qry]
-  (str "Invalid query: " (pr-str qry) " - "
-       (str/join "; "
-                 (if (map? humanized-errors)
-                   (map (fn [[k v]]
-                          (str (name k) ": "
-                               (str/join " " v))) humanized-errors)
-                   humanized-errors))))
 
 (defn coerce-query
   [qry]
   (try*
-   (coerce-query* qry)
-   (catch* e
-     (let [he        (humanize-error e)
-           _         (log/trace "humanized errors:" he)
-           error-msg (coalesce-query-errors he qry)]
-       (throw (ex-info error-msg {:status 400, :error :db/invalid-query}))))))
+    (coerce-query* qry)
+    (catch* e
+            (let [error-msg        (humanize-error e)
+                  _         (log/trace "humanized errors:" error-msg)]
+              (throw (ex-info error-msg {:status 400, :error :db/invalid-query}))))))
 
 (def parse-selector
   (m/parser ::selector {:registry registry}))

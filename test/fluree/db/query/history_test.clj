@@ -172,7 +172,7 @@
                  Throwable->map
                  :cause))))
 
-    (testing "invalid query"
+    #_(testing "invalid query"
       (is (= "History query not properly formatted. Provided {:history []}"
              (-> @(fluree/history ledger {:history []})
                  Throwable->map

@@ -93,10 +93,10 @@
                          (catch* e
                            (throw
                              (ex-info
-                               (str "History query not properly formatted. Provided "
-                                    (pr-str query-map))
+                               (-> e
+                                   v/explain-error
+                                   (v/format-explained-errors nil))
                                {:status  400
-                                :message (v/humanize-error e)
                                 :error   :db/invalid-query}))))
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
      (<? (history* db history-query)))))
