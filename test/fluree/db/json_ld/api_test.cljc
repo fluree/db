@@ -263,16 +263,7 @@
                                                    :schema/email "jake@example.org"}}])
                db             @(fluree/commit! ledger db)
                target-t       (:t db)
-               conn2-context  {:id  "@id", :type "@type"
-                               :xsd "http://www.w3.org/2001/XMLSchema#"
-                               :foo "http://foobar.com/"
-                               :baz "http://baz.org/"}
-               conn2          @(fluree/connect
-                                {:method   :file, :storage-path storage-path
-                                 :defaults {:context      conn2-context
-                                            :context-type :keyword}})
-               loaded         (test-utils/load-to-t conn2 ledger-alias target-t
-                                                    100)
+               loaded         @(fluree/load conn1 ledger-alias)
                loaded-db      (fluree/db loaded)
                merged-ctx     (merge (ctx-util/stringify-context conn1-context)
                                      (ctx-util/stringify-context ledger-context))]

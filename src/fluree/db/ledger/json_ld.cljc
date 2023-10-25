@@ -1,5 +1,6 @@
 (ns fluree.db.ledger.json-ld
-  (:require [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async]
+            [fluree.db.flake :as flake]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.query.range :as query-range]
@@ -18,7 +19,7 @@
             [fluree.db.util.context :as ctx-util]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.db.conn.core :refer [register-ledger release-ledger]]
+            [fluree.db.conn.core :refer [register-ledger release-ledger cached-ledger]]
             [fluree.db.json-ld.commit-data :as commit-data]
             [fluree.db.index :as index]
             [fluree.db.util.log :as log])
@@ -226,6 +227,7 @@
           (recur r db**))
         db*))))
 
+
 (defn create
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
@@ -234,6 +236,11 @@
                   reindex-min-bytes reindex-max-bytes initial-tx new-context?]
            :or   {branch       :main
                   new-context? true}} opts
+          [not-cached? ledger-chan] (register-ledger conn ledger-alias) ;; holds final cached ledger in a promise-chan avoid race conditions
+          _               (when-not not-cached?
+                            (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
+                                            {:status 400
+                                             :error  :db/ledger-exists})))
           default-context (if defaultContext
                             (-> defaultContext
                                 (ctx-util/mapify-context (conn-proto/-default-context conn))
@@ -293,7 +300,7 @@
         ;; includes other ledgers - experimental
         (let [db* (<? (include-dbs conn db include))]
           (ledger-proto/-db-update ledger db*)))
-      (register-ledger conn ledger ledger-alias)
+      (async/put! ledger-chan ledger)
       ledger)))
 
 (defn commit->ledger-alias
@@ -304,19 +311,28 @@
       (->> (conn-proto/-nameservices conn)
            (some #(ns-proto/-alias % db-alias)))))
 
-(defn load
-  [conn db-alias]
+(defn alias-from-address
+  [address]
+  (when-let [path (->> address
+                       (re-matches #"^fluree:[^:]+://(.*)$")
+                       (second))]
+    (if (str/ends-with? path "/main/head")
+      (subs path 0 (- (count path) 10))
+      path)))
+
+(defn load*
+  [conn address]
   (go-try
-    (let [commit-addr  (<? (nameservice/lookup-commit conn db-alias nil))
+    (let [commit-addr  (<? (nameservice/lookup-commit conn address nil))
           _            (when-not commit-addr
-                         (throw (ex-info (str "Unable to load. No commit exists for: " db-alias)
+                         (throw (ex-info (str "Unable to load. No commit exists for: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
           [commit _] (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))
           _            (log/debug "load commit:" commit)
-          ledger-alias (commit->ledger-alias conn db-alias commit)
+          ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
           default-ctx  (-> commit
                            (get-first const/iri-default-context)
@@ -330,6 +346,28 @@
           db           (ledger-proto/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
       (ledger-proto/-commit-update ledger branch db*)
-      (register-ledger conn ledger ledger-alias)
       (nameservice/subscribe-ledger conn ledger-alias) ;; async in background, elect to receive update notifications
       ledger)))
+
+(defn load
+  [conn alias-or-address]
+  (async/go
+    (let [address? (str/starts-with? alias-or-address "fluree:")
+          alias    (if address?
+                     (alias-from-address alias-or-address)
+                     alias-or-address)
+          [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions]
+      (if not-cached?
+        (let [address (if address?
+                        alias-or-address
+                        (async/<! (nameservice/primary-address conn alias-or-address nil)))]
+          (if (util/exception? address)
+            (async/put! ledger-chan
+                        (ex-info (str "Load for " alias-or-address " failed due to exception in address lookup.")
+                                 {:status 400 :error :db/invalid-address}
+                                 address))
+            (let [ledger (async/<! (load* conn address))]
+              ;; note, ledger can be an exception!
+              (async/put! ledger-chan ledger)
+              ledger)))
+        (<? ledger-chan)))))

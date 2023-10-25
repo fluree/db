@@ -94,16 +94,27 @@
       (conn-event conn msg))))
 
 (defn register-ledger
-  "Records a reference to a loaded ledger on the conn's state atom,
-  so a ledger 'load' event can see first if a ledger is already loaded
-  before going to storage.
+  "Creates a promise-chan and saves it in a cache of ledgers being held
+  in-memory on the conn.
 
-  Also allows already loaded ledger to be updated with incoming new
-  commit messages"
-  ([{:keys [state] :as _conn} {:keys [alias] :as ledger}]
-   (register-ledger state ledger alias))
-  ([{:keys [state] :as _conn} ledger ledger-alias]
-   (swap! state assoc-in [:ledger ledger-alias] ledger)))
+  Returns a two-tuple of
+  [not-cached? promise-chan]
+
+  where not-cached? is true if a new promise-chan was created, false if an
+  existing promise-chan was found.
+
+  promise-chan is the new promise channel that must have the final ledger `put!` into it
+  assuming success? is true, otherwise it will return the existing found promise-chan when
+  success? is false"
+  [{:keys [state] :as _conn} ledger-alias]
+  (let [new-p-chan  (async/promise-chan)
+        new-state   (swap! state update-in [:ledger ledger-alias]
+                           (fn [existing]
+                             (or existing new-p-chan)))
+        p-chan      (get-in new-state [:ledger ledger-alias])
+        not-cached? (= p-chan new-p-chan)]
+    (log/debug "Registering ledger: " ledger-alias " not-cached? " not-cached?)
+    [not-cached? p-chan]))
 
 (defn release-ledger
   "Opposite of register-ledger. Removes reference to a ledger from conn"
