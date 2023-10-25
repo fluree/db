@@ -130,6 +130,7 @@
 (def predicate-refs
   "The following predicates have objects that are refs to other predicates."
   #{const/$fluree:targetClass
+    const/$_predicate:equivalentProperty
     const/$rdfs:Class
     const/$rdfs:subClassOf
     const/$sh:alternativePath
