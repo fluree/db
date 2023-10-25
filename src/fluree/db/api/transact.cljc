@@ -1,15 +1,17 @@
 (ns fluree.db.api.transact
   (:require [clojure.walk :refer [keywordize-keys]]
+            [fluree.db.conn.proto :as conn-proto]
             [fluree.db.constants :as const]
+            [fluree.db.dbproto :as dbproto]
             [fluree.db.fuel :as fuel]
-            [fluree.db.util.core :as util :refer [try* catch*]]
-            [fluree.db.util.async :as async-util :refer [<? go-try]]
             [fluree.db.json-ld.transact :as tx]
             [fluree.db.ledger.json-ld :as jld-ledger]
-            [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.dbproto :as dbproto]
             [fluree.db.nameservice.core :as nameservice]
-            [fluree.json-ld :as json-ld]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.util.core :as util :refer [catch* try*]]
+            [fluree.db.util.log :as log]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.json-ld.credential :as cred]))
 
 (defn stage
   [db json-ld opts]
@@ -32,19 +34,56 @@
                                   e)))))
         (<? (dbproto/-stage db json-ld opts*))))))
 
+(defn parse-opts
+  [opts parsed-opts]
+  (reduce (fn [opts* [k v]] (assoc opts* (keyword k) v))
+          parsed-opts
+          opts))
+
+(defn stage2
+  [db txn parsed-opts]
+  (go-try
+    (let [{txn :subject did :did} (or (<? (cred/verify txn))
+                                      {:subject txn})
+          expanded                (json-ld/expand txn)
+          opts                    (util/get-first-value expanded const/iri-opts)
+          parsed-opts             (cond-> parsed-opts did (assoc :did did))
+
+          {:keys [maxFuel meta] :as parsed-opts*} (parse-opts opts parsed-opts)]
+      (if (or maxFuel meta)
+        (let [start-time   #?(:clj (System/nanoTime)
+                              :cljs (util/current-time-millis))
+              fuel-tracker (fuel/tracker maxFuel)]
+          (try* (let [result (<? (tx/stage2 db fuel-tracker expanded parsed-opts*))]
+                  {:status 200
+                   :result result
+                   :time   (util/response-time-formatted start-time)
+                   :fuel   (fuel/tally fuel-tracker)})
+                (catch* e
+                        (throw (ex-info "Error staging database"
+                                        {:time (util/response-time-formatted start-time)
+                                         :fuel (fuel/tally fuel-tracker)}
+                                        e)))))
+        (<? (tx/stage2 db expanded parsed-opts*))))))
+
 (defn parse-json-ld-txn
   "Expands top-level keys and parses any opts in json-ld transaction document.
   Throws if required keys @id or @graph are absent."
   [conn context-type json-ld]
   (let [conn-default-ctx (conn-proto/-default-context conn context-type)
-        parsed-cdc       (json-ld/parse-context conn-default-ctx)
         context-key      (cond
                            (contains? json-ld "@context") "@context"
                            (contains? json-ld :context) :context)
-        context          (get json-ld context-key)
-        parsed-context   (if context
-                           (json-ld/parse-context parsed-cdc context)
-                           parsed-cdc)
+        txn-context      (get json-ld context-key)
+        _                (log/trace "parse-json-ld-txn txn-context:" txn-context)
+        parsed-context   (if (or (nil? txn-context)
+                                 (and (sequential? txn-context)
+                                      (= "" (first txn-context))))
+                           (json-ld/parse-context
+                            (cons conn-default-ctx (rest txn-context)))
+                           (json-ld/parse-context txn-context))
+        _                (log/trace "parse-json-ld-txn parsed-context:" parsed-context)
+
         {ledger-id const/iri-ledger graph "@graph" :as parsed-txn}
         (into {}
               (map (fn [[k v]]

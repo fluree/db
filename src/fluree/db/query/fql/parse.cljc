@@ -85,15 +85,15 @@
 (defn safe-read
   [code-str]
   (try*
-   (let [code (read-string code-str)]
-     (when-not (list? code)
-       (throw (ex-info (code-str "Invalid function: " code-str)
-                       {:status 400 :error :db/invalid-query})))
-     code)
-   (catch* e
-     (log/warn e "Invalid query function attempted: " code-str)
-     (throw (ex-info (str "Invalid query function: " code-str)
-                     {:status 400 :error :db/invalid-query})))))
+    (let [code (read-string code-str)]
+      (when-not (list? code)
+        (throw (ex-info (code-str "Invalid function: " code-str)
+                        {:status 400 :error :db/invalid-query})))
+      code)
+    (catch* e
+      (log/warn e "Invalid query function attempted: " code-str)
+      (throw (ex-info (str "Invalid query function: " code-str)
+                      {:status 400 :error :db/invalid-query})))))
 
 (defn variables
   "Returns the set of items within the arbitrary data structure `data` that
@@ -409,21 +409,41 @@
   (when-let [where (:where q)]
     (parse-where-clause where vars db context)))
 
+(defn parse-as-fn
+  [f]
+  (let [parsed-fn  (parse-code f)
+        fn-name    (some-> parsed-fn second first)
+        bind-var   (last parsed-fn)
+        aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
+    (-> parsed-fn
+        eval/compile
+        (select/as-selector bind-var aggregate?))))
+
+(defn parse-fn
+  [f]
+  (-> f parse-code eval/compile select/aggregate-selector))
+
+(defn parse-select-map
+  [sm db context depth]
+  (log/trace "parse-select-map:" sm)
+  (let [{:keys [variable selection depth spec]} (parse-subselection db context
+                                                                    sm depth)]
+    (select/subgraph-selector variable selection depth spec)))
+
 (defn parse-selector
   [db context depth s]
-  (cond
-    (v/variable? s) (-> s parse-var-name select/variable-selector)
-    (v/as-fn? s)    (let [parsed-fn  (parse-code s)
-                          fn-name    (some-> parsed-fn second first)
-                          bind-var   (last parsed-fn)
-                          aggregate? (when fn-name (eval/allowed-aggregate-fns fn-name))]
-                      (-> parsed-fn
-                          eval/compile
-                          (select/as-selector bind-var aggregate?)))
-    (v/query-fn? s) (-> s parse-code eval/compile select/aggregate-selector)
-    (select-map? s) (let [{:keys [variable selection depth spec]}
-                          (parse-subselection db context s depth)]
-                      (select/subgraph-selector variable selection depth spec))))
+  (let [[selector-type selector-val] (syntax/parse-selector s)]
+    (case selector-type
+      :wildcard select/wildcard-selector
+      :var (-> selector-val symbol select/variable-selector)
+      :aggregate (case (first selector-val)
+                   :string-fn (if (re-find #"^\(as " s)
+                                (parse-as-fn s)
+                                (parse-fn s))
+                   :list-fn (if (= 'as (first s))
+                              (parse-as-fn s)
+                              (parse-fn s)))
+      :select-map (parse-select-map s db context depth))))
 
 (defn parse-select-clause
   [clause db context depth]
@@ -565,3 +585,88 @@
   (-> mdfn
       syntax/coerce-modification
       (parse-ledger-update db)))
+
+(defn temp-bnode-id
+  "Generate a temporary bnode id. This will get replaced during flake creation when a sid is generated."
+  [bnode-counter]
+  (str "_:fdb" (vswap! bnode-counter inc)))
+
+(declare parse-subj-cmp)
+(defn parse-obj-cmp
+  [bnode-counter subj-cmp pred-cmp m triples {:keys [list id value type language] :as v-map}]
+  (cond list
+        (reduce (fn [triples [i list-item]]
+                  (parse-obj-cmp bnode-counter subj-cmp pred-cmp {:i i} triples list-item))
+                triples
+                (map vector (range) list))
+
+        (some? value)
+        (let [obj-cmp (if (v/variable? value)
+                        (parse-variable value)
+                        (cond-> {::where/val value}
+                          (or m language) (assoc ::where/m (cond-> m language (assoc :lang language)))
+                          type (assoc ::where/datatype type)))]
+          (conj triples [subj-cmp pred-cmp obj-cmp]))
+
+        :else
+        (let [ref-cmp (if (nil? id)
+                        {::where/val (temp-bnode-id bnode-counter) ::where/datatype const/iri-id}
+                        (cond-> {::where/val id ::where/datatype const/iri-id}
+                          m (assoc ::where/m m)))
+              v-map* (if (nil? id)
+                       ;; project newly created bnode-id into v-map
+                       (assoc v-map :id (::where/val ref-cmp))
+                       v-map)]
+          (conj (parse-subj-cmp bnode-counter triples v-map*) [subj-cmp pred-cmp ref-cmp]))))
+
+(defn parse-pred-cmp
+  [bnode-counter subj-cmp triples [pred values]]
+  (let [values*  (if (= pred :type)
+                   ;; homogenize @type values so they have the same structure as other predicates
+                   (map #(do {:id %}) values)
+                   values)
+        pred-cmp (cond (v/variable? pred) (parse-variable pred)
+                       ;; we want the actual iri here, not the keyword
+                       (= pred :type)     {::where/val const/iri-type}
+                       :else              {::where/val pred})]
+    (reduce (partial parse-obj-cmp bnode-counter subj-cmp pred-cmp nil)
+            triples
+            values*)))
+
+(defn parse-subj-cmp
+  [bnode-counter triples {:keys [id] :as node}]
+  (let [subj-cmp (cond (nil? id) {::where/val (temp-bnode-id bnode-counter)}
+                       (v/variable? id) (parse-variable id)
+                       :else {::where/val id})]
+    (reduce (partial parse-pred-cmp bnode-counter subj-cmp)
+            triples
+            (dissoc node :id :idx))))
+
+(defn parse-triples
+  "Flattens and parses expanded json-ld into update triples."
+  [expanded]
+  (let [bnode-counter (volatile! 0)]
+    (reduce (partial parse-subj-cmp bnode-counter)
+            []
+            expanded)))
+
+(defn parse-txn
+  [txn db]
+  (let [context       (parse-context txn db)
+        [vars values] (parse-values {:values (util/get-first-value txn const/iri-values)})
+        where         (parse-where {:where (util/get-first-value txn const/iri-where)} vars db context)
+
+        delete (-> (util/get-first-value txn const/iri-delete)
+                   (json-ld/expand context)
+                   (util/sequential)
+                   (parse-triples))
+        insert (-> (util/get-first-value txn const/iri-insert)
+                   (json-ld/expand context)
+                   (util/sequential)
+                   (parse-triples))]
+    (cond-> {}
+      context            (assoc :context context)
+      where              (assoc :where where)
+      (seq values)       (assoc :values values)
+      (not-empty delete) (assoc :delete delete)
+      (not-empty insert) (assoc :insert insert))))

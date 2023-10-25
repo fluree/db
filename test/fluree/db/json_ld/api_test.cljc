@@ -3,6 +3,7 @@
                :cljs [cljs.test :refer-macros [deftest is testing async]])
             #?@(:cljs [[clojure.core.async :refer [go <!]]
                        [clojure.core.async.interop :refer [<p!]]])
+            [fluree.db.did :as did]
             [fluree.db.dbproto :as dbproto]
             [fluree.db.json-ld.api :as fluree]
             [fluree.db.query.range :as query-range]
@@ -886,3 +887,154 @@
                   (is (re-find #"Fuel limit exceeded"
                                (-> results ex-cause ex-message))))))))
         (done)))))
+
+#?(:clj
+   (deftest transaction-test
+     (let [conn   @(fluree/connect {:method :memory})
+           ledger-id "update-syntax"
+           ledger @(fluree/create conn ledger-id {:defaultContext [test-utils/default-str-context {"ex" "ns:ex/"}]})
+           db0    (fluree/db ledger)
+
+           db1 @(fluree/stage2 db0 {"@context" "https://ns.flur.ee"
+                                    "insert" [{"@id" "ex:dp"
+                                               "ex:name" "Dan"
+                                               "ex:child" [{"@id" "ex:ap" "ex:name" "AP"}
+                                                           {"@id" "ex:np" "ex:name" "NP"}]
+                                               "ex:spouse" [{"@id" "ex:kp" "ex:name" "KP"
+                                                             "ex:spouse" {"@id" "ex:dp"}}]}]})
+
+           db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
+                                    "where" [["?s" "ex:name" "?name"]]
+                                    "delete" {"@id" "?s" "ex:name" "?name"}
+                                    "insert" {"@graph"
+                                              [{"@id" "?s" "ex:name" "BORG"}
+                                               {"@id" "ex:mp"
+                                                "@type" "ex:Cat"
+                                                "ex:isPerson" false
+                                                "ex:isOrange" true
+                                                "ex:nickname" {"@language" "en" "@value" "The Wretch"}
+                                                "ex:name" "Murray"
+                                                "ex:address"
+                                                {"ex:street" "55 Bashford"
+                                                 "ex:city" "St. Paul"
+                                                 "ex:zip" {"@value" 55105 "@type" "ex:PostalCode"}
+                                                 "ex:state" "MN"}
+                                                "ex:favs" {"@list" ["Persey" {"@id" "ex:dp"}]}}]}})
+           db3 @(fluree/stage2 db2 {"@context" "https://ns.flur.ee"
+                                    "insert" {"@type" "sh:NodeShape"
+                                              "sh:targetClass" {"@id" "ex:Friend"}
+                                              "sh:property"
+                                              [{"sh:path" {"@id" "ex:nickname"}
+                                                "sh:maxCount" 1
+                                                "sh:datatype" {"@id" "xsd:string"}}]}})
+
+           db4 @(fluree/stage2 db3 {"@context" "https://ns.flur.ee"
+                                    "insert" {"@id" "ex:mp"
+                                              "@type" "ex:Friend"
+                                              "ex:nickname" "Murrseph Gordon-Levitt"}})
+
+           root-did  (:id (did/private->did-map "8ce4eca704d653dec594703c81a84c403c39f262e54ed014ed857438933a2e1c"))
+           alice-did (:id (did/private->did-map "c0459840c334ca9f20c257bed971da88bd9b1b5d4fca69d4e3f4b8504f981c07"))
+
+           db5 @(fluree/stage2 db3 {"@context" "https://ns.flur.ee"
+                                    "insert" {"@graph"
+                                              [{"@id" root-did "f:role" {"@id" "ex:rootRole"}}
+                                               {"@id" alice-did "f:role" {"@id" "ex:userRole"} "ex:user" {"@id" "ex:alice"}}
+                                               {"@id" "ex:alice"
+                                                "@type" "ex:User"
+                                                "schema:name" "Alice"
+                                                "schema:email" "alice@flur.ee"
+                                                "schema:birthDate" "2022-08-17"
+                                                "schema:ssn" "111-11-1111"
+                                                "ex:address" {"ex:state" "NC" "ex:country" "USA"}}
+                                               {"@id" "ex:john"
+                                                "@type" "ex:User"
+                                                "schema:name" "John"
+                                                "schema:email" "john@flur.ee"
+                                                "schema:birthDate" "2022-08-17"
+                                                "schema:ssn" "222-22-2222"
+                                                "ex:address" {"ex:state" "SC" "ex:country" "USA"}}
+                                               {"@id" "ex:rootPolicy"
+                                                "@type" "f:Policy"
+                                                "f:targetNode" {"@id" "f:allNodes"}
+                                                "f:allow" {"@id" "ex:rootAccessAllow"
+                                                           "f:targetRole" {"@id" "ex:rootRole"}
+                                                           "f:action" [{"@id" "f:view"} {"@id" "f:modify"}]}}
+                                               {"@id" "ex:userPolicy"
+                                                "@type" "f:Policy"
+                                                "f:targetClass" {"@id" "ex:User"}
+                                                "f:allow" {"@id" "ex:globalViewAllow"
+                                                           "f:targetRole" {"@id" "ex:userRole"}
+                                                           "f:action" [{"@id" "f:view"}]}
+                                                "f:property" {"f:path" {"@id" "schema:ssn"}
+                                                              "f:allow" {"@id" "ex:ssnViewRule"
+                                                                         "f:targetRole" "ex:userRole"
+                                                                         "f:action" {"@id" "f:view"}
+                                                                         "f:equals" {"@list" [{"@id" "f:$identity"}
+                                                                                              {"@id" "ex:user"}]}}}}]}})
+
+           committed @(fluree/commit! ledger db5)
+           loaded    @(fluree/load conn ledger-id)]
+       (is (= ["AP" "Dan" "KP" "NP"]
+              @(fluree/query db1 {"where" [["?s" "ex:name" "?name"]]
+                                  "select" "?name"})))
+       (is (= [{"id" "ex:mp"
+                "type" "ex:Cat"
+                "ex:name" "Murray"
+                "ex:favs" ["Persey" {"id" "ex:dp"}]
+                "ex:address" {"ex:street" "55 Bashford" "ex:city" "St. Paul" "ex:zip" 55105 "ex:state" "MN"}
+                "ex:isOrange" true
+                "ex:isPerson" false
+                "ex:nickname" "The Wretch"}]
+              @(fluree/query db2 {"where" [["?s" "ex:name" "Murray"]]
+                                  "select" {"?s" ["*" {"ex:address" ["ex:street" "ex:city" "ex:state" "ex:zip"]}]}})))
+
+       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
+              (ex-message db4)))
+
+       (is (= [{"id" "ex:john"
+                "type" "ex:User"
+                "ex:address" {"ex:state" "SC" "ex:country" "USA"}
+                "schema:birthDate" "2022-08-17"
+                "schema:name" "John"
+                "schema:email" "john@flur.ee"
+                "schema:ssn" "222-22-2222"}
+               {"id" "ex:alice"
+                "type" "ex:User"
+                "ex:address" {"ex:state" "NC" "ex:country" "USA"}
+                "schema:birthDate" "2022-08-17"
+                "schema:name" "Alice"
+                "schema:email" "alice@flur.ee"
+                "schema:ssn" "111-11-1111"}]
+              @(fluree/query db5 {:where [["?s" "@type" "ex:User"]]
+                                  :select {"?s" ["*" {"ex:address" ["ex:state" "ex:country"]}]}
+                                  :opts {:did root-did
+                                         :role "ex:rootRole"}}))
+           "rootRole user can see all ex:Users")
+
+       (is (= [{"id" "ex:john"
+                "schema:email" "john@flur.ee"
+                "schema:birthDate" "2022-08-17"
+                "schema:name" "John"}
+               {"id" "ex:alice"
+                "schema:email" "alice@flur.ee"
+                "schema:birthDate" "2022-08-17"
+                "schema:name" "Alice"
+                "schema:ssn" "111-11-1111"}]
+              @(fluree/query db5 {:where [["?s" "@type" "ex:User"]]
+                                  :select {"?s" ["*" {"ex:address" ["*"]}]}
+                                  :opts {:did alice-did :role "ex:userRole"}}))
+           "userRole user can see all ex:Users but only their own ssn")
+
+       (is (= 132
+              (-> @(fluree/history ledger {:commit-details true :t {:from :latest}})
+                  (first)
+                  (get "f:commit")
+                  (get "f:data")
+                  (get "f:flakes"))))
+       (is (= 132
+              (-> @(fluree/history loaded {:commit-details true :t {:from :latest}})
+                  (first)
+                  (get "f:commit")
+                  (get "f:data")
+                  (get "f:flakes")))))))

@@ -100,7 +100,7 @@
 (defn parse-subselection
   [db context select-map depth]
   (let [{:keys [variable selection depth]} (parse-map select-map depth)
-        spec                               (expand-selection db context depth selection)]
+        spec (expand-selection db context depth selection)]
     {:variable  variable
      :selection selection
      :depth     depth
@@ -113,11 +113,13 @@
   (reduce
     (fn [acc select-item]
       (if-let [selection (:selection select-item)]
-        (conj acc (assoc select-item :spec (expand-selection db context (:depth select-item) selection)))
+        (conj acc (assoc select-item :spec
+                                     (expand-selection db context
+                                                       (:depth select-item)
+                                                       selection)))
         (conj acc select-item)))
     []
     parsed-select))
-
 
 (defn parse
   [{:keys [limit pretty-print context depth where] :as parsed-query}

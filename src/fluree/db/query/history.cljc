@@ -1,5 +1,6 @@
 (ns fluree.db.query.history
   (:require [clojure.core.async :as async :refer [go >! <!]]
+            [clojure.string :as str]
             [malli.core :as m]
             [fluree.json-ld :as json-ld]
             [fluree.db.constants :as const]
@@ -10,6 +11,7 @@
             [fluree.db.query.json-ld.response :as json-ld-resp]
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.docs :as docs]
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.db.json-ld :as jld-db]
@@ -24,14 +26,18 @@
   it wants to require, which are not required/supported here in the db library."
   [extra-kvs]
   [:and
-     [:map-of ::json-ld-keyword :any]
+   [:map-of ::json-ld-keyword :any]
+   [:fn {:error/message "Must supply a value for either \"history\" or \"commit-details\""}
+    (fn [{:keys [history commit-details t]}]
+      (or (string? history) (keyword? history) (seq history) commit-details))]
    (into
      [:map
       [:history {:optional true}
-       [:orn
-        [:subject ::iri]
+       [:orn {:error/message
+              "Value of \"history\" must be a subject, or a vector containing one or more of subject, predicate, object"}
+        [:subject {:error/message "Invalid iri"} ::iri]
         [:flake
-         [:or
+         [:or {:error/message "Must provide a tuple of one more more iris"}
           [:catn
            [:s ::iri]]
           [:catn
@@ -41,39 +47,44 @@
            [:s [:maybe ::iri]]
            [:p ::iri]
            [:o [:not :nil]]]]]]]
-      [:commit-details {:optional true} :boolean]
+      [:commit-details {:optional true
+                        :error/message "Invalid value of \"commit-details\" key"} :boolean]
       [:context {:optional true} ::context]
       [:opts {:optional true} [:map-of :keyword :any]]
       [:t
        [:and
-        [:map-of :keyword :any]
+        [:map-of {:error/message "Value of \"t\" must be a map"} :keyword :any]
         [:map
-         [:from {:optional true} [:or
-                                  [:= :latest]
-                                  [:int {:min 0}]
-                                  [:re datatype/iso8601-datetime-re]]]
-         [:to {:optional true} [:or
-                                [:= :latest]
-                                [:int {:min 0}]
-                                [:re datatype/iso8601-datetime-re]]]
-         [:at {:optional true} [:or
-                                [:= :latest]
-                                [:int {:min 0}]
-                                [:re datatype/iso8601-datetime-re]]]]
-        [:fn {:error/message "Either \"from\" or \"to\" `t` keys must be provided."}
+         [:from {:optional true}
+          [:or {:error/message "Value of \"from\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+           [:= :latest]
+           [:int {:min 0
+                  :error/message "Must be a positive value"} ]
+           [:re datatype/iso8601-datetime-re]]]
+         [:to {:optional true}
+          [:or {:error/message "Value of \"to\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+           [:=  :latest]
+           [:int {:min 0
+                  :error/message "Must be a positive value"}]
+           [:re datatype/iso8601-datetime-re]]]
+         [:at {:optional true}
+          [:or {:error/message "Value of \"at\" must be one of: the key latest, an integer > 0, or an iso-8601 datetime value"}
+           [:= :latest]
+           [:int {:min 0
+                  :error/message "Must be a positive value"} ]
+           [:re datatype/iso8601-datetime-re]]]]
+        [:fn {:error/message "Must provide: either \"from\" or \"to\", or the key \"at\" "}
          (fn [{:keys [from to at]}]
            ;; if you have :at, you cannot have :from or :to
            (if at
              (not (or from to))
              (or from to)))]
-        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value."}
+        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value,"}
          (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                    (<= from to)
                                    true))]]]]
-     extra-kvs)
-     [:fn {:error/message "Must supply either a :history or :commit-details key."}
-      (fn [{:keys [history commit-details t]}]
-        (or history commit-details))]])
+     extra-kvs)])
+
 
 (def registry
   (merge
