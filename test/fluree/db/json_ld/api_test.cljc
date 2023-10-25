@@ -964,7 +964,22 @@
                                                                          "f:equals" {"@list" [{"@id" "f:$identity"}
                                                                                               {"@id" "ex:user"}]}}}}]}})
 
-           committed @(fluree/commit! ledger db5)
+           db6 @(fluree/stage2 db5 {"@context" "https://ns.flur.ee",
+                                    "insert" [{"@id" "schema:givenName", "@type" "rdf:Property"}
+                                              {"@id" "ex:firstName",
+                                               "@type" "rdf:Property",
+                                               "owl:equivalentProperty" {"@id" "schema:givenName"}}
+                                              {"@id" "foaf:name",
+                                               "@type" "rdf:Property",
+                                               "owl:equivalentProperty" {"@id" "ex:firstName"}}]})
+
+           db7 @(fluree/stage2 db6 {"@context" "https://ns.flur.ee",
+                                    "insert" [{"@id" "ex:andrew", "schema:givenName" "Andrew"}
+                                              {"@id" "ex:freddy", "foaf:name" "Freddy"}
+                                              {"@id" "ex:letty", "ex:firstName" "Leticia"}
+                                              {"@id" "ex:betty", "ex:firstName" "Betty"}]})
+
+           committed @(fluree/commit! ledger db7)
            loaded    @(fluree/load conn ledger-id)]
        (is (= ["AP" "Dan" "KP" "NP"]
               @(fluree/query db1 {"where" [["?s" "ex:name" "?name"]]
@@ -1017,13 +1032,18 @@
                                   :opts {:did alice-did :role "ex:userRole"}}))
            "userRole user can see all ex:Users but only their own ssn")
 
-       (is (= 132
+       (is (= #{"Freddy" "Betty" "Leticia" "Andrew"}
+              (set @(fluree/query db7 {"selectDistinct" "?name",
+                                       "where" [["?s" "schema:givenName" "?name"]]})))
+           "equivalentProperty annotations work")
+
+       (is (= 150
               (-> @(fluree/history ledger {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
                   (get "f:data")
                   (get "f:flakes"))))
-       (is (= 132
+       (is (= 150
               (-> @(fluree/history loaded {:commit-details true :t {:from :latest}})
                   (first)
                   (get "f:commit")
