@@ -12,7 +12,6 @@ test("expect all flureenjs functions to be defined", () => {
     "defaultContextAtT",
     "exists",
     "load",
-    "loadFromAddress",
     "query",
     "setLogging",
     "stage",
