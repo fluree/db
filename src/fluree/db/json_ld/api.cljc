@@ -18,6 +18,7 @@
             [fluree.db.util.log :as log]
             [fluree.db.query.range :as query-range]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.conn.core :refer [cached-ledger notify-ledger]]
             [fluree.db.json-ld.policy :as perm])
   (:refer-clojure :exclude [merge load range exists?]))
 
@@ -157,9 +158,11 @@
   [conn ledger-alias]
   (promise-wrap
     (go
-      (let [address (<! (alias->address conn ledger-alias))]
-        (log/debug "Loading ledger from" address)
-        (<! (jld-ledger/load conn address))))))
+      (if-let [cached-ledger (cached-ledger conn ledger-alias)]
+        cached-ledger
+        (let [address (<! (alias->address conn ledger-alias))]
+          (log/debug "Loading ledger from" address)
+          (<! (jld-ledger/load conn address)))))))
 
 (defn exists?
   "Returns a promise with true if the ledger alias or address exists, false
@@ -191,6 +194,21 @@
   Returns an updated db."
   [db default-context]
   (dbproto/-default-context-update db default-context))
+
+(defn notify
+  "Notifies the connection with a new commit map (parsed JSON commit with string keys).
+
+  If the connection knows of the ledger, and is currently maintaining
+  an in-memory version of the ledger, will attempt to update the db if the commit
+  is for the next 't' value. If a commit is for a past 't' value, noop.
+  If commit is for a future 't' value, will drop in-memory ledger for reload upon next request."
+  [conn commit-map]
+  (promise-wrap
+    (if (map? commit-map)
+      (notify-ledger conn commit-map)
+      (go
+        (ex-info (str "Invalid commit map, perhaps it is JSON that needs to be parsed first?: " commit-map)
+                 {:status 400 :error :db/invalid-commit-map})))))
 
 
 (defn index

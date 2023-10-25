@@ -6,7 +6,7 @@
             [fluree.crypto :as crypto]
             [fluree.db.conn.cache :as conn-cache]
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.conn.state-machine :as state-machine]
+            [fluree.db.conn.core :as conn-core]
             [fluree.db.full-text :as full-text]
             [fluree.db.index :as index]
             [fluree.db.indexer.default :as idx-default]
@@ -17,7 +17,8 @@
             [fluree.db.util.core :as util]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]
-            [fluree.json-ld :as json-ld]))
+            [fluree.json-ld :as json-ld])
+  (:import (java.io Writer)))
 
 (set! *warn-on-reflection* true)
 
@@ -123,6 +124,12 @@
     (throw (ex-info "S3 connection does not support full text operations."
                     {:status 400, :error :db/unsupported-operation}))))
 
+
+(defmethod print-method S3Connection [^S3Connection conn, ^Writer w]
+  (.write w (str "#S3Connection "))
+  (binding [*out* w]
+    (pr (conn-core/printer-map conn))))
+
 (defn ledger-defaults
   [{:keys [context context-type did indexer]}]
   {:context      (ctx-util/stringify-context context)
@@ -156,7 +163,7 @@
                                  s3-endpoint (assoc :endpoint-override s3-endpoint))
           client         (aws/client aws-opts)
           conn-id        (str (random-uuid))
-          state          (state-machine/blank-state)
+          state          (conn-core/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-S3-nameservice client s3-bucket s3-prefix)))
           cache-size     (conn-cache/memory->cache-size memory)

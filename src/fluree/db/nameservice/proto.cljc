@@ -5,7 +5,7 @@
 (defprotocol iNameService
   (-lookup [nameservice ledger-alias] [nameservice ledger-alias opts] "Performs lookup operation on ledger alias and returns map of latest commit and other metadata")
   (-push [nameservice commit-data] "Pushes new commit to nameservice.")
-  (-subscribe [nameservice ledger-alias callback] "Creates a subscription to nameservice(s) for ledger events")
+  (-subscribe [nameservice ledger-alias callback] "Creates a subscription to nameservice(s) for ledger events. Will call callback with event data as received.")
   (-unsubscribe [nameservice ledger-alias] "Unsubscribes to nameservice(s) for ledger events")
   (-sync? [nameservice] "Indicates if nameservice updates should be performed synchronously, before commit is finalized. Failure will cause commit to fail")
 

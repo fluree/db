@@ -12,7 +12,8 @@
             [fluree.db.platform :as platform]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log :include-macros true])
-  (:import #?@(:clj  ((org.httpkit.client TimeoutException))
+  (:import #?@(:clj  ((org.httpkit.client TimeoutException)
+                      (java.nio HeapCharBuffer))
                :cljs ((goog.net.ErrorCode)))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -133,7 +134,7 @@
   :request-timeout - how many milliseconds until we throw an exception without a response (default 5000)"
   [url message opts]
   (let [base-req (if (contains? message :multipart)
-                   (->> (:multipart message)                ;; stringify each :content key of multipart message
+                   (->> (:multipart message) ;; stringify each :content key of multipart message
                         (mapv #(assoc % :content (json/stringify (:content %))))
                         (assoc message :multipart))
                    (json/stringify message))]
@@ -219,14 +220,59 @@
                       (:body opts) (assoc :body (json/stringify (:body opts))))]
     (get url opts*)))
 
+(def ws-close-status-codes
+  {:normal-close {:code 1000 :reason "Normal closure"}
+   :going-away   {:code 1001 :reason "Going away"}
+   :protocol     {:code 1002 :reason "Protocol error"}
+   :unsupported  {:code 1003 :reason "Unsupported data"}
+   :no-status    {:code 1005 :reason "No status code"}
+   :abnormal     {:code 1006 :reason "Abnormal closure"}
+   :bad-data     {:code 1007 :reason "Invalid frame payload data"}
+   :policy       {:code 1008 :reason "Policy violation"}
+   :too-big      {:code 1009 :reason "Message too big"}
+   :extension    {:code 1010 :reason "Missing extension"}
+   :unexpected   {:code 1011 :reason "Internal error"}
+   :internal     {:code 1012 :reason "Service restart"}
+   :service      {:code 1013 :reason "Try again later"}
+   :gateway      {:code 1014 :reason "Bad gateway"}
+   :tls          {:code 1015 :reason "TLS handshake"}})
+
+
+
+(defn close-websocket
+  "Closes websocket with optional reason-keyword which
+  will utilize the respective status code and reason string
+  from ws-close-status-codes.
+  Status code info:
+  https://www.rfc-editor.org/rfc/rfc6455.html#section-7.1.5"
+  ([ws]
+   #?(:clj  (ws/close! ws)
+      :cljs (.close ws)))
+  ([ws reason-kw]
+   (let [code   (get-in ws-close-status-codes [reason-kw :code] 1000)
+         reason (get-in ws-close-status-codes [reason-kw :reason] "Normal closure")]
+     #?(:clj  (ws/close! ws code reason)
+        :cljs (.close ws code reason)))))
 
 (defn socket-publish-loop
+  "Sends messages out as they appear on pub-chan.
+  If no message has sent out recently, sends a ping message.
+
+  Does not use ws/ping! as in CLJS web browser support for a
+  true ping is limited/non-existent, so just sends a ping event
+  over the normal message channel which has the same keep-alive effect."
   [ws pub-chan]
   (async/go-loop []
-    (let [val (async/<! pub-chan)]
-      (if (nil? val)
-        (log/info "Web socket pub/producer channel closed.")
-        (let [[msg resp-chan] val]
+    (let [ping-chan (async/timeout 20000)
+          [val ch] (async/alts! [pub-chan ping-chan])]
+      (if (and (= ch pub-chan)
+               (nil? val))
+        (do
+          (log/info "Web socket pub/producer channel closed.")
+          (close-websocket ws :going-away))
+        (let [[msg resp-chan] (if (= ch ping-chan)
+                                [(json/stringify {"action" "ping"}) nil]
+                                val)]
           (try*
             #?(:clj  (ws/send! ws msg)
                :cljs (.send ws msg))
@@ -239,12 +285,6 @@
           (recur))))))
 
 
-(defn close-websocket
-  [ws]
-  #?(:clj  (ws/close! ws)
-     :cljs (.close ws)))
-
-
 (defn try-socket
   [url sub-chan pub-chan resp-chan timeout close-fn]
   #?(:clj
@@ -252,7 +292,12 @@
                       :on-close        (fn [_ status reason]
                                          (log/debug "Websocket closed; status:" status
                                                     "reason:" reason)
-                                         (close-fn))
+                                         (let [abnormal? (= status (get-in ws-close-status-codes [:abnormal :code]))]
+                                           (if abnormal?
+                                             (do
+                                               (log/info "Abnormal websocket closure, attempting to re-establish connection.")
+                                               (try-socket url sub-chan pub-chan resp-chan timeout close-fn))
+                                             (close-fn))))
                       :headers         nil
                       :on-open         (fn [_]
                                          (log/debug "Websocket opened"))
@@ -261,7 +306,7 @@
                                          (close-fn)
                                          (when-not (nil? e) (async/put! resp-chan e)))
                       :on-message      (fn [_ msg last?]
-                                         (async/put! sub-chan [:on-message msg last?]))
+                                         (async/put! sub-chan [:on-message (.toString ^HeapCharBuffer msg) last?]))
                       :on-ping         (fn [ws msg]
                                          (async/put! sub-chan [:on-ping msg])
                                          (ws/pong! ws msg))

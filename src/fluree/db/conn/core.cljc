@@ -1,8 +1,11 @@
-(ns fluree.db.conn.state-machine
-  (:require [fluree.db.util.core :as util]
-            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+(ns fluree.db.conn.core
+  (:require [clojure.core.async :as async]
+            [fluree.db.constants :as const]
+            [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch* get-first-value]]
             [fluree.db.util.log :as log :include-macros true]
-            [clojure.core.async :as async]))
+            [fluree.db.util.async :refer [<? go-try]]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.ledger.proto :as ledger-proto]))
 
 ;; state machine for connections
 
@@ -11,18 +14,15 @@
 
 (comment
   ;; state machine looks like this:
-  {:ledger {"ledger-a" {:event-fn :main-system-event-fn     ;; returns async-chan response once complete
-                        :subs     {:sub-id :sub-fn}         ;; active subscriptions
+  {:ledger {"ledger-a" {:event-fn :main-system-event-fn ;; returns async-chan response once complete
+                        :subs     {:sub-id :sub-fn} ;; active subscriptions
                         ;; map of branches, along with current/default branch
                         :branches {}
                         :branch   {}}}
 
 
-   :await  {:msg-id :async-res-ch}                          ;; map of msg-ids to response chans for messages awaiting responses
-   :stats  {}})                                               ;; any stats about the connection itself
-
-
-
+   :await  {:msg-id :async-res-ch} ;; map of msg-ids to response chans for messages awaiting responses
+   :stats  {}}) ;; any stats about the connection itself
 
 
 (defn blank-state
@@ -34,15 +34,9 @@
      :stats   {}
      :closed? false}))
 
-
 (defn mark-closed
   [{:keys [state] :as conn}]
   (swap! state assoc :closed? true))
-
-(defn clear-state
-  [])
-
-
 
 
 (defn await-response
@@ -54,7 +48,6 @@
     (swap! state assoc-in [:ledger ledger :await id] res-ch)
     res-ch))
 
-
 (defn subscribe
   "Creates a new subscription on given ledger where 'callback' function
   will get executed with every new message.
@@ -63,7 +56,6 @@
   [{:keys [state] :as conn} ledger callback sub-id]
   (let [id (or sub-id (random-uuid))]
     (swap! state assoc-in [:ledger ledger :subs id] callback)))
-
 
 (defn- message-response
   "Checks for any pending callback functions for incoming messages.
@@ -100,3 +92,51 @@
     (if request-resp?
       (message-response conn msg)
       (conn-event conn msg))))
+
+(defn register-ledger
+  "Records a reference to a loaded ledger on the conn's state atom,
+  so a ledger 'load' event can see first if a ledger is already loaded
+  before going to storage.
+
+  Also allows already loaded ledger to be updated with incoming new
+  commit messages"
+  ([{:keys [state] :as _conn} {:keys [alias] :as ledger}]
+   (swap! state assoc-in [:ledger alias] ledger))
+  ([{:keys [state] :as _conn} ledger ledger-alias]
+   (swap! state assoc-in [:ledger ledger-alias] ledger)))
+
+(defn release-ledger
+  "Opposite of register-ledger. Removes reference to a ledger from conn"
+  [{:keys [state] :as _conn} ledger-alias]
+  (swap! state update :ledger dissoc ledger-alias))
+
+(defn release-all-ledgers
+  "Releases all ledgers from conn.
+  Typically used when closing a connection to release resources."
+  [{:keys [state] :as _conn}]
+  (swap! state assoc :ledger {}))
+
+(defn cached-ledger
+  "Returns a cached ledger from the connection if it is cached, else nil"
+  [{:keys [state] :as _conn} ledger-alias]
+  (get-in @state [:ledger ledger-alias]))
+
+(defn notify-ledger
+  [conn commit-map]
+  (go-try
+    (let [expanded-commit (json-ld/expand commit-map)
+          ledger-alias    (get-first-value expanded-commit const/iri-alias)
+          ledger          (cached-ledger conn ledger-alias)]
+      (if ledger
+        (<? (ledger-proto/-notify ledger expanded-commit))
+        (log/debug "No cached ledger found for commit: " commit-map)))))
+
+(defn printer-map
+  "Returns map of important data for print writer"
+  [conn]
+  {:id              (:id conn)
+   :stats           (get @(:state conn) :stats)
+   :cached-ledgers  (keys (get @(:state conn) :ledgers))
+   :nameservices    (mapv type (:nameservices conn))
+   :ledger-defaults (:ledger-defaults conn)
+   :parallelism     (:parallelism conn)})

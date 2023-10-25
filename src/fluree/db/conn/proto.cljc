@@ -12,7 +12,7 @@
   (-context-type [conn] "Returns the context-type for the default-context")
   (-new-indexer [conn opts] "Returns optional default new indexer object for a new ledger with optional opts.")
   (-did [conn] "Returns optional default did map if set at connection level")
-  (-msg-in [conn msg] "Handler for incoming message from connection service")
+  (-msg-in [conn msg] "Handler for incoming message from nameservices")
   (-msg-out [conn msg] "Pushes outgoing messages/commands to connection service")
   (-nameservices [conn] "Returns a sequence of all nameservices configured for the connection.")
   (-state [conn] [conn ledger] "Returns internal state-machine information for connection, or specific ledger"))

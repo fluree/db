@@ -9,15 +9,17 @@
             [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.state-machine :as state-machine]
+            [fluree.db.conn.core :as conn-core]
             [fluree.db.method.remote.core :as remote]
             [fluree.db.nameservice.remote :as ns-remote]
             [fluree.db.indexer.default :as idx-default]
-            [clojure.string :as str]))
+            [clojure.string :as str])
+  #?(:clj (:import (java.io Writer))))
 
 
-(defrecord RemoteConnection [id server-state state lru-cache-atom serializer nameservices
-                             ledger-defaults parallelism msg-in-ch msg-out-ch]
+
+(defrecord RemoteConnection [id server-state state lru-cache-atom serializer
+                             nameservices ledger-defaults parallelism]
 
   conn-proto/iStorage
   (-c-read [_ commit-key] (remote/remote-read state server-state commit-key false))
@@ -40,7 +42,6 @@
   (-context-type [_] (:context-type ledger-defaults))
   (-did [_] (:did ledger-defaults))
   (-msg-in [_ msg] (go-try
-                     ;; TODO - push into state machine
                      (log/warn "-msg-in: " msg)
                      :TODO))
   (-msg-out [_ msg] (go-try
@@ -64,6 +65,19 @@
           (fn [_]
             (storage/resolve-index-node conn node
                                         (fn [] (conn-cache/lru-evict lru-cache-atom cache-key)))))))))
+
+#?(:cljs
+   (extend-type RemoteConnection
+     IPrintWithWriter
+     (-pr-writer [conn w opts]
+       (-write w "#RemoteConnection ")
+       (-write w (pr (conn-core/printer-map conn))))))
+
+#?(:clj
+   (defmethod print-method RemoteConnection [^RemoteConnection conn, ^Writer w]
+     (.write w (str "#RemoteConnection "))
+     (binding [*out* w]
+       (pr (conn-core/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
@@ -90,7 +104,7 @@
                                  :connected-to nil
                                  :stats        {:connected-at nil}})
           conn-id         (str (random-uuid))
-          state           (state-machine/blank-state)
+          state           (conn-core/blank-state)
           nameservices*   (util/sequential
                             (or nameservices (default-remote-nameservice server-state state)))
           cache-size      (conn-cache/memory->cache-size memory)
@@ -103,6 +117,4 @@
                               :serializer      serializer
                               :ledger-defaults ledger-defaults
                               :parallelism     parallelism
-                              :nameservices    nameservices*
-                              :msg-in-ch       (chan)
-                              :msg-out-ch      (chan)}))))
+                              :nameservices    nameservices*}))))

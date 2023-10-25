@@ -4,6 +4,7 @@
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.util.async :refer [<? go-try]]
+            [fluree.db.conn.core :refer [notify-ledger]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -92,3 +93,31 @@
               true
               (recur (rest nameservices*))))
           false)))))
+
+(defn subscribe-ledger
+  "Initiates subscription requests for a ledger into all namespaces on a connection."
+  [conn ledger-alias]
+  (let [nameservices (nameservices conn)
+        callback     (fn [msg]
+                       (log/info "Subscription message received: " msg)
+                       (let [action       (get msg "action")
+                             ledger-alias (get msg "ledger")
+                             data         (get msg "data")]
+                         (if (= "new-commit" action)
+                           (notify-ledger conn data)
+                           (log/info "New subscritipn message with action: " action "received, ignored."))))]
+    (go-try
+      (loop [nameservices* nameservices]
+        (when-let [ns (first nameservices*)]
+          (<? (ns-proto/-subscribe ns ledger-alias callback))
+          (recur (rest nameservices*)))))))
+
+(defn unsubscribe-ledger
+  "Initiates unsubscription requests for a ledger into all namespaces on a connection."
+  [conn ledger-alias]
+  (let [nameservices (nameservices conn)]
+    (go-try
+      (loop [nameservices* nameservices]
+        (when-let [ns (first nameservices*)]
+          (<? (ns-proto/-unsubscribe ns ledger-alias))
+          (recur (rest nameservices*)))))))

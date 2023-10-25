@@ -6,6 +6,8 @@
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
+(def message-codes {:subscribe-ledger   1
+                    :unsubscribe-ledger 2})
 
 (defn pick-server
   "Currently does just a round-robin selection if multiple servers are given.
@@ -30,25 +32,80 @@
                      {:resource commit-key}
                      {:keywordize-keys keywordize-keys?})))
 
-;; NOTE, below function works in conjunction with message broadcasting (not in current PR)
-#_(defn remote-read
-    "Returns a core async channel with value of remote resource."
-    [state servers commit-key keywordize-keys?]
-    (log/debug "[remote conn] remote read initiated for: " commit-key)
-    (if-let [cached (get-in @state [:resource commit-key])]
-      (go cached)
-      (xhttp/post-json (str (pick-server servers) "/fluree/remoteResource")
-                       {:resource commit-key}
-                       {:keywordize-keys keywordize-keys?})))
+(defn monitor-messages
+  [conn msg-in msg-out]
+  (async/go-loop [next-msg (async/<! msg-in)]
+    (if next-msg
+      (let []
+        (log/warn "MESSAGE RECEIVED!!: " next-msg)
+        (recur (async/<! msg-in)))
+      (log/info "Websocket messaging connection closed."))))
 
 
-;; NOTE, below function works in conjunction with message broadcasting (not in current PR)
-#_(defn remote-lookup
-    [state servers ledger-address]
-    (go-try
-      (or (get-in @state [:lookup ledger-address])
-          (let [head-commit  (<? (remote-read state servers ledger-address false))
-                head-address (get head-commit "address")]
-            (swap! state assoc-in [:lookup ledger-address] head-address)
-            (swap! state assoc-in [:resource head-address] head-commit)
-            head-address))))
+
+(defn ws-connect
+  "Returns websocket or exception wrapped in a promise-chan."
+  [server-state msg-in msg-out]
+  (let [current-server (pick-server server-state)
+        ws-chan        (async/promise-chan)
+        url            (-> current-server
+                           (str/replace-first "http" "ws")
+                           (str "/fluree/subscribe"))
+        timeout        10000
+        close-fn       (fn []
+                         (log/warn "Websocket connection closed!"))]
+    (xhttp/try-socket url msg-in msg-out ws-chan timeout close-fn) ;; will return success or error on ws-chan
+    (async/go
+      (let [ws (async/<! ws-chan)]
+        (async/close! ws-chan)
+        (if (util/exception? ws)
+          (log/warn "Error establishing websocket connection:" ws)
+          (log/debug "Websocket connection successfully established."))))
+    ws-chan))
+
+
+(defn subscribed-ledger?
+  [{:keys [server-state] :as _conn} ledger-id]
+  (boolean
+    (get-in @server-state [:subscriptions ledger-id])))
+
+(defn record-ledger-subscription
+  [{:keys [server-state] :as _conn} ledger-id]
+  (swap! server-state assoc-in [:subscriptions ledger-id] {:subscribed-at (util/current-time-millis)}))
+
+(defn remove-ledger-subscription
+  [{:keys [server-state] :as _conn} ledger-id]
+  (swap! server-state update :subscriptions dissoc ledger-id))
+
+(defn subscribe-ledger-msg
+  [ledger-id]
+  (json/stringify
+    [(:subscribe-ledger message-codes) ledger-id]))
+
+(defn request-ledger-subscribe
+  [conn ledger-id]
+  #_(conn-proto/-msg-out conn {:action :subscribe
+                               :ledger ledger-id}))
+
+(defn request-ledger-unsubscribe
+  [conn ledger-id]
+  #_(conn-proto/-msg-out conn {:action :unsubscribe
+                               :ledger ledger-id}))
+
+(defn unsubscribe-ledger
+  [conn ledger-id]
+  (log/debug "Subscriptions request for ledger: " ledger-id)
+  (if (subscribed-ledger? conn ledger-id)
+    (log/info "Subscription requested for ledger already exists: " ledger-id)
+    (do
+      (remove-ledger-subscription conn ledger-id)
+      (request-ledger-unsubscribe conn ledger-id))))
+
+(defn subscribe-ledger
+  [conn ledger-id]
+  (log/debug "Subscriptions request for ledger: " ledger-id)
+  (if (subscribed-ledger? conn ledger-id)
+    (log/info "Subscription requested for ledger already exists: " ledger-id)
+    (do
+      (record-ledger-subscription conn ledger-id)
+      (request-ledger-subscribe conn ledger-id))))
