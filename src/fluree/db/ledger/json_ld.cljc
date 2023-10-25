@@ -293,6 +293,7 @@
         ;; includes other ledgers - experimental
         (let [db* (<? (include-dbs conn db include))]
           (ledger-proto/-db-update ledger db*)))
+      (register-ledger conn ledger ledger-alias)
       ledger)))
 
 (defn commit->ledger-alias

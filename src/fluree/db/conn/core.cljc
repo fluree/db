@@ -101,7 +101,7 @@
   Also allows already loaded ledger to be updated with incoming new
   commit messages"
   ([{:keys [state] :as _conn} {:keys [alias] :as ledger}]
-   (swap! state assoc-in [:ledger alias] ledger))
+   (register-ledger state ledger alias))
   ([{:keys [state] :as _conn} ledger ledger-alias]
    (swap! state assoc-in [:ledger ledger-alias] ledger)))
 

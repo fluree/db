@@ -109,13 +109,13 @@
                                                                           :blah "http://blah.me/wow/ns/"}})
           db1      @(test-utils/transact ledger [{:id      :blah/one
                                                   :ex/name "One"}])
-          db1-load (fluree/db (test-utils/retry-load conn "ctx/stability" 100))
+          db1-load (fluree/db @(fluree/load conn "ctx/stability"))
           db2      @(test-utils/transact ledger [{:id      :blah/two
                                                   :ex/name "Two"}])
-          db2-load (fluree/db (test-utils/retry-load conn "ctx/stability" 100))
+          db2-load (fluree/db @(fluree/load conn "ctx/stability"))
           db3      @(test-utils/transact ledger [{:id      :blah/three
                                                   :ex/name "Three"}])
-          db3-load (fluree/db (test-utils/retry-load conn "ctx/stability" 100))]
+          db3-load (fluree/db @(fluree/load conn "ctx/stability"))]
 
       (testing "Loaded default context is same as initial db's"
         (is (= (dbproto/-default-context db1-load)
