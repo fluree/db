@@ -264,23 +264,31 @@
           (recur r (into vocab-flakes pred-flakes)))
         (schema vocab-flakes t)))))
 
+(defn predicate-sids
+  "Extract predicate sids from flakes."
+  [flakes]
+  (into #{}
+        (comp (filter flake/op)
+              (map
+                (fn [f]
+                  (let [p (flake/p f)
+                        o (flake/o f)]
+                    (->> [p
+                          ;; if p is a predicate ref, we know o is a predicate sid as well
+                          (when (contains? jld-ledger/predicate-refs p)
+                            o)
+                          ;; if p (type) has an o that says s is a predicate, include s as well
+                          (when (and (= p const/$rdf:type)
+                                     (jld-ledger/class-or-property-sid o))
+                            (flake/s f))]
+                         (remove nil?)))))
+              cat)
+        flakes))
+
 (defn hydrate-schema
   "Updates the :schema key of a by processing just the vocabulary flakes out of the new flakes."
   [db new-flakes]
-  (let [pred-sids    (into #{} (comp (filter flake/op)
-                                     (map (fn [f]
-                                            (let [p (flake/p f)]
-                                              (cond
-                                                ;; if p is a predicate ref, we know o is a predicate sid as well
-                                                (jld-ledger/predicate-refs p)
-                                                [p (flake/o f)]
-                                                ;; if p has an o that says s is a predicate, include s as well
-                                                (and (= p const/$rdf:type) (jld-ledger/class-or-property-sid (flake/o f)))
-                                                [p (flake/s f)]
-                                                :else
-                                                [p]))))
-                                     cat)
-                           new-flakes)
+  (let [pred-sids    (predicate-sids new-flakes)
         vocab-flakes (filterv #(pred-sids (flake/s %)) new-flakes)
         {:keys [t refs coll pred shapes prefix fullText subclasses]}
         (schema vocab-flakes (:t db))]
