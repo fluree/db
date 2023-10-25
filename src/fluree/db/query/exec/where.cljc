@@ -10,7 +10,8 @@
             [fluree.db.datatype :as datatype]
             [fluree.db.query.dataset :as dataset]
             [fluree.db.dbproto :as dbproto]
-            [fluree.db.constants :as const])
+            [fluree.db.constants :as const]
+            [fluree.db.json-ld.ledger :as ledger])
   #?(:clj (:import (clojure.lang MapEntry))))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -362,7 +363,8 @@
   [db p-mch]
   (let [db-alias (:alias db)
         p-iri    (::iri p-mch)]
-    (when-let [pid (dbproto/-p-prop db :id p-iri)]
+    (when-let [pid (or (get ledger/predefined-properties p-iri)
+                       (dbproto/-p-prop db :id p-iri))]
       (match-sid p-mch db-alias pid))))
 
 (defn evaluate-iris

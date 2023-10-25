@@ -25,6 +25,7 @@
          {"http://www.w3.org/1999/02/22-rdf-syntax-ns#Property" const/$rdf:Property
           const/iri-id                                          const/$xsd:anyURI
           const/iri-type                                        const/$rdf:type
+          const/iri-rdf-type                                    const/$rdf:type
           ;; rdfs
           "http://www.w3.org/2000/01/rdf-schema#Class"          const/$rdfs:Class
           "http://www.w3.org/2000/01/rdf-schema#subClassOf"     const/$rdfs:subClassOf
