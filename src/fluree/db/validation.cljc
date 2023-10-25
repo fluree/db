@@ -272,7 +272,7 @@
                             [:map ::where-map]
                             [:tuple ::where-tuple]]
     ::filter               [:sequential {:error/message "Filter must be a function call wrapped in a vector"} ::function]
-    ::optional             [:orn {:error/message "Invalid optional, must be a signle where pattern or vector of where patterns."}
+    ::optional             [:orn {:error/message "Invalid optional, must be a single where clause or vector of where clauses."}
                             [:single ::where-pattern]
                             [:collection [:sequential ::where-pattern]]]
     ::union                [:sequential [:sequential ::where-pattern]]
