@@ -23,16 +23,16 @@ test("expect all flureenjs functions to be defined", () => {
 test("expect conn, ledger, stage, commit, defaultContext, and query to work", async () => {
 
   const defaultCtx = {
-                       id: "@id",
-                       type: "@type",
-                       schema: "http://schema.org/",
-                       rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                       rdfs: "http://www.w3.org/2000/01/rdf-schema#",
-                       wiki: "https://www.wikidata.org/wiki/",
-                       skos: "http://www.w3.org/2008/05/skos#",
-                       f: "https://ns.flur.ee/ledger#",
-                       ex: "http://example.org/ns/"
-                     };
+    id: "@id",
+    type: "@type",
+    schema: "http://schema.org/",
+    rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    rdfs: "http://www.w3.org/2000/01/rdf-schema#",
+    wiki: "https://www.wikidata.org/wiki/",
+    skos: "http://www.w3.org/2008/05/skos#",
+    f: "https://ns.flur.ee/ledger#",
+    ex: "http://example.org/ns/"
+  };
 
   const conn = await flureenjs.connect({
     method: "memory",
@@ -84,7 +84,8 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
   // test providing context works and remaps keys
   const contextResults = await flureenjs.query(
     db1,
-    { "@context": ["", {"flhubee": "http://schema.org/name"}],
+    {
+      "@context": ["", { "flhubee": "http://schema.org/name" }],
       select: { "?s": ["*"] },
       where: [["?s", "type", "ex:User"]]
     }
@@ -105,17 +106,19 @@ test("expect conn, ledger, stage, commit, defaultContext, and query to work", as
     "@id": "uniqueId",
     foo: "foo",
     bar: "bar",
+    "fake:iri/baz": "baz",
   });
 
-//  await flureenjs.commit(db);
+  //  await flureenjs.commit(db);
 
   const results2 = await flureenjs.query(db2, {
+    "@context": ["", { b: "fake:iri/" }],
     select: { "?s": ["*"] },
     where: [["?s", "@id", "uniqueId"]],
   });
 
   expect(results2).toStrictEqual([
-    { "id": "uniqueId", foo: "foo", bar: "bar" },
+    { "id": "uniqueId", foo: "foo", bar: "bar", "b:baz": "baz" },
   ]);
 });
 
