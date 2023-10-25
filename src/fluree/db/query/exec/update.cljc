@@ -205,7 +205,7 @@
 (defn bnode-id
   "A stable bnode."
   [sid]
-  (str "_:" sid))
+  (str "_:f" sid))
 
 (defn create-id-flake
   [sid iri t]
