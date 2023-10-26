@@ -174,11 +174,11 @@
 
 (defn format-error
   [explained error error-opts]
-  (let [{:keys [path value]} error
-        top-level-key (some-> (first (filter top-level-query-keys path))
-                              name)
+  (let [{full-value :value} explained
+        {:keys [path value]} error
+        top-level-key (first (filter top-level-query-keys path))
         top-level-message (when top-level-key
-                            (str "Error in value for \"" top-level-key "\""))
+                            (str "Error in value for \"" (name top-level-key) "\""))
         [_ root-message] (resolve-root-error-for-in
                           explained
                           error
@@ -190,11 +190,15 @@
         docs-pointer-msg (when top-level-key
                            (str " See documentation for details: "
                                 docs/error-codes-page "#query-invalid-"
-                                (->> (str/replace top-level-key #"-" "")
+                                (->> (str/replace (name top-level-key) #"-" "")
                                      (map str/lower-case)
-                                     str/join)))]
+                                     str/join)))
+        provided-value    (or value full-value)]
     [top-level-message root-message direct-message
-     (str "Provided: " (pr-str value)) docs-pointer-msg]))
+     (some->> provided-value
+             pr-str
+             (str "Provided: "))
+     docs-pointer-msg]))
 
 (defn top-level-fn-error
   [errors]
