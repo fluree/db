@@ -495,7 +495,7 @@
                sub-obj    (dissoc o* ::sids ::iri)
                class-objs (into [o*]
                                 (comp (map (fn [cls]
-                                             (match-sid sub-obj cls db-alias)))
+                                             (match-sid sub-obj db-alias cls)))
                                       (remove nil?))
                                 (dbproto/-class-prop db :subclasses cls))
                class-ch   (async/to-chan! class-objs)]
