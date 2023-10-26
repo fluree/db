@@ -310,11 +310,12 @@
                               #"Invalid transaction, missing required keys: .+ledger"
                               @(fluree/transact! conn txn nil)))))))
 
-(deftest ^:pending base-and-vocab-test
+(deftest ^:integration base-and-vocab-test
   (testing "@base & @vocab work w/ stage"
-    (let [conn        (test-utils/create-conn)
+    (let [conn        @(fluree/connect {:method :memory})
           ctx         {"@base"  "http://example.org/"
-                       "@vocab" "http://example.org/terms/"}
+                       "@vocab" "http://example.org/terms/"
+                       "f"      "https://ns.flur.ee/ledger#"}
           ledger-name "cookbook/base"
           txn         {"@context" ctx
                        "f:ledger" ledger-name
@@ -332,7 +333,7 @@
                                  "where"    '{"@id" ?m
                                               "@type" "http://example.org/terms/SeaMonster"}})))))
   (testing "@base & @vocab work w/ stage2"
-    (let [conn        (test-utils/create-conn)
+    (let [conn        @(fluree/connect {:method :memory})
           ctx         ["https://ns.flur.ee"
                        {"@base"  "http://example.org/"
                         "@vocab" "http://example.org/terms/"}]

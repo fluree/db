@@ -681,8 +681,9 @@
                  (<? (perm/wrap-policy db policy-opts))
                  db)
            tx-state      (->tx-state2 db*)
-           context       (ctx-util/extract db* txn parsed-opts)
-           parsed-txn    (q-parse/parse-txn txn context)
+
+           txn-context   (dbproto/-context db* (:context parsed-opts))
+           parsed-txn    (q-parse/parse-txn txn txn-context db*)
            flakes-ch     (generate-flakes db fuel-tracker parsed-txn tx-state)
            fuel-error-ch (:error-ch fuel-tracker)
            chans         (remove nil? [fuel-error-ch flakes-ch])
