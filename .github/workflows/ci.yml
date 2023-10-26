@@ -4,6 +4,10 @@ on:
   schedule:
     - cron: 13 01 * * *
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   docker-build-cache:
     name: docker build cache
