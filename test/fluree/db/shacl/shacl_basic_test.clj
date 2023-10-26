@@ -1541,8 +1541,8 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                         "ex:address" {"ex:postalCode" ["12345" "45678"]}}})]
       (is (= [{"id"         "ex:Bob",
                "type" "ex:Person",
-               "ex:address" {"id" "_:f211106232532997", "ex:postalCode" "12345"}}]
-             @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["*"]}]}
+               "ex:address" {"ex:postalCode" "12345"}}]
+             @(fluree/query valid-person {"select" {"?s" ["*" {"ex:address" ["ex:postalCode"]}]}
                                           "where"  [["?s" "id" "ex:Bob"]]})))
       (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
              (ex-message invalid-person)))))
