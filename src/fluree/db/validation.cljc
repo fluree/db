@@ -169,7 +169,8 @@
     :orderBy
     :commit-details
     :t
-    :history})
+    :history
+    :from})
 
 (defn format-error
   [explained error error-opts]
@@ -239,7 +240,6 @@
   [explained-error opts]
    (let [error-opts   (or opts default-error-overrides)
          {:keys [errors schema value]} explained-error
-         [first-e] errors
          e (or (top-level-fn-error errors)
                (choose-relevant-error explained-error))]
      (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
@@ -250,13 +250,14 @@
    (m/type-schemas)
    (m/sequence-schemas)
    (m/predicate-schemas)
-   {::iri                  [:or :string :keyword]
+   {::iri                  [:or {:error/message "invalid iri"}
+                            :string :keyword]
     ::iri-key              [:fn iri-key?]
     ::iri-map              [:map-of {:max 1}
                             ::iri-key ::iri]
     ::json-ld-keyword      [:keyword {:decode/json decode-json-ld-keyword
                                       :decode/fql  decode-json-ld-keyword}]
-    ::var                  [:fn {:error/message "Invalid variable, should be one or more characters begin with `?`"}
+    ::var                  [:fn {:error/message "Invalid variable, should be one or more characters beginning with `?`"}
                             variable?]
     ::val                  [:fn value?]
     ::subject              [:orn {:error/message "Subject must be a subject id, ident, or iri"}
@@ -291,16 +292,18 @@
                                    :decode/json string->keyword
                                    :error/message "Unrecognized operation in where map, must be one of: filter, optional, union, bind"}
                             :filter :optional :union :bind]
-    ::graph                [:orn
+    ::graph                [:orn {:error/message "Value of \"graph\" should be ledger alias or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
-    ::graph-map            [:map {:closed true}
+    ::graph-map            [:map {:closed true
+                                  :error/message "Named where map must be a map specifying the graph to query and valid where clause"}
                             [:graph ::graph]
                             [:where [:ref ::where]]]
-    ::where-map            [:orn
+    ::where-map            [:orn {:error/message "Invalid where map, must be either named graph or valid where operation map"}
                             [:named ::graph-map]
                             [:default [:and
-                                      [:map-of {:max 1 :error/message "Unnamed where map can only have 1 key/value pair"} ::where-op :any]
+                                      [:map-of {:max 1 :error/message "Unnamed where map can only have 1 key/value pair"}
+                                       ::where-op :any]
                                       [:multi {:dispatch where-op}
                                        [:filter [:map [:filter [:ref ::filter]]]]
                                        [:optional [:map [:optional [:ref ::optional]]]]
@@ -314,9 +317,11 @@
                              [:where-map ::where-map]
                              [:tuple ::where-tuple]]]
     ::ledger               ::iri
-    ::from                 [:orn
+    ::from                 [:orn {:error/message "from must be a ledger iri or vector of ledger iris"}
                             [:single ::ledger]
-                            [:collection [:sequential ::ledger]]]
+                            [:collection [:sequential
+                                          {:error/message "all values in `from`/`from-named` must be ledger iris"}
+                                          ::ledger]]]
     ::from-named           ::from
     ::delete               [:orn {:error/message "delete statements must be a triple or vector of triples"}
                             [:single ::triple]
