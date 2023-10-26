@@ -160,12 +160,22 @@
           (recur (pop path) (last path) path' p' m')
           (when m [(if (seq in) (mu/path->in schema path') (me/error-path error options)) m' p']))))))
 
+(def top-level-query-keys
+  #{:select
+    :where
+    :group-by
+    :groupBy
+    :order-by
+    :orderBy
+    :commit-details
+    :t
+    :history})
+
 (defn format-error
   [explained error error-opts]
   (let [{:keys [path value]} error
-        top-level-key (when-not (= ::m/extra-key (:type error))
-                        (some->  (first (filter keyword? path))
-                                 name))
+        top-level-key (some-> (first (filter top-level-query-keys path))
+                              name)
         top-level-message (when top-level-key
                             (str "Error in value for \"" top-level-key "\""))
         [_ root-message] (resolve-root-error-for-in

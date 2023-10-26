@@ -79,7 +79,7 @@
            (if at
              (not (or from to))
              (or from to)))]
-        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value,"}
+        [:fn {:error/message "\"from\" value must be less than or equal to \"to\" value"}
          (fn [{:keys [from to]}] (if (and (number? from) (number? to))
                                    (<= from to)
                                    true))]]]]
