@@ -1,7 +1,7 @@
 .PHONY: all deps jar install deploy nodejs browser webworker cljtest \
         cljs-browser-test cljs-node-test cljstest test eastwood ci clean \
         js-packages sync-package-json publish-nodejs publish-browser \
-        publish-webworker publish-js
+        publish-webworker publish-js pending-tests pt
 
 DOCS_MARKDOWN := $(shell find docs -name '*.md')
 DOCS_TARGETS := $(DOCS_MARKDOWN:docs/%.md=docs/%.html)
@@ -110,6 +110,11 @@ cljstest: cljs-browser-test cljs-node-test
 
 cljtest:
 	clojure -X:dev:cljtest
+
+pending-tests:
+	clojure -X:dev:pending-tests
+
+pt: pending-tests
 
 test: cljtest cljstest nodejs-test browser-test
 
