@@ -284,20 +284,39 @@
                     (async/put! resp-chan false)))
           (recur))))))
 
+(declare try-socket)
+
+(defn retry-socket
+  "Attempts repeated retried to re-establish connection."
+  [url sub-chan pub-chan timeout close-fn]
+  (async/go-loop [retries 1]
+    (let [retry-timeout (min (* retries 1000) 20000)
+          ws            (async/<! (try-socket url sub-chan pub-chan timeout close-fn))]
+      (when (util/exception? ws)
+        (do
+          (log/info "Unable to establish websocket connection, retrying in " retry-timeout "ms. "
+                    "Reported websocket exception: " (ex-message ws))
+          (async/<! (async/timeout (min (* retries 500) 10000))) ;; timeout maxes at 10s
+          (recur (inc retries)))))))
+
+
+(defn abnormal-socket-close?
+  [status-code]
+  (= status-code (get-in ws-close-status-codes [:abnormal :code])))
 
 (defn try-socket
-  [url sub-chan pub-chan resp-chan timeout close-fn]
+  [url msg-in msg-out timeout close-fn]
   #?(:clj
-     (let [ws-config {:connect-timeout timeout
+     (let [resp-chan (async/promise-chan)
+           ws-config {:connect-timeout timeout
                       :on-close        (fn [_ status reason]
                                          (log/debug "Websocket closed; status:" status
                                                     "reason:" reason)
-                                         (let [abnormal? (= status (get-in ws-close-status-codes [:abnormal :code]))]
-                                           (if abnormal?
-                                             (do
-                                               (log/info "Abnormal websocket closure, attempting to re-establish connection.")
-                                               (try-socket url sub-chan pub-chan resp-chan timeout close-fn))
-                                             (close-fn))))
+                                         (if (abnormal-socket-close? status)
+                                           (do
+                                             (log/info "Abnormal websocket closure, attempting to re-establish connection.")
+                                             (retry-socket url msg-in msg-out timeout close-fn))
+                                           (close-fn)))
                       :headers         nil
                       :on-open         (fn [_]
                                          (log/debug "Websocket opened"))
@@ -306,18 +325,28 @@
                                          (close-fn)
                                          (when-not (nil? e) (async/put! resp-chan e)))
                       :on-message      (fn [_ msg last?]
-                                         (async/put! sub-chan [:on-message (.toString ^HeapCharBuffer msg) last?]))
+                                         (async/put! msg-in [:on-message (.toString ^HeapCharBuffer msg) last?]))
                       :on-ping         (fn [ws msg]
-                                         (async/put! sub-chan [:on-ping msg])
+                                         (async/put! msg-in [:on-ping msg])
                                          (ws/pong! ws msg))
                       :on-pong         (fn [_ msg]
-                                         (async/put! sub-chan [:on-pong msg]))}
-           ws        @(ws/websocket url ws-config)]
-       (socket-publish-loop ws pub-chan)
-       (async/put! resp-chan ws))
+                                         (async/put! msg-in [:on-pong msg]))}]
+
+       ;; launch websocket connection in background
+       (future
+         (let [ws (try @(ws/websocket url ws-config)
+                       (catch Exception e e))]
+           (when-not (util/exception? ws)
+             (socket-publish-loop ws msg-out))
+           (async/put! resp-chan ws)
+           (async/close! resp-chan)))
+
+       ;; response chan will have websocket or exception
+       resp-chan)
 
      :cljs
-     (let [ws           (if platform/BROWSER
+     (let [resp-chan    (async/promise-chan)
+           ws           (if platform/BROWSER
                           (js/WebSocket. url)
                           (NodeWebSocket. url))
            open?        (async/promise-chan)
@@ -325,10 +354,14 @@
 
        (set! (.-binaryType ws) "arraybuffer")
        (set! (.-onopen ws) (fn [] (async/put! open? true)))
-       (set! (.-onmessage ws) (fn [e] (async/put! sub-chan (.-data e))))
+       (set! (.-onmessage ws) (fn [e] (async/put! msg-in (.-data e))))
        (set! (.-onclose ws) (fn [e]
-                              (log/warn "Websocket closed: " (.-reason e) "Code: " (.-code e))
-                              (close-fn)))
+                              (log/info "Websocket closed: " (.-reason e) "Code: " (.-code e))
+                              (if (abnormal-socket-close? (.-code e))
+                                (do
+                                  (log/info "Abnormal websocket closure, attempting to re-establish connection.")
+                                  (retry-socket url msg-in msg-out timeout close-fn))
+                                (close-fn))))
        ;; timeout connection attempt
        (async/go
          (let [[_ ch] (async/alts! [open? timeout-chan] :priority true)]
@@ -339,5 +372,5 @@
                                     {:status 400 :error :db/connection-error}))
                (close-websocket ws))
              ;; socket is open, start loop for outgoing messages
-             (socket-publish-loop ws pub-chan))))
-       ::no-return)))
+             (socket-publish-loop ws msg-out))))
+       resp-chan)))

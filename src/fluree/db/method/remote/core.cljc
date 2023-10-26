@@ -2,7 +2,7 @@
   (:require [fluree.db.util.xhttp :as xhttp]
             [clojure.string :as str]
             [clojure.core.async :as async]
-            [fluree.db.util.core :as util]
+            [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.json :as json]
             [fluree.db.util.log :as log]))
 
@@ -41,27 +41,26 @@
         (recur (async/<! msg-in)))
       (log/info "Websocket messaging connection closed."))))
 
-
+(defn close-websocket
+  [websocket]
+  (xhttp/close-websocket websocket))
 
 (defn ws-connect
-  "Returns websocket or exception wrapped in a promise-chan."
+  "Returns channel with websocket or exception."
   [server-state msg-in msg-out]
   (let [current-server (pick-server server-state)
-        ws-chan        (async/promise-chan)
         url            (-> current-server
                            (str/replace-first "http" "ws")
                            (str "/fluree/subscribe"))
         timeout        10000
         close-fn       (fn []
                          (log/warn "Websocket connection closed!"))]
-    (xhttp/try-socket url msg-in msg-out ws-chan timeout close-fn) ;; will return success or error on ws-chan
-    (async/go
-      (let [ws (async/<! ws-chan)]
-        (async/close! ws-chan)
-        (if (util/exception? ws)
-          (log/warn "Error establishing websocket connection:" ws)
-          (log/debug "Websocket connection successfully established."))))
-    ws-chan))
+    (try*
+      ;; will return chan with socket object or exception
+      (xhttp/try-socket url msg-in msg-out timeout close-fn)
+      (catch* e
+              (log/warn "Exception establishing web socket: " (ex-message e))
+              (async/go e)))))
 
 
 (defn subscribed-ledger?
@@ -82,6 +81,9 @@
   (json/stringify
     [(:subscribe-ledger message-codes) ledger-id]))
 
+;; TODO - remote subscriptions only partially implemented, for now
+;; TODO - remote server will send all commits for all ledgers, but
+;; TODO - locally, we'll only pay attention to those commits for ledgers
 (defn request-ledger-subscribe
   [conn ledger-id]
   #_(conn-proto/-msg-out conn {:action :subscribe

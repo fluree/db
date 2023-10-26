@@ -22,9 +22,8 @@
     (boolean
       (<? (remote-lookup state server-state ledger-address nil)))))
 
-(defn launch-subscription-socket
-  [{:keys [conn-state server-state msg-in msg-out] :as _remote-ns}]
-  (remote/ws-connect server-state msg-in msg-out)
+(defn monitor-socket-messages
+  [{:keys [conn-state msg-in] :as _remote-ns} websocket]
   (go-loop []
     (let [next-msg (async/<! msg-in)]
       (if next-msg
@@ -39,7 +38,25 @@
                       (log/error "Subscription callback for ledger: " ledger " failed with error: " e)))
             (log/warn "No callback registered for ledger: " ledger))
           (recur))
-        (log/info "Websocket messaging connection closed.")))))
+        (do
+          (log/info "Websocket messaging connection closed, closing websocket.")
+          (remote/close-websocket websocket))))))
+
+(defn launch-subscription-socket
+  "Returns chan with websocket after successful connection, or exception. "
+  [{:keys [server-state msg-in msg-out] :as remote-ns}]
+  (go
+    (let [ws (async/<! (remote/ws-connect server-state msg-in msg-out))]
+      (if (util/exception? ws)
+        (do
+          (log/error "Error establishing websocket connection: " (ex-message ws))
+          (ex-info (str "Error establishing websocket connection: " (ex-message ws))
+                   {:status 400
+                    :error  :db/websocket-error}))
+        (do
+          (log/info "Websocket connection established.")
+          (monitor-socket-messages remote-ns ws)
+          ws)))))
 
 
 (defn subscribe
@@ -70,15 +87,21 @@
     (go (str ledger-alias "/" (name branch) "/head")))
   (-alias [_ ledger-address]
     ledger-address)
-  (-close [nameservice] true))
+  (-close [nameservice]
+    (async/close! msg-in)
+    (async/close! msg-out)))
 
 (defn initialize
   [server-state conn-state]
-  (let [remote-ns (map->RemoteNameService {:server-state server-state
-                                           :msg-in       (async/chan)
-                                           :msg-out      (async/chan)
-                                           :conn-state   (or conn-state (atom nil))
-                                           :sync?        true})]
-    ;; launch websocket connection to receive updates and `-notify` respective ledgers of those updates
-    (launch-subscription-socket remote-ns)
-    remote-ns))
+  (go-try
+    (let [msg-in    (async/chan)
+          msg-out   (async/chan)
+          remote-ns (map->RemoteNameService {:server-state server-state
+                                             :msg-in       msg-in
+                                             :msg-out      msg-out
+                                             :conn-state   (or conn-state (atom nil))
+                                             :sync?        true})
+          websocket (async/<! (launch-subscription-socket remote-ns))]
+      (if (util/exception? websocket)
+        (ns-proto/-close remote-ns)
+        remote-ns))))

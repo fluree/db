@@ -106,7 +106,10 @@
           conn-id         (str (random-uuid))
           state           (conn-core/blank-state)
           nameservices*   (util/sequential
-                            (or nameservices (default-remote-nameservice server-state state)))
+                            (or nameservices
+                                ;; if default ns, and returns exception, throw - connection fails
+                                ;; (likely due to unreachable server with websocket request)
+                                (<? (default-remote-nameservice server-state state))))
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache
                                                      cache-size)))]

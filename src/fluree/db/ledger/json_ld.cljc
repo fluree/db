@@ -178,6 +178,8 @@
         ;; missing some updates, dump in-memory ledger forcing a reload
         (> commit-t (inc latest-t))
         (do
+          (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
+                     "Will dump in-memory ledger and force a reload: " (:alias ledger))
           (close-ledger ledger)
           false)))))
 
@@ -319,6 +321,7 @@
       (->> (conn-proto/-nameservices conn)
            (some #(ns-proto/-alias % db-alias)))))
 
+;; TODO - once we have a different delimiter than `/` for branch/t-value this can simplified
 (defn alias-from-address
   [address]
   (when-let [path (->> address
