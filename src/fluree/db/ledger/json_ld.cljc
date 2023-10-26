@@ -228,7 +228,7 @@
         db*))))
 
 
-(defn create
+(defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
@@ -236,11 +236,6 @@
                   reindex-min-bytes reindex-max-bytes initial-tx new-context?]
            :or   {branch       :main
                   new-context? true}} opts
-          [not-cached? ledger-chan] (register-ledger conn ledger-alias) ;; holds final cached ledger in a promise-chan avoid race conditions
-          _               (when-not not-cached?
-                            (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
-                                            {:status 400
-                                             :error  :db/ledger-exists})))
           default-context (if defaultContext
                             (-> defaultContext
                                 (ctx-util/mapify-context (conn-proto/-default-context conn))
@@ -300,8 +295,21 @@
         ;; includes other ledgers - experimental
         (let [db* (<? (include-dbs conn db include))]
           (ledger-proto/-db-update ledger db*)))
-      (async/put! ledger-chan ledger)
       ledger)))
+
+(defn create
+  [conn ledger-alias opts]
+  (go-try
+    (let [[not-cached? ledger-chan] (register-ledger conn ledger-alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
+      (if not-cached?
+        (let [ledger (async/<! (create* conn ledger-alias opts))]
+          (when (util/exception? ledger)
+            (release-ledger conn ledger-alias))
+          (async/put! ledger-chan ledger)
+          ledger)
+        (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
+                        {:status 400
+                         :error  :db/ledger-exists}))))))
 
 (defn commit->ledger-alias
   "Returns ledger alias from commit map, if present. If not present
@@ -339,10 +347,10 @@
                            (get-first-value const/iri-address)
                            (->> (jld-reify/load-default-context conn))
                            <?)
-          ledger       (<? (create conn ledger-alias {:branch         branch
-                                                      :id             commit-addr
-                                                      :defaultContext default-ctx
-                                                      :new-context?   false}))
+          ledger       (<? (create* conn ledger-alias {:branch         branch
+                                                       :id             commit-addr
+                                                       :defaultContext default-ctx
+                                                       :new-context?   false}))
           db           (ledger-proto/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
       (ledger-proto/-commit-update ledger branch db*)
