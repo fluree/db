@@ -239,6 +239,30 @@
           (is (= [["ex:bob"]] sut)
               "returns correctly filtered results"))))))
 
+(deftest ^:integration ^:pending datatype-test
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "people"
+                               {:defaultContext
+                                ["" {:ex "http://example.org/ns/"}]})
+        db     @(-> ledger
+                    fluree/db
+                    (fluree/stage
+                     [{:id      :ex/homer
+                       :ex/name "Homer"
+                       :ex/age  36}
+                      {:id      :ex/bart
+                       :ex/name "Bart"
+                       :ex/age  "forever 10"}]))]
+    (testing "including datatype in query results"
+      (let [query   '{:select [?age ?dt]
+                      :where  [[?s :ex/age ?age]
+                               {:bind {?dt (datatype ?age)}}]}
+            results @(fluree/query db query)]
+        (is (= [["forever 10" "xsd:string"] [36 "xsd:long"]]
+               results))))
+    (testing "filtering query results with datatype fn")
+    (testing "filtering query results with @type value map")))
+
 (deftest ^:integration subject-object-test
   (let [conn   (test-utils/create-conn
                 {:defaults
