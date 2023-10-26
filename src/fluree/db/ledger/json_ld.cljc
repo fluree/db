@@ -362,10 +362,12 @@
                         alias-or-address
                         (async/<! (nameservice/primary-address conn alias-or-address nil)))]
           (if (util/exception? address)
-            (async/put! ledger-chan
-                        (ex-info (str "Load for " alias-or-address " failed due to exception in address lookup.")
-                                 {:status 400 :error :db/invalid-address}
-                                 address))
+            (do
+              (release-ledger conn alias)
+              (async/put! ledger-chan
+                          (ex-info (str "Load for " alias-or-address " failed due to exception in address lookup.")
+                                   {:status 400 :error :db/invalid-address}
+                                   address)))
             (let [ledger (async/<! (load* conn address))]
               ;; note, ledger can be an exception!
               (async/put! ledger-chan ledger)
