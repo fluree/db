@@ -1,5 +1,7 @@
 (ns fluree.db.util.context
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [fluree.json-ld :as json-ld]
+            [fluree.db.dbproto :as dbproto]))
 
 ;; handles some default context merging.
 
@@ -141,3 +143,45 @@
       (throw (ex-info (str "keywordize-context called on a context that is not a map: " context)
                       {:status 400
                        :error  :db/invalid-context})))))
+
+(defn retrieve-context
+  "Returns the parsed context. Caches."
+  ([default-context supplied-context context-type]
+   (retrieve-context default-context nil supplied-context context-type))
+  ([default-context context-cache supplied-context context-type]
+   (or (and context-cache (get-in @context-cache [context-type supplied-context]))
+       (let [context (cond (= ::dbproto/default-context supplied-context)
+                           (if (= :keyword context-type)
+                             (keywordize-context default-context)
+                             default-context)
+
+                           ;; clearing the context
+                           (nil? supplied-context)
+                           nil
+
+                           :else
+                           (if (sequential? supplied-context)
+                             (mapv #(if (= "" %)
+                                      ;; we need to substitute in the default
+                                      ;; context, keywordize if of type :keyword
+                                      (if (= :keyword context-type)
+                                        (keywordize-context default-context)
+                                        default-context)
+                                      %)
+                                   supplied-context)
+                             supplied-context))
+
+             parsed-ctx (json-ld/parse-context context)]
+         (when context-cache
+           (vswap! context-cache assoc-in [context-type supplied-context] parsed-ctx))
+         parsed-ctx))))
+
+(defn get-context
+  [jsonld]
+  (cond (contains? jsonld :context) (:context jsonld)
+        (contains? jsonld "@context") (get jsonld "@context")
+        :else ::dbproto/default-context))
+
+(defn extract
+  [db jsonld opts]
+  (dbproto/-context db (get-context jsonld) (:context-type opts)))

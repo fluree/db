@@ -291,14 +291,21 @@
                                    :decode/json string->keyword
                                    :error/message "Unrecognized operation in where map, must be one of: filter, optional, union, bind"}
                             :filter :optional :union :bind]
-    ::where-map            [:and
-                            [:map-of {:max 1 :error/message "Where map can only have 1 key/value pair"}
-                             ::where-op :any]
-                            [:multi {:dispatch where-op}
-                             [:filter [:map [:filter [:ref ::filter]]]]
-                             [:optional [:map [:optional [:ref ::optional]]]]
-                             [:union [:map [:union [:ref ::union]]]]
-                             [:bind [:map [:bind [:ref ::bind]]]]]]
+    ::graph                [:orn
+                            [:ledger ::ledger]
+                            [:variable ::var]]
+    ::graph-map            [:map {:closed true}
+                            [:graph ::graph]
+                            [:where [:ref ::where]]]
+    ::where-map            [:orn
+                            [:named ::graph-map]
+                            [:default [:and
+                                      [:map-of {:max 1 :error/message "Unnamed where map can only have 1 key/value pair"} ::where-op :any]
+                                      [:multi {:dispatch where-op}
+                                       [:filter [:map [:filter [:ref ::filter]]]]
+                                       [:optional [:map [:optional [:ref ::optional]]]]
+                                       [:union [:map [:union [:ref ::union]]]]
+                                       [:bind [:map [:bind [:ref ::bind]]]]]]]]
     ::where-tuple          [:orn {:error/message "Invalid tuple"}
                             [:triple ::triple]
                             [:remote [:sequential {:max 4} :any]]]
@@ -306,6 +313,11 @@
                             [:orn {:error/message "where clauses must be valid tuples or maps"}
                              [:where-map ::where-map]
                              [:tuple ::where-tuple]]]
+    ::ledger               ::iri
+    ::from                 [:orn
+                            [:single ::ledger]
+                            [:collection [:sequential ::ledger]]]
+    ::from-named           ::from
     ::delete               [:orn {:error/message "delete statements must be a triple or vector of triples"}
                             [:single ::triple]
                             [:collection [:sequential ::triple]]]

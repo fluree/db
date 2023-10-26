@@ -2,9 +2,12 @@
   (:require [clojure.core.async :as async :refer [<! go]]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.util.core :as util #?(:clj :refer :cljs :refer-macros) [try* catch*]]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.query.subject-crawl.core :refer [simple-subject-crawl]]
             [fluree.db.query.fql.parse :as parse]
-            [fluree.db.query.exec :as exec])
+            [fluree.db.query.exec :as exec]
+            [fluree.db.query.exec.update :as update]
+            [fluree.db.query.subject-crawl.reparse :refer [re-parse-as-simple-subj-crawl]])
   (:refer-clojure :exclude [var? vswap!])
   #?(:cljs (:require-macros [clojure.core])))
 
@@ -38,13 +41,15 @@
 
 (defn query
   "Returns core async channel with results or exception"
-  ([db query-map]
-   (query db nil query-map))
-  ([db fuel-tracker query-map]
+  ([db ctx query-map]
+   (query db ctx nil query-map))
+  ([db ctx fuel-tracker query-map]
    (if (cache? query-map)
      (cache-query db query-map)
      (let [q   (try*
-                 (parse/parse-query query-map db)
+                 (let [parsed (parse/parse-query query-map ctx)]
+                   (or (re-parse-as-simple-subj-crawl parsed db)
+                       parsed))
                  (catch* e e))
            db* (assoc db :ctx-cache (volatile! {}))] ;; allow caching of some functions when available
        (if (util/exception? q)
@@ -52,3 +57,20 @@
          (if (= :simple-subject-crawl (:strategy q))
            (simple-subject-crawl db* q)
            (exec/query db* fuel-tracker q)))))))
+
+(defn update?
+  [x]
+  (and (map? x)
+       (or (update/insert? x)
+           (update/retract? x))
+       (or (contains? x :where)
+           (contains? x "where"))))
+
+(defn modify
+  ([db t json-ld]
+   (modify db t nil json-ld))
+
+  ([db t fuel-tracker {:keys [opts] :as mdfn-map}]
+   (let [ctx  (ctx-util/extract db mdfn-map opts)
+         mdfn (parse/parse-modification mdfn-map ctx)]
+     (exec/modify db t fuel-tracker mdfn))))

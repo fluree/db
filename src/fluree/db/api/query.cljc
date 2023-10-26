@@ -8,13 +8,14 @@
             [fluree.db.ledger.json-ld :as jld-ledger]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.time-travel :as time-travel]
+            [fluree.db.query.dataset :as dataset]
             [fluree.db.query.fql :as fql]
-            [fluree.db.query.fql.parse :as fql-parse]
             [fluree.db.query.history :as history]
             [fluree.db.query.range :as query-range]
             [fluree.db.query.sparql :as sparql]
             [fluree.db.util.core :as util :refer [try* catch*]]
             [fluree.db.util.async :as async-util :refer [<? go-try]]
+            [fluree.db.util.context :as ctx-util]
             [fluree.db.json-ld.policy :as perm]
             [fluree.db.json-ld.credential :as cred]
             [fluree.db.nameservice.core :as nameservice]
@@ -30,7 +31,6 @@
                           (<? (perm/wrap-policy db policy-opts))
                           db)
          {:keys [history t commit-details] :as parsed} (history/parse-history-query query-map)
-         context        (fql-parse/get-context parsed)
 
          ;; from and to are positive ints, need to convert to negative or fill in default values
          {:keys [from to at]} t
@@ -49,7 +49,8 @@
                                 (number? to) (- to)
                                 (nil? to) (:t db*))])
 
-         parsed-context (fql-parse/parse-context query-map db*)
+         context        (ctx-util/get-context parsed)
+         parsed-context (dbproto/-context db context (:context-type opts))
          error-ch       (async/chan)]
      (if history
        ;; filter flakes for history pattern
@@ -101,46 +102,56 @@
          history-query (cond-> coerced-query did (assoc-in [:opts :did] did))]
      (<? (history* db history-query)))))
 
+(defn sanitize-query-options
+  [opts did]
+  (cond-> (util/parse-opts opts)
+    did (assoc :did did :issuer did)))
+
+(defn restrict-db
+  [db t opts]
+  (go-try
+    (let [db*  (if-let [policy-opts (perm/policy-opts opts)]
+                 (<? (perm/wrap-policy db policy-opts))
+                 db)
+          db** (-> (if t
+                     (<? (time-travel/as-of db* t))
+                     db*))]
+      (assoc-in db** [:policy :cache] (atom {})))))
+
+(defn track-query
+  [db ctx max-fuel query]
+  (go-try
+    (let [start        #?(:clj  (System/nanoTime)
+                          :cljs (util/current-time-millis))
+          fuel-tracker (fuel/tracker max-fuel)]
+      (try* (let [result (<? (fql/query db ctx fuel-tracker query))]
+              {:status 200
+               :result result
+               :time   (util/response-time-formatted start)
+               :fuel   (fuel/tally fuel-tracker)})
+            (catch* e
+                    (throw (ex-info "Error executing query"
+                                    {:status (-> e ex-data :status)
+                                     :time   (util/response-time-formatted start)
+                                     :fuel   (fuel/tally fuel-tracker)}
+                                    e)))))))
+
 (defn query-fql
   "Execute a query against a database source. Returns core async channel
   containing result or exception."
   [db query]
   (go-try
-    (let [{query :subject, did :did} (or (<? (cred/verify query))
-                                         {:subject query})
+    (let [{query :subject, did :did}  (or (<? (cred/verify query))
+                                          {:subject query})
+          {:keys [t opts] :as query*} (update query :opts sanitize-query-options did)
 
-          {:keys [opts t]} query
-          opts*    (util/parse-opts opts)
-          query*   (assoc query :opts opts*)
-          db*      (if-let [policy-opts (perm/policy-opts
-                                         (cond-> opts* did (assoc :did did)))]
-                     (<? (perm/wrap-policy db policy-opts))
-                     db)
-          db**     (-> (if t
-                         (<? (time-travel/as-of db* t))
-                         db*)
-                       (assoc-in [:policy :cache] (atom {})))
-          query**  (-> query*
-                       (update :opts assoc :issuer did)
-                       (update :opts dissoc :meta :max-fuel ::util/track-fuel?))
-          start    #?(:clj  (System/nanoTime)
-                      :cljs (util/current-time-millis))
-          max-fuel (:max-fuel opts*)]
-      (if (::util/track-fuel? opts*)
-        (let [fuel-tracker (fuel/tracker max-fuel)]
-          (try* (let [fuel-tracker (fuel/tracker max-fuel)
-                      result (<? (fql/query db** fuel-tracker query**))]
-                  {:status 200
-                   :result result
-                   :time   (util/response-time-formatted start)
-                   :fuel   (fuel/tally fuel-tracker)})
-                (catch* e
-                  (throw (ex-info "Error executing query"
-                                  {:status (-> e ex-data :status)
-                                   :time   (util/response-time-formatted start)
-                                   :fuel   (fuel/tally fuel-tracker)}
-                                  e)))))
-        (<? (fql/query db** query**))))))
+          db*      (<? (restrict-db db t opts))
+          query**  (update query* :opts dissoc   :meta :max-fuel ::util/track-fuel?)
+          ctx      (ctx-util/extract db* query** opts)
+          max-fuel (:max-fuel opts)]
+      (if (::util/track-fuel? opts)
+        (<? (track-query db* ctx max-fuel query**))
+        (<? (fql/query db* ctx query**))))))
 
 (defn query-sparql
   [db query]
@@ -160,22 +171,77 @@
     :fql (query-fql db query)
     :sparql (query-sparql db query)))
 
-(defn from-query-fql
+(defn load-alias
+  [conn alias t opts]
+  (go-try
+    (let [address (<? (nameservice/primary-address conn alias nil))
+          ledger  (<? (jld-ledger/load conn address))
+          db      (ledger-proto/-db ledger)]
+      (<? (restrict-db db t opts)))))
+
+(defn load-aliases
+  [conn aliases opts]
+  (go-try
+    (loop [[alias & r] aliases
+           db-map      {}]
+      (if alias
+        ;; TODO: allow restricting federated dataset components individually by t
+        (let [db      (<? (load-alias conn alias nil opts))
+              db-map* (assoc db-map alias db)]
+          (recur r db-map*))
+        db-map))))
+
+(defn load-dataset
+  [conn defaults named opts]
+  (go-try
+    (if (and (= (count defaults) 1)
+             (empty? named))
+      (let [alias (first defaults)]
+        (<? (load-alias conn alias nil opts))) ; return an unwrapped db if the data set
+                                               ; consists of one ledger
+      (let [all-aliases  (->> defaults (concat named) distinct)
+            db-map       (<? (load-aliases conn all-aliases opts))
+            default-coll (-> db-map
+                             (select-keys defaults)
+                             vals)
+            named-map    (select-keys db-map named)]
+        (dataset/combine named-map default-coll)))))
+
+(defn query-connection-fql
   [conn query]
   (go-try
-    (let [ledger-alias (:from query)
-          ledger-address (<? (nameservice/primary-address conn ledger-alias nil))
-          ledger (<? (jld-ledger/load conn ledger-address))]
-      (<? (query-fql (ledger-proto/-db ledger) (dissoc query :from))))))
+    (let [{query :subject, did :did} (or (<? (cred/verify query))
+                                         {:subject query})
+          {:keys [opts] :as query*}  (update query :opts sanitize-query-options did)
 
-(defn from-query-sparql
+          default-aliases (some-> query* :from util/sequential)
+          named-aliases   (some-> query* :from-named util/sequential)]
+      (if (or (seq default-aliases)
+              (seq named-aliases))
+        (let [ds          (<? (load-dataset conn default-aliases named-aliases opts))
+              query**     (update query* :opts dissoc :meta :max-fuel ::util/track-fuel?)
+              max-fuel    (:max-fuel opts)
+              default-ctx (conn-proto/-default-context conn)
+              q-ctx       (ctx-util/get-context query**)
+              ctx-type    (or (:context-type opts)
+                              (conn-proto/-context-type conn))
+              ctx         (ctx-util/retrieve-context default-ctx q-ctx ctx-type)]
+
+          (if (::util/track-fuel? opts)
+            (<? (track-query ds ctx max-fuel query**))
+            (<? (fql/query ds ctx query**))))
+        (throw (ex-info "Missing ledger specification in connection query"
+                        {:status 400, :error :db/invalid-query}))))))
+
+
+(defn query-connection-sparql
   [conn query]
   (go-try
     (let [fql (sparql/->fql query)]
-      (<? (from-query-fql conn fql)))))
+      (<? (query-connection-fql conn fql)))))
 
-(defn from-query
+(defn query-connection
   [conn query {:keys [format] :as _opts :or {format :fql}}]
   (case format
-    :fql (from-query-fql conn query)
-    :sparql (from-query-sparql conn query)))
+    :fql (query-connection-fql conn query)
+    :sparql (query-connection-sparql conn query)))

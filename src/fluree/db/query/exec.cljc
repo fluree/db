@@ -1,11 +1,14 @@
 (ns fluree.db.query.exec
   "Find and format results of queries against database values."
   (:require [clojure.core.async :as async :refer [go]]
+            [fluree.db.flake :as flake]
+            [fluree.db.fuel :as fuel]
             [fluree.db.query.exec.select :as select]
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.group :as group]
             [fluree.db.query.exec.order :as order]
             [fluree.db.query.exec.having :as having]
+            [fluree.db.query.exec.update :as update]
             [fluree.db.util.log :as log :include-macros true]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -60,3 +63,22 @@
       (async/alt!
         error-ch  ([e] e)
         result-ch ([result] result)))))
+
+(defn into-flakeset
+  [fuel-tracker flake-ch]
+  (let [flakeset (flake/sorted-set-by flake/cmp-flakes-spot)]
+    (if fuel-tracker
+      (let [track-fuel (fuel/track fuel-tracker)]
+        (async/transduce track-fuel into flakeset flake-ch))
+      (async/reduce into flakeset flake-ch))))
+
+(defn modify
+  [db t fuel-tracker mdfn]
+  (go
+    (let [error-ch  (async/chan)
+          update-ch (->> (where/search db mdfn fuel-tracker error-ch)
+                         (update/modify db mdfn t fuel-tracker error-ch)
+                         (into-flakeset fuel-tracker))]
+      (async/alt!
+        error-ch ([e] e)
+        update-ch ([flakes] flakes)))))

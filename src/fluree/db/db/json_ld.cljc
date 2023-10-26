@@ -118,12 +118,12 @@
     (when-let [flake (first (<? (query-range/index-range db :spot = [subject-id 0])))]
       (-> flake flake/o compact-fn))))
 
-;; ================ GraphDB record support fns ================================
+;; ================ Jsonld record support fns ================================
 
-(defn- graphdb-root-db [this]
+(defn- jsonld-root-db [this]
   (assoc this :policy root-policy-map))
 
-(defn- graphdb-c-prop [{:keys [schema]} property collection]
+(defn- jsonld-c-prop [{:keys [schema]} property collection]
   ;; collection properties TODO-deprecate :id property below in favor of :partition
   (assert (#{:name :id :sid :partition :spec :specDoc :base-iri} property)
           (str "Invalid collection property: " (pr-str property)))
@@ -131,7 +131,7 @@
     (get-in schema [:coll "_tx" property])
     (get-in schema [:coll collection property])))
 
-(defn- graphdb-p-prop [{:keys [schema] :as this} property predicate]
+(defn- jsonld-p-prop [{:keys [schema] :as this} property predicate]
   (assert (#{:name :id :iri :type :ref? :idx? :unique :multi :index :upsert
              :component :noHistory :restrictCollection :spec :specDoc :txSpec
              :txSpecDoc :restrictTag :retractDuplicates :subclassOf :new?} property)
@@ -139,7 +139,7 @@
   (cond->> (get-in schema [:pred predicate property])
            (= :restrictCollection property) (dbproto/-c-prop this :partition)))
 
-(defn- graphdb-tag
+(defn- jsonld-tag
   "resolves a tags's value given a tag subject id; optionally shortening the
   return value if it starts with the given predicate name"
   ([this tag-id]
@@ -158,7 +158,7 @@
            (-> (str/split tag #":") second)
            tag))))))
 
-(defn- graphdb-tag-id
+(defn- jsonld-tag-id
   ([this tag-name]
    (go-try
      (let [tag-pred-id const/$_tag:id]
@@ -192,34 +192,6 @@
           (assoc-in [:stats :indexed] index-t))
       db)))
 
-(defn retrieve-context
-  "Returns the parsed context. Caches."
-  [default-context context-cache supplied-context context-type]
-  (or (get-in @context-cache [context-type supplied-context])
-      (let [context (cond (= ::dbproto/default-context supplied-context)
-                          (if (= :keyword context-type)
-                            (ctx-util/keywordize-context default-context)
-                            default-context)
-
-                          ;; clearing the context
-                          (nil? supplied-context)
-                          nil
-
-                          :else
-                          (if (sequential? supplied-context)
-                            (mapv #(if (= "" %)
-                                     ;; we need to substitute in the default context, keywordize if of type :keyword
-                                     (if (= :keyword context-type)
-                                       (ctx-util/keywordize-context default-context)
-                                       default-context)
-                                     %)
-                                  supplied-context)
-                            supplied-context))
-
-            parsed-ctx (json-ld/parse-context context)]
-        (vswap! context-cache assoc-in [context-type supplied-context] parsed-ctx)
-        parsed-ctx)))
-
 (defn default-context-update
   "Updates default context, so on next commit it will get written in the commit file."
   [db default-context]
@@ -230,38 +202,42 @@
               :context-cache (volatile! {})
               :new-context? true)))
 
-;; ================ end GraphDB record support fns ============================
+;; ================ end Jsonld record support fns ============================
 
 (defrecord JsonLdDb [ledger alias branch commit t tt-id stats spot post
                      opst tspo schema comparators novelty policy ecount
                      default-context context-type context-cache new-context?]
   dbproto/IFlureeDb
-  (-rootdb [this] (graphdb-root-db this))
-  (-c-prop [this property collection] (graphdb-c-prop this property collection))
+  (-rootdb [this] (jsonld-root-db this))
+  (-c-prop [this property collection] (jsonld-c-prop this property collection))
   (-class-prop [this property class]
     (if (= :subclasses property)
       (get @(:subclasses schema) class)
       (get-in schema [:pred class property])))
-  (-p-prop [this property predicate] (graphdb-p-prop this property predicate))
+  (-p-prop [this property predicate] (jsonld-p-prop this property predicate))
   (-expand-iri [this compact-iri] (expand-iri this compact-iri))
   (-expand-iri [this compact-iri context] (expand-iri this compact-iri context))
-  (-tag [this tag-id] (graphdb-tag this tag-id))
-  (-tag [this tag-id pred] (graphdb-tag this tag-id pred))
-  (-tag-id [this tag-name] (graphdb-tag-id this tag-name))
-  (-tag-id [this tag-name pred] (graphdb-tag-id this tag-name pred))
+  (-tag [this tag-id] (jsonld-tag this tag-id))
+  (-tag [this tag-id pred] (jsonld-tag this tag-id pred))
+  (-tag-id [this tag-name] (jsonld-tag-id this tag-name))
+  (-tag-id [this tag-name pred] (jsonld-tag-id this tag-name pred))
   (-subid [this ident] (subid this ident false))
   (-subid [this ident strict?] (subid this ident strict?))
   (-class-ids [this subject] (class-ids this subject))
   (-iri [this subject-id] (iri this subject-id identity))
   (-iri [this subject-id compact-fn] (iri this subject-id compact-fn))
-  (-query [this query-map] (fql/query this query-map))
+  (-query [this query-map]
+    (let [ctx-type (-> query-map :opts :context-type)
+          q-ctx    (ctx-util/get-context query-map)
+          ctx      (dbproto/-context this q-ctx ctx-type)]
+      (fql/query this ctx query-map)))
   (-stage [db json-ld] (jld-transact/stage db json-ld nil))
   (-stage [db json-ld opts] (jld-transact/stage db json-ld opts))
   (-stage [db fuel-tracker json-ld opts] (jld-transact/stage db fuel-tracker json-ld opts))
   (-index-update [db commit-index] (index-update db commit-index))
-  (-context [_] (retrieve-context default-context context-cache ::dbproto/default-context context-type))
-  (-context [_ context] (retrieve-context default-context context-cache context context-type))
-  (-context [_ context type] (retrieve-context default-context context-cache context (or type context-type)))
+  (-context [_] (ctx-util/retrieve-context default-context context-cache ::dbproto/default-context context-type))
+  (-context [_ context] (ctx-util/retrieve-context default-context context-cache context context-type))
+  (-context [_ context type] (ctx-util/retrieve-context default-context context-cache context (or type context-type)))
   (-default-context [_] default-context)
   (-default-context-update [db default-context] (default-context-update db default-context))
   (-context-type [_] context-type))
@@ -324,8 +300,7 @@
                         context-type)]
     (map->JsonLdDb {:ledger          ledger
                     :conn            conn
-                    :method          method
-                    :ledger-alias    alias
+                    :alias           alias
                     :branch          (:name branch)
                     :commit          (:commit branch)
                     :t               0
