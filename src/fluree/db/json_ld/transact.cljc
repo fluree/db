@@ -625,14 +625,31 @@
                                        (<? (query-range/index-range db-before :spot = [sid const/$rdf:type]
                                                                     {:flake-xf (map flake/o)}))))
                 class-shapes   (<? (shacl/class-shapes db-before classes))
+                ;; these target objects in s-flakes
+                pid->ref-flakes (->> s-flakes
+                                    (filterv #(= const/$xsd:anyURI (flake/dt %)))
+                                    (group-by flake/p))
+                o-pred-shapes   (when (seq pid->ref-flakes)
+                                  (<? (shacl/targetobject-shapes db-before (keys pid->ref-flakes))))
+                ;; thes target subjects in s-flakes
                 referring-pids (when has-target-objects-of-shapes
-                                 (<? (query-range/index-range db-before :opst = [sid] {:flake-xf (map flake/p)})))
-                pred-shapes    (when (seq referring-pids)
+                                 (<? (query-range/index-range db-before :opst = [sid]
+                                                              {:flake-xf (map flake/p)})))
+                s-pred-shapes  (when (seq referring-pids)
                                  (<? (shacl/targetobject-shapes db-before referring-pids)))
-                subject-meta   {:new?    new-subject?
+                subject-meta   {:new?    (boolean new-subject?)
                                 :classes classes
-                                :shacl   (into class-shapes pred-shapes)}]
-            (recur r (assoc subj-mods sid subject-meta)))
+                                :shacl   (into class-shapes s-pred-shapes)}]
+            (recur r (reduce
+                       (fn [subj-mods o-pred-shape]
+                         (let [target-os (->> (get pid->ref-flakes (:target-objects-of o-pred-shape))
+                                              (mapv flake/o))]
+                           (reduce (fn [subj-mods target-o]
+                                     (update-in subj-mods [target-o :shacl] conj o-pred-shape))
+                                   subj-mods
+                                   target-os)))
+                       (-> subj-mods (assoc sid subject-meta))
+                       o-pred-shapes)))
           subj-mods)))))
 
 (defn final-db2

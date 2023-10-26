@@ -853,16 +853,8 @@
   (go-try
     (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetClass type-sid]
                                                   {:flake-xf (map flake/s)}))]
-      (<? (build-shapes db shape-sids)))))
-
-(defn merge-shapes
-  "Merges multiple shape maps together when multiple classes have shape
-  constraints on the same subject."
-  [shape-maps]
-  (reduce (fn [{:keys [datatype shapes] :as acc} shape]
-            (assoc acc :datatype (merge-with merge-datatype datatype (:datatype shape))
-                       :shapes (into shapes (:shapes shape))))
-          shape-maps))
+      (->> (<? (build-shapes db shape-sids))
+           (mapv (fn [shape] (assoc shape :target-class type-sid)))))))
 
 (defn class-shapes
   "Takes a list of target classes and returns shapes that must pass validation,
@@ -887,7 +879,8 @@
   (go-try
     (let [shape-sids (<? (query-range/index-range db :post = [const/$sh:targetObjectsOf pred-sid]
                                                   {:flake-xf (map flake/s)}))]
-      (<? (build-shapes db shape-sids)))))
+      (->> (<? (build-shapes db shape-sids))
+           (mapv (fn [shape] (assoc shape :target-objects-of pred-sid)))))))
 
 (defn targetobject-shapes
   "Takes a list of predicates and returns shapes that must pass validation,
