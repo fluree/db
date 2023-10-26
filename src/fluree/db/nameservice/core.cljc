@@ -4,7 +4,7 @@
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.util.async :refer [<? go-try]]
-            [clojure.core.async :as async :refer [go]]
+            [fluree.db.conn.core :refer [notify-ledger]]
             [fluree.db.util.log :as log]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -30,9 +30,13 @@
   we should retrieve all stored ns addresses in the commit if possible and
   try to use all nameservices."
   [conn ledger-alias {:keys [branch] :or {branch "main"} :as _opts}]
-  (if (relative-ledger-alias? ledger-alias)
-    (let [nameservices (nameservices conn)]
-      (go-try
+  (go-try
+    (if (relative-ledger-alias? ledger-alias)
+      (let [nameservices (nameservices conn)]
+        (when-not (and (sequential? nameservices)
+                       (> (count nameservices) 0))
+          (throw (ex-info "No nameservices configured on connection!"
+                          {:status 500 :error :db/invalid-nameservice})))
         (loop [nameservices* nameservices
                addresses     []]
           (let [ns (first nameservices*)]
@@ -40,8 +44,8 @@
               (if-let [address (<? (ns-address ns ledger-alias branch))]
                 (recur (rest nameservices*) (conj addresses address))
                 (recur (rest nameservices*) addresses))
-              addresses)))))
-    (go [ledger-alias])))
+              addresses))))
+      [ledger-alias])))
 
 (defn primary-address
   "From a connection, lookup primary address from
@@ -89,3 +93,31 @@
               true
               (recur (rest nameservices*))))
           false)))))
+
+(defn subscribe-ledger
+  "Initiates subscription requests for a ledger into all namespaces on a connection."
+  [conn ledger-alias]
+  (let [nameservices (nameservices conn)
+        callback     (fn [msg]
+                       (log/info "Subscription message received: " msg)
+                       (let [action       (get msg "action")
+                             ledger-alias (get msg "ledger")
+                             data         (get msg "data")]
+                         (if (= "new-commit" action)
+                           (notify-ledger conn data)
+                           (log/info "New subscritipn message with action: " action "received, ignored."))))]
+    (go-try
+      (loop [nameservices* nameservices]
+        (when-let [ns (first nameservices*)]
+          (<? (ns-proto/-subscribe ns ledger-alias callback))
+          (recur (rest nameservices*)))))))
+
+(defn unsubscribe-ledger
+  "Initiates unsubscription requests for a ledger into all namespaces on a connection."
+  [conn ledger-alias]
+  (let [nameservices (nameservices conn)]
+    (go-try
+      (loop [nameservices* nameservices]
+        (when-let [ns (first nameservices*)]
+          (<? (ns-proto/-unsubscribe ns ledger-alias))
+          (recur (rest nameservices*)))))))

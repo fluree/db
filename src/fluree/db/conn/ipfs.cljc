@@ -2,27 +2,24 @@
   (:require [fluree.db.storage :as storage]
             [fluree.db.index :as index]
             [fluree.db.util.context :as ctx-util]
-            [fluree.db.util.core :as util :refer [exception?]]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.method.ipfs.core :as ipfs]
-            [fluree.db.util.async :refer [<? go-try channel?]]
-            [clojure.core.async :as async :refer [go <!]]
-            [fluree.db.conn.state-machine :as state-machine]
-            [#?(:cljs cljs.cache :clj clojure.core.cache) :as cache]
+            [fluree.db.util.async :refer [<? go-try]]
+            [clojure.core.async :as async :refer [go <! chan]]
+            [fluree.db.conn.core :as conn-core]
             [fluree.db.serde.json :refer [json-serde]]
             [fluree.db.method.ipfs.keys :as ipfs-keys]
-            [fluree.db.method.ipfs.directory :as ipfs-dir]
             [fluree.db.indexer.default :as idx-default]
-            [clojure.string :as str]
-            [fluree.db.conn.cache :as conn-cache]))
+            [fluree.db.conn.cache :as conn-cache])
+  #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; IPFS Connection object
 
-(defrecord IPFSConnection [id memory state ledger-defaults lru-cache-atom
+(defrecord IPFSConnection [id state ledger-defaults lru-cache-atom
                            serializer parallelism msg-in-ch msg-out-ch
                            ipfs-endpoint]
 
@@ -84,6 +81,18 @@
          (throw (ex-info "IPFS connection does not support full text operations."
                          {:status 500 :error :db/unexpected-error})))]))
 
+#?(:cljs
+   (extend-type IPFSConnection
+     IPrintWithWriter
+     (-pr-writer [conn w opts]
+       (-write w "#IPFSConnection ")
+       (-write w (pr (conn-core/printer-map conn))))))
+
+#?(:clj
+   (defmethod print-method IPFSConnection [^IPFSConnection conn, ^Writer w]
+     (.write w (str "#IPFSConnection "))
+     (binding [*out* w]
+       (pr (conn-core/printer-map conn)))))
 
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
@@ -125,7 +134,7 @@
           ledger-defaults (<? (ledger-defaults ipfs-endpoint defaults))
           memory          (or memory 1000000) ;; default 1MB memory
           conn-id         (str (random-uuid))
-          state           (state-machine/blank-state)
+          state           (conn-core/blank-state)
 
           cache-size      (conn-cache/memory->cache-size memory)
           lru-cache-atom  (or lru-cache-atom (atom (conn-cache/create-lru-cache cache-size)))]
@@ -135,8 +144,7 @@
                             :ledger-defaults ledger-defaults
                             :serializer      serializer
                             :parallelism     parallelism
-                            :msg-in-ch       (async/chan)
-                            :msg-out-ch      (async/chan)
-                            :memory          true
+                            :msg-in-ch       (chan)
+                            :msg-out-ch      (chan)
                             :state           state
                             :lru-cache-atom  lru-cache-atom}))))

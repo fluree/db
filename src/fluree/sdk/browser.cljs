@@ -32,10 +32,6 @@
   [conn alias-or-address]
   (fluree/exists? conn alias-or-address))
 
-(defn ^:export loadFromAddress
-  ([address] (fluree/load-from-address address))
-  ([conn address] (fluree/load-from-address conn address)))
-
 (defn ^:export load
   ([conn ledger-alias] (fluree/load conn ledger-alias)))
 
@@ -104,7 +100,6 @@
        :db              db
        :exists          exists
        :load            load
-       :loadFromAddress loadFromAddress
        :query           query
        :setLogging      setLogging
        :stage           stage

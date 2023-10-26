@@ -9,7 +9,7 @@
             [fluree.db.index :as index]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.state-machine :as state-machine]
+            [fluree.db.conn.core :as conn-core]
             [fluree.db.util.log :as log :include-macros true]
             [fluree.db.storage :as storage]
             [fluree.db.indexer.default :as idx-default]
@@ -19,7 +19,8 @@
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.util.json :as json]
             [fluree.db.nameservice.filesystem :as ns-filesystem]
-            [fluree.db.ledger.proto :as ledger-proto]))
+            [fluree.db.ledger.proto :as ledger-proto])
+  #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -109,7 +110,7 @@
   [conn context-key]
   (json/parse (read-address conn context-key) true))
 
-(defrecord FileConnection [id memory state ledger-defaults parallelism msg-in-ch
+(defrecord FileConnection [id state ledger-defaults parallelism msg-in-ch
                            nameservices serializer msg-out-ch lru-cache-atom]
 
   conn-proto/iStorage
@@ -170,6 +171,19 @@
          (throw (ex-info "File connection does not support full text operations."
                          {:status 500 :error :db/unexpected-error})))]))
 
+#?(:cljs
+   (extend-type FileConnection
+     IPrintWithWriter
+     (-pr-writer [conn w opts]
+       (-write w "#FileConnection ")
+       (-write w (pr (conn-core/printer-map conn))))))
+
+#?(:clj
+   (defmethod print-method FileConnection [^FileConnection conn, ^Writer w]
+     (.write w (str "#FileConnection "))
+     (binding [*out* w]
+       (pr (conn-core/printer-map conn)))))
+
 (defn trim-last-slash
   [s]
   (if (str/ends-with? s "/")
@@ -206,7 +220,7 @@
   (go
     (let [storage-path   (trim-last-slash storage-path)
           conn-id        (str (random-uuid))
-          state          (state-machine/blank-state)
+          state          (conn-core/blank-state)
           nameservices*  (util/sequential
                            (or nameservices (default-file-nameservice storage-path)))
           cache-size     (conn-cache/memory->cache-size memory)

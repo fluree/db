@@ -24,9 +24,6 @@ exports[`lists flureedb fns 1`] = `
       load
     </li>
     <li>
-      loadFromAddress
-    </li>
-    <li>
       query
     </li>
     <li>

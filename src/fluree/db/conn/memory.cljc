@@ -8,13 +8,14 @@
             [fluree.db.util.log :as log :include-macros true]
             #?(:clj [fluree.db.full-text :as full-text])
             [fluree.db.conn.proto :as conn-proto]
-            [fluree.db.util.async :refer [<? go-try channel?]]
+            [fluree.db.util.async :refer [<? go-try]]
             [fluree.db.platform :as platform]
             [fluree.db.conn.cache :as conn-cache]
-            [fluree.db.conn.state-machine :as state-machine]
+            [fluree.db.conn.core :as conn-core]
             [fluree.db.indexer.default :as idx-default]
             [fluree.json-ld :as json-ld]
-            [fluree.crypto :as crypto]))
+            [fluree.crypto :as crypto])
+  #?(:clj (:import (java.io Writer))))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -129,6 +130,19 @@
          (throw (ex-info "Memory connection does not support full text operations."
                          {:status 500 :error :db/unexpected-error})))]))
 
+#?(:cljs
+   (extend-type MemoryConnection
+     IPrintWithWriter
+     (-pr-writer [conn w opts]
+       (-write w "#MemoryConnection ")
+       (-write w (pr (conn-core/printer-map conn))))))
+
+#?(:clj
+   (defmethod print-method MemoryConnection [^MemoryConnection conn, ^Writer w]
+     (.write w (str "#MemoryConnection "))
+     (binding [*out* w]
+       (pr (conn-core/printer-map conn)))))
+
 (defn ledger-defaults
   "Normalizes ledger defaults settings"
   [{:keys [context did context-type] :as _defaults}]
@@ -149,7 +163,7 @@
     (let [ledger-defaults (<? (ledger-defaults defaults))
           conn-id         (str (random-uuid))
           data-atom       (atom {})
-          state           (state-machine/blank-state)
+          state           (conn-core/blank-state)
           nameservices*   (util/sequential
                             (or nameservices
                                 (default-memory-nameservice data-atom)))

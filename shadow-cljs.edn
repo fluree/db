@@ -30,7 +30,6 @@
                       :db                fluree.sdk.node/db
                       :exists            fluree.sdk.node/exists
                       :load              fluree.sdk.node/load
-                      :loadFromAddress   fluree.sdk.node/loadFromAddress
                       :query             fluree.sdk.node/query
                       :setLogging        fluree.sdk.node/setLogging
                       :stage             fluree.sdk.node/stage

@@ -1,5 +1,6 @@
 (ns fluree.db.ledger.json-ld
-  (:require [fluree.db.flake :as flake]
+  (:require [clojure.core.async :as async]
+            [fluree.db.flake :as flake]
             [fluree.db.ledger.proto :as ledger-proto]
             [fluree.db.conn.proto :as conn-proto]
             [fluree.db.query.range :as query-range]
@@ -18,6 +19,9 @@
             [fluree.db.util.context :as ctx-util]
             [fluree.db.nameservice.proto :as ns-proto]
             [fluree.db.nameservice.core :as nameservice]
+            [fluree.db.conn.core :refer [register-ledger release-ledger cached-ledger]]
+            [fluree.db.json-ld.commit-data :as commit-data]
+            [fluree.db.index :as index]
             [fluree.db.util.log :as log])
   (:refer-clojure :exclude [load]))
 
@@ -56,7 +60,9 @@
   newer than provided db, updates index before storing.
 
   If index in provided db is newer, updates latest index held in ledger state."
-  [{:keys [state] :as _ledger} branch-name db force?]
+  [{:keys [state] :as ledger} branch-name db force?]
+  (log/debug "Attempting to update ledger's db with new commit:"
+             (:alias ledger) "branch:" branch-name)
   (when-not (get-in @state [:branches branch-name])
     (throw (ex-info (str "Unable to update commit on branch: " branch-name " as it no longer exists in ledger. "
                          "Did it just get deleted? Branches that exist are: " (keys (:branches @state)))
@@ -124,10 +130,11 @@
 
 (defn close-ledger
   "Shuts down ledger and resources."
-  [{:keys [indexer cache state] :as _ledger}]
+  [{:keys [indexer cache state conn alias] :as _ledger}]
   (idx-proto/-close indexer)
   (reset! state {:closed? true})
-  (reset! cache {}))
+  (reset! cache {})
+  (release-ledger conn alias)) ;; remove ledger from conn cache
 
 ;; TODO - finalize in-memory db update along with logic to ensure consistent state
 (defn update-local-db
@@ -138,37 +145,50 @@
   true)
 
 (defn notify
-  [{:keys [conn] :as ledger} {:keys [address t branch] :as commit-notification}]
-  (let [latest-db (ledger-proto/-db ledger {:branch branch})
-        latest-t  (:t latest-db)]
-    ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
-    (cond
+  "Returns false if provided commit update did not result in an update to the ledger because
+  the provided commit was not the next expected commit.
 
-      (< t latest-t)
-      (do
-        (log/info "Received update for ledger: " address " at t value: " t
-                  " however, latest-t is more current: " latest-t)
-        false)
+  If commit successful, returns successfully updated db."
+  [{:keys [conn] :as ledger} expanded-commit]
+  (go-try
+    (let [[commit proof] (jld-reify/parse-commit expanded-commit)
+          branch    (keyword (get-first-value expanded-commit const/iri-branch))
+          commit-t  (-> expanded-commit
+                        (get-first const/iri-data)
+                        (get-first-value const/iri-t))
+          latest-db (ledger-proto/-db ledger {:branch branch})
+          latest-t  (- (:t latest-db))]
+      (log/debug "notify of new commit for ledger: " (:alias ledger) " at t value: " commit-t
+                 " where current cached db t value is: " latest-t)
+      ;; note, index updates will have same t value as current one, so still need to check if t = latest-t
+      (cond
 
-      (= t (inc latest-t))
-      (->> (jld-reify/read-commit conn address)
-           <?
-           (jld-reify/merge-commit conn latest-db false)
-           <?
-           (update-local-db ledger))
+        (< commit-t latest-t)
+        (do
+          (log/info "Received commit update for ledger: " (:alias ledger) " at t value: " commit-t
+                    " however, latest-t is more current: " latest-t)
+          false)
 
-      ;; missing some updates, dump in-memory ledger forcing a reload
-      (> t (inc latest-t))
-      (do
-        (close-ledger ledger)
-        false))))
+        (= commit-t (inc latest-t))
+        (let [updated-db  (<? (jld-reify/merge-commit conn latest-db false [commit proof]))
+              commit-map  (commit-data/json-ld->map commit (select-keys updated-db index/types))
+              updated-db* (assoc updated-db :commit commit-map)]
+          (commit-update ledger branch updated-db* false))
+
+        ;; missing some updates, dump in-memory ledger forcing a reload
+        (> commit-t (inc latest-t))
+        (do
+          (log/debug "Received commit update that is more than 1 ahead of current ledger state. "
+                     "Will dump in-memory ledger and force a reload: " (:alias ledger))
+          (close-ledger ledger)
+          false)))))
 
 (defrecord JsonLDLedger [id address alias did indexer
                          state cache conn method]
   ledger-proto/iCommit
   (-commit! [ledger db] (commit! ledger db nil))
   (-commit! [ledger db opts] (commit! ledger db opts))
-  (-notify [ledger commit-notification] (notify ledger commit-notification))
+  (-notify [ledger expanded-commit] (notify ledger expanded-commit))
 
   ledger-proto/iLedger
   (-db [ledger] (db ledger nil))
@@ -209,7 +229,8 @@
           (recur r db**))
         db*))))
 
-(defn create
+
+(defn create*
   "Creates a new ledger, optionally bootstraps it as permissioned or with default context."
   [conn ledger-alias opts]
   (go-try
@@ -278,6 +299,20 @@
           (ledger-proto/-db-update ledger db*)))
       ledger)))
 
+(defn create
+  [conn ledger-alias opts]
+  (go-try
+    (let [[not-cached? ledger-chan] (register-ledger conn ledger-alias)] ;; holds final cached ledger in a promise-chan avoid race conditions
+      (if not-cached?
+        (let [ledger (async/<! (create* conn ledger-alias opts))]
+          (when (util/exception? ledger)
+            (release-ledger conn ledger-alias))
+          (async/put! ledger-chan ledger)
+          ledger)
+        (throw (ex-info (str "Unable to create new ledger, one already exists for: " ledger-alias)
+                        {:status 400
+                         :error  :db/ledger-exists}))))))
+
 (defn commit->ledger-alias
   "Returns ledger alias from commit map, if present. If not present
   then tries to resolve the ledger alias from the nameservice."
@@ -286,30 +321,66 @@
       (->> (conn-proto/-nameservices conn)
            (some #(ns-proto/-alias % db-alias)))))
 
-(defn load
-  [conn db-alias]
+;; TODO - once we have a different delimiter than `/` for branch/t-value this can simplified
+(defn alias-from-address
+  [address]
+  (when-let [path (->> address
+                       (re-matches #"^fluree:[^:]+://(.*)$")
+                       (second))]
+    (if (str/ends-with? path "/main/head")
+      (subs path 0 (- (count path) 10))
+      path)))
+
+(defn load*
+  [conn address]
   (go-try
-    (let [commit-addr  (<? (nameservice/lookup-commit conn db-alias nil))
+    (let [commit-addr  (<? (nameservice/lookup-commit conn address nil))
           _            (when-not commit-addr
-                         (throw (ex-info (str "Unable to load. No commit exists for: " db-alias)
+                         (throw (ex-info (str "Unable to load. No commit exists for: " address)
                                          {:status 400 :error :db/invalid-commit-address})))
           [commit _] (<? (jld-reify/read-commit conn commit-addr))
           _            (when-not commit
                          (throw (ex-info (str "Unable to load. No commit exists for: " commit-addr)
                                          {:status 400 :error :db/invalid-db})))
           _            (log/debug "load commit:" commit)
-          ledger-alias (commit->ledger-alias conn db-alias commit)
+          ledger-alias (commit->ledger-alias conn address commit)
           branch       (keyword (get-first-value commit const/iri-branch))
           default-ctx  (-> commit
                            (get-first const/iri-default-context)
                            (get-first-value const/iri-address)
                            (->> (jld-reify/load-default-context conn))
                            <?)
-          ledger       (<? (create conn ledger-alias {:branch         branch
-                                                      :id             commit-addr
-                                                      :defaultContext default-ctx
-                                                      :new-context?   false}))
+          ledger       (<? (create* conn ledger-alias {:branch         branch
+                                                       :id             commit-addr
+                                                       :defaultContext default-ctx
+                                                       :new-context?   false}))
           db           (ledger-proto/-db ledger)
           db*          (<? (jld-reify/load-db-idx db commit commit-addr false))]
       (ledger-proto/-commit-update ledger branch db*)
+      (nameservice/subscribe-ledger conn ledger-alias) ;; async in background, elect to receive update notifications
       ledger)))
+
+(defn load
+  [conn alias-or-address]
+  (async/go
+    (let [address? (str/starts-with? alias-or-address "fluree:")
+          alias    (if address?
+                     (alias-from-address alias-or-address)
+                     alias-or-address)
+          [not-cached? ledger-chan] (register-ledger conn alias)] ;; holds final cached ledger in a promise-chan avoid race conditions]
+      (if not-cached?
+        (let [address (if address?
+                        alias-or-address
+                        (async/<! (nameservice/primary-address conn alias-or-address nil)))]
+          (if (util/exception? address)
+            (do
+              (release-ledger conn alias)
+              (async/put! ledger-chan
+                          (ex-info (str "Load for " alias-or-address " failed due to exception in address lookup.")
+                                   {:status 400 :error :db/invalid-address}
+                                   address)))
+            (let [ledger (async/<! (load* conn address))]
+              ;; note, ledger can be an exception!
+              (async/put! ledger-chan ledger)
+              ledger)))
+        (<? ledger-chan)))))
