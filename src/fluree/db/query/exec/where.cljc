@@ -121,6 +121,13 @@
       unmatched-var
       (assoc ::fn f)))
 
+(defn lang-matcher
+  "Return a function that returns true if the language metadata of a matched
+  pattern equals the supplied language code `lang`."
+  [lang]
+  (fn [mch]
+    (-> mch ::meta :lang (= lang))))
+
 (defn ->val-filter
   "Build a query function specification for the explicit value `val` out of the
   boolean function `f`. `f` should accept a single flake where-match map."

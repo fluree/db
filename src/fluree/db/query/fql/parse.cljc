@@ -219,8 +219,7 @@
   [m]
   (when-let [v (get-first-value m :value)]
     (if-let [lang (get-first-value m :language)]
-      (let [lang-filter (fn [mch]
-                          (-> mch ::where/meta :lang (= lang)))]
+      (let [lang-filter (where/lang-matcher lang)]
         (where/->val-filter v lang-filter))
       (where/anonymous-value v))))
 
