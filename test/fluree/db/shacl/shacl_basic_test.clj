@@ -1748,7 +1748,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                      "insert" {"id" "ex:PersonShape"
                                                "type" "sh:NodeShape"
                                                "sh:targetClass" {"id" "ex:Person"}
-                                               "sh:property" [{"sh:path" [{"id" "ex:cool"} {"id" "ex:dude"}]
+                                               "sh:property" [{"sh:path" {"@list" [{"id" "ex:cool"} {"id" "ex:dude"}]}
                                                                "sh:nodeKind" {"id" "sh:BlankNode"}
                                                                "sh:minCount" 1}]}})
             valid-person @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
