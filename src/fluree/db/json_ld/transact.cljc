@@ -626,9 +626,10 @@
                                                                     {:flake-xf (map flake/o)}))))
                 class-shapes   (<? (shacl/class-shapes db-before classes))
                 ;; these target objects in s-flakes
-                pid->ref-flakes (->> s-flakes
-                                    (filterv #(= const/$xsd:anyURI (flake/dt %)))
-                                    (group-by flake/p))
+                pid->ref-flakes (when has-target-objects-of-shapes
+                                  (->> s-flakes
+                                       (filterv #(= const/$xsd:anyURI (flake/dt %)))
+                                       (group-by flake/p)))
                 o-pred-shapes   (when (seq pid->ref-flakes)
                                   (<? (shacl/targetobject-shapes db-before (keys pid->ref-flakes))))
                 ;; thes target subjects in s-flakes
