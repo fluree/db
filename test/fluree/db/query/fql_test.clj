@@ -85,58 +85,55 @@
           db     (fluree/db people)]
       (testing "binding a single variable"
         (testing "with a single value"
-          (let [q '{:select  [?name ?age]
-                    :where   [[?s :schema/email ?email]
-                              [?s :schema/name ?name]
-                              [?s :schema/age ?age]]
-                    :values  [?email ["alice@example.org"]]}]
+          (let [q '{:select [?name ?age]
+                    :where  [[?s :schema/email ?email]
+                             [?s :schema/name ?name]
+                             [?s :schema/age ?age]]
+                    :values [?email ["alice@example.org"]]}]
             (is (= [["Alice" 50]]
                    @(fluree/query db q))
                 "returns only the results related to the bound value")))
         (testing "with multiple values"
-          (let [q '{:select  [?name ?age]
-                    :where   [[?s :schema/email ?email]
-                              [?s :schema/name ?name]
-                              [?s :schema/age ?age]]
-                    :values  [?email ["alice@example.org" "cam@example.org"]]}]
+          (let [q '{:select [?name ?age]
+                    :where  [[?s :schema/email ?email]
+                             [?s :schema/name ?name]
+                             [?s :schema/age ?age]]
+                    :values [?email ["alice@example.org" "cam@example.org"]]}]
             (is (= [["Alice" 50] ["Cam" 34]]
                    @(fluree/query db q))
                 "returns only the results related to the bound values"))))
       (testing "binding multiple variables"
         (testing "with multiple values"
-          (let [q '{:select  [?name ?age]
-                    :where   [[?s :schema/email ?email]
-                              [?s :ex/favNums ?favNum]
-                              [?s :schema/name ?name]
-                              [?s :schema/age ?age]]
-                    :values  [[?email ?favNum] [["alice@example.org" 42]
-                                                ["cam@example.org" 10]]]}]
+          (let [q '{:select [?name ?age]
+                    :where  [[?s :schema/email ?email]
+                             [?s :ex/favNums ?favNum]
+                             [?s :schema/name ?name]
+                             [?s :schema/age ?age]]
+                    :values [[?email ?favNum] [["alice@example.org" 42]
+                                               ["cam@example.org" 10]]]}]
             (is (= [["Alice" 50] ["Cam" 34]]
                    @(fluree/query db q))
                 "returns only the results related to the bound values")))
         (testing "with some values not present"
-          (let [q '{:select  [?name ?age]
-                    :where   [[?s :schema/email ?email]
-                              [?s :ex/favNums ?favNum]
-                              [?s :schema/name ?name]
-                              [?s :schema/age ?age]]
-                    :values  [[?email ?favNum] [["alice@example.org" 42]
-                                                ["cam@example.org" 37]]]}]
+          (let [q '{:select [?name ?age]
+                    :where  [[?s :schema/email ?email]
+                             [?s :ex/favNums ?favNum]
+                             [?s :schema/name ?name]
+                             [?s :schema/age ?age]]
+                    :values [[?email ?favNum] [["alice@example.org" 42]
+                                               ["cam@example.org" 37]]]}]
             (is (= [["Alice" 50]]
                    @(fluree/query db q))
                 "returns only the results related to the existing bound values"))))
       (testing "with string vars"
-        (let [q {:select  ["?name" "?age"]
-                 :where   [["?s" :schema/email "?email"]
-                           ["?s" :schema/name "?name"]
-                           ["?s" :schema/age "?age"]]
-                 :values  ["?age" [13]]}]
+        (let [q {:select ["?name" "?age"]
+                 :where  [["?s" :schema/email "?email"]
+                          ["?s" :schema/name "?name"]
+                          ["?s" :schema/age "?age"]]
+                 :values ["?age" [13]]}]
           (is (= [["Liam" 13]]
                  @(fluree/query db q))
               "returns only the results related to the bound values"))))))
-
-
-
 
 (deftest ^:integration bind-query-test
   (let [conn   (test-utils/create-conn)
@@ -179,8 +176,8 @@
                                    ?canVote    (>= ?age 18)}}]
                 :order-by ?name}]
         (is (re-matches
-              #"Aggregate function sum is only valid for grouped values"
-              (ex-message @(fluree/query db q))))))))
+             #"Aggregate function sum is only valid for grouped values"
+             (ex-message @(fluree/query db q))))))))
 
 (deftest ^:integration iri-test
   (let [conn   (test-utils/create-conn)
@@ -243,17 +240,19 @@
               "returns correctly filtered results"))))))
 
 (deftest ^:integration subject-object-test
-  (let [conn (test-utils/create-conn {:defaults {:context-type :string
-                                                 :context      {"id"     "@id",
-                                                                "type"   "@type",
-                                                                "ex"     "http://example.org/",
-                                                                "f"      "https://ns.flur.ee/ledger#",
-                                                                "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                                                "schema" "http://schema.org/",
-                                                                "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+  (let [conn   (test-utils/create-conn
+                {:defaults
+                 {:context-type :string
+                  :context      {"id"     "@id",
+                                 "type"   "@type",
+                                 "ex"     "http://example.org/",
+                                 "f"      "https://ns.flur.ee/ledger#",
+                                 "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                 "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                 "schema" "http://schema.org/",
+                                 "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
         ledger @(fluree/create conn "test/love")
-        db @(fluree/stage     (fluree/db ledger)
+        db     @(fluree/stage (fluree/db ledger)
                               [{"@id"                "ex:fluree",
                                 "@type"              "schema:Organization",
                                 "schema:description" "We ❤️ Data"}
@@ -265,9 +264,9 @@
                                 "schema:description" "We ❤️ Human Blood"}]
                               {})]
     (testing "subject-object scans"
-      (let [q '{:select [?s ?p ?o]
-                :where [[?s "schema:description" ?o]
-                        [?s ?p ?o]]}
+      (let [q       '{:select [?s ?p ?o]
+                      :where  [[?s "schema:description" ?o]
+                               [?s ?p ?o]]}
             subject @(fluree/query db q)]
         (is (= [["ex:fluree" "schema:description" "We ❤️ Data"]
                 ["ex:mosquitos" "schema:description" "We ❤️ Human Blood"]
@@ -294,9 +293,9 @@
                  {?favNums 42, ?name "Liam", ?s :ex/liam}]
                results))))
     (testing "select * w/o graph crawl returns all vars bound in where clause w/ grouping"
-      (let [query   '{:select :*
-                      :where  [[?s :schema/name ?name]
-                               [?s :ex/favNums ?favNums]]
+      (let [query   '{:select   :*
+                      :where    [[?s :schema/name ?name]
+                                 [?s :ex/favNums ?favNums]]
                       :group-by [?s ?name]}
             results @(fluree/query db query)]
         (is (= '[{?favNums [9 42 76], ?name "Alice", ?s :ex/alice}
