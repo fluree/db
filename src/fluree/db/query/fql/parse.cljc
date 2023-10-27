@@ -53,17 +53,11 @@
                              values)
                         {:status 400 :error :db/invalid-query}))))))
 
-(def rdf-type-preds #{"a"
-                      :a
-                      :type
-                      const/iri-type
-                      "rdf:type"
-                      :rdf/type
-                      const/iri-rdf-type})
+(def type-preds #{const/iri-type const/iri-rdf-type})
 
-(defn rdf-type?
+(defn type-pred?
   [p]
-  (contains? rdf-type-preds p))
+  (contains? type-preds p))
 
 (defn select-map?
   [x]
@@ -239,27 +233,17 @@
 
 (defmulti parse-pattern
   (fn [pattern _vars _context]
-    (if (map? pattern)
-      (if (contains? pattern :graph)
-        :graph
-        (->> pattern keys first))
-      (if (map-entry? pattern)
-        :binding
-        :triple))))
+    (v/where-pattern-type pattern)))
 
-(defn type-pattern?
-  [typ x]
-  (and (map? x)
-       (-> x keys first (= typ))))
-
-(def filter-pattern?
-  (partial type-pattern? :filter))
+(defn filter-pattern?
+  [pattern]
+  (-> pattern v/where-pattern-type (= :filter)))
 
 (defn parse-filter-maps
   [vars filters]
   (let [vars (set vars)]
     (->> filters
-         (mapcat vals)
+         (mapcat rest)
          flatten
          (map (fn [fltr]
                 (parse-filter-function fltr vars)))
@@ -282,12 +266,115 @@
   [clause vars context]
   (let [patterns (->> clause
                       (remove filter-pattern?)
-                      (mapv (fn [pattern]
-                              (parse-pattern pattern vars context))))
+                      (mapcat (fn [pattern]
+                                (parse-pattern pattern vars context))))
         filters  (->> clause
                       (filter filter-pattern?)
                       (parse-filter-maps vars))]
     (where/->where-clause patterns filters)))
+
+(defn expand-keys
+  [m context]
+  (reduce-kv (fn [expanded p o]
+               (let [p* (if (v/variable? p)
+                          p
+                          (json-ld/expand-iri p context))]
+                 (assoc expanded p* o)))
+             {} m))
+
+(defn parse-value-attributes
+  [v attrs]
+  (if-let [lang (get attrs const/iri-language)]
+    (let [matcher (where/lang-matcher lang)]
+      (where/->val-filter v matcher))
+    (where/anonymous-value v)))
+
+(defn generate-subject-var
+  "Generate a unique subject variable"
+  []
+  (gensym "?s"))
+
+(defn id-or-variable
+  [id]
+  (or id (generate-subject-var)))
+
+(defn with-id
+  [m]
+  (update m const/iri-id id-or-variable))
+
+(defn parse-subject
+  [id context]
+  (if (v/variable? id)
+    (parse-variable id)
+    (parse-iri id context)))
+
+(defn parse-predicate
+  [p]
+  (if (v/variable? p)
+    (parse-variable p)
+    (where/->predicate p)))
+
+(declare parse-statements)
+
+(defn parse-statement*
+  [s-mch p o context]
+  (let [p-mch (parse-predicate p)]
+    (if (map? o)
+      (let [o* (expand-keys o context)]
+        (if-let [v (get o* const/iri-value)]
+          (let [attrs (dissoc o* const/iri-value)
+                o-mch (parse-value-attributes v attrs)]
+            [[s-mch p-mch o-mch]])
+          (let [id-map  (with-id o*)
+                o-mch   (-> id-map
+                            (get const/iri-id)
+                            (parse-subject context))
+                o-attrs (dissoc id-map const/iri-id)]
+            ;; return a thunk wrapping the recursive call to preserve stack
+            ;; space by delaying execution
+            #(into [[s-mch p-mch o-mch]]
+                   (parse-statements o-mch o-attrs context)))))
+      (if (v/variable? o)
+        (let [o-mch (parse-variable o)]
+          [[s-mch p-mch o-mch]])
+        (if (-> p-mch ::where/iri type-pred?)
+          (let [class-ref (parse-class o context)]
+            [(where/->pattern :class [s-mch p-mch class-ref])])
+          (let [o-mch (where/anonymous-value o)]
+            [[s-mch p-mch o-mch]]))))))
+
+(defn parse-statement
+  [s-mch p o context]
+  (trampoline parse-statement* s-mch p o context))
+
+(defn parse-statements*
+  [s-mch attrs context]
+  #(mapcat (fn [[p o]]
+             (parse-statement s-mch p o context))
+           attrs))
+
+(defn parse-statements
+  [s-mch attrs context]
+  (trampoline parse-statements* s-mch attrs context))
+
+(defn parse-id-map-pattern
+  [m context]
+  (let [s-mch (-> m
+                  (get const/iri-id)
+                  (parse-subject context))
+        attrs (dissoc m const/iri-id)]
+    (parse-statements s-mch attrs context)))
+
+(defn parse-node-map
+  [m context]
+  (-> m
+      (expand-keys context)
+      with-id
+      (parse-id-map-pattern context)))
+
+(defmethod parse-pattern :node
+  [m _vars context]
+  (parse-node-map m context))
 
 (defn parse-triple
   [[s-pat p-pat o-pat] context]
@@ -303,45 +390,33 @@
         (let [o (parse-object-pattern o-pat context)]
           [s p o])))))
 
-(defmethod parse-pattern :triple
-  [triple _ context]
-  (parse-triple triple context))
-
 (defmethod parse-pattern :union
-  [{:keys [union]} vars context]
+  [[_ union] vars context]
   (let [parsed (mapv (fn [clause]
                        (parse-where-clause clause vars context))
                      union)]
-    (where/->pattern :union parsed)))
+    [(where/->pattern :union parsed)]))
 
 (defmethod parse-pattern :optional
-  [{:keys [optional]} vars context]
-  (let [clause (if (coll? (first optional))
-                 optional
-                 [optional])
-        parsed (parse-where-clause clause vars context)]
-    (where/->pattern :optional parsed)))
+  [[_ optional] vars context]
+  (let [parsed (parse-where-clause optional vars context)]
+    [(where/->pattern :optional parsed)]))
 
 (defmethod parse-pattern :bind
-  [{:keys [bind]} _vars _context]
-  (let [parsed  (parse-bind-map bind)
-        pattern (where/->pattern :bind parsed)]
-    pattern))
-
-(defmethod parse-pattern :binding
-  [[v f] _vars _context]
-  (where/->pattern :binding [v f]))
+  [[_ bind] _vars _context]
+  (let [parsed  (parse-bind-map bind)]
+    [(where/->pattern :bind parsed)]))
 
 (defmethod parse-pattern :graph
-  [{:keys [graph where]} vars context]
+  [[_ graph where] vars context]
   (let [graph* (or (parse-variable graph)
                    graph)
         where* (parse-where-clause where vars context)]
-    (where/->pattern :graph [graph* where*])))
+    [(where/->pattern :graph [graph* where*])]))
 
 (defn parse-where
   [q vars context]
-  (when-let [where (:where q)]
+  (when-let [where (some-> q :where util/sequential)]
     (parse-where-clause where vars context)))
 
 (defn parse-as-fn
@@ -473,12 +548,10 @@
 
 (defn parse-update-clause
   [clause context]
-  (let [clause* (if (syntax/triple? clause)
-                  [clause]
-                  clause)]
-    (mapv (fn [trip]
-            (parse-triple trip context))
-          clause*)))
+  (->> clause
+       util/sequential
+       (mapv (fn [trip]
+               (parse-triple trip context)))))
 
 (defn parse-ledger-update
   [mdfn context]
