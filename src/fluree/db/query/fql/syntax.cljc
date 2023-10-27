@@ -44,8 +44,8 @@
    [:map-of ::json-ld-keyword :any]
    [:fn
     {:error/fn
-     (fn [{:keys [value]} _]
-       (str "Query: " (pr-str value) " does not have exactly one select clause. "
+     (fn [_ _]
+       (str "Query does not have exactly one select clause. "
             "One of 'select', 'selectOne', 'select-one', 'selectDistinct', or 'select-distinct' is required in queries. "
             "See documentation here for more details: "
             docs/error-codes-page "#query-missing-select"))}
