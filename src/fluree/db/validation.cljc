@@ -55,8 +55,8 @@
 (defn nearest-or-parent
   "If a given error is the child of a disjunction,
    returns the error data corresponding to that disjunction."
-  [error schema]
-  (let [{:keys [value path]} error]
+  [{:keys [schema value] :as _explained-error} error]
+  (let [{:keys [path in]} error]
     (loop [i (dec (count path))]
       (when-not (= 0 i)
         (let [subpath (subvec path 0 i)
@@ -65,13 +65,14 @@
                            m/type)]
           (if (#{:or :orn} type)
             (let [props (m/properties schema-fragment)
-                  in (mu/path->in schema subpath)]
+                  in-length (count (mu/path->in schema subpath))
+                  in' (subvec in 0 in-length)]
               {:schema schema-fragment
                :path subpath
                :type type
-               :in in
-               :value value})
-            (recur (dec i) )))))))
+               :in in'
+               :value (get-in value in')})
+            (recur (dec i))))))))
 
 (defn error-specificity-score
   "Given an error, applies a heursitic
@@ -103,7 +104,7 @@
    (portion of the value whch failed), and attempts to
    find the nearest disjunction which contains all of
    those errors. "
-  [{:keys [errors schema] :as _explained-error}]
+  [{:keys [errors] :as explained-error}]
   (let [most-specific-errors  (->> errors
                                    (sort-by error-specificity-score)
                                    (partition-by error-specificity-score)
@@ -112,14 +113,14 @@
       (first most-specific-errors)
       (let [same-in (val (first (group-by :in most-specific-errors)))
             [e & es] same-in
-            or-parent (loop [{:keys [path] :as parent} (nearest-or-parent e schema)]
+            or-parent (loop [{:keys [path] :as parent} (nearest-or-parent explained-error e)]
                         (when parent
                           (if (every? (fn [err]
                                         (let [path' (:path err)]
                                           (when (<= (count path) (count path'))
                                             (= path (subvec path' 0 (count path)))))) es)
                             parent
-                            (recur (nearest-or-parent parent schema)))))]
+                            (recur (nearest-or-parent explained-error parent)))))]
         (or or-parent (first same-in))))))
 
 (defn resolve-root-error-for-in
