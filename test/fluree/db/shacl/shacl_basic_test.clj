@@ -1577,12 +1577,14 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                      "ex:parent" [{"id" "ex:Bob"}
                                                                   {"id"        "ex:Zorba"
                                                                    "ex:gender" "alien"}]}})]
-      (is (= [{"id"        "ex:ValidKid"
-               "type" "ex:Kid"
-               "ex:parent" [{"id" "ex:Bob"}
-                            {"id" "ex:Jane"}]}]
-             @(fluree/query valid-kid {"select" {"?s" ["*"]}
-                                       "where"  [["?s" "id" "ex:ValidKid"]]})))
+      (is (= {"id"        "ex:ValidKid"
+              "type" "ex:Kid"
+              "ex:parent" [{"id" "ex:Bob"}
+                           {"id" "ex:Jane"}]}
+             (-> @(fluree/query valid-kid {"select" {"?s" ["*"]}
+                                           "where"  [["?s" "id" "ex:ValidKid"]]})
+                 first
+                 (update "ex:parent" (partial sort-by #(get % "id"))))))
       (is (str/starts-with? (ex-message invalid-kid)
                             "SHACL PropertyShape exception - path "))))
   (testing "sh:qualifiedValueShape node shape"
@@ -1623,12 +1625,14 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                                   {"id" "ex:Zorba"
                                                                    "type" "ex:Parent"
                                                                    "ex:gender" "alien"}]}})]
-      (is (= [{"id" "ex:ValidKid"
-               "type" "ex:Kid"
-               "ex:parent" [{"id" "ex:Mom"}
-                            {"id" "ex:Dad"}]}]
-             @(fluree/query valid-kid {"select" {"?s" ["*"]}
-                                       "where" [["?s" "id" "ex:ValidKid"]]})))
+      (is (= {"id" "ex:ValidKid"
+              "type" "ex:Kid"
+              "ex:parent" [{"id" "ex:Dad"}
+                           {"id" "ex:Mom"}]}
+             (-> @(fluree/query valid-kid {"select" {"?s" ["*"]}
+                                           "where" [["?s" "id" "ex:ValidKid"]]})
+                 first
+                 (update "ex:parent" (partial sort-by #(get % "id"))))))
       (is (= "SHACL PropertyShape exception - sh:pattern: value alien does not match pattern \"female\" or it is not a literal value."
              (ex-message invalid-kid)))))
   (testing "sh:qualifiedValueShapesDisjoint"
@@ -1675,16 +1679,18 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
                                                                   {"ex:name" "Finger"}
                                                                   {"ex:name" "Finger"}
                                                                   {"ex:name" ["Finger" "Thumb"]}]}})]
-      (is (= [{"id"       "ex:ValidHand",
-               "type" "ex:Hand",
-               "ex:digit"
-               [{"ex:name" "Thumb"}
-                {"ex:name" "Finger"}
-                {"ex:name" "Finger"}
-                {"ex:name" "Finger"}
-                {"ex:name" "Finger"}]}]
-             @(fluree/query valid-hand {"select" {"?s" ["*" {"ex:digit" ["ex:name"]}]}
-                                        "where"  [["?s" "id" "ex:ValidHand"]]})))
+      (is (= {"id"       "ex:ValidHand",
+              "type" "ex:Hand",
+              "ex:digit"
+              [{"ex:name" "Finger"}
+               {"ex:name" "Finger"}
+               {"ex:name" "Finger"}
+               {"ex:name" "Finger"}
+               {"ex:name" "Thumb"}]}
+             (-> @(fluree/query valid-hand {"select" {"?s" ["*" {"ex:digit" ["ex:name"]}]}
+                                            "where"  [["?s" "id" "ex:ValidHand"]]})
+                 (first)
+                 (update "ex:digit" (partial sort-by #(get % "ex:name"))))))
       (is (str/starts-with? (ex-message invalid-hand)
                             "SHACL PropertyShape exception - path ")))))
 
