@@ -12,7 +12,7 @@
          metosin/malli                   {:git/url "https://github.com/metosin/malli.git"
                                           :git/sha "5211aca498ff7b022c36de4ca713990f5e731a9c"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
-                                          :git/sha "2b4a4cf75f2b823eea7fa221c6b9cbeb68299e90"}
+                                          :git/sha "c2bef3785631dd178b9261e2f4d2ee012fed984c"}
 
          ;; logging
          org.clojure/tools.logging       {:mvn/version "1.2.4"}
@@ -46,8 +46,8 @@
 
  :aliases
  {:build
-  {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.5"
-                                               :git/sha "8bf69b5"}
+  {:deps       {io.github.clojure/tools.build {:git/tag "v0.9.6"
+                                               :git/sha "8e78bcc"}
                 slipset/deps-deploy           {:mvn/version "0.2.1"}}
    :ns-default build}
 
@@ -56,7 +56,7 @@
    :extra-deps  {org.clojure/tools.namespace       {:mvn/version "1.4.4"}
                  criterium/criterium               {:mvn/version "0.4.6"}
                  figwheel-sidecar/figwheel-sidecar {:mvn/version "0.5.20"}
-                 thheller/shadow-cljs              {:mvn/version "2.25.7"}}}
+                 thheller/shadow-cljs              {:mvn/version "2.25.9"}}}
 
   :cljtest
   {:extra-paths ["test" "dev-resources" "test-resources"]
@@ -120,5 +120,5 @@
    :main-opts  ["-m" "antq.core"]}
 
   :clj-kondo
-  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.09.07"}}
+  {:extra-deps {clj-kondo/clj-kondo {:mvn/version "2023.10.20"}}
    :main-opts  ["-m" "clj-kondo.main" "--lint" "src" "--config" ".clj-kondo/config.edn"]}}}
