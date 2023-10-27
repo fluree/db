@@ -311,3 +311,44 @@
         (is (thrown-with-msg? Exception
                               #"Invalid transaction, missing required keys: .+ledger"
                               @(fluree/transact! conn txn nil)))))))
+
+(deftest ^:pending base-and-vocab-test
+  (testing "@base & @vocab work w/ stage"
+    (let [conn        (test-utils/create-conn)
+          ctx         {"@base"  "http://example.org/"
+                       "@vocab" "http://example.org/terms/"}
+          ledger-name "cookbook/base"
+          txn         {"@context" ctx
+                       "f:ledger" ledger-name
+                       "@graph"   [{"@id"     "nessie"
+                                    "@type"   "SeaMonster"
+                                    "isScary" false}]}
+          ledger      @(fluree/create conn ledger-name)
+          db0         (fluree/db ledger)
+          db1         @(fluree/stage db0 txn)]
+      (is (= [{"@id"                              "http://example.org/nessie"
+               "@type"                            "http://example.org/terms/SeaMonster"
+               "http://example.org/terms/isScary" false}]
+             @(fluree/query db1 {"@context" nil
+                                 "select"   '{?m ["*"]}
+                                 "where"    '[[?m "@type" "http://example.org/terms/SeaMonster"]]})))))
+  (testing "@base & @vocab work w/ stage2"
+    (let [conn        (test-utils/create-conn)
+          ctx         ["https://ns.flur.ee"
+                       {"@base"  "http://example.org/"
+                        "@vocab" "http://example.org/terms/"}]
+          ledger-name "cookbook/base"
+          txn         {"@context" ctx
+                       "ledger"   ledger-name
+                       "insert"   {"@id"     "nessie"
+                                   "@type"   "SeaMonster"
+                                   "isScary" false}}
+          ledger      @(fluree/create conn ledger-name)
+          db0         (fluree/db ledger)
+          db1         @(fluree/stage2 db0 txn)]
+      (is (= [{"@id"                              "http://example.org/nessie"
+               "@type"                            "http://example.org/terms/SeaMonster"
+               "http://example.org/terms/isScary" false}]
+             @(fluree/query db1 '{"@context" nil
+                                  "select"   {?m ["*"]}
+                                  "where"    [[?m "@type" "http://example.org/terms/SeaMonster"]]}))))))
