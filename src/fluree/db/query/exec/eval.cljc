@@ -22,7 +22,7 @@
 
 (defn sum
   [coll]
-  (reduce + 0 coll))
+  (reduce + coll))
 
 (defn avg
   [coll]

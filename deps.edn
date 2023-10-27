@@ -10,7 +10,7 @@
          cheshire/cheshire               {:mvn/version "5.12.0"}
          instaparse/instaparse           {:mvn/version "1.4.12"}
          metosin/malli                   {:git/url "https://github.com/metosin/malli.git"
-                                          :git/sha "5211aca498ff7b022c36de4ca713990f5e731a9c" }
+                                          :git/sha "5211aca498ff7b022c36de4ca713990f5e731a9c"}
          com.fluree/json-ld              {:git/url "https://github.com/fluree/json-ld.git"
                                           :git/sha "2b4a4cf75f2b823eea7fa221c6b9cbeb68299e90"}
 
