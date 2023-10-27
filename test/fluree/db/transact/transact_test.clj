@@ -223,9 +223,9 @@
                       :where  [[?s :type :ex/User]]}]
     (testing "Top-level context is used for transaction nodes"
       (let [txn {:f/ledger ledger-name
-                 :context  {:f   "https://ns.flur.ee/ledger#"
-                            :foo "http://foo.com/"
-                            :id  "@id"
+                 :context  {:f     "https://ns.flur.ee/ledger#"
+                            :foo   "http://foo.com/"
+                            :id    "@id"
                             :graph "@graph"}
                  :graph    [{:id          :ex/alice
                              :type        :ex/User
@@ -245,34 +245,34 @@
                  :foo/bar     "foo",
                  :schema/name "Alice"}]
                @(fluree/query db (assoc user-query
-                                        :context ["" {:foo "http://foo.com/"}]))))))
+                                   :context ["" {:foo "http://foo.com/"}]))))))
     (testing "Aliased @id, @graph are correctly identified"
       (let [txn {:context     {:id-alias    "@id"
                                :graph-alias "@graph"
                                :f           "https://ns.flur.ee/ledger#"}
                  :f/ledger    ledger-name
-                 :graph-alias {:id-alias    :ex/alice
+                 :graph-alias {:id-alias         :ex/alice
                                :schema/givenName "Alicia"}}
             db  @(fluree/transact! conn txn nil)]
         (is (= [{:id          :ex/bob,
                  :type        :ex/User,
                  :schema/name "Bob",
                  :foo/baz     "baz"}
-                {:id          :ex/alice,
-                 :type        :ex/User,
-                 :schema/name "Alice",
-                 :foo/bar     "foo",
+                {:id               :ex/alice,
+                 :type             :ex/User,
+                 :schema/name      "Alice",
+                 :foo/bar          "foo",
                  :schema/givenName "Alicia"}]
                @(fluree/query db (assoc user-query
-                                        :context ["" {:foo "http://foo.com/"
-                                                      :bar "http://bar.com/"}]))))))
+                                   :context ["" {:foo "http://foo.com/"
+                                                 :bar "http://bar.com/"}]))))))
     (testing "@context inside node is correctly handled"
-      (let [txn        {:context  {:f "https://ns.flur.ee/ledger#"}
-                        :f/ledger ledger-name
-                        "@graph"  [{:context    {:quux "http://quux.com/"}
-                                    :id         :ex/alice
-                                    :quux/corge "grault"}]}
-            db @(fluree/transact! conn txn nil)]
+      (let [txn {:context  {:f "https://ns.flur.ee/ledger#"}
+                 :f/ledger ledger-name
+                 "@graph"  [{:context    {:quux "http://quux.com/"}
+                             :id         :ex/alice
+                             :quux/corge "grault"}]}
+            db  @(fluree/transact! conn txn nil)]
         (is (= [{:id          :ex/bob
                  :type        :ex/User
                  :schema/name "Bob"
@@ -284,9 +284,9 @@
                  :quux/corge       "grault"
                  :foo/bar          "foo"}]
                @(fluree/query db (assoc user-query
-                                        :context ["" {:foo  "http://foo.com/"
-                                                      :bar  "http://bar.com/"
-                                                      :quux "http://quux.com/"}]))))))
+                                   :context ["" {:foo  "http://foo.com/"
+                                                 :bar  "http://bar.com/"
+                                                 :quux "http://quux.com/"}]))))))
     (testing "conn default context is inherited when requested (and not o/w)"
       (let [txn1 {:context  ["" {:f "https://ns.flur.ee/ledger#"}]
                   :f/ledger ledger-name
@@ -305,9 +305,9 @@
         (is (thrown-with-msg? Exception #"Invalid compact-iri"
                               @(fluree/transact! conn txn2 nil)))))
     (testing "Throws on invalid txn"
-      (let [txn        {"@graph" [{:context    {:quux "http://quux.com/"}
-                                   :id         :ex/cam
-                                   :quux/corge "grault"}]}]
+      (let [txn {"@graph" [{:context    {:quux "http://quux.com/"}
+                            :id         :ex/cam
+                            :quux/corge "grault"}]}]
         (is (thrown-with-msg? Exception
                               #"Invalid transaction, missing required keys: .+ledger"
                               @(fluree/transact! conn txn nil)))))))
