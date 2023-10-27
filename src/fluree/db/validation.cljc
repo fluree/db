@@ -5,7 +5,8 @@
             [malli.core :as m]
             [malli.error :as me]
             [malli.util :as mu]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [clojure.walk :as walk]))
 
 (defn iri?
   [v]
@@ -71,7 +72,7 @@
                :path subpath
                :type type
                :in in'
-               :value (get-in value in')})
+               :value (get-in (walk/keywordize-keys value) in')})
             (recur (dec i))))))))
 
 (defn error-specificity-score
