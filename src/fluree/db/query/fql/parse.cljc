@@ -59,10 +59,6 @@
   [p]
   (contains? type-preds p))
 
-(defn select-map?
-  [x]
-  (map? x))
-
 (defn safe-read
   [code-str]
   (try*
@@ -165,37 +161,16 @@
       (json-ld/expand-iri context)
       where/->iri-ref))
 
-(defn parse-subject-pattern
-  [s-pat context]
-  (when s-pat
-    (or (parse-variable s-pat)
-        (parse-pred-ident s-pat)
-        (parse-iri s-pat context)
-        (throw (ex-info (str "Subject values in where statement must be integer subject IDs or two-tuple identies. "
-                             "Provided: " s-pat ".")
-                        {:status 400 :error :db/invalid-query})))))
-
 (defn parse-predicate-iri
   [p context]
   (let [iri (json-ld/expand-iri p context)]
     (where/->predicate iri)))
-
-(defn parse-predicate-pattern
-  [p-pat context]
-  (or (parse-variable p-pat)
-      (parse-predicate-iri p-pat context)))
 
 (defn parse-class
   [o-iri context]
   (-> o-iri
       (json-ld/expand-iri context)
       where/->iri-ref))
-
-(defn parse-object-iri
-  [x context]
-  (-> x
-      (json-ld/expand-iri context)
-      where/anonymous-value))
 
 (defn iri-map?
   [m]
@@ -223,13 +198,6 @@
     (let [expanded (json-ld/expand pat context)]
       (or (parse-iri-map expanded)
           (parse-value-map expanded)))))
-
-(defn parse-object-pattern
-  [o-pat context]
-  (or (parse-variable o-pat)
-      (parse-pred-ident o-pat)
-      (parse-reference-map o-pat context)
-      (where/anonymous-value o-pat)))
 
 (defmulti parse-pattern
   (fn [pattern _vars _context]
@@ -376,20 +344,6 @@
 (defmethod parse-pattern :node
   [m _vars context]
   (parse-node-map m context))
-
-(defn parse-triple
-  [[s-pat p-pat o-pat] context]
-  (let [s (parse-subject-pattern s-pat context)
-        p (parse-predicate-pattern p-pat context)]
-    (if (and (#{const/iri-type const/iri-rdf-type} (::where/iri p))
-             (not (v/variable? o-pat)))
-      (let [class-ref (parse-class o-pat context)]
-        (where/->pattern :class [s p class-ref]))
-      (if (= const/iri-id (::where/iri p))
-        (let [o (parse-object-iri o-pat context)]
-          [s p o])
-        (let [o (parse-object-pattern o-pat context)]
-          [s p o])))))
 
 (defmethod parse-pattern :union
   [[_ & union] vars context]
@@ -551,8 +505,8 @@
   [clause context]
   (->> clause
        util/sequential
-       (mapv (fn [trip]
-               (parse-triple trip context)))))
+       (mapv (fn [m]
+               (parse-node-map m context)))))
 
 (defn parse-ledger-update
   [mdfn context]
@@ -646,14 +600,14 @@
   (let [[vars values] (parse-values {:values (util/get-first-value txn const/iri-values)})
         where         (parse-where {:where (util/get-first-value txn const/iri-where)} vars context)
 
-        delete (-> (util/get-first-value txn const/iri-delete)
-                   (json-ld/expand context)
-                   (util/sequential)
-                   (parse-triples))
-        insert (-> (util/get-first-value txn const/iri-insert)
-                   (json-ld/expand context)
-                   (util/sequential)
-                   (parse-triples))]
+        delete (->> (util/get-first-value txn const/iri-delete)
+                    util/sequential
+                    (mapcat (fn [m]
+                              (parse-node-map m context))))
+        insert (->> (util/get-first-value txn const/iri-insert)
+                    util/sequential
+                    (mapcat (fn [m]
+                              (parse-node-map m context))))]
     (cond-> {}
       context            (assoc :context context)
       where              (assoc :where where)
