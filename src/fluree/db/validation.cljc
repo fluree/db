@@ -5,7 +5,8 @@
             [malli.core :as m]
             [malli.error :as me]
             [malli.util :as mu]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [clojure.walk :as walk]))
 
 (defn iri?
   [v]
@@ -61,8 +62,8 @@
 (defn nearest-or-parent
   "If a given error is the child of a disjunction,
    returns the error data corresponding to that disjunction."
-  [error schema]
-  (let [{:keys [value path]} error]
+  [{:keys [schema value] :as _explained-error} error]
+  (let [{:keys [path in]} error]
     (loop [i (dec (count path))]
       (when-not (= 0 i)
         (let [subpath (subvec path 0 i)
@@ -71,13 +72,14 @@
                            m/type)]
           (if (#{:or :orn} type)
             (let [props (m/properties schema-fragment)
-                  in (mu/path->in schema subpath)]
+                  in-length (count (mu/path->in schema subpath))
+                  in' (subvec in 0 in-length)]
               {:schema schema-fragment
                :path subpath
                :type type
-               :in in
-               :value value})
-            (recur (dec i) )))))))
+               :in in'
+               :value (get-in (walk/keywordize-keys value) in')})
+            (recur (dec i))))))))
 
 (defn error-specificity-score
   "Given an error, applies a heursitic
@@ -109,7 +111,7 @@
    (portion of the value whch failed), and attempts to
    find the nearest disjunction which contains all of
    those errors. "
-  [{:keys [errors schema] :as _explained-error}]
+  [{:keys [errors] :as explained-error}]
   (let [most-specific-errors  (->> errors
                                    (sort-by error-specificity-score)
                                    (partition-by error-specificity-score)
@@ -118,14 +120,14 @@
       (first most-specific-errors)
       (let [same-in (val (first (group-by :in most-specific-errors)))
             [e & es] same-in
-            or-parent (loop [{:keys [path] :as parent} (nearest-or-parent e schema)]
+            or-parent (loop [{:keys [path] :as parent} (nearest-or-parent explained-error e)]
                         (when parent
                           (if (every? (fn [err]
                                         (let [path' (:path err)]
                                           (when (<= (count path) (count path'))
                                             (= path (subvec path' 0 (count path)))))) es)
                             parent
-                            (recur (nearest-or-parent parent schema)))))]
+                            (recur (nearest-or-parent explained-error parent)))))]
         (or or-parent (first same-in))))))
 
 (defn resolve-root-error-for-in
@@ -175,15 +177,16 @@
     :orderBy
     :commit-details
     :t
-    :history})
+    :history
+    :from})
 
 (defn format-error
   [explained error error-opts]
-  (let [{:keys [path value]} error
-        top-level-key (some-> (first (filter top-level-query-keys path))
-                              name)
+  (let [{full-value :value} explained
+        {:keys [path value]} error
+        top-level-key (first (filter top-level-query-keys path))
         top-level-message (when top-level-key
-                            (str "Error in value for \"" top-level-key "\""))
+                            (str "Error in value for \"" (name top-level-key) "\""))
         [_ root-message] (resolve-root-error-for-in
                           explained
                           error
@@ -195,11 +198,15 @@
         docs-pointer-msg (when top-level-key
                            (str " See documentation for details: "
                                 docs/error-codes-page "#query-invalid-"
-                                (->> (str/replace top-level-key #"-" "")
+                                (->> (str/replace (name top-level-key) #"-" "")
                                      (map str/lower-case)
-                                     str/join)))]
+                                     str/join)))
+        provided-value    (or value full-value)]
     [top-level-message root-message direct-message
-     (str "Provided: " (pr-str value)) docs-pointer-msg]))
+     (some->> provided-value
+             pr-str
+             (str "Provided: "))
+     docs-pointer-msg]))
 
 (defn top-level-fn-error
   [errors]
@@ -245,7 +252,6 @@
   [explained-error opts]
    (let [error-opts   (or opts default-error-overrides)
          {:keys [errors schema value]} explained-error
-         [first-e] errors
          e (or (top-level-fn-error errors)
                (choose-relevant-error explained-error))]
      (str/join "; " (remove nil? (distinct  (format-error explained-error e error-opts))))))
@@ -256,7 +262,8 @@
    (m/type-schemas)
    (m/sequence-schemas)
    (m/predicate-schemas)
-   {::iri                  [:or :string :keyword]
+   {::iri                  [:or {:error/message "invalid iri"}
+                            :string :keyword]
     ::iri-key              [:fn iri-key?]
     ::iri-map              [:map-of {:max 1}
                             ::iri-key ::iri]
@@ -278,7 +285,7 @@
                                    :decode/json string->keyword
                                    :error/message "unrecognized operation in where tuple, must be one of: graph, filter, optional, union, bind"}
                             :graph :filter :optional :union :bind]
-    ::graph                [:orn {:error/message "graph. Must be a ledger name or variable"}
+    ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
                             [:ledger ::ledger]
                             [:variable ::var]]
     ::node-map-key         [:orn {:error/message "node map keys must be an iri or variable"}
@@ -306,9 +313,11 @@
                             [:single ::node-map]
                             [:collection [:sequential ::where-pattern]]]
     ::ledger               ::iri
-    ::from                 [:orn
+    ::from                 [:orn {:error/message "from must be a ledger iri or vector of ledger iris"}
                             [:single ::ledger]
-                            [:collection [:sequential ::ledger]]]
+                            [:collection [:sequential
+                                          {:error/message "all values in `from`/`from-named` must be ledger iris"}
+                                          ::ledger]]]
     ::from-named           ::from
     ::delete               [:orn {:error/message "delete statements must be a node map or sequence of node maps"}
                             [:single ::node-map]

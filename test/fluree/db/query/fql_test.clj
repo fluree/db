@@ -135,8 +135,6 @@
                  @(fluree/query db q))
               "returns only the results related to the bound values"))))))
 
-
-
 (deftest ^:integration bind-query-test
   (let [conn   (test-utils/create-conn)
         people (test-utils/load-people conn)
@@ -178,8 +176,8 @@
                                    ?canVote    (>= ?age 18)}]]
                 :order-by ?name}]
         (is (re-matches
-              #"Aggregate function sum is only valid for grouped values"
-              (ex-message @(fluree/query db q))))))))
+             #"Aggregate function sum is only valid for grouped values"
+             (ex-message @(fluree/query db q))))))))
 
 (deftest ^:integration iri-test
   (let [conn   (test-utils/create-conn)
@@ -238,18 +236,44 @@
           (is (= [["ex:bob"]] sut)
               "returns correctly filtered results"))))))
 
+(deftest ^:integration ^:pending datatype-test
+  (let [conn   (test-utils/create-conn)
+        ledger @(fluree/create conn "people"
+                               {:defaultContext
+                                ["" {:ex "http://example.org/ns/"}]})
+        db     @(-> ledger
+                    fluree/db
+                    (fluree/stage
+                     [{:id      :ex/homer
+                       :ex/name "Homer"
+                       :ex/age  36}
+                      {:id      :ex/bart
+                       :ex/name "Bart"
+                       :ex/age  "forever 10"}]))]
+    (testing "including datatype in query results"
+      (let [query   '{:select [?age ?dt]
+                      :where  [[?s :ex/age ?age]
+                               {:bind {?dt (datatype ?age)}}]}
+            results @(fluree/query db query)]
+        (is (= [["forever 10" "xsd:string"] [36 "xsd:long"]]
+               results))))
+    (testing "filtering query results with datatype fn")
+    (testing "filtering query results with @type value map")))
+
 (deftest ^:integration subject-object-test
-  (let [conn (test-utils/create-conn {:defaults {:context-type :string
-                                                 :context      {"id"     "@id",
-                                                                "type"   "@type",
-                                                                "ex"     "http://example.org/",
-                                                                "f"      "https://ns.flur.ee/ledger#",
-                                                                "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-                                                                "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
-                                                                "schema" "http://schema.org/",
-                                                                "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
+  (let [conn   (test-utils/create-conn
+                {:defaults
+                 {:context-type :string
+                  :context      {"id"     "@id",
+                                 "type"   "@type",
+                                 "ex"     "http://example.org/",
+                                 "f"      "https://ns.flur.ee/ledger#",
+                                 "rdf"    "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                                 "rdfs"   "http://www.w3.org/2000/01/rdf-schema#",
+                                 "schema" "http://schema.org/",
+                                 "xsd"    "http://www.w3.org/2001/XMLSchema#"}}})
         ledger @(fluree/create conn "test/love")
-        db @(fluree/stage     (fluree/db ledger)
+        db     @(fluree/stage (fluree/db ledger)
                               [{"@id"                "ex:fluree",
                                 "@type"              "schema:Organization",
                                 "schema:description" "We ❤️ Data"}
