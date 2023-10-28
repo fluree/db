@@ -65,7 +65,6 @@
           [:order-by {:optional true} ::order-by]
           [:groupBy {:optional true} ::group-by]
           [:group-by {:optional true} ::group-by]
-          [:filter {:optional true} ::filter]
           [:having {:optional true} ::function]
           [:values {:optional true} ::values]
           [:limit {:optional true} ::limit]
@@ -150,7 +149,6 @@
     ::group-by        [:orn {:error/message "groupBy clause must be a variable or a vector of variables"}
                        [:clause ::var]
                        [:collection [:sequential ::var]]]
-    ::triple          ::v/triple
     ::filter          ::v/filter
     ::where           ::v/where
     ::values          ::v/values
@@ -162,17 +160,8 @@
     ::from            ::v/from
     ::from-named      ::v/from-named}))
 
-(def triple-validator
-  (m/validator ::triple {:registry registry}))
-
-(defn triple?
-  [x]
-  (triple-validator x))
-
 (def coerce-query*
   (m/coercer ::query (mt/transformer {:name :fql}) {:registry registry}))
-
-
 
 (defn humanize-error
   [error]
@@ -182,7 +171,6 @@
                        (fn [errors] (map #(dissoc % :schema) errors))))
     (-> explain-data
         (v/format-explained-errors nil))))
-
 
 (defn coerce-query
   [qry]
