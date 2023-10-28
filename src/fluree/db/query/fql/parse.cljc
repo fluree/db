@@ -391,7 +391,7 @@
           [s p o])))))
 
 (defmethod parse-pattern :union
-  [[_ union] vars context]
+  [[_ & union] vars context]
   (let [parsed (mapv (fn [clause]
                        (parse-where-clause clause vars context))
                      union)]
