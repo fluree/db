@@ -264,11 +264,12 @@
 
 (defn parse-where-clause
   [clause vars context]
-  (let [patterns (->> clause
+  (let [clause*  (util/sequential clause)
+        patterns (->> clause*
                       (remove filter-pattern?)
                       (mapcat (fn [pattern]
                                 (parse-pattern pattern vars context))))
-        filters  (->> clause
+        filters  (->> clause*
                       (filter filter-pattern?)
                       (parse-filter-maps vars))]
     (where/->where-clause patterns filters)))
@@ -416,7 +417,7 @@
 
 (defn parse-where
   [q vars context]
-  (when-let [where (some-> q :where util/sequential)]
+  (when-let [where (:where q)]
     (parse-where-clause where vars context)))
 
 (defn parse-as-fn
