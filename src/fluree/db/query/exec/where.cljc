@@ -104,14 +104,17 @@
   #?(:clj  (MapEntry/create typ data)
      :cljs (MapEntry. typ data nil)))
 
-(defn ->ident
-  "Build a pattern that already matches the two-tuple database identifier `x`"
-  [x]
-  {::ident x})
-
 (defn ->iri-ref
   [x]
   {::iri x})
+
+(defn variable?
+  [sym]
+  (and (symbol? sym)
+       (-> sym
+           name
+           first
+           (= \?))))
 
 (defn ->var-filter
   "Build a query function specification for the variable `var` out of the
@@ -682,16 +685,14 @@
 
 (defn search
   [ds q fuel-tracker error-ch]
-  (let [where-clause      (:where q)
-        initial-solutions (-> q
-                              :values
-                              not-empty
-                              (or [blank-solution]))
-        out-ch            (async/chan)]
-    (async/pipeline-async 2
-                          out-ch
-                          (fn [initial-solution ch]
-                            (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)
-                                (async/pipe ch)))
-                          (async/to-chan! initial-solutions))
+  (let [out-ch (async/chan 2)]
+    (if-let [where-clause (:where q)]
+      (let [initial-solutions (-> q :values not-empty (or [blank-solution]))]
+        (async/pipeline-async 2
+                              out-ch
+                              (fn [initial-solution ch]
+                                (-> (match-clause ds fuel-tracker initial-solution where-clause error-ch)
+                                    (async/pipe ch)))
+                              (async/to-chan! initial-solutions)))
+      (async/put! out-ch blank-solution #(async/close! out-ch)))
     out-ch))
