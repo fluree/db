@@ -357,18 +357,10 @@
     min         fluree.db.query.exec.eval/min})
 
 
-(defn variable?
-  [sym]
-  (and (symbol? sym)
-       (-> sym
-           name
-           first
-           (= \?))))
-
 (defn as*
   [val var]
   (log/trace "as binding value:" val "to variable:" var)
-  (if (variable? var)
+  (if (where/variable? var)
     val ; only needs to return the value b/c we store the binding variable in the AsSelector
     (throw
      (ex-info
@@ -396,7 +388,7 @@
   [code]
   (->> code
        symbols
-       (filter variable?)))
+       (filter where/variable?)))
 
 (defn qualify
   [sym allow-aggregates?]
@@ -418,7 +410,7 @@
   [code allow-aggregates?]
   (postwalk (fn [x]
               (if (and (symbol? x)
-                       (not (variable? x)))
+                       (not (where/variable? x)))
                 (qualify x allow-aggregates?)
                 x))
             code))

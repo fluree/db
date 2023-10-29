@@ -3,7 +3,6 @@
             [fluree.db.query.exec.where :as where]
             [fluree.db.query.exec.update :as update]
             [fluree.db.query.exec.select :as select]
-            [fluree.db.query.json-ld.select :refer [parse-subselection]]
             [fluree.db.datatype :as datatype]
             [fluree.db.query.fql.syntax :as syntax]
             [clojure.set :as set]
@@ -354,11 +353,55 @@
   [f]
   (-> f parse-code eval/compile select/aggregate-selector))
 
+(defn reverse?
+  [context k]
+  (-> context
+      (get-in [k :reverse])
+      boolean))
+
+(defn expand-selection
+  [selection depth context]
+  (reduce
+    (fn [acc select-item]
+      (cond
+        (map? select-item)
+        (let [[k v]  (first select-item)
+              iri    (json-ld/expand-iri k context)
+              spec   {:iri iri}
+              depth* (if (zero? depth)
+                       0
+                       (dec depth))
+              spec*  (-> spec
+                         (assoc :spec (expand-selection v depth* context)
+                                :as k))]
+          (if (reverse? context k)
+            (assoc-in acc [:reverse iri] spec*)
+            (assoc acc iri spec*)))
+
+        (#{"*" :* '*} select-item)
+        (assoc acc :wildcard? true)
+
+        (#{"_id" :_id} select-item)
+        (assoc acc :_id? true)
+
+        :else
+        (let [iri  (json-ld/expand-iri select-item context)
+              spec {:iri iri, :as select-item}]
+          (if (reverse? context select-item)
+            (assoc-in acc [:reverse iri] spec)
+            (assoc acc iri spec)))))
+    {:depth depth} selection))
+
 (defn parse-select-map
-  [sm context depth]
+  [sm depth context]
   (log/trace "parse-select-map:" sm)
-  (let [{:keys [variable selection depth spec]} (parse-subselection context sm depth)]
-    (select/subgraph-selector variable selection depth spec)))
+  (let [[subj selection] (first sm)
+        spec             (expand-selection selection depth context)]
+    (if (v/variable? subj)
+      (let [var (parse-var-name subj)]
+        (select/subgraph-selector var selection depth spec))
+      (let [iri (json-ld/expand-iri subj context)]
+        (select/subgraph-selector iri selection depth spec)))))
 
 (defn parse-selector
   [context depth s]
@@ -373,7 +416,7 @@
                    :list-fn (if (= 'as (first s))
                               (parse-as-fn s)
                               (parse-fn s)))
-      :select-map (parse-select-map s context depth))))
+      :select-map (parse-select-map s depth context))))
 
 (defn parse-select-clause
   [clause context depth]

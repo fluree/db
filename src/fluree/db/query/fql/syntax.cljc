@@ -53,7 +53,7 @@
    (into [:map {:closed true}
           [:from {:optional true} ::from]
           [:from-named {:optional true} ::from-named]
-          [:where ::where]
+          [:where {:optional true} ::where]
           [:t {:optional true} ::t]
           [:context {:optional true} ::context]
           [:select {:optional true} ::select]
@@ -123,9 +123,11 @@
                         [:wildcard ::wildcard]
                         [:predicate ::iri]
                         [:subselect-map [:ref ::subselect-map]]]]
+    ::select-map-key  [:orn {:error/message "select map key must be a variable or iri"}
+                       [:var ::var] [:iri ::iri]]
     ::select-map      [:map-of {:max 1
                                 :error/message "Only one key/val for select-map"}
-                       ::var ::subselection]
+                       ::select-map-key ::subselection]
     ::selector        [:orn {:error/message "selector must be either a variable, wildcard symbol (`*`), iri, function application, or select map"}
                        [:wildcard ::wildcard]
                        [:var ::var]

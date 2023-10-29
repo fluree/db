@@ -9,10 +9,10 @@
           movies (test-utils/load-movies conn)
           db     (fluree/db movies)]
       (testing "basic wildcard single subject query"
-        (let [query-res @(fluree/query db '{:select {?s [:*]}
-                                            :where [[?s :id :wiki/Q836821]]})]
+        (let [q         '{:select {:wiki/Q836821 [:*]}}
+              query-res @(fluree/query db q)]
           (is (= [{:id                               :wiki/Q836821,
-                   :type                         :schema/Movie,
+                   :type                             :schema/Movie,
                    :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                    :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                    :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
@@ -20,34 +20,30 @@
                  query-res)
               "Basic select * is working will context normalization")))
       (testing "basic single subject query with explicit field selection"
-        (let [query-res @(fluree/query db '{:select {?s [:id :schema/name]}
-                                            :where [[?s :id :wiki/Q836821]]})]
+        (let [query-res @(fluree/query db '{:select {:wiki/Q836821 [:id :schema/name]}})]
           (is (= [{:id :wiki/Q836821, :schema/name "The Hitchhiker's Guide to the Galaxy"}] query-res))))
       (testing "basic single subject query with selectOne"
-        (let [query-res @(fluree/query db '{:selectOne {?s [:id :schema/name]}
-                                            :where [[?s :id :wiki/Q836821]]})]
+        (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:id :schema/name]}})]
           (is (= {:id :wiki/Q836821, :schema/name "The Hitchhiker's Guide to the Galaxy"} query-res))))
       (testing "basic single subject query with graph crawl"
-        (let [query-res @(fluree/query db '{:selectOne {?s [:* {:schema/isBasedOn [:*]}]}
-                                            :where [[?s :id :wiki/Q836821]]})]
+        (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:* {:schema/isBasedOn [:*]}]}})]
           (is (= {:id                               :wiki/Q836821,
-                  :type                         :schema/Movie,
+                  :type                             :schema/Movie,
                   :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                   :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                   :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
                   :schema/isBasedOn                 {:id            :wiki/Q3107329,
-                                                     :type      :schema/Book,
+                                                     :type          :schema/Book,
                                                      :schema/name   "The Hitchhiker's Guide to the Galaxy",
                                                      :schema/isbn   "0-330-25864-8",
                                                      :schema/author {:id :wiki/Q42}}}
                  query-res))))
       (testing "basic single subject query using depth graph crawl"
         (testing "using only wildcard"
-          (let [query-res @(fluree/query db '{:selectOne {?s [:*]}
-                                              :where [[?s :id :wiki/Q836821]]
+          (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:*]}
                                               :depth 3})]
             (is (= {:id                               :wiki/Q836821,
-                    :type                         :schema/Movie,
+                    :type                             :schema/Movie,
                     :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                     :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                     :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
@@ -60,11 +56,10 @@
                                                                        :schema/name "Douglas Adams"}}}
                    query-res))))
         (testing "using graph sub-selection"
-          (let [query-res @(fluree/query db '{:selectOne {?s [:* {:schema/isBasedOn [:*]}]}
-                                              :where [[?s :id :wiki/Q836821]]
+          (let [query-res @(fluree/query db '{:selectOne {:wiki/Q836821 [:* {:schema/isBasedOn [:*]}]}
                                               :depth 3})]
             (is (= {:id                               :wiki/Q836821,
-                    :type                         :schema/Movie,
+                    :type                             :schema/Movie,
                     :schema/name                      "The Hitchhiker's Guide to the Galaxy",
                     :schema/disambiguatingDescription "2005 British-American comic science fiction film directed by Garth Jennings",
                     :schema/titleEIDR                 "10.5240/B752-5B47-DBBE-E5D4-5A3F-N",
