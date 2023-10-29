@@ -44,7 +44,8 @@
                                          {const/iri-property
                                           [:* {const/iri-allow
                                                [:* {const/iri-target-role [:_id]}]}]}]}
-                           :where  [['?s const/iri-type const/iri-policy]]}))))
+                           :where  {const/iri-id   '?s
+                                    const/iri-type const/iri-policy}}))))
 
 (defn policies-for-roles*
   "Filters all rules into only those that apply to the given roles."
