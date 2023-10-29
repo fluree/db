@@ -12,49 +12,49 @@
                                            {:defaultContext
                                             ["" {:ex "http://example.org/ns/"}]})
           user-query       {:select {'?s [:*]}
-                            :where  [['?s :type :ex/User]]}
+                            :where  {:id '?s, :type :ex/User}}
           db               @(fluree/stage
-                             (fluree/db ledger)
-                             {:id             :ex/UserShape
-                              :type           [:sh/NodeShape]
-                              :sh/targetClass :ex/User
-                              :sh/not         [{:sh/path     :schema/companyName
-                                                :sh/minCount 1}
-                                               {:sh/path   :schema/name
-                                                :sh/equals :schema/callSign}]
-                              :sh/property    [{:sh/path     :schema/callSign
-                                                :sh/minCount 1
-                                                :sh/maxCount 1
-                                                :sh/datatype :xsd/string}]})
+                              (fluree/db ledger)
+                              {:id             :ex/UserShape
+                               :type           [:sh/NodeShape]
+                               :sh/targetClass :ex/User
+                               :sh/not         [{:sh/path     :schema/companyName
+                                                 :sh/minCount 1}
+                                                {:sh/path   :schema/name
+                                                 :sh/equals :schema/callSign}]
+                               :sh/property    [{:sh/path     :schema/callSign
+                                                 :sh/minCount 1
+                                                 :sh/maxCount 1
+                                                 :sh/datatype :xsd/string}]})
           db-ok            @(fluree/stage
-                             db
-                             {:id              :ex/john,
-                              :type            [:ex/User],
-                              :schema/name     "John"
-                              :schema/callSign "j-rock"})
+                              db
+                              {:id              :ex/john,
+                               :type            [:ex/User],
+                               :schema/name     "John"
+                               :schema/callSign "j-rock"})
           db-company-name  (try
                              @(fluree/stage
-                               db
-                               {:id                 :ex/john,
-                                :type               [:ex/User],
-                                :schema/companyName "WrongCo"
-                                :schema/callSign    "j-rock"})
+                                db
+                                {:id                 :ex/john,
+                                 :type               [:ex/User],
+                                 :schema/companyName "WrongCo"
+                                 :schema/callSign    "j-rock"})
                              (catch Exception e e))
           db-two-names     (try
                              @(fluree/stage
-                               db
-                               {:id                 :ex/john,
-                                :type               [:ex/User],
-                                :schema/companyName ["John", "Johnny"]
-                                :schema/callSign    "j-rock"})
+                                db
+                                {:id                 :ex/john,
+                                 :type               [:ex/User],
+                                 :schema/companyName ["John", "Johnny"]
+                                 :schema/callSign    "j-rock"})
                              (catch Exception e e))
           db-callsign-name (try
                              @(fluree/stage
-                               db
-                               {:id              :ex/john
-                                :type            [:ex/User]
-                                :schema/name     "Johnny Boy"
-                                :schema/callSign "Johnny Boy"})
+                                db
+                                {:id              :ex/john
+                                 :type            [:ex/User]
+                                 :schema/name     "Johnny Boy"
+                                 :schema/callSign "Johnny Boy"})
                              (catch Exception e e))
           ok-results       @(fluree/query db-ok user-query)]
       (is (util/exception? db-company-name))
@@ -67,7 +67,7 @@
       (is (= "SHACL PropertyShape exception - sh:not sh:equals: [\"Johnny Boy\"] is required to be not equal to [\"Johnny Boy\"]."
              (ex-message db-callsign-name)))
       (is (= [{:id              :ex/john,
-               :type        :ex/User,
+               :type            :ex/User,
                :schema/name     "John",
                :schema/callSign "j-rock"}]
              ok-results)
@@ -79,28 +79,28 @@
                                        {:defaultContext
                                         ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
+                        :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage
-                         (fluree/db ledger)
-                         {:id             :ex/UserShape
-                          :type           [:sh/NodeShape]
-                          :sh/targetClass :ex/User
-                          :sh/not         [{:sh/path         :schema/age
-                                            :sh/minInclusive 130}
-                                           {:sh/path         :schema/favNums
-                                            :sh/maxExclusive 9000}]
-                          :sh/property    [{:sh/path     :schema/age
-                                            :sh/minCount 1
-                                            :sh/maxCount 1
-                                            :sh/datatype :xsd/long}]})
+                          (fluree/db ledger)
+                          {:id             :ex/UserShape
+                           :type           [:sh/NodeShape]
+                           :sh/targetClass :ex/User
+                           :sh/not         [{:sh/path         :schema/age
+                                             :sh/minInclusive 130}
+                                            {:sh/path         :schema/favNums
+                                             :sh/maxExclusive 9000}]
+                           :sh/property    [{:sh/path     :schema/age
+                                             :sh/minCount 1
+                                             :sh/maxCount 1
+                                             :sh/datatype :xsd/long}]})
           db-ok        @(fluree/stage
-                         db
-                         {:id              :ex/john,
-                          :type            [:ex/User],
-                          :schema/name     "John"
-                          :schema/callSign "j-rock"
-                          :schema/age      42
-                          :schema/favNums  [9004 9008 9015 9016 9023 9042]})
+                          db
+                          {:id              :ex/john,
+                           :type            [:ex/User],
+                           :schema/name     "John"
+                           :schema/callSign "j-rock"
+                           :schema/age      42
+                           :schema/favNums  [9004 9008 9015 9016 9023 9042]})
           db-too-old   @(fluree/stage
                           db
                           {:id                 :ex/john,
@@ -136,7 +136,7 @@
                             ;; could be either problem so just match common prefix
                             "SHACL PropertyShape exception - sh:not "))
       (is (= [{:id              :ex/john,
-               :type        :ex/User,
+               :type            :ex/User,
                :schema/name     "John",
                :schema/callSign "j-rock"
                :schema/age      42
@@ -145,51 +145,51 @@
           (str "unexpected query result: " (pr-str ok-results)))))
 
   (testing "shacl not w/ string constraints works"
-    (let [conn         (test-utils/create-conn)
-          ledger       @(fluree/create conn "shacl/str"
-                                       {:defaultContext
-                                        ["" {:ex "http://example.org/ns/"}]})
-          user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
-          db           @(fluree/stage
-                          (fluree/db ledger)
-                          {:id             :ex/UserShape
-                           :type           [:sh/NodeShape]
-                           :sh/targetClass :ex/User
-                           :sh/not    [{:sh/path      :ex/tag
-                                        :sh/minLength 4}
-                                       {:sh/path      :schema/name
-                                        :sh/maxLength 10}
-                                       {:sh/path     :ex/greeting
-                                        :sh/pattern  "hello.*"}]})
-          db-ok-name     @(fluree/stage
-                           db
-                           {:id          :ex/jean-claude
-                            :type        :ex/User,
-                            :schema/name "Jean-Claude"})
-          db-ok-tag    @(fluree/stage
-                              db
-                              {:id          :ex/al,
-                               :type        :ex/User,
-                               :ex/tag 1})
+    (let [conn       (test-utils/create-conn)
+          ledger     @(fluree/create conn "shacl/str"
+                                     {:defaultContext
+                                      ["" {:ex "http://example.org/ns/"}]})
+          user-query {:select {'?s [:*]}
+                      :where  {:id '?s, :type :ex/User}}
+          db         @(fluree/stage
+                        (fluree/db ledger)
+                        {:id             :ex/UserShape
+                         :type           [:sh/NodeShape]
+                         :sh/targetClass :ex/User
+                         :sh/not         [{:sh/path      :ex/tag
+                                           :sh/minLength 4}
+                                          {:sh/path      :schema/name
+                                           :sh/maxLength 10}
+                                          {:sh/path    :ex/greeting
+                                           :sh/pattern "hello.*"}]})
+          db-ok-name @(fluree/stage
+                        db
+                        {:id          :ex/jean-claude
+                         :type        :ex/User,
+                         :schema/name "Jean-Claude"})
+          db-ok-tag  @(fluree/stage
+                        db
+                        {:id     :ex/al,
+                         :type   :ex/User,
+                         :ex/tag 1})
 
-          db-ok-greeting    @(fluree/stage
-                               db
-                               {:id          :ex/al,
-                                :type        :ex/User,
-                                :ex/greeting "HOWDY"})
-          db-name-too-short  (try @(fluree/stage
-                                     db
-                                     {:id          :ex/john,
-                                      :type        [:ex/User],
-                                      :schema/name "John"})
-                                  (catch Exception e e))
-          db-tag-too-long (try @(fluree/stage
-                                  db
-                                  {:id          :ex/john,
-                                   :type        [:ex/User],
-                                   :ex/tag 12345})
-                               (catch Exception e e))
+          db-ok-greeting        @(fluree/stage
+                                   db
+                                   {:id          :ex/al,
+                                    :type        :ex/User,
+                                    :ex/greeting "HOWDY"})
+          db-name-too-short     (try @(fluree/stage
+                                        db
+                                        {:id          :ex/john,
+                                         :type        [:ex/User],
+                                         :schema/name "John"})
+                                     (catch Exception e e))
+          db-tag-too-long       (try @(fluree/stage
+                                        db
+                                        {:id     :ex/john,
+                                         :type   [:ex/User],
+                                         :ex/tag 12345})
+                                     (catch Exception e e))
           db-greeting-incorrect (try @(fluree/stage
                                         db
                                         {:id          :ex/john,
@@ -206,14 +206,14 @@
       (is (= "SHACL PropertyShape exception - sh:not sh:pattern: value hello! must not match pattern \"hello.*\"."
              (ex-message db-greeting-incorrect)))
       (is (= [{:id          :ex/jean-claude
-               :type    :ex/User,
+               :type        :ex/User,
                :schema/name "Jean-Claude"}]
              @(fluree/query db-ok-name user-query)))
-      (is (= [{:id       :ex/al,
-               :type :ex/User,
-               :ex/tag   1}]
+      (is (= [{:id     :ex/al,
+               :type   :ex/User,
+               :ex/tag 1}]
              @(fluree/query db-ok-tag user-query)))
-      (is (= [{:id       :ex/al,
-               :type :ex/User,
-               :ex/greeting   "HOWDY"}]
+      (is (= [{:id          :ex/al,
+               :type        :ex/User,
+               :ex/greeting "HOWDY"}]
              @(fluree/query db-ok-greeting user-query))))))

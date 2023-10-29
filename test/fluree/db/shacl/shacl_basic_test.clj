@@ -21,8 +21,7 @@
                         "insert" {:id :ex/myClassInstance
                                   :type :ex/MyClass
                                   :schema/description "Now a new subject uses MyClass as a Class"}})
-          query-res @(fluree/query db2 '{:select {?s [:*]}
-                                         :where  [[?s :id :ex/myClassInstance]]})]
+          query-res @(fluree/query db2 '{:select {:ex/myClassInstance [:*]}})]
       (is (= query-res
              [{:id                 :ex/myClassInstance
                :type           :ex/MyClass
@@ -34,7 +33,7 @@
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/a" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
+                        :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage2
                           (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
@@ -95,7 +94,7 @@
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
+                        :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage2
                           (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
@@ -146,7 +145,7 @@
     (let [conn          (test-utils/create-conn)
           ledger        @(fluree/create conn "shacl/c" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query    {:select {'?s [:*]}
-                         :where  [['?s :type :ex/User]]}
+                         :where  {:id '?s, :type :ex/User}}
           db            @(fluree/stage2
                            (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
@@ -190,7 +189,7 @@
     (let [conn       (test-utils/create-conn)
           ledger     @(fluree/create conn "shacl/pairs" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
-                      :where  [['?s :type :ex/User]]}]
+                      :where  {:id '?s, :type :ex/User}}]
       (testing "single-cardinality equals"
         (let [db           @(fluree/stage2
                               (fluree/db ledger)
@@ -652,7 +651,7 @@
     (let [conn       (test-utils/create-conn)
           ledger     @(fluree/create conn "shacl/value-range" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query {:select {'?s [:*]}
-                      :where  [['?s :type :ex/User]]}]
+                      :where  {:id '?s, :type :ex/User}}]
       (testing "exclusive constraints"
         (let [db          @(fluree/stage2
                              (fluree/db ledger)
@@ -799,7 +798,7 @@
                                               {:defaultContext
                                                ["" {:ex "http://example.org/ns/"}]})
           user-query          {:select {'?s [:*]}
-                               :where  [['?s :type :ex/User]]}
+                               :where  {:id '?s, :type :ex/User}}
           db                  @(fluree/stage2
                                  (fluree/db ledger)
                                  {"@context" "https://ns.flur.ee"
@@ -894,7 +893,7 @@
                                                  {:defaultContext
                                                   ["" {:ex "http://example.org/ns/"}]})
           user-query             {:select {'?s [:*]}
-                                  :where  [['?s :type :ex/User]]}
+                                  :where  {:id '?s, :type :ex/User}}
           db                     @(fluree/stage2
                                     (fluree/db ledger)
                                     {"@context" "https://ns.flur.ee"
@@ -979,7 +978,7 @@ WORLD! does not match pattern \"hello   (.*?)world\" with provided sh:flags: [\"
     (let [conn         (test-utils/create-conn)
           ledger       @(fluree/create conn "shacl/b" {:defaultContext ["" {:ex "http://example.org/ns/"}]})
           user-query   {:select {'?s [:*]}
-                        :where  [['?s :type :ex/User]]}
+                        :where  {:id '?s, :type :ex/User}}
           db           @(fluree/stage2
                           (fluree/db ledger)
                           {"@context" "https://ns.flur.ee"
