@@ -150,54 +150,17 @@
          (util/str->int recur-n)
          default-recursion-depth)])))
 
-(defn parse-pred-ident
-  [x]
-  (when (util/pred-ident? x)
-    (where/->ident x)))
-
 (defn parse-iri
   [x context]
   (-> x
       (json-ld/expand-iri context)
       where/->iri-ref))
 
-(defn parse-predicate-iri
-  [p context]
-  (let [iri (json-ld/expand-iri p context)]
-    (where/->predicate iri)))
-
 (defn parse-class
   [o-iri context]
   (-> o-iri
       (json-ld/expand-iri context)
       where/->iri-ref))
-
-(defn iri-map?
-  [m]
-  (and (contains? m :id)
-       (= (count m) 2))) ; account for :idx key in expanded maps
-
-(defn parse-iri-map
-  [m]
-  (when (iri-map? m)
-    (-> m
-        (get :id)
-        where/->iri-ref)))
-
-(defn parse-value-map
-  [m]
-  (when-let [v (get-first-value m :value)]
-    (if-let [lang (get-first-value m :language)]
-      (let [lang-filter (where/lang-matcher lang)]
-        (where/->val-filter v lang-filter))
-      (where/anonymous-value v))))
-
-(defn parse-reference-map
-  [pat context]
-  (when (map? pat)
-    (let [expanded (json-ld/expand pat context)]
-      (or (parse-iri-map expanded)
-          (parse-value-map expanded)))))
 
 (defmulti parse-pattern
   (fn [pattern _vars _context]
