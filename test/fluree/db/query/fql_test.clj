@@ -400,15 +400,11 @@
         (let [q '{"@context" "https://schema.org"
                   :from      ["test/authors" "test/books" "test/movies"]
                   :select    [?movieName ?bookIsbn ?authorName]
-                  :where     [{"id"        ?movie
-                               "type"      "Movie"
+                  :where     [{"type"      "Movie"
                                "name"      ?movieName
-                               "isBasedOn" ?book}
-                              {"id"     ?book
-                               "isbn"   ?bookIsbn
-                               "author" ?author}
-                              {"id"   ?author
-                               "name" ?authorName}]}]
+                               "isBasedOn" {"isbn"   ?bookIsbn
+                                            "author" {"name" ?authorName}}}]}]
+
           (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
                   ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
                  @(fluree/query-connection conn q))
