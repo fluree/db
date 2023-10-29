@@ -299,6 +299,7 @@
                             [:boolean :boolean]
                             [:int :int]
                             [:double :double]
+                            [:nil :nil]
                             [:iri ::iri]
                             [:map [:ref ::node-map]]]
     ::node-map             [:map-of {:error/message "Invalid node map"}
