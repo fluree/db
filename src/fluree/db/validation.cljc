@@ -291,9 +291,12 @@
     ::node-map-key         [:orn {:error/message "node map keys must be an iri or variable"}
                             [:iri ::iri]
                             [:var ::var]]
-    ::node-map-value       [:orn {:error/message "node map values must be an iri, string, map, or variable"}
+    ::node-map-value       [:orn {:error/message "node map values must be an iri, string, number, boolean, map, or variable"}
                             [:var ::var]
                             [:string :string]
+                            [:boolean :boolean]
+                            [:int :int]
+                            [:double :double]
                             [:iri ::iri]
                             [:map [:ref ::node-map]]]
     ::node-map             [:map-of {:error/message "Invalid node map"}
