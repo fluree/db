@@ -187,11 +187,14 @@
                  {}))))
 
 (defn parse-bind-map
-  [bind]
-  (reduce-kv (fn [m k v]
-               (let [parsed-k (parse-var-name k)]
-                 (assoc m parsed-k (parse-bind-function parsed-k v))))
-             {} bind))
+  [binds]
+  (into {}
+        (comp (partition-all 2)
+              (map (fn [[k v]]
+                     (let [var (parse-var-name k)
+                           f   (parse-bind-function var v)]
+                       [var f]))))
+        binds))
 
 (defn parse-where-clause
   [clause vars context]
@@ -321,8 +324,8 @@
     [(where/->pattern :optional parsed)]))
 
 (defmethod parse-pattern :bind
-  [[_ bind] _vars _context]
-  (let [parsed  (parse-bind-map bind)]
+  [[_ & binds] _vars _context]
+  (let [parsed (parse-bind-map binds)]
     [(where/->pattern :bind parsed)]))
 
 (defmethod parse-pattern :graph

@@ -280,7 +280,9 @@
                             ::where]
     ::union                [:sequential {:error/message "union clause must be a sequence of valid where clauses."}
                             [:ref ::where]]
-    ::bind                 [:map-of {:error/message "bind clause must be a map with variable keys"} ::var :any]
+    ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
+                            [:catn [:var ::var]
+                                   [:binding ::function]]]
     ::where-op             [:enum {:decode/fql  string->keyword
                                    :decode/json string->keyword
                                    :error/message "unrecognized operation in where tuple, must be one of: graph, filter, optional, union, bind"}
@@ -310,7 +312,9 @@
                             [:union [:catn
                                      [:op ::where-op]
                                      [:* [:schema [:ref ::union]]]]]
-                            [:bind [:tuple ::where-op [:ref ::bind]]]
+                            [:bind [:catn
+                                    [:op ::where-op]
+                                    [:ref ::bind]]]
                             [:graph [:tuple ::where-op ::graph [:ref ::where]]]]
     ::where                [:orn {:error/message "where clause must be a single node map pattern or a sequence of where patterns"}
                             [:single ::node-map]

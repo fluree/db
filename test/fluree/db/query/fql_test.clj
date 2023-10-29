@@ -143,8 +143,8 @@
       (let [q   '{:select   [?firstLetterOfName ?name ?decadesOld]
                   :where    [{:schema/age  ?age
                               :schema/name ?name}
-                             [:bind {?decadesOld (quot ?age 10)}]
-                             [:bind {?firstLetterOfName (subStr ?name 1 1)}]]
+                             [:bind ?decadesOld (quot ?age 10)]
+                             [:bind ?firstLetterOfName (subStr ?name 1 1)]]
                   :order-by ?firstLetterOfName}
             res @(fluree/query db q)]
         (is (= [["A" "Alice" 5]
@@ -153,12 +153,13 @@
                 ["L" "Liam" 1]]
                res))))
 
-    (testing "with 2 fn binds in one bind map"
+    (testing "with 2 fn binds in one bind pattern"
       (let [q   '{:select   [?firstLetterOfName ?name ?canVote]
                   :where    [{:schema/age  ?age
                               :schema/name ?name}
-                             [:bind {?firstLetterOfName (subStr ?name 1 1)
-                                     ?canVote           (>= ?age 18)}]]
+                             [:bind
+                              ?firstLetterOfName (subStr ?name 1 1)
+                              ?canVote           (>= ?age 18)]]
                   :order-by ?name}
             res @(fluree/query db q)]
         (is (= [["A" "Alice" true]
@@ -172,8 +173,9 @@
                 :where    [{:schema/age  ?age
                             :ex/favNums  ?favNums
                             :schema/name ?name}
-                           [:bind {?sumFavNums (sum ?favNums)
-                                   ?canVote    (>= ?age 18)}]]
+                           [:bind
+                            ?sumFavNums (sum ?favNums)
+                            ?canVote    (>= ?age 18)]]
                 :order-by ?name}]
         (is (re-matches
              #"Aggregate function sum is only valid for grouped values"
@@ -214,7 +216,7 @@
                                       :select    [?job ?lang]
                                       :where     [{"@id"           "ex:frank"
                                                    "ex:occupation" ?job}
-                                                  [:bind {?lang "(lang ?job)"}]]})]
+                                                  [:bind ?lang "(lang ?job)"]]})]
           (is (= [["Ninja" "en"] ["忍者" "ja"]] sut)
               "return the correct language tags.")))
 
@@ -252,8 +254,8 @@
                        :ex/age  "forever 10"}]))]
     (testing "including datatype in query results"
       (let [query   '{:select [?age ?dt]
-                      :where  [[?s :ex/age ?age]
-                               {:bind {?dt (datatype ?age)}}]}
+                      :where  [{:ex/age ?age}
+                               [:bind ?dt (datatype ?age)]]}
             results @(fluree/query db query)]
         (is (= [["forever 10" "xsd:string"] [36 "xsd:long"]]
                results))))
@@ -400,10 +402,10 @@
         (let [q '{"@context" "https://schema.org"
                   :from      ["test/authors" "test/books" "test/movies"]
                   :select    [?movieName ?bookIsbn ?authorName]
-                  :where     [{"type"      "Movie"
-                               "name"      ?movieName
-                               "isBasedOn" {"isbn"   ?bookIsbn
-                                            "author" {"name" ?authorName}}}]}]
+                  :where     {"type"      "Movie"
+                              "name"      ?movieName
+                              "isBasedOn" {"isbn"   ?bookIsbn
+                                           "author" {"name" ?authorName}}}}]
 
           (is (= [["Gone with the Wind" "0-582-41805-4" "Margaret Mitchell"]
                   ["The Hitchhiker's Guide to the Galaxy" "0-330-25864-8" "Douglas Adams"]]
