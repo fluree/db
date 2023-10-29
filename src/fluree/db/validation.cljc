@@ -278,13 +278,13 @@
                             [:list-fn [:and list? [:cat :symbol [:* any?]]]]]
     ::optional             [:ref {:error/message "optional clause must be a valid where clause."}
                             ::where]
-    ::union                [:sequential {:error/message "union clause must be a sequence of valid where clauses."}
-                            [:ref ::where]]
+    ::union                [:+ {:error/message "union pattern must be a sequence of valid where clauses."}
+                            [:schema [:ref ::where]]]
     ::bind                 [:+ {:error/message "bind values must be mappings from variables to functions"}
                             [:catn [:var ::var]
-                                   [:binding ::function]]]
-    ::where-op             [:enum {:decode/fql  string->keyword
-                                   :decode/json string->keyword
+                             [:binding ::function]]]
+    ::where-op             [:enum {:decode/fql    string->keyword
+                                   :decode/json   string->keyword
                                    :error/message "unrecognized operation in where tuple, must be one of: graph, filter, optional, union, bind"}
                             :graph :filter :optional :union :bind]
     ::graph                [:orn {:error/message "value of graph. Must be a ledger name or variable"}
@@ -311,10 +311,10 @@
                             [:optional [:tuple ::where-op [:ref ::optional]]]
                             [:union [:catn
                                      [:op ::where-op]
-                                     [:* [:schema [:ref ::union]]]]]
+                                     [:clauses ::union]]]
                             [:bind [:catn
                                     [:op ::where-op]
-                                    [:ref ::bind]]]
+                                    [:bindings ::bind]]]
                             [:graph [:tuple ::where-op ::graph [:ref ::where]]]]
     ::where                [:orn {:error/message "where clause must be a single node map pattern or a sequence of where patterns"}
                             [:single ::node-map]
