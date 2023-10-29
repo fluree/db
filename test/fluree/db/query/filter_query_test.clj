@@ -45,34 +45,34 @@
     (testing "single filter"
       (is (= [["David" 46]
               ["Brian" 50]]
-             @(fluree/query db {:select ['?name '?age]
-                                :where  [['?s :type :ex/User]
-                                         ['?s :schema/age '?age]
-                                         ['?s :schema/name '?name]
-                                         {:filter ["(> ?age 45)"]}]}))))
+             @(fluree/query db '{:select [?name ?age]
+                                 :where  [{:type :ex/User
+                                           :schema/age ?age
+                                           :schema/name ?name}
+                                          [:filter "(> ?age 45)"]]}))))
     (testing "multiple filters on same var"
       (is (= [["David" 46]]
-             @(fluree/query db {:select ['?name '?age]
-                                :where  [['?s :type :ex/User]
-                                         ['?s :schema/age '?age]
-                                         ['?s :schema/name '?name]
-                                         {:filter ["(> ?age 45)", "(< ?age 50)"]}]}))))
+             @(fluree/query db '{:select [?name ?age]
+                                 :where  [{:type :ex/User
+                                           :schema/age ?age
+                                           :schema/name ?name}
+                                          [:filter "(> ?age 45)" "(< ?age 50)"]]}))))
     (testing "multiple filters, different vars"
       (is (= [["Brian" "Smith"]]
-             @(fluree/query db {:select ['?name '?last]
-                                :where  [['?s :type :ex/User]
-                                         ['?s :schema/age '?age]
-                                         ['?s :schema/name '?name]
-                                         ['?s :ex/last '?last]
-                                         {:filter ["(> ?age 45)", "(strEnds ?last \"ith\")"]}]}))))
+             @(fluree/query db '{:select [?name ?last]
+                                 :where  [{:type :ex/User
+                                           :schema/age ?age
+                                           :schema/name ?name
+                                           :ex/last ?last}
+                                          [:filter "(> ?age 45)" "(strEnds ?last \"ith\")"]]}))))
 
     (testing "nested filters"
       (is (= [["Brian" 50]]
              @(fluree/query db '{:select [?name ?age]
-                                 :where  [[?s :type :ex/User]
-                                          [?s :schema/age ?age]
-                                          [?s :schema/name ?name]
-                                          {:filter ["(> ?age (/ (+ ?age 47) 2))"]}]}))))
+                                 :where  [{:type :ex/User
+                                           :schema/age ?age
+                                           :schema/name ?name}
+                                          [:filter "(> ?age (/ (+ ?age 47) 2))"]]}))))
 
     ;;TODO: simple-subject-crawl does not yet support filters.
     ;;these are being run as regular analytial queries
@@ -93,8 +93,8 @@
                :schema/age 50,
                :ex/favNums 7}]
              @(fluree/query db {:select {"?s" ["*"]}
-                                :where  [["?s" :schema/age "?age"]
-                                         {:filter ["(> ?age 45)"]}]})))
+                                :where  [{:id "?s", :schema/age "?age"}
+                                         [:filter "(> ?age 45)"]]})))
       (is (= [{:id :ex/david,
                :type :ex/User,
                :schema/name "David",
@@ -104,8 +104,8 @@
                :ex/favNums [15 70],
                :ex/friend {:id :ex/cam}}]
              @(fluree/query db {:select {"?s" ["*"]}
-                                :where  [["?s" :schema/age "?age"]
-                                         {:filter ["(> ?age 45)", "(< ?age 50)"]}]})))
+                                :where  [{:id "?s", :schema/age "?age"}
+                                         [:filter "(> ?age 45)" "(< ?age 50)"]]})))
       (is (= [{:type :ex/User
                :schema/email "cam@example.org"
                :ex/favNums [5 10]
@@ -116,5 +116,5 @@
                :ex/friend [{:id :ex/brian} {:id :ex/alice}]
                :ex/favColor "Blue"}]
              @(fluree/query db {:select {"?s" ["*"]}
-                                :where  [["?s" :ex/favColor "?color"]
-                                         {:filter ["(strStarts ?color \"B\")"]}]}))))))
+                                :where  [{:id "?s", :ex/favColor "?color"}
+                                         [:filter "(strStarts ?color \"B\")"]]}))))))
