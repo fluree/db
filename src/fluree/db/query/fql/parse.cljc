@@ -609,14 +609,16 @@
   (let [[vars values] (parse-values {:values (util/get-first-value txn const/iri-values)})
         where         (parse-where {:where (util/get-first-value txn const/iri-where)} vars context)
 
-        delete (->> (util/get-first-value txn const/iri-delete)
-                    util/sequential
-                    (mapcat (fn [m]
-                              (parse-node-map m context))))
-        insert (->> (util/get-first-value txn const/iri-insert)
-                    util/sequential
-                    (mapcat (fn [m]
-                              (parse-node-map m context))))]
+        delete (-> txn
+                   (util/get-first-value const/iri-delete)
+                   (json-ld/expand context)
+                   util/sequential
+                   parse-triples)
+        insert (-> txn
+                   (util/get-first-value const/iri-insert)
+                   (json-ld/expand context)
+                   util/sequential
+                   parse-triples)]
     (cond-> {}
       context            (assoc :context context)
       where              (assoc :where where)
