@@ -191,7 +191,7 @@
                loaded-db      (fluree/db loaded)
                merged-ctx     (merge (ctx-util/stringify-context conn-context)
                                      (ctx-util/stringify-context ledger-context))
-               query          {:where  '[[?p :schema/email "wes@example.org"]]
+               query          {:where  '{:id ?p, :schema/email "wes@example.org"}
                                :select '{?p [:*]}}
                results        @(fluree/query loaded-db query)]
            (is (= target-t (:t loaded-db)))
@@ -225,8 +225,7 @@
                                   :ex/friend   {:id          :ex/Jonathan
                                                 :type        :schema/Person
                                                 :schema/name "Jonathan"}}])
-               query          {:select '{?s [:*]}
-                               :where  '[[?s :id :ex/Andrew]]}
+               query          {:select {:ex/Andrew [:*]}}
                res1           @(fluree/query db query)
                _              @(fluree/commit! ledger db)
                loaded         (test-utils/retry-load conn ledger-alias 100)
@@ -305,7 +304,7 @@
                       :type   :ex/User,
                       :ex/friends [{:id :ex/john} {:id :ex/cam}]}]
                     @(fluree/query loaded-db '{:select {?s [:*]}
-                                               :where  [[?s :type :ex/User]]}))))))
+                                               :where  {:id ?s, :type :ex/User}}))))))
 
        (testing "can load with policies"
          (with-tmp-dir storage-path
@@ -379,7 +378,7 @@
                                             {:f/property
                                              [:* {:f/allow
                                                   [:* {:f/targetRole [:_id]}]}]}]}
-                                       :where  [[?s :type :f/Policy]]}))))))))
+                                       :where  {:id ?s, :type :f/Policy}}))))))))
 
      (testing "Can load a ledger with time values"
        (with-tmp-dir storage-path
@@ -409,7 +408,7 @@
                db-commit @(fluree/commit! ledger db)
                loaded (test-utils/retry-load conn (:alias ledger) 100)
                q {"select" {"?s" ["*"]}
-                  "where" [["?s" "type" "ex:Bar"]]}]
+                  "where" {"@id" "?s", "type" "ex:Bar"}}]
            (is (= @(fluree/query (fluree/db loaded) q)
                   @(fluree/query db q))))))))
 
@@ -526,7 +525,7 @@
              loaded         (test-utils/load-to-t conn ledger-alias target-t 100)
              loaded-db      (fluree/db loaded)
              merged-ctx     (merge (ctx-util/stringify-context conn-context) (ctx-util/stringify-context ledger-context))
-             query          {:where  '[[?p :schema/email "wes@example.org"]]
+             query          {:where  '{:id ?p, :schema/email "wes@example.org"}
                              :select '{?p [:*]}}
              results        @(fluree/query loaded-db query)]
          (is (= target-t (:t loaded-db)))
@@ -559,8 +558,7 @@
                                 :ex/friend   {:id          :ex/Jonathan
                                               :type        :schema/Person
                                               :schema/name "Jonathan"}}])
-             query          {:select '{?s [:*]}
-                             :where  '[[?s :id :ex/Andrew]]}
+             query          {:select '{:ex/Andrew [:*]}}
              res1           @(fluree/query db query)
              _              @(fluree/commit! ledger db)
              loaded         (test-utils/retry-load conn ledger-alias 100)
@@ -601,7 +599,7 @@
                     :type   :ex/User,
                     :ex/friends [{:id :ex/john} {:id :ex/cam}]}]
                   @(fluree/query loaded-db '{:select {?s [:*]}
-                                             :where  [[?s :type :ex/User]]})))))
+                                             :where  {:id ?s, :type :ex/User}})))))
 
        (testing "can load with policies"
          (let [conn         @(fluree/connect
@@ -664,7 +662,7 @@
                                                             {:type [:_id]}
                                                             {:f/allow [:* {:f/targetRole [:_id]}]}
                                                             {:f/property [:* {:f/allow [:* {:f/targetRole [:_id]}]}]}]}
-                                               :where  [[?s :type :f/Policy]]})))))))
+                                               :where  {:id ?s, :type :f/Policy}})))))))
      (testing "loading predefined properties"
        (let [conn (test-utils/create-conn {:context test-utils/default-str-context
                                            :context-type :string})
@@ -677,7 +675,8 @@
                                         "sh:property"
                                         [{"sh:path" {"id" "schema:familyName"}
                                           "sh:datatype" {"id" "xsd:string"}}]})
-             property-query {:select {"?s" ["*"]}, :where [["?s" "sh:property" "?property"]]}
+             property-query {:select {"?s" ["*"]}
+                             :where {"id" "?s", "sh:property" "?property"}}
              shape-id (-> @(fluree/query db1 property-query)
                           first
                           (get "id"))
@@ -728,14 +727,14 @@
                                      :type               :ex/Animal
                                      :schema/description "We ❤️ catnip"}]})
              description-query '{:select {?s [:id]}
-                                 :where  [[?s :schema/description ?description]]}
+                                 :where  {:id ?s, :schema/description ?description}}
              _                 @(fluree/commit! ledger db1)
              loaded1           (test-utils/retry-load conn ledger-alias 100)
              loaded-db1        (fluree/db loaded1)
              db2               @(fluree/stage
                                   loaded-db1
-                                  '{:delete [:ex/mosquitos ?p ?o]
-                                    :where  [[:ex/mosquitos ?p ?o]]})
+                                  '{:delete {:id :ex/mosquitos, ?p ?o}
+                                    :where  {:id :ex/mosquitos, ?p ?o}})
              _                 @(fluree/commit! ledger db2)
              loaded2           (test-utils/retry-load conn ledger-alias 100)
              loaded-db2        (fluree/db loaded2)]
@@ -744,9 +743,10 @@
              "The id :ex/mosquitos should be removed")
          (let [db3        @(fluree/stage
                              loaded-db2
-                             '{:delete [?s ?p ?o]
-                               :where  [[?s :type :schema/Organization]
-                                        [?s ?p ?o]]})
+                             '{:delete {:id ?s, ?p ?o}
+                               :where  {:id ?s
+                                        :type :schema/Organization
+                                        ?p ?o}})
                _          @(fluree/commit! ledger db3)
                loaded3  (test-utils/retry-load conn ledger-alias 100)
                loaded-db3 (fluree/db loaded3)]
@@ -755,9 +755,10 @@
                "Only :ex/kittens should be left"))))))
 
 (deftest ^:integration query-test
-  (let [query {:select ["?person" "?name"]
-               :where  [["?person" :type :ex/User]
-                        ["?person" :schema/name "?name"]]}
+  (let [query    {:select ["?person" "?name"]
+                  :where  {:id          "?person"
+                           :type        :ex/User
+                           :schema/name "?name"}}
         expected [[:ex/liam "Liam"]
                   [:ex/cam "Cam"]
                   [:ex/alice "Alice"]
@@ -771,9 +772,9 @@
          :cljs
          (async done
            (go
-            (let [conn    (<! (test-utils/create-conn))
-                  ledger  (<! (test-utils/load-people conn))
-                  results (<p! (fluree/query (fluree/db ledger) query))]
+             (let [conn    (<! (test-utils/create-conn))
+                   ledger  (<! (test-utils/load-people conn))
+                   results (<p! (fluree/query (fluree/db ledger) query))]
               (is (= expected results))
               (done))))))))
 
@@ -805,7 +806,8 @@
            (let [db          @(fluree/stage db0 test-utils/people)
                  flake-total (count (<?? (query-range/index-range db :spot)))
                  query       '{:select [?s ?p ?o]
-                               :where  [[?s ?p ?o]]}]
+                               :where  {:id ?s
+                                        ?p ?o}}]
              (testing "queries not returning metadata"
                (let [sut @(fluree/query db query)]
                  (is (nil? (:fuel sut))
@@ -817,7 +819,8 @@
                      "Reports that all flakes were traversed"))))
            (testing "short-circuits if request fuel exhausted"
              (let [query   '{:select [?s ?p ?o]
-                             :where  [[?s ?p ?o]]
+                             :where  {:id ?s
+                                      ?p ?o}
                              :opts   {:max-fuel 1}}
                    db      @(fluree/stage db0 test-utils/people)
                    results @(fluree/query db query)]
@@ -856,7 +859,8 @@
               (let [db          (<p! (fluree/stage db0 test-utils/people))
                     flake-total (count (<? (query-range/index-range db :spot)))
                     query       '{:select [?s ?p ?o]
-                                  :where  [[?s ?p ?o]]}]
+                                  :where  {:id ?s
+                                           ?p ?o}}]
                 (testing "queries not returning metadata"
                   (let [sut (<p! (fluree/query db query))]
                     (is (nil? (:fuel sut))
@@ -868,7 +872,8 @@
                         "Reports that all flakes were traversed"))))
               (testing "short-circuits if request fuel exhausted"
                 (let [query   '{:select [?s ?p ?o]
-                                :where  [[?s ?p ?o]]
+                                :where  {:id ?s
+                                         ?p ?o}
                                 :opts   {:max-fuel 1}}
                       db      (<p! (fluree/stage db0 test-utils/people))
                       results (try
@@ -895,7 +900,7 @@
                                                              "ex:spouse" {"@id" "ex:dp"}}]}]})
 
            db2 @(fluree/stage2 db1 {"@context" "https://ns.flur.ee"
-                                    "where" [["?s" "ex:name" "?name"]]
+                                    "where" {"id" "?s", "ex:name" "?name"}
                                     "delete" {"@id" "?s" "ex:name" "?name"}
                                     "insert" {"@graph"
                                               [{"@id" "?s" "ex:name" "BORG"}
@@ -982,7 +987,7 @@
            committed @(fluree/commit! ledger db7)
            loaded    @(fluree/load conn ledger-id)]
        (is (= ["AP" "Dan" "KP" "NP"]
-              @(fluree/query db1 {"where" [["?s" "ex:name" "?name"]]
+              @(fluree/query db1 {"where" {"id" "?s", "ex:name" "?name"}
                                   "select" "?name"})))
        (is (= [{"id" "ex:mp"
                 "type" "ex:Cat"
@@ -992,7 +997,7 @@
                 "ex:isOrange" true
                 "ex:isPerson" false
                 "ex:nickname" "The Wretch"}]
-              @(fluree/query db2 {"where" [["?s" "ex:name" "Murray"]]
+              @(fluree/query db2 {"where" {"id" "?s", "ex:name" "Murray"}
                                   "select" {"?s" ["*" {"ex:address" ["ex:street" "ex:city" "ex:state" "ex:zip"]}]}})))
 
        (is (= "SHACL PropertyShape exception - sh:maxCount of 1 lower than actual count of 2."
@@ -1012,7 +1017,7 @@
                 "schema:name" "Alice"
                 "schema:email" "alice@flur.ee"
                 "schema:ssn" "111-11-1111"}]
-              @(fluree/query db5 {:where [["?s" "@type" "ex:User"]]
+              @(fluree/query db5 {:where {"id" "?s", "@type" "ex:User"}
                                   :select {"?s" ["*" {"ex:address" ["ex:state" "ex:country"]}]}
                                   :opts {:did root-did
                                          :role "ex:rootRole"}}))
@@ -1027,14 +1032,14 @@
                 "schema:birthDate" "2022-08-17"
                 "schema:name" "Alice"
                 "schema:ssn" "111-11-1111"}]
-              @(fluree/query db5 {:where [["?s" "@type" "ex:User"]]
+              @(fluree/query db5 {:where {"id" "?s", "@type" "ex:User"}
                                   :select {"?s" ["*" {"ex:address" ["*"]}]}
                                   :opts {:did alice-did :role "ex:userRole"}}))
            "userRole user can see all ex:Users but only their own ssn")
 
        (is (= #{"Freddy" "Betty" "Leticia" "Andrew"}
               (set @(fluree/query db7 {"selectDistinct" "?name",
-                                       "where" [["?s" "schema:givenName" "?name"]]})))
+                                       "where" {"id" "?s", "schema:givenName" "?name"}})))
            "equivalentProperty annotations work")
 
        (is (= 150

@@ -514,8 +514,8 @@
   [clause context]
   (->> clause
        util/sequential
-       (mapv (fn [m]
-               (parse-node-map m context)))))
+       (mapcat (fn [m]
+                 (parse-node-map m context)))))
 
 (defn parse-ledger-update
   [mdfn context]
