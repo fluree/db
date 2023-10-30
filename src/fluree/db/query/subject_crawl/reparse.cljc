@@ -163,7 +163,7 @@
        (empty? (::where/filters where))
        ;;TODO: vars support not complete
        (empty? vars)
-       (when-let [{select-var :var} select]
+       (when-let [{select-var :subj} select]
          (let [{::where/keys [patterns]} where]
            (every? (fn [pattern]
                      (and (mergeable-where-clause? pattern)

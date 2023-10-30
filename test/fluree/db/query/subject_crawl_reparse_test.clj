@@ -45,43 +45,47 @@
                    :ex/friend    [:ex/brian :ex/alice]}])
         context  (dbproto/-context db)
         ssc-q1-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
-                                                      :where  [["?s" :schema/name "Alice"]]}
+                                                     :where  {:id "?s", :schema/name "Alice"}}
                                                      context)
         ssc-q2-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
-                                                      :where  [["?s" :schema/age 50]
-                                                               ["?s" :ex/favColor "Blue"]]}
+                                                     :where  {:id "?s"
+                                                              :schema/age 50
+                                                              :ex/favColor "Blue"}}
                                                      context)
         not-ssc-parsed (parse/parse-analytical-query {:select  ['?name '?age '?email]
-                                                       :where   [['?s :schema/name "Cam"]
-                                                                 ['?s :ex/friend '?f]
-                                                                 ['?f :schema/name '?name]
-                                                                 ['?f :schema/age '?age]
-                                                                 ['?f :schema/email '?email]]}
+                                                      :where  {:schema/name "Cam"
+                                                               :ex/friend {:schema/name '?name
+                                                                           :schema/age '?age
+                                                                           :schema/email '?email}
+ }}
                                                       context)
         order-group-parsed (parse/parse-analytical-query {:select   ['?name '?favNums]
-                                                           :where    [['?s :schema/name '?name]
-                                                                      ['?s :ex/favNums '?favNums]]
+                                                          :where    {:schema/name '?name
+                                                                     :ex/favNums '?favNums}
                                                            :group-by '?name
                                                            :order-by '?name}
                                                           context)
         vars-query-parsed (parse/parse-analytical-query {:select {"?s" ["*"]}
-                                                          :where  [["?s" :schema/name '?name]]
-                                                          :vars {'?name "Alice"}}
+                                                         :where  {:id "?s", :schema/name '?name}
+                                                         :values ['?name ["Alice"]]}
                                                          context)
         s+p+o-parsed (parse/parse-analytical-query {:select {"?s" [:*]}
-                                                    :where  [["?s" "?p" "?o"]]}
+                                                    :where  {:id "?s", "?p" "?o"}}
                                                    context)
         s+p+o2-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
-                                                     :where [['?s :schema/age 50]
-                                                             ['?s '?p '?o]]}
+                                                     :where {:id '?s
+                                                             :schema/age 50
+                                                             '?p '?o}}
                                                     context)
         s+p+o3-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
-                                                     :where [['?s '?p '?o]
-                                                             ['?s :schema/age 50]]}
+                                                     :where {:id '?s
+                                                             '?p '?o
+                                                             :schema/age 50}}
                                                     context)
         equivalent-property-parsed (parse/parse-analytical-query {:select {'?s ["*"]}
-                                                                  :where [['?s :schema/name '?name]
-                                                                          ['?s :vocab1/credential '?credential]]}
+                                                                  :where {:id '?s
+                                                                          :schema/name '?name
+                                                                          :vocab1/credential '?credential}}
                                                                  context)]
     (testing "simple-subject-crawl?"
       (is (= true
