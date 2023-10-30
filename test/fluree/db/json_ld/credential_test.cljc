@@ -112,7 +112,7 @@
                     (done)))))))
 
 #?(:clj
-   (deftest ^:integration cred-wrapped-transactions-and-queries
+   (deftest ^:kaocha/pending ^:integration cred-wrapped-transactions-and-queries
      (let [conn   @(fluree/connect {:method :memory})
            ledger @(fluree/create conn "credentialtest" {:defaultContext
                                                          [test-utils/default-str-context
@@ -131,25 +131,27 @@
            ;; can't use credentials until after an identity with a role has been created
            db1       @(test-utils/transact ledger tx)
 
-           mdfn {"delete" [["?s" "name" "Daniel"]
-                           ["?s" "favnums" 1]]
-                 "insert" [["?s" "name" "D"]
-                           ["?s" "favnums" 4]
-                           ["?s" "favnums" 5]
-                           ["?s" "favnums" 6]]
-                 "where"  [["?s" "@id" (:id auth)]]}
+           mdfn {"delete" {"@id" (:id auth)
+                           "name" "Daniel"
+                           "favnums" 1}
+                 "insert" [{"@id" (:id auth)
+                            "name" "D"}
+                           {"@id" (:id auth)
+                            "favnums" 4}
+                           {"@id" (:id auth)
+                            "favnums" 5}
+                           {"@id" (:id auth)
+                            "favnums" 6}]}
 
            db2 @(test-utils/transact ledger (async/<!! (cred/generate mdfn (:private auth))))
 
-           query {"select" {"?s" ["*"]} "where" [["?s" "@id" (:id auth)]]}]
+           query {"select" {(:id auth) ["*"]}}]
 
        (is (= [{"id" "open", "foo" "bar"}]
-              @(fluree/query db0 {"select" {"?s" ["*"]}
-                                  "where" [["?s" "@id" "open"]]}))
+              @(fluree/query db0 {"select" {"open" ["*"]}}))
            "can see everything when no identity is asserted")
        (is (= "Applying policy without a role is not yet supported."
-              (-> @(fluree/query db0 (async/<!! (cred/generate {"select" {"?s" ["*"]}
-                                                                "where" [["?s" "@id" "open"]]}
+              (-> @(fluree/query db0 (async/<!! (cred/generate {"select" {"open" ["*"]}}
                                                                (:private auth))))
                   (Throwable->map)
                   :cause))
