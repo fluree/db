@@ -193,6 +193,19 @@
           (ex-info {:status 400, :error :db/invalid-query})
           throw))))
 
+(def coerce-where*
+  (m/coercer ::where fql-transformer {:registry registry}))
+
+(defn coerce-where
+  [where]
+  (try*
+    (coerce-where* where)
+    (catch* e
+      (-> e
+          humanize-error
+          (ex-info {:status 400, :error :db/invalid-query})
+          throw))))
+
 (def parse-selector
   (m/parser ::selector {:registry registry}))
 

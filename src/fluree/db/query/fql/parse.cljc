@@ -343,7 +343,10 @@
 (defn parse-where
   [q vars context]
   (when-let [where (:where q)]
-    (parse-where-clause where vars context)))
+    (-> where
+        syntax/coerce-where
+        (log/debug->val "coerced where clause:")
+        (parse-where-clause vars context))))
 
 (defn parse-as-fn
   [f]
